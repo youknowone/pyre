@@ -46,17 +46,26 @@ struct CacheState<K, V> {
 
 #[derive(Debug)]
 pub struct Cache<K, V> {
-    state: Mutex<CacheState<K, V>>,
+    state: Mutex<Option<CacheState<K, V>>>,
+}
+
+fn occupied<'a, K, V>(state: &'a mut Option<CacheState<K, V>>) -> &'a mut CacheState<K, V> {
+    state.get_or_insert_with(|| CacheState {
+        content: IndexMap::new(),
+        _building: IndexMap::new(),
+    })
+}
+
+impl<K, V> Cache<K, V> {
+    /// Empty cache for a prebuilt owner (`cache.py Cache.__init__`).
+    pub const EMPTY: Self = Self {
+        state: Mutex::new(None),
+    };
 }
 
 impl<K, V> Default for Cache<K, V> {
     fn default() -> Self {
-        Self {
-            state: Mutex::new(CacheState {
-                content: IndexMap::new(),
-                _building: IndexMap::new(),
-            }),
-        }
+        Self::EMPTY
     }
 }
 
@@ -66,7 +75,11 @@ impl<K, V> Cache<K, V> {
     /// must expose the same stored values, never copies in a side table.
     /// The visitor must not allocate or re-enter cache construction.
     pub fn visit_values_mut(&self, mut visit: impl FnMut(&mut V)) {
-        for value in self.state.lock().content.values_mut() {
+        let mut guard = self.state.lock();
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        for value in state.content.values_mut() {
             visit(value);
         }
     }
@@ -74,13 +87,15 @@ impl<K, V> Cache<K, V> {
 
 // Cache.getorbuild's inner finally, including Rust panic unwinding.
 struct Building<'a, K: Eq + Hash, V> {
-    state: &'a Mutex<CacheState<K, V>>,
+    state: &'a Mutex<Option<CacheState<K, V>>>,
     key: K,
 }
 
 impl<K: Eq + Hash, V> Drop for Building<'_, K, V> {
     fn drop(&mut self) {
-        self.state.lock()._building.shift_remove(&self.key);
+        if let Some(state) = self.state.lock().as_mut() {
+            state._building.shift_remove(&self.key);
+        }
     }
 }
 
@@ -115,7 +130,8 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
             guard
         };
         {
-            let mut state = self.state.lock();
+            let mut guard = self.state.lock();
+            let state = occupied(&mut guard);
             if let Some(result) = state.content.get(&key) {
                 return Ok(result.clone());
             }
@@ -129,7 +145,9 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
             key: key.clone(),
         };
         let result = builder._build(&key)?;
-        self.state.lock().content.insert(key, result.clone());
+        occupied(&mut self.state.lock())
+            .content
+            .insert(key, result.clone());
         drop(building);
         builder._ready(&result)?;
         Ok(result)
@@ -246,8 +264,22 @@ mod tests {
             second: Cache::new(),
         };
         assert_eq!(owner.first.getorbuild(0, &owner), Ok(42));
-        assert!(owner.first.state.lock()._building.is_empty());
-        assert!(owner.second.state.lock()._building.is_empty());
+        assert!(
+            owner
+                .first
+                .state
+                .lock()
+                .as_ref()
+                .is_none_or(|s| s._building.is_empty())
+        );
+        assert!(
+            owner
+                .second
+                .state
+                .lock()
+                .as_ref()
+                .is_none_or(|s| s._building.is_empty())
+        );
     }
 
     struct RecursiveCache {

@@ -31,10 +31,13 @@ pub(crate) fn character_name(ch: char) -> Option<String> {
 
 type PyResult = Result<PyObjectRef, PyError>;
 
-/// Latest bundled database view — the module-level functions.
-const MODERN: ucd_core::Ucd = ucd_core::Ucd::new(true);
-/// Unicode 3.2.0 view — `unicodedata.ucd_3_2_0`.
-const LEGACY: ucd_core::Ucd = ucd_core::Ucd::new(false);
+/// `interp_ucd.py UCD._unicodedb` — the view is a field of the UCD
+/// instance, not a module-level const the translator would load as a
+/// residual global.  `legacy` is `W_UCD.legacy`; module callables pass
+/// `false` (latest tables).
+fn ucd(legacy: bool) -> ucd_core::Ucd {
+    ucd_core::Ucd::new(!legacy)
+}
 
 /// Extract the single-code-point argument of a character function.
 ///
@@ -104,58 +107,58 @@ fn char_and_default(
     Ok((cp, args.get(1).copied()))
 }
 
-// Version-sensitive queries select `MODERN` for module functions and
-// `LEGACY` for the `ucd_3_2_0` instance.
+// Version-sensitive queries take a `Ucd` built from `W_UCD.legacy`
+// (`interp_ucd.py` `self._unicodedb`).
 
-fn category_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn category_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(db.category(one_char("category", args)?)))
 }
 fn category(args: &[PyObjectRef]) -> PyResult {
-    category_impl(&MODERN, args)
+    category_impl(ucd(false), args)
 }
 
-fn bidirectional_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn bidirectional_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         db.bidirectional(one_char("bidirectional", args)?),
     ))
 }
 fn bidirectional(args: &[PyObjectRef]) -> PyResult {
-    bidirectional_impl(&MODERN, args)
+    bidirectional_impl(ucd(false), args)
 }
 
-fn east_asian_width_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn east_asian_width_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         db.east_asian_width(one_char("east_asian_width", args)?),
     ))
 }
 fn east_asian_width(args: &[PyObjectRef]) -> PyResult {
-    east_asian_width_impl(&MODERN, args)
+    east_asian_width_impl(ucd(false), args)
 }
 
-fn combining_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn combining_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_int_new(db.combining(one_char("combining", args)?) as i64))
 }
 fn combining(args: &[PyObjectRef]) -> PyResult {
-    combining_impl(&MODERN, args)
+    combining_impl(ucd(false), args)
 }
 
-fn mirrored_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn mirrored_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_int_new(db.mirrored(one_char("mirrored", args)?) as i64))
 }
 fn mirrored(args: &[PyObjectRef]) -> PyResult {
-    mirrored_impl(&MODERN, args)
+    mirrored_impl(ucd(false), args)
 }
 
-fn decomposition_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn decomposition_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         &db.decomposition(one_char("decomposition", args)?),
     ))
 }
 fn decomposition(args: &[PyObjectRef]) -> PyResult {
-    decomposition_impl(&MODERN, args)
+    decomposition_impl(ucd(false), args)
 }
 
-fn digit_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn digit_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("digit", args)?;
     match db.digit(cp) {
         Some(v) => Ok(w_int_new(v as i64)),
@@ -163,10 +166,10 @@ fn digit_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     }
 }
 fn digit(args: &[PyObjectRef]) -> PyResult {
-    digit_impl(&MODERN, args)
+    digit_impl(ucd(false), args)
 }
 
-fn decimal_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn decimal_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("decimal", args)?;
     match db.decimal(cp) {
         Some(v) => Ok(w_int_new(v as i64)),
@@ -174,10 +177,10 @@ fn decimal_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     }
 }
 fn decimal(args: &[PyObjectRef]) -> PyResult {
-    decimal_impl(&MODERN, args)
+    decimal_impl(ucd(false), args)
 }
 
-fn numeric_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn numeric_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("numeric", args)?;
     match db.numeric(cp) {
         Some(v) => Ok(w_float_new(v)),
@@ -185,13 +188,13 @@ fn numeric_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     }
 }
 fn numeric(args: &[PyObjectRef]) -> PyResult {
-    numeric_impl(&MODERN, args)
+    numeric_impl(ucd(false), args)
 }
 
 /// Short general-category name of an unassigned code point.
 const UNASSIGNED_CATEGORY: &str = "Cn";
 
-fn name_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn name_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("name", args)?;
     // A view has no name for a code point its own release leaves unassigned,
     // so the version's general category gates the name table: `ucd_3_2_0.name`
@@ -204,7 +207,7 @@ fn name_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     default.ok_or_else(|| PyError::value_error("no such name"))
 }
 fn name(args: &[PyObjectRef]) -> PyResult {
-    name_impl(&MODERN, args)
+    name_impl(ucd(false), args)
 }
 
 // Version-independent queries: `normalize` / `is_normalized` do not depend
@@ -212,7 +215,7 @@ fn name(args: &[PyObjectRef]) -> PyResult {
 // `lookup` is versioned: aliases and named sequences exist only on the
 // modern UCD.
 
-fn lookup_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn lookup_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
         return Err(PyError::type_error(format!(
             "lookup expected 1 argument, got {}",
@@ -247,7 +250,7 @@ fn lookup_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
 }
 
 fn lookup(args: &[PyObjectRef]) -> PyResult {
-    lookup_impl(&MODERN, args)
+    lookup_impl(ucd(false), args)
 }
 
 /// Parse the normalization-form argument (`NFC`/`NFKC`/`NFD`/`NFKD`).
@@ -339,70 +342,37 @@ fn ucd_method_args(args: &[PyObjectRef]) -> &[PyObjectRef] {
 #[crate::pyre_methods(doc = "Unicode character database.")]
 impl W_UCD {
     fn category(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        category_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        category_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn bidirectional(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        bidirectional_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        bidirectional_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn east_asian_width(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        east_asian_width_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        east_asian_width_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn combining(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        combining_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        combining_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn mirrored(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        mirrored_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        mirrored_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn decomposition(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        decomposition_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        decomposition_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn digit(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        digit_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        digit_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn decimal(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        decimal_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        decimal_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn numeric(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        numeric_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        numeric_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn name(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        name_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        name_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn lookup(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        lookup_impl(
-            if self.legacy { &LEGACY } else { &MODERN },
-            ucd_method_args(args),
-        )
+        lookup_impl(ucd(self.legacy), ucd_method_args(args))
     }
     fn normalize(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         normalize(ucd_method_args(args))

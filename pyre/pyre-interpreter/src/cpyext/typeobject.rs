@@ -4362,14 +4362,14 @@ fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         publish(
             ns,
             "__pow__",
-            crate::gateway::BuiltinCodeFlags::HOPELESS.bits(),
+            crate::gateway::HOPELESS,
             power_slot,
             nb_pow_direct,
         );
         publish(
             ns,
             "__rpow__",
-            crate::gateway::BuiltinCodeFlags::HOPELESS.bits(),
+            crate::gateway::HOPELESS,
             power_slot,
             nb_pow_reflected,
         );
@@ -4379,7 +4379,7 @@ fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         publish(
             ns,
             "__ipow__",
-            crate::gateway::BuiltinCodeFlags::HOPELESS.bits(),
+            crate::gateway::HOPELESS,
             inplace_power,
             nb_ipow,
         );
@@ -4820,15 +4820,10 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
     // very name this would publish.
     let scalars: [(&'static str, u16, *const c_void, WrapperFn); 13] = unsafe {
         [
-            (
-                "__new__",
-                crate::gateway::BuiltinCodeFlags::HOPELESS.bits(),
-                (*tp).tp_new,
-                slot_new,
-            ),
+            ("__new__", crate::gateway::HOPELESS, (*tp).tp_new, slot_new),
             (
                 "__init__",
-                crate::gateway::BuiltinCodeFlags::HOPELESS.bits(),
+                crate::gateway::HOPELESS,
                 (*tp).tp_init,
                 slot_init,
             ),
@@ -4839,7 +4834,7 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
             ("__hash__", 1, (*tp).tp_hash, slot_hash),
             (
                 "__call__",
-                crate::gateway::BuiltinCodeFlags::HOPELESS.bits(),
+                crate::gateway::HOPELESS,
                 (*tp).tp_call,
                 slot_call,
             ),

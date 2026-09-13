@@ -6,10 +6,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::PyFrame;
 
 pub type ForceFrameFn = unsafe extern "C" fn(*mut PyFrame);
-static FORCE_FRAME_HOOK: OnceLock<ForceFrameFn> = OnceLock::new();
+
+/// Process-wide hook installed by JIT init (`eval.rs force_pyframe`).
+/// A runtime load, not a `OnceLock`: the unset word must stay a runtime
+/// read so translated `force_frame` is not folded to a permanent no-op.
+static FORCE_FRAME_HOOK: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 pub fn register_force_frame_hook(f: ForceFrameFn) {
-    let _ = FORCE_FRAME_HOOK.set(f);
+    FORCE_FRAME_HOOK.store(f as *mut (), Ordering::Release);
 }
 
 /// `rvirtualizable.py hook_access_field` → `jit_force_virtualizable`:
@@ -28,7 +33,9 @@ pub fn register_force_frame_hook(f: ForceFrameFn) {
 /// aborts the whole trace with `ABORT_ESCAPE`.
 #[inline]
 pub fn force_frame(frame: *mut PyFrame) {
-    if let Some(f) = FORCE_FRAME_HOOK.get() {
+    let p = FORCE_FRAME_HOOK.load(Ordering::Acquire);
+    if !p.is_null() {
+        let f: ForceFrameFn = unsafe { std::mem::transmute(p) };
         unsafe { f(frame) };
     }
 }
@@ -183,10 +190,16 @@ pub fn jit_force_virtualizable(frame: *mut PyFrame) {
 /// `JitVirtualRef`, so `is_virtual_ref` is always false and this stays the
 /// identity fast path.
 pub type ForceVRefFn = unsafe extern "C" fn(*mut PyFrame) -> *mut PyFrame;
-static FORCE_VREF_HOOK: OnceLock<ForceVRefFn> = OnceLock::new();
+
+/// Process-wide hook installed by JIT init (`eval.rs force_pyframe_vref`).
+/// A runtime load, not a `OnceLock`: the unset word must stay a runtime
+/// read so a translated vref-arm `force_vref` is not folded to a
+/// permanent panic.  A later register overwrites; null is unset.
+static FORCE_VREF_HOOK: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 pub fn register_force_vref_hook(f: ForceVRefFn) {
-    let _ = FORCE_VREF_HOOK.set(f);
+    FORCE_VREF_HOOK.store(f as *mut (), Ordering::Release);
 }
 
 /// The frame a chain slot NAMES, read WITHOUT forcing —
@@ -234,7 +247,7 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
 /// `un-lowered helper call in body` naming
 /// `majit_metainterp::virtualref::ptr_is_virtual_ref`.
 ///
-/// The `FORCE_VREF_HOOK` arm is an indirect call through a `OnceLock` fn
+/// The `FORCE_VREF_HOOK` arm is an indirect call through a runtime fn
 /// pointer, so that half is unwalkable in any case.
 #[inline]
 #[majit_macros::dont_look_inside]
@@ -243,9 +256,12 @@ pub fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
         // Only the tracer stores a `JitVirtualRef` here, and it registers the
         // hook when the driver comes up, so an unset hook means the slot was
         // misidentified.  Returning `ptr` would hand a vref out as a frame.
-        let f = FORCE_VREF_HOOK
-            .get()
-            .expect("frame-chain vref with no force hook: the JIT never came up");
+        let p = FORCE_VREF_HOOK.load(Ordering::Acquire);
+        assert!(
+            !p.is_null(),
+            "frame-chain vref with no force hook: the JIT never came up"
+        );
+        let f: ForceVRefFn = unsafe { std::mem::transmute(p) };
         unsafe { f(ptr) }
     } else {
         ptr
@@ -3320,4 +3336,89 @@ pub fn report_error(
 pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootFinalizerQueue {
     let _ = w_root;
     WRootFinalizerQueue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{force_frame, force_frame_before_locals_read, register_force_frame_hook};
+    use crate::PyFrame;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    static SEEN: AtomicPtr<PyFrame> = AtomicPtr::new(std::ptr::null_mut());
+
+    unsafe extern "C" fn record(frame: *mut PyFrame) {
+        SEEN.store(frame, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn registered_force_frame_hook_is_invoked_with_the_frame_pointer() {
+        force_frame_before_locals_read(std::ptr::null_mut());
+
+        SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
+        register_force_frame_hook(record);
+        let dummy = 0x0000_0000_DEAD_BEEF as *mut PyFrame;
+        force_frame(dummy);
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            dummy,
+            "register_force_frame_hook + force_frame must dispatch the same pointer"
+        );
+    }
+
+    #[test]
+    fn force_vref_identity_dispatch_and_unset_panic() {
+        use super::{FORCE_VREF_HOOK, force_vref, register_force_vref_hook};
+        use majit_metainterp::virtualref::{ObjectHeader, VirtualRefInfo};
+
+        struct RestoreUnset;
+        impl Drop for RestoreUnset {
+            fn drop(&mut self) {
+                FORCE_VREF_HOOK.store(std::ptr::null_mut(), Ordering::Release);
+            }
+        }
+        let _restore = RestoreUnset;
+        FORCE_VREF_HOOK.store(std::ptr::null_mut(), Ordering::Release);
+
+        static SEEN_VREF: AtomicPtr<PyFrame> = AtomicPtr::new(std::ptr::null_mut());
+        unsafe extern "C" fn record_vref(frame: *mut PyFrame) -> *mut PyFrame {
+            SEEN_VREF.store(frame, Ordering::SeqCst);
+            0x0000_0000_FEED_FACE as *mut PyFrame
+        }
+
+        assert!(
+            std::ptr::eq(force_vref(std::ptr::null_mut()), std::ptr::null_mut()),
+            "null is identity and must not require a hook"
+        );
+        let mut header = ObjectHeader { typeptr: 1 };
+        let dummy = &mut header as *mut ObjectHeader as *mut PyFrame;
+        assert!(
+            std::ptr::eq(force_vref(dummy), dummy),
+            "a non-vref is identity and must not call the hook"
+        );
+        assert!(SEEN_VREF.load(Ordering::SeqCst).is_null());
+
+        let info = VirtualRefInfo::new();
+        let vref = info.virtual_ref_during_tracing(0x1000 as *mut u8) as *mut PyFrame;
+        assert!(
+            unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(vref as *const u8) },
+            "virtual_ref_during_tracing must produce a JitVirtualRef"
+        );
+        register_force_vref_hook(record_vref);
+        let got = force_vref(vref);
+        assert!(
+            std::ptr::eq(SEEN_VREF.load(Ordering::SeqCst), vref),
+            "force_vref must invoke the hook with the vref"
+        );
+        assert!(
+            std::ptr::eq(got, 0x0000_0000_FEED_FACE as *mut PyFrame),
+            "force_vref must return the hook's result"
+        );
+
+        FORCE_VREF_HOOK.store(std::ptr::null_mut(), Ordering::Release);
+        let panicked = std::panic::catch_unwind(|| force_vref(vref)).is_err();
+        assert!(
+            panicked,
+            "a vref with no hook must panic, not return the vref as a frame"
+        );
+    }
 }

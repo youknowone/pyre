@@ -2420,6 +2420,48 @@ pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<
         .collect()
 }
 
+/// Whether the markers in `hints` keep a callee's body out of the JitCode
+/// closure, without consulting its graph.
+///
+/// This is the function-level half of `JitPolicy.look_inside_graph`
+/// (`rpython/jit/codewriter/policy.py`): `_jit_look_inside_` overrides
+/// everything, and otherwise `_reject_function` rejects an
+/// `_elidable_function_` callee unconditionally — "explicitly elidable
+/// functions are always opaque".  `call.py find_all_graphs` then never makes
+/// the rejected graph a candidate, so its call sites stay residual.
+///
+/// The two spellings differ only in how the rejection was written down, so
+/// everything that exists to serve a body-less residual boundary — above all
+/// the declaration-sourced stub in
+/// [`collect_policy_opaque_fn_stubs_from_llbc`] — reads them as one set.
+/// The other half of `look_inside_graph` (loops, unsupported variable types)
+/// needs a graph and therefore cannot be decided here; it can only reject
+/// further, never admit a body this predicate already rejected.
+///
+/// Every elidable spelling the macros accept (`elidable`,
+/// `elidable_cannot_raise`, `elidable_or_memerror`) emits
+/// `_elidable_function_` alongside its own marker, so the single `"elidable"`
+/// token covers all three.
+pub(crate) fn hints_reject_body(hints: &[String]) -> bool {
+    if hints.iter().any(|h| h == "jit_look_inside") {
+        return false;
+    }
+    hints
+        .iter()
+        .any(|h| h == "dont_look_inside" || h == "elidable")
+}
+
+/// The set of paths in this LLBC whose bodies [`hints_reject_body`] keeps out
+/// of the JitCode closure, keyed `strip_crate_prefix(name_path())` — the same
+/// derivation [`dont_look_inside_set_of`] uses for its narrower question.
+fn policy_opaque_fn_set_of(llbc: &Llbc) -> std::collections::HashSet<String> {
+    crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc))
+        .into_iter()
+        .filter(|(_, hints)| hints_reject_body(hints))
+        .map(|(path, _)| path)
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     llbc: &Llbc,
@@ -20339,9 +20381,10 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| fd.signature.is_unsafe)
 }
 
-/// Collect signature-only residual stubs for every local function marked
-/// `#[dont_look_inside]`, including functions which the JIT policy correctly
-/// omitted from `CallControl::function_graphs`.
+/// Collect signature-only residual stubs for every local function whose
+/// markers make it opaque to the JIT policy ([`hints_reject_body`]:
+/// `#[dont_look_inside]` and `#[elidable]` alike), including functions which
+/// the JIT policy correctly omitted from `CallControl::function_graphs`.
 ///
 /// RPython creates the `FunctionDesc` from the callable independently of
 /// `find_all_graphs`, then `JitPolicy.look_inside_graph` merely keeps its body
@@ -20349,7 +20392,20 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
 /// annotator-only stub carrier restores that ordering: a caller can annotate
 /// the declared residual call even though there is intentionally no body to
 /// compile.
-pub(crate) fn collect_dont_look_inside_fn_stubs_from_llbc(
+///
+/// Both hint spellings need the same carrier for the same reason, and a
+/// declaration reached only through a caller's lift needs it most: the
+/// `function_graphs` residualize arm in
+/// `cutover::populate_call_registry_from_call_graphs` can only stub a callee
+/// the MIR loop already turned into a `SemanticFunction`, so an opaque callee
+/// whose body never lowered (`build_semantic_program`'s
+/// `declaration-has-no-unstructured-body` and unrecognised-shape drops) held
+/// no registry key at all and every caller that named it failed its own lift
+/// with "not registered in CallRegistry".  Keying off the marker rather than
+/// off the lowered body is what `_reject_function` already implies: the body
+/// was never going to be compiled, so whether it could be lowered must not
+/// decide whether the call site can be annotated.
+pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<(
@@ -20357,7 +20413,7 @@ pub(crate) fn collect_dont_look_inside_fn_stubs_from_llbc(
     crate::flowspace::argument::Signature,
     Option<String>,
 )> {
-    let marked = dont_look_inside_set_of(llbc);
+    let marked = policy_opaque_fn_set_of(llbc);
     collect_fn_stubs_from_llbc_if(llbc, error_carrier, |fd| {
         marked.contains(&strip_crate_prefix(&fd.item_meta.name_path()))
     })
@@ -35699,6 +35755,46 @@ mod tests {
         );
     }
 
+    /// `rlib/jit.py isconstant` / `isvirtual` return `NonConstant(False)`, not
+    /// a bare `False`: the annotator must not read the result as a constant or
+    /// it folds every `if isconstant(x)` in the interpreter and deletes the
+    /// looked-inside arm before `jtransform` rewrites the call to
+    /// `*_isconstant`.  Pin the producer — both bodies must still route their
+    /// literal through `nonconst::non_constant`, which is resolved as a
+    /// registered external rather than a lifted graph.  Loads the majit-rlib
+    /// LLBC, ignored; run with `cargo test -p majit-translate --lib
+    /// jit_constancy_probes_return_non_constant -- --ignored`.
+    #[test]
+    #[ignore]
+    fn jit_constancy_probes_return_non_constant() {
+        use crate::model::{CallTarget, OpKind};
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+        let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+        for probe in ["isconstant", "isvirtual"] {
+            let graph = super::lower_function(&llbc, probe)
+                .unwrap_or_else(|e| panic!("lower {probe}: {e}"));
+            let non_constant_calls = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                            if super::fmt_path_ends_with(
+                                segments,
+                                &["nonconst", "non_constant"],
+                            )
+                    )
+                })
+                .count();
+            assert_eq!(
+                non_constant_calls, 1,
+                "{probe} must return its literal through nonconst::non_constant"
+            );
+        }
+    }
+
     /// Regression: `RBigInt::digits` uses `from_raw_parts(base, capacity)` — the
     /// block's own length — so its header alias IS sound and must STILL fold
     /// (the P1 fix removes only the object-list arm). The residual
@@ -38128,6 +38224,64 @@ mod tests {
         );
     }
 
+    /// `policy.py look_inside_graph` reads `_jit_look_inside_` first and
+    /// otherwise lets `_reject_function` reject an `_elidable_function_`
+    /// unconditionally, so both marker spellings name one set of body-less
+    /// residual boundaries.
+    #[test]
+    fn both_opaque_markers_reject_a_body_and_the_override_admits_it() {
+        let hint = |s: &str| vec![s.to_string()];
+        assert!(super::hints_reject_body(&hint("dont_look_inside")));
+        assert!(super::hints_reject_body(&hint("elidable")));
+        assert!(!super::hints_reject_body(&hint("jit_look_inside")));
+        assert!(!super::hints_reject_body(&hint("unroll_safe")));
+        assert!(!super::hints_reject_body(&[]));
+        // `_jit_look_inside_ = True` overrides the elidable rejection.
+        assert!(!super::hints_reject_body(&[
+            "elidable".to_string(),
+            "jit_look_inside".to_string(),
+        ]));
+    }
+
+    /// The elidable half of the same carrier, on the real declarations.
+    /// `interp_exceptions::lookup_exc_class_for_kind` is `#[elidable]` and
+    /// reads a process-global slot the MIR driver cannot lower, so it has no
+    /// `SemanticFunction` at all — exactly the callee whose absent registry
+    /// key failed `typedef::type`'s lift.
+    #[test]
+    #[ignore]
+    fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
+            &llbc,
+            crate::ErrorCarrierSpec::default(),
+        );
+        let expected = [
+            "pyre_object",
+            "interp_exceptions",
+            "lookup_exc_class_for_kind",
+        ];
+        let (_, signature, token) = specs
+            .iter()
+            .find(|(segments, _, _)| {
+                segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+            })
+            .expect("an elidable declaration must have a residual stub");
+        assert_eq!(signature.argnames.len(), 1);
+        assert_eq!(
+            token.as_deref(),
+            Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE),
+            "the declared PyObjectRef return keeps its typed object-pointer shell"
+        );
+    }
+
     #[test]
     #[ignore]
     fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
@@ -38136,7 +38290,7 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let specs = super::collect_dont_look_inside_fn_stubs_from_llbc(
+        let specs = super::collect_policy_opaque_fn_stubs_from_llbc(
             &llbc,
             crate::ErrorCarrierSpec::default(),
         );

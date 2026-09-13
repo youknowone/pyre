@@ -1273,6 +1273,30 @@ impl FunctionDesc {
                 self.name,
             )));
         }
+        // Lifted (LLBC) functions have one lowered body, prefilled at
+        // `GraphCacheKey::None`. Upstream `cachedgraph` re-runs
+        // `buildgraph` per key (`description.py FunctionDesc.cachedgraph`
+        // → `translator.buildflowgraph`). There is no Python code
+        // object to re-flow, so clone that template with fresh
+        // Variables (`flowspace/model.py copygraph`).
+        if builder.is_none() && !matches!(&key, GraphCacheKey::None) {
+            let template = self.cache.borrow().get(&GraphCacheKey::None).cloned();
+            if let Some(template) = template {
+                let computed_alt_name = alt_name.map(str::to_string).or_else(|| {
+                    let postfix = Self::key_to_cache_name(&Self::nameof_cache_key(&key));
+                    Some(format!("{}__{}", self.name, postfix))
+                });
+                let cloned = clone_lifted_graph(&template, computed_alt_name.as_deref());
+                self.cache.borrow_mut().insert(key, cloned.clone());
+                if let Some(annotator) = self.base.bookkeeper.try_annotator() {
+                    let mut graphs = annotator.translator.graphs.borrow_mut();
+                    if !graphs.iter().any(|g| Rc::ptr_eq(g, &cloned.graph)) {
+                        graphs.push(cloned.graph.clone());
+                    }
+                }
+                return Ok(cloned);
+            }
+        }
         let computed_alt_name = alt_name.map(str::to_string).or_else(|| {
             if matches!(&key, GraphCacheKey::None) {
                 None
@@ -1285,6 +1309,23 @@ impl FunctionDesc {
         self.cache.borrow_mut().insert(key, graph.clone());
         Ok(graph)
     }
+}
+
+/// Analogue of `translator.buildflowgraph` for a lifted LLBC body:
+/// `copygraph` (`flowspace/model.py`) with a new name.
+fn clone_lifted_graph(template: &PyGraph, alt_name: Option<&str>) -> Rc<PyGraph> {
+    let mut copied =
+        crate::flowspace::model::copygraph(&template.graph.borrow(), false, &HashMap::new(), false);
+    if let Some(name) = alt_name {
+        copied.name = name.to_string();
+    }
+    Rc::new(PyGraph {
+        graph: Rc::new(RefCell::new(copied)),
+        func: template.func.clone(),
+        signature: RefCell::new(template.signature.borrow().clone()),
+        defaults: RefCell::new(template.defaults.borrow().clone()),
+        access_directly: std::cell::Cell::new(template.access_directly.get()),
+    })
 }
 
 /// Result of [`FunctionDesc::specialize`].
@@ -3532,6 +3573,38 @@ mod tests {
         let msg = err.msg.expect("AnnotatorError should carry message");
         assert!(msg.contains("bad_leaf.cachedgraph: source lift failed"));
         assert!(msg.contains("producer failed before pygraph lift"));
+    }
+
+    #[test]
+    fn cachedgraph_clones_the_prefilled_lifted_template_per_key() {
+        let fd = FunctionDesc::new(bk(), None, "isconstant", int_sig(&["value"]), None, None);
+        let template = make_pygraph(int_sig(&["value"]), Some(Vec::new()));
+        fd.cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, template.clone());
+
+        let first = fd
+            .cachedgraph(
+                GraphCacheKey::Position(PositionKey::new(1, 2, 3)),
+                None,
+                None,
+            )
+            .expect("clone of lifted template");
+        let second = fd
+            .cachedgraph(
+                GraphCacheKey::Position(PositionKey::new(1, 2, 4)),
+                None,
+                None,
+            )
+            .expect("second clone");
+
+        assert!(!Rc::ptr_eq(&first, &template));
+        assert!(!Rc::ptr_eq(&first, &second));
+        assert_eq!(
+            first.graph.borrow().name,
+            "isconstant__call_location_g1_b2_i3"
+        );
+        assert_eq!(fd.cache.borrow().len(), 3);
     }
 
     #[test]

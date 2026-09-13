@@ -30,15 +30,25 @@ pub fn install_we_are_jitted(f: fn() -> bool) {
 }
 
 /// `rlib/jit.py isconstant`.
+///
+/// The literal goes through [`crate::nonconst::non_constant`] so the
+/// annotator reads the result as a non-constant `SomeBool`.  A bare `false`
+/// would let it fold every `if isconstant(x)` in the interpreter to the
+/// not-constant arm and delete the looked-inside arm before `jtransform`
+/// ever rewrites the call to `*_isconstant`.
+#[majit_macros::specialize_call_location]
 #[majit_macros::oopspec("jit.isconstant(value)")]
 pub fn isconstant<T: ?Sized>(_value: &T) -> bool {
-    false
+    crate::nonconst::non_constant(false)
 }
 
 /// `rlib/jit.py isvirtual`.
+///
+/// Non-constant for the same reason as [`isconstant`].
+#[majit_macros::specialize_call_location]
 #[majit_macros::oopspec("jit.isvirtual(value)")]
 pub fn isvirtual<T: ?Sized>(_value: &T) -> bool {
-    false
+    crate::nonconst::non_constant(false)
 }
 
 /// `rlib/jit.py conditional_call` residual body (`if condition: function(*args)`).

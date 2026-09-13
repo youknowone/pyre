@@ -5406,6 +5406,7 @@ pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
 /// `dstrategy` slot points at.
 pub static MAP_DICT_STRATEGY_REF: pyre_object::dictmultiobject::DictStrategyRef =
     pyre_object::dictmultiobject::DictStrategyRef {
+        kind: pyre_object::dictmultiobject::StrategyKind::Map,
         imp: &MAP_DICT_STRATEGY,
         owner: std::ptr::null_mut(),
     };

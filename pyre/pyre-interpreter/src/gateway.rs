@@ -355,15 +355,11 @@ pub struct FastFuncNotSupported;
 pub struct BuiltinActivation;
 
 pub struct GatewayCache {
-    base: crate::baseobjspace::SpaceCache<
-        usize,
-        usize,
-        std::sync::Arc<crate::baseobjspace::ObjSpace>,
-    >,
+    base: crate::baseobjspace::SpaceCache<usize, usize, crate::baseobjspace::SpaceHandle>,
 }
 
 impl GatewayCache {
-    pub fn new(space: std::sync::Arc<crate::baseobjspace::ObjSpace>) -> Self {
+    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
         Self {
             base: crate::baseobjspace::SpaceCache::new(space),
         }
@@ -876,6 +872,11 @@ bitflags::bitflags! {
     }
 }
 
+/// eval.py:22 `HOPELESS = 0x400` — module-level integer so `immutablevalue`
+/// reads a prebuilt Constant; the `bitflags!` associated const has an Opaque
+/// initializer and becomes an unregistered nullary Call.
+pub const HOPELESS: u16 = 0x400;
+
 /// Allocate a new `BuiltinCode` with no docstring.
 /// `fast_natural_arity` defaults to HOPELESS (no fast path).
 pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
@@ -906,13 +907,7 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
-    builtin_code_new_full(
-        name,
-        func,
-        docstring,
-        BuiltinCodeFlags::HOPELESS.bits(),
-        std::ptr::null(),
-    )
+    builtin_code_new_full(name, func, docstring, HOPELESS, std::ptr::null())
 }
 
 /// Allocate a new `BuiltinCode` with `fast_natural_arity = PASSTHROUGHARGS1`.
@@ -1012,13 +1007,7 @@ pub fn builtin_code_new_with_signature(
     signature: Signature,
 ) -> PyObjectRef {
     let sig: *const Signature = Box::into_raw(Box::new(signature));
-    builtin_code_new_full(
-        name,
-        func,
-        docstring,
-        BuiltinCodeFlags::HOPELESS.bits(),
-        sig,
-    )
+    builtin_code_new_full(name, func, docstring, HOPELESS, sig)
 }
 
 /// Check if an object is a built-in function.
@@ -1768,9 +1757,7 @@ pub fn make_builtin_function_with_arity_and_maybe_sig(
     signature: Option<Signature>,
 ) -> PyObjectRef {
     let arity = match &signature {
-        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
-            BuiltinCodeFlags::HOPELESS.bits()
-        }
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
         _ => arity,
     };
     let sig: *const Signature = match signature {
@@ -1985,7 +1972,7 @@ pub fn make_module_builtin_function_with_arity_and_sig(
 ) -> PyObjectRef {
     let arity =
         if signature.has_vararg() || signature.has_kwarg() || signature.num_kwonlyargnames() > 0 {
-            BuiltinCodeFlags::HOPELESS.bits()
+            HOPELESS
         } else {
             arity
         };
@@ -2011,9 +1998,7 @@ pub fn make_module_builtin_function_with_arity_and_maybe_sig(
     signature: Option<Signature>,
 ) -> PyObjectRef {
     let arity = match &signature {
-        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => {
-            BuiltinCodeFlags::HOPELESS.bits()
-        }
+        Some(s) if s.has_vararg() || s.has_kwarg() || s.num_kwonlyargnames() > 0 => HOPELESS,
         _ => arity,
     };
     let sig: *const Signature = match signature {

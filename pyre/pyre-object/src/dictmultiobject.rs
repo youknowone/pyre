@@ -766,12 +766,13 @@ pub unsafe fn hash_key_checked(obj: PyObjectRef) -> Result<(), DictKeyError> {
     Ok(())
 }
 
+/// `dictmultiobject.py` `w_dict.strategy is SomeStrategy` — a field
+/// compare on the holder, not a vtable call.  Upstream stores the
+/// strategy instance and tests identity; the holder carries `kind`
+/// so the real path sees a `getfield` the dual gate can type.
 #[inline]
-fn strategy_is(
-    current: &'static dyn crate::dictmultiobject::DictStrategy,
-    expected: &'static dyn crate::dictmultiobject::DictStrategy,
-) -> bool {
-    current.strategy_kind() == expected.strategy_kind()
+fn strategy_is(current: &DictStrategyRef, expected: StrategyKind) -> bool {
+    current.kind == expected
 }
 
 #[inline]
@@ -1790,6 +1791,7 @@ pub fn w_module_dict_new() -> PyObjectRef {
         unsafe { std::mem::transmute::<&dyn DictStrategy, &'static dyn DictStrategy>(&*strategy) };
     let strategy_ref = crate::gc_storage::gc_alloc_storage_box(
         DictStrategyRef {
+            kind: StrategyKind::Module,
             imp,
             owner: strategy as *mut u8,
         },
@@ -1913,7 +1915,7 @@ pub fn module_dict_locks_after_fork_child() {}
 #[inline]
 pub unsafe fn w_module_dict_is_object_strategy(obj: PyObjectRef) -> bool {
     let strategy = (*(obj as *const W_ModuleDictObject)).mstrategy;
-    !strategy.is_null() && (*strategy).strategy_kind() == StrategyKind::Object
+    !strategy.is_null() && (*strategy).kind == StrategyKind::Object
 }
 
 /// Read-only view of ObjectDictStrategy's erased storage; returns `None`
@@ -2600,12 +2602,8 @@ pub unsafe fn w_dict_is_empty_strategy(obj: PyObjectRef) -> bool {
     if is_module_dict(obj) {
         return false;
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
-    strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
-        || strategy_is(
-            strategy,
-            &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
-        )
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    strategy_is(dstrategy, StrategyKind::Empty) || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
 }
 
 /// Fallible variant of [`w_dict_lookup`].  Propagates hash errors
@@ -2625,20 +2623,18 @@ pub unsafe fn w_dict_lookup_checked(
     if is_module_dict(obj) {
         return w_module_dict_lookup_inner_checked(obj, key);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
-    if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
-        || strategy_is(
-            strategy,
-            &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
-        )
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = dstrategy.imp;
+    if strategy_is(dstrategy, StrategyKind::Empty)
+        || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
     {
         hash_key_checked(key)?;
         return Ok(None);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Object) {
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::BYTES_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Bytes) {
         if crate::is_bytes(key) {
             return Ok(w_dict_lookup_bytes_strategy(obj, key));
         }
@@ -2649,7 +2645,7 @@ pub unsafe fn w_dict_lookup_checked(
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Unicode) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             return w_dict_lookup_object_strategy_checked(obj, key);
         }
@@ -2659,7 +2655,7 @@ pub unsafe fn w_dict_lookup_checked(
         w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Int) {
         if crate::listobject::is_plain_int1(key) {
             return Ok(w_dict_lookup_int_strategy(obj, key));
         }
@@ -2670,7 +2666,7 @@ pub unsafe fn w_dict_lookup_checked(
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
             return Ok(strategy.getitem(obj, key));
         }
@@ -2678,7 +2674,7 @@ pub unsafe fn w_dict_lookup_checked(
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             return Ok(strategy.getitem(obj, key));
         }
@@ -3058,22 +3054,20 @@ unsafe fn w_dict_store_checked_inner(
     if is_module_dict(obj) {
         return w_module_dict_store_inner_checked(obj, key, value);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
-    if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY) {
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = dstrategy.imp;
+    if strategy_is(dstrategy, StrategyKind::Empty) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         return w_dict_store_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(
-        strategy,
-        &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
-    ) {
+    if strategy_is(dstrategy, StrategyKind::EmptyKwargs) {
         crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         return w_dict_store_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Object) {
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::BYTES_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Bytes) {
         if crate::is_bytes(key) {
             w_dict_store_bytes_strategy(obj, key, value);
             return Ok(());
@@ -3081,13 +3075,13 @@ unsafe fn w_dict_store_checked_inner(
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Unicode) {
         if !crate::is_exact_type(key, &crate::STR_TYPE) {
             w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         }
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Int) {
         if crate::listobject::is_plain_int1(key) {
             w_dict_store_int_strategy(obj, key, value);
             return Ok(());
@@ -3095,7 +3089,7 @@ unsafe fn w_dict_store_checked_inner(
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
             strategy.setitem(obj, key, value);
             return Ok(());
@@ -3103,7 +3097,7 @@ unsafe fn w_dict_store_checked_inner(
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
-    if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             strategy.setitem(obj, key, value);
             return Ok(());
@@ -3173,7 +3167,8 @@ pub unsafe fn w_dict_setdefault_checked(
         )?;
         return Ok(_dict_guard.root(2));
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = dstrategy.imp;
     // `dictmultiobject.py EmptyDictStrategy.setdefault`:
     //   self.switch_to_correct_strategy(w_dict, w_key)
     //   w_dict.setitem(w_key, w_default)
@@ -3184,20 +3179,17 @@ pub unsafe fn w_dict_setdefault_checked(
     // `w_dict_store_checked` and propagate its `Result` directly:
     // `object_key_for_checked` consumes the hook error slot, so a
     // post-hoc `take_hash_error()` would observe no pending error.
-    if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Empty) {
         crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         w_dict_store_checked(obj, key, value)?;
         return Ok(_dict_guard.root(2));
     }
-    if strategy_is(
-        strategy,
-        &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
-    ) {
+    if strategy_is(dstrategy, StrategyKind::EmptyKwargs) {
         crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY.switch_to_correct_strategy(obj, key);
         w_dict_store_checked(obj, key, value)?;
         return Ok(_dict_guard.root(2));
     }
-    if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Object) {
         // `AbstractTypedStrategy.setdefault` (`dictmultiobject.py`) runs
         // `r_dict.setdefault`, a single bucket probe that returns the occupied
         // value or fills the vacant slot.  Run that probe callback-free; a
@@ -3253,7 +3245,7 @@ pub unsafe fn w_dict_setdefault_checked(
         dict_write_barrier(obj);
         return Ok(value);
     }
-    if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Kwargs) {
         // `kwargsdict.py KwargsDictStrategy.setdefault`: exact text
         // keys stay in the parallel arrays; every other key first switches
         // to ObjectDictStrategy and then calls `w_dict.setdefault` again.
@@ -3294,17 +3286,14 @@ pub unsafe fn w_dict_setdefault_checked(
 ///
 /// # Safety
 /// `key` must be a valid PyObjectRef.
-unsafe fn pop_switches_to_object_strategy(
-    strategy: &'static dyn crate::dictmultiobject::DictStrategy,
-    key: PyObjectRef,
-) -> bool {
-    if strategy_is(strategy, &crate::dictmultiobject::BYTES_DICT_STRATEGY) {
+unsafe fn pop_switches_to_object_strategy(strategy: &DictStrategyRef, key: PyObjectRef) -> bool {
+    if strategy_is(strategy, StrategyKind::Bytes) {
         return !crate::is_bytes(key) && !_never_equal_to_string(key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
+    if strategy_is(strategy, StrategyKind::Unicode) {
         return !crate::is_exact_type(key, &crate::STR_TYPE) && !_never_equal_to_string(key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
+    if strategy_is(strategy, StrategyKind::Int) {
         return !crate::listobject::is_plain_int1(key) && !_never_equal_to_int(key);
     }
     false
@@ -3334,7 +3323,8 @@ pub unsafe fn w_dict_pop_checked(
             None => Ok(None),
         }
     } else {
-        let mut strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+        let mut dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+        let mut strategy = dstrategy.imp;
         // `AbstractTypedStrategy.pop` (`dictmultiobject.py`): a key
         // of the wrong type that could still compare equal moves the
         // dictionary to the object strategy and pops there, and that pop is
@@ -3344,14 +3334,15 @@ pub unsafe fn w_dict_pop_checked(
         // for; making the move here keeps it.
         let _roots = crate::gc_roots::push_roots();
         let (mut obj, mut key) = (obj, key);
-        if pop_switches_to_object_strategy(strategy, key) {
+        if pop_switches_to_object_strategy(dstrategy, key) {
             let obj_slot = crate::gc_roots::pin_roots(&[obj, key]);
             strategy.switch_to_object_strategy(obj);
             obj = crate::gc_roots::shadow_stack_get(obj_slot);
             key = crate::gc_roots::shadow_stack_get(obj_slot + 1);
-            strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+            dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+            strategy = dstrategy.imp;
         }
-        if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+        if strategy_is(dstrategy, StrategyKind::Object) {
             // `AbstractTypedStrategy.pop` (`dictmultiobject.py`) performs
             // one r_dict lookup followed by removal.  Run that probe
             // callback-free; a comparison the builtin ladder cannot settle
@@ -4050,20 +4041,18 @@ pub unsafe fn w_dict_delitem_checked(
     if is_module_dict(obj) {
         return w_module_dict_delitem_inner_checked(obj, key);
     }
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
-    if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
-        || strategy_is(
-            strategy,
-            &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
-        )
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = dstrategy.imp;
+    if strategy_is(dstrategy, StrategyKind::Empty)
+        || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
     {
         hash_key_checked(key)?;
         return Ok(false);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Object) {
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::BYTES_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Bytes) {
         if crate::is_bytes(key) {
             return Ok(w_dict_delitem_bytes_strategy(obj, key));
         }
@@ -4071,14 +4060,14 @@ pub unsafe fn w_dict_delitem_checked(
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Unicode) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
             return w_dict_delitem_object_strategy_checked(obj, key);
         }
         w_dict_set_strategy(obj, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::dictmultiobject::INT_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Int) {
         if crate::listobject::is_plain_int1(key) {
             return Ok(w_dict_delitem_int_strategy(obj, key));
         }
@@ -4086,7 +4075,7 @@ pub unsafe fn w_dict_delitem_checked(
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
             return Ok(strategy.delitem(obj, key));
         }
@@ -4094,7 +4083,7 @@ pub unsafe fn w_dict_delitem_checked(
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
     }
-    if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
+    if strategy_is(dstrategy, StrategyKind::Kwargs) {
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
         return w_dict_delitem_object_strategy_checked(obj, key);
@@ -4166,7 +4155,8 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
         return Ok(true);
     }
 
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = dstrategy.imp;
     if strategy.strategy_kind() != StrategyKind::Object {
         crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
     }
@@ -4306,18 +4296,16 @@ pub unsafe fn w_dict_move_to_end_checked(
         return Ok(true);
     }
 
-    let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    let strategy = dstrategy.imp;
     // `EmptyDictStrategy.move_to_end` (dictmultiobject.py) raises
     // `KeyError` for the requested key without hashing it: an unhashable key
     // reports `KeyError`, not the object strategy's unhashable `TypeError`, and
     // no user `__hash__` runs.  Dispatch through the empty strategy before
     // switching, matching `w_dict_delitem_checked`'s empty-strategy arm (which,
     // being `del`, does hash).
-    if strategy_is(strategy, &crate::dictmultiobject::EMPTY_DICT_STRATEGY)
-        || strategy_is(
-            strategy,
-            &crate::dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY,
-        )
+    if strategy_is(dstrategy, StrategyKind::Empty)
+        || strategy_is(dstrategy, StrategyKind::EmptyKwargs)
     {
         return Ok(false);
     }
@@ -6551,6 +6539,10 @@ pub trait DictStrategy {
 /// other call through the slot reads exactly as before.
 #[repr(C)]
 pub struct DictStrategyRef {
+    /// `DictStrategy` class identity as a stored field (`convert_const`
+    /// of a prebuilt).  Compared by [`strategy_is`] instead of a
+    /// vtable `strategy_kind` call, so the real path types a `getfield`.
+    pub kind: StrategyKind,
     pub imp: &'static dyn crate::dictmultiobject::DictStrategy,
     /// GC owner of a per-dict strategy instance.  Stateless
     /// `space.fromcache(...)` holders leave this null; a module dict's holder
@@ -6615,26 +6607,32 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// per singleton above.  Each is a distinct address; the singletons themselves
 /// are zero-sized and need not be.
 pub static OBJECT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: StrategyKind::Object,
     imp: &OBJECT_DICT_STRATEGY,
     owner: std::ptr::null_mut(),
 };
 pub static EMPTY_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: StrategyKind::Empty,
     imp: &EMPTY_DICT_STRATEGY,
     owner: std::ptr::null_mut(),
 };
 pub static EMPTY_KWARGS_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: StrategyKind::EmptyKwargs,
     imp: &EMPTY_KWARGS_DICT_STRATEGY,
     owner: std::ptr::null_mut(),
 };
 pub static BYTES_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: StrategyKind::Bytes,
     imp: &BYTES_DICT_STRATEGY,
     owner: std::ptr::null_mut(),
 };
 pub static UNICODE_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: StrategyKind::Unicode,
     imp: &UNICODE_DICT_STRATEGY,
     owner: std::ptr::null_mut(),
 };
 pub static INT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
+    kind: StrategyKind::Int,
     imp: &INT_DICT_STRATEGY,
     owner: std::ptr::null_mut(),
 };
@@ -8303,6 +8301,29 @@ mod tests {
                 22,
             );
         }
+    }
+
+    #[test]
+    fn strategy_holder_kind_matches_the_singleton() {
+        assert_eq!(OBJECT_DICT_STRATEGY_REF.kind, StrategyKind::Object);
+        assert_eq!(EMPTY_DICT_STRATEGY_REF.kind, StrategyKind::Empty);
+        assert_eq!(
+            EMPTY_KWARGS_DICT_STRATEGY_REF.kind,
+            StrategyKind::EmptyKwargs
+        );
+        assert_eq!(BYTES_DICT_STRATEGY_REF.kind, StrategyKind::Bytes);
+        assert_eq!(UNICODE_DICT_STRATEGY_REF.kind, StrategyKind::Unicode);
+        assert_eq!(INT_DICT_STRATEGY_REF.kind, StrategyKind::Int);
+        assert_eq!(
+            crate::identitydict::IDENTITY_DICT_STRATEGY_REF.kind,
+            StrategyKind::Identity
+        );
+        assert_eq!(
+            crate::kwargsdict::KWARGS_DICT_STRATEGY_REF.kind,
+            StrategyKind::Kwargs
+        );
+        assert!(strategy_is(&OBJECT_DICT_STRATEGY_REF, StrategyKind::Object));
+        assert!(!strategy_is(&OBJECT_DICT_STRATEGY_REF, StrategyKind::Empty));
     }
 
     #[test]

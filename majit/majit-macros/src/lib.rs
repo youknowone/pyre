@@ -2141,6 +2141,18 @@ pub fn specialize_memo(_attr: TokenStream, item: TokenStream) -> TokenStream {
     host_function_marker(item, "_annspecialcase_memo_", "specialize_memo")
 }
 
+/// `objectmodel.py specialize.call_location`: attach
+/// `_annspecialcase_ = 'specialize:call_location'` without changing ABI.
+/// One specialized graph per call site (`FunctionDesc.cachedgraph(op)`).
+#[proc_macro_attribute]
+pub fn specialize_call_location(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    host_function_marker(
+        item,
+        "_annspecialcase_call_location_",
+        "specialize_call_location",
+    )
+}
+
 fn host_function_marker(item: TokenStream, prefix: &str, attribute: &str) -> TokenStream {
     let item_ts = proc_macro2::TokenStream::from(item);
     if let Ok(func) = syn::parse2::<ItemFn>(item_ts.clone()) {
