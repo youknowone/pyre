@@ -65,13 +65,13 @@ pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usiz
     };
     let tid = lowlevel_string_gc_type_id(base_size, item_size);
     let gc_ptr = if tid != 0 {
-        let ptr = crate::gc_hook::try_gc_alloc_stable_raw(tid, total_size);
+        let ptr = crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size);
         ptr
     } else {
         std::ptr::null_mut()
     };
     let ptr = if !gc_ptr.is_null() {
-        // Stable GC allocation is not specified to clear the payload.
+        // Nursery GC allocation is not specified to clear the payload.
         unsafe { std::ptr::write_bytes(gc_ptr, 0, total_size) };
         gc_ptr
     } else {
