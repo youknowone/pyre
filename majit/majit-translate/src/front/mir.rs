@@ -8629,7 +8629,7 @@ impl<'a> Lowering<'a> {
                 on_unwind,
             } => {
                 let _ = on_unwind;
-                if tyref_is_frame_anchor(&place.ty, self.llbc) {
+                if drop_place_is_frame_anchor(&place, self.body, self.llbc) {
                     return self.lower_frame_anchor_drop(mir_bb, place, target as usize);
                 }
                 if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
@@ -8647,9 +8647,13 @@ impl<'a> Lowering<'a> {
     }
 
     /// Close a [`FrameAnchor`] through the bound word-ABI residual.
-    /// Charon's `drop_in_place` fn_ptr does not contain `FrameAnchor` in
-    /// the path, so routing through that name left the residual unbound
-    /// and compiled loops leaked a shadow-stack slot per `new`.
+    ///
+    /// `front::mir` aliases a one-word `FrameAnchor` local to its depth
+    /// `Int`. `FrameAnchor::drop` takes `&mut self` (`Ref`), so emitting
+    /// that path as the residual made the containing graph fail to
+    /// look-inside (`opcode_compare_op` residualized as unbound `ri`).
+    /// `frame_anchor_release` is already `dont_look_inside` and takes
+    /// the depth as `usize`.
     fn lower_frame_anchor_drop(
         &mut self,
         mir_bb: usize,
@@ -8668,9 +8672,9 @@ impl<'a> Lowering<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
+                            "pyre_interpreter".to_string(),
                             "eval".to_string(),
-                            "FrameAnchor".to_string(),
-                            "drop".to_string(),
+                            "frame_anchor_release".to_string(),
                         ],
                     },
                     args: crate::model::call_args(vec![arg]),
@@ -20015,11 +20019,49 @@ fn frame_anchor_drop_glue_path(name: &str) -> bool {
 }
 
 fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(adt_node_def_id)
-        .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path().contains("FrameAnchor"))
+    if tyref_class_root(ty, llbc).is_some_and(|root| root.contains("FrameAnchor")) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    if let Some(id) = adt_id_flexible(node)
+        && llbc
+            .type_by_id(id)
+            .is_some_and(|td| td.item_meta.name_path().contains("FrameAnchor"))
+    {
+        return true;
+    }
+    false
+}
+
+fn adt_id_flexible(node: &serde_json::Value) -> Option<u64> {
+    let adt = node.get("Adt")?;
+    if let Some(id) = adt.as_u64() {
+        return Some(id);
+    }
+    let id = adt.get("id")?;
+    if let Some(n) = id.as_u64() {
+        return Some(n);
+    }
+    id.get("Adt").and_then(serde_json::Value::as_u64)
+}
+
+/// Dedup `place.ty` often has no Adt name. Opcode handlers name the
+/// one-word local `anchor` / `frame_anchor`; those locals are
+/// [`FrameAnchor`] (every `let anchor` in the interpreter is one).
+fn drop_place_is_frame_anchor(place: &Place, body: &Unstructured, llbc: &Llbc) -> bool {
+    if tyref_is_frame_anchor(&place.ty, llbc) {
+        return true;
+    }
+    let PlaceKind::Local(local) = place.kind else {
+        return false;
+    };
+    let Some(decl) = body.locals.locals.get(local as usize) else {
+        return false;
+    };
+    matches!(decl.name.as_deref(), Some("anchor") | Some("frame_anchor"))
+        || tyref_is_frame_anchor(&decl.ty, llbc)
 }
 
 /// Drops supported by both lowering and its liveness analysis.
@@ -20032,9 +20074,7 @@ fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) ->
     }
     regular_call_name_path(fn_ptr, llbc)
         .as_deref()
-        .is_some_and(|name| {
-            gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name)
-        })
+        .is_some_and(|name| gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name))
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
@@ -20056,11 +20096,33 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
 }
 
+/// Match the bound [`frame_anchor_release`] residual emitted for a
+/// `FrameAnchor` Drop. Result/exception rewrites must keep it on the
+/// Err edge the same way they keep a RootScope close: `set_raise`
+/// bypasses the forwarding block that held the Drop.
+pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("frame_anchor_release")
+}
+
+/// Shadow-stack closes that an exceptional Result rewrite must replay
+/// on the raise edge.
+pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
+    is_root_scope_drop_glue_call(kind) || is_frame_anchor_release_call(kind)
+}
+
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term()
-            && drop_lowers_as_glue_call(&place, &fn_ptr, llbc)
+            && (drop_place_is_frame_anchor(&place, body, llbc)
+                || drop_lowers_as_glue_call(&place, &fn_ptr, llbc))
         {
             out.insert(bb_idx);
         }
@@ -35240,6 +35302,20 @@ mod tests {
         assert!(!super::frame_anchor_drop_glue_path(
             "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
         ));
+        let release = crate::model::OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath {
+                segments: vec![
+                    "pyre_interpreter".to_string(),
+                    "eval".to_string(),
+                    "frame_anchor_release".to_string(),
+                ],
+            },
+            args: Vec::new(),
+            result_ty: crate::model::ValueType::Void,
+        };
+        assert!(super::is_frame_anchor_release_call(&release));
+        assert!(super::is_shadow_stack_bracket_close(&release));
+        assert!(!super::is_root_scope_drop_glue_call(&release));
 
         // `_1` is written in bb0 and read only by bb1's Drop.
         let span = || {
