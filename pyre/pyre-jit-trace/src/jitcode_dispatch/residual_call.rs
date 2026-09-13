@@ -7027,6 +7027,15 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+        if ctx.is_authoritative_executor
+            && dst_bank == 'r'
+            && spec_gate(SpecFold::FormatWithSpec, || {
+                try_walker_specialize_format_with_spec(ctx, op, &r_args, dst)
+            })?
+            .is_some()
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
     }
 
     // #62: a self-recursive call the inline path declined (e.g. the

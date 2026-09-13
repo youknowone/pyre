@@ -15880,6 +15880,94 @@ pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// FORMAT_WITH_SPEC (`f"{x:spec}"`) on an exact `int` or exact `str` plus
+/// an exact `str` spec: `format_w` as a CanRaise call instead of the
+/// MayForce residual.  A bool, subclass, long, or user `__format__`
+/// declines (SAFE); those stay on [`try_walker_inline_format`] or the
+/// residual.
+pub(crate) fn try_walker_specialize_format_with_spec<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let Some(concrete) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let Some(concrete_spec) = walker_concrete_ref_object(ctx, r_args[1]) else {
+        return Ok(None);
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(concrete) {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_type(concrete_spec, &pyre_object::STR_TYPE) } {
+        return Ok(None);
+    }
+    let value_is_exact_str =
+        unsafe { pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE) };
+    let value_is_exact_int = unsafe {
+        std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
+            && std::ptr::eq(
+                (*concrete).w_class,
+                pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+            )
+    };
+    if !value_is_exact_str && !value_is_exact_int {
+        return Ok(None);
+    }
+    let boxed_result = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::type_methods::format_w(concrete, concrete_spec)
+    };
+    let Ok(boxed_result) = boxed_result else {
+        return Ok(None);
+    };
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+    let value = r_args[0];
+    let spec = r_args[1];
+    if value_is_exact_str {
+        let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+        let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+        walker_guard_class(ctx, op.pc, value, str_type_addr)?;
+        walker_guard_exact_w_class(ctx, op.pc, value, str_typeobj)?;
+    } else {
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+        walker_guard_class(ctx, op.pc, value, int_type_addr)?;
+        walker_guard_exact_w_class(ctx, op.pc, value, int_typeobj)?;
+    }
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    walker_guard_class(ctx, op.pc, spec, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, spec, str_typeobj)?;
+    let helper = crate::helpers::jit_format_w as *const ();
+    let raw = ctx.trace_ctx.call_typed_with_effect(
+        OpCode::CallR,
+        helper,
+        &[value, spec],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Ref,
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        raw,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', raw)?;
+    Ok(Some(()))
+}
+
 /// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s:
 /// `rstring.py startswith` / `endswith` as one elidable `call_i`, instead of
 /// the MayForce residual through the bound builtin.  The recorded loop in
