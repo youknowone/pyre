@@ -5553,10 +5553,21 @@ fn build_jit_driver_pair() -> JitDriverPair {
             int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
         });
         majit_metainterp::register_binary_op_residual(majit_metainterp::BinaryOpResidual {
-            fnaddrs: vec![
-                pyre_interpreter::opcode_ops::jit_binary_value_from_tag as i64,
-                crate::call_jit::bh_binary_op_fn as i64,
-            ],
+            fnaddrs: {
+                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter(|(name, _)| {
+                        name.contains("jit_binary_value_from_tag")
+                            || name.contains("bh_binary_op_fn")
+                    })
+                    .map(|(_, addr)| addr)
+                    .collect();
+                addrs.push(
+                    pyre_interpreter::opcode_ops::jit_binary_value_from_tag as *const () as i64,
+                );
+                addrs.push(crate::call_jit::bh_binary_op_fn as *const () as i64);
+                addrs
+            },
             size_descr: pyre_jit_trace::descr::w_int_size_descr(),
             intval_descr: pyre_jit_trace::descr::int_intval_descr(),
             int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
