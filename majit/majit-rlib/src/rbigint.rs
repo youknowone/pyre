@@ -600,15 +600,19 @@ impl RBigInt {
         // into the flow graph.
         debug_assert!(size >= 0);
         let logical_len = if size == 0 { digits.len() as i64 } else { size };
-        let block = unsafe { Digits::new(digits.len().max(1)) };
+        // `digits` may alias another bigint's GcArray. Copy first so
+        // `Digits::new` (`collect_and_reserve`) cannot evacuate the source
+        // under this slice.
+        let owned: Vec<Digit> = digits.to_vec();
+        let block = unsafe { Digits::new(owned.len().max(1)) };
         unsafe {
             let base = typed_items_block_items_base(block) as *mut Digit;
-            if digits.is_empty() {
+            if owned.is_empty() {
                 *base = NULLDIGIT;
             } else {
                 let mut i = 0;
-                while i < digits.len() {
-                    *base.add(i) = digits[i];
+                while i < owned.len() {
+                    *base.add(i) = owned[i];
                     i += 1;
                 }
             }
@@ -628,16 +632,17 @@ impl RBigInt {
         } else {
             size
         };
-        let allocation_size = digits.len().max(1);
+        let owned: Vec<Digit> = digits.to_vec();
+        let allocation_size = owned.len().max(1);
         let block = unsafe { Digits::try_new(allocation_size) }.ok_or(RBigIntError::Memory)?;
         unsafe {
             let base = typed_items_block_items_base(block) as *mut Digit;
-            if digits.is_empty() {
+            if owned.is_empty() {
                 *base = NULLDIGIT;
             } else {
                 let mut i = 0;
-                while i < digits.len() {
-                    *base.add(i) = digits[i];
+                while i < owned.len() {
+                    *base.add(i) = owned[i];
                     i += 1;
                 }
             }

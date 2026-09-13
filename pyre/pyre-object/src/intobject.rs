@@ -215,7 +215,9 @@ pub fn w_int_gc_alloc(value: i64) -> *mut PyObject {
     // return is a GCREF (`*mut PyObject`), so the bump is
     // `malloc_fixedsize` — same as `w_tuple_new`.
     let w_class = get_instantiate(&INT_TYPE);
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+    // Residual `dont_look_inside` return lives in a register the gcmap
+    // does not describe. `try_gc_alloc_nursery_raw` forbids that window.
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
     if raw.is_null() {
         return crate::PY_NULL;
     }
@@ -276,7 +278,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         map: 0,
         storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
         W_INT_USER_GC_TYPE_ID.get(),
         std::mem::size_of::<W_IntObjectUser>(),
     );

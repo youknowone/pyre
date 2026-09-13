@@ -2346,6 +2346,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let _obj_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
         // stringmethods.py / bytearrayobject.py `descr_getitem`: unpack the
@@ -2353,18 +2357,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // mutate a bytearray), then use `adjust_indices`' explicit slice
         // length.  Iterating by that count also avoids overflowing on the
         // final `start + step` for a step near `sys.maxsize`.
-        let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`; the operand is
-            // rooted for that window and neither `bytes` nor `bytearray`
-            // moves.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            crate::sliceobject::slice_unpack(
-                w_slice_get_start(index),
-                w_slice_get_stop(index),
-                w_slice_get_step(index),
-            )?
-        };
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -2404,15 +2402,8 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = {
-            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
-            // before dispatching here, so nothing else roots it across the
-            // call. A bytes-like operand never moves, so the root is for liveness alone
-            // and the address in hand stays correct.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(index)?
-        };
+        let indexed = space_index(index)?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -19649,15 +19640,19 @@ unsafe fn generator_invoke_execute_frame(
         )));
     }
     w_generator_set_running(gen_obj, true);
+    let _gen_roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(gen_obj);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     if !ec.is_null() {
-        (*ec).push_gen_or_coroutine(gen_obj);
+        (*ec).push_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
     let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
+    let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     let result = match result {
         Err(e) => {
             generator_frame_is_finished(gen_obj, frame, prompt_finalization);
@@ -19687,6 +19682,7 @@ unsafe fn generator_invoke_execute_frame(
     };
     // generator.py:142-145 `finally`.
     frame.f_backref = std::ptr::null_mut();
+    let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     w_generator_set_running(gen_obj, false);
     if !ec.is_null() {
         (*ec).pop_gen_or_coroutine(gen_obj);

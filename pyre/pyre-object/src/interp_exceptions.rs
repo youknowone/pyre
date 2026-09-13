@@ -642,9 +642,12 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
         // collection there could sweep the unrooted (non-moving oldgen)
         // exception before `w_exception_set_args` writes through it.
         let _roots = crate::gc_roots::push_roots();
-        let exc = crate::gc_roots::pin_root(exc);
+        let exc_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(exc);
         let arg = crate::gc_roots::pin_root(crate::unicodeobject::w_str_new_managed(message));
+        let exc = crate::gc_roots::shadow_stack_get(exc_slot);
         unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
+        return crate::gc_roots::shadow_stack_get(exc_slot);
     }
     exc
 }
@@ -656,11 +659,14 @@ pub fn w_exception_new_wtf8(kind: ExcKind, message: &Wtf8) -> PyObjectRef {
     if !message.is_empty() {
         // See `w_exception_new`: pin `exc` across the allocating arg build.
         let _roots = crate::gc_roots::push_roots();
-        let exc = crate::gc_roots::pin_root(exc);
+        let exc_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(exc);
         let arg = crate::gc_roots::pin_root(crate::unicodeobject::w_str_from_wtf8_managed(
             message.to_wtf8_buf(),
         ));
+        let exc = crate::gc_roots::shadow_stack_get(exc_slot);
         unsafe { w_exception_set_args(exc, w_exception_args_new(vec![arg])) };
+        return crate::gc_roots::shadow_stack_get(exc_slot);
     }
     exc
 }

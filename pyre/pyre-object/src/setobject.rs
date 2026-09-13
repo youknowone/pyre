@@ -392,7 +392,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(items as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(set_type));
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
     let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
     let body = W_SetObject {
         ob_header: PyObject {
