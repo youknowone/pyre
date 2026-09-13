@@ -2834,14 +2834,33 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         )
         before = parse_stamp(stamp)
         after = parse_stamp(current_stamp)
-        if any(before[field] != after[field] for field in ("closure", "external")):
+        # The pre-build stamp is computed with `include_closure=False`
+        # (`closure=-`). That is not a moved tree: `stamp_skip_ok` already
+        # treats an uncomputed closure as "did not move". Comparing `-` to
+        # the post-build digest would refuse every first extract.
+        closure_moved = (
+            before.get("closure") != CLOSURE_UNCOMPUTED
+            and after.get("closure") != CLOSURE_UNCOMPUTED
+            and before.get("closure") != after.get("closure")
+        )
+        external_moved = before.get("external") != after.get("external")
+        if closure_moved or external_moved:
             invalidate_fingerprint(stamp_path, readfiles)
             forget_collected_inputs()
             unstamped.append(crate)
+            moved_fields = [
+                field
+                for field, moved in (
+                    ("closure", closure_moved),
+                    ("external", external_moved),
+                )
+                if moved
+            ]
             print(
                 f"    REFUSING to stamp {dest.name}: the tree moved during its"
-                f" build, so no input hash describes this artefact. Left"
-                f" unstamped — reported as freshness UNKNOWN, not as fresh."
+                f" build ({', '.join(moved_fields)}), so no input hash"
+                f" describes this artefact. Left unstamped — reported as"
+                f" freshness UNKNOWN, not as fresh."
             )
             continue
         # The line ending is pinned, not left to the platform: the stamp is
