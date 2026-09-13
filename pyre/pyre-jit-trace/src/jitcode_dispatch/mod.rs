@@ -11816,16 +11816,18 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     Ok(())
 }
 
-/// `executioncontext.py` `profilefunc?` — PyPy's opt log pins the empty
-/// function pointer with `getfield_gc_i(inst_profilefunc)` + `int_is_zero` +
-/// `guard_true` next to the `w_tracefunc` promote.  The green
-/// `is_being_profiled` selects a different cell for a *new* recording; a
-/// loop already compiled with the slot empty jumps to itself and never
-/// re-reads that green, so without this pin `sys.setprofile` leaves it
-/// running.  `setllprofile` invalidates the watchers.
+/// `executioncontext.py` `profilefunc?`.  We do not trace through
+/// `execute_frame`, so PyPy's `getfield + int_is_zero + guard_true` is
+/// not a compiled-loop read we have to replay.  The `?` watcher is what
+/// `setllprofile` needs: a compiled loop jumps to itself and never
+/// re-reads the `is_being_profiled` green, and GNI fails when the slot
+/// is written.  Recording the promote half here ate five ops of a
+/// `trace_limit=8` walk and fragmented `trace_too_long_effect_replay`
+/// (aborts 17→46, guard_failures 1247→7746).  Marker only; the pending
+/// GNI flushes on the next real guard, coalesced with `w_tracefunc?`.
 fn record_portal_profilefunc_guard<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
+    _op_pc: usize,
 ) -> Result<(), DispatchError> {
     if ctx.fbw_mode.inline_subwalk {
         return Ok(());
@@ -11837,26 +11839,11 @@ fn record_portal_profilefunc_guard<Sym: WalkSym>(
     let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
     };
-    let descr = crate::descr::ec_profilefunc_descr();
-    let descr_index = descr.index();
-    if ctx
-        .trace_ctx
-        .heapcache_getfield_cached(ec_box, descr_index)
-        .is_some()
-    {
-        return Ok(());
-    }
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
-    let read = ctx
-        .trace_ctx
-        .record_op_with_descr(OpCode::GetfieldGcI, &[ec_box], descr);
-    ctx.trace_ctx
-        .heapcache_getfield_now_known(ec_box, descr_index, read);
-    ctx.trace_ctx.set_opref_concrete(read, Value::Int(0));
-    let is_zero = ctx.trace_ctx.record_op(OpCode::IntIsZero, &[read]);
-    ctx.trace_ctx.set_opref_concrete(is_zero, Value::Int(1));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_zero])?;
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        ec_box,
+        crate::descr::ec_profilefunc_descr(),
+    );
     Ok(())
 }
 
