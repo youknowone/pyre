@@ -731,10 +731,10 @@ impl Trace {
         let unique = self.op_count;
         let opref = OpRef::op_typed(unique, opcode.result_type());
         let first_arg = args.first().copied();
-        // history.py record0/1/2/3 take the boxes inline. A heap `Vec`
-        // here would be one allocation per recorded op; arity ≤ 4 is
-        // the fixed-op surface (`resoperation.py oparity`).
-        let boxes: smallvec::SmallVec<[OcBox; 4]> =
+        // history.py record0/1/2/3 take the boxes inline. JUMP and
+        // other N-ary ops exceed that 0–3 surface; eight OcBoxes stay
+        // off the process allocator.
+        let boxes: smallvec::SmallVec<[OcBox; 8]> =
             args.iter().copied().map(|a| self.arg_to_box(a)).collect();
         let trb = self
             .trb
@@ -902,7 +902,7 @@ impl Trace {
     /// directly. Frame registers and the public `record_*` API stay OpRef; the
     /// optimizer bridges back with `Operand::to_opref`, which round-trips to the
     /// same `OpRef` the `from_opref` view produced.
-    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 8]> {
+    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 16]> {
         args.iter().map(|&a| self.box_for_operand(a)).collect()
     }
 
