@@ -1305,6 +1305,28 @@ fn free_op_inner(p: std::ptr::NonNull<OpInner>) {
 /// Chunked slots keep `Box<OpKindExtra>` (32–40 B) off the process
 /// allocator on the regex `and`/`or` leaf.
 const EXTRA_CHUNK: usize = 1024;
+/// `is_extra_inline` / `is_both_inline` require `w & 7 == 0` so the
+/// packed word stays distinct from `pack_forwarded` SmallWide (tag 4).
+/// wasm32's natural `align_of` for these types is 4.
+const PACKED_PTR_ALIGN: usize = 8;
+
+fn packed_stride<T>() -> usize {
+    std::mem::size_of::<T>().next_multiple_of(PACKED_PTR_ALIGN)
+}
+
+fn alloc_packed_chunk<T>(count: usize) -> *mut T {
+    let stride = packed_stride::<T>();
+    let layout = std::alloc::Layout::from_size_align(stride * count, PACKED_PTR_ALIGN)
+        .expect("packed slot chunk layout");
+    let base = unsafe { std::alloc::alloc(layout) };
+    assert!(!base.is_null(), "packed slot chunk alloc failed");
+    debug_assert_eq!(base as usize & (PACKED_PTR_ALIGN - 1), 0);
+    base as *mut T
+}
+
+fn packed_chunk_slot<T>(base: *mut T, index: usize) -> *mut T {
+    unsafe { (base as *mut u8).add(index * packed_stride::<T>()) as *mut T }
+}
 
 struct ExtraHeap {
     chunks: Vec<(*mut OpKindExtra, usize)>,
@@ -1327,13 +1349,11 @@ fn extra_slot() -> *mut OpKindExtra {
     if let Some((base, used)) = heap.chunks.last_mut()
         && *used < EXTRA_CHUNK
     {
-        let p = unsafe { (*base).add(*used) };
+        let p = packed_chunk_slot(*base, *used);
         *used += 1;
         return p;
     }
-    let layout = std::alloc::Layout::array::<OpKindExtra>(EXTRA_CHUNK).expect("OpKindExtra chunk");
-    let base = unsafe { std::alloc::alloc(layout) as *mut OpKindExtra };
-    assert!(!base.is_null(), "OpKindExtra chunk alloc failed");
+    let base = alloc_packed_chunk::<OpKindExtra>(EXTRA_CHUNK);
     heap.chunks.push((base, 1));
     base
 }
@@ -1384,13 +1404,11 @@ fn both_slot() -> *mut BothPayload {
     if let Some((base, used)) = heap.chunks.last_mut()
         && *used < BOTH_CHUNK
     {
-        let p = unsafe { (*base).add(*used) };
+        let p = packed_chunk_slot(*base, *used);
         *used += 1;
         return p;
     }
-    let layout = std::alloc::Layout::array::<BothPayload>(BOTH_CHUNK).expect("BothPayload chunk");
-    let base = unsafe { std::alloc::alloc(layout) as *mut BothPayload };
-    assert!(!base.is_null(), "BothPayload chunk alloc failed");
+    let base = alloc_packed_chunk::<BothPayload>(BOTH_CHUNK);
     heap.chunks.push((base, 1));
     base
 }
@@ -6345,6 +6363,24 @@ mod tests {
         assert!(unset.guard_fail_args().is_none());
         unset.setfailargs(OpArgVec::new());
         assert_eq!(unset.guard_fail_args(), Some(&[][..]));
+    }
+
+    #[test]
+    fn set_rd_resume_position_finds_the_extra_just_written() {
+        // wasm32 Extra/Both slots were 4-aligned, so `is_extra_inline`
+        // (`w & 7 == 0`) missed the word `extra_replace` just stored
+        // and `ensure_guard_extra` panicked in ByteTraceIter.
+        let arg = crate::forwarding::test_support::bound_resop_operand(Type::Int, 0);
+        let op = Op::new(OpCode::GuardTrue, &[arg.clone()]);
+        op.set_rd_resume_position(42);
+        assert_eq!(op.rd_resume_position(), 42);
+        op.set_rd_resume_position(0);
+        assert_eq!(op.rd_resume_position(), 0);
+
+        let descr = crate::make_loop_target_descr(1, false);
+        let both = Op::with_descr(OpCode::GuardTrue, &[arg], descr);
+        both.set_rd_resume_position(7);
+        assert_eq!(both.rd_resume_position(), 7);
     }
 
     #[test]
