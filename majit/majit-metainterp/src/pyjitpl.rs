@@ -5027,9 +5027,11 @@ impl<M: Clone> MetaInterp<M> {
         // caller already supplied an expanded tail we reuse those inputarg
         // slots; otherwise we mint new inputargs here for each freshly-read
         // box, recovering the same `original_boxes += read_boxes(...)` shape.
-        let vable_values: Vec<Value> = if !self.vable_ptr.is_null() {
+        // `vinfo.read_boxes(cpu, virtualizable, startindex)` — always
+        // the heap object unwrap produced, never an expanded live_values tail.
+        let vable_values: Vec<Value> = if !virtualizable_ptr.is_null() {
             let (static_boxes, array_boxes) =
-                unsafe { info.read_all_boxes(self.vable_ptr, &array_lengths) };
+                unsafe { info.read_all_boxes(virtualizable_ptr as *const u8, &array_lengths) };
             let mut out = Vec::with_capacity(total_vable);
             for (i, bits) in static_boxes.iter().enumerate() {
                 out.push(heap_value_for(info.static_fields[i].field_type, *bits));
@@ -5104,7 +5106,7 @@ impl<M: Clone> MetaInterp<M> {
         // the live heap pointer to mirror shadow writes. Mirror here — the
         // MetaInterp `vable_ptr` was cached before `tracing` existed, so
         // `set_vable_ptr` could not plumb it through.
-        ctx.set_virtualizable_heap_ptr(self.vable_ptr);
+        ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
         // pyjitpl.py `initialize_virtualizable` closes by asserting the
         // freshly read boxes still match the object it read them from.
         ctx.check_synchronized_virtualizable();

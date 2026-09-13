@@ -2576,6 +2576,7 @@ impl Bookkeeper {
             let key = majit_ir::descr::canonical_struct_name(node);
             let bases = base_host.iter().cloned().collect();
             let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
+            crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
             self.struct_root_classes
                 .borrow_mut()
                 .insert(key, host.clone());
@@ -2611,6 +2612,7 @@ impl Bookkeeper {
             return existing.clone();
         }
         let host = crate::flowspace::model::HostObject::new_class(key.clone(), bases);
+        crate::virtualizable_decl::stamp_host_virtualizable(&host, &key);
         self.struct_root_classes
             .borrow_mut()
             .insert(key, host.clone());
@@ -4502,6 +4504,40 @@ mod tests {
             .insert("x".to_string(), attrs_attr);
         bk.classdefs.borrow_mut().push(classdef);
         bk.check_no_flags_on_instances();
+    }
+
+    #[test]
+    fn intern_pyframe_stamps_interp_jit_virtualizable_list() {
+        crate::virtualizable_decl::register_virtualizable_roots(["PyFrame".to_string()]);
+        let bk = bk();
+        let host = bk.intern_class_by_qualname("PyFrame");
+        let listed = host
+            .class_get("_virtualizable_")
+            .expect("interp_jit.py PyFrame._virtualizable_");
+        let ConstValue::List(items) = listed else {
+            panic!("_virtualizable_ must be a list");
+        };
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, ConstValue::ByteStr(bytes) if bytes == b"last_instr"))
+        );
+        let classdesc = crate::annotator::classdesc::ClassDesc::new(
+            &bk,
+            host,
+            Some("PyFrame".into()),
+            None,
+            None,
+        )
+        .expect("ClassDesc");
+        assert!(
+            !matches!(
+                classdesc.borrow().get_param("_virtualizable_", None, true),
+                ConstValue::None
+            ),
+            "classdesc.get_param('_virtualizable_') must see the class attribute"
+        );
+        crate::virtualizable_decl::register_virtualizable_roots(std::iter::empty::<String>());
     }
 
     #[test]

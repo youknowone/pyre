@@ -24,6 +24,19 @@
 //! invocation — the shape `local_crates` has.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
+use crate::flowspace::model::{ConstValue, HostObject};
+
+/// `pypy/module/pypyjit/interp_jit.py` `PyFrame._virtualizable_`.
+pub const PYFRAME_VIRTUALIZABLE: &[&str] = &[
+    "last_instr",
+    "pycode",
+    "valuestackdepth",
+    "locals_cells_stack_w[*]",
+    "debugdata",
+    "w_globals",
+];
 
 thread_local! {
     /// Per-pipeline-invocation `_virtualizable_` roots, seeded by the
@@ -35,8 +48,7 @@ thread_local! {
     /// pipeline runs start-to-finish on one thread, and a process-global
     /// would let a parallel `cargo test` pipeline overwrite this run's
     /// declaration between its own seed and read.
-    static REGISTERED: RefCell<std::collections::HashSet<String>> =
-        RefCell::new(std::collections::HashSet::new());
+    static REGISTERED: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
 }
 
 /// Replace this thread's `_virtualizable_` root set. A later invocation on
@@ -48,12 +60,105 @@ thread_local! {
 /// program without going through `analyze_pipeline_from_module_paths`; such a
 /// consumer owns the ordering, since the read happens during the build.
 pub fn register_virtualizable_roots(roots: impl IntoIterator<Item = String>) {
-    REGISTERED.with(|registered| *registered.borrow_mut() = roots.into_iter().collect());
+    REGISTERED.with(|registered| {
+        *registered.borrow_mut() = roots.into_iter().map(|root| (root, Vec::new())).collect();
+    });
 }
 
 /// The registered roots for the current pipeline invocation. Empty when the
 /// consumer declared none, which makes the minter's class test fail closed —
 /// upstream's erasing branch.
-pub(crate) fn virtualizable_roots() -> std::collections::HashSet<String> {
-    REGISTERED.with(|registered| registered.borrow().clone())
+pub(crate) fn virtualizable_roots() -> HashSet<String> {
+    REGISTERED.with(|registered| registered.borrow().keys().cloned().collect())
+}
+
+/// `interp_jit.py` `PyFrame._virtualizable_ = [...]` — stamp the class
+/// attribute on a newly interned host when this invocation declared it.
+pub fn stamp_host_virtualizable(host: &HostObject, class_key: &str) {
+    let Some(fields) = field_names_for(class_key) else {
+        return;
+    };
+    let items = fields
+        .into_iter()
+        .map(ConstValue::byte_str)
+        .collect::<Vec<_>>();
+    host.class_set("_virtualizable_", ConstValue::List(items));
+}
+
+fn field_names_for(class_key: &str) -> Option<Vec<String>> {
+    if !is_registered(class_key) {
+        return None;
+    }
+    if is_pyframe(class_key) {
+        return Some(
+            PYFRAME_VIRTUALIZABLE
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        );
+    }
+    REGISTERED.with(|registered| lookup(&registered.borrow(), class_key).cloned())
+}
+
+fn is_registered(class_key: &str) -> bool {
+    REGISTERED.with(|registered| lookup(&registered.borrow(), class_key).is_some())
+}
+
+fn is_pyframe(class_key: &str) -> bool {
+    class_key.rsplit("::").next() == Some("PyFrame")
+}
+
+fn lookup<'a>(
+    registered: &'a HashMap<String, Vec<String>>,
+    class_key: &str,
+) -> Option<&'a Vec<String>> {
+    if let Some(fields) = registered.get(class_key) {
+        return Some(fields);
+    }
+    let leaf = class_key.rsplit("::").next().unwrap_or(class_key);
+    registered
+        .iter()
+        .find(|(key, _)| key.rsplit("::").next() == Some(leaf))
+        .map(|(_, fields)| fields)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stamp_host_virtualizable_writes_interp_jit_list_on_pyframe() {
+        register_virtualizable_roots(["PyFrame".to_string()]);
+        let host = HostObject::new_class("PyFrame", vec![]);
+        stamp_host_virtualizable(&host, "PyFrame");
+        let ConstValue::List(items) = host
+            .class_get("_virtualizable_")
+            .expect("interp_jit.py assigns PyFrame._virtualizable_")
+        else {
+            panic!("_virtualizable_ must be a list");
+        };
+        let names: Vec<String> = items
+            .iter()
+            .map(|item| match item {
+                ConstValue::ByteStr(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            PYFRAME_VIRTUALIZABLE
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>()
+        );
+        register_virtualizable_roots(std::iter::empty::<String>());
+    }
+
+    #[test]
+    fn stamp_host_virtualizable_skips_undeclared_classes() {
+        register_virtualizable_roots(std::iter::empty::<String>());
+        let host = HostObject::new_class("Plain", vec![]);
+        stamp_host_virtualizable(&host, "Plain");
+        assert!(host.class_get("_virtualizable_").is_none());
+    }
 }
