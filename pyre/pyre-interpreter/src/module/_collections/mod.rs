@@ -190,6 +190,16 @@ pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
 /// with one reads endpoints belonging to two different chains and can reach a
 /// `PY_NULL` link. The stripe is reentrant, so the `store`/`append_right`
 /// nesting below costs nothing.
+/// Publish the needle and the snapshot as one livevar set, then normalize
+/// once. Sequential `pin_root` / `pin_roots` would query after the first
+/// write and leave the rest invisible to a foreign collection.
+fn publish_needle_and_snapshot(x: PyObjectRef, items: &[PyObjectRef]) -> (usize, usize) {
+    let x_slot = pyre_object::gc_roots::publish_roots(&[x]);
+    let items_base = pyre_object::gc_roots::publish_roots(items);
+    pyre_object::gc_roots::normalize_roots(x_slot, 1 + items.len());
+    (x_slot, items_base)
+}
+
 fn snapshot(self_obj: PyObjectRef) -> Vec<PyObjectRef> {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -836,8 +846,11 @@ fn deque_compare(
     let snap_a = snapshot(self_obj);
     let snap_b = snapshot(other);
     let _roots = pyre_object::gc_roots::push_roots();
-    let a_base = pyre_object::gc_roots::pin_roots(&snap_a);
-    let b_base = pyre_object::gc_roots::pin_roots(&snap_b);
+    // Publish both snapshots before any normalize query: each `pin_roots`
+    // is a safepoint, and the second slice would still be unrooted.
+    let a_base = pyre_object::gc_roots::publish_roots(&snap_a);
+    let b_base = pyre_object::gc_roots::publish_roots(&snap_b);
+    pyre_object::gc_roots::normalize_roots(a_base, snap_a.len() + snap_b.len());
     let mut i = 0usize;
     loop {
         // next(w_it1): lock-check precedes the element.
@@ -1063,9 +1076,7 @@ impl W_Deque {
         let lock = getlock(self_obj);
         let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let x_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(x);
-        let items_base = pyre_object::gc_roots::pin_roots(&items);
+        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
         let mut n = 0i64;
         for i in 0..items.len() {
             let equal = crate::baseobjspace::eq_w(
@@ -1084,9 +1095,7 @@ impl W_Deque {
         let items = snapshot(self_obj);
         let lock = getlock(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let x_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(x);
-        let items_base = pyre_object::gc_roots::pin_roots(&items);
+        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
         let mut pos = None;
         for i in 0..items.len() {
             let equal = crate::baseobjspace::eq_w(
@@ -1138,9 +1147,7 @@ impl W_Deque {
         let lock = getlock(self_obj);
         let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let x_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(x);
-        let items_base = pyre_object::gc_roots::pin_roots(&items);
+        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
         for i in 0..items.len() {
             let equal = crate::baseobjspace::eq_w(
                 pyre_object::gc_roots::shadow_stack_get(items_base + i),
@@ -1230,9 +1237,7 @@ impl W_Deque {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         let items = snapshot(self_obj);
         let _roots = pyre_object::gc_roots::push_roots();
-        let x_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(x);
-        let items_base = pyre_object::gc_roots::pin_roots(&items);
+        let (x_slot, items_base) = publish_needle_and_snapshot(x, &items);
         let len = items.len() as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
         // so a `__index__` on start/stop that mutates the deque is caught

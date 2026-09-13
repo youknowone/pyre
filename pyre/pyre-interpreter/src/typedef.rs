@@ -25309,18 +25309,20 @@ pub(crate) fn unicode_encode_error(
     fields.push(pyre_object::w_int_new(start));
     fields.push(pyre_object::w_int_new(end));
     fields.push(pyre_object::w_str_new_managed(reason));
-    let items = fields.take();
-    let w_object = items[0];
-    let w_encoding = items[1];
-    let w_start = items[2];
-    let w_end = items[3];
-    let w_reason = items[4];
     // PyPy stores the five fields/args here and formats them only from
     // `W_UnicodeEncodeError.descr_str`. `PyError::from_exc_object` follows
     // the same lazy display path, so do not precompute a parallel message.
     let exc = pyre_object::interp_exceptions::w_exception_new_empty(
         pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
     );
+    fields.push(exc);
+    let items = fields.take();
+    let w_object = items[0];
+    let w_encoding = items[1];
+    let w_start = items[2];
+    let w_end = items[3];
+    let w_reason = items[4];
+    let exc = items[5];
     unsafe {
         pyre_object::interp_exceptions::w_exception_set_encoding(exc, w_encoding);
         pyre_object::interp_exceptions::w_exception_set_object(exc, w_object);
@@ -25328,11 +25330,13 @@ pub(crate) fn unicode_encode_error(
         pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
         pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
+        let items = fields.take();
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            w_encoding, w_object, w_start, w_end, w_reason,
+            items[1], items[0], items[2], items[3], items[4],
         ]);
+        let exc = fields.take()[5];
         pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
-        crate::PyError::from_exc_object(exc)
+        crate::PyError::from_exc_object(fields.take()[5])
     }
 }
 

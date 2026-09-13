@@ -7746,9 +7746,7 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // tuple / search value across a minor collection; root both and reload.
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let tup = pyre_object::gc_roots::pin_root(tup);
-        let value = pyre_object::gc_roots::pin_root(value);
+        let sp = pyre_object::gc_roots::pin_roots(&[tup, value]);
         let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
         let mut i = start.max(0);
         while i < stop {
@@ -7757,13 +7755,10 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 break;
             }
             if let Some(item) = w_tuple_getitem(tup, i) {
-                let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(item);
+                let _elem_roots = pyre_object::gc_roots::push_roots();
+                let item = pyre_object::gc_roots::pin_root(item);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                if crate::baseobjspace::eq_w(
-                    pyre_object::gc_roots::shadow_stack_get(item_slot),
-                    value,
-                )? {
+                if crate::baseobjspace::eq_w(item, value)? {
                     return Ok(w_int_new(i));
                 }
             }
@@ -7791,9 +7786,7 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // collection; root both and reload after each comparison.
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let tup = pyre_object::gc_roots::pin_root(tup);
-        let value = pyre_object::gc_roots::pin_root(value);
+        let sp = pyre_object::gc_roots::pin_roots(&[tup, value]);
         let mut i = 0i64;
         loop {
             let tup = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -7801,13 +7794,10 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 break;
             }
             if let Some(item) = w_tuple_getitem(tup, i) {
-                let item_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(item);
+                let _elem_roots = pyre_object::gc_roots::push_roots();
+                let item = pyre_object::gc_roots::pin_root(item);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                if crate::baseobjspace::eq_w(
-                    pyre_object::gc_roots::shadow_stack_get(item_slot),
-                    value,
-                )? {
+                if crate::baseobjspace::eq_w(item, value)? {
                     count += 1;
                 }
             }

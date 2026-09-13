@@ -1096,10 +1096,10 @@ fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Res
             break;
         }
         let w_item = array_w_getitem(obj, i, false)?;
-        let item_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_item);
+        let _elem_roots = pyre_object::gc_roots::push_roots();
+        let w_item = pyre_object::gc_roots::pin_root(w_item);
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        if crate::baseobjspace::eq_w(pyre_object::gc_roots::shadow_stack_get(item_slot), w_value)? {
+        if crate::baseobjspace::eq_w(w_item, w_value)? {
             if count {
                 cnt += 1;
             } else {
@@ -1174,10 +1174,10 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
             break;
         }
         let w_item = array_w_getitem(obj, i as usize, false)?;
-        let item_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_item);
+        let _elem_roots = pyre_object::gc_roots::push_roots();
+        let w_item = pyre_object::gc_roots::pin_root(w_item);
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        if crate::baseobjspace::eq_w(pyre_object::gc_roots::shadow_stack_get(item_slot), w_value)? {
+        if crate::baseobjspace::eq_w(w_item, w_value)? {
             return Ok(pyre_object::w_int_new(i));
         }
         i += 1;

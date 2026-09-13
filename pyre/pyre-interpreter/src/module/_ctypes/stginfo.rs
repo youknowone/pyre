@@ -131,36 +131,47 @@ fn get_int(info: PyObjectRef, key: &str) -> i64 {
 
 /// Build a fresh `StgInfo` carrier from `data`.
 pub(super) fn stginfo_new(data: StgInfoData) -> PyObjectRef {
-    let info = pyre_object::w_instance_new(stginfo_type());
-    let d = dict_of(info);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let info_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(stginfo_type()));
+    let info = || pyre_object::gc_roots::shadow_stack_get(info_slot);
+    let d = || dict_of(info());
     unsafe {
-        pyre_object::w_dict_setitem_str(d, K_SIZE, pyre_object::w_int_new(data.size as i64));
-        pyre_object::w_dict_setitem_str(d, K_ALIGN, pyre_object::w_int_new(data.align as i64));
-        pyre_object::w_dict_setitem_str(d, K_LENGTH, pyre_object::w_int_new(data.length as i64));
+        pyre_object::w_dict_setitem_str(d(), K_SIZE, pyre_object::w_int_new(data.size as i64));
+        pyre_object::w_dict_setitem_str(d(), K_ALIGN, pyre_object::w_int_new(data.align as i64));
+        pyre_object::w_dict_setitem_str(d(), K_LENGTH, pyre_object::w_int_new(data.length as i64));
         pyre_object::w_dict_setitem_str(
-            d,
+            d(),
             K_ELEMENT_SIZE,
             pyre_object::w_int_new(data.element_size as i64),
         );
-        pyre_object::w_dict_setitem_str(d, K_FLAGS, pyre_object::w_int_new(data.flags));
+        pyre_object::w_dict_setitem_str(d(), K_FLAGS, pyre_object::w_int_new(data.flags));
         pyre_object::w_dict_setitem_str(
-            d,
+            d(),
             K_PARAMFUNC,
             pyre_object::w_str_new_managed(data.paramfunc.name()),
         );
-        pyre_object::w_dict_setitem_str(d, K_PROTO, data.proto.unwrap_or_else(pyre_object::w_none));
         pyre_object::w_dict_setitem_str(
-            d,
+            d(),
+            K_PROTO,
+            data.proto.unwrap_or_else(pyre_object::w_none),
+        );
+        pyre_object::w_dict_setitem_str(
+            d(),
             K_FORMAT,
             match data.format {
                 Some(s) => pyre_object::w_str_new_managed(&s),
                 None => pyre_object::w_none(),
             },
         );
-        pyre_object::w_dict_setitem_str(d, K_POINTER_TYPE, pyre_object::w_none());
-        pyre_object::w_dict_setitem_str(d, K_BIG_ENDIAN, pyre_object::w_bool_from(data.big_endian));
+        pyre_object::w_dict_setitem_str(d(), K_POINTER_TYPE, pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(
+            d(),
+            K_BIG_ENDIAN,
+            pyre_object::w_bool_from(data.big_endian),
+        );
     }
-    info
+    info()
 }
 
 /// Direct (non-MRO) lookup of `cls`'s own `StgInfo`, if any.

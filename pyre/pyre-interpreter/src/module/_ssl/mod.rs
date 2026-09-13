@@ -1657,10 +1657,15 @@ mod ssl_socket_methods {
         if owner.is_null() {
             return Ok(());
         }
+        let _owner_roots = pyre_object::gc_roots::push_roots();
+        let owner_live = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(owner);
         for event in events {
             let _event_roots = pyre_object::gc_roots::push_roots();
             let owner_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(owner);
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::gc_roots::shadow_stack_get(
+                owner_live,
+            ));
             let data_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&event.data));
             let direction_slot = pyre_object::gc_roots::shadow_stack_len();

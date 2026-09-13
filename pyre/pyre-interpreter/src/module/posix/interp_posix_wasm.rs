@@ -1009,14 +1009,11 @@ fn uname_seq_type() -> PyObjectRef {
 /// through `socket.gethostname`, which wasi writes over this same call.
 fn uname(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let fields = ["wasi", "(none)", "0.0.0", "0.0.0", "wasm32"];
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut seq = Vec::with_capacity(fields.len());
+    let mut seq = pyre_object::gc_roots::RootedItems::new();
     for field in fields {
-        seq.push(pyre_object::gc_roots::pin_root(
-            pyre_object::w_str_new_managed(field),
-        ));
+        seq.push(pyre_object::w_str_new_managed(field));
     }
-    Ok(crate::_structseq::new_instance(uname_seq_type(), seq))
+    Ok(crate::_structseq::new_instance(uname_seq_type(), seq.take()))
 }
 
 /// What one parameter of a refused entry point is, which decides the
