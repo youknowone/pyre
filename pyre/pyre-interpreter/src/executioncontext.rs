@@ -6,10 +6,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::PyFrame;
 
 pub type ForceFrameFn = unsafe extern "C" fn(*mut PyFrame);
-static FORCE_FRAME_HOOK: OnceLock<ForceFrameFn> = OnceLock::new();
+
+/// Process-wide hook installed by JIT init (`eval.rs force_pyframe`).
+/// A runtime load, not a `OnceLock`: the unset word must stay a runtime
+/// read so translated `force_frame` is not folded to a permanent no-op.
+static FORCE_FRAME_HOOK: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 pub fn register_force_frame_hook(f: ForceFrameFn) {
-    let _ = FORCE_FRAME_HOOK.set(f);
+    FORCE_FRAME_HOOK.store(f as *mut (), Ordering::Release);
 }
 
 /// `rvirtualizable.py hook_access_field` → `jit_force_virtualizable`:
@@ -28,7 +33,9 @@ pub fn register_force_frame_hook(f: ForceFrameFn) {
 /// aborts the whole trace with `ABORT_ESCAPE`.
 #[inline]
 pub fn force_frame(frame: *mut PyFrame) {
-    if let Some(f) = FORCE_FRAME_HOOK.get() {
+    let p = FORCE_FRAME_HOOK.load(Ordering::Acquire);
+    if !p.is_null() {
+        let f: ForceFrameFn = unsafe { std::mem::transmute(p) };
         unsafe { f(frame) };
     }
 }
@@ -3320,4 +3327,32 @@ pub fn report_error(
 pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootFinalizerQueue {
     let _ = w_root;
     WRootFinalizerQueue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{force_frame, force_frame_before_locals_read, register_force_frame_hook};
+    use crate::PyFrame;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    static SEEN: AtomicPtr<PyFrame> = AtomicPtr::new(std::ptr::null_mut());
+
+    unsafe extern "C" fn record(frame: *mut PyFrame) {
+        SEEN.store(frame, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn registered_force_frame_hook_is_invoked_with_the_frame_pointer() {
+        force_frame_before_locals_read(std::ptr::null_mut());
+
+        SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
+        register_force_frame_hook(record);
+        let dummy = 0x0000_0000_DEAD_BEEF as *mut PyFrame;
+        force_frame(dummy);
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            dummy,
+            "register_force_frame_hook + force_frame must dispatch the same pointer"
+        );
+    }
 }
