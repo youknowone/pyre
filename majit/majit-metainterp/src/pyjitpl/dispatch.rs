@@ -7455,46 +7455,15 @@ where
                 self.frames.current_mut().code_cursor = target;
             }
             jitcode::insns::BC_INLINE_CALL => {
-                let (sub_idx, arg_triples, return_i, return_r, return_f) = {
+                // pyjitpl.py newframe decoder: mint the callee, then
+                // fill_registers from the caller bytecode. Do not collect
+                // the arg triples into a Vec (9 usizes = 72 B).
+                let (sub_idx, num_args) = {
                     let frame = self.frames.current_mut();
-                    let sub_idx = frame.next_u16() as usize;
-                    let num_args = frame.next_u16() as usize;
-                    let mut arg_triples = Vec::with_capacity(num_args);
-                    for _ in 0..num_args {
-                        let kind = JitArgKind::decode(frame.next_u8());
-                        let caller_src = frame.next_reg() as usize;
-                        let callee_dst = frame.next_reg() as usize;
-                        arg_triples.push((kind, caller_src, callee_dst));
-                    }
-                    let dest = {
-                        let dst = frame.next_reg() as usize;
-                        if dst == crate::jitcode::NO_RETURN_REG as usize {
-                            None
-                        } else {
-                            Some(dst)
-                        }
-                    };
-                    frame.pc = frame.code_cursor;
-                    let resulttype = frame
-                        .jitcode
-                        .core()
-                        .body()
-                        .resulttypes
-                        .as_ref()
-                        .and_then(|types| types.get(&frame.pc).copied());
-                    let (return_i, return_r, return_f, result_argcode) = match resulttype {
-                        Some('i') => (dest, None, None, b'i'),
-                        Some('r') => (None, dest, None, b'r'),
-                        Some('f') => (None, None, dest, b'f'),
-                        _ => (None, None, None, b'v'),
-                    };
-                    frame._result_argcode = result_argcode;
-                    frame.result_arg_index = dest;
-                    (sub_idx, arg_triples, return_i, return_r, return_f)
+                    (frame.next_u16() as usize, frame.next_u16() as usize)
                 };
-                let pc = self.frames.current_mut().pc;
-                // RPython `blackhole.py:150-157` — `j` argcode resolves
-                // via `self.descrs[idx]` asserted to be a `JitCode`.
+                // RPython blackhole.py — `j` argcode resolves via
+                // `self.descrs[idx]` asserted to be a JitCode.
                 // `as_jitcode_owned`, so a recursive helper's back edge resolves
                 // to the same callee an owning edge would.  By the time anything
                 // executes this operand the callee is published, so the `Weak`
@@ -7510,33 +7479,62 @@ where
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
                     });
                 let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
-                ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;
-                for (kind, caller_src, callee_dst) in arg_triples {
-                    match kind {
-                        JitArgKind::Int => {
-                            let (value, concrete) = self.read_int_reg(caller_src);
-                            #[cfg(feature = "jit-audits")]
-                            majit_ir::reg_write_audit::note_int_write(
-                                sub_frame.int_regs.as_ptr() as usize,
-                                callee_dst,
-                                Some(value),
-                            );
-                            sub_frame.int_regs[callee_dst] = Some(value);
-                            sub_frame.int_values[callee_dst] = Some(concrete);
-                        }
-                        JitArgKind::Ref => {
-                            let (value, concrete) = self.read_ref_reg(caller_src);
-                            sub_frame.ref_regs[callee_dst] = Some(value);
-                            sub_frame.ref_values[callee_dst] = Some(concrete);
-                        }
-                        JitArgKind::Float => {
-                            let (value, concrete) = self.read_float_reg(caller_src);
-                            sub_frame.float_regs[callee_dst] = Some(value);
-                            sub_frame.float_values[callee_dst] = Some(concrete);
+                let (return_i, return_r, return_f) = {
+                    let caller = self.frames.current_mut();
+                    for _ in 0..num_args {
+                        let kind = JitArgKind::decode(caller.next_u8());
+                        let caller_src = caller.next_reg() as usize;
+                        let callee_dst = caller.next_reg() as usize;
+                        match kind {
+                            JitArgKind::Int => {
+                                #[cfg(feature = "jit-audits")]
+                                majit_ir::reg_write_audit::note_int_write(
+                                    sub_frame.int_regs.as_ptr() as usize,
+                                    callee_dst,
+                                    caller.int_regs[caller_src],
+                                );
+                                sub_frame.int_regs[callee_dst] = caller.int_regs[caller_src];
+                                sub_frame.int_values[callee_dst] = caller.int_values[caller_src];
+                            }
+                            JitArgKind::Ref => {
+                                sub_frame.ref_regs[callee_dst] = caller.ref_regs[caller_src];
+                                sub_frame.ref_values[callee_dst] = caller.ref_values[caller_src];
+                            }
+                            JitArgKind::Float => {
+                                sub_frame.float_regs[callee_dst] = caller.float_regs[caller_src];
+                                sub_frame.float_values[callee_dst] =
+                                    caller.float_values[caller_src];
+                            }
                         }
                     }
-                }
+                    let dest = {
+                        let dst = caller.next_reg() as usize;
+                        if dst == crate::jitcode::NO_RETURN_REG as usize {
+                            None
+                        } else {
+                            Some(dst)
+                        }
+                    };
+                    caller.pc = caller.code_cursor;
+                    let resulttype = caller
+                        .jitcode
+                        .core()
+                        .body()
+                        .resulttypes
+                        .as_ref()
+                        .and_then(|types| types.get(&caller.pc).copied());
+                    let (return_i, return_r, return_f, result_argcode) = match resulttype {
+                        Some('i') => (dest, None, None, b'i'),
+                        Some('r') => (None, dest, None, b'r'),
+                        Some('f') => (None, None, dest, b'f'),
+                        _ => (None, None, None, b'v'),
+                    };
+                    caller._result_argcode = result_argcode;
+                    caller.result_arg_index = dest;
+                    ctx.push_inline_frame((sub_idx, caller.pc), u32::MAX);
+                    (return_i, return_r, return_f)
+                };
                 sub_frame.return_i = return_i;
                 sub_frame.return_r = return_r;
                 sub_frame.return_f = return_f;
@@ -11012,41 +11010,7 @@ where
             _ => unreachable!("typed inline-call dispatch arm passed bytecode {bytecode}"),
         };
 
-        let (sub_idx, args_i, args_r, args_f, result_dst) = {
-            let frame = self.frames.current_mut();
-            let sub_idx = frame.next_u16() as usize;
-            let mut read_list = |frame: &mut MIFrame| {
-                let count = frame.next_u8() as usize;
-                let mut regs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    regs.push(frame.next_reg() as usize);
-                }
-                regs
-            };
-            let args_i = if has_i_list {
-                read_list(frame)
-            } else {
-                Default::default()
-            };
-            let args_r = read_list(frame);
-            let args_f = if has_f_list {
-                read_list(frame)
-            } else {
-                Default::default()
-            };
-            let result_dst = return_kind.map(|_| frame.next_reg() as usize);
-            frame._result_argcode = match return_kind {
-                Some(JitArgKind::Int) => b'i',
-                Some(JitArgKind::Ref) => b'r',
-                Some(JitArgKind::Float) => b'f',
-                None => b'v',
-            };
-            frame.result_arg_index = result_dst;
-            frame.pc = frame.code_cursor;
-            (sub_idx, args_i, args_r, args_f, result_dst)
-        };
-
-        let pc = self.frames.current_mut().pc;
+        let sub_idx = self.frames.current_mut().next_u16() as usize;
         // `descr_at` resolves the callee from the per-jitcode `exec.descrs`
         // pool (runtime-built jitcodes) or the shared global build-time pool
         // (LLBC-extracted jitcodes, whose per-jitcode pool is empty).
@@ -11065,30 +11029,35 @@ where
             return TraceAction::Abort;
         };
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
-        ctx.push_inline_frame((sub_idx, pc), u32::MAX);
         sub_frame.inline_frame = true;
 
-        for (callee_dst, caller_src) in args_i.into_iter().enumerate() {
-            let (value, concrete) = self.read_int_reg(caller_src);
-            #[cfg(feature = "jit-audits")]
-            majit_ir::reg_write_audit::note_int_write(
-                sub_frame.int_regs.as_ptr() as usize,
-                callee_dst,
-                Some(value),
-            );
-            sub_frame.int_regs[callee_dst] = Some(value);
-            sub_frame.int_values[callee_dst] = Some(concrete);
-        }
-        for (callee_dst, caller_src) in args_r.into_iter().enumerate() {
-            let (value, concrete) = self.read_ref_reg(caller_src);
-            sub_frame.ref_regs[callee_dst] = Some(value);
-            sub_frame.ref_values[callee_dst] = Some(concrete);
-        }
-        for (callee_dst, caller_src) in args_f.into_iter().enumerate() {
-            let (value, concrete) = self.read_float_reg(caller_src);
-            sub_frame.float_regs[callee_dst] = Some(value);
-            sub_frame.float_values[callee_dst] = Some(concrete);
-        }
+        // pyjitpl.py newframe decoder + fill_registers: write each callee
+        // slot as the caller bytecode names it. Do not collect the index
+        // lists (9 usizes = 72 B).
+        let result_dst = {
+            let caller = self.frames.current_mut();
+            if has_i_list {
+                let n = caller.next_u8() as usize;
+                caller.fill_registers(&mut sub_frame, n, b'I');
+            }
+            let n_r = caller.next_u8() as usize;
+            caller.fill_registers(&mut sub_frame, n_r, b'R');
+            if has_f_list {
+                let n_f = caller.next_u8() as usize;
+                caller.fill_registers(&mut sub_frame, n_f, b'F');
+            }
+            let result_dst = return_kind.map(|_| caller.next_reg() as usize);
+            caller._result_argcode = match return_kind {
+                Some(JitArgKind::Int) => b'i',
+                Some(JitArgKind::Ref) => b'r',
+                Some(JitArgKind::Float) => b'f',
+                None => b'v',
+            };
+            caller.result_arg_index = result_dst;
+            caller.pc = caller.code_cursor;
+            ctx.push_inline_frame((sub_idx, caller.pc), u32::MAX);
+            result_dst
+        };
 
         sub_frame.return_i = None;
         sub_frame.return_r = None;
