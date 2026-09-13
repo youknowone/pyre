@@ -110,6 +110,24 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
     frames.iter().any(|frame| frame.w_code == w_code)
 }
 
+/// True when two live frames share a `w_code`.  Inlining a raising leaf
+/// through two suspended copies of the same intermediate is the
+/// `selfrec_tail_exception_unwind` storm; a `shape → mid → leaf` chain of
+/// distinct codes is not.
+pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
+    let mut seen = Vec::with_capacity(frames.len());
+    for frame in frames {
+        if frame.w_code == 0 {
+            continue;
+        }
+        if seen.contains(&frame.w_code) {
+            return true;
+        }
+        seen.push(frame.w_code);
+    }
+    false
+}
+
 /// Total inline-stack bound for a callee after its same-greenkey recursion
 /// count has already been checked against the live `max_unroll_recursion`.
 ///
@@ -118,15 +136,24 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
 /// is the sole value-returning recursion bound.  FBW's generic multiframe cap
 /// is a local cost valve for non-recursive call chains and must not silently
 /// turn an upstream value of 7 into an effective 6 when an ambient inline
-/// frame is present.  Raising chains retain their separate depth-two safety
-/// bound because their carrier unwind crosses suspended frames.
+/// frame is present.
+///
+/// Raising chains keep a shallower local bound because the carrier unwind
+/// crosses suspended frames.  The second flag is "this callee is already on
+/// the stack, or two live frames already share a `w_code`" — that is the
+/// `selfrec_tail_exception_unwind` storm (a third copy of the same frame,
+/// `guard_failures` 937 → 7408).  A distinct `shape → mid → leaf` chain is
+/// not that shape and is admitted one level deeper so it matches
+/// `perform_call`, which has no raise-depth screen.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
-    recursive_portal_present: bool,
+    recursive_or_duplicate: bool,
 ) -> usize {
-    if contains_raise {
+    if contains_raise && recursive_or_duplicate {
         2
-    } else if recursive_portal_present {
+    } else if contains_raise {
+        3
+    } else if recursive_or_duplicate {
         usize::MAX
     } else {
         fbw_max_multiframe_depth()
@@ -165,6 +192,21 @@ mod recursion_depth_policy_tests {
     #[test]
     fn raising_recursion_keeps_the_carrier_unwind_safety_bound() {
         assert_eq!(fbw_effective_multiframe_depth(true, true), 2);
+    }
+
+    #[test]
+    fn non_recursive_raising_admits_portal_mid_leaf() {
+        assert_eq!(fbw_effective_multiframe_depth(true, false), 3);
+    }
+
+    #[test]
+    fn duplicate_w_code_on_stack_is_the_selfrec_unroll_shape() {
+        let frames = [frame(7, true), frame(7, true), frame(9, false)];
+        assert!(framestack_has_duplicate_w_code(&frames));
+        assert!(!framestack_has_duplicate_w_code(&[
+            frame(7, true),
+            frame(9, false)
+        ]));
     }
 }
 

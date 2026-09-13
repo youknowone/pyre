@@ -516,15 +516,35 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
+            if fbw_strict_diag_enabled() {
+                eprintln!("[strict-reject-mf] pc={pc} (undecodable)");
+            }
             return false;
         };
         if d.opname.starts_with("switch") {
+            if fbw_strict_diag_enabled() {
+                eprintln!("[strict-reject-mf] pc={} op={} (switch)", d.pc, d.opname);
+            }
             return false;
         }
         if d.opname.starts_with("goto_if_not") {
-            // `iL`: 2B LE label at operand offset 1 (after the 1B Int reg).
-            let target = read_label(body_code, &d, 1);
+            // Label is the last operand (`branch.rs` `goto.argcodes.len() - 1`,
+            // `label_operand_offset`).  A fused compare (`goto_if_not_int_lt/iiL`)
+            // puts two Int regs before `L`; reading offset 1 takes the second
+            // register as the label and treats a forward `if k < 0` as a
+            // back-edge, so `try_multiframe` refuses the callee.
+            // `perform_call` (`pyjitpl.py`) has no such screen.
+            let Some(off) = label_operand_offset(d.argcodes) else {
+                return false;
+            };
+            let target = read_label(body_code, &d, off);
             if target <= d.pc {
+                if fbw_strict_diag_enabled() {
+                    eprintln!(
+                        "[strict-reject-mf] pc={} op={} target={target} (backward branch)",
+                        d.pc, d.opname
+                    );
+                }
                 return false;
             }
         }
@@ -6131,20 +6151,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // drain builds once a guard inside the compiled chain fails.  The drain
     // walks the paused middle frames between the raising leaf and the root, so
     // one intermediate frame may sit between the loop and the raise; a middle
-    // that CATCHES is still declined, which is what holds the cap here instead
-    // of letting a raising chain run to `fbw_max_multiframe_depth`.  A
-    // value-returning chain (no raise) inlines to the full depth either way.
-    //
-    // Measured against one drain-complete binary, nine interleaved reps per
-    // arm: `bench/synth/exception_escape_caller_frame_tb_node` runs at 0.70x
-    // of the one-level cap, `bench/synth/gc_bug_bridge_flavor_traceback_names`
-    // at 1.02x and `bench/synth/selfrec_tail_exception_unwind` at 0.99x.  A
-    // third level regresses — `selfrec_tail_exception_unwind` takes
-    // `guard_failures` from 937 to 7408 — because the unwind then crosses two
-    // suspended copies of the same frame, the shape `fbw_max_rec_unroll_depth`
-    // bounds above.
-    let effective_multiframe_depth =
-        fbw_effective_multiframe_depth(contains_raise, recursive_portal_present);
+    // that CATCHES is still declined.  Two live copies of the same `w_code`
+    // stay at depth two because a third copy storms
+    // `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).  A
+    // distinct `shape → mid → leaf` chain is admitted at three so it follows
+    // `perform_call`.  A value-returning chain (no raise) inlines to the full
+    // depth either way.
+    // Value-returning recursion still keys only on this callee's own
+    // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
+    // only a raising-chain safety valve: it must not promote an unrelated
+    // value-returning callee to the unbounded recursive cap.
+    let effective_multiframe_depth = fbw_effective_multiframe_depth(
+        contains_raise,
+        if contains_raise {
+            recursive_portal_present
+                || framestack_has_duplicate_w_code(&ctx.session.borrow().framestack)
+        } else {
+            recursive_portal_present
+        },
+    );
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so neither replay safety nor an unseeded caller-boundary
@@ -6477,15 +6502,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     if branchy_poison_admit {
         inline_poison_pcs = Some(branchy_poisoned.into());
     }
+    // `can_inline_callable` / `perform_call` test no exception table and push
+    // an MIFrame for every admitted callee.  The replay screen below is only
+    // for an unseeded sub-walk, whose guards resume at the caller's CALL
+    // boundary and would double a live-heap write.  A seeded frame
+    // (`try_multiframe` / `strict_seed`, the `perform_call` shape) carries the
+    // callee's own resume coordinate, so the screen does not apply.  The
+    // foriter Dirty flag is the same exemption, but only `fbw_foriter_inflight`
+    // ever sets it; a regular CALL that already owns a seeded frame was still
+    // residualized here (`mutate_then_raise_caught`'s `step`).
+    let seeded_inline = try_multiframe || strict_seed;
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
         && !foriter_dirty_seeded_resume_admit
         && !branchy_poison_admit
+        && !seeded_inline
     {
-        // Keep the whole-body replay screen when the sub-walk is unseeded: its
-        // guard resumes at the caller's CALL boundary, so replaying the callee
-        // would double a live-heap write.  The admission above requires the
-        // seeded-frame shape of `MetaInterp.perform_call`, whose guard carries
-        // the callee's own resume coordinate instead.
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {
                 "InlineCallee::BranchyHandlerDeferredCall"
@@ -6501,7 +6532,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // emission would strand dead seed IR and force an abort/replay after the
     // callee already consumed external state.  RPython decides whether to
     // inline the graph before `perform_call` pushes its MIFrame.
-    let seeded_inline = try_multiframe || strict_seed;
     if !seeded_inline {
         // The remaining strict cases are deeper than the resume chain
         // currently supports. Keep the CALL residual instead of entering an
@@ -6515,12 +6545,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // neither predicate accepts declined here before this gate existed,
         // while the depth case is the one the seeded-only admission newly
         // residualizes.
+        let seeded_why = if !strict_inlinable {
+            "SeededInline::NeitherStrictNorMultiframe"
+        } else {
+            "SeededInline::OverMultiframeDepth"
+        };
         if fbw_debug_abort_enabled() {
-            crate::jitcode_dispatch::census_record(if !strict_inlinable {
-                "SeededInline::NeitherStrictNorMultiframe"
-            } else {
-                "SeededInline::OverMultiframeDepth"
-            });
+            crate::jitcode_dispatch::census_record(seeded_why);
+        }
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[seeded-inline-decline] pc={} why={seeded_why} \
+                 strict={strict_inlinable} mf={try_multiframe} depth={inline_depth}",
+                op.pc
+            );
         }
         return resolved_inline_decline(op.pc, line!());
     }
