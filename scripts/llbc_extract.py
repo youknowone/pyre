@@ -2834,15 +2834,16 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
         )
         before = parse_stamp(stamp)
         after = parse_stamp(current_stamp)
-        # The pre-build stamp is computed with `include_closure=False`
-        # (`closure=-`). That is not a moved tree: `stamp_skip_ok` already
-        # treats an uncomputed closure as "did not move". Comparing `-` to
-        # the post-build digest would refuse every first extract.
-        closure_moved = (
-            before.get("closure") != CLOSURE_UNCOMPUTED
-            and after.get("closure") != CLOSURE_UNCOMPUTED
-            and before.get("closure") != after.get("closure")
-        )
+        # Skip used `include_closure=False`. The stamp recomputed just
+        # before Charon must carry a real `closure=` digest so a
+        # closure-only edit during the multi-minute build is visible.
+        if before.get("closure") == CLOSURE_UNCOMPUTED:
+            raise SystemExit(
+                f"extract-llbc.py: pre-build stamp for {crate} has"
+                " closure=-; the post-skip stamp_for must compute a"
+                " real closure digest before Charon starts"
+            )
+        closure_moved = before.get("closure") != after.get("closure")
         external_moved = before.get("external") != after.get("external")
         if closure_moved or external_moved:
             invalidate_fingerprint(stamp_path, readfiles)
