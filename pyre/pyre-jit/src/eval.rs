@@ -629,8 +629,9 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
             as *mut majit_ir::GcRef,
     );
-    // W_BaseException is currently malloc_typed-immortal, so forwarding its
-    // carrier above does not make the collector visit traceback/context/args.
+    // Forwarding the exception carrier still does not walk its
+    // traceback/context/args slots; those sit behind the exception
+    // object's own offsets.
     // Preserve the children of the exception parked by
     // `ExecutionContext.pop_gen_or_coroutine`, just as the EC root walker does
     // for its active `sys_exc_value` slot.
