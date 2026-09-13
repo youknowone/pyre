@@ -242,6 +242,20 @@ impl QuasiImmutField {
         qmut.invalidate();
     }
 
+    /// Unlink, sweep, then run `store`, all under this field's lock.
+    /// Sweeping first means `GUARD_NOT_INVALIDATED` is already patched
+    /// when the new value is published; the lock keeps
+    /// [`Self::get_current_qmut_instance`] from installing a watcher
+    /// against the old value in between.
+    pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
+        let _guard = self.lock.lock();
+        let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !qmut_ptr.is_null() {
+            unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
+        }
+        store();
+    }
+
     /// Unlink the instance and hand the field's reference to the caller, who
     /// drops it. [`Self::invalidate`] sweeps first; a swept owner's destructor
     /// calls it on its own to release an instance that was never invalidated.
@@ -399,6 +413,31 @@ mod tests {
         assert!(field.is_installed());
         field.invalidate();
         assert!(flag2.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn invalidate_then_store_publishes_under_the_field_lock() {
+        let field = QuasiImmutField::new();
+        let flag = Arc::new(AtomicBool::new(false));
+        let token = test_loop_token(&flag);
+        field
+            .get_current_qmut_instance()
+            .register_loop_token(&token);
+
+        let published = AtomicBool::new(false);
+        field.invalidate_then_store(|| {
+            assert!(
+                !field.is_installed(),
+                "store must see the watcher already unlinked"
+            );
+            assert!(
+                flag.load(Ordering::Acquire),
+                "GUARD_NOT_INVALIDATED must be patched before the store"
+            );
+            published.store(true, Ordering::Release);
+        });
+        assert!(published.load(Ordering::Acquire));
+        assert!(!field.is_installed());
     }
 
     /// `quasiimmut.py QuasiImmutDescr.is_still_valid_for if qmut is not self.qmut` — a recording holds the

@@ -263,6 +263,44 @@ mod host_clock {
     }
 }
 
+// Browser clock for the `web` build. `Date.now` / `performance.now` are the
+// wall and monotonic clocks; wasm32's `SystemTime` panics, so without this
+// `datetime.date.today()` is always 1970-01-01.
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+mod web_clock {
+    use pyre_interpreter::module::time::interp_time::ClockProvider;
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = Date, js_name = now)]
+        fn date_now() -> f64;
+        #[wasm_bindgen(js_namespace = performance, js_name = now)]
+        fn performance_now() -> f64;
+    }
+
+    struct WebClock;
+
+    impl ClockProvider for WebClock {
+        fn wall_nanos(&self) -> i128 {
+            (date_now() * 1_000_000.0) as i128
+        }
+        fn monotonic_nanos(&self) -> i128 {
+            (performance_now() * 1_000_000.0) as i128
+        }
+        fn sleep_nanos(&self, _nanos: u64) {
+            // The browser event loop cannot block. A playground `time.sleep`
+            // returns immediately rather than freeze the tab.
+        }
+    }
+
+    pub fn install() {
+        pyre_interpreter::module::time::interp_time::install_clock_provider(std::sync::Arc::new(
+            WebClock,
+        ));
+    }
+}
+
 // Host-filesystem source provider for the native-host (`wasm-host`) build.
 //
 // wasm32 has no filesystem, but the wasmtime runner does, so module source is
@@ -922,7 +960,11 @@ fn run_python_impl(source: &str) -> String {
     // in-memory VFS; the native-host (`wasm-host`) build reads the host filesystem
     // through `pyre_host.*` imports the runner satisfies.
     #[cfg(feature = "web")]
-    pyre_interpreter::importing::mount_embedded_stdlib(std::path::Path::new("/lib-python/3"));
+    {
+        pyre_interpreter::importing::mount_embedded_stdlib(std::path::Path::new("/lib-python/3"));
+        #[cfg(target_arch = "wasm32")]
+        web_clock::install();
+    }
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     {
         // `pymain_sys_path_add_path0`: the script's directory heads

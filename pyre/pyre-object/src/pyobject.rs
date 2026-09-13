@@ -266,6 +266,36 @@ pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
 /// RPython: this corresponds to reading typeptr + gettypefor (fused into one field).
 pub const W_CLASS_OFFSET: usize = std::mem::offset_of!(PyObject, w_class);
 
+/// Hidden `mutate_w_class` for the header field spelled `w_class?`.
+///
+/// `__class__` assignment is rare and shared across every instance, so one
+/// process-global [`QuasiImmutField`] serves every object — the rtyper would
+/// synthesise a per-object slot, but a write already has to revoke every
+/// loop that folded any instance's class.
+static W_CLASS_WATCHERS: crate::quasiimmut::QuasiImmutField =
+    crate::quasiimmut::QuasiImmutField::new();
+
+/// `quasiimmut.py get_current_qmut_instance` for `PyObject.w_class`.
+pub fn w_class_current_qmut() -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
+    W_CLASS_WATCHERS.get_current_qmut_instance()
+}
+
+/// Invalidate loops that folded a `w_class` read. Call after a published
+/// object's class changes (`descr_set___class__`, exception retag).
+#[inline]
+pub fn notify_w_class_mutated() {
+    if W_CLASS_WATCHERS.is_installed() {
+        W_CLASS_WATCHERS.invalidate();
+    }
+}
+
+/// Unlink the `w_class?` watcher and publish `store` under the same lock
+/// so a tracer cannot fold the old class onto a freshly installed watcher.
+#[inline]
+pub fn notify_w_class_mutated_then(store: impl FnOnce()) {
+    W_CLASS_WATCHERS.invalidate_then_store(store);
+}
+
 /// Field offset of `subclassrange_min` within PyType (OBJECT_VTABLE).
 /// rclass.py — first field in OBJECT_VTABLE.
 pub const SUBCLASSRANGE_MIN_OFFSET: usize = std::mem::offset_of!(PyType, subclassrange_min);

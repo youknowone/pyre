@@ -13021,7 +13021,11 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         if crate::objspace::std::mapdict::has_mapdict_storage(w_obj) {
             crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
         }
-        (*w_obj).w_class = w_newcls;
+        // Unlink and store under one lock so a tracer cannot install a
+        // fresh watcher against the old class between the two.
+        pyre_object::notify_w_class_mutated_then(|| {
+            (*w_obj).w_class = w_newcls;
+        });
     }
     Ok(w_none())
 }

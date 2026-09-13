@@ -261,18 +261,22 @@ fn refresh_forwarded_const_ref(
     forwarded.refresh_const_ref(updated);
 }
 
-/// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` -
-/// `runtime_boxes` are
-/// the original boxes, InputArg and Op alike. Phase 2 recovers an Op arg's
-/// observed value through its producing op, but `find_producer_op` has
-/// nothing to return for an InputArg arg, so materialize the entry box's
-/// value as an inline Const, which carries it namespace-independently.
-/// `runtime_boxes` are only ever READ by `generate_guards`
-/// (`virtualstate.py generate_guards`); the guard it emits carries the target
-/// state's own constant, never this one.
+/// `pyjitpl.py compile_trace`'s `live_arg_boxes[num_green_args:]` —
+/// `runtime_boxes` are the original boxes, InputArg and Op alike.
+/// `generate_guards` reads them via `getint`/`getref_base` /
+/// `get_runtime_field` (virtualstate.py:48-55, :493). A raw OpRef does
+/// not carry `_resint`/`_resref`, so materialize each stamped value as
+/// an inline Const — the same recovery `closing_jump_runtime_boxes`
+/// already performs for bridges. InputArg values live on
+/// `trace_inputarg_boxes`; ResOp values live on the recorded producer
+/// (`set_concrete_at` → `Op::set_value`). Without the ResOp arm a
+/// virtual W_IntObject JUMP slot arrives as `RefOp(n)` with no
+/// readable intval, and `IntBounded` vs `Unknown(Int)` rejects the
+/// peel even though the first-iteration heap value is in range.
 fn fold_recorded_jump_args(
     args: Vec<OpRef>,
     inputarg_boxes: &[majit_ir::InputArgRc],
+    recorded_ops: &[Op],
 ) -> Vec<OpRef> {
     args.into_iter()
         .map(|arg| {
@@ -282,18 +286,20 @@ fn fold_recorded_jump_args(
                 }
                 _ => None,
             };
-            let Some(inputarg_box) = inputarg_index.and_then(|i| inputarg_boxes.get(i)) else {
-                return arg;
-            };
-            if Some(inputarg_box.tp) != arg.ty() {
-                return arg;
+            if let Some(inputarg_box) = inputarg_index.and_then(|i| inputarg_boxes.get(i))
+                && Some(inputarg_box.tp) == arg.ty()
+                && let Some(value) = inputarg_box.get_value()
+                && !matches!(value, Value::Void)
+            {
+                return OpRef::const_inline_from_value(&value);
             }
-            match inputarg_box.get_value() {
-                Some(value) if !matches!(value, Value::Void) => {
-                    OpRef::const_inline_from_value(&value)
-                }
-                _ => arg,
+            if let Some(op) = recorded_ops.iter().find(|op| op.pos().get() == arg)
+                && let Some(value) = op.get_value()
+                && !matches!(value, Value::Void)
+            {
+                return OpRef::const_inline_from_value(&value);
             }
+            arg
         })
         .collect()
 }
@@ -955,9 +961,20 @@ impl UnrollOptimizer {
             let recorded_jump_args = fold_recorded_jump_args(
                 ops.iter()
                     .rfind(|op| op.opcode == OpCode::Jump)
-                    .map(|op| op.getarglist().iter().map(|a| a.to_opref()).collect())
+                    .map(|op| {
+                        op.getarglist()
+                            .iter()
+                            .map(|a| match a.get_value() {
+                                Some(value) if !matches!(value, Value::Void) => {
+                                    OpRef::const_inline_from_value(&value)
+                                }
+                                _ => a.to_opref(),
+                            })
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 &self.trace_inputarg_boxes,
+                ops,
             );
             // Hand opt_p1 the per-iter operand pool that p1_iter
             // allocated. trace.get_iter() per-call
@@ -7511,6 +7528,28 @@ mod tests {
             state.runtime_boxes[0],
             OpRef::const_int(73),
             "recorded closing-JUMP entry InputArg must retain observed runtime value",
+        );
+    }
+
+    #[test]
+    fn test_recorded_jump_resop_keeps_observed_runtime_value() {
+        // closing_jump_runtime_boxes already lifts a stamped ResOp into an
+        // inline Const for bridges; fold_recorded_jump_args must do the
+        // same for the peeled-loop runtime_boxes channel.
+        let mut add = Op::new(
+            OpCode::IntAdd,
+            &[
+                rooted_inputarg_operand(Type::Int, 0),
+                rooted_inputarg_operand(Type::Int, 0),
+            ],
+        );
+        add.pos().set(OpRef::int_op(1));
+        add.set_value(Value::Int(73));
+        let folded = fold_recorded_jump_args(vec![OpRef::int_op(1)], &[], &[add]);
+        assert_eq!(
+            folded[0],
+            OpRef::const_int(73),
+            "recorded closing-JUMP ResOp must retain observed runtime value",
         );
     }
 

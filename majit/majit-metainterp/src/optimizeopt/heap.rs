@@ -965,8 +965,37 @@ impl OptHeap {
         qmutdescr: &majit_ir::QuasiImmutDescr,
         ctx: &mut OptContext,
     ) -> bool {
+        // `quasiimmut.py is_still_valid_for` compares the recorded gcref
+        // to the box now in the optimizer. `PyObject.w_class?` uses one
+        // process-global watcher (every instance shares the mutate
+        // field), so the recorded struct_ptr is whichever object the
+        // tracer happened to read — not the owner of the QuasiImmut.
+        // A later replacement of that box (force of a virtual int)
+        // must not look like the field changed. The watcher identity
+        // (`is_current`) still revokes on `__class__` assignment.
+        let shared_w_class_watcher = qmutdescr
+            .fielddescr()
+            .as_field_descr()
+            .is_some_and(|f| f.is_w_class());
         if struct_ptr != qmutdescr.struct_ptr() {
-            return false;
+            if !shared_w_class_watcher {
+                return false;
+            }
+            // Same watcher, different object: accept only when this
+            // object's class still matches the folded constant. Otherwise
+            // a polymorphic replacement would keep A's class on B.
+            let Some(constantfieldbox) = qmutdescr.constantfieldbox() else {
+                return false;
+            };
+            let Some(currentbox) = ctx
+                .get_runtime_field(obj, qmutdescr.fielddescr())
+                .and_then(|r| r.inline_const_to_value())
+            else {
+                return false;
+            };
+            if currentbox != constantfieldbox {
+                return false;
+            }
         }
         if !qmutdescr.qmut().is_current() {
             return false;

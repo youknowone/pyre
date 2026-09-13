@@ -95,4 +95,39 @@ mod tests {
     fn generated_stdlib_blob_round_trips() {
         assert!(!unpack(STDLIB_BLOB).unwrap().is_empty());
     }
+
+    #[test]
+    fn generated_stdlib_blob_contains_playground_modules() {
+        let names: std::collections::HashSet<String> = unpack(STDLIB_BLOB)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for need in [
+            "re/__init__.py",
+            "re/_parser.py",
+            "json/__init__.py",
+            "json/decoder.py",
+            "json/encoder.py",
+            "json/scanner.py",
+            "codecs.py",
+            "operator.py",
+            "datetime.py",
+            "locale.py",
+            "encodings/__init__.py",
+            "encodings/aliases.py",
+            "encodings/utf_8.py",
+            "ipaddress.py",
+            "random.py",
+            "pathlib/__init__.py",
+            "dataclasses.py",
+            "typing.py",
+            "urllib/parse.py",
+        ] {
+            assert!(
+                names.contains(need),
+                "embedded stdlib missing {need} (have {names:?})"
+            );
+        }
+    }
 }
