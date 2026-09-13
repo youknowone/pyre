@@ -5552,24 +5552,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
             intval_descr: pyre_jit_trace::descr::int_intval_descr(),
             int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
         });
-        let fnaddrs = pyre_interpreter::jit_trace_fnaddrs();
-        majit_metainterp::register_binary_op_residual(majit_metainterp::BinaryOpResidual {
-            fnaddrs: fnaddrs
-                .iter()
-                .filter(|(name, _)| {
-                    name.contains("jit_binary_value_from_tag") || name.contains("bh_binary_op_fn")
-                })
-                .map(|(_, addr)| *addr)
-                .collect(),
-            exclude_fnaddrs: fnaddrs
-                .iter()
-                .filter(|(name, _)| name.contains("jit_compare_value_from_tag"))
-                .map(|(_, addr)| *addr)
-                .collect(),
-            size_descr: pyre_jit_trace::descr::w_int_size_descr(),
-            intval_descr: pyre_jit_trace::descr::int_intval_descr(),
-            int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
-        });
     }
     let info = build_pyframe_virtualizable_info();
     let mut d = JitDriver::new(JIT_THRESHOLD);

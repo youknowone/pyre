@@ -1586,108 +1586,6 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    /// Specialise residual `jit_binary_value_from_tag` of two ints to
-    /// unbox + int_OP + wrapint, before `ForceToken` escapes the boxes.
-    fn try_record_int_binary_op(
-        &mut self,
-        ctx: &mut TraceCtx,
-        concrete_ptr: i64,
-        trace_ptr: i64,
-        args: &[OpRef],
-        arg_types: &[majit_ir::Type],
-        raw_i: &[i64],
-        raw_r: &[i64],
-        arg_classes: &str,
-        dst: usize,
-    ) -> Option<TraceAction> {
-        let spec = crate::box_trace::binary_op_residual()?;
-        if !spec.matches_call(concrete_ptr) && !spec.matches_call(trace_ptr) {
-            return None;
-        }
-        if arg_types
-            != [
-                majit_ir::Type::Ref,
-                majit_ir::Type::Ref,
-                majit_ir::Type::Int,
-            ]
-        {
-            return None;
-        }
-        if args.len() < 3 || raw_r.len() < 2 {
-            return None;
-        }
-        let tag = if let Some(majit_ir::Value::Int(t)) = ctx.box_value(args[2]) {
-            t
-        } else {
-            *raw_i.last().unwrap_or(&i64::MIN)
-        };
-        let (opcode, ovf) = crate::box_trace::int_binary_op_kind(tag)?;
-        if opcode == majit_ir::OpCode::IntMod {
-            // `box_value` of a wrapint NewWithVtable is the heap Ref, not
-            // the intval. Read the payload so rem-by-zero stays residual
-            // (ZeroDivision would abort the peel).
-            let rhs_int = match ctx.box_value(args[1]) {
-                Some(majit_ir::Value::Int(n)) => Some(n),
-                Some(majit_ir::Value::Ref(r)) => ctx
-                    .field_sanity_load(r.0 as i64, &spec.intval_descr, majit_ir::Type::Int)
-                    .and_then(|v| match v {
-                        majit_ir::Value::Int(n) => Some(n),
-                        _ => None,
-                    }),
-                _ => None,
-            };
-            if rhs_int == Some(0) || rhs_int.is_none() {
-                return None;
-            }
-        }
-        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
-        {
-            return None;
-        }
-        self.clear_exception();
-        let boxed_ptr = unsafe {
-            majit_backend::call_stub::bh_call_i_by_classes(
-                concrete_ptr as usize,
-                arg_classes,
-                Some(raw_i),
-                Some(raw_r),
-                Some(&[]),
-            )
-        };
-        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 || boxed_ptr == 0 {
-            ctx.pending_switch_to_blackhole =
-                Some(crate::pyjitpl::SwitchToBlackhole::abort_escape());
-            return Some(TraceAction::Abort);
-        }
-        let boxed = if ovf {
-            crate::box_trace::trace_int_binop_ovf(
-                ctx,
-                args[0],
-                args[1],
-                opcode,
-                spec.int_type_addr,
-                spec.intval_descr.clone(),
-                spec.size_descr.clone(),
-            )
-        } else {
-            crate::box_trace::trace_int_binop(
-                ctx,
-                args[0],
-                args[1],
-                opcode,
-                spec.int_type_addr,
-                spec.intval_descr.clone(),
-                spec.size_descr.clone(),
-            )
-        };
-        ctx.set_opref_concrete(
-            boxed,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
-        );
-        self.set_ref_reg(dst, Some(boxed), Some(boxed_ptr));
-        Some(TraceAction::Continue)
-    }
-
     fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
@@ -8797,24 +8695,6 @@ where
                     {
                         self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
                         return TraceAction::Continue;
-                    }
-
-                    // Int BINARY_OP (`jit_binary_value_from_tag`): specialise
-                    // before `ForceToken`. FBW `residual_call.rs` BinaryOp fold
-                    // emits unbox + int_OP + wrapint so the call does not
-                    // escape virtual int boxes.
-                    if let Some(action) = self.try_record_int_binary_op(
-                        ctx,
-                        concrete_ptr as i64,
-                        trace_ptr as i64,
-                        &args,
-                        &arg_types,
-                        &raw_i,
-                        &raw_r,
-                        &calldescr.arg_classes,
-                        dst,
-                    ) {
-                        return action;
                     }
 
                     // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:
