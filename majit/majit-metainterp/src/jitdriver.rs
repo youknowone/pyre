@@ -2869,7 +2869,7 @@ impl<S: JitState> JitDriver<S> {
     pub fn run_pending_abort_blackhole(&mut self, state: &mut S, env: &S::Env) -> Option<usize> {
         let pending = self.meta.pending_abort_blackhole.take()?;
         let PendingAbortBlackhole {
-            mut framestack,
+            framestack,
             scalar_values,
             ref_scalar_values,
             virt_array_values,
@@ -2877,6 +2877,11 @@ impl<S: JitState> JitDriver<S> {
             last_exc_value,
             raising_exception,
         } = pending;
+        // pyjitpl.py popframe appends to free_frames_list; the standalone
+        // walk's pool is that list. Recycle on every exit, including the
+        // unseeded-array decline below.
+        let mut recycle = crate::pyjitpl::RecycleFramestackOnDrop(framestack);
+        let framestack = &mut recycle.0;
         let layout = state.state_field_layout();
         if !layout.array_lens.is_empty() {
             if crate::majit_log_enabled() {
@@ -2935,7 +2940,7 @@ impl<S: JitState> JitDriver<S> {
         let staticdata = &self.meta.staticdata;
         let outcome = drive_multi_frame_blackhole(
             &mut bh_builder,
-            &mut framestack,
+            framestack,
             layout.clone(),
             vinfo_ptr,
             virtualizable_ptr,
@@ -3697,7 +3702,9 @@ impl<S: JitState> JitDriver<S> {
         // ran (a `jit_merge_point!` expansion without a `state` argument, or a
         // non-macro driver).  It names frames from a finished walk, so drop it
         // rather than let this merge point's handoff read it.
-        self.meta.pending_abort_blackhole = None;
+        if let Some(pending) = self.meta.pending_abort_blackhole.take() {
+            crate::pyjitpl::recycle_framestack(pending.framestack);
+        }
         if self.sym.is_none() || self.meta.trace_meta().is_none() {
             crate::debug::log_one("jit-abort", "mp: abort:sym_none");
             self.meta.abort_trace(false);
