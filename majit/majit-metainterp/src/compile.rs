@@ -3127,8 +3127,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             // slot is a listiter. Leftover extras past the mint, or a
             // mint slot that is a frame, must not stay on GETFIELD
             // (`'frame' object is not an iterator`).
-            if src.is_input_arg() && src.ty() == Some(Type::Ref) && !tos_sources.contains(&src)
-            {
+            if src.is_input_arg() && src.ty() == Some(Type::Ref) && !tos_sources.contains(&src) {
                 if src.raw() >= expanded_len as u32 {
                     tos_sources.push(src);
                 } else if leftover_has_listiter_id()
@@ -3141,9 +3140,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                     let slot = if idx < n_static {
                         unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
                     } else if !vinfo.array_fields.is_empty() {
-                        unsafe {
-                            vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8
-                        }
+                        unsafe { vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8 }
                     } else {
                         std::ptr::null()
                     };
@@ -3159,9 +3156,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // TOS_RELOAD can fall back to GETFIELD when peel preview is not a
     // listiter (range-for). Aborting those traces SNAPDIFF'd unrelated
     // fixtures.
-    let listiter_leftover = tos_sources
-        .iter()
-        .any(|s| s.raw() >= expanded_len as u32);
+    let listiter_leftover = tos_sources.iter().any(|s| s.raw() >= expanded_len as u32);
     // ForIterNext residual leftover (no Getfield seq). Bind it to the
     // peeled TOS only when leftover-empty would otherwise GETFIELD a
     // portal slot that is not the iterator. Leftover numbering is the
@@ -3219,8 +3214,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                             unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
                         } else if !vinfo.array_fields.is_empty() {
                             unsafe {
-                                vinfo.read_array_item(orig_vable, 0, idx - n_static)
-                                    as *const u8
+                                vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8
                             }
                         } else {
                             std::ptr::null()
@@ -3338,8 +3332,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             if *mint_index != LISTITER_TOS_RELOAD {
                 return false;
             }
-            if source.raw() < entry_prefix_len as u32 || (source.raw() as usize) >= expanded_len
-            {
+            if source.raw() < entry_prefix_len as u32 || (source.raw() as usize) >= expanded_len {
                 return false;
             }
             let idx = source.raw() as usize - entry_prefix_len;
@@ -3414,7 +3407,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             op.getdescr().is_some_and(|d| {
                 d.as_call_descr().is_some_and(|cd| {
                     cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
-                }) || d.as_field_descr().is_some_and(crate::history::is_list_iter_seq_field)
+                }) || d
+                    .as_field_descr()
+                    .is_some_and(crate::history::is_list_iter_seq_field)
             })
         });
         if has_foriter {
