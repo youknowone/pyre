@@ -3195,7 +3195,7 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
         frame,
         ca,
     };
-    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs)
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs)
         .expect("cover-check publish must still declare the union residual");
     validate_wasm(&bytes);
     let mut ptr_eqs = 0usize;
