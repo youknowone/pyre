@@ -5619,11 +5619,20 @@ fn assemble_peeled_trace_with_jump_args(
     } else {
         full_label_args.as_slice()
     };
-    let mut stream_defs: indexmap::IndexSet<OpRef> = remap_dsts
-        .iter()
-        .copied()
-        .filter(|a| is_trace_runtime_ref(*a, constants))
-        .collect();
+    // Values available BEFORE the loop LABEL. The start LABEL's args are
+    // live only when that LABEL is actually emitted; the loop LABEL's
+    // args are destinations of that LABEL, not producers. Seeding them
+    // here drops the fallthrough SameAs that binds a preamble box onto
+    // a remapped LABEL slot.
+    let mut stream_defs: indexmap::IndexSet<OpRef> = if emit_start_label {
+        start_label_args
+            .iter()
+            .copied()
+            .filter(|a| is_trace_runtime_ref(*a, constants))
+            .collect()
+    } else {
+        indexmap::IndexSet::new()
+    };
     for op in &result {
         if !op.pos().get().is_none() && op.opcode != OpCode::Jump && op.result_type() != Type::Void
         {
