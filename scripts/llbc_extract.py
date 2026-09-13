@@ -1551,6 +1551,12 @@ def charon_version(charon_dest: Path) -> str:
     return stamp.read_text().strip() if stamp.exists() else "unknown"
 
 
+# Placeholder `stamp_for(..., include_closure=False)` writes instead of
+# walking the cargo closure. `stamp_skip_ok` treats it as "not computed"
+# rather than "closure moved".
+CLOSURE_UNCOMPUTED = "-"
+
+
 def stamp_for(
     eng: Engine,
     *,
@@ -1563,7 +1569,13 @@ def stamp_for(
     layout_targets: list[str],
     layout_flags: list[str],
     artefacts: str,
+    include_closure: bool = True,
 ) -> str:
+    closure = (
+        closure_fingerprint(eng, [crate], cargo_features)
+        if include_closure
+        else CLOSURE_UNCOMPUTED
+    )
     return "\n".join(
         [
             f"crate={crate}",
@@ -1583,7 +1595,8 @@ def stamp_for(
             # The old wide source hash remains as a residual detector. A move
             # here alone warns: the artefact's declared read set did not move,
             # but a new trait impl outside that set can still affect resolution.
-            f"closure={closure_fingerprint(eng, [crate], cargo_features)}",
+            # Skip does not need this walk: `closure=` is not a gate.
+            f"closure={closure}",
             # Inputs `source=` structurally cannot cover: everything outside
             # this repo. Kept as its own field rather than folded into
             # `source=` so `check`'s per-field diff can say WHICH side moved —
@@ -1657,7 +1670,11 @@ def stamp_skip_ok(recorded_text: str, expected: str) -> tuple[bool, bool]:
     if any(key not in recorded for key in STAMP_KEYS):
         return False, False
     gates_match = all(recorded[key] == want.get(key) for key in STAMP_GATE_KEYS)
-    closure_moved = recorded.get("closure") != want.get("closure")
+    want_closure = want.get("closure")
+    if want_closure == CLOSURE_UNCOMPUTED:
+        closure_moved = False
+    else:
+        closure_moved = recorded.get("closure") != want_closure
     return gates_match, closure_moved
 
 
@@ -2443,6 +2460,7 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
             layout_targets=crate_layout_targets(eng, spec),
             layout_flags=layout_flags,
             artefacts=artefacts_fingerprint(eng, spec, dest_dir),
+            include_closure=False,
         )
 
         sidecars = [

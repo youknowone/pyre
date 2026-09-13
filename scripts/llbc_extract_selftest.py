@@ -265,6 +265,16 @@ def run_stamp_skip(engine) -> int:
     ok, _ = engine.stamp_skip_ok(missing + "\n", expected)
     expect("stamp missing a gate field refuses the skip", not ok)
 
+    uncomputed = "\n".join(
+        f"{key}={engine.CLOSURE_UNCOMPUTED if key == 'closure' else base[key]}"
+        for key in keys
+    )
+    ok, closure_moved = engine.stamp_skip_ok(recorded, uncomputed)
+    expect(
+        "uncomputed closure still skips and does not claim it moved",
+        ok and not closure_moved,
+    )
+
     return failures
 
 
