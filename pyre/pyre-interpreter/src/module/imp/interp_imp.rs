@@ -887,12 +887,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // when constructing loader_state.  This is load-bearing when
                 // the 3.14 tests import a fresh source copy of importlib and
                 // its `_setup` repairs already-loaded frozen modules.
-                let w_origname = pyre_object::w_str_new(entry.origname.unwrap_or(entry.name));
+                let origname_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
+                    entry.origname.unwrap_or(entry.name),
+                ));
                 unsafe {
                     pyre_object::w_dict_setitem_str(
                         pyre_object::gc_roots::shadow_stack_get(globals_slot),
                         "__origname__",
-                        w_origname,
+                        pyre_object::gc_roots::shadow_stack_get(origname_slot),
                     );
                 }
                 // `PyImport_ImportFrozenModuleObject`: a frozen *package* gets
@@ -937,13 +940,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ns,
         "_frozen_module_names",
         crate::make_builtin_function("_frozen_module_names", |_| {
-            Ok(pyre_object::w_list_new(
-                FROZEN_MODULES
-                    .iter()
-                    .filter(|entry| frozen_module_served(entry))
-                    .map(|entry| pyre_object::w_str_new(entry.name))
-                    .collect(),
-            ))
+            let mut names = pyre_object::gc_roots::RootedItems::new();
+            for entry in FROZEN_MODULES
+                .iter()
+                .filter(|entry| frozen_module_served(entry))
+            {
+                names.push(pyre_object::w_str_new_managed(entry.name));
+            }
+            Ok(pyre_object::w_list_new(names.take()))
         }),
     );
     crate::module_ns_store(

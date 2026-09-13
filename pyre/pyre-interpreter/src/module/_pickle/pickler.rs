@@ -1811,7 +1811,7 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
         // proto 0: UNICODE + raw-unicode-escape. The codec leaves
         // backslash / NUL / newline / CR / EOF-on-DOS literal, so escape
         // those first; the load side reverses with raw-unicode-escape.
-        let mut w_tmp = w_obj;
+        let mut w_tmp_slot = slot;
         for (from, to) in [
             ("\\", "\\u005c"),
             ("\0", "\\u0000"),
@@ -1819,16 +1819,28 @@ fn save_str(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
             ("\r", "\\u000d"),
             ("\u{1a}", "\\u001a"),
         ] {
-            w_tmp = call_meth(
-                w_tmp,
+            let from_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(from));
+            let to_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(to));
+            let replaced = call_meth(
+                pyre_object::gc_roots::shadow_stack_get(w_tmp_slot),
                 "replace",
-                &[pyre_object::w_str_new(from), pyre_object::w_str_new(to)],
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(from_slot),
+                    pyre_object::gc_roots::shadow_stack_get(to_slot),
+                ],
             )?;
+            w_tmp_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(replaced);
         }
+        let encoding_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed("raw-unicode-escape"));
         let w_enc = call_meth(
-            w_tmp,
+            pyre_object::gc_roots::shadow_stack_get(w_tmp_slot),
             "encode",
-            &[pyre_object::w_str_new("raw-unicode-escape")],
+            &[pyre_object::gc_roots::shadow_stack_get(encoding_slot)],
         )?;
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_enc) };
         buf.push(op::UNICODE);

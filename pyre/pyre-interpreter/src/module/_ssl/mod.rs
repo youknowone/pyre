@@ -505,7 +505,7 @@ fn decoded_certificate_dict(cert: *mut pyre_native::ssl::DecodedCertificate) -> 
             let kind = unsafe { pyre_native::ssl::certificate_san_kind(cert, index) };
             let entry = {
                 let mut pair = pyre_object::gc_roots::RootedItems::new();
-                pair.push(w_str_new(kind));
+                pair.push(w_str_new_managed(kind));
                 let value = if kind == "DirName" {
                     decoded_directory_name(cert, index)
                 } else {
@@ -1663,14 +1663,25 @@ mod ssl_socket_methods {
             let _ = pyre_object::gc_roots::pin_root(owner);
             let data_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&event.data));
+            let direction_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(if event.write {
+                "write"
+            } else {
+                "read"
+            }));
+            // Ints are non-moving, but minting them can collect and move the
+            // direction string, so the call reloads it from the slot.
+            let version = w_int_new(event.version as i64);
+            let content_type = w_int_new(event.content_type as i64);
+            let message_type = w_int_new(event.message_type as i64);
             crate::call::call_function_impl_result(
                 context.msg_callback,
                 &[
                     pyre_object::gc_roots::shadow_stack_get(owner_slot),
-                    w_str_new(if event.write { "write" } else { "read" }),
-                    w_int_new(event.version as i64),
-                    w_int_new(event.content_type as i64),
-                    w_int_new(event.message_type as i64),
+                    pyre_object::gc_roots::shadow_stack_get(direction_slot),
+                    version,
+                    content_type,
+                    message_type,
                     pyre_object::gc_roots::shadow_stack_get(data_slot),
                 ],
             )?;

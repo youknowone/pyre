@@ -8377,10 +8377,15 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             interp_exceptions::w_exception_set_import_name_from,
         ),
     ] {
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(key));
         let popped = crate::baseobjspace::call_method(
             pyre_object::gc_roots::shadow_stack_get(base + 1),
             "pop",
-            &[pyre_object::w_str_new(key), pyre_object::w_none()],
+            &[
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::w_none(),
+            ],
         );
         if popped.is_null()
             && let Some(e) = crate::call::take_call_error()

@@ -1063,11 +1063,12 @@ fn run_python_impl(source: &str) -> String {
         let _ = pyre_object::gc_roots::pin_root(canonical);
         let key_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__file__"));
-        let w_path = pyre_object::w_str_new_managed(path);
+        let path_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(path));
         let _ = pyre_interpreter::baseobjspace::setitem(
             pyre_object::gc_roots::shadow_stack_get(globals_slot),
             pyre_object::gc_roots::shadow_stack_get(key_slot),
-            w_path,
+            pyre_object::gc_roots::shadow_stack_get(path_slot),
         );
     }
 

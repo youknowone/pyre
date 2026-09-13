@@ -2159,15 +2159,15 @@ impl PyError {
         // decode failure would mean a byte none of them put there; read it the
         // way a filesystem name is read so it keeps its escape instead of
         // folding to U+FFFD, and so this sink and the fd sink agree.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let stream_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stderr);
         let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
             Some(text) => pyre_object::w_str_from_wtf8_managed(text.to_wtf8_buf()),
             None => {
                 pyre_object::w_str_from_wtf8_managed(crate::gateway::fsdecode_filename_wtf8(buf))
             }
         };
-        let _roots = pyre_object::gc_roots::push_roots();
-        let stream_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(stderr);
         let _ = pyre_object::gc_roots::pin_root(w_text);
         let text_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let result = crate::baseobjspace::call_method(

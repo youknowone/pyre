@@ -25303,14 +25303,15 @@ pub(crate) fn unicode_encode_error(
     reason: &str,
 ) -> crate::PyError {
     let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(pyre_object::w_str_new_managed(encoding));
+    // Pin the object before minting the encoding/reason strings.
     fields.push(w_object);
+    fields.push(pyre_object::w_str_new_managed(encoding));
     fields.push(pyre_object::w_int_new(start));
     fields.push(pyre_object::w_int_new(end));
     fields.push(pyre_object::w_str_new_managed(reason));
     let items = fields.take();
-    let w_encoding = items[0];
-    let w_object = items[1];
+    let w_object = items[0];
+    let w_encoding = items[1];
     let w_start = items[2];
     let w_end = items[3];
     let w_reason = items[4];
@@ -25327,7 +25328,9 @@ pub(crate) fn unicode_encode_error(
         pyre_object::interp_exceptions::w_exception_set_end(exc, w_end);
         pyre_object::interp_exceptions::w_exception_set_reason(exc, w_reason);
         // W_BaseException.descr_init: args_w = [encoding, object, start, end, reason]
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(items);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
+            w_encoding, w_object, w_start, w_end, w_reason,
+        ]);
         pyre_object::interp_exceptions::w_exception_set_args(exc, args_list);
         crate::PyError::from_exc_object(exc)
     }
@@ -29234,7 +29237,7 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
         let index = pyre_object::w_set_iter_get_index(args[0]);
-        let mut remaining = Vec::with_capacity(startlen.saturating_sub(index));
+        let mut remaining = pyre_object::gc_roots::RootedItems::new();
         let mut i = pyre_object::w_set_iter_get_slot(args[0]);
         while let Some(slot) = pyre_object::w_set_next_slot(w_set, i) {
             if let Some(key) = pyre_object::w_set_key_at(w_set, slot) {
@@ -29242,7 +29245,7 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
             i = slot + 1;
         }
-        let list = pyre_object::w_list_new(remaining);
+        let list = pyre_object::w_list_new(remaining.take());
         let mut state = pyre_object::gc_roots::RootedItems::new();
         state.push(list);
         let state = pyre_object::w_tuple_new(state.take());

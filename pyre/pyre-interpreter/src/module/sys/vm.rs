@@ -3874,7 +3874,7 @@ pub fn audit(event: &str, args_w: &[pyre_object::PyObjectRef]) -> Result<(), cra
     // emit runs off the reloaded values.
     let _roots = pyre_object::gc_roots::push_roots();
     let args_slot = pyre_object::gc_roots::pin_roots(args_w);
-    let w_event = w_str_new(event);
+    let w_event = pyre_object::gc_roots::pin_root(w_str_new_managed(event));
     let args_w: Vec<pyre_object::PyObjectRef> = (0..args_w.len())
         .map(|i| pyre_object::gc_roots::shadow_stack_get(args_slot + i))
         .collect();

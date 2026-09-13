@@ -405,10 +405,12 @@ fn tuple_index(t: PyObjectRef, item: PyObjectRef) -> Result<Option<usize>, crate
     let item = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let n = unsafe { w_tuple_len(t()) };
     for i in 0..n {
-        if let Some(x) = unsafe { w_tuple_getitem(t(), i as i64) }
-            && crate::baseobjspace::eq_w(x, item())?
-        {
-            return Ok(Some(i));
+        if let Some(x) = unsafe { w_tuple_getitem(t(), i as i64) } {
+            let x_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(x);
+            if crate::baseobjspace::eq_w(pyre_object::gc_roots::shadow_stack_get(x_slot), item())? {
+                return Ok(Some(i));
+            }
         }
     }
     Ok(None)
@@ -1207,8 +1209,15 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
         let b = pyre_object::gc_roots::pin_root(b);
         let b_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let ah = w_union_get_hashable_args(a);
+        let ah_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(ah);
         let bh = w_union_get_hashable_args(b);
-        if !crate::baseobjspace::eq_w(ah, bh)? {
+        let bh_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(bh);
+        if !crate::baseobjspace::eq_w(
+            pyre_object::gc_roots::shadow_stack_get(ah_slot),
+            pyre_object::gc_roots::shadow_stack_get(bh_slot),
+        )? {
             return Ok(false);
         }
         let aa = w_union_get_unhashable_args(pyre_object::gc_roots::shadow_stack_get(a_slot));
@@ -1231,14 +1240,22 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
             else {
                 return Ok(false);
             };
+            let x_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(x);
             let mut found = false;
             for j in 0..nb {
                 if let Some(y) =
                     w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(bb_slot), j as i64)
-                    && crate::baseobjspace::eq_w(x, y)?
                 {
-                    found = true;
-                    break;
+                    let y_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(y);
+                    if crate::baseobjspace::eq_w(
+                        pyre_object::gc_roots::shadow_stack_get(x_slot),
+                        pyre_object::gc_roots::shadow_stack_get(y_slot),
+                    )? {
+                        found = true;
+                        break;
+                    }
                 }
             }
             if !found {
@@ -1251,14 +1268,22 @@ pub(crate) fn union_set_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, crate
             else {
                 return Ok(false);
             };
+            let x_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(x);
             let mut found = false;
             for j in 0..na {
                 if let Some(y) =
                     w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(aa_slot), j as i64)
-                    && crate::baseobjspace::eq_w(x, y)?
                 {
-                    found = true;
-                    break;
+                    let y_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(y);
+                    if crate::baseobjspace::eq_w(
+                        pyre_object::gc_roots::shadow_stack_get(x_slot),
+                        pyre_object::gc_roots::shadow_stack_get(y_slot),
+                    )? {
+                        found = true;
+                        break;
+                    }
                 }
             }
             if !found {
