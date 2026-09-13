@@ -169,14 +169,16 @@ impl QuasiImmut {
 /// because that bare test is the whole cost a mutation on an object no loop
 /// watches has to pay.
 ///
-/// Both owners are allocated non-moving (`try_gc_alloc_stable_raw` /
-/// `malloc_typed`), so the lock cannot be remapped out from under a holder and
-/// no address-striped indirection is needed. The critical section allocates
-/// nothing GC-managed and crosses no safepoint, so it cannot park a mutator the
-/// collector is waiting for.
+/// The lock lives in a heap box, not inline. Upstream's owner is a
+/// nursery `malloc_fixedsize` object (`function.py` `Function` /
+/// `StaticMethod`); an embedded `parking_lot::Mutex` cannot move, so
+/// the lock is allocated on first use and the field stores only the
+/// pointer. A minor collection memcpy's that word. The critical section
+/// allocates nothing GC-managed and crosses no safepoint, so it cannot
+/// park a mutator the collector is waiting for.
 pub struct QuasiImmutField {
     ptr: AtomicPtr<QuasiImmut>,
-    lock: parking_lot::Mutex<()>,
+    lock: AtomicPtr<parking_lot::Mutex<()>>,
 }
 
 impl Default for QuasiImmutField {
@@ -189,8 +191,30 @@ impl QuasiImmutField {
     pub const fn new() -> Self {
         Self {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
-            lock: parking_lot::Mutex::new(()),
+            lock: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        let existing = self.lock.load(Ordering::Acquire);
+        let mutex = if existing.is_null() {
+            let fresh = Box::into_raw(Box::new(parking_lot::Mutex::new(())));
+            match self.lock.compare_exchange(
+                std::ptr::null_mut(),
+                fresh,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => fresh,
+                Err(winner) => {
+                    drop(unsafe { Box::from_raw(fresh) });
+                    winner
+                }
+            }
+        } else {
+            existing
+        };
+        unsafe { (*mutex).lock() }
     }
 
     /// Whether any read has been recorded since the last invalidation — the
@@ -211,7 +235,7 @@ impl QuasiImmutField {
     /// `compile.py register_loop_token` both read later; pyre returns it
     /// for the same two consumers.
     pub fn get_current_qmut_instance(&self) -> Arc<QuasiImmut> {
-        let _guard = self.lock.lock();
+        let _guard = self.lock();
         let qmut_ptr = self.ptr.load(Ordering::Acquire);
         if qmut_ptr.is_null() {
             let fresh = Arc::new(QuasiImmut::new());
@@ -248,7 +272,7 @@ impl QuasiImmutField {
     /// [`Self::get_current_qmut_instance`] from installing a watcher
     /// against the old value in between.
     pub fn invalidate_then_store<F: FnOnce()>(&self, store: F) {
-        let _guard = self.lock.lock();
+        let _guard = self.lock();
         let qmut_ptr = self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !qmut_ptr.is_null() {
             unsafe { Arc::from_raw(qmut_ptr) }.invalidate();
@@ -265,7 +289,7 @@ impl QuasiImmutField {
     /// the compiler registering into freed memory.
     pub fn take(&self) -> Option<Arc<QuasiImmut>> {
         let qmut_ptr = {
-            let _guard = self.lock.lock();
+            let _guard = self.lock();
             self.ptr.swap(std::ptr::null_mut(), Ordering::AcqRel)
         };
         if qmut_ptr.is_null() {
@@ -282,6 +306,10 @@ impl Drop for QuasiImmutField {
         let qmut_ptr = *self.ptr.get_mut();
         if !qmut_ptr.is_null() {
             drop(unsafe { Arc::from_raw(qmut_ptr) });
+        }
+        let lock = *self.lock.get_mut();
+        if !lock.is_null() {
+            drop(unsafe { Box::from_raw(lock) });
         }
     }
 }

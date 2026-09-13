@@ -211,14 +211,18 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// syntactically and declines to emit one for an aliased return type.
 #[majit_macros::dont_look_inside]
 pub fn w_int_gc_alloc(value: i64) -> *mut PyObject {
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+    // Class word first: `get_instantiate` can allocate. The residual
+    // return is a GCREF (`*mut PyObject`), so the bump is
+    // `malloc_fixedsize` — same as `w_tuple_new`.
+    let w_class = get_instantiate(&INT_TYPE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
     if raw.is_null() {
         return crate::PY_NULL;
     }
     unsafe {
         let p = raw as *mut W_IntObject;
         (*p).ob_header.ob_type = &INT_TYPE as *const PyType;
-        (*p).ob_header.w_class = get_instantiate(&INT_TYPE);
+        (*p).ob_header.w_class = w_class;
         (*p).intval = value;
     }
     raw as PyObjectRef
@@ -272,7 +276,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         map: 0,
         storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_INT_USER_GC_TYPE_ID.get(),
         std::mem::size_of::<W_IntObjectUser>(),
     );

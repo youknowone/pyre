@@ -125,18 +125,17 @@ pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef 
     // the shadow stack so the moving collector keeps it alive and rewrites
     // the slot; we read the relocated address back after the malloc.
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(value);
+    let save_point = crate::gc_roots::pin_roots(&[value]);
     let header = PyObject {
         ob_type: &CELL_TYPE as *const PyType,
         w_class: get_instantiate(&CELL_TYPE),
     };
-    // Route through the managed allocator like `w_list_new`/`w_tuple_new`.
+    // Same nursery bump as `w_tuple_new` / `w_slice_new` (`malloc_fixedsize`).
     // A cell whose `contents` is reachable only through this cell (e.g. a
     // closure cellvar) must itself be GC-traced; a `malloc_typed`
     // (`std::alloc`) cell is invisible to `is_managed_heap_object`, so the
     // mark-sweep skips it and the only-reachable-via-cell value is swept.
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE);
     let value = crate::gc_roots::shadow_stack_get(save_point);
     if !raw.is_null() {
         unsafe {
@@ -149,10 +148,10 @@ pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef 
                 },
             );
         }
-        // The cell lives in old-gen (`try_gc_alloc_stable`); `contents` may
-        // still be a nursery object. Register the cell so the next minor
-        // collection scans it (incminimark.py write_barrier) and
-        // relocates a young value held only by `contents`.
+        // Nursery-full spills this header to old-gen while `contents` may
+        // still be young. `try_gc_write_barrier` is a no-op on a young
+        // header and records the old-gen store when the bump spilled
+        // (incminimark.py `write_barrier`).
         crate::gc_hook::try_gc_write_barrier(raw);
         return raw as PyObjectRef;
     }

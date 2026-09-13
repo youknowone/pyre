@@ -91,6 +91,10 @@ jobs:
   cpyext-abi:
     name: cpyext ABI
     runs-on: ubuntu-24.04
+    # Same cheap gate as the prepare jobs. The ABI check itself is a
+    # Python script and needs no cargo, but starting it beside pre-commit
+    # made a rustfmt-red PR also light the ABI job first.
+    needs: pre-commit
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
