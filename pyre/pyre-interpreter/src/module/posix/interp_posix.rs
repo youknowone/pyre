@@ -2541,13 +2541,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
+            use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
             // CPython 3.14 `_Py_get_blocking`: translate the CRT descriptor
             // through the host seam, then read PIPE_NOWAIT from the pipe's
-            // current mode.  GetNamedPipeHandleStateW is one of the narrow nt
-            // calls host_env does not wrap, like the other windows-sys calls
-            // owned by this crate.
+            // current mode.
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
                 .map_err(|error| {
                     crate::PyError::os_error_syscall(
@@ -2561,25 +2559,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     pyre_object::PY_NULL,
                 )
             })?;
-            let mut mode = 0;
-            let success = unsafe {
-                GetNamedPipeHandleStateW(
-                    handle.as_raw_handle() as _,
-                    &mut mode,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
+            let mode = rustpython_host_env::winapi::get_named_pipe_handle_state(
+                handle.as_raw_handle(),
+            )
+            .map_err(|error| {
+                crate::PyError::os_error_win32_syscall2(
+                    error.raw_os_error().unwrap_or(
+                        rustpython_host_env::winapi::get_last_error() as i32,
+                    ),
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
                 )
-            };
-            if success == 0 {
-                return Err(crate::PyError::os_error_win32_syscall2(
-                    rustpython_host_env::winapi::get_last_error() as i32,
-                    pyre_object::PY_NULL,
-                    pyre_object::PY_NULL,
-                ));
-            }
+            })?;
             Ok(pyre_object::w_bool_from(mode & PIPE_NOWAIT == 0))
         }
         #[cfg(any(
@@ -2639,7 +2630,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Pipes::{GetNamedPipeHandleStateW, PIPE_NOWAIT};
+            use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
             // CPython 3.14 `_Py_set_blocking` maps a CRT descriptor back to
             // its pipe HANDLE and flips PIPE_NOWAIT with
@@ -2659,25 +2650,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     pyre_object::PY_NULL,
                 )
             })?;
-            let mut mode = 0;
-            let success = unsafe {
-                GetNamedPipeHandleStateW(
-                    handle.as_raw_handle() as _,
-                    &mut mode,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    0,
+            let mut mode = rustpython_host_env::winapi::get_named_pipe_handle_state(
+                handle.as_raw_handle(),
+            )
+            .map_err(|error| {
+                crate::PyError::os_error_win32_syscall2(
+                    error.raw_os_error().unwrap_or(
+                        rustpython_host_env::winapi::get_last_error() as i32,
+                    ),
+                    pyre_object::PY_NULL,
+                    pyre_object::PY_NULL,
                 )
-            };
-            if success == 0 {
-                return Err(crate::PyError::os_error_win32_syscall2(
-                    rustpython_host_env::winapi::get_last_error() as i32,
-                    pyre_object::PY_NULL,
-                    pyre_object::PY_NULL,
-                ));
-            }
+            })?;
             if blocking {
                 mode &= !PIPE_NOWAIT;
             } else {

@@ -13,50 +13,71 @@
 //! every call.
 
 use pyre_object::{PY_NULL, PyObjectRef};
-use windows_sys::Win32::System::Rpc::{
-    RPC_S_OK, RPC_S_UUID_LOCAL_ONLY, RPC_S_UUID_NO_ADDRESS, UuidCreateSequential,
-};
-use windows_sys::core::GUID;
 
-/// One `UuidCreateSequential` call, answering the raw UUID and its status.
-fn create_sequential() -> (GUID, i32) {
+#[cfg(feature = "host_env")]
+fn sequential_uuid() -> ([u8; 16], i32) {
+    let uuid = rustpython_host_env::uuid::create_sequential();
+    (uuid.bytes, uuid.status)
+}
+
+#[cfg(not(feature = "host_env"))]
+fn sequential_uuid() -> ([u8; 16], i32) {
+    use windows_sys::Win32::System::Rpc::UuidCreateSequential;
+    use windows_sys::core::GUID;
     let mut uuid = GUID::from_u128(0);
     // SAFETY: `uuid` is a live, aligned `GUID` the callee only writes into.
     let status = unsafe { UuidCreateSequential(&raw mut uuid) };
-    (uuid, status)
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&uuid.data1.to_le_bytes());
+    bytes[4..6].copy_from_slice(&uuid.data2.to_le_bytes());
+    bytes[6..8].copy_from_slice(&uuid.data3.to_le_bytes());
+    bytes[8..16].copy_from_slice(&uuid.data4);
+    (bytes, status)
+}
+
+#[cfg(feature = "host_env")]
+fn status_ok() -> i32 {
+    rustpython_host_env::uuid::STATUS_OK
+}
+#[cfg(feature = "host_env")]
+fn status_local_only() -> i32 {
+    rustpython_host_env::uuid::STATUS_LOCAL_ONLY
+}
+#[cfg(feature = "host_env")]
+fn status_no_address() -> i32 {
+    rustpython_host_env::uuid::STATUS_NO_ADDRESS
+}
+#[cfg(not(feature = "host_env"))]
+fn status_ok() -> i32 {
+    windows_sys::Win32::System::Rpc::RPC_S_OK
+}
+#[cfg(not(feature = "host_env"))]
+fn status_local_only() -> i32 {
+    windows_sys::Win32::System::Rpc::RPC_S_UUID_LOCAL_ONLY
+}
+#[cfg(not(feature = "host_env"))]
+fn status_no_address() -> i32 {
+    windows_sys::Win32::System::Rpc::RPC_S_UUID_NO_ADDRESS
 }
 
 /// `py_windows_has_stable_node`: only `RPC_S_OK` means the node came from a
 /// network card.  The two local-only statuses report a random node, which is
 /// no more stable than the one `uuid.py` makes for itself.
 fn has_stable_node() -> bool {
-    create_sequential().1 == RPC_S_OK
+    sequential_uuid().1 == status_ok()
 }
 
 /// `py_UuidCreate($module, /)`.
 fn uuid_create(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (uuid, status) = create_sequential();
+    let (bytes, status) = sequential_uuid();
     // The two local-only statuses are successes that say the node is random
     // rather than MAC-derived.  If the OS cannot tell, neither can we, so the
     // UUID is taken anyway.
-    if !matches!(
-        status,
-        RPC_S_OK | RPC_S_UUID_LOCAL_ONLY | RPC_S_UUID_NO_ADDRESS
-    ) {
+    if status != status_ok() && status != status_local_only() && status != status_no_address() {
         return Err(crate::PyError::os_error_win32_syscall2(
             status, PY_NULL, PY_NULL,
         ));
     }
-    // `Py_BuildValue("y#", (const char *)&uuid, sizeof(uuid))` hands over the
-    // struct's own memory, which is why `uuid.py` reads it back through
-    // `UUID(bytes_le=...)`.  A `GUID` is four, two, two and eight bytes with
-    // no padding, so spelling the three integer fields little-endian gives
-    // exactly those sixteen bytes.
-    let mut bytes = [0u8; 16];
-    bytes[0..4].copy_from_slice(&uuid.data1.to_le_bytes());
-    bytes[4..6].copy_from_slice(&uuid.data2.to_le_bytes());
-    bytes[6..8].copy_from_slice(&uuid.data3.to_le_bytes());
-    bytes[8..16].copy_from_slice(&uuid.data4);
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
 }
 
