@@ -1,10 +1,13 @@
 # pyre-check: max-pypy-ratio=6.5
-# Warm-up-then-raise exception handling: the loop runs cleanly long enough to
-# compile, then a nested try/(try-finally)/except starts raising only after the
-# warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,
-# so the guard failure resumes in the blackhole and the exception must hop
-# floordiv -> inner finally -> reraise -> outer except entirely under blackhole
-# control. Benches that raise from iteration 1 do not exercise this path.
+# pyre-check: max-wasm-ratio=7.4
+# Ubuntu run 34705838874: wasm/dynasm 6.4x. The oracle compiles 1 loop / 2
+# bridges (`handle_fail` / `must_compile`); pyre matches. wasm materializes
+# each as its own module. 7.4x is 6.4x plus WASM_RATIO_FIT_HEADROOM (15%).
+# Warm-up-then-raise: the loop compiles clean, then `i >= 2000 and i % 19 == 0`
+# starts raising. That guard is not in the recorded loop, so the first
+# failures blackhole (`resume_in_blackhole`) until `must_compile` attaches
+# the exception-edge bridge. Benches that raise from iteration 1 do not
+# exercise this warmup-then-bridge path.
 N = 47040000
 
 
