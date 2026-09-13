@@ -1308,6 +1308,39 @@ impl MIFrame {
         }
     }
 
+    /// pyjitpl.py `MIFrame.fill_registers`.
+    ///
+    /// The `newframe` / `newframe2` / `newframe3` decoder writes each
+    /// callee slot as it reads a register index from the caller bytecode
+    /// ("instead of allocating the list of boxes"). `length` source
+    /// indices start at this frame's `code_cursor`.
+    pub fn fill_registers(&mut self, callee: &mut MIFrame, length: usize, argcode: u8) {
+        for i in 0..length {
+            let index = self.next_reg() as usize;
+            match argcode {
+                b'I' => {
+                    #[cfg(feature = "jit-audits")]
+                    majit_ir::reg_write_audit::note_int_write(
+                        callee.int_regs.as_ptr() as usize,
+                        i,
+                        self.int_regs[index],
+                    );
+                    callee.int_regs[i] = self.int_regs[index];
+                    callee.int_values[i] = self.int_values[index];
+                }
+                b'R' => {
+                    callee.ref_regs[i] = self.ref_regs[index];
+                    callee.ref_values[i] = self.ref_values[index];
+                }
+                b'F' => {
+                    callee.float_regs[i] = self.float_regs[index];
+                    callee.float_values[i] = self.float_values[index];
+                }
+                other => panic!("fill_registers: argcode {other} is not I, R, or F"),
+            }
+        }
+    }
+
     pub fn setup_call(&mut self, argboxes: &[(JitArgKind, OpRef, i64)]) {
         self.pc = 0;
         self.parent_snapshot = -1;
@@ -1876,6 +1909,33 @@ mod tests {
         assert!(frame.ref_values.iter().all(|v| v.is_none()));
         // pyjitpl.py:127: pushed_box is reset to None.
         assert_eq!(frame.pushed_box, None);
+    }
+
+    #[test]
+    fn fill_registers_copies_nine_int_slots_from_caller_bytecode() {
+        // pyjitpl.py fill_registers: nine source indices (the 72 B
+        // Vec<usize> the typed inline-call path used to allocate) are
+        // read from the caller bytecode and written to callee slots
+        // 0..9 with no intermediate list.
+        let mut caller_jc = make_jitcode_with_regs(9, 0, 0);
+        {
+            let jc = Arc::get_mut(&mut caller_jc).expect("fresh Arc");
+            jc.body_mut().code = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+            jc.body_mut().c_num_regs_i = 9;
+        }
+        let callee_jc = make_jitcode_with_regs(9, 0, 0);
+        let mut caller = MIFrame::new(caller_jc, 0);
+        let mut callee = MIFrame::new(callee_jc, 0);
+        for i in 0..9 {
+            caller.int_regs[i] = Some(OpRef::int_op(10 + i as u32));
+            caller.int_values[i] = Some(100 + i as i64);
+        }
+        caller.fill_registers(&mut callee, 9, b'I');
+        for i in 0..9 {
+            assert_eq!(callee.int_regs[i], Some(OpRef::int_op(10 + i as u32)));
+            assert_eq!(callee.int_values[i], Some(100 + i as i64));
+        }
+        assert_eq!(caller.code_cursor, 9);
     }
 
     /// pyjitpl.py `MIFrame.replace_active_box_in_frame`.
