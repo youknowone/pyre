@@ -5543,6 +5543,54 @@ fn build_jit_driver_pair() -> JitDriverPair {
     {
         let trampoline: extern "C" fn(i64) -> i64 =
             pyre_object::intobject::__majit_call_target_w_int_gc_alloc;
+        majit_metainterp::register_identity_ref_residual(majit_metainterp::IdentityRefResidual {
+            fnaddrs: {
+                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| {
+                        (name.contains("reload_top_root")
+                            || name.contains("try_gc_current_object_address"))
+                        .then_some(addr)
+                    })
+                    .collect();
+                addrs.push(pyre_object::gc_roots::reload_top_root as *const () as i64);
+                addrs.push(pyre_object::gc_roots::reload_top_root_jit_abi as *const () as i64);
+                addrs.push(pyre_object::gc_hook::try_gc_current_object_address as *const () as i64);
+                addrs
+            },
+        });
+        majit_metainterp::register_elidable_int_residual(majit_metainterp::ElidableIntResidual {
+            fnaddrs: {
+                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| {
+                        (name.ends_with("::enabled")
+                            || name.contains("gc_interp::enabled")
+                            || name.contains("binary_op_arg")
+                            || name.contains("comparison_op_arg")
+                            || name.contains("jump_target_forward")
+                            || name.contains("jump_target_backward")
+                            || name.contains("w_code_const")
+                            || name.ends_with("::nlocals")
+                            || name.ends_with("::ncells")
+                            || name.contains("frame_anchor_push")
+                            || name.contains("stack_check"))
+                        .then_some(addr)
+                    })
+                    .collect();
+                addrs.push(pyre_object::gc_interp::enabled as *const () as i64);
+                addrs
+            },
+        });
+        majit_metainterp::register_void_skip_residual(majit_metainterp::VoidSkipResidual {
+            fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
+                .into_iter()
+                .filter_map(|(name, addr)| {
+                    (name.contains("frame_anchor_release") || name.contains("frame_anchor_drop"))
+                        .then_some(addr)
+                })
+                .collect(),
+        });
         majit_metainterp::register_wrapint_residual(majit_metainterp::WrapintResidual {
             alloc_fnaddrs: vec![
                 trampoline as i64,
@@ -10443,11 +10491,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     .expect("eval_loop_dispatch_poll status 2 must leave WARMUP_TICK_ERR"));
             }
         }
-        // Residual calls inside an opcode can collect and move the frame.
-        // Until every such residual goes through vable-after-residual, the
-        // jitted arm still needs this forwarding read; skipping it SIGABRTs
-        // on a moved frame (tuple_slice_index_rooting).
-        f = FrameView::reload(f);
+        // interp_jit.py `PyFrame.dispatch` has no per-opcode frame
+        // reload: the jitted arm has no interpreter-path collection
+        // between opcodes (`reload_if_interp`). A residual that can
+        // collect must reread its own roots (tuple_slice_index_rooting
+        // rereads the slice receiver), not force a residual
+        // `reload_top_root` into every compiled iteration.
+        f = FrameView::reload_if_interp(f);
 
         let pc = unsafe { &*f }.next_instr();
 

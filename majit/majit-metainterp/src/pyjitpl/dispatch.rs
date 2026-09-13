@@ -8136,6 +8136,26 @@ where
                     if is_forces {
                         ctx.vrefs_after_residual_call();
                     }
+                    // `frame_anchor_release` is the drop of a tracing-only
+                    // shadow-stack slot. `interp_jit.py` `dispatch` has no
+                    // counterpart; skip the `CallN` when the helper ran.
+                    if let Some(spec) = crate::box_trace::void_skip_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                    {
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
                     // 3. record IR (`history.record` →
                     //    `_record_helper_varargs`). pyjitpl.py
                     //    do_residual_call threads the original calldescr's
@@ -8473,6 +8493,29 @@ where
                     // TOKEN_TRACING_RESCALL in that branch).
                     if is_forces {
                         ctx.vrefs_after_residual_call();
+                    }
+                    // `gc_interp::enabled` is `@elidable` (`rlib/jit.py`):
+                    // the env read is cached. Record the traced constant
+                    // instead of `CallI` so compiled loops do not keep the
+                    // residual the frozen jitcode still emits.
+                    if let Some(spec) = crate::box_trace::elidable_int_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                    {
+                        let folded = ctx.const_int(concrete);
+                        self.set_int_reg(dst, Some(folded), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
                     }
                     // pyjitpl.py do_residual_call plain branch:
                     //     pure = effectinfo.check_is_elidable()
@@ -8860,6 +8903,32 @@ where
                     // TOKEN_TRACING_RESCALL in that branch).
                     if is_forces {
                         ctx.vrefs_after_residual_call();
+                    }
+                    // interp_jit.py `PyFrame.dispatch` has no per-opcode
+                    // `reload_top_root`. When the live result equals the
+                    // argument, no collection moved it — record the
+                    // identity instead of `CallR`.
+                    if let Some(spec) = crate::box_trace::identity_ref_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && let Some(&raw_op) = args.first()
+                    {
+                        let arg_bits = raw_r.first().copied().unwrap_or(0);
+                        if concrete == arg_bits {
+                            self.set_ref_reg(dst, Some(raw_op), Some(concrete));
+                            if is_forces
+                                && matches!(
+                                    self.finalize_standard_virtualizable_may_force(
+                                        ctx,
+                                        sym,
+                                        active_vable
+                                    ),
+                                    TraceAction::Abort
+                                )
+                            {
+                                return TraceAction::Abort;
+                            }
+                            return TraceAction::Continue;
+                        }
                     }
                     // Residual wrapint (`w_int_gc_alloc`): execute already
                     // ran; record `new_with_vtable` + `setfield_gc`
