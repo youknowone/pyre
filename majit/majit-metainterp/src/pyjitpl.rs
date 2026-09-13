@@ -19336,6 +19336,61 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// Execute a residual wrapint allocator and record the virtualizable
+    /// `new_with_vtable` + `setfield_gc` form instead of `CallR`.
+    ///
+    /// `intobject.py wrapint` is never residual in PyPy. The collector
+    /// arm here is `dont_look_inside`, so interpret rewrites it the way
+    /// FBW `residual_call.rs` already rewrites `RuntimeHelperKind::BoxInt`.
+    fn try_record_wrapint_residual(
+        &mut self,
+        allboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+        descr_ref: majit_ir::DescrRef,
+        descr_view: &dyn majit_ir::descr::CallDescr,
+        dst: Option<(crate::jitcode::JitArgKind, usize)>,
+    ) -> Option<Option<(OpRef, i64)>> {
+        let spec = crate::box_trace::wrapint_residual()?;
+        let funcaddr = allboxes.first()?.2;
+        if !spec.matches(funcaddr) {
+            return None;
+        }
+        if self.tracing.is_none() {
+            return None;
+        }
+        let raw = allboxes
+            .get(1)
+            .filter(|(kind, _, _)| matches!(kind, crate::jitcode::JitArgKind::Int))?;
+        let raw_op = raw.1;
+        let boxed_ptr = crate::executor::execute_varargs(self, OpCode::CallR, allboxes, descr_view);
+        let result = if boxed_ptr != 0 {
+            let ctx = self.tracing.as_mut()?;
+            let boxed = crate::box_trace::trace_box_int(
+                ctx,
+                raw_op,
+                spec.size_descr.clone(),
+                spec.intval_descr.clone(),
+                spec.int_type_addr,
+            );
+            ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
+            );
+            Some((boxed, boxed_ptr))
+        } else {
+            let opref_args: Vec<OpRef> = allboxes.iter().map(|(_, op, _)| *op).collect();
+            self._record_helper_varargs(OpCode::CallR, boxed_ptr, descr_ref, &opref_args)
+        };
+        if let (Some((opref, concrete)), Some((kind, target_index))) = (result, dst) {
+            self.framestack.current_mut().make_result_of_lastop(
+                kind,
+                target_index,
+                opref,
+                concrete,
+            );
+        }
+        Some(result)
+    }
+
     /// pyjitpl.py `MIFrame.do_residual_call(funcbox, argboxes, descr, pc, assembler_call=False, assembler_call_jd=None)`.
     ///
     /// ```python
@@ -19399,6 +19454,15 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
         // pyjitpl.py: allboxes = self._build_allboxes(funcbox, argboxes, descr)
         let allboxes = self._build_allboxes(funcbox, argboxes, descr_view, None);
+        // Residual wrapint (`w_int_gc_alloc`): execute the real allocator
+        // and record `new_with_vtable` + `setfield_gc` (`intobject.py
+        // wrapint`) instead of an opaque `CallR`. See
+        // `box_trace::WrapintResidual`.
+        if let Some(result) =
+            self.try_record_wrapint_residual(&allboxes, descr_ref.clone(), descr_view, dst)
+        {
+            return Ok(result);
+        }
         // pyjitpl.py:2003: effectinfo = descr.get_extra_info()
         let effectinfo = descr_view.get_extra_info();
         // pyjitpl.py:2004-2005: OS_NOT_IN_TRACE
