@@ -195,6 +195,81 @@ pub fn wrapint_residual() -> Option<&'static WrapintResidual> {
     WRAPINT_RESIDUAL.get()
 }
 
+/// Residual `Ref -> Ref` helpers that return the argument when no
+/// collection moved it (`reload_top_root`, `try_gc_current_object_address`).
+/// `interp_jit.py PyFrame.dispatch` has no per-opcode frame reload; record
+/// the identity instead of `CallR` when the live result equals the arg.
+#[derive(Clone, Default)]
+pub struct IdentityRefResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl IdentityRefResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static IDENTITY_REF_RESIDUAL: std::sync::OnceLock<IdentityRefResidual> = std::sync::OnceLock::new();
+
+pub fn register_identity_ref_residual(spec: IdentityRefResidual) {
+    let _ = IDENTITY_REF_RESIDUAL.set(spec);
+}
+
+pub fn identity_ref_residual() -> Option<&'static IdentityRefResidual> {
+    IDENTITY_REF_RESIDUAL.get()
+}
+
+/// Residual `() -> Int` helpers whose result is process-constant after
+/// first touch (`gc_interp::enabled`). `@elidable` (`rlib/jit.py`) folds
+/// the traced concrete; without a live LLBC extract the frozen jitcode
+/// still residualizes, so interpret records the constant instead of `CallI`.
+#[derive(Clone, Default)]
+pub struct ElidableIntResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl ElidableIntResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static ELIDABLE_INT_RESIDUAL: std::sync::OnceLock<ElidableIntResidual> = std::sync::OnceLock::new();
+
+pub fn register_elidable_int_residual(spec: ElidableIntResidual) {
+    let _ = ELIDABLE_INT_RESIDUAL.set(spec);
+}
+
+pub fn elidable_int_residual() -> Option<&'static ElidableIntResidual> {
+    ELIDABLE_INT_RESIDUAL.get()
+}
+
+/// Residual `() -> Void` helpers that are no-ops on the recorded
+/// trace when they succeed (`frame_anchor_release`, `stack_check`).
+/// `interp_jit.py` `dispatch` has neither; compiled loops poll the
+/// breaker on the back-edge instead.
+#[derive(Clone, Default)]
+pub struct VoidSkipResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl VoidSkipResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static VOID_SKIP_RESIDUAL: std::sync::OnceLock<VoidSkipResidual> = std::sync::OnceLock::new();
+
+pub fn register_void_skip_residual(spec: VoidSkipResidual) {
+    let _ = VOID_SKIP_RESIDUAL.set(spec);
+}
+
+pub fn void_skip_residual() -> Option<&'static VoidSkipResidual> {
+    VOID_SKIP_RESIDUAL.get()
+}
+
 /// Host-registered rewrite of a residual int COMPARE_OP.
 ///
 /// `compare_slot` residualizes through `compare_slot_jit_abi` (the

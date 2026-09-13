@@ -110,7 +110,9 @@ pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_man
 pub mod blackhole;
 pub mod box_trace;
 pub use box_trace::{
-    CompareOpResidual, WrapintResidual, register_compare_op_residual, register_wrapint_residual,
+    CompareOpResidual, ElidableIntResidual, IdentityRefResidual, VoidSkipResidual, WrapintResidual,
+    register_compare_op_residual, register_elidable_int_residual, register_identity_ref_residual,
+    register_void_skip_residual, register_wrapint_residual,
 };
 pub(crate) mod call_descr;
 pub(crate) mod compile;
