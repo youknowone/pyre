@@ -2978,6 +2978,18 @@ impl WasmBackend {
         }
     }
 
+    fn rebind_failarg_const_tables(token: &JitCellToken) {
+        codegen::bind_failarg_const_table(&[], 0);
+        let Some(clt) = token.compiled_loop_token() else {
+            return;
+        };
+        for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+            if let Some(table) = tracer.downcast_ref::<majit_gc::GcTable>() {
+                codegen::extend_failarg_const_table_from_gc_table(table);
+            }
+        }
+    }
+
     fn register_gc_table(token: &JitCellToken, table: Arc<majit_gc::GcTable>) {
         if let Some(clt) = token.compiled_loop_token() {
             let tracer: Arc<dyn std::any::Any + Send + Sync> = table.clone();
@@ -3322,6 +3334,10 @@ impl WasmBackend {
         // Key-0 still clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
+        // `intern_ref_constants` of the just-compiled bridge cleared the
+        // TLS ConstPtr map. Restore every table pinned on this token so
+        // owner/region force-arm ConstPtrs rematerialize after collection.
+        Self::rebind_failarg_const_tables(token);
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
             codegen::build_wasm_module(&inputs)?;
         let code_size = wasm_bytes.len();

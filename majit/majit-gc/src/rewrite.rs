@@ -178,19 +178,12 @@ fn leftover_folded_ref(arg: &Operand, defined: &HashSet<u32>) -> Option<GcRef> {
     if opref != OpRef::NONE && !opref.is_constant() && defined.contains(&opref.raw()) {
         return None;
     }
-    let value = if arg.is_inputarg() {
-        match arg.get_forwarded() {
-            Forwarded::Const(c) => c.get(),
-            _ => return None,
-        }
-    } else {
-        match arg.get_value() {
-            Some(value) => value,
-            None => match arg.get_forwarded() {
-                Forwarded::Const(c) => c.get(),
-                _ => return None,
-            },
-        }
+    // `get_value()` / `_resref` is the tracing observation. Only
+    // `Forwarded::Const` is a fold — the same gate `remove_constptr`
+    // uses after `get_box_replacement`.
+    let value = match arg.get_forwarded() {
+        Forwarded::Const(c) => c.get(),
+        _ => return None,
     };
     match value {
         Value::Ref(gcref) if !gcref.is_null() => Some(gcref),
@@ -3771,6 +3764,19 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].opcode, OpCode::Label);
         assert_eq!(out[0].arg(0).to_opref(), OpRef::input_arg_ref(99));
+    }
+
+    #[test]
+    fn remove_ref_constants_does_not_intern_offstream_resref_observation() {
+        let producer = OpRc::new(Op::new(OpCode::SameAsR, &[]));
+        producer.pos().set(OpRef::ref_op(99));
+        producer.set_value(Value::Ref(GcRef(0x1000)));
+        let operand = Operand::from_bound_op(&producer);
+        let label = Op::new(OpCode::Label, &[operand]);
+        let (out, gcrefs) = remove_ref_constants(&[label], 0);
+        assert!(gcrefs.is_empty(), "observation must not enter the gc table");
+        assert_eq!(out[0].opcode, OpCode::Label);
+        assert_eq!(out[0].arg(0).to_opref(), OpRef::ref_op(99));
     }
 
     #[test]

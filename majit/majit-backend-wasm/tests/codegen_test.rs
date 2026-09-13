@@ -3246,16 +3246,11 @@ fn test_folded_producer_value_seeds_unbound_local() {
     // to `IntOp(99)` without a pool entry used to decline the module.
     let producer = OpRc::new(Op::new(OpCode::IntAdd, &[]));
     producer.pos().set(OpRef::int_op(99));
-    producer.set_value(majit_ir::Value::Int(7));
+    let folded = Operand::from_bound_op(&producer);
+    folded.set_forwarded_const(majit_ir::Const::Int(7));
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let add = Op::new(
-        OpCode::IntAdd,
-        &[
-            Operand::from_bound_op(&producer),
-            rb(OpRef::input_arg_int(0)),
-        ],
-    );
+    let add = Op::new(OpCode::IntAdd, &[folded, rb(OpRef::input_arg_int(0))]);
     add.pos().set(OpRef::int_op(1));
     let ops = vec![add, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -3274,10 +3269,11 @@ fn test_folded_producer_ref_is_interned() {
     // `LoadFromGcTable` (`rewrite.py remove_constptr`), not a baked pointer.
     let producer = OpRc::new(Op::new(OpCode::SameAsR, &[]));
     producer.pos().set(OpRef::ref_op(99));
-    producer.set_value(majit_ir::Value::Ref(majit_ir::GcRef(0x1000)));
+    let folded = Operand::from_bound_op(&producer);
+    folded.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0x1000)));
 
     let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
-    let same = Op::new(OpCode::SameAsR, &[Operand::from_bound_op(&producer)]);
+    let same = Op::new(OpCode::SameAsR, &[folded]);
     same.pos().set(OpRef::ref_op(1));
     let ops = vec![same, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))])];
     // `compile_loop` intern_ref_constants runs this pass first; a leftover

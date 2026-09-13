@@ -161,6 +161,22 @@ pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) 
     });
 }
 
+/// Merge one interned GC table into the force-arm ConstPtr map.
+///
+/// `intern_ref_constants` of a later compile (an inline bridge) clears the
+/// TLS map. Re-emission must restore every retained region's table, each
+/// under its own `base_addr`, or a non-null owner ConstPtr falls through
+/// to a raw address.
+pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
+    FAILARG_CONST_TABLE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let base = table.base_addr() as u32;
+        for i in 0..table.len() {
+            map.insert(table.slot(i).0, (base, i as u32));
+        }
+    });
+}
+
 /// Dense wasm-local assignment for the sparse value-id namespace.
 struct ValueLocals {
     by_id: Vec<Option<u32>>,
@@ -11011,27 +11027,17 @@ fn emit_resolve_f64(
 /// payload from the box; flattening to `IntOp(pos)` and looking only at the
 /// backend pool drops `_resint` / `_forwarded` (`history.py *FrontendOp`).
 fn folded_scalar_bits(arg: &Operand) -> Option<i64> {
-    // InputArg.get_value() is the value observed while tracing, not a
-    // folded proof. Seeding that sample makes later iterations reuse the
-    // first loop counter (or similar) instead of the runtime argument.
-    let value = if arg.is_inputarg() {
-        match arg.get_forwarded() {
-            Forwarded::Const(c) => c.get(),
-            _ => return None,
-        }
-    } else {
-        match arg.get_value() {
-            Some(value) => value,
-            None => match arg.get_forwarded() {
-                Forwarded::Const(c) => c.get(),
-                _ => {
-                    let replaced = arg.get_box_replacement(false);
-                    if !replaced.is_constant() {
-                        return None;
-                    }
-                    replaced.const_value()?
-                }
-            },
+    // `get_value()` is the tracing observation. Seed only a proven fold:
+    // `Forwarded::Const`, or `get_box_replacement` landing on an inline
+    // constant / the constants map.
+    let value = match arg.get_forwarded() {
+        Forwarded::Const(c) => c.get(),
+        _ => {
+            let replaced = arg.get_box_replacement(false);
+            if !replaced.is_constant() {
+                return None;
+            }
+            replaced.const_value()?
         }
     };
     match value {
