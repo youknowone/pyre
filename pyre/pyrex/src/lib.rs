@@ -1347,11 +1347,18 @@ pub(crate) fn seed_main_loader(
             },
         )
         .and_then(|ty| {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let ty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ty);
+            let name_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__main__"));
+            let path_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(path));
             pyre_interpreter::call::call_function_impl_result(
-                ty,
+                pyre_object::gc_roots::shadow_stack_get(ty_slot),
                 &[
-                    pyre_object::w_str_new("__main__"),
-                    pyre_object::w_str_new_managed(path),
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    pyre_object::gc_roots::shadow_stack_get(path_slot),
                 ],
             )
             .ok()
@@ -2235,13 +2242,20 @@ fn runpy_run_module_as_main(
     let runpy = importing::importhook("runpy", canonical, pyre_object::PY_NULL, 0, ec_ptr)?;
     let func = pyre_interpreter::getattr(runpy, pyre_object::w_str_new("_run_module_as_main"))?;
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_module = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(module));
+    let func_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(func);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(module));
     let args = if alter_argv {
-        vec![w_module]
+        vec![pyre_object::gc_roots::shadow_stack_get(module_slot)]
     } else {
-        vec![w_module, pyre_object::w_bool_from(false)]
+        vec![
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
+            pyre_object::w_bool_from(false),
+        ]
     };
-    let res = pyre_interpreter::call_function(func, &args);
+    let res =
+        pyre_interpreter::call_function(pyre_object::gc_roots::shadow_stack_get(func_slot), &args);
     if res.is_null() {
         return Err(
             pyre_interpreter::call::take_call_error().unwrap_or_else(|| {
