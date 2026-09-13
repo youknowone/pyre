@@ -9531,6 +9531,23 @@ where
                     target.concrete_ptr
                 };
                 let slot = target.effect_info_slot;
+                let extra_info = crate::call_descr::effect_info_for_slot(slot);
+                let mut raw_i = Vec::new();
+                let mut raw_r = Vec::new();
+                let mut arg_classes = String::new();
+                for (spec, &concrete) in arg_regs.iter().zip(concrete_args.iter()) {
+                    match spec.kind {
+                        JitArgKind::Int => {
+                            raw_i.push(concrete);
+                            arg_classes.push('i');
+                        }
+                        JitArgKind::Ref => {
+                            raw_r.push(concrete);
+                            arg_classes.push('r');
+                        }
+                        JitArgKind::Float => arg_classes.push('f'),
+                    }
+                }
                 match bytecode {
                     jitcode::insns::BC_COND_CALL_VOID => {
                         // RPython pyjitpl.py opimpl_conditional_call_ir_v:
@@ -9540,8 +9557,47 @@ where
                             // skip
                         } else {
                             ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
+                            let mut allboxes =
+                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            allboxes.extend_from_slice(&args);
+                            ctx.heapcache_invalidate_caches_varargs(
+                                OpCode::CondCallN,
+                                Some(&extra_info),
+                                &allboxes,
+                            );
+                            self.clear_exception();
                             if first_val != 0 {
+                                if let Some(action) = refuse_walk_local_ref_args(
+                                    ctx,
+                                    concrete_ptr as usize,
+                                    &raw_i,
+                                    &raw_r,
+                                    &args,
+                                    &arg_classes,
+                                ) {
+                                    return action;
+                                }
+                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                    concrete_ptr as i64,
+                                ) {
+                                    return report_symbolic_residual_call_target(
+                                        ctx,
+                                        concrete_ptr as usize,
+                                        Some(&arg_classes),
+                                    );
+                                }
                                 call_void_function(concrete_ptr, &concrete_args);
+                                if let Some(action) = host_requested_walk_abort(
+                                    ctx,
+                                    concrete_ptr as usize,
+                                    &arg_classes,
+                                ) {
+                                    return action;
+                                }
+                            }
+                            match self.finish_residual_call_exception_path(ctx, sym, &extra_info) {
+                                TraceAction::Continue => {}
+                                action => return action,
                             }
                         }
                     }
@@ -9553,16 +9609,92 @@ where
                                 self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
                             }
                         } else {
+                            let patch_pos = ctx.get_trace_position();
                             let traced = ctx.cond_call_value_int_typed(
                                 first_box, trace_ptr, &args, &arg_types, slot,
                             );
+                            let mut allboxes =
+                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            allboxes.extend_from_slice(&args);
+                            ctx.heapcache_invalidate_caches_varargs(
+                                OpCode::CondCallValueI,
+                                Some(&extra_info),
+                                &allboxes,
+                            );
+                            self.clear_exception();
                             let concrete_result = if first_val == 0 {
-                                call_int_function(concrete_ptr, &concrete_args)
+                                if let Some(action) = refuse_walk_local_ref_args(
+                                    ctx,
+                                    concrete_ptr as usize,
+                                    &raw_i,
+                                    &raw_r,
+                                    &args,
+                                    &arg_classes,
+                                ) {
+                                    return action;
+                                }
+                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                    concrete_ptr as i64,
+                                ) {
+                                    return report_symbolic_residual_call_target(
+                                        ctx,
+                                        concrete_ptr as usize,
+                                        Some(&arg_classes),
+                                    );
+                                }
+                                let n = call_int_function(concrete_ptr, &concrete_args);
+                                if let Some(action) = host_requested_walk_abort(
+                                    ctx,
+                                    concrete_ptr as usize,
+                                    &arg_classes,
+                                ) {
+                                    return action;
+                                }
+                                n
                             } else {
                                 first_val
                             };
-                            if let Some(dst) = dst {
+                            let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                            let traced = if last_exc == 0 {
+                                let mut call_args =
+                                    vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                                call_args.extend_from_slice(&args);
+                                let mut concrete_values = vec![majit_ir::Value::Int(first_val)];
+                                concrete_values.extend(build_concrete_values(
+                                    trace_ptr,
+                                    &concrete_args,
+                                    &arg_types,
+                                ));
+                                ctx.record_result_of_call_pure(
+                                    traced,
+                                    &call_args,
+                                    &concrete_values,
+                                    crate::call_descr::make_call_descr_with_effect(
+                                        &arg_types,
+                                        majit_ir::Type::Int,
+                                        extra_info.clone(),
+                                    ),
+                                    patch_pos,
+                                    majit_ir::OpCode::CondCallValueI,
+                                    majit_ir::Value::Int(concrete_result),
+                                )
+                            } else {
+                                traced
+                            };
+                            if last_exc == 0
+                                && let Some(dst) = dst
+                            {
                                 self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
+                            }
+                            if !(last_exc == 0 && traced.is_constant()) {
+                                match self.finish_residual_call_exception_path(
+                                    ctx,
+                                    sym,
+                                    &extra_info,
+                                ) {
+                                    TraceAction::Continue => {}
+                                    action => return action,
+                                }
                             }
                         }
                     }
@@ -9575,20 +9707,93 @@ where
                                 self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
                             }
                         } else {
+                            let patch_pos = ctx.get_trace_position();
                             let traced = ctx.cond_call_value_ref_typed(
                                 first_box, trace_ptr, &args, &arg_types, slot,
                             );
+                            let mut allboxes =
+                                vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                            allboxes.extend_from_slice(&args);
+                            ctx.heapcache_invalidate_caches_varargs(
+                                OpCode::CondCallValueR,
+                                Some(&extra_info),
+                                &allboxes,
+                            );
+                            self.clear_exception();
                             let concrete_result = if first_val == 0 {
-                                // `bhimpl_residual_call_*_r` → `cpu.bh_call_r`.
-                                // Pyre routes through the structurally-distinct
-                                // `call_ref_function` even though it currently
-                                // aliases the int ABI.
-                                call_ref_function(concrete_ptr, &concrete_args)
+                                if let Some(action) = refuse_walk_local_ref_args(
+                                    ctx,
+                                    concrete_ptr as usize,
+                                    &raw_i,
+                                    &raw_r,
+                                    &args,
+                                    &arg_classes,
+                                ) {
+                                    return action;
+                                }
+                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                    concrete_ptr as i64,
+                                ) {
+                                    return report_symbolic_residual_call_target(
+                                        ctx,
+                                        concrete_ptr as usize,
+                                        Some(&arg_classes),
+                                    );
+                                }
+                                let p = call_ref_function(concrete_ptr, &concrete_args);
+                                if let Some(action) = host_requested_walk_abort(
+                                    ctx,
+                                    concrete_ptr as usize,
+                                    &arg_classes,
+                                ) {
+                                    return action;
+                                }
+                                p
                             } else {
                                 first_val
                             };
-                            if let Some(dst) = dst {
+                            let last_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                            let traced = if last_exc == 0 {
+                                let mut call_args =
+                                    vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                                call_args.extend_from_slice(&args);
+                                let mut concrete_values =
+                                    vec![majit_ir::Value::Ref(majit_ir::GcRef(first_val as usize))];
+                                concrete_values.extend(build_concrete_values(
+                                    trace_ptr,
+                                    &concrete_args,
+                                    &arg_types,
+                                ));
+                                ctx.record_result_of_call_pure(
+                                    traced,
+                                    &call_args,
+                                    &concrete_values,
+                                    crate::call_descr::make_call_descr_with_effect(
+                                        &arg_types,
+                                        majit_ir::Type::Ref,
+                                        extra_info.clone(),
+                                    ),
+                                    patch_pos,
+                                    majit_ir::OpCode::CondCallValueR,
+                                    majit_ir::Value::Ref(majit_ir::GcRef(concrete_result as usize)),
+                                )
+                            } else {
+                                traced
+                            };
+                            if last_exc == 0
+                                && let Some(dst) = dst
+                            {
                                 self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
+                            }
+                            if !(last_exc == 0 && traced.is_constant()) {
+                                match self.finish_residual_call_exception_path(
+                                    ctx,
+                                    sym,
+                                    &extra_info,
+                                ) {
+                                    TraceAction::Continue => {}
+                                    action => return action,
+                                }
                             }
                         }
                     }
@@ -9610,6 +9815,14 @@ where
                             majit_ir::Type::Int,
                             slot,
                         );
+                        let mut allboxes =
+                            vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                        allboxes.extend_from_slice(&args);
+                        ctx.heapcache_invalidate_caches_varargs(
+                            OpCode::RecordKnownResult,
+                            Some(&extra_info),
+                            &allboxes,
+                        );
                     }
                     jitcode::insns::BC_RECORD_KNOWN_RESULT_REF => {
                         // RPython pyjitpl.py opimpl_record_known_result_r —
@@ -9626,6 +9839,14 @@ where
                             &arg_types,
                             majit_ir::Type::Ref,
                             slot,
+                        );
+                        let mut allboxes =
+                            vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
+                        allboxes.extend_from_slice(&args);
+                        ctx.heapcache_invalidate_caches_varargs(
+                            OpCode::RecordKnownResult,
+                            Some(&extra_info),
+                            &allboxes,
                         );
                     }
                     _ => unreachable!(),
