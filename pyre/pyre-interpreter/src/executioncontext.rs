@@ -18,6 +18,26 @@ pub fn register_force_frame_hook(f: ForceFrameFn) {
     FORCE_FRAME_HOOK.store(f as *mut (), Ordering::Release);
 }
 
+/// Restores the previous process-wide hook when dropped. Tests that
+/// overwrite `FORCE_FRAME_HOOK` must hold this so a panic still clears it.
+pub struct ForceFrameHookGuard {
+    prev: *mut (),
+}
+
+impl Drop for ForceFrameHookGuard {
+    fn drop(&mut self) {
+        FORCE_FRAME_HOOK.store(self.prev, Ordering::Release);
+    }
+}
+
+/// Install `f` and restore the previous hook when the guard drops.
+#[must_use]
+pub fn install_force_frame_hook(f: ForceFrameFn) -> ForceFrameHookGuard {
+    ForceFrameHookGuard {
+        prev: FORCE_FRAME_HOOK.swap(f as *mut (), Ordering::AcqRel),
+    }
+}
+
 /// `rvirtualizable.py hook_access_field` → `jit_force_virtualizable`:
 /// materialize a frame's virtualizable fields before something outside the JIT
 /// reads them.
@@ -3407,7 +3427,7 @@ pub fn make_finalizer_queue<WRoot>(w_root: WRoot, _space: PyObjectRef) -> WRootF
 
 #[cfg(test)]
 mod tests {
-    use super::{force_frame, force_frame_before_locals_read, register_force_frame_hook};
+    use super::{force_frame, force_frame_before_locals_read};
     use crate::PyFrame;
     use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -3422,7 +3442,7 @@ mod tests {
         force_frame_before_locals_read(std::ptr::null_mut());
 
         SEEN.store(std::ptr::null_mut(), Ordering::SeqCst);
-        register_force_frame_hook(record);
+        let _hook = super::install_force_frame_hook(record);
         let dummy = 0x0000_0000_DEAD_BEEF as *mut PyFrame;
         force_frame(dummy);
         assert_eq!(
