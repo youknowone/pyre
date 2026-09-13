@@ -4727,9 +4727,6 @@ impl OptUnroll {
                 "import_state: source is target (unroll.py:496 `assert source is not target`)"
             );
             ctx.register_carried_host(&b_target);
-            if ctx.is_vm_red_name(source) && !ctx.is_vm_red_name(target) {
-                continue;
-            }
             ctx.make_equal_to(&b_source, &b_target);
             if crate::debug::have_debug_prints() {
                 crate::debug::log_one(

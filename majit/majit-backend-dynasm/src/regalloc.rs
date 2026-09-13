@@ -489,24 +489,6 @@ pub fn compute_vars_longevity<T: AsRef<Op>>(
         }
     }
 
-    // Loop-carried Ref reds keep their assembled home for the whole
-    // trace. A mid-opcode guard that still names the InputArg would
-    // otherwise dump a reused colour (a Scope sitting in the Vm slot).
-    let last = operations.len() as i32 - 1;
-    if last >= 0 {
-        for iarg in inputargs {
-            if iarg.tp != Type::Ref {
-                continue;
-            }
-            let opref = iarg.opref();
-            if let Some(lt) = longevity.get_mut(opref)
-                && lt.last_usage < last
-            {
-                lt.last_usage = last;
-            }
-        }
-    }
-
     // regalloc.py:1224-1231 reverse real_usages and check invariants
     // We need to iterate over all lifetimes; collect keys first to avoid borrow issues
     let keys: Vec<OpRef> = longevity.lifetimes.keys().copied().collect();
