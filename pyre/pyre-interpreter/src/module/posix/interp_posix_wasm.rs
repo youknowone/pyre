@@ -1012,7 +1012,9 @@ fn uname(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let mut seq = Vec::with_capacity(fields.len());
     for field in fields {
-        seq.push(pyre_object::gc_roots::pin_root(pyre_object::w_str_new(field)));
+        seq.push(pyre_object::gc_roots::pin_root(
+            pyre_object::w_str_new_managed(field),
+        ));
     }
     Ok(crate::_structseq::new_instance(uname_seq_type(), seq))
 }
