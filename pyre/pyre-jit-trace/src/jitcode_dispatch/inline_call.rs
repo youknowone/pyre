@@ -5204,6 +5204,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
     let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
+    // The first recording has no procedure token, so it still inlines the
+    // `fib(2)` shape. A later bridge that re-enters the same compiled
+    // portal must not unroll the left spine (`bridge_subwalk.rs`: that
+    // continuation is CALL_ASSEMBLER, not a fresh peel).
+    if recursive_portal_present
+        && crate::driver::try_driver_pair().is_some_and(|(driver, _)| {
+            driver
+                .meta_interp()
+                .warm_state_ref()
+                .get_cell_for_key(&callee_green_key)
+                .is_some_and(|cell| cell.is_compiled())
+        })
+    {
+        return resolved_inline_decline(op.pc, line!());
+    }
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
