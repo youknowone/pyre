@@ -10121,6 +10121,7 @@ where
         let frame = self.frames.current_mut();
         frame.ref_regs[reg] = opref;
         frame.ref_values[reg] = value;
+        frame.retire_portal_red_ref(reg);
     }
 
     fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
