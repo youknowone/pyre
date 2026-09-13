@@ -1,34 +1,19 @@
 //! Wasm `_ssl` backend. rustls + aws-lc cannot build for
-//! `wasm32-unknown-unknown` (`UnixTime::now` / native crypto), so this
-//! module is the host-free surface: MemoryBIO works, TLS operations fail.
+//! `wasm32-unknown-unknown`, so TLS operations fail. MemoryBIO, constants,
+//! OID tables, and ALPN parsing come from `rustpython_host_env::ssl`.
+
+use rustpython_host_env::ssl as host_ssl;
 
 const UNAVAILABLE: &str = "TLS is not available on this platform";
 
-pub const PROTOCOL_TLS: i32 = 2;
-pub const PROTOCOL_TLS_CLIENT: i32 = 16;
-pub const PROTOCOL_TLS_SERVER: i32 = 17;
-pub const PROTOCOL_TLSV1: i32 = 3;
-pub const PROTOCOL_TLSV1_1: i32 = 4;
-pub const PROTOCOL_TLSV1_2: i32 = 5;
-pub const PROTOCOL_TLSV1_3: i32 = 6;
-pub const CERT_NONE: i32 = 0;
-pub const CERT_OPTIONAL: i32 = 1;
-pub const CERT_REQUIRED: i32 = 2;
-pub const PROTO_TLSV1_2: i32 = 0x0303;
-pub const PROTO_TLSV1_3: i32 = 0x0304;
-pub const SSL3_RT_CHANGE_CIPHER_SPEC: i32 = 20;
-pub const SSL3_RT_ALERT: i32 = 21;
-pub const SSL3_RT_HANDSHAKE: i32 = 22;
-pub const SSL3_RT_APPLICATION_DATA: i32 = 23;
-pub const SSL3_RT_HEADER: i32 = 256;
-pub const SSL3_MT_CHANGE_CIPHER_SPEC: i32 = 0x0101;
-pub const TLS_ERROR_SSL: i32 = 1;
-pub const TLS_ERROR_WANT_READ: i32 = 2;
-pub const TLS_ERROR_WANT_WRITE: i32 = 3;
-pub const TLS_ERROR_ZERO_RETURN: i32 = 6;
-pub const TLS_ERROR_EOF: i32 = 8;
-pub const TLS_ERROR_NO_MEMORY: i32 = 9;
-pub const TLS_ERROR_CERT_VERIFY_BASE: i32 = 1_000;
+pub use host_ssl::{
+    CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTO_TLSV1_2, PROTO_TLSV1_3, PROTOCOL_TLS,
+    PROTOCOL_TLS_CLIENT, PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2,
+    PROTOCOL_TLSV1_3, SSL3_MT_CHANGE_CIPHER_SPEC, SSL3_RT_ALERT, SSL3_RT_APPLICATION_DATA,
+    SSL3_RT_CHANGE_CIPHER_SPEC, SSL3_RT_HANDSHAKE, SSL3_RT_HEADER, TLS_ERROR_CERT_VERIFY_BASE,
+    TLS_ERROR_EOF, TLS_ERROR_NO_MEMORY, TLS_ERROR_SSL, TLS_ERROR_WANT_READ, TLS_ERROR_WANT_WRITE,
+    TLS_ERROR_ZERO_RETURN,
+};
 
 pub type NativeResult<T> = Result<T, (i32, String)>;
 pub type TlsResult<T> = Result<T, (i32, String)>;
@@ -78,35 +63,10 @@ fn unavailable<T>() -> NativeResult<T> {
 
 pub fn ensure_provider() {}
 
-pub struct MemoryBio {
-    buffer: Vec<u8>,
-    start: usize,
-    eof_written: bool,
-}
-
-impl MemoryBio {
-    fn pending(&self) -> usize {
-        self.buffer.len() - self.start
-    }
-
-    fn compact(&mut self) {
-        if self.start == self.buffer.len() {
-            self.buffer.clear();
-            self.start = 0;
-        } else if self.start >= 4096 && self.start * 2 >= self.buffer.len() {
-            self.buffer.copy_within(self.start.., 0);
-            self.buffer.truncate(self.buffer.len() - self.start);
-            self.start = 0;
-        }
-    }
-}
+pub type MemoryBio = host_ssl::MemoryBio;
 
 pub fn memory_bio_new() -> *mut MemoryBio {
-    Box::into_raw(Box::new(MemoryBio {
-        buffer: Vec::new(),
-        start: 0,
-        eof_written: false,
-    }))
+    Box::into_raw(Box::new(MemoryBio::new()))
 }
 
 pub unsafe fn memory_bio_free(bio: *mut MemoryBio) {
@@ -116,27 +76,15 @@ pub unsafe fn memory_bio_free(bio: *mut MemoryBio) {
 }
 
 pub unsafe fn memory_bio_read(bio: *mut MemoryBio, size: usize) -> Vec<u8> {
-    let bio = unsafe { &mut *bio };
-    let count = size.min(bio.pending());
-    let end = bio.start + count;
-    let out = bio.buffer[bio.start..end].to_vec();
-    bio.start = end;
-    bio.compact();
-    out
+    unsafe { (*bio).read(size) }
 }
 
 pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: &[u8]) -> Result<usize, &'static str> {
-    let bio = unsafe { &mut *bio };
-    if bio.eof_written {
-        return Err("cannot write() after write_eof()");
-    }
-    bio.compact();
-    bio.buffer.extend_from_slice(data);
-    Ok(data.len())
+    unsafe { (*bio).write(data) }.map_err(|_| "cannot write() after write_eof()")
 }
 
 pub unsafe fn memory_bio_write_eof(bio: *mut MemoryBio) {
-    unsafe { (*bio).eof_written = true };
+    unsafe { (*bio).write_eof() };
 }
 
 pub unsafe fn memory_bio_pending(bio: *const MemoryBio) -> usize {
@@ -144,8 +92,7 @@ pub unsafe fn memory_bio_pending(bio: *const MemoryBio) -> usize {
 }
 
 pub unsafe fn memory_bio_eof(bio: *const MemoryBio) -> bool {
-    let bio = unsafe { &*bio };
-    bio.eof_written && bio.pending() == 0
+    unsafe { (*bio).eof() }
 }
 
 pub struct Context {
@@ -242,8 +189,8 @@ pub unsafe fn context_set_keylog_filename(
 pub unsafe fn context_session_stats(_context: *const Context) -> (usize, usize) {
     (0, 0)
 }
-pub fn parse_length_prefixed_alpn(_data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
-    Ok(Vec::new())
+pub fn parse_length_prefixed_alpn(data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    host_ssl::parse_length_prefixed_alpn(data).map_err(|_| "invalid ALPN protocol list")
 }
 pub unsafe fn context_set_alpn(_context: *mut Context, _protocols: Vec<Vec<u8>>) {}
 pub unsafe fn context_add_roots(_context: *mut Context, _ders: Vec<Vec<u8>>) {}
@@ -423,14 +370,23 @@ pub struct OidInfo {
     pub oid: Option<&'static str>,
 }
 
-pub fn oid_by_nid(_nid: i32) -> Option<OidInfo> {
-    None
+fn oid_info(entry: &'static host_ssl::oid::OidEntry) -> OidInfo {
+    OidInfo {
+        nid: entry.nid,
+        short_name: entry.short_name,
+        long_name: entry.long_name,
+        oid: entry.oid_string(),
+    }
 }
-pub fn oid_by_oid_string(_oid: &str) -> Option<OidInfo> {
-    None
+
+pub fn oid_by_nid(nid: i32) -> Option<OidInfo> {
+    host_ssl::oid::find_by_nid(nid).map(oid_info)
 }
-pub fn oid_by_name(_name: &str) -> Option<OidInfo> {
-    None
+pub fn oid_by_oid_string(oid: &str) -> Option<OidInfo> {
+    host_ssl::oid::find_by_oid_string(oid).map(oid_info)
+}
+pub fn oid_by_name(name: &str) -> Option<OidInfo> {
+    host_ssl::oid::find_by_name(name).map(oid_info)
 }
 
 pub fn cipher_count() -> usize {
