@@ -1436,6 +1436,22 @@ def charon_paths(charon_root: Path) -> tuple[str, Path, Path]:
     return platform_key, charon_dest, charon_dest / charon_exe
 
 
+def charon_cargo_target_dir(root: Path) -> Path:
+    """Cargo target dir for Charon's nightly rustc, not the workspace `target/`.
+
+    Charon's rustc is a different compiler from the stable build. Sharing
+    `target/` with it either rebuilds the whole graph (metadata rustc hash)
+    or, with incremental on, fuses CGUs from the two sessions. A dedicated
+    directory lets CI cache the nightly deps without bloating rust-cache,
+    and lets worktrees share them via `PYRE_SHARED_BUILD`.
+    """
+    if value := os.environ.get("CHARON_TARGET_DIR"):
+        return Path(value)
+    repo_parent = root.parent
+    shared = Path(os.environ.get("PYRE_SHARED_BUILD", repo_parent / ".pyre-build"))
+    return shared / "charon-target"
+
+
 def llbc_dest_path(out_dir: Path, root: Path) -> Path:
     """Where artefacts live, without creating it.
 
@@ -2312,6 +2328,15 @@ def extract(eng: Engine, args: argparse.Namespace) -> None:
     unstamped: list[str] = []
     env = os.environ.copy()
     prepend_msvc_link(env)
+    # Dedicated dir so Charon's nightly rlibs are not mixed with the
+    # stable `target/` rust-cache, and so `invalidate_cargo_unit` sees
+    # the same layout `charon cargo` writes. Set on `os.environ` too:
+    # `cargo_unit_location` runs `cargo metadata` without an env dict.
+    charon_target = charon_cargo_target_dir(eng.root)
+    charon_target.mkdir(parents=True, exist_ok=True)
+    env["CARGO_TARGET_DIR"] = str(charon_target)
+    os.environ["CARGO_TARGET_DIR"] = str(charon_target)
+    print(f"charon cargo target: {charon_target}")
 
     crate_attr = "-Zcrate-attr=feature(cfg_select)"
     env["RUSTC_BOOTSTRAP"] = "1"
