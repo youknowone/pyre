@@ -1833,8 +1833,10 @@ impl<'a> GraphFlattener<'a> {
                     let link = link.borrow();
                     link.last_exception.is_some() && link.last_exc_value.is_some()
                 })
-                .or_else(|| exits.first())
-                .expect("raise-terminated block has an exit");
+                .expect(
+                    "raise-terminated block has an exception-carrying exit; \
+                     attach_catch_exception_edge must run after recording raise",
+                );
             let catch_label = self.tlabel_for_link(link);
             self.emitline(Insn::op("catch_exception", vec![catch_label]));
             let handler_label = self.label_for_link(link);
@@ -3907,7 +3909,7 @@ where
     // the walker promotes that to `finishframe_exception` instead
     // of dest-writing the NULL.
     if let Some(insn) = build_orthodox_inline_call_ir_r(
-        "pyre_interpreter::opcode_ops::binary_value_from_tag",
+        inline_call_targets::BINARY_VALUE_FROM_TAG,
         vec![Operand::ConstInt(op_val)],
         vec![lhs_operand.clone(), rhs_operand.clone()],
         result_reg,
@@ -4111,19 +4113,15 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    // `is` / `is_not` can inline: they do not raise.
-    // Other COMPARE tags stay residual so `CompareOpDescent` and
-    // `finishframe_exception` own the portal-frame raise.
-    if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_val)
-        && let Some(insn) = build_orthodox_inline_call_ir_r(
-            "pyre_interpreter::opcode_ops::compare_value_from_tag",
-            vec![Operand::ConstInt(op_val)],
-            vec![lhs_operand.clone(), rhs_operand.clone()],
-            result_reg,
-        )
-    {
-        return Some(insn);
-    }
+    // `is` / `is_not` stay residual.  Walking `compare_value_from_tag` →
+    // `is_w` records `GuardSubclass` against an unbound type constant
+    // (classptr 0) on the value-comparing arms (`int`/`float`/`str`/…),
+    // and the assembler panics looking up that range.  The residual fold
+    // (`try_walker_fold_is_op`) already emits `ptr_eq` for pointer-identity
+    // classes and declines the value-comparing ones — which is the shape
+    // `is_op_identity` pins.  Other COMPARE tags stay residual so
+    // `CompareOpDescent` and `finishframe_exception` own the portal-frame
+    // raise.
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.compare_op_fn_idx,
         op_val,
@@ -6497,6 +6495,28 @@ where
     ))
 }
 
+/// Canonical paths of the callee bodies a lowering arm may name in an
+/// `inline_call_*` instead of residualizing the op.  Every
+/// `build_orthodox_inline_call_*` target is spelled once here, so the set of
+/// callees this pass is willing to inline reads in one place rather than
+/// scattered across the arms.  A path this build did not bind is not an
+/// error: [`fully_bound_callee_body`] declines it and the arm keeps its
+/// residual fallback.
+mod inline_call_targets {
+    /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
+    pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
+    /// COMPARE_OP `is` / `is_not` only — `lower_compare_op_hlop_to_insn`.
+    pub const COMPARE_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::compare_value_from_tag";
+    /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
+    pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
+    /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
+    pub const INVERT: &str = "pyre_interpreter::objspace::descroperation::invert";
+    /// UNARY_POSITIVE — `lower_unary_positive_hlop_to_insn`.
+    pub const POS: &str = "pyre_interpreter::objspace::descroperation::pos";
+    /// UNARY_NOT — `lower_unary_not_hlop_to_insn`.
+    pub const NOT: &str = "pyre_interpreter::baseobjspace::not_";
+}
+
 /// The body of a fixed callee path whose host addresses this build has fully
 /// bound — what an `inline_call_*` may name — or `None` for the residual-call
 /// case.
@@ -6589,6 +6609,29 @@ fn build_orthodox_inline_call_ir_r(
     ))
 }
 
+/// The lowering the single-Ref unary HLOp families share: the canonical
+/// `inline_call_r_r` naming `canonical_path` when this build carries that
+/// body fully bound, else the `fn_idx` MayForce residual carrying
+/// `runtime_helper`.  The families differ only in those three values.
+fn build_unary_inline_call_or_residual(
+    canonical_path: &'static str,
+    fn_idx: u16,
+    runtime_helper: majit_ir::RuntimeHelperKind,
+    value: Operand,
+    dst_reg: Register,
+) -> Insn {
+    if let Some(insn) = build_orthodox_inline_call_r_r(canonical_path, value.clone(), dst_reg) {
+        return insn;
+    }
+    build_residual_call_r_r_insn_from_operands(
+        fn_idx,
+        vec![value],
+        CallFlavor::MayForce,
+        runtime_helper,
+        dst_reg,
+    )
+}
+
 /// Lower the UNARY_NEGATIVE flowspace op `neg(value)` → `result: Ref`
 /// (operation.py `neg`) to the canonical
 /// `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by RPython's
@@ -6616,18 +6659,11 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    if let Some(insn) = build_orthodox_inline_call_r_r(
-        "pyre_interpreter::objspace::descroperation::neg",
-        value.clone(),
-        dst_reg,
-    ) {
-        return Some(insn);
-    }
-    Some(build_residual_call_r_r_insn_from_operands(
+    Some(build_unary_inline_call_or_residual(
+        inline_call_targets::NEG,
         ctx.unary_negative_fn_idx,
-        vec![value],
-        CallFlavor::MayForce,
         majit_ir::RuntimeHelperKind::UnaryNegative,
+        value,
         dst_reg,
     ))
 }
@@ -6661,18 +6697,11 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    if let Some(insn) = build_orthodox_inline_call_r_r(
-        "pyre_interpreter::objspace::descroperation::invert",
-        value.clone(),
-        dst_reg,
-    ) {
-        return Some(insn);
-    }
-    Some(build_residual_call_r_r_insn_from_operands(
+    Some(build_unary_inline_call_or_residual(
+        inline_call_targets::INVERT,
         ctx.unary_invert_fn_idx,
-        vec![value],
-        CallFlavor::MayForce,
         majit_ir::RuntimeHelperKind::UnaryInvert,
+        value,
         dst_reg,
     ))
 }
@@ -6704,18 +6733,11 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    if let Some(insn) = build_orthodox_inline_call_r_r(
-        "pyre_interpreter::objspace::descroperation::pos",
-        value.clone(),
-        dst_reg,
-    ) {
-        return Some(insn);
-    }
-    Some(build_residual_call_r_r_insn_from_operands(
+    Some(build_unary_inline_call_or_residual(
+        inline_call_targets::POS,
         ctx.unary_positive_fn_idx,
-        vec![value],
-        CallFlavor::MayForce,
         majit_ir::RuntimeHelperKind::UnaryPositive,
+        value,
         dst_reg,
     ))
 }
@@ -6955,18 +6977,11 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    if let Some(insn) = build_orthodox_inline_call_r_r(
-        "pyre_interpreter::baseobjspace::not_",
-        value.clone(),
-        dst_reg,
-    ) {
-        return Some(insn);
-    }
-    Some(build_residual_call_r_r_insn_from_operands(
+    Some(build_unary_inline_call_or_residual(
+        inline_call_targets::NOT,
         ctx.unary_not_fn_idx,
-        vec![value],
-        CallFlavor::MayForce,
         majit_ir::RuntimeHelperKind::UnaryNot,
+        value,
         dst_reg,
     ))
 }
