@@ -6624,30 +6624,23 @@ impl<M: Clone> MetaInterp<M> {
         ctx.load_fields_from_virtualizable(&info, vable_ptr);
     }
 
-    /// pyjitpl.py `opimpl_getfield_vable_i(box, fielddescr, pc)`.
-    ///
-    /// `pyjitpl.py MetaInterp.replace_box` framestack half. Step 4 of
-    /// `_nonstandard_virtualizable` already rewrote the TraceCtx records;
-    /// this finishes the same walk on every live `MIFrame`.
-    fn apply_pending_box_replace(&mut self) {
-        let Some((oldbox, newbox)) = self
-            .tracing
-            .as_mut()
-            .and_then(|ctx| ctx.take_pending_box_replace())
-        else {
-            return;
-        };
-        for frame in self.framestack.frames.iter_mut() {
+    /// `pyjitpl.py MetaInterp.replace_box` framestack walk.
+    unsafe fn walk_miframe_stack(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+        let stack = unsafe { &mut *data.cast::<crate::pyjitpl::MIFrameStack>() };
+        for frame in stack.frames.iter_mut() {
             frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
         }
     }
 
     fn with_tracing_vable<R>(&mut self, f: impl FnOnce(&mut TraceCtx) -> R) -> R {
-        let result = f(self
+        let frames = &mut self.framestack as *mut crate::pyjitpl::MIFrameStack;
+        let ctx = self
             .tracing
             .as_mut()
-            .expect("vable op requires active tracing"));
-        self.apply_pending_box_replace();
+            .expect("vable op requires active tracing");
+        ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast());
+        let result = f(ctx);
+        ctx.set_replace_frames(None, std::ptr::null_mut());
         result
     }
 

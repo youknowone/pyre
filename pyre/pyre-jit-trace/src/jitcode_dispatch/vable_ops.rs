@@ -122,15 +122,45 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
     }
 }
 
-/// `pyjitpl.py MetaInterp.replace_box` framestack half for the walker.
-///
-/// `_nonstandard_virtualizable` Step 4 already rewrote the TraceCtx
-/// records. The live register banks are this walk's `MIFrame` analogue.
-pub(super) fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
-    let Some((oldbox, newbox)) = ctx.trace_ctx.take_pending_box_replace() else {
-        return;
+/// Install the walker's framestack half of `MetaInterp.replace_box` so
+/// `_nonstandard_virtualizable` can rewrite banks immediately.
+pub(super) fn with_replace_frames<Sym: WalkSym, R>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    f: impl FnOnce(&mut WalkContext<'_, '_, Sym>) -> R,
+) -> R {
+    struct WalkerReplaceData {
+        session: *const std::cell::RefCell<WalkSession>,
+        registers_r: *const RegisterBank,
+        registers_i: *const RegisterBank,
+        registers_f: *const RegisterBank,
+        frame_state: *const WalkFrameState,
+    }
+    unsafe fn walk(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+        let data = unsafe { &*data.cast::<WalkerReplaceData>() };
+        let mut session = unsafe { (*data.session).borrow_mut() };
+        replace_box_in_paused_frames(&mut session, oldbox, newbox);
+        match oldbox.ty() {
+            Some(Type::Int) => unsafe { (*data.registers_i).replace_active_box(oldbox, newbox) },
+            Some(Type::Ref) => unsafe { (*data.registers_r).replace_active_box(oldbox, newbox) },
+            Some(Type::Float) => unsafe { (*data.registers_f).replace_active_box(oldbox, newbox) },
+            _ => {}
+        }
+        unsafe {
+            (*data.frame_state).replace_active_box(oldbox, newbox);
+        }
+    }
+    let mut data = WalkerReplaceData {
+        session: ctx.session,
+        registers_r: ctx.registers_r,
+        registers_i: ctx.registers_i,
+        registers_f: ctx.registers_f,
+        frame_state: &ctx.frame_state,
     };
-    replace_box_in_all_walk_frames(ctx, oldbox, newbox);
+    ctx.trace_ctx
+        .set_replace_frames(Some(walk), &raw mut data as *mut ());
+    let result = f(ctx);
+    ctx.trace_ctx.set_replace_frames(None, std::ptr::null_mut());
+    result
 }
 
 /// `pyjitpl.py MetaInterp.replace_box`: promotion updates the recording
@@ -299,14 +329,14 @@ mod frame_replacement_tests {
             let mut info =
                 majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
             info.add_field("last_instr", Type::Int, 0);
-            info.set_parent_descr(majit_ir::descr::make_size_descr(8));
+            let info = info.finalize_arc(majit_ir::descr::make_size_descr(8));
             let initial = ctx.trace_ctx.const_int(0);
             let pointer = Value::Ref(majit_ir::GcRef(0x1000));
             ctx.trace_ctx.set_opref_concrete(old, pointer);
             ctx.trace_ctx.set_virtualizable_boxes_with_info(
                 vec![initial, standard],
                 vec![Value::Int(0), pointer],
-                &info,
+                info.as_ref(),
                 &[],
             );
             let site = TracebackNodeSite {
@@ -329,7 +359,6 @@ mod frame_replacement_tests {
             assert!(ctx.trace_ctx.num_guards() > guards_before);
             assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
             assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
-            assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
         }
     }
 
@@ -639,7 +668,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // with, or the trace and the optimizer could disagree about the constant;
     // `trace.rs` installs this same `shared()` handle via `set_cpu`.
     let cpu = crate::pyre_cpu::shared();
-    let (result, shadow_value) = match dst_bank {
+    let (result, shadow_value) = with_replace_frames(ctx, |ctx| match dst_bank {
         'i' => ctx
             .trace_ctx
             .vable_getfield_int(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
@@ -650,8 +679,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
             .trace_ctx
             .vable_getfield_float(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
-    };
-    apply_pending_vable_box_replace(ctx);
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
     // `virtualizable_boxes[index]` (`pyjitpl.py`) — a Box whose
@@ -802,10 +830,10 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
     // JitCode PC, pass through.
     let guards_before = ctx.trace_ctx.num_guards();
-    let write = ctx
-        .trace_ctx
-        .vable_setfield(op.pc, obj, descr, value, concrete);
-    apply_pending_vable_box_replace(ctx);
+    let write = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .vable_setfield(op.pc, obj, descr, value, concrete)
+    });
     // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
     // authoritative for optimization, while the matching concrete frame is
     // its blackhole-resume image; mirror only own-frame standard-vable writes,
@@ -1025,10 +1053,10 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // Upstream decides standardness before promoting the index: an ordinary
     // heap access on the non-standard leg must retain the index box as-is.
     let check_guards_before = ctx.trace_ctx.num_guards();
-    let nonstandard = ctx
-        .trace_ctx
-        .nonstandard_virtualizable(op.pc, vable, &fdescr);
-    apply_pending_vable_box_replace(ctx);
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .nonstandard_virtualizable(op.pc, vable, &fdescr)
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -1321,10 +1349,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // As in the read path, only the standard virtualizable leg promotes the
     // array index and needs the full walker-owned resume snapshot.
     let check_guards_before = ctx.trace_ctx.num_guards();
-    let nonstandard = ctx
-        .trace_ctx
-        .nonstandard_virtualizable(op.pc, vable, &fdescr);
-    apply_pending_vable_box_replace(ctx);
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .nonstandard_virtualizable(op.pc, vable, &fdescr)
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -1503,15 +1531,16 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 1, 3, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
     let cpu = crate::pyre_cpu::shared();
-    let result = ctx.trace_ctx.vable_arraylen_vable(
-        cpu.as_ref(),
-        op.pc,
-        vable,
-        vable_struct_ptr,
-        fdescr,
-        adescr,
-    );
-    apply_pending_vable_box_replace(ctx);
+    let result = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx.vable_arraylen_vable(
+            cpu.as_ref(),
+            op.pc,
+            vable,
+            vable_struct_ptr,
+            fdescr,
+            adescr,
+        )
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);

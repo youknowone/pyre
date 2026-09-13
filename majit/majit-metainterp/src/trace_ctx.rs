@@ -684,14 +684,14 @@ pub struct TraceCtx {
     /// `None` outside the brief window between the dispatch-site stash
     /// and the jitdriver-side drain.
     pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
-    /// `pyjitpl.py _nonstandard_virtualizable` Step 4 calls
-    /// `self.metainterp.replace_box`, which rewrites every `MIFrame`
-    /// register bank before the vref / vable / heapcache walks.
-    /// `TraceCtx::replace_box` owns only those three walks; the
-    /// framestack lives on the jitcode machine / walker. Step 4 stashes
-    /// the alias here so the caller that owns the frames can finish the
-    /// same `replace_box` after the vable op returns.
-    pending_box_replace: Option<(OpRef, OpRef)>,
+    /// Framestack half of `pyjitpl.py MetaInterp.replace_box`.
+    ///
+    /// `_nonstandard_virtualizable` calls `self.metainterp.replace_box`
+    /// immediately (`pyjitpl.py` `if isstandard: replace_box`). The
+    /// framestack lives on the jitcode machine / walker, so that owner
+    /// installs this hook for the duration of a vable op. `None` is the
+    /// test path with no live frames.
+    replace_frames: Option<(unsafe fn(*mut (), OpRef, OpRef), *mut ())>,
 
     /// `pyjitpl.py MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
     /// vrefbox]` for every `opimpl_virtual_ref` ↔ `opimpl_virtual_ref_finish`
@@ -1381,13 +1381,26 @@ impl TraceCtx {
         self.pending_guard_not_invalidated_pc = pc;
     }
 
-    /// The framestack half of `pyjitpl.py MetaInterp.replace_box`.
-    ///
-    /// `_nonstandard_virtualizable` Step 4 records the alias after
-    /// `TraceCtx::replace_box`. The owner of the live `MIFrame` /
-    /// walker register banks drains it and rewrites those banks.
-    pub fn take_pending_box_replace(&mut self) -> Option<(OpRef, OpRef)> {
-        self.pending_box_replace.take()
+    /// Install the framestack half of `MetaInterp.replace_box` for one
+    /// vable op. `walk` receives `(framestack, old, new)`.
+    pub fn set_replace_frames(
+        &mut self,
+        walk: Option<unsafe fn(*mut (), OpRef, OpRef)>,
+        data: *mut (),
+    ) {
+        self.replace_frames = walk.map(|walk| (walk, data));
+    }
+
+    /// `pyjitpl.py _nonstandard_virtualizable`:
+    /// `self.metainterp.replace_box(box, standard_box)`.
+    /// Framestack first, then vref / vable / heapcache.
+    fn replace_standard_vable(&mut self, oldbox: OpRef, newbox: OpRef) {
+        if let Some((walk, data)) = self.replace_frames {
+            unsafe {
+                walk(data, oldbox, newbox);
+            }
+        }
+        self.replace_box(oldbox, newbox);
     }
 
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
@@ -1865,7 +1878,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
-            pending_box_replace: None,
+            replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -1966,7 +1979,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
-            pending_box_replace: None,
+            replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -4397,20 +4410,7 @@ impl TraceCtx {
                     //     self.metainterp.replace_box(box, standard_box)`.
                     // Virtualizables are always Refs here, so the
                     // `box.type == 'r'` check is unconditional.
-                    //
-                    // Upstream's `MetaInterp.replace_box` also walks the
-                    // framestack, rewriting the box in every frame's active
-                    // registers; this one rewrites only the records `TraceCtx`
-                    // owns, so an alias of `vable_opref` sitting in a register
-                    // would keep naming the nonstandard box.
-                    //
-                    // `self.metainterp.replace_box` also walks every
-                    // `MIFrame` register bank. This method owns only the
-                    // vref / vable / heapcache half; the jitcode machine
-                    // and the walker drain `take_pending_box_replace` to
-                    // finish the same walk on the frames they own.
-                    self.replace_box(vable_opref, standard_box);
-                    self.pending_box_replace = Some((vable_opref, standard_box));
+                    self.replace_standard_vable(vable_opref, standard_box);
                     return false;
                 }
             }
@@ -6318,18 +6318,72 @@ mod tests {
     }
 
     #[test]
-    fn replace_box_does_not_by_itself_queue_a_framestack_rewrite() {
+    fn replace_box_does_not_install_a_framestack_hook() {
         // `pyjitpl.py replace_box` always walks frames, but
         // `TraceCtx::replace_box` is only the vref/vable/heapcache half.
-        // The framestack pending is armed only by `_nonstandard_virtualizable`
-        // Step 4, which is the one caller that used to skip the walk.
+        // The framestack hook is installed by the owner of the live frames.
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
         let old = OpRef::input_arg_ref(0);
         let new = OpRef::input_arg_ref(1);
         ctx.replace_box(old, new);
         assert!(
-            ctx.take_pending_box_replace().is_none(),
-            "a bare replace_box must not invent a framestack alias"
+            ctx.replace_frames.is_none(),
+            "a bare replace_box must not invent a framestack walk"
+        );
+    }
+
+    #[test]
+    fn nonstandard_standard_alias_walks_framestack_immediately() {
+        // `_nonstandard_virtualizable` Step 4: two boxes, same pointer,
+        // matching vinfo → `replace_box` at the promote itself.
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(16));
+        let fd = info.static_field_descr(0);
+
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let alias = recorder.record_input_arg(Type::Ref);
+        let field = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let pointer = Value::Ref(majit_ir::GcRef(0x1000));
+        ctx.set_opref_concrete(standard, pointer);
+        ctx.set_opref_concrete(alias, pointer);
+        ctx.set_virtualizable_boxes_with_info(
+            vec![field, standard],
+            vec![Value::Int(0), pointer],
+            info.as_ref(),
+            &[],
+        );
+
+        let mut walked = std::cell::Cell::new(None::<(OpRef, OpRef)>);
+        unsafe fn walk(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+            let slot = unsafe { &*data.cast::<std::cell::Cell<Option<(OpRef, OpRef)>>>() };
+            slot.set(Some((oldbox, newbox)));
+        }
+        ctx.set_replace_frames(Some(walk), &raw mut walked as *mut ());
+        let nonstandard = ctx.nonstandard_virtualizable(0, alias, &fd);
+        ctx.set_replace_frames(None, std::ptr::null_mut());
+
+        assert!(
+            !nonstandard,
+            "same-pointer alias must become the standard virtualizable"
+        );
+        assert_eq!(
+            walked.get(),
+            Some((alias, standard)),
+            "the framestack hook must run inside replace_box, not after a drain"
+        );
+        assert_eq!(
+            ctx.virtualizable_boxes
+                .as_ref()
+                .map(|boxes| boxes.as_slice()),
+            Some([field, standard].as_slice()),
+            "replace_box must already have walked virtualizable_boxes"
         );
     }
 

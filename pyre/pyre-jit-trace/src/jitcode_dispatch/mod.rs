@@ -1500,14 +1500,15 @@ fn emit_traceback_node<Sym: WalkSym>(
     // without it the promote reaches the decoder holding
     // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
     let guards_before = ctx.trace_ctx.num_guards();
-    let write = ctx.trace_ctx.vable_setfield(
-        opcode_position,
-        site.frame,
-        last_instr_descr,
-        last_instr_value,
-        Some(Value::Int(i64::from(site.last_instruction))),
-    );
-    vable_ops::apply_pending_vable_box_replace(ctx);
+    let write = vable_ops::with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx.vable_setfield(
+            opcode_position,
+            site.frame,
+            last_instr_descr,
+            last_instr_value,
+            Some(Value::Int(i64::from(site.last_instruction))),
+        )
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
