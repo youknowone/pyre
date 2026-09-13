@@ -2626,11 +2626,13 @@ mod tests {
 // (`pyjitpl.py:2455+ self.history.record2(...)` call sites).
 
 use crate::call_descr::{
-    EffectInfoSlot, make_call_descr_from_target_slot, make_call_may_force_descr,
+    EffectInfoSlot, make_call_descr_from_target_slot, make_call_descr_with_effect,
+    make_call_may_force_descr,
 };
 use crate::jitdriver::JitDriverStaticData;
 use crate::recorder::{Trace, TracePosition};
 use crate::trace_ctx::TraceCtx;
+use majit_ir::EffectInfo;
 
 impl TraceCtx {
     /// history.py: get_trace_position — current recorder position.
@@ -4164,9 +4166,9 @@ impl TraceCtx {
     /// `getcalldescr` (`codewriter/call.rs`) builds for the
     /// matching `CALL_PURE_*` op.
     ///
-    /// `slot` is the per-callee classification chosen at producer time
-    /// (`call.py getcalldescr`'s `extraeffect` selection); see
-    /// `make_call_descr_from_target_slot` for the resolution rule.
+    /// `extra_info` is the decoded `calldescr` effect
+    /// (`pyjitpl.py opimpl_record_known_result_*` passes `calldescr`
+    /// to `_record_helper_varargs`).
     pub fn record_known_result_typed(
         &mut self,
         result: OpRef,
@@ -4174,14 +4176,15 @@ impl TraceCtx {
         args: &[OpRef],
         arg_types: &[Type],
         result_type: Type,
-        slot: EffectInfoSlot,
+        extra_info: EffectInfo,
     ) {
-        // `opimpl_record_known_result_{i,r}_ir_v` records `resbox` itself.
+        // `opimpl_record_known_result_{i,r}_ir_v` records `resbox` itself
+        // and passes the decoded `calldescr` to `_record_helper_varargs`.
         // `result_type` still selects the calldescr identity
         // (`jtransform.py rewrite_op_jit_record_known_result` uses
         // `op.args[0]`'s concretetype).
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let descr = make_call_descr_from_target_slot(arg_types, result_type, slot);
+        let descr = make_call_descr_with_effect(arg_types, result_type, extra_info);
         let mut call_args = vec![result, func_ref];
         call_args.extend_from_slice(args);
         self.recorder

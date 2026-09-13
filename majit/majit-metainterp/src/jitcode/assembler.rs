@@ -4033,6 +4033,14 @@ impl JitCodeBuilder {
     }
 
     fn push_reg_list(&mut self, regs: &[u16]) {
+        // `assembler.py write_insn` `assert len(lst) <= 255, "list too long!"`
+        // for `ListOfKind`. A silent `as u8` wrap turns 256 args into a
+        // zero-length list and leaves the register bytes as later opcodes.
+        assert!(
+            regs.len() <= 255,
+            "inline_call ListOfKind length {} exceeds 255",
+            regs.len()
+        );
         self.push_u8(regs.len() as u8);
         for &reg in regs {
             self.push_reg_u8(reg, "inline_call list");

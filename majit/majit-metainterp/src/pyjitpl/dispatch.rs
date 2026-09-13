@@ -9444,7 +9444,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Int,
-                            slot,
+                            calldescr.extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9465,7 +9465,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Ref,
-                            slot,
+                            calldescr.extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9813,7 +9813,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Int,
-                            slot,
+                            extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
@@ -9838,7 +9838,7 @@ where
                             &args,
                             &arg_types,
                             majit_ir::Type::Ref,
-                            slot,
+                            extra_info.clone(),
                         );
                         let mut allboxes =
                             vec![first_box, ctx.const_int(trace_ptr as usize as i64)];
