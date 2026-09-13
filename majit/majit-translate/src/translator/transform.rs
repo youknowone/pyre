@@ -395,28 +395,38 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
     // Variable variant carries `annotation`.
     let (n, total) = {
         let blk = block.borrow();
-        let n = blk
+        let can_succeed: Vec<_> = blk
             .operations
             .iter()
-            .position(|op| match &op.result {
-                Hlvalue::Variable(v) => v.annotation.borrow().is_none(),
-                Hlvalue::Constant(_) => false,
+            .map(|op| match &op.result {
+                Hlvalue::Variable(v) => v.annotation.borrow().is_some(),
+                Hlvalue::Constant(_) => true,
             })
-            .unwrap_or(blk.operations.len());
+            .collect();
+        let n = can_succeed.iter().filter(|annotated| **annotated).count();
+        // transform.py::cutoff_alwaysraising_block checks both partitions:
+        // successfully annotated operations must precede the failing tail.
+        assert!(
+            can_succeed[..n].iter().all(|annotated| *annotated),
+            "cutoff_alwaysraising_block: annotated operations must form a prefix"
+        );
+        assert!(
+            can_succeed[n..].iter().all(|annotated| !*annotated),
+            "cutoff_alwaysraising_block: unannotated operations must form a suffix"
+        );
         (n, blk.operations.len())
     };
     if crate::determinism_trace_enabled() {
         let trace = cutoff_block_trace_with_counts(ann, block, n, total);
         eprintln!("[DTRACE-CUT] {trace}");
     }
-    // upstream: `assert 0 <= n < len(block.operations)`.  A
-    // `Result::Err` constructor has no unannotated op — every
-    // statement succeeded and the Ok exit was the one
-    // `transform_dead_code` killed.  The remaining exits already
-    // raise; inventing AssertionError would be a second raise.
-    if n >= total {
-        return;
-    }
+    // transform.py::cutoff_alwaysraising_block: a successful operation prefix
+    // must end at an operation that cannot succeed. Missing followed links
+    // or preseeded annotations are not an alternative successful cutoff.
+    assert!(
+        n < total,
+        "cutoff_alwaysraising_block: no failing op (n={n}, total={total})"
+    );
 
     // upstream: `del block.operations[n+1:]`.
     block.borrow_mut().operations.truncate(n + 1);
@@ -1177,6 +1187,51 @@ mod tests {
         let ops = &start.borrow().operations;
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opname, "alloc_and_set");
+    }
+
+    /// transform.py::cutoff_alwaysraising_block requires an operation whose
+    /// result was never annotated. A fully annotated block with no exits is
+    /// broken flow/followed-link bookkeeping, not a successful cutoff.
+    #[test]
+    #[should_panic(expected = "no failing op")]
+    fn cutoff_rejects_fully_annotated_block_without_exits() {
+        use crate::annotator::model::SomeInteger;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+        let result = Variable::new();
+        result
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                false, false,
+            )))));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![Hlvalue::Constant(Constant::new(ConstValue::Int(1)))],
+            Hlvalue::Variable(result),
+        ));
+        cutoff_alwaysraising_block(&ann, &block);
+    }
+
+    #[test]
+    #[should_panic(expected = "annotated operations must form a prefix")]
+    fn cutoff_rejects_annotation_after_unannotated_operation() {
+        use crate::annotator::model::SomeInteger;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let block = Block::shared(vec![]);
+        let late_result = Variable::new();
+        late_result
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                false, false,
+            )))));
+        for result in [Variable::new(), late_result] {
+            block.borrow_mut().operations.push(SpaceOperation::new(
+                "same_as",
+                vec![Hlvalue::Constant(Constant::new(ConstValue::Int(1)))],
+                Hlvalue::Variable(result),
+            ));
+        }
+        cutoff_alwaysraising_block(&ann, &block);
     }
 
     #[test]

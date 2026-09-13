@@ -3399,6 +3399,19 @@ impl Assembler {
             ConstValue::Int(n) => *n,
             ConstValue::Bool(b) => *b as i64,
             ConstValue::SpecTag(tag) => *tag as i64,
+            // assembler.py::Assembler.emit_const converts raw pointers via
+            // cast_ptr_to_adr/adr2int. Null needs no runtime relocation.
+            ConstValue::LLPtr(ptr) if !ptr.nonzero() => {
+                assert_eq!(
+                    ptr._TYPE._gckind(),
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    "integer pointer constants must be raw"
+                );
+                0
+            }
+            ConstValue::LLAddress(
+                crate::translator::rtyper::lltypesystem::lltype::_address::Null,
+            ) => 0,
             // Symbolic inheritance-id marker: emit the resolved id. When
             // only the eager `value` is present it is the concrete id;
             // `cdef_id` reserves the key for a numbering resolution.
@@ -3500,6 +3513,16 @@ impl Assembler {
             return self.emit_unit_variant_const_r(qualname, tag, state);
         }
         let bits = match value {
+            // assembler.py::Assembler.emit_const casts ref constants to
+            // GCREF and gives every typed nullptr the same None pool key.
+            ConstValue::LLPtr(ptr) if !ptr.nonzero() => {
+                assert_eq!(
+                    ptr._TYPE._gckind(),
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
+                    "reference pointer constants must be GC-managed"
+                );
+                0
+            }
             ConstValue::HostObject(obj) => obj.identity_id() as i64,
             ConstValue::LLAddress(
                 crate::translator::rtyper::lltypesystem::lltype::_address::Null,
@@ -7372,6 +7395,114 @@ mod tests {
         let body = asm.assemble(&mut flat, &regallocs);
 
         assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
+        assert!(asm.insns.contains_key("ref_return/r"));
+    }
+
+    #[test]
+    #[should_panic(expected = "integer pointer constants must be raw")]
+    fn integer_constants_reject_null_gc_pointer() {
+        let null = crate::translator::rtyper::lltypesystem::lltype::nullptr(
+            crate::translator::rtyper::rclass::OBJECT.clone(),
+        )
+        .unwrap();
+        Assembler::resolve_const_i_value(&ConstValue::LLPtr(Box::new(null)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "reference pointer constants must be GC-managed")]
+    fn reference_constants_reject_null_raw_pointer() {
+        let null = crate::translator::rtyper::lltypesystem::lltype::nullptr(
+            crate::translator::rtyper::rclass::OBJECT_VTABLE.clone(),
+        )
+        .unwrap();
+        Assembler::new().emit_const_r(&ConstValue::LLPtr(Box::new(null)), &mut empty_state());
+    }
+
+    #[test]
+    fn assemble_int_return_with_typed_null_class_pointer() {
+        use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
+
+        let classtype = crate::translator::rtyper::rclass::CLASSTYPE.clone();
+        let LowLevelType::Ptr(classptr) = &classtype else {
+            unreachable!()
+        };
+        let null = lltype::nullptr(classptr.TO.clone().into()).expect("null CLASSTYPE");
+        let mut flat = SSARepr {
+            name: "return_null_class".into(),
+            insns: vec![FlatOp::IntReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    classtype,
+                ),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        // Assembler.emit_const uses USE_C_FORM for int_return: raw NULL is
+        // the short integer zero, not a constant-pool entry.
+        assert!(body.constants_i.is_empty());
+        assert!(body.constants_r.is_empty());
+        assert!(asm.insns.contains_key("int_return/c"));
+
+        let null_address = ConstValue::LLAddress(lltype::_address::Null);
+        let mut state = empty_state();
+        assert_eq!(
+            asm.emit_const_i_from_const_allow_short(&null_address, true, &mut state, None),
+            (0, 'c'),
+        );
+        assert!(state.constants_i.is_empty());
+    }
+
+    #[test]
+    fn emit_const_r_deduplicates_typed_nulls() {
+        use crate::translator::rtyper::lltypesystem::{lltype, rstr};
+
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_r = 3;
+        for container in [
+            crate::translator::rtyper::rclass::OBJECT.clone(),
+            rstr::STR.clone(),
+        ] {
+            let null = lltype::nullptr(container).expect("null GC pointer");
+            let slot = asm.emit_const_r(&ConstValue::LLPtr(Box::new(null)), &mut state);
+            assert_eq!(
+                slot, 3,
+                "typed nulls share one slot after the Ref registers"
+            );
+        }
+        assert_eq!(state.constants_r, vec![0]);
+        assert!(state.str_consts.is_empty());
+        assert!(state.unit_variant_consts.is_empty());
+    }
+
+    #[test]
+    fn assemble_ref_return_with_typed_null_constant() {
+        use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
+
+        let LowLevelType::Ptr(objectptr) = crate::translator::rtyper::rclass::OBJECTPTR.clone()
+        else {
+            unreachable!()
+        };
+        let null = lltype::nullptr(objectptr.TO.clone().into()).expect("null OBJECTPTR");
+        let mut flat = SSARepr {
+            name: "return_typed_null".into(),
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                crate::flowspace::model::Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+                ),
+            ))],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &empty_regallocs());
+        assert_eq!(body.constants_r, vec![0]);
+        assert!(body.str_consts.is_empty());
+        assert!(body.unit_variant_consts.is_empty());
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 
