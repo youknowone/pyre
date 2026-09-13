@@ -2977,6 +2977,101 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
     validate_wasm(&bytes);
 }
 
+/// assembler.py `push_gcmap` stores this site's map. The host union is
+/// only for incomparable ordinary/LABEL extents; a live map that already
+/// covers these bits must not `call_indirect` it. The pointer-eq sits in
+/// front of that call so a keyed resume into the same module is a guest
+/// compare.
+#[test]
+fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
+    let inputargs = vec![
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
+    ];
+    let const_1 = OpRef::const_int(1);
+    let const_100 = OpRef::const_int(100);
+    let ops = vec![
+        Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(1), OpRef::input_arg_int(0)],
+            OpRef::int_op(2),
+        ),
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(3),
+        ),
+        make_op(
+            OpCode::IntLt,
+            &[OpRef::int_op(3), const_100],
+            OpRef::int_op(4),
+        ),
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::int_op(4)],
+            &[OpRef::int_op(3), OpRef::int_op(2)],
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(3)), rb(OpRef::int_op(2))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.compute_home_gcmap = true;
+    ca.ca_reload_fn_ptr = 1;
+    let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame,
+        ca,
+    };
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs)
+        .expect("cover-check publish must still declare the union residual");
+    validate_wasm(&bytes);
+    let mut ptr_eqs = 0usize;
+    let mut union_calls = 0usize;
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            for op in body.get_operators_reader().unwrap() {
+                match op.unwrap() {
+                    wasmparser::Operator::I64Eq => ptr_eqs += 1,
+                    wasmparser::Operator::CallIndirect { .. } => union_calls += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(
+        ptr_eqs > 0,
+        "publish must i64.eq the live jf_gcmap against this map before union"
+    );
+    assert!(
+        union_calls > 0,
+        "incomparable ordinary/LABEL maps still need the union residual"
+    );
+}
+
 /// A re-emission that grew the LABEL-capture tail must still build when
 /// asked to null only the newly marked slots before publishing.
 #[test]

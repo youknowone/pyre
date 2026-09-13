@@ -2633,11 +2633,16 @@ fn emit_ca_reload_top(sink: &mut PeepSink<'_, '_>, top_addr: u32) {
 /// Publish `build_home_gcmap` on the live frame (`local 0` is the items
 /// base). `ptr == 0` is the test path that never installs a map.
 ///
-/// Ordinary homes and LABEL captures grow independently, so the live map
-/// and this module's map can be incomparable. With a residual type family
-/// the store is their bitwise union (`wasm_jit_union_gcmap`). Without one
-/// (host tests) the store is still monotonic: publish this map only when
-/// it covers every live bit.
+/// assembler.py `push_gcmap` stores this site's map. Ordinary homes and
+/// LABEL captures grow independently, so two live maps can be incomparable
+/// and a later keyed resume must not drop the other region. The host
+/// `wasm_jit_union_gcmap` exists only for that case. A live map that
+/// already covers these bits — the same pointer, or a prior union — is
+/// left in place: a host call here sat on every keyed LABEL resume and
+/// every key-0 re-entry after the first, including the hot out-of-line
+/// loop-closing bridges that #1766 put over the wasm/dynasm ceiling.
+/// Without a residual type family (host tests) the store is still
+/// monotonic: publish this map only when it covers every live bit.
 fn emit_publish_home_gcmap(
     sink: &mut PeepSink<'_, '_>,
     ptr: i64,
@@ -2692,6 +2697,46 @@ fn emit_publish_home_gcmap(
     if let Some(base) = residual_type_base {
         // `(i64, i64) -> i64` at `residual_type_base + 2`.
         let union_fn = crate::wasm_jit_union_gcmap as *const () as usize as i64;
+        let ne_words = |sink: &mut PeepSink<'_, '_>| {
+            if word == 4 {
+                sink.i32_ne();
+            } else {
+                sink.i64_ne();
+            }
+        };
+        sink.block(BlockType::Empty); // $after
+        sink.local_get(old_local);
+        sink.i64_extend_i32_u();
+        sink.i64_const(ptr);
+        sink.i64_eq();
+        sink.br_if(0);
+        sink.block(BlockType::Empty); // $union
+        sink.local_get(old_local);
+        load_usize(sink, 0);
+        if word == 8 {
+            sink.i32_wrap_i64();
+        }
+        sink.i32_const(n_new as i32);
+        sink.i32_lt_u();
+        sink.br_if(0);
+        for (i, &new_word) in new_words.iter().enumerate() {
+            if new_word == 0 {
+                continue;
+            }
+            sink.local_get(old_local);
+            load_usize(sink, (1 + i as u32) as u64 * word as u64);
+            const_usize(sink, new_word);
+            if word == 4 {
+                sink.i32_and();
+            } else {
+                sink.i64_and();
+            }
+            const_usize(sink, new_word);
+            ne_words(sink);
+            sink.br_if(0);
+        }
+        sink.br(1);
+        sink.end(); // $union
         emit_hdr(sink);
         sink.local_get(old_local);
         sink.i64_extend_i32_u();
@@ -2699,6 +2744,7 @@ fn emit_publish_home_gcmap(
         sink.i32_const(union_fn as i32);
         sink.call_indirect(0, base + 2);
         emit_word_store(sink, JF_GCMAP_OFS as u64);
+        sink.end(); // $after
         sink.end();
         return;
     }
@@ -3921,10 +3967,11 @@ pub struct CaParams {
     pub inline: Option<CaInlineParams>,
     /// `build_home_gcmap` pointer published after the fresh-entry home/input
     /// stores, and again on each keyed LABEL resume after those slots are
-    /// already valid or newly marked ones have been nulled. Used only when
-    /// [`Self::compute_home_gcmap`] is false. Zero leaves `jf_gcmap` unset
-    /// in the generated module (tests). assembler.py writes `jf_gcmap` at
-    /// safepoints once those slots are live.
+    /// already valid or newly marked ones have been nulled. A resume whose
+    /// live map already covers this pointer leaves `jf_gcmap` unchanged.
+    /// Used only when [`Self::compute_home_gcmap`] is false. Zero leaves
+    /// `jf_gcmap` unset in the generated module (tests). assembler.py
+    /// writes `jf_gcmap` at safepoints once those slots are live.
     pub home_gcmap_ptr: i64,
     /// When set, leak a map from this module's `RefHomes` and LABEL captures
     /// (raised to the `home_gcmap_min_*` floors) instead of
@@ -6176,7 +6223,11 @@ fn build_function(
             // Keyed resume skipped the key-0 stores. Grown slots were
             // nulled before `br_table`; remaining marked homes already
             // hold the previous module's values. Publish before the
-            // loader stores, matching `push_gcmap` at a live safepoint.
+            // loader stores so a foreign JUMP or a grown re-emission
+            // cannot leave this module's homes unmarked. assembler.py
+            // `push_gcmap` is a safepoint store, not a LABEL op: when
+            // the live map already covers these bits the publish is a
+            // guest compare, not a host union.
             emit_publish_home_gcmap(
                 &mut sink,
                 publish_ptr,
