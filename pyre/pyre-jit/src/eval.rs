@@ -5570,24 +5570,52 @@ fn build_jit_driver_pair() -> JitDriverPair {
                             || name.contains("comparison_op_arg")
                             || name.contains("jump_target_forward")
                             || name.contains("jump_target_backward")
-                            || name.contains("w_code_const")
                             || name.ends_with("::nlocals")
                             || name.ends_with("::ncells")
-                            || name.contains("frame_anchor_push")
-                            || name.contains("stack_check"))
+                            || name.contains("ll_issubclass")
+                            || name.contains("raise_kind_arg")
+                            || name.contains("label_arg_to_usize"))
                         .then_some(addr)
                     })
                     .collect();
                 addrs.push(pyre_object::gc_interp::enabled as *const () as i64);
+                addrs.push(pyre_object::ll_issubclass as *const () as i64);
+                addrs.push(
+                    pyre_object::pyobject::__majit_call_target_ll_issubclass as *const () as i64,
+                );
                 addrs
             },
         });
+        majit_metainterp::register_elidable_ref_residual(majit_metainterp::ElidableRefResidual {
+            fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
+                .into_iter()
+                .filter_map(|(name, addr)| name.contains("w_code_const").then_some(addr))
+                .collect(),
+        });
+        majit_metainterp::register_exact_int_false_residual(
+            majit_metainterp::ExactIntFalseResidual {
+                fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| {
+                        name.contains("needs_numeric_binop_dispatch")
+                            .then_some(addr)
+                    })
+                    .collect(),
+                is_exact_int: |ptr| {
+                    let obj = ptr as pyre_object::PyObjectRef;
+                    !obj.is_null()
+                        && unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) }
+                },
+            },
+        );
         majit_metainterp::register_void_skip_residual(majit_metainterp::VoidSkipResidual {
             fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
                 .into_iter()
                 .filter_map(|(name, addr)| {
-                    (name.contains("frame_anchor_release") || name.contains("frame_anchor_drop"))
-                        .then_some(addr)
+                    (name.contains("frame_anchor_release")
+                        || name.contains("frame_anchor_drop")
+                        || name.contains("stack_check"))
+                    .then_some(addr)
                 })
                 .collect(),
         });
