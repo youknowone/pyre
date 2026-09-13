@@ -4332,115 +4332,120 @@ impl TraceCtx {
             self.forced_virtualizable = None;
         }
         // Step 3: standard_box identity check.
-        //     standard_box = self.metainterp.virtualizable_boxes[-1]
-        //     if standard_box is box:
-        //         return False
+        //     if (self.metainterp.jitdriver_sd.virtualizable_info is not None or
+        //         self.metainterp.jitdriver_sd.greenfield_info is not None):
+        //         standard_box = self.metainterp.virtualizable_boxes[-1]
+        //         if standard_box is box:
+        //             return False
+        //
+        // Empty `virtualizable_boxes` is the vinfo-is-None / greenfield-is-None
+        // arm: skip the standard identity check and fall through to Step 5
+        // `emit_force_virtualizable`. An early `return True` here dropped the
+        // force that `_nonstandard_virtualizable` still runs on that path.
         let standard_box = self
             .virtualizable_boxes
             .as_ref()
             .and_then(|boxes| boxes.last().copied());
-        let Some(standard_box) = standard_box else {
-            // No boxes → treat as nonstandard.
-            return true;
-        };
-        if standard_box == vable_opref {
-            return false;
-        }
-        // Step 4: PTR_EQ + implement_guard_value + replace_box.
-        //     vinfo = self.metainterp.jitdriver_sd.virtualizable_info
-        //     if vinfo is fielddescr.get_vinfo():
-        //         eqbox = self.metainterp.execute_and_record(
-        //             rop.PTR_EQ, None, box, standard_box)
-        //         eqbox = self.implement_guard_value(eqbox, pc)
-        //         isstandard = eqbox.getint()
-        //         if isstandard:
-        //             if box.type == 'r':
-        //                 self.metainterp.replace_box(box, standard_box)
-        //             return False
-        //
-        // `fielddescr.get_vinfo()` upgrades the backref stamped by
-        // `finalize_arc`.  When the descriptor carries a vinfo backref,
-        // the upstream `vinfo is fielddescr.get_vinfo()` check holds iff
-        // the active `virtualizable_info` is the same concrete type
-        // (pyre single-driver: trivially true).  When the descriptor
-        // lacks a backref (by-value legacy path), pyre skips the
-        // PTR_EQ/replace_box short-circuit and falls through to Step 5 —
-        // same behaviour as upstream when the fielddescr came from a
-        // different jitdriver's vinfo.
-        let descriptor_vinfo = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
-        let descriptor_has_matching_vinfo = match descriptor_vinfo {
-            // Backref stamped by `finalize_arc` → concrete type must be
-            // our `VirtualizableInfo`.  Pyre's single-driver model means
-            // every marker that downcasts successfully is the active
-            // vinfo; this is the structural mirror of upstream's Python
-            // `vinfo is fielddescr.get_vinfo()` identity check.
-            Some(ref m) => m.as_any().is::<VirtualizableInfo>(),
-            // Legacy by-value descriptor → no backref to compare
-            // against.  Treat as "matching" so the PTR_EQ/replace_box
-            // block still runs for test harnesses that pre-date
-            // `finalize_arc`.  Production pyre always stamps backrefs.
-            None => true,
-        };
-        if descriptor_has_matching_vinfo {
-            let standard_concrete = self.standard_virtualizable_concrete();
-            // pyjitpl.py `eqbox = self.metainterp.execute_and_record(
-            //     rop.PTR_EQ, None, box, standard_box);
-            //     eqbox = self.implement_guard_value(eqbox, pc);
-            //     isstandard = eqbox.getint()`.
-            //
-            // pyre resolves `isstandard` by comparing the traced concrete
-            // ptrs directly (see `concrete_of_opref` for how `concrete` is
-            // reconstructed from tracer-local state).  The subsequent
-            // `promote_int` records the GUARD_VALUE that commits the
-            // runtime outcome to the trace.  `pc` threads through for
-            // RPython signature parity; pyre's `record_guard` seeds the
-            // guard descr via `num_live` (live-var count), not pc, so the
-            // parameter is documented here but not consumed at this layer.
-            let _ = pc;
-            let isstandard: i64 = if concrete_ptrs_eq(concrete.as_ref(), standard_concrete.as_ref())
-            {
-                1
-            } else {
-                0
-            };
-            // pyjitpl.py `_nonstandard_virtualizable` execute leg. Step 3
-            // already returned for `standard_box is box`, so two constants
-            // arriving here are *different* constants and cannot be equal at
-            // runtime either — the fold to `ConstInt(0)` is sound, and
-            // `promote_int` then short-circuits it into no GUARD_VALUE.
-            // `PTR_EQ` reads no memory, so the fold does not depend on which
-            // backend answers; `TraceCtx` holds no `Cpu`, so the default one
-            // stands in.
-            let cpu = crate::cpu::default_cpu();
-            let eqbox = self.execute_and_record(
-                Some(cpu.as_ref()),
-                OpCode::PtrEq,
-                None,
-                &[vable_opref, standard_box],
-                Some(Value::Int(isstandard)),
-                0,
-            );
-            self.promote_int(eqbox, isstandard, 0);
-            if isstandard != 0 {
-                // `_nonstandard_virtualizable`'s `if box.type == 'r':
-                //     self.metainterp.replace_box(box, standard_box)`.
-                // Virtualizables are always Refs here, so the
-                // `box.type == 'r'` check is unconditional.
-                //
-                // Upstream's `MetaInterp.replace_box` also walks the
-                // framestack, rewriting the box in every frame's active
-                // registers; this one rewrites only the records `TraceCtx`
-                // owns, so an alias of `vable_opref` sitting in a register
-                // would keep naming the nonstandard box.
-                //
-                // `self.metainterp.replace_box` also walks every
-                // `MIFrame` register bank. This method owns only the
-                // vref / vable / heapcache half; the jitcode machine
-                // and the walker drain `take_pending_box_replace` to
-                // finish the same walk on the frames they own.
-                self.replace_box(vable_opref, standard_box);
-                self.pending_box_replace = Some((vable_opref, standard_box));
+        if let Some(standard_box) = standard_box {
+            if standard_box == vable_opref {
                 return false;
+            }
+            // Step 4: PTR_EQ + implement_guard_value + replace_box.
+            //     vinfo = self.metainterp.jitdriver_sd.virtualizable_info
+            //     if vinfo is fielddescr.get_vinfo():
+            //         eqbox = self.metainterp.execute_and_record(
+            //             rop.PTR_EQ, None, box, standard_box)
+            //         eqbox = self.implement_guard_value(eqbox, pc)
+            //         isstandard = eqbox.getint()
+            //         if isstandard:
+            //             if box.type == 'r':
+            //                 self.metainterp.replace_box(box, standard_box)
+            //             return False
+            //
+            // `fielddescr.get_vinfo()` upgrades the backref stamped by
+            // `finalize_arc`.  When the descriptor carries a vinfo backref,
+            // the upstream `vinfo is fielddescr.get_vinfo()` check holds iff
+            // the active `virtualizable_info` is the same concrete type
+            // (pyre single-driver: trivially true).  When the descriptor
+            // lacks a backref (by-value legacy path), pyre skips the
+            // PTR_EQ/replace_box short-circuit and falls through to Step 5 —
+            // same behaviour as upstream when the fielddescr came from a
+            // different jitdriver's vinfo.
+            let descriptor_vinfo = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
+            let descriptor_has_matching_vinfo = match descriptor_vinfo {
+                // Backref stamped by `finalize_arc` → concrete type must be
+                // our `VirtualizableInfo`.  Pyre's single-driver model means
+                // every marker that downcasts successfully is the active
+                // vinfo; this is the structural mirror of upstream's Python
+                // `vinfo is fielddescr.get_vinfo()` identity check.
+                Some(ref m) => m.as_any().is::<VirtualizableInfo>(),
+                // Legacy by-value descriptor → no backref to compare
+                // against.  Treat as "matching" so the PTR_EQ/replace_box
+                // block still runs for test harnesses that pre-date
+                // `finalize_arc`.  Production pyre always stamps backrefs.
+                None => true,
+            };
+            if descriptor_has_matching_vinfo {
+                let standard_concrete = self.standard_virtualizable_concrete();
+                // pyjitpl.py `eqbox = self.metainterp.execute_and_record(
+                //     rop.PTR_EQ, None, box, standard_box);
+                //     eqbox = self.implement_guard_value(eqbox, pc);
+                //     isstandard = eqbox.getint()`.
+                //
+                // pyre resolves `isstandard` by comparing the traced concrete
+                // ptrs directly (see `concrete_of_opref` for how `concrete` is
+                // reconstructed from tracer-local state).  The subsequent
+                // `promote_int` records the GUARD_VALUE that commits the
+                // runtime outcome to the trace.  `pc` threads through for
+                // RPython signature parity; pyre's `record_guard` seeds the
+                // guard descr via `num_live` (live-var count), not pc, so the
+                // parameter is documented here but not consumed at this layer.
+                let _ = pc;
+                let isstandard: i64 =
+                    if concrete_ptrs_eq(concrete.as_ref(), standard_concrete.as_ref()) {
+                        1
+                    } else {
+                        0
+                    };
+                // pyjitpl.py `_nonstandard_virtualizable` execute leg. Step 3
+                // already returned for `standard_box is box`, so two constants
+                // arriving here are *different* constants and cannot be equal at
+                // runtime either — the fold to `ConstInt(0)` is sound, and
+                // `promote_int` then short-circuits it into no GUARD_VALUE.
+                // `PTR_EQ` reads no memory, so the fold does not depend on which
+                // backend answers; `TraceCtx` holds no `Cpu`, so the default one
+                // stands in.
+                let cpu = crate::cpu::default_cpu();
+                let eqbox = self.execute_and_record(
+                    Some(cpu.as_ref()),
+                    OpCode::PtrEq,
+                    None,
+                    &[vable_opref, standard_box],
+                    Some(Value::Int(isstandard)),
+                    0,
+                );
+                self.promote_int(eqbox, isstandard, 0);
+                if isstandard != 0 {
+                    // `_nonstandard_virtualizable`'s `if box.type == 'r':
+                    //     self.metainterp.replace_box(box, standard_box)`.
+                    // Virtualizables are always Refs here, so the
+                    // `box.type == 'r'` check is unconditional.
+                    //
+                    // Upstream's `MetaInterp.replace_box` also walks the
+                    // framestack, rewriting the box in every frame's active
+                    // registers; this one rewrites only the records `TraceCtx`
+                    // owns, so an alias of `vable_opref` sitting in a register
+                    // would keep naming the nonstandard box.
+                    //
+                    // `self.metainterp.replace_box` also walks every
+                    // `MIFrame` register bank. This method owns only the
+                    // vref / vable / heapcache half; the jitcode machine
+                    // and the walker drain `take_pending_box_replace` to
+                    // finish the same walk on the frames they own.
+                    self.replace_box(vable_opref, standard_box);
+                    self.pending_box_replace = Some((vable_opref, standard_box));
+                    return false;
+                }
             }
         }
         // Step 5a: emit_force_virtualizable.
@@ -4459,7 +4464,18 @@ impl TraceCtx {
         //             rop.COND_CALL, [condbox, funcbox, box],
         //             vinfo.clear_vable_descr, False, False)
         if !self.heap_cache.is_unescaped(vable_opref) {
-            self.emit_force_virtualizable(fielddescr, vable_opref);
+            // `emit_force_virtualizable` starts `vinfo = fielddescr.get_vinfo();
+            // assert vinfo is not None`. A plain heap FieldDescr (test harness)
+            // has no backref and no active `virtualizable_info`; skip the
+            // COND_CALL rather than invent a force helper.
+            let can_emit = fielddescr
+                .as_field_descr()
+                .and_then(|fd| fd.get_vinfo())
+                .is_some()
+                || self.virtualizable_info.is_some();
+            if can_emit {
+                self.emit_force_virtualizable(fielddescr, vable_opref);
+            }
         }
         // Step 5b: mark this box as a known nonstandard virtualizable so
         // future accesses short-circuit at Step 1.
@@ -6957,6 +6973,40 @@ mod tests {
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
+    }
+
+    /// `pyjitpl.py _nonstandard_virtualizable`: empty `virtualizable_boxes`
+    /// is the `vinfo is None` arm of the standard-box gate. Step 5 still
+    /// emits `emit_force_virtualizable` before returning True.
+    #[test]
+    fn empty_boxes_still_emits_force_virtualizable() {
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info = make_test_vable_info();
+        info.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let fd8 = info.static_field_descr(0);
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.virtualizable_info = Some(std::sync::Arc::new(info));
+
+        let _result = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, vable, 0, fd8);
+
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::CondCallN),
+            "empty boxes must still emit emit_force_virtualizable, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "nonstandard getfield still records the heap load, got {ops:?}"
+        );
     }
 
     #[test]
