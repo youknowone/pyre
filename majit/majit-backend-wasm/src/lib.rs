@@ -2416,6 +2416,11 @@ const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 
 /// A merge that passed every inline check and is waiting on
 /// [`INLINE_TRIP_THRESHOLD`] entries into the bridge compiled in its place.
+///
+/// Installation replaces the retained wasm module after compiled execution
+/// returns. Dispatch is withdrawn during this transition, so intervening exits
+/// use blackhole resume without heating an already-attached guard. Invalidation
+/// remains owned by the loop token across module replacement.
 struct PendingInline {
     /// The loop this region merges into.
     owner: Arc<JitCellToken>,

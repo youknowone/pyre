@@ -4201,15 +4201,14 @@ pub trait FailDescr: Descr {
         false
     }
 
-    /// Wasm-only dispatch withdrawal for deferred module replacement. Native
-    /// `assembler.py::patch_jump_for_descr` keeps an attached bridge reachable;
-    /// this wasm backend returns from compiled code before replacement. It resumes
-    /// through `compile.py::AbstractResumeGuardDescr.handle_fail`'s blackhole
-    /// arm without ticking the already-attached guard again.
-    /// Keep this reason separate from ST_BUSY_FLAG: a busy guard still reports
-    /// a real failure during bridge tracing, whereas withdrawal is maintenance.
-    /// The remaining status bits hold the jitcounter hash or value-slot index
-    /// (compile.py::AbstractResumeGuardDescr), so no unused bit is borrowed.
+    /// Whether wasm bridge dispatch is withdrawn for deferred module replacement.
+    /// Compiled execution must return before the retained module is replaced.
+    /// An exit through the withdrawn dispatch resumes in the blackhole without
+    /// heating a guard whose bridge is already attached.
+    ///
+    /// This is separate from ST_BUSY_FLAG: a busy guard still reports a real
+    /// failure during bridge tracing, whereas withdrawal is maintenance. The
+    /// remaining status bits hold the jitcounter hash or value-slot index.
     ///
     /// The methods stay on every target so a wasm32 layout pass can compile
     /// against a host-built `majit-ir`. The AtomicBool field remains

@@ -298,6 +298,11 @@ pub fn main() {
 /// `front::result_exc` lowers a `Result<T, E>`-returning graph into
 /// exception edges; naming `E` is the consumer's job, so the identity of
 /// pyre's own `E` lives here rather than in majit.
+///
+/// These conversions transport the application-level exception object, not
+/// the complete interpreter-level carrier. `PyError::from_exc_object`
+/// initializes `attach_tb` and `context_recorded` rather than restoring their
+/// input values, so the conversion pair is not a lossless carrier round trip.
 const PYRE_ERROR_CARRIER: majit_translate::ErrorCarrierSpec<'static> =
     majit_translate::ErrorCarrierSpec {
         carrier_path: "pyre_interpreter::error::PyError",
