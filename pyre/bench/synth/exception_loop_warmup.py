@@ -1,10 +1,4 @@
 # pyre-check: max-pypy-ratio=6.5
-# pyre-check: max-wasm-ratio=4.9
-# Post-warmup raises leave the compiled loop and hop through blackhole.
-# The same fail-arg recording made dynasm's remaining deopts a register
-# restore from the jitframe, while wasm still interprets that hop.
-# ubuntu-24.04 measured 4.2x against that faster dynasm, so 4.9x is
-# the highest observation plus WASM_RATIO_FIT_HEADROOM (15%).
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,
