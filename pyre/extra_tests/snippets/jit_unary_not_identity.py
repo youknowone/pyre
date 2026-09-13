@@ -2,9 +2,9 @@
 """Compiled `not` must keep the bool singletons and the int/bool mix.
 
 The interpreter UNARY_NOT is `space.not_` (`newbool(not is_true(x))`).
-The JIT still residualizes that helper (walking `w_bool_from` would
-guard one singleton). After warmup the residual fold has to answer
-the same objects the interpreter does.
+The JIT walks that body: `space.newbool` is a guard on the truth plus
+the prebuilt singleton, and the other arm is a bridge. After warmup
+the compiled path still has to answer the same objects.
 """
 
 n = 0

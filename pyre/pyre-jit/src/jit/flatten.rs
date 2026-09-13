@@ -3759,10 +3759,9 @@ pub struct LoweringContext {
     /// unpacks `*`/`**` and dispatches (user code → `MayForce`).
     pub call_function_ex_fn_idx: u16,
     /// `unary_not_fn` descrs-pool index.  UNARY_NOT records the object-space
-    /// `not_(value)` op lowered to `residual_call_r_r` via
-    /// [`lower_unary_not_hlop_to_insn`]; walking `baseobjspace::not_` is
-    /// declined until `w_bool_from` is a select rather than a branch.
-    /// `bh_unary_not_fn` returns `not value` as a bool (`MayForce`).
+    /// `not_(value)` op; [`lower_unary_not_hlop_to_insn`] emits
+    /// `inline_call_r_r` of `baseobjspace::not_` when that body is fully
+    /// bound, otherwise this residual (`bh_unary_not_fn`, MayForce).
     pub unary_not_fn_idx: u16,
     /// `load_fast_check_fn` descrs-pool index.  LOAD_FAST_CHECK records the
     /// `load_fast_check(value, code, name_idx)` HLOp lowered to
@@ -6928,13 +6927,13 @@ where
 }
 
 /// Lower the UNARY_NOT object-space op `not_(value)` → `result: Ref`
-/// (pyopcode.py `unaryoperation("not_")`) to
-/// `residual_call_r_r(ConstInt(unary_not_fn_idx), ListR([value]), Descr) →
-/// reg`.  `baseobjspace::not_` is now a real jitcode (`space.not_`), but
-/// walking it records `w_bool_from`'s branch onto one bool singleton and
-/// guards the other — a toggling `not` then deopts every iteration.  The
-/// residual fold emits `int_is_true` / bool invert instead.  Inline once
-/// that boxing is a select, the same way `pos`/`neg`/`invert` already are.
+/// (pyopcode.py `unaryoperation("not_")`) to the canonical
+/// `inline_call_r_r(JitCode, ListR([value])) → reg` emitted by RPython's
+/// `jtransform.py handle_regular_call`.  Walking `baseobjspace::not_`
+/// traces `space.newbool` as a guard on the truth plus the prebuilt
+/// singleton (`walker_newbool_guarded`); the other arm is a
+/// `trace_eagerness` bridge, not a per-iteration tax.  A build whose
+/// body `fully_bound_callee_body` declines keeps the MayForce residual.
 ///
 /// Returns `None` for non-`not_` opnames so the caller can fall through
 /// to other lowering arms.
@@ -6956,6 +6955,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if let Some(insn) = build_orthodox_inline_call_r_r(
+        "pyre_interpreter::baseobjspace::not_",
+        value.clone(),
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.unary_not_fn_idx,
         vec![value],
@@ -13713,12 +13719,15 @@ mod tests {
     }
 
     #[test]
-    fn lower_unary_not_hlop_emits_unary_not_fn_residual() {
-        // Residual on purpose: walking `not_` currently guards one bool
-        // singleton.  See `lower_unary_not_hlop_to_insn`.
-        assert_unary_lowering_emits_residual("not_", 110, |op, ctx, gr, lc| {
-            super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
-        });
+    fn lower_unary_not_hlop_emits_inline_call_or_residual_fallback() {
+        assert_unary_lowering_inlines_bound_body(
+            "not_",
+            "pyre_interpreter::baseobjspace::not_",
+            110,
+            |op, ctx, gr, lc| {
+                super::lower_unary_not_hlop_to_insn(op, ctx, &mut |v| gr(v), &mut |c| lc(c))
+            },
+        );
     }
 
     #[test]
