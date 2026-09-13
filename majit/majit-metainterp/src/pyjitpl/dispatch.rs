@@ -9174,13 +9174,12 @@ where
                 let slot = target.effect_info_slot;
                 match bytecode {
                     jitcode::insns::BC_CONDITIONAL_CALL_IR_V => {
-                        let (first_box, first_val) = {
-                            let frame = self.frames.current_mut();
-                            let first_val = frame.int_values[first_reg as usize].unwrap_or(0);
-                            let first_box = frame.int_regs[first_reg as usize]
-                                .unwrap_or_else(|| OpRef::const_int(first_val));
-                            (first_box, first_val)
-                        };
+                        // `_opimpl_conditional_call_*`: skip only when the
+                        // register's own SSA box is already a Const. Inventing
+                        // ConstInt from this iteration's concrete value makes
+                        // `is_constant()` true for a live register and bakes
+                        // the snapshot into the trace.
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
                         // `opimpl_conditional_call_ir_v`: ConstInt(0) records
                         // nothing so the heapcache can keep args virtual.
                         if first_box.is_constant() && first_val == 0 {
@@ -9202,13 +9201,7 @@ where
                         }
                     }
                     jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I => {
-                        let (first_box, first_val) = {
-                            let frame = self.frames.current_mut();
-                            let first_val = frame.int_values[first_reg as usize].unwrap_or(0);
-                            let first_box = frame.int_regs[first_reg as usize]
-                                .unwrap_or_else(|| OpRef::const_int(first_val));
-                            (first_box, first_val)
-                        };
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
                         // `_opimpl_conditional_call_value`: Const nonnull
                         // returns the value box without recording.
                         if first_box.is_constant() && first_val != 0 {
@@ -9239,15 +9232,7 @@ where
                         }
                     }
                     jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R => {
-                        let (first_box, first_val) = {
-                            let frame = self.frames.current_mut();
-                            let first_val = frame.ref_values[first_reg as usize].unwrap_or(0);
-                            let first_box =
-                                frame.ref_regs[first_reg as usize].unwrap_or_else(|| {
-                                    OpRef::const_ptr(majit_ir::GcRef(first_val as usize))
-                                });
-                            (first_box, first_val)
-                        };
+                        let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
                         if first_box.is_constant() && first_val != 0 {
                             if let Some(dst) = dst {
                                 self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
@@ -9276,12 +9261,7 @@ where
                         }
                     }
                     jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V => {
-                        let first_box = {
-                            let frame = self.frames.current_mut();
-                            let result_val = frame.int_values[first_reg as usize].unwrap_or(0);
-                            frame.int_regs[first_reg as usize]
-                                .unwrap_or_else(|| OpRef::const_int(result_val))
-                        };
+                        let (first_box, _) = self.read_int_reg(first_reg as usize);
                         ctx.profiler()
                             .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                         ctx.record_known_result_typed(
@@ -9294,13 +9274,7 @@ where
                         );
                     }
                     jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
-                        let first_box = {
-                            let frame = self.frames.current_mut();
-                            let result_val = frame.ref_values[first_reg as usize].unwrap_or(0);
-                            frame.ref_regs[first_reg as usize].unwrap_or_else(|| {
-                                OpRef::const_ptr(majit_ir::GcRef(result_val as usize))
-                            })
-                        };
+                        let (first_box, _) = self.read_ref_reg(first_reg as usize);
                         ctx.profiler()
                             .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                         ctx.record_known_result_typed(
@@ -9371,13 +9345,7 @@ where
                     jitcode::insns::BC_COND_CALL_VOID => {
                         // RPython pyjitpl.py opimpl_conditional_call_ir_v:
                         //   if condition != 0: call func(args)
-                        let (first_box, first_val) = {
-                            let frame = self.frames.current_mut();
-                            let first_val = frame.int_values[first_reg as usize].unwrap_or(0);
-                            let first_box = frame.int_regs[first_reg as usize]
-                                .unwrap_or_else(|| OpRef::const_int(first_val));
-                            (first_box, first_val)
-                        };
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
                         if first_box.is_constant() && first_val == 0 {
                             // skip
                         } else {
@@ -9389,13 +9357,7 @@ where
                     }
                     jitcode::insns::BC_COND_CALL_VALUE_INT => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
-                        let (first_box, first_val) = {
-                            let frame = self.frames.current_mut();
-                            let first_val = frame.int_values[first_reg as usize].unwrap_or(0);
-                            let first_box = frame.int_regs[first_reg as usize]
-                                .unwrap_or_else(|| OpRef::const_int(first_val));
-                            (first_box, first_val)
-                        };
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
                         if first_box.is_constant() && first_val != 0 {
                             if let Some(dst) = dst {
                                 self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
@@ -9417,15 +9379,7 @@ where
                     jitcode::insns::BC_COND_CALL_VALUE_REF => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
                         // value is a ref — read from ref register bank.
-                        let (first_box, first_val) = {
-                            let frame = self.frames.current_mut();
-                            let first_val = frame.ref_values[first_reg as usize].unwrap_or(0);
-                            let first_box =
-                                frame.ref_regs[first_reg as usize].unwrap_or_else(|| {
-                                    OpRef::const_ptr(majit_ir::GcRef(first_val as usize))
-                                });
-                            (first_box, first_val)
-                        };
+                        let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
                         if first_box.is_constant() && first_val != 0 {
                             if let Some(dst) = dst {
                                 self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
@@ -9454,12 +9408,7 @@ where
                         // known-result var) as the fake result var for
                         // `getcalldescr`; here that maps to `Type::Int`
                         // because the bytecode is `_i_ir_v`.
-                        let first_box = {
-                            let frame = self.frames.current_mut();
-                            let result_val = frame.int_values[first_reg as usize].unwrap_or(0);
-                            frame.int_regs[first_reg as usize]
-                                .unwrap_or_else(|| OpRef::const_int(result_val))
-                        };
+                        let (first_box, _) = self.read_int_reg(first_reg as usize);
                         // `opimpl_record_known_result_i_ir_v` records without executing.
                         ctx.profiler()
                             .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
@@ -9476,13 +9425,7 @@ where
                         // RPython pyjitpl.py opimpl_record_known_result_r —
                         // `_r_ir_v` opname, calldescr result type is
                         // `Type::Ref`.
-                        let first_box = {
-                            let frame = self.frames.current_mut();
-                            let result_val = frame.ref_values[first_reg as usize].unwrap_or(0);
-                            frame.ref_regs[first_reg as usize].unwrap_or_else(|| {
-                                OpRef::const_ptr(majit_ir::GcRef(result_val as usize))
-                            })
-                        };
+                        let (first_box, _) = self.read_ref_reg(first_reg as usize);
                         // `opimpl_record_known_result_r_ir_v` records without executing.
                         ctx.profiler()
                             .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);

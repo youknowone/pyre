@@ -1239,9 +1239,21 @@ unsafe fn tuple_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 unsafe fn unicode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let unicode = unsafe { &mut *(obj_addr as *mut pyre_object::unicodeobject::W_UnicodeObject) };
     f(&mut unicode.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
+    // Same `try_gc_owns_object` gate as `bytes_object_custom_trace`: an
+    // exact immortal `str` keeps a `malloc_raw` `Wtf8Buf` the collector
+    // must not treat as a box, while a managed value box has to be greyed
+    // or a later `hash()` reads a swept `Vec` length (`capacity overflow`).
+    if !unicode.value.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(unicode.value as *mut u8)
+    {
+        f(std::ptr::addr_of_mut!(unicode.value) as *mut majit_ir::GcRef);
+    }
     f(&mut unicode.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(unicode.index_storage) as *mut majit_ir::GcRef);
+    if !unicode.index_storage.is_null()
+        && pyre_object::gc_hook::try_gc_owns_object(unicode.index_storage as *mut u8)
+    {
+        f(std::ptr::addr_of_mut!(unicode.index_storage) as *mut majit_ir::GcRef);
+    }
 }
 
 unsafe fn unicode_user_object_custom_trace(
