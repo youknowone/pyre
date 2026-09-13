@@ -3383,12 +3383,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             // deopts through FOR_ITER failargs that still name the
             // leftover frame (`'frame' object is not an iterator`).
             // Tests leave LISTITER_TYPE_WORD unset so peel still emits.
+            // A mint TOS that *is* a listiter must stay on GETFIELD —
+            // rejecting that aborts every leftover-empty `for x in xs`.
             tos_sources.clear();
-            let would_peel = leftover_ptr_is_listiter(preview)
-                || listiter_leftover
-                || mint_tos_is_frame
-                || mint_seq_frame;
-            if would_peel {
+            if listiter_leftover {
                 if std::env::var_os("MAJIT_LEFTOVER").is_some() {
                     eprintln!(
                         "leftover-empty reject TOS={preview:p} orig={orig_vable:p} \
@@ -3397,29 +3395,6 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 }
                 note_leftover_empty_reject();
             }
-        }
-    }
-    // Retry after a leftover-empty reject can still GETFIELD a stale
-    // baked-vs-mint shape (`baked=42 entry=19`) whose iterator slot is
-    // a frame. Refuse that compile; the interpreter runs FOR_ITER.
-    if leftover_has_listiter_id() && baked_field_len != entry_field_oprefs.len() {
-        let has_foriter = ops.iter().any(|op| {
-            op.getdescr().is_some_and(|d| {
-                d.as_call_descr().is_some_and(|cd| {
-                    cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
-                }) || d
-                    .as_field_descr()
-                    .is_some_and(crate::history::is_list_iter_seq_field)
-            })
-        });
-        if has_foriter {
-            if std::env::var_os("MAJIT_LEFTOVER").is_some() {
-                eprintln!(
-                    "leftover-empty reject stale baked={baked_field_len} entry={}",
-                    entry_field_oprefs.len()
-                );
-            }
-            note_leftover_empty_reject();
         }
     }
     if !tos_sources.is_empty() {
