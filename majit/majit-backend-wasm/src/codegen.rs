@@ -11154,8 +11154,10 @@ fn unbound_pool_const_seeds(
             // not in the token's input list and has no producer — leftover
             // of a residualized interior slot (`FrameLocalsRoot` keeps that
             // address out of compiled Ref homes). Dynasm `RegisterManager.loc`
-            // allocates a dummy frame slot; seed a LABEL/JUMP-only leftover
-            // with 0 so the module is well-formed. A Ref that also sits in
+            // allocates a dummy frame slot; seed a JUMP leftover with 0 so
+            // the module is well-formed. LABEL args are skipped above
+            // (`consider_label`). A body read of the same hole is a real
+            // unbound operand and must decline. A Ref that also sits in
             // failargs is the virtualizable identity / pycode: compiling
             // null there panics at deopt, so decline and let the interpreter
             // run the loop.
@@ -11165,8 +11167,10 @@ fn unbound_pool_const_seeds(
                     readers.push(format!("{:?}.{slot} {opref:?}", op.opcode));
                     return;
                 }
-                seeds.push((raw, 0));
-                return;
+                if op.opcode == OpCode::Jump {
+                    seeds.push((raw, 0));
+                    return;
+                }
             }
             // No producer, no pool entry, no leftover box value: the local
             // would read as the zero wasm initializes it to. Decline the

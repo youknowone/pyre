@@ -3518,12 +3518,39 @@ fn test_inputarg_observation_is_not_a_folded_scalar() {
     ];
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
-    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
-    validate_wasm(&bytes);
-    assert_eq!(
-        execute_simple_trace(&bytes, &[5]),
-        5,
-        "InputArg observation 7 must not seed the leftover; 0-seed + input 5 = 5"
+    let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops,
+        inlined_bridges: Vec::new(),
+        constants,
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    }) {
+        Err(err) => err,
+        Ok(_) => panic!("a body read of an InputArg observation must decline, not seed 7"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no producing op")
+            && (msg.contains("value[99]") || msg.contains("InputArgInt(99)")),
+        "must decline the unbound InputArg, got {msg}"
     );
 }
 
