@@ -8748,90 +8748,128 @@ where
                     if is_forces {
                         ctx.vrefs_after_residual_call();
                     }
-                    // pyjitpl.py do_residual_call plain branch —
-                    // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
-                    let plain_branch = !is_forces && !is_loopinvariant;
-                    let pure = plain_branch && effectinfo.check_is_elidable();
-                    let patch_pos = if pure {
-                        Some(ctx.get_trace_position())
-                    } else {
-                        None
-                    };
-                    let traced = if is_forces {
-                        ctx.call_may_force_ref_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_loopinvariant {
-                        ctx.call_loopinvariant_ref_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                            concrete,
-                        )
-                    } else {
-                        ctx.record_call_with_descr(
-                            majit_ir::OpCode::CallR,
-                            trace_ptr,
-                            &args,
-                            trace_descr.clone(),
-                        )
-                    };
-                    // pyjitpl.py:1946 gate (see int sibling for full cite).
-                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    let traced = match patch_pos {
-                        Some(patch_pos) if last_exc_value == 0 => {
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                traced,
-                                &call_args,
-                                &concrete_values,
-                                trace_descr,
-                                patch_pos,
-                                majit_ir::OpCode::CallR,
-                                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                            )
-                        }
-                        _ => traced,
-                    };
-                    // `pyjitpl.py execute_and_record_varargs` runs the call
-                    // through `executor.execute_varargs` and hands the result
-                    // to `history.record_nospec`, so the recorded op carries
-                    // the executed value on its own frontend slot -- every
-                    // later `getvalue()` of that box answers it.  Writing the
-                    // value into the destination register alone leaves
-                    // `concrete_of_opref` answering `None` for the box, and
-                    // the two readers then disagree: `_nonstandard_virtualizable`
-                    // asks the box, so a residual that returns the standard
-                    // virtualizable (the portal's `reload_top_root`) loses its
-                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
-                    // vable access on that register takes the nonstandard leg.
-                    // The full-body walker already stamps its own residual
-                    // results this way (`jitcode_dispatch/residual_call.rs`).
-                    ctx.set_opref_concrete(
-                        traced,
-                        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                    );
-                    self.set_ref_reg(dst, Some(traced), Some(concrete));
-                    if is_forces
-                        && matches!(
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
+                    // Residual wrapint (`w_int_gc_alloc`): execute already
+                    // ran; record `new_with_vtable` + `setfield_gc`
+                    // (`intobject.py wrapint`) instead of `CallR`.
+                    if let Some(spec) = crate::box_trace::wrapint_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && concrete != 0
+                        && let Some(&raw_op) = args.first()
                     {
-                        return TraceAction::Abort;
-                    }
-                    if !(pure && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                            TraceAction::Continue => {}
-                            action => return action,
+                        let boxed = crate::box_trace::trace_box_int(
+                            ctx,
+                            raw_op,
+                            spec.size_descr.clone(),
+                            spec.intval_descr.clone(),
+                            spec.int_type_addr,
+                        );
+                        ctx.set_opref_concrete(
+                            boxed,
+                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        );
+                        self.set_ref_reg(dst, Some(boxed), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                    } else {
+                        // pyjitpl.py do_residual_call plain branch —
+                        // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
+                        let plain_branch = !is_forces && !is_loopinvariant;
+                        let pure = plain_branch && effectinfo.check_is_elidable();
+                        let patch_pos = if pure {
+                            Some(ctx.get_trace_position())
+                        } else {
+                            None
+                        };
+                        let traced = if is_forces {
+                            ctx.call_may_force_ref_typed_with_effect(
+                                trace_ptr,
+                                &args,
+                                &arg_types,
+                                effectinfo.clone(),
+                            )
+                        } else if is_loopinvariant {
+                            ctx.call_loopinvariant_ref_typed_with_effect(
+                                trace_ptr,
+                                &args,
+                                &arg_types,
+                                effectinfo.clone(),
+                                concrete,
+                            )
+                        } else {
+                            ctx.record_call_with_descr(
+                                majit_ir::OpCode::CallR,
+                                trace_ptr,
+                                &args,
+                                trace_descr.clone(),
+                            )
+                        };
+                        // pyjitpl.py:1946 gate (see int sibling for full cite).
+                        let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                        let traced = match patch_pos {
+                            Some(patch_pos) if last_exc_value == 0 => {
+                                let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                                let mut call_args = vec![func_ref];
+                                call_args.extend_from_slice(&args);
+                                let concrete_values =
+                                    build_concrete_values(trace_ptr, &concrete_args, &arg_types);
+                                ctx.record_result_of_call_pure(
+                                    traced,
+                                    &call_args,
+                                    &concrete_values,
+                                    trace_descr,
+                                    patch_pos,
+                                    majit_ir::OpCode::CallR,
+                                    majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                                )
+                            }
+                            _ => traced,
+                        };
+                        // `pyjitpl.py execute_and_record_varargs` runs the call
+                        // through `executor.execute_varargs` and hands the result
+                        // to `history.record_nospec`, so the recorded op carries
+                        // the executed value on its own frontend slot -- every
+                        // later `getvalue()` of that box answers it.  Writing the
+                        // value into the destination register alone leaves
+                        // `concrete_of_opref` answering `None` for the box, and
+                        // the two readers then disagree: `_nonstandard_virtualizable`
+                        // asks the box, so a residual that returns the standard
+                        // virtualizable (the portal's `reload_top_root`) loses its
+                        // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                        // vable access on that register takes the nonstandard leg.
+                        // The full-body walker already stamps its own residual
+                        // results this way (`jitcode_dispatch/residual_call.rs`).
+                        ctx.set_opref_concrete(
+                            traced,
+                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        );
+                        self.set_ref_reg(dst, Some(traced), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        if !(pure && traced.is_constant()) {
+                            match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                                TraceAction::Continue => {}
+                                action => return action,
+                            }
                         }
                     }
                 }
