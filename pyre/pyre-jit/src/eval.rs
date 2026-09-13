@@ -5716,6 +5716,20 @@ fn build_jit_driver_pair() -> JitDriverPair {
         for addr in pyre_interpreter::jit_builtin_folds::word_fold_helper_addrs() {
             majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
         }
+        for addr in pyre_jit_trace::helpers::walker_word_helper_addrs() {
+            majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
+        for addr in pyre_jit_trace::helpers::walker_void_word_helper_addrs() {
+            majit_backend_wasm::vouch_residual_call_addr(addr);
+        }
+        use pyre_interpreter::objspace::descroperation as desc;
+        for addr in [
+            desc::jit_bigint_add_int_int as *const () as usize as i64,
+            desc::jit_bigint_sub_int_int as *const () as usize as i64,
+            desc::jit_bigint_mul_int_int as *const () as usize as i64,
+        ] {
+            majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+        }
     }
     pyre_interpreter::executioncontext::register_force_frame_hook(force_pyframe);
     pyre_interpreter::executioncontext::register_force_vref_hook(force_pyframe_vref);
