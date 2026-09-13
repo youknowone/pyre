@@ -223,12 +223,12 @@ impl Op {
         self.ensure_guard_extra().set_fail_args(fail_args);
     }
 
-    /// Share the source guard's `_fail_args` list (same `Rc` slice).
+    /// Share the source guard's `_fail_args` list (same slab slot).
     /// Avoids a second 4-/6-operand heap when stamp/copy already has
     /// the replacements on `src`.
     pub fn copy_failargs_shared(&self, src: &Self) {
-        match src.try_guard_extra().and_then(|g| g.fail_args_rc()) {
-            Some(rc) => self.ensure_guard_extra().set_fail_args_rc(rc),
+        match src.try_guard_extra() {
+            Some(g) => self.ensure_guard_extra().share_fail_args_from(g),
             None => self.clearfailargs(),
         }
     }

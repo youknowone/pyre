@@ -7347,14 +7347,12 @@ impl OptContext {
         // non-Const position has no operand to bind and panics at
         // `Operand::from_opref` — the same contract the operand-union
         // `_args` model enforces (#9).
-        let final_operands: Vec<Operand> = liveboxes
-            .iter()
-            .map(|a| {
-                self.resolve_to_operand(*a)
-                    .unwrap_or_else(|| Operand::from_opref(*a))
-            })
-            .collect();
+        op.store_final_boxes(liveboxes.iter().map(|a| {
+            self.resolve_to_operand(*a)
+                .unwrap_or_else(|| Operand::from_opref(*a))
+        }));
         memo.recycle_ordered_liveboxes(liveboxes);
+        let final_operands = op.guard_fail_args().unwrap_or(&[]);
         let logical_rd_locs: majit_ir::RdLocs = final_operands
             .iter()
             .enumerate()
@@ -7379,7 +7377,6 @@ impl OptContext {
                 final_oprefs,
             );
         }
-        op.store_final_boxes(final_operands);
         op.set_fail_arg_types(new_types.clone());
         // optimizer.py `store_final_boxes_in_guard` parity:
         //   if op.getdescr() is not None:

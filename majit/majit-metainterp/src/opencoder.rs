@@ -515,24 +515,52 @@ where
         }
         let src: &majit_ir::Op = self.trace[self.pos].borrow();
         self.pos += 1;
-        let mut res: majit_ir::Op = src.clone();
-        // opencoder.py:379-387: for i in range(argnum):
-        //     res.setarg(i, self._untag(self._next()))
-        for i in 0..res.num_args() {
-            // The legacy adapter already carries the decoded Const object in
-            // the source op. RPython's byte iterator creates it once while
-            // decoding `_untag`; keep that object instead of flattening it to
-            // OpRef and allocating a second Const wrapper immediately.
-            if !res.arg(i).is_constant() {
-                res.setarg(i, self._untag(res.arg(i).to_opref()));
-            }
+        // opencoder.py `TraceIterator.next` `cls()` / `ResOperation(opnum, args)`
+        // — a fresh object, not a clone of the recorded op. Cloning copied
+        // `Box<OpKindExtra>` (32 B) on every guard; minting writes
+        // remapped args/fail_args onto a new `Op` the way `cls()` does.
+        let mut args: majit_ir::resoperation::OpArgVec = smallvec::SmallVec::new();
+        for i in 0..src.num_args() {
+            let a = src.arg(i);
+            args.push(if a.is_constant() {
+                a
+            } else {
+                self._untag(a.to_opref())
+            });
         }
-        if let Some(fa) = res.fail_args_mut() {
-            for arg in fa.iter_mut() {
-                if !arg.is_constant() {
-                    *arg = self._untag(arg.to_opref());
-                }
-            }
+        let res = match src.getdescr() {
+            Some(d) => majit_ir::Op::with_descr(src.opcode, &args, d),
+            None => majit_ir::Op::new(src.opcode, &args),
+        };
+        // history.py FrontendOp `_resint`/`_resfloat`/`_resref` ride on
+        // the recorded box. The byte-stream iterator never sees them;
+        // this structured walker must keep the stamp or fannkuch grows
+        // two extra JUMP bridges (22 → 24, 5049 → 5450 guard_failures).
+        if let Some(v) = src.get_value() {
+            res.set_value(v);
+        }
+        if let Some(vecinfo) = src.get_vecinfo() {
+            res.set_vecinfo(vecinfo);
+        }
+        if let Some(fa) = src.guard_fail_args() {
+            let mapped: majit_ir::resoperation::OpArgVec = fa
+                .iter()
+                .map(|arg| {
+                    if arg.is_constant() {
+                        arg.clone()
+                    } else {
+                        self._untag(arg.to_opref())
+                    }
+                })
+                .collect();
+            res.setfailargs(mapped);
+        }
+        let resume = src.rd_resume_position();
+        if resume >= 0 {
+            res.set_rd_resume_position(resume);
+        }
+        if let Some(types) = src.get_fail_arg_types() {
+            res.set_fail_arg_types(types);
         }
         // RPython opencoder.py:399-401:
         //     res = ResOperation(opnum, args, descr)   # fresh cls() object
@@ -942,7 +970,7 @@ impl<'a> Iterator for ByteTraceIter<'a> {
             None => self._next() as usize,
         };
         // opencoder.py — read `argnum` tagged args and untag.
-        let mut args: smallvec::SmallVec<[Operand; 3]> = smallvec::SmallVec::new();
+        let mut args: majit_ir::resoperation::OpArgVec = smallvec::SmallVec::new();
         for _ in 0..arity {
             let tagged = self._next();
             args.push(self._untag(tagged));
@@ -3411,6 +3439,19 @@ mod tests {
         let fa = r2.guard_fail_args().unwrap();
         assert_eq!(fa[0].to_opref(), iarg(10));
         assert_eq!(fa[1].to_opref(), iop(11));
+    }
+
+    #[test]
+    fn test_trace_iterator_keeps_frontend_stamp() {
+        // history.py FrontendOp `_resint` lives on the recorded box.
+        // The structured walker must copy it onto the cls() result.
+        let mut add = op_at(1, majit_ir::OpCode::IntAdd, &[iarg(0), iarg(0)]);
+        add.set_value(majit_ir::value::Value::Int(7));
+        let ops = vec![add];
+        let ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
+        let mut iter = TraceIterator::new(&ops, 0, ops.len(), None, &[majit_ir::Type::Int], 10);
+        let r = iter.next().unwrap();
+        assert_eq!(r.get_value(), Some(majit_ir::value::Value::Int(7)));
     }
 
     #[test]
