@@ -198,28 +198,18 @@ impl Cpu for PyreCpu {
 
     fn protect_speculative_string(&self, gcptr: GcRef) -> Result<(), SpeculativeError> {
         // `llmodel.py protect_speculative_string` → `protect_speculative_array`
-        // with `gc_ll_descr.str_descr` (rstr `STR` tid).
+        // with `gc_ll_descr.str_descr`.  Fail closed when the typeid is
+        // not the STR tid: an aligned wrapper or other immortal is not a
+        // payload, and `bh_strlen` would read its header as `len`.
         if gcptr.is_null() {
             return Err(SpeculativeError);
         }
         if !majit_gc::supports_guard_gc_type() {
             return Ok(());
         }
-        if majit_gc::gc_owns_object(gcptr.0) {
-            let actual = majit_gc::get_actual_typeid(gcptr).ok_or(SpeculativeError)?;
-            let want = lowlevel_str_gc_type_id();
-            if want != 0 && actual == want {
-                return Ok(());
-            }
-            return Err(SpeculativeError);
-        }
-        // Immortal `_utf8` is a raw STR (`alloc_raw_utf8_payload`) so an
-        // immortal header never greys a young box.  No GC header, so
-        // `get_actual_typeid` would read `hash` as a vtable.  Accept an
-        // aligned non-null payload; the length word is the allocation we
-        // wrote.  Convergence: register immortal STR as a prebuilt root
-        // so `get_actual_typeid` answers the STR tid.
-        if gcptr.0 % std::mem::align_of::<usize>() != 0 {
+        let want = lowlevel_str_gc_type_id();
+        let actual = majit_gc::get_actual_typeid(gcptr).ok_or(SpeculativeError)?;
+        if want == 0 || actual != want {
             return Err(SpeculativeError);
         }
         Ok(())

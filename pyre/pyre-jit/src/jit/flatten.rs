@@ -6155,7 +6155,7 @@ where
         ctx.binary_slice_fn_idx,
         vec![obj, start, stop],
         CallFlavor::MayForce,
-        majit_ir::RuntimeHelperKind::None,
+        majit_ir::RuntimeHelperKind::BinarySlice,
         dst_reg,
     ))
 }

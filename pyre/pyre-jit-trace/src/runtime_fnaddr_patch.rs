@@ -391,19 +391,16 @@ pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
 /// pattern.
 const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
-/// Materialize one immortal runtime `W_UnicodeObject` for a prebuilt-string
-/// constant, returning its address.  `box_str_constant` leaks (never freed,
-/// outside the nursery) a `W_UnicodeObject` whose `_utf8` is an rstr `STR`.
-/// `bh_strlen` / `bh_strgetitem` (`pyre_cpu.rs`) read that payload, matching
-/// `llmodel.py`.  It is the same builder `pyre-jit`'s `flatten.rs` uses for
-/// runtime string literals, and interns identical literals by content (the
-/// runtime analog of the assembler's per-jitcode dedup).  `precomputed_hash`
-/// is unused at runtime — `W_UnicodeObject` carries the Python `hash()`
-/// cache, so `ll_strhash` recomputes from the `STR` on demand.
+/// Materialize one immortal rstr `STR` for a prebuilt-string constant.
+/// `StringRepr.convert_const` (`rstr.py`) yields `Ptr(STR)`, and
+/// `bh_strlen` / `bh_strgetitem` (`llmodel.py`) read that payload.
+/// `box_str_constant` still interns the wrapper; the slot holds
+/// `_utf8`, not the wrapper header.
 fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("prebuilt STR constant bytes are not valid WTF-8");
-    pyre_object::unicodeobject::box_str_constant(wtf8) as i64
+    let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
+    unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
