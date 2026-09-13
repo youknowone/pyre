@@ -5867,21 +5867,21 @@ mod tests {
         let mut memo = ResumeDataLoopMemo::new();
         let snapshot = Snapshot::single_frame(0, 8, vec![numbered]);
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        // `_number_boxes` inserts `get_box_replacement_operand(raw).to_opref()`,
+        // the collapsed box, not the Phase-2 numbering name.
         assert_eq!(
             numb_state
                 .livebox_types
                 .get_index(0)
                 .map(|(opref, _)| *opref),
-            Some(numbered),
+            Some(collapsed),
         );
         let (_rd_numb, _rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None).unwrap();
 
-        // Numbering keeps 231 in `livebox_types`. finish() still materializes
-        // the Operand key (`to_opref` → 1): emitting 231 as the dump home
-        // SIGSEGVs Grain, because the compiled failarg locs are the
-        // forwarded box. Do not switch finish() onto `livebox_types`
-        // until the backend names a loc for that numbering opref.
+        // finish() materializes the same Operand key (`to_opref` → 1).
+        // Emitting 231 as the dump home SIGSEGVs Grain, because the
+        // compiled failarg locs are the forwarded box.
         assert_eq!(liveboxes, vec![collapsed]);
     }
 
