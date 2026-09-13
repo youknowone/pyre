@@ -208,6 +208,31 @@ fn portal_reachable_symbolic_residual_scan_is_empty() {
     );
 }
 
+/// jd1's `unpackiterable_portal` is a second driver, not the eval portal
+/// above. A `||` closure in its drain livevar reloads used to mint
+/// `target:closure.call` hashes that this scan (and the walk) refuse.
+#[test]
+fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let portal =
+        crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
+            .expect("the build-time table registers the unpackiterable portal");
+    let portal = majit_metainterp::JitCode::from_canonical((*portal).clone());
+
+    let scan = portal.reachable_symbolic_residuals();
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the unpackiterable portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "named shadow_stack_get / next / drain residuals must resolve; \
+         a leftover target:closure.call hash aborts the jd1 walk",
+    );
+}
+
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
     let mut session = WalkSession::default();

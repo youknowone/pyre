@@ -438,10 +438,56 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         lastexc_blocks >= 1,
         "the drain next() site must become a LastException exception-edge"
     );
+
+    // Reload livevars through the named `shadow_stack_get` residual, not a
+    // `||` closure. A closure residual is `Method { name: "call",
+    // receiver_root: Some("closure" | "closure#N") }`, which the codewriter
+    // mints as `target:closure.call` — a hash `jit_trace_fnaddrs` cannot bind,
+    // so `refuse_reachable_symbolic_residuals` aborts the jd1 walk.
+    let closure_calls: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::Method {
+                        name,
+                        receiver_root: Some(receiver),
+                        ..
+                    },
+                ..
+            } if name == "call" && receiver.starts_with("closure") => {
+                Some(format!("{receiver}.{name}"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        closure_calls.is_empty(),
+        "unpackiterable_portal must not residualize `||` closures: {closure_calls:?}"
+    );
+    let shadow_stack_gets = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("shadow_stack_get")
+            )
+        })
+        .count();
+    assert!(
+        shadow_stack_gets >= 1,
+        "drain livevars must reload through named shadow_stack_get"
+    );
+
     eprintln!(
         "drain fusion: object_predicate={object_predicate_calls} \
          source_predicate={source_predicate_calls} exc_kind_discriminant={exc_kind_calls} \
-         lastexc_blocks={lastexc_blocks}"
+         lastexc_blocks={lastexc_blocks} shadow_stack_get={shadow_stack_gets}"
     );
 }
 
