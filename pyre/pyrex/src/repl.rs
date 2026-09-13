@@ -453,7 +453,7 @@ fn ensure_sys_prompt(sys_module: pyre_object::PyObjectRef, name: &str, fallback:
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             sys_module,
             name,
-            pyre_object::w_str_new(fallback),
+            pyre_object::w_str_new_managed(fallback),
         );
     }
 }

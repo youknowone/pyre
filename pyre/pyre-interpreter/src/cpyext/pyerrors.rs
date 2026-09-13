@@ -969,18 +969,16 @@ pub unsafe extern "C" fn PyTraceBack_Print(tb: *mut CPyObject, file: *mut CPyObj
         return -1;
     }
     let roots = pyre_object::gc_roots::push_roots();
-    let traceback_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(traceback);
-    let file_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(file);
+    let pair = pyre_object::gc_roots::pin_roots(&[traceback, file]);
+    let traceback_slot = pair;
+    let file_slot = pair + 1;
     let reload = pyre_object::gc_roots::shadow_stack_get;
-    let header = crate::baseobjspace::call_method(
-        reload(file_slot),
-        "write",
-        &[pyre_object::w_str_new(
-            "Traceback (most recent call last):\n",
-        )],
-    );
+    let header_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new_managed(
+        "Traceback (most recent call last):\n",
+    ));
+    let header =
+        crate::baseobjspace::call_method(reload(file_slot), "write", &[reload(header_slot)]);
     if header.is_null() {
         return report_call_failure();
     }

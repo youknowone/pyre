@@ -2239,13 +2239,15 @@ fn path_hook_accepts(
     let iterator = pyre_interpreter::baseobjspace::iter(path_hooks)?;
 
     let _roots = push_roots();
-    let filename_slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::w_str_new(filename));
     // A hook call runs arbitrary Python and can drive a collection, which moves
     // the iterator that has to survive it. A Rust local is not walked, so
     // publish it in a shadow-stack slot and read it back for the next step.
+    // Pin the already-live iterator first; the path string is minted after
+    // that publish so the mint cannot move an unpublished iterator.
     let iterator_slot = shadow_stack_len();
     let _ = pin_root(iterator);
+    let filename_slot = shadow_stack_len();
+    let _ = pin_root(pyre_object::w_str_new_managed(filename));
     loop {
         let hook = match pyre_interpreter::baseobjspace::next(shadow_stack_get(iterator_slot)) {
             Ok(hook) => hook,
@@ -2490,7 +2492,7 @@ fn eval_program_in_main(
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
             "__file__",
-            pyre_object::w_str_new(file),
+            pyre_object::w_str_new_managed(file),
         );
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,

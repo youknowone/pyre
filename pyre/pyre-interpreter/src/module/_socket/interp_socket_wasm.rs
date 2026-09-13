@@ -230,7 +230,7 @@ pub(super) fn register_names(ns: PyObjectRef) {
         "gethostname",
         crate::make_builtin_function_with_arity(
             "gethostname",
-            |_args| Ok(pyre_object::w_str_new(NODE_NAME)),
+            |_args| Ok(pyre_object::w_str_new_managed(NODE_NAME)),
             0,
         ),
     );

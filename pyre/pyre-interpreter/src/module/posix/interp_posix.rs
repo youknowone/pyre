@@ -6872,7 +6872,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             return Ok(crate::gateway::fsdecode_os_str(cwd.as_os_str()));
                         }
                     }
-                    Ok(pyre_object::w_str_new(""))
+                    Ok(pyre_object::w_str_new_managed(""))
                 }
             },
             0,

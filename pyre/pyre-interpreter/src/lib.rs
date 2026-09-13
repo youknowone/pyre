@@ -834,7 +834,7 @@ impl PywrapKind for bool {
 impl PywrapKind for &str {
     #[inline]
     fn into_py(self) -> ::pyre_object::PyObjectRef {
-        ::pyre_object::w_str_new(self)
+        ::pyre_object::w_str_new_managed(self)
     }
 }
 impl PywrapKind for String {

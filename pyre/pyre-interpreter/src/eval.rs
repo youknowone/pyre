@@ -4533,17 +4533,18 @@ impl OpcodeStepExecutor for PyFrame {
     ) -> Result<(), PyError> {
         // Stack: [value, expression, format_spec?] — format_spec present only
         // when the oparg low bit is set, else it defaults to the empty string.
-        let _interp_roots = pyre_object::gc_roots::push_roots();
-        let format_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(if has_format_spec {
+        let format = if has_format_spec {
             self.pop()
         } else {
             pyre_object::w_str_new("")
-        });
-        let expression_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(self.pop());
-        let value_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(self.pop());
+        };
+        let expression = self.pop();
+        let value = self.pop();
+        let _interp_roots = pyre_object::gc_roots::push_roots();
+        let triple = pyre_object::gc_roots::pin_roots(&[format, expression, value]);
+        let format_slot = triple;
+        let expression_slot = triple + 1;
+        let value_slot = triple + 2;
         let conversion_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(conversion as i64));
         let anchor = FrameAnchor::new(self);

@@ -3200,7 +3200,7 @@ fn iterator_reduce_tuple(
         // specialized string/list iterators; generic sequence, bytes and
         // tuple iterators use the canonical empty tuple.
         let empty = match empty_kind {
-            1 => w_str_new(""),
+            1 => w_str_new_managed(""),
             2 => w_list_new(vec![]),
             _ => w_tuple_new(vec![]),
         };
@@ -8340,25 +8340,25 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
 pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
     unsafe {
         if std::ptr::eq(obj, crate::typedef::w_type()) {
-            return Ok(w_str_new(crate::typedef::TYPE_DOC));
+            return Ok(w_str_new_managed(crate::typedef::TYPE_DOC));
         }
         if std::ptr::eq(
             obj,
             crate::typedef::gettypeobject(&pyre_object::descriptor::PROPERTY_TYPE),
         ) {
-            return Ok(w_str_new(crate::typedef::PROPERTY_DOC));
+            return Ok(w_str_new_managed(crate::typedef::PROPERTY_DOC));
         }
         if std::ptr::eq(
             obj,
             crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE),
         ) {
-            return Ok(w_str_new(crate::typedef::FUNCTION_DOC));
+            return Ok(w_str_new_managed(crate::typedef::FUNCTION_DOC));
         }
         if std::ptr::eq(
             obj,
             crate::typedef::gettypeobject(&pyre_object::function::METHOD_TYPE),
         ) {
-            return Ok(w_str_new(crate::typedef::METHOD_DOC));
+            return Ok(w_str_new_managed(crate::typedef::METHOD_DOC));
         }
         if !w_type_is_cpython_heaptype(obj) {
             // typeobject.py descr__doc: `if not w_type.is_heaptype(): return w_type.w_doc`.
