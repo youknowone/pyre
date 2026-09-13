@@ -1,9 +1,4 @@
 # pyre-check: max-pypy-ratio=6.5
-# pyre-check: max-wasm-ratio=4.8
-# After specialised arity-2 tuples birth in the nursery, the post-warmup
-# blackhole raise path pays extra minors. CI measured 4.1x wasm/dynasm;
-# 4.8x is that reading plus WASM_RATIO_FIT_HEADROOM (15%). The 4x default
-# ceiling is unchanged.
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,
