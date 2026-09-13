@@ -3394,13 +3394,15 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// rjitlog.py `JitLogger.start_new_trace`: increment even when the
-    /// binary log is off. Called at the start of `compile_trace`.
-    fn jitlog_start_new_trace(&mut self) {
-        self.jitlog_trace_id += 1;
+    /// binary log is off. `is_bridge` is true when compile.py passes a
+    /// `faildescr` (`compile_trace` / `compile_retrace`).
+    fn jitlog_start_new_trace(&mut self, is_bridge: bool) {
+        self.jitlog_trace_id = crate::rjitlog::start_new_trace(is_bridge, "");
     }
 
     /// rjitlog.py `JitLogger.trace_aborted`.
     fn jitlog_trace_aborted(&mut self) {
+        crate::rjitlog::trace_aborted();
         self.warm_state.log_trace_aborted();
     }
 
@@ -7302,7 +7304,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
         // compile_retrace is a separate entry and increments itself.
         if self.partial_trace.is_none() {
-            self.jitlog_start_new_trace();
+            self.jitlog_start_new_trace(false);
         }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
@@ -7690,11 +7692,13 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         // compile.py `CompileData.optimize_trace`:
+        //     log_trace(MARK_TRACE).write_trace(self.trace)
         //     if self.log_noopt:
         //         metainterp_sd.logger_noopt.log_loop_from_trace(self.trace, ...)
         // logger.py:15-24 wraps it in the `jit-log-noopt` section and heads the
         // dump with the traced op count. This is the only view of the trace as
         // the optimizer receives it; every other section is post-optimization.
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE, &trace.inputargs, &trace.ops);
         if crate::debug::have_debug_prints() {
             let _s = crate::debug::scope("jit-log-noopt");
             crate::debug::debug_print(&format!(
@@ -8527,6 +8531,8 @@ impl<M: Clone> MetaInterp<M> {
         let compile_start = Instant::now();
         forget_optimization_info(&compiled_ops);
         forget_optimization_info(&inputargs);
+        // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE_OPT, &inputargs, &compiled_ops);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -9073,9 +9079,9 @@ impl<M: Clone> MetaInterp<M> {
             crate::mc_diag_bump(33); // compile_trace: no tracing session
             return CompileOutcome::Cancelled;
         }
-        // compile.py compile_trace: jitlog.start_new_trace. After the
-        // session check, before the long tracing borrow.
-        self.jitlog_start_new_trace();
+        // compile.py compile_trace: jitlog.start_new_trace(faildescr=resumekey).
+        // After the session check, before the long tracing borrow.
+        self.jitlog_start_new_trace(true);
         let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
@@ -9368,8 +9374,8 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns true if compilation succeeded.
     pub fn compile_retrace(&mut self, jump_args: &[OpRef], meta: M) -> bool {
         self.remember_compiled_graph_write();
-        // compile.py compile_retrace: jitlog.start_new_trace.
-        self.jitlog_start_new_trace();
+        // compile.py compile_retrace: jitlog.start_new_trace(faildescr=resumekey).
+        self.jitlog_start_new_trace(true);
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -9705,6 +9711,8 @@ impl<M: Clone> MetaInterp<M> {
         // the pre-peel arg set for slots the loop label rebinds.
         unroll_opt.emit_start_label = false;
 
+        // compile.py UnrolledLoopData.optimize_trace: log_trace(MARK_TRACE).
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE, &trace.inputargs, &trace.ops);
         let optimize_start = Instant::now();
         let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
             &trace_ops,
@@ -9918,6 +9926,8 @@ impl<M: Clone> MetaInterp<M> {
         let compile_start = Instant::now();
         forget_optimization_info(&combined_ops);
         forget_optimization_info(&inputargs);
+        // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE_OPT, &inputargs, &combined_ops);
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -10239,6 +10249,8 @@ impl<M: Clone> MetaInterp<M> {
         // ... profiler.end_backend() + debug_stop("jit-backend")`.
         forget_optimization_info(&combined_ops);
         forget_optimization_info(&inputargs);
+        // compile.py do_compile_bridge: log_trace(MARK_TRACE_OPT).write(...)
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE_OPT, &inputargs, &combined_ops);
         let bridge_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -10630,7 +10642,7 @@ impl<M: Clone> MetaInterp<M> {
             self.pending_abort_reason = Some(reason.as_int());
             return Err(SwitchToBlackhole::giveup());
         }
-        self.jitlog_start_new_trace();
+        self.jitlog_start_new_trace(true);
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns
@@ -10717,14 +10729,17 @@ impl<M: Clone> MetaInterp<M> {
         }
         // InvalidLoop during optimization should abort the trace, not crash
         // the process. Matches compile_loop.
+        // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         let optimize_start = Instant::now();
-        let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
-            // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
-            // seeds identity directly from them.
-            &trace.ops,
-            &mut constants,
-            trace.inputargs.len(),
-        );
+        let optimize_result = simple_data.optimize_trace(|_| {
+            optimizer.optimize_with_constants_and_inputs_oprc(
+                // `trace.ops` are the canonical `Rc<Op>`, so `input_ops`
+                // seeds identity directly from them.
+                &trace.ops,
+                &mut constants,
+                trace.inputargs.len(),
+            )
+        });
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
@@ -10800,6 +10815,19 @@ impl<M: Clone> MetaInterp<M> {
             &optimized_ops,
             &constants,
         );
+        // compile.py send_loop_to_backend(..., "entry bridge") →
+        // logger.py log_loop(..., type="entry bridge").
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-loop");
+            crate::debug::debug_print(&format!(
+                "# Loop {} : entry bridge with {} ops",
+                self.jitlog_trace_id,
+                optimized_ops.len()
+            ));
+            for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
+        }
 
         // resume.py:411-417 parity: NONE entries in guard fail_args are
         // valid (TAGCONST/TAGVIRTUAL slots that resume reconstructs from
@@ -10908,6 +10936,8 @@ impl<M: Clone> MetaInterp<M> {
         let compile_start = Instant::now();
         forget_optimization_info(&optimized_ops);
         forget_optimization_info(&inputargs);
+        // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE_OPT, &inputargs, &optimized_ops);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend
@@ -11053,21 +11083,12 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.attach_procedure_with_redirect(green_key, Arc::clone(&token));
                 self.stats.loops_compiled += 1;
-                crate::loop_census::note_compiled(green_key, "root");
-                // `cpu.tracker.total_compiled_loops` is bumped inside
-                // `CompiledLoopToken::new` (model.py parity).
-                //
-                // Counted as a LOOP even though nothing here closes one: this
-                // arm is root-only (`compile_finish_from_active_session` routes
-                // `bridge.is_some()` to `compile_trace_finish`), and a root
-                // trace that ends in FINISH with no LABEL attaches upstream
-                // through `ResumeFromInterpDescr.compile_and_attach`
-                // (compile.py:1006-1017), which mints its own JitCellToken and
-                // calls `send_loop_to_backend(.., "entry bridge", ..)`.  So a
-                // portal function that always raises legitimately reads
-                // `loops_compiled=2` with only one `compiled loop at key=`
-                // line -- that line is logged by `compile_loop_body` alone, and
-                // its absence here is not a double count.
+                crate::loop_census::note_compiled(green_key, "entry-bridge");
+                // compile.py send_loop_to_backend(..., "entry bridge"):
+                // ResumeFromInterpDescr.compile_and_attach mints a token
+                // and compiles the FINISH-only procedure as an entry
+                // bridge. `add_new_loop` still counts it; the kind string
+                // is "entry bridge", not a closed loop.
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-summary",
@@ -11201,13 +11222,16 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_vref_boxes = snapshot_vref_map;
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
+        // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
         let optimize_start = Instant::now();
-        let optimize_result = optimizer.optimize_with_constants_and_inputs_oprc(
-            // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
-            &trace.ops,
-            &mut constants,
-            num_trace_inputargs,
-        );
+        let optimize_result = simple_data.optimize_trace(|_| {
+            optimizer.optimize_with_constants_and_inputs_oprc(
+                // Canonical `Rc<Op>`; `input_ops` seeds identity from them.
+                &trace.ops,
+                &mut constants,
+                num_trace_inputargs,
+            )
+        });
         let optimized_ops = match optimize_result {
             Ok(ops) => ops,
             // A guard proven to always fail (deferred `InvalidLoop` signal):
@@ -11357,6 +11381,8 @@ impl<M: Clone> MetaInterp<M> {
         let compile_start = Instant::now();
         forget_optimization_info(&compiled_ops);
         forget_optimization_info(&inputargs);
+        // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE_OPT, &inputargs, &compiled_ops);
         let compile_loop_result = {
             let _backend_guard = self.staticdata.profiler.enter_backend();
             self.backend.compile_loop(
@@ -14315,6 +14341,8 @@ impl<M: Clone> MetaInterp<M> {
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py:1245-1282).
         let retrace_limit = self.warm_state.retrace_limit();
+        // compile.py compile_trace: log_trace(MARK_TRACE) before optimize_bridge.
+        crate::rjitlog::write_trace(crate::rjitlog::MARK_TRACE, bridge_inputargs, bridge_ops);
         let optimize_start = Instant::now();
         let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
@@ -14438,6 +14466,19 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
         }
+        // compile.py send_loop_to_backend(..., "entry bridge") →
+        // logger.py log_loop(..., type="entry bridge").
+        if crate::debug::have_debug_prints() {
+            let _s = crate::debug::scope("jit-log-opt-loop");
+            crate::debug::debug_print(&format!(
+                "# Loop {} : entry bridge with {} ops",
+                self.jitlog_trace_id,
+                optimized_ops.len()
+            ));
+            for line in majit_ir::format_trace(&optimized_ops, &constants).lines() {
+                crate::debug::debug_print(line);
+            }
+        }
 
         self.backend
             .set_constants_pool(compiled_constants_typed.clone());
@@ -14472,6 +14513,12 @@ impl<M: Clone> MetaInterp<M> {
         let compile_start = Instant::now();
         forget_optimization_info(&optimized_ops);
         forget_optimization_info(&entry_inputargs);
+        // compile.py do_compile_loop: log_trace(MARK_TRACE_OPT).write(...)
+        crate::rjitlog::write_trace(
+            crate::rjitlog::MARK_TRACE_OPT,
+            &entry_inputargs,
+            &optimized_ops,
+        );
         let compile_result = {
             let _backend_scope = self.staticdata.profiler.enter_backend();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -15396,6 +15443,12 @@ impl<M: Clone> MetaInterp<M> {
             // debug_stop("jit-backend")`.
             forget_optimization_info(&optimized_ops);
             forget_optimization_info(bridge_inputargs);
+            // compile.py do_compile_bridge: log_trace(MARK_TRACE_OPT).write(...)
+            crate::rjitlog::write_trace(
+                crate::rjitlog::MARK_TRACE_OPT,
+                bridge_inputargs,
+                &optimized_ops,
+            );
             let bridge_result = {
                 let _backend_scope = self.staticdata.profiler.enter_backend();
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

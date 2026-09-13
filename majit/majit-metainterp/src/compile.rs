@@ -386,12 +386,13 @@ pub struct DeadFrameArtifacts {
 
 /// `compile.py` `class CompileData(object)`.
 ///
-/// `optimize_trace` is the compile.py method: run subclass `optimize()`,
-/// then `forget_optimization_info`. Logging / `build_opt_chain` stay at the
-/// flattened call site in `pyjitpl.rs` because the optimizer borrows
-/// `MetaInterp`, backend state, constant pools, and snapshot side tables.
-/// Call sites still pass the same trace/runtime/resume/call-pure/opts state
-/// that RPython would store on the corresponding object.
+/// `optimize_trace` is the compile.py method: write `MARK_TRACE`, run
+/// subclass `optimize()`, then `forget_optimization_info`. `logger_noopt`
+/// / `build_opt_chain` stay at the flattened call site in `pyjitpl.rs`
+/// because the optimizer borrows `MetaInterp`, backend state, constant
+/// pools, and snapshot side tables. Call sites still pass the same
+/// trace/runtime/resume/call-pure/opts state that RPython would store on
+/// the corresponding object.
 pub struct CompileData<'a> {
     pub trace: &'a TreeLoop,
 }
@@ -409,9 +410,14 @@ impl<'a> CompileData<'a> {
         }
     }
 
-    /// compile.py `CompileData.optimize_trace`: run the subclass
-    /// `optimize()` body, then `forget_optimization_info`.
+    /// compile.py `CompileData.optimize_trace`: `log_trace(MARK_TRACE)`,
+    /// run the subclass `optimize()` body, then `forget_optimization_info`.
     pub fn optimize_trace<T, E>(&self, optimize: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        crate::rjitlog::write_trace(
+            crate::rjitlog::MARK_TRACE,
+            self.inputargs(),
+            self.operations(),
+        );
         let result = optimize();
         self.forget_optimization_info();
         result

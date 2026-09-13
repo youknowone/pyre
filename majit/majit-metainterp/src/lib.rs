@@ -157,6 +157,7 @@ pub mod recorder;
 pub mod resoperation;
 pub mod resume;
 pub mod resume_box_reader;
+pub mod rjitlog;
 // The rule DSL is an offline generator: `real.rules` is compiled to the
 // checked-in `optimizeopt/autogenintrules.rs`, so nothing in a normal build
 // calls the parser, prover or codegen. It is a file-for-file port of
