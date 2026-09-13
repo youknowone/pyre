@@ -7757,8 +7757,13 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 break;
             }
             if let Some(item) = w_tuple_getitem(tup, i) {
+                let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(item);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                if crate::baseobjspace::eq_w(item, value)? {
+                if crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(item_slot),
+                    value,
+                )? {
                     return Ok(w_int_new(i));
                 }
             }
@@ -7796,8 +7801,13 @@ pub fn tuple_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 break;
             }
             if let Some(item) = w_tuple_getitem(tup, i) {
+                let item_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(item);
                 let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-                if crate::baseobjspace::eq_w(item, value)? {
+                if crate::baseobjspace::eq_w(
+                    pyre_object::gc_roots::shadow_stack_get(item_slot),
+                    value,
+                )? {
                     count += 1;
                 }
             }

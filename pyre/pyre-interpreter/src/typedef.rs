@@ -29237,7 +29237,7 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             ));
         }
         let index = pyre_object::w_set_iter_get_index(args[0]);
-        let mut remaining = Vec::with_capacity(startlen.saturating_sub(index));
+        let mut remaining = pyre_object::gc_roots::RootedItems::new();
         let mut i = pyre_object::w_set_iter_get_slot(args[0]);
         while let Some(slot) = pyre_object::w_set_next_slot(w_set, i) {
             if let Some(key) = pyre_object::w_set_key_at(w_set, slot) {
@@ -29245,7 +29245,7 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             }
             i = slot + 1;
         }
-        let list = pyre_object::w_list_new(remaining);
+        let list = pyre_object::w_list_new(remaining.take());
         let mut state = pyre_object::gc_roots::RootedItems::new();
         state.push(list);
         let state = pyre_object::w_tuple_new(state.take());
