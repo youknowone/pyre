@@ -594,7 +594,11 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
         storage: std::ptr::null_mut(),
     };
     let obj = if raw.is_null() {
-        crate::lltype::malloc_typed(unicode) as PyObjectRef
+        // An immortal header cannot grey a GC value box. Rebuild a
+        // fully immortal string rather than leave `value` dangling
+        // after the next major collection.
+        let recovered = unsafe { (*unicode.base.value).clone() };
+        return w_str_from_wtf8_immortal(recovered);
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_UnicodeObjectUser, unicode);
@@ -1063,6 +1067,15 @@ pub unsafe fn w_str_get_value_opt(obj: PyObjectRef) -> Option<&'static str> {
 #[inline]
 pub unsafe fn w_str_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_UnicodeObject)).len }
+}
+
+/// WTF-8 byte count stored on the header (`W_UnicodeObject.byte_len`).
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[inline]
+pub unsafe fn w_str_byte_len(obj: PyObjectRef) -> usize {
+    unsafe { (*(obj as *const W_UnicodeObject)).byte_len }
 }
 
 /// `unicodeobject.py W_UnicodeObject.is_ascii` — `self._length ==
