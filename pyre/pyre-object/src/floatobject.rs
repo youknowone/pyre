@@ -100,7 +100,7 @@ pub fn newfloat(value: f64) -> PyObjectRef {
 /// and looking inside it is what hung a `truediv` helper subwalk.
 #[majit_macros::dont_look_inside]
 pub fn w_float_gc_alloc(value: f64) -> *mut PyObject {
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
     if raw.is_null() {
         return crate::PY_NULL;
     }
@@ -134,7 +134,7 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
     if raw.is_null() {
         crate::lltype::malloc_typed(obj) as PyObjectRef
     } else {

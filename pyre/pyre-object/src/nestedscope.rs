@@ -135,7 +135,7 @@ pub fn w_cell_new(value: PyObjectRef, family: *const CellFamily) -> PyObjectRef 
     // closure cellvar) must itself be GC-traced; a `malloc_typed`
     // (`std::alloc`) cell is invisible to `is_managed_heap_object`, so the
     // mark-sweep skips it and the only-reachable-via-cell value is swept.
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE);
     let value = crate::gc_roots::shadow_stack_get(save_point);
     if !raw.is_null() {
         unsafe {
