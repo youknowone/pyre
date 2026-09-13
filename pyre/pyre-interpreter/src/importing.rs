@@ -5307,33 +5307,56 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
         crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
         && crate::baseobjspace::is_true(w_initializing)?
     {
-        let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
-            return Ok(None);
-        };
-        let bootstrap_slot = shadow_stack_len();
-        let _ = pin_root(w_bootstrap);
-        let Some(w_lock_unlock) = crate::baseobjspace::findattr_result(
-            shadow_stack_get(bootstrap_slot),
-            "_lock_unlock_module",
-        )?
-        else {
-            return Ok(None);
-        };
-        let lock_unlock_slot = shadow_stack_len();
-        let _ = pin_root(w_lock_unlock);
-        let name_slot = shadow_stack_len();
-        let _ = pin_root(pyre_object::w_str_new_managed(name));
-        crate::call::call_function_impl_result(
-            shadow_stack_get(lock_unlock_slot),
-            &[shadow_stack_get(name_slot)],
-        )?;
+        // The wait is a Python call into `_lock_unlock_module`.  Keep it off
+        // the look-inside graph so `test_import.test_import_in_function` can
+        // see only the initialized-module arm (`guard_not_invalidated`).
+        return wait_initializing_module(name, shadow_stack_get(mod_slot));
+    }
+    Ok(Some(shadow_stack_get(mod_slot)))
+}
 
-        let Some(w_current) = check_sys_modules(name) else {
-            return Ok(None);
-        };
-        if w_current != shadow_stack_get(mod_slot) {
-            return Ok(None);
-        }
+/// Concurrent-import tail of `_gcd_import`: wait for `__spec__._initializing`
+/// to clear, then re-read `sys.modules`.
+///
+/// `interp_import.py _gcd_import` raises `FastPathGiveUp` when `_initializing`
+/// is true.  The 3.14 `import_ensure_initialized` wait lives here instead, as
+/// a residual, so the initialized arm stays a small look-inside body.
+#[majit_macros::dont_look_inside]
+fn wait_initializing_module(
+    name: &str,
+    w_module: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_module);
+    let Some(w_bootstrap) = get_sys_module("importlib._bootstrap") else {
+        return Ok(None);
+    };
+    let bootstrap_slot = shadow_stack_len();
+    let _ = pin_root(w_bootstrap);
+    let Some(w_lock_unlock) = crate::baseobjspace::findattr_result(
+        shadow_stack_get(bootstrap_slot),
+        "_lock_unlock_module",
+    )?
+    else {
+        return Ok(None);
+    };
+    let lock_unlock_slot = shadow_stack_len();
+    let _ = pin_root(w_lock_unlock);
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(pyre_object::w_str_new_managed(name));
+    crate::call::call_function_impl_result(
+        shadow_stack_get(lock_unlock_slot),
+        &[shadow_stack_get(name_slot)],
+    )?;
+
+    let Some(w_current) = check_sys_modules(name) else {
+        return Ok(None);
+    };
+    if w_current != shadow_stack_get(mod_slot) {
+        return Ok(None);
     }
     Ok(Some(shadow_stack_get(mod_slot)))
 }
@@ -5395,11 +5418,17 @@ fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
 
 /// `interp_import.py:85-90` — hand a cached package's fromlist to importlib.
 ///
+/// PyPy's `interp___import__` reaches this as `space.call_method` on
+/// `_handle_fromlist`, a residual Python call.  The same residual keeps the
+/// package arm out of the look-inside graph so a cached non-package
+/// (`from math import pi`) still folds.
+///
 /// `space.call_method(w_importlib, "_handle_fromlist", w_mod, w_fromlist,
 /// space.w_default_importlib_import)`.  `_handle_fromlist` imports whichever
 /// names the list adds, so the package case needs no `sys.meta_path` walk of
 /// its own.  Answers `None` while the bootstrap is not installed, which leaves
 /// the caller on the slow path.
+#[majit_macros::dont_look_inside]
 fn handle_fromlist_fast(
     w_mod: PyObjectRef,
     w_fromlist: PyObjectRef,
@@ -5562,6 +5591,59 @@ pub fn dunder_import(
             // handler.
         }
     }
+
+    // `interp_import.py interp___import__` hands the miss to frozen
+    // importlib as one residual call.  Keep that graph behind
+    // `dont_look_inside` so a cached `import math` does not drag the
+    // bootstrap into the look-inside body.
+    dunder_import_slow(
+        name,
+        w_globals,
+        w_locals,
+        w_fromlist,
+        fromlist_missing,
+        level,
+        execution_context,
+    )
+}
+
+/// Miss / relative / bootstrap half of `interp___import__`.
+///
+/// PyPy's `space.call_function(FrozenCache.w_frozen_import, ...)` is one
+/// residual.  The generated `__import__` wrapper must stay small enough for
+/// `try_walker_inline_builtin_call` to descend: a look-inside of this body
+/// is 300+ un-lowered helpers and the descent scan refuses the whole builtin.
+#[majit_macros::dont_look_inside]
+fn dunder_import_slow(
+    name: &str,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    fromlist_missing: bool,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let globals_slot = shadow_stack_len();
+    let _ = pin_root(if w_globals.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_globals
+    });
+    let locals_slot = shadow_stack_len();
+    let _ = pin_root(if w_locals.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_locals
+    });
+    let fromlist_slot = shadow_stack_len();
+    let _ = pin_root(if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    });
 
     // The frozen bootstrap aliases stay on the native importer:
     // `_install_external_importers` imports `_frozen_importlib_external`

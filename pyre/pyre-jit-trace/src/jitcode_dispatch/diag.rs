@@ -412,6 +412,7 @@ spec_folds! {
     FormatSimple         => ("format_simple",            "residual_call", "-"),
     StrStartswith        => ("str_startswith",           "residual_call", "-"),
     StrEndswith          => ("str_endswith",             "residual_call", "-"),
+    ImportCached         => ("import_cached",            "residual_call", "-"),
     BuiltinDivmod        => ("builtin_divmod",           "residual_call", "-"),
     ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
     SetAddMethod         => ("set_add_method",           "residual_call", "-"),
