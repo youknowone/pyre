@@ -1893,6 +1893,9 @@ fn report_post_residual_shadow<Sym: WalkSym>(
 /// from the residual's own arguments hides it from the compiled call too.
 fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
     use pyre_interpreter::pyframe::frame_locals_proxy::viewed_frame;
+    if obj.is_null() || unsafe { (*obj).ob_type.is_null() } {
+        return None;
+    }
     if let Some(frame) = viewed_frame(obj) {
         return Some(frame);
     }
@@ -1932,6 +1935,9 @@ fn residual_operands_are_not_all_objects<Sym: WalkSym>(
     };
     majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
         || pyre_interpreter::is_abi_unsound_argument_residual(addr as usize)
+        || pyre_interpreter::jit_trace_fnaddrs()
+            .iter()
+            .any(|(n, a)| *a == addr && n.contains("bigint"))
 }
 
 /// Write the traced frame's locals region out before a residual that reads it
