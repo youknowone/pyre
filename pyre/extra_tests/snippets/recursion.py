@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 from testutils import assert_raises
 
 

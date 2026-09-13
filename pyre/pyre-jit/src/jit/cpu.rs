@@ -292,9 +292,9 @@ pub struct Cpu {
     /// `bh_unbound_local_error_fn(code, name_idx)` — construct and return the
     /// UnboundLocalError value for DELETE_FAST without publishing it.
     pub unbound_local_error_fn: extern "C" fn(i64, i64) -> i64,
-    /// `bhimpl_compare_op` — RPython compare_op opcodes.
+    /// Residual-fallback entry point for the `compare_value_from_tag` graph.
     pub compare_fn: extern "C" fn(i64, i64, i64) -> i64,
-    /// `bhimpl_binary_op` — RPython binary_op opcodes.
+    /// Residual-fallback entry point for the `binary_value_from_tag` graph.
     pub binary_op_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_w_int_new` — box a raw integer into a PyObject.
     pub box_int_fn: extern "C" fn(i64) -> i64,

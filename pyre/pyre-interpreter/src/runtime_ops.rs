@@ -223,11 +223,11 @@ pub fn register_jit_exc_clearer(clearer: JitExcClearer) {
     let _ = JIT_EXC_CLEARER.set(clearer);
 }
 
-/// Drop the backend pos_exception / pos_exc_value cells that
-/// `llmodel.py _store_exception` fills.  Upstream has no separate clearing
-/// routine: `grab_exc_value` consumes the cells on the guard exit.  Pyre's
-/// interpreter-side `except` handler and its compiled-loop entry do not
-/// pass through that consumer, so they clear the cells here instead, or a
+/// Drop `BH_LAST_EXC_VALUE` and the backend pos_exception / pos_exc_value cells
+/// that residual helpers fill.  Upstream has no separate clearing routine:
+/// `grab_exc_value` consumes the exception on the guard exit.  Pyre's
+/// interpreter-side `except` handler and its compiled-loop entry do not pass
+/// through that consumer, so they clear both carriers here instead, or a
 /// previous raise would be re-delivered by the next `GUARD_NO_EXCEPTION`.
 #[inline]
 pub(crate) fn jit_clear_published_exception() {

@@ -9242,7 +9242,32 @@ impl OptContext {
                 if is_header_word && pi.is_virtual() {
                     return;
                 }
-                if let Some(parent) = parent_descr.clone() {
+                // A header word names class identity, not a slot in a parent's
+                // field list, so it contributes no layout to the receiver's
+                // info either.  `ensure_ptr_info_arg0` already refuses to build
+                // one from it -- its `is_w_class` arm returns the descr-less
+                // `InstancePtrInfo()` that `GUARD_CLASS` builds -- and
+                // `init_fields` is the one call that can put a descr back.  What
+                // it would put back is the header word's `get_parent_descr()`:
+                // the two-word `PyObject` shell, whose `vtable()` is 0 and whose
+                // `is_object()` is therefore false.  An `InstancePtrInfo` is
+                // only ever constructed from a parent that answers `is_object()`
+                // (`optimizer.py ensure_ptr_info_arg0`), and
+                // `InstancePtrInfo.make_guards` reads `self.descr.get_vtable()`
+                // on the strength of that, so stamping a vtable-less shell there
+                // publishes `GUARD_SUBCLASS[op, ConstInt(0)]` into the short
+                // preamble -- a classptr the backend has no
+                // `subclassrange_min/max` for.  RPython never reaches this:
+                // `heaptracker.py` drops `typeptr` from the field list before
+                // any descr is built, so `AbstractStructPtrInfo.setfield`'s
+                // `init_fields(descr.get_parent_descr(), ...)` is only ever
+                // handed an ordinary field's object parent -- the same invariant
+                // `serialize_optheap` states for the bridge export when it skips
+                // a cached field whose parent is not `is_object()`.  The value
+                // is still cached: `heap::OptHeap::field_slot_index` answers a
+                // header word out of a band of its own, and the association list
+                // `setfield` writes needs no `_fields` sizing to hold it.
+                if !is_header_word && let Some(parent) = parent_descr.clone() {
                     pi.init_fields(parent, field_idx as usize);
                 }
                 pi.setfield(field_idx, value.clone());

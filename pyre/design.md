@@ -595,21 +595,28 @@ compiled path is close to what it could be.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 82 `try_walker_specialize_*` functions — 78 in
+pyre records traces through 88 `try_walker_specialize_*` functions — 84 in
 `jitcode_dispatch/specialize.rs`, one in `residual_call.rs`
 (`load_deref`) and three in `inline_call.rs` (`instance_iter`,
-`instance_next`, `generator_next`) — described by the 95 rows of
+`instance_next`, `generator_next`) — described by the 102 rows of
 `SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
 Five of those rows are not folds at all: every label ending in `_descent` —
 `subscr_tuple_descent`, `binary_op_descent`, `compare_op_descent`,
-`builtin_len_descent` and `load_super_attr_descent` — is
-an orthodox sub-walk through a `try_walker_orthodox_*` entry (8 of those
-exist; the other three are the `list_append`/`list_pop` shapes), carrying a row only so it can
-be suppressed and A/B'd like the fold it replaced.  Counting them as debt
-overstates it by five; the fold count is 90. The three unary descent rows
+`builtin_len_descent` and `load_super_attr_descent` — carry a row only so they
+can be suppressed and A/B'd like the fold they replaced. Four of the five
+(`subscr_tuple_descent`, `binary_op_descent`, `compare_op_descent`,
+`load_super_attr_descent`) are orthodox sub-walks through a
+`try_walker_orthodox_*` entry, while `builtin_len_descent` gates the generated
+gateway shortcut in `inline_call.rs` instead; the eight
+`try_walker_orthodox_*` functions are those four entries, the shared
+`try_walker_orthodox_descent` driver they call, and the three
+`list_append`/`list_pop` shapes. Counting them as debt overstates it by five;
+the fold count is 97. The three unary descent rows
 retired when `flatten` began emitting canonical codewriter `inline_call_r_r`
-operations to `descroperation::pos`, `neg` and `invert`; their int and long
-traces now enter those bodies without a residual-call gate.
+operations to `descroperation::pos`, `neg` and `invert`. `pos` and `invert`
+now enter those bodies with no residual-call gate at all; `neg` and `not` keep
+one as the fallback for a build whose bodies are unbound, under the `unary_neg`
+and `unary_not` rows.
 Nothing in this charter named that layer before 2026-08-26, which is itself
 the finding: it is the largest single adaptation in the tree.
 
@@ -619,18 +626,18 @@ Every command below is quoted as it must be typed.
 
 * Rows — select the complete `spec_folds!` invocation by its symbol boundaries:
   `sed -n '/^spec_folds! {/,/^}/p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`
-  answers 95; replacing the final matcher with `rg -cF '_descent"'` answers
+  answers 102; replacing the final matcher with `rg -cF '_descent"'` answers
   the 5 descent rows. A fixed line range is invalid here: the previous range
   ended before the macro did and published a stale count.
   `-F` is load-bearing: without it the `(` is an unclosed regex group and
   `rg` exits 2 rather than counting.
-* Definitions — `rg -c` reports one count *per file*, so it answers 78/1/3
-  rather than 82. Sum the matches instead:
+* Definitions — `rg -c` reports one count *per file*, so it answers 84/1/3
+  rather than 88. Sum the matches instead:
   `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
   The descent entries are a separate population:
   `rg -o 'fn try_walker_orthodox_' pyre/ majit/ -g '*.rs' | wc -l` answers 8.
 * Corpus — `ls pyre/bench/synth/*.py | wc -l`. Non-recursive **on purpose**:
-  it answers 541. A recursive walk also sweeps archived subdirectories and
+  it answers 544. A recursive walk also sweeps archived subdirectories and
   over-counts the active corpus. Do not "fix" this to a recursive `find`.
 
 `specialize.rs`'s own line count moved seven times in seven commits and is
@@ -660,7 +667,7 @@ boundaries contain judgement calls (`set_add_method` may be read as a call or
 a heap mutation, and the `super` rows mix virtual construction with frame
 access), so attaching an independently edited `n` column made the table look
 exact while letting it disagree with `SPEC_FOLD_ROWS`. The reproducible split
-is 86 hand-written rows plus 5 orthodox descent rows, re-derived on 2026-09-03.
+is 97 hand-written rows plus 5 orthodox descent rows, re-derived on 2026-09-13.
 
 Four groups have only downstream cleanup upstream, three have nothing at all,
 and exactly one has a counterpart that is a pass rather than a consumer. So
@@ -681,10 +688,10 @@ That is a missing capability rather than dead weight — closure-callee
 inlining needs the fold, the fold needs constant cells, and constant cells
 need the inlining.
 
-**What does not hold it in place.** 53 fixtures carry a `spec-folds=` header
-and they name 63 distinct rows between them (3 of those descent rows;
+**What does not hold it in place.** 54 fixtures carry a `spec-folds=` header
+and they name 68 distinct rows between them (3 of those descent rows;
 `subscr_tuple_descent` and `load_super_attr_descent` are named by none), so
-32 of the 95 rows have no fixture coupling at all
+34 of the 102 rows have no fixture coupling at all
 (`rg -o --no-filename --max-depth 1 'spec-folds=[^ ]+' pyre/bench/synth -g '*.py' | sed 's/spec-folds=//' | tr ',' '\n' | sort -u | wc -l`;
 `-o` must be spelled without `-h`, which is `rg`'s help flag).  Retirement
 is blocked by reach, not by headers.
@@ -696,8 +703,9 @@ question.** The type-identity group — `builtin_type`, `builtin_isinstance`,
 `[jit-stats]` counter and no wall clock. That is gate neutrality, not a
 descent: nothing in that change demonstrates the trace now carries the
 interpreter's own `abstract_isinstance_w` shape, and `isinstance` is still
-recognised outside the layer by `try_specialize_isinstance_call`, where it gates
-replay-safety, carries no row, and the census cannot see it. Read that
+recognised outside the layer by the `observed_replay_safe_isinstance` test in
+`try_execute_residual_call_via_executor`, where it gates replay-safety, carries
+no row, and the census cannot see it. Read that
 commit's message with care — it claims five retirements including
 `load_type_name_attr`, but its diff never touches that identifier and the
 fold remains live in `try_walker_specialize_load_type_name_attr`.

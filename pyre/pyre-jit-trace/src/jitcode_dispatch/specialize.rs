@@ -10095,6 +10095,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
         .map(|&(_, obj)| ConcreteValue::Ref(obj))
         .collect();
 
+    let exc_before_subwalk = ctx.last_exc_value();
     let walk = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
@@ -10135,18 +10136,19 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
             return Err(error);
         }
     };
-    let result = match promote_published_null_return(ctx, walk_outcome, op_pc) {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
-        // `PyError` aggregate from supported literal-message raise paths and
-        // materialises the interpreter's `W_BaseException` through one opaque
-        // residual.  That is the exception value the ordinary inline-callee
-        // machinery propagates too, so preserve the sub-walk's `SubRaise`
-        // instead of rolling it back to a hand-written operator fold.
-        raised @ DispatchOutcome::SubRaise { .. } => return Ok(Some(raised)),
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
+    let result =
+        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk) {
+            DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
+            // `PyError` aggregate from supported literal-message raise paths and
+            // materialises the interpreter's `W_BaseException` through one opaque
+            // residual.  That is the exception value the ordinary inline-callee
+            // machinery propagates too, so preserve the sub-walk's `SubRaise`
+            // instead of rolling it back to a hand-written operator fold.
+            raised @ DispatchOutcome::SubRaise { .. } => return Ok(Some(raised)),
+            _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+        };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     // `handle_possible_exception`: a successful descent of `//` / `%`
     // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor

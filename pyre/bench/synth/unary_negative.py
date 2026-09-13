@@ -8,8 +8,8 @@ N = 93041900
 
 
 # UNARY_NEGATIVE in a hot loop lowers to the `unary_negative(value)` HLOp →
-# the canonical `inline_call_r_r` to the interpreter's `neg` body through
-# opcode_ops::unary_negative_value (mirroring UNARY_INVERT).
+# the canonical `inline_call_r_r` to the interpreter's `descroperation::neg`
+# body (mirroring UNARY_INVERT).
 # Before the HLOp lowering the flow op `neg` reached the assembler with no
 # builder mapping and any `-x` in a JIT-compiled loop panicked.
 def main():
@@ -27,9 +27,12 @@ def main():
 # W_LongObject.  The codewriter inline-call walks that overflow arm of `neg`,
 # so the compiled loop must agree with the long result rather than wrapping
 # back to INT_MIN.  The promoted long crosses the loop header as an argument
-# and the comparison keeps its bigint call in the body; the retired
-# `unary_negative_int` fold pinned the operand with GUARD_VALUE instead, and
-# this loop ran 3x faster under it.
+# and the comparison keeps its bigint call in the body.  Negation reaches the
+# `descroperation::neg` body through the canonical inline-call; the `unary_neg`
+# specialization (`try_emit_exact_int_uneg`) is consulted at that site and at
+# the residual fallback, and declines INT_MIN outright because its negation is
+# the 2**63 long.  A since-retired int-negation fold pinned the operand with
+# GUARD_VALUE instead, and this loop ran 3x faster under it.
 def main_int_min():
     m = -9223372036854775807 - 1  # INT_MIN as a machine int
     acc = 0

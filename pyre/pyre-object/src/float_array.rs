@@ -39,7 +39,7 @@ pub struct FloatArray {
     ///
     /// Same size and bit validity as `usize`, so `offset_of!` and the JIT's
     /// `Type::Int` read are unchanged.
-    pub(crate) len: AtomicUsize,
+    len: AtomicUsize,
 }
 
 pub const FLOAT_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(FloatArray, block);

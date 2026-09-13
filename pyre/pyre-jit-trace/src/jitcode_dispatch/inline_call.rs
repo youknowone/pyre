@@ -12633,17 +12633,6 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     result
 }
 
-/// [`promote_published_null_return_since`] without a bracket around the
-/// sub-walk: any standing exception promotes.  Correct only where nothing
-/// could already be standing when the callee was entered.
-pub(crate) fn promote_published_null_return<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    outcome: DispatchOutcome,
-    pc: usize,
-) -> DispatchOutcome {
-    promote_published_null_return_since(ctx, outcome, pc, None)
-}
-
 /// The `*_from_tag` helpers follow a publish-and-return-NULL convention: on a
 /// raise they set the exception and hand back NULL, so a sub-walk that
 /// recorded that arm looks like `SubReturn` with `last_exc_value` set.

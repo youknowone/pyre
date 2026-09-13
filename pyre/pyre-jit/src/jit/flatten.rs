@@ -6506,7 +6506,6 @@ mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
     /// COMPARE_OP `is` / `is_not` only — `lower_compare_op_hlop_to_insn`.
-    pub const COMPARE_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::compare_value_from_tag";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.

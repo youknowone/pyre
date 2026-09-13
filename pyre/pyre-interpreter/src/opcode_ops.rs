@@ -162,6 +162,10 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
+fn null_operand_error(what: &str) -> PyError {
+    PyError::type_error(format!("{what} on null operand"))
+}
+
 /// Body of [`binary_value_from_tag`].  The public function stays
 /// `inline(never)` so the codewriter mints a graph; the residual C ABI
 /// wrapper calls this directly so compiled traces do not pay that hop.
@@ -171,6 +175,12 @@ fn binary_value_from_tag_inner(
     b: PyObjectRef,
     op_tag: i64,
 ) -> Result<PyObjectRef, PyError> {
+    // A compiled force that has not written a local yet hands a NULL
+    // here.  It must raise, or the inlined path returns a NULL result
+    // without an exception (`ValueError: call failed`).
+    if a.is_null() || b.is_null() {
+        return Err(null_operand_error("binary operation"));
+    }
     // In-place tags (13-24) must consult the in-place special (`__iadd__`
     // etc.) first; route them through `binary_value`.  Tags 0-12 use the
     // plain dispatch below.
@@ -241,7 +251,7 @@ fn compare_value_from_tag_inner(
     // here.  It must raise, or the inlined path returns a NULL result
     // without an exception (`ValueError: call failed`).
     if a.is_null() || b.is_null() {
-        return Err(PyError::type_error("comparison on null operand"));
+        return Err(null_operand_error("comparison"));
     }
     // CONTAINS_OP routes through the compare-residual machinery.
     // `a` is the needle, `b` the container (flatten lowers the args

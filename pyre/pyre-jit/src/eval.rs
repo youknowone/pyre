@@ -10576,9 +10576,10 @@ fn maybe_compile_and_run(
         return None;
     }
     // Compiled `GUARD_NO_EXCEPTION` reads the backend `_store_exception`
-    // cells.  A raise caught in the interpreter (or left by a previous
-    // trace) must not still sit there when this loop starts.
-    crate::call_jit::drain_backend_jit_exc();
+    // cells, while blackhole propagation reads `BH_LAST_EXC_VALUE`.  A raise
+    // caught in the interpreter (or left by a previous trace) must not still
+    // sit in either carrier when this loop starts.
+    crate::call_jit::clear_residual_call_exception();
     // The gates below and the decision at the end answer `None` for a green
     // key whose cell has latched at the abort ceiling, and go on answering it
     // for every back edge of a loop that can no longer trace. Take the cached

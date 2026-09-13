@@ -12,7 +12,7 @@ for i in range(4000):
     assert (not i) is (i == 0), i
     assert (not (i & 1)) is ((i & 1) == 0), i
     flag = bool(i & 1)
-    assert (not flag) is (not bool(i & 1)), i
+    assert (not flag) is (i % 2 == 0), i
     n += 1
 assert n == 4000
 assert (not 0) is True

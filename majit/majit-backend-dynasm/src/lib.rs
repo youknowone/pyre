@@ -804,7 +804,6 @@ pub fn call_assembler_execute_addr() -> usize {
 mod tests {
     use super::*;
     use majit_ir::Type;
-    use std::sync::Arc;
 
     unsafe fn alloc_test_jitframe(descr: usize, slots: &[i64]) -> *mut jitframe::JitFrame {
         let depth = slots.len();

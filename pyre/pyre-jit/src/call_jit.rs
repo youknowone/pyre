@@ -558,7 +558,7 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 }
 
 extern "C" fn jit_exc_clear_shim() {
-    drain_backend_jit_exc();
+    clear_residual_call_exception();
 }
 
 /// Publish a raise from a may-force residual helper to BOTH executors.
