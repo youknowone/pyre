@@ -295,6 +295,33 @@ pub fn elidable_ref_residual() -> Option<&'static ElidableRefResidual> {
     ELIDABLE_REF_RESIDUAL.get()
 }
 
+/// Residual `Int -> Ref` helpers that return the standard virtualizable
+/// frame (`frame_anchor_live`). `interp_jit.py` has no shadow-stack
+/// slot; the frame is the loop's red input. Reuse that OpRef when the
+/// live concrete equals the vable pointer. `frame_anchor_push` stays a
+/// recorded Call so blackhole resume still has the depth.
+#[derive(Clone, Default)]
+pub struct FrameAnchorLiveResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl FrameAnchorLiveResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static FRAME_ANCHOR_LIVE_RESIDUAL: std::sync::OnceLock<FrameAnchorLiveResidual> =
+    std::sync::OnceLock::new();
+
+pub fn register_frame_anchor_live_residual(spec: FrameAnchorLiveResidual) {
+    let _ = FRAME_ANCHOR_LIVE_RESIDUAL.set(spec);
+}
+
+pub fn frame_anchor_live_residual() -> Option<&'static FrameAnchorLiveResidual> {
+    FRAME_ANCHOR_LIVE_RESIDUAL.get()
+}
+
 /// Residual `Ref, Ref, Int -> Int` override gates that are false for
 /// exact builtin ints (`needs_numeric_binop_dispatch`).
 /// `descroperation.py _call_binop_impl` looks inside; the exact-int
