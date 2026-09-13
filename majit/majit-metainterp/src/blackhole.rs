@@ -832,21 +832,19 @@ impl BlackholeInterpreter {
         self.setposition_ref(&jitcode, position);
     }
 
-    /// `setposition` without taking the `Arc`. A 4–7 frame `shift` resume
-    /// reseats the same helper; skip the clone and the constant walk when
-    /// the banks are already that jitcode's.
+    /// `setposition` without taking the `Arc`.
+    ///
+    /// `blackhole.py setposition` always `copy_constants` into the constant
+    /// area, even when the bank is already wide enough for this jitcode.
+    /// Skipping that walk after [`Self::reset_for_inline_reuse`] (which zeros
+    /// the whole file, constants included) leaves residual-call fnaddrs as 0
+    /// on the next seating of the same helper.
     #[inline]
     pub fn setposition_ref(&mut self, jitcode: &std::sync::Arc<JitCode>, position: usize) {
-        // `copy_constants` is idempotent for one jitcode. Working regs are
-        // filled by `consume_one_section` from liveness.
-        let already = std::sync::Arc::ptr_eq(&self.jitcode, jitcode)
-            && self.registers_i.len() >= jitcode.num_regs_and_consts_i()
-            && self.registers_r.len() >= jitcode.num_regs_and_consts_r()
-            && self.registers_f.len() >= jitcode.num_regs_and_consts_f();
-        if !already {
-            self.init_register_files_from_runtime_jitcode(jitcode);
+        if !std::sync::Arc::ptr_eq(&self.jitcode, jitcode) {
             self.jitcode = std::sync::Arc::clone(jitcode);
         }
+        self.init_register_files_from_runtime_jitcode(jitcode);
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
             eprintln!(
@@ -4625,6 +4623,38 @@ mod tests {
                 std::sync::Arc::strong_count(&jitcode),
                 before,
                 "reseating the same helper must not clone the Arc"
+            );
+        }
+
+        /// `reset_for_inline_reuse` zeros the constant area. `setposition`
+        /// must `copy_constants` again (`blackhole.py setposition`), or the
+        /// next residual call on that helper reads fnaddr 0.
+        #[test]
+        fn setposition_ref_recopies_constants_after_inline_reuse() {
+            let mut b = JitCodeBuilder::default();
+            b.ensure_i_regs(1);
+            b.load_const_i_value(0, 0x1234_5678);
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            assert!(
+                !jitcode.constants_i.is_empty(),
+                "fixture: the wide load must occupy a constants_i slot"
+            );
+            let expected = jitcode.constants_i[0];
+            let const_index = jitcode.num_regs_i();
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&jitcode, 0);
+            assert_eq!(bh.registers_i[const_index], expected);
+            bh.reset_for_inline_reuse();
+            assert_eq!(
+                bh.registers_i[const_index], 0,
+                "reuse zeros the constant area"
+            );
+            bh.setposition_ref(&jitcode, 0);
+            assert_eq!(
+                bh.registers_i[const_index], expected,
+                "setposition must copy_constants after reset_for_inline_reuse"
             );
         }
 
