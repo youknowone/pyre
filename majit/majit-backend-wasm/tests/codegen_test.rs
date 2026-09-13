@@ -9408,6 +9408,37 @@ fn inline_nursery_new_zeros_its_payload() {
     );
 }
 
+fn vtable_new(result: u32, type_id: u32) -> Op {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+    let descr = SimpleSizeDescr::with_vtable(0, 24, type_id, 0x100);
+    descr.set_non_moving(false);
+    let op = make_op(OpCode::NewWithVtable, &[], OpRef::ref_op(result));
+    op.setdescr(Arc::new(descr));
+    op
+}
+
+#[test]
+fn inline_nursery_new_with_vtable_skips_payload_fill() {
+    // malloc_cond does not zero the payload. A NewWithVtable whose descr
+    // has no leftover gc Refs (W_IntObject: only w_class, stamped here)
+    // must not memory.fill — fannkuch does eight of these at JUMP.
+    let inputs = nursery_new_inputs(vec![vtable_new(1, 53), finish_int_arg0()], 53);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    let mut fills = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            fills += 1;
+        }
+    });
+    assert_eq!(
+        fills, 0,
+        "NewWithVtable with no leftover gc Refs must not payload-fill (fills={fills})"
+    );
+}
+
 #[test]
 fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
     let incr = make_op(

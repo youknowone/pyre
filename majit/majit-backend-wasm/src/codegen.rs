@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
+use majit_ir::descr::SizeDescr;
 use majit_ir::forwarding::Forwarded;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
@@ -4397,6 +4398,20 @@ fn emit_zero_bytes(sink: &mut PeepSink<'_, '_>, base_local: u32, offset: u32, le
     sink.i32_const(0);
     sink.i32_const(len as i32);
     sink.memory_fill(0);
+}
+
+/// `malloc_cond` does not zero the payload. Nursery reset is dirty
+/// (`malloc_zero_filled = False`), so a leftover *gc pointer* would be
+/// traced. Skip the fill when this lowering stamps every gc Ref
+/// (`NewWithVtable` writes `w_class`) or the descr has none — fannkuch's
+/// eight `W_IntObject` bumps at JUMP are that case.
+fn nursery_new_has_unstamped_gc_refs(sd: &dyn SizeDescr, stamps_class_word: bool) -> bool {
+    let class_off = stamps_class_word
+        .then(|| sd.class_word_field().map(|fd| fd.offset()))
+        .flatten();
+    sd.gc_fielddescrs()
+        .iter()
+        .any(|fd| fd.field_type() == Type::Ref && Some(fd.offset()) != class_off)
 }
 
 /// Zero the payload of a headered nursery object whose header is in
@@ -9596,6 +9611,13 @@ fn build_function(
                             .map(|fd| (fd.offset() as u64, w_class))
                     })
                 });
+                let stamps_class_word =
+                    op.opcode == OpCode::NewWithVtable && w_class_init.is_some();
+                // `New` still fills: rewrite may leave gc Refs unstamped.
+                // `NewWithVtable` stamps `w_class` here; skip the fill when
+                // that covers every gc Ref (`malloc_cond` does not zero).
+                let zero_payload = op.opcode != OpCode::NewWithVtable
+                    || sd.is_none_or(|sd| nursery_new_has_unstamped_gc_refs(sd, stamps_class_word));
 
                 // `rewrite.rs handle_new`: a `non_moving` descr declines the
                 // nursery outright — both the inline bump and the collecting
@@ -9644,12 +9666,14 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
-                    emit_zero_bytes(
-                        &mut sink,
-                        alloc_scratch_local,
-                        0,
-                        total_size.saturating_sub(GcHeader::SIZE) as u32,
-                    );
+                    if zero_payload {
+                        emit_zero_bytes(
+                            &mut sink,
+                            alloc_scratch_local,
+                            0,
+                            total_size.saturating_sub(GcHeader::SIZE) as u32,
+                        );
+                    }
                     sink.else_();
                     sink.i64_const(type_id);
                     sink.i64_const(size);
@@ -9748,7 +9772,9 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
+                    if zero_payload {
+                        emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
+                    }
                     if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
                         sink.i32_const(1);
                         sink.local_set(alloc_batch_flag_local);
