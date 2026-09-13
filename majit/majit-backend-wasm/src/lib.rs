@@ -554,6 +554,11 @@ pub fn set_inline_eager_max_bytes(max_bytes: u32) {
     INLINE_EAGER_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
 }
 
+/// Deferred merges waiting on their entry trip.
+pub fn pending_inline_count() -> usize {
+    PENDING_INLINES.with(|pending| pending.borrow().len())
+}
+
 /// Entries the bridge standing in for a merge must be entered before the merge
 /// is taken, for an owner whose last emission was `owner_module_bytes` long.
 ///
@@ -583,6 +588,11 @@ fn inline_trip_threshold_for(owner_module_bytes: u32) -> u64 {
 /// once a bridge table slot is present.
 pub fn bridge_params_disable() {
     BRIDGE_PARAMS_ENABLED.store(false, Ordering::Relaxed);
+}
+
+/// Restore the default after [`bridge_params_disable`].
+pub fn bridge_params_enable() {
+    BRIDGE_PARAMS_ENABLED.store(true, Ordering::Relaxed);
 }
 
 fn bridge_params_enabled() -> bool {
