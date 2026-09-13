@@ -488,6 +488,10 @@ pub enum SpaceCacheInstance {
 pub enum SpaceHandle {
     ProcessWide,
     Isolated(std::sync::Weak<ObjSpace>),
+    /// Strong handle held by a `fromcache` result so the returned
+    /// cache keeps its isolated space alive (`InternalSpaceCache`
+    /// owns space strongly upstream).
+    IsolatedStrong(std::sync::Arc<ObjSpace>),
 }
 
 /// Keeps an isolated `Arc` alive for the duration of a `&ObjSpace` borrow.
@@ -514,6 +518,20 @@ impl SpaceHandle {
             Self::Isolated(space) => {
                 SpaceGuard::Held(space.upgrade().expect("live InternalSpaceCache owner"))
             }
+            Self::IsolatedStrong(space) => SpaceGuard::Held(space.clone()),
+        }
+    }
+
+    /// Upgrade a construction-time Weak into the strong handle a
+    /// published cache holds, so dropping the caller's Arc does not
+    /// collect the space while the cache is live.
+    fn retain(&self) -> Self {
+        match self {
+            Self::ProcessWide => Self::ProcessWide,
+            Self::Isolated(space) => {
+                Self::IsolatedStrong(space.upgrade().expect("live InternalSpaceCache owner"))
+            }
+            Self::IsolatedStrong(space) => Self::IsolatedStrong(space.clone()),
         }
     }
 }
@@ -526,6 +544,7 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
         &self,
         space: &SpaceHandle,
     ) -> Result<Self::Value, majit_rlib::cache::CacheError<Self::Error>> {
+        let space = space.retain();
         Ok(match self {
             Self::TypeCache => SpaceCacheInstance::TypeCache(std::sync::Arc::new(
                 crate::objspace::std::typeobject::TypeCache::new(space.clone()),
