@@ -219,7 +219,7 @@ fn setup_context(
         let globals = crate::importing::get_interpreter_sys_module()
             .map(|module| unsafe { w_module_get_w_dict(module) })
             .unwrap_or_else(w_dict_new);
-        (w_str_new("<sys>"), 0, globals)
+        (w_str_new_managed("<sys>"), 0, globals)
     } else {
         let frame = unsafe { &*frame };
         (
@@ -228,8 +228,9 @@ fn setup_context(
             frame.get_w_globals(),
         )
     };
-    let filename_slot = pin_root_slot(filename);
-    let globals_slot = pin_root_slot(globals);
+    let pair = pyre_object::gc_roots::pin_roots(&[filename, globals]);
+    let filename_slot = pair;
+    let globals_slot = pair + 1;
     let registry = unsafe {
         w_dict_getitem_str(
             pyre_object::gc_roots::shadow_stack_get(globals_slot),
@@ -254,7 +255,7 @@ fn setup_context(
             "__name__",
         )
     }
-    .unwrap_or_else(|| w_str_new("<string>"));
+    .unwrap_or_else(|| w_str_new_managed("<string>"));
     let module_slot = pin_root_slot(module);
     (
         pyre_object::gc_roots::shadow_stack_get(filename_slot),
@@ -700,7 +701,7 @@ pub(crate) fn do_warn_explicit(
         let filename_text = unsafe { w_str_get_wtf8(filename) };
         let filename_bytes = filename_text.as_bytes();
         if filename_bytes.is_empty() {
-            w_str_new("<unknown>")
+            w_str_new_managed("<unknown>")
         } else if filename_bytes.ends_with(b".py") {
             let stem = rustpython_wtf8::Wtf8Buf::from_bytes(
                 filename_bytes[..filename_bytes.len() - 3].to_vec(),

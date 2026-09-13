@@ -405,12 +405,11 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
     // hashable does not make one immobile, and a value pattern that names a
     // tuple (`case {Cls.KEY: v}`) puts a nursery-allocated key in `key_items`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let subject_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(subject);
-    let keys_base = pyre_object::gc_roots::shadow_stack_len();
-    for &key in &key_items {
-        let _ = pyre_object::gc_roots::pin_root(key);
-    }
+    let mut live = Vec::with_capacity(1 + key_items.len());
+    live.push(subject);
+    live.extend_from_slice(&key_items);
+    let subject_slot = pyre_object::gc_roots::pin_roots(&live);
+    let keys_base = subject_slot + 1;
     // pyopcode.py:1797-1818 — a key repeated in the pattern is rejected
     // before it binds anything; track keys already looked up and raise on
     // a duplicate. Each key is looked up with `map.get(key, sentinel)`
@@ -502,10 +501,9 @@ pub fn match_class_value(
     // type, which is old-gen and never moves.  Pinning `kwd_attrs` is what
     // makes the collector walk it, so its name slots are forwarded too.
     let roots = pyre_object::gc_roots::push_roots();
-    let subject_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(subject);
-    let kwd_attrs_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(kwd_attrs);
+    let pair = pyre_object::gc_roots::pin_roots(&[subject, kwd_attrs]);
+    let subject_slot = pair;
+    let kwd_attrs_slot = pair + 1;
     let subject = || roots.get(subject_slot);
     let kwd_attrs = || roots.get(kwd_attrs_slot);
 
