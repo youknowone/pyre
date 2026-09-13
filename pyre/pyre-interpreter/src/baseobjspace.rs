@@ -757,9 +757,14 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
+    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&base_exc) = BASE_EXC.get() {
+        return issubtype_w(w_cls, base_exc as PyObjectRef);
+    }
     let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
         return false;
     };
+    let _ = BASE_EXC.set(base_exc as usize);
     issubtype_w(w_cls, base_exc)
 }
 

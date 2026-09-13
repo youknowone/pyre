@@ -733,11 +733,17 @@ impl Drop for ResidualExceptionScope {
 /// pending exception.
 pub(crate) fn drain_backend_jit_exc() {
     #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::jit_exc_clear();
+    if majit_backend_cranelift::jit_exc_is_pending() {
+        majit_backend_cranelift::jit_exc_clear();
+    }
     #[cfg(feature = "dynasm")]
-    majit_backend_dynasm::jit_exc_clear();
+    if majit_backend_dynasm::jit_exc_is_pending() {
+        majit_backend_dynasm::jit_exc_clear();
+    }
     #[cfg(target_arch = "wasm32")]
-    majit_backend_wasm::jit_exc_clear();
+    if majit_backend_wasm::jit_exc_value_peek() != 0 {
+        majit_backend_wasm::jit_exc_clear();
+    }
 }
 
 /// Clear the two pyre carriers for a residual-call exception after a compiled
