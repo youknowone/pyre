@@ -236,6 +236,24 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     out
 }
 
+/// `ll_str.py ll_int2dec` — `@jit.elidable` decimal render of a Signed
+/// into a fresh rstr `STR`.  `descr_repr` (intobject.py) wraps the
+/// result with `space.newutf8(res, len(res))`.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
+    let text = val.to_string();
+    let bytes = text.as_bytes();
+    let out = bh_alloc_lowlevel_string(bytes.len(), LOWLEVEL_STR_BASE_SIZE, 1);
+    if out == 0 {
+        return 0;
+    }
+    unsafe {
+        let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+    }
+    out
+}
+
 pub extern "C" fn jit_ll_shrink_array(buf: i64, new_len: i64) -> i64 {
     // Width discovery reads the GC type header, so it needs the same entry
     // livevar normalization as the shrink itself rather than dereferencing the
@@ -290,6 +308,22 @@ pub fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jit_ll_int2dec_renders_signed_decimal() {
+        for val in [0i64, 1, -1, 10, -10, i64::MIN, i64::MAX] {
+            let buf = jit_ll_int2dec(val);
+            assert_ne!(buf, 0);
+            let expected = val.to_string();
+            assert_eq!(bh_lowlevel_string_len(buf), expected.len());
+            let chars: String = bh_read_lowlevel_string(buf, 1)
+                .into_iter()
+                .map(|c| c as u8 as char)
+                .collect();
+            assert_eq!(chars, expected);
+            bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
+        }
+    }
 
     #[test]
     fn shrink_lowlevel_array_str_truncates_and_preserves_hash() {

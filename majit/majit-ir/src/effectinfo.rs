@@ -965,10 +965,10 @@ pub enum RuntimeHelperKind {
     /// `__format__` runs Python here, so the generic residual is opaque for
     /// the whole method body.
     ///
-    /// The walker folds an exact `int` to `jit_int_str` and an exact `str`
-    /// to identity — the empty-spec arms of `format_w`.  A bool, subclass,
-    /// or Python `__format__` stays residual.  [`FormatWithSpec`] inlines a
-    /// Python `__format__` when a spec operand is present.
+    /// The walker folds an exact `int` to `ll_int2dec` + `newutf8` and an
+    /// exact `str` to identity — the empty-spec arms of `format_w`.  A bool,
+    /// subclass, or Python `__format__` stays residual.  [`FormatWithSpec`]
+    /// inlines a Python `__format__` when a spec operand is present.
     FormatSimple,
     /// `bh_format_with_spec_fn(value, spec)` — the FORMAT_WITH_SPEC helper,
     /// the two-operand sibling of [`RuntimeHelperKind::FormatSimple`] carrying

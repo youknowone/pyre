@@ -15793,14 +15793,11 @@ pub(crate) fn try_walker_specialize_float_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `str(i)` on an exact `int`: emit the guarded unbox plus one elidable
-/// `jit_int_str` call instead of the opaque `bh_call_fn(str_type, NULL, i)`
-/// residual.  `rint.py rtype_str` / `rstr.py ll_int2dec` lower an unboxed
-/// `str(int)` to a `direct_call` of the decimal-render helper, which the
-/// optimized trace carries as one `call_r(ll_str__IntegerR_SignedConst_Signed,
-/// i, EF=3)` + `guard_no_exception`.  `jtransform` already lowers the
-/// graph-level `UnaryOp { op: "str" }` over an Int operand to that same
-/// `jit_int_str`; this is the Python-level call site taking the same channel.
+/// `str(i)` on an exact `int`: emit the guarded unbox plus `ll_int2dec`
+/// + `newutf8` instead of the opaque `bh_call_fn(str_type, NULL, i)`
+/// residual.  `descr_repr` (intobject.py) is `space.newutf8(str(self.intval),
+/// len(res))`; `rint.py rtype_str` / `ll_str.py ll_int2dec` lower the
+/// unboxed render to `call_r(..., EF=3)` + `guard_no_exception`.
 ///
 /// The residual it replaces is a `CallMayForce`, so it also clears the heap
 /// cache and forces virtualizables across itself — the reason a `str(i)` loop
@@ -15889,25 +15886,19 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Guard exact `int`, unbox, and emit `jit_int_str` + `GuardNoException`.
+/// Guard exact `int`, unbox, and emit `ll_int2dec` + `newutf8`.
 /// Shared by [`try_walker_specialize_str_call`] and the FORMAT_SIMPLE int arm.
 ///
-/// `EF_CAN_RAISE`, matching the helper's `#[dont_look_inside]` and NOT
-/// an elidable effect.  `descr_repr` (intobject.py) splits the render
-/// from the wrapper — `str(self.intval)` is the `@jit.elidable`
-/// `ll_int2dec` and `space.newutf8(res, len(res))` is a plain
-/// allocation — while this helper performs both in one call.  Recording
-/// the pair pure let the pure pass share one call between two `str(i)`
-/// sites on the same operand, and `is_w` gives a `str` of `_len() > 1`
-/// storage identity, so a compiled loop answered `str(i) is str(i)`
-/// True where the interpreter, pypy3 and CPython all answer False.
-/// Recovering the elidable half needs the render and the wrapper split
-/// into two ops, the shape `emit_box_long_inline` already gives the
-/// bigint arms.
+/// `descr_repr` (intobject.py) is `space.newutf8(str(self.intval),
+/// len(res))`: `str(self.intval)` is `@jit.elidable` `ll_int2dec`
+/// (`ll_str.py`, `EF=3`) and the wrap is a plain `W_UnicodeObject`
+/// allocation.  Recording the pair as one fused `jit_int_str` let the
+/// pure pass share one box between two `str(i)` sites, and `is_w` of a
+/// `_len() > 1` string made that visible (`str(i) is str(i)` True).
 ///
 /// The read/write sets stay empty: the call allocates and touches no
 /// field the trace has cached.  Concrete is set before the guard: the
-/// guard captures a resume snapshot, and a `raw` with no value yet is
+/// guard captures a resume snapshot, and a payload with no value yet is
 /// recorded into it without one.
 fn walker_emit_jit_int_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -15927,24 +15918,39 @@ fn walker_emit_jit_int_str<Sym: WalkSym>(
         int_type_addr,
         crate::descr::int_intval_descr(),
     )?;
-    let helper = pyre_object::unicodeobject::jit_int_str as *const ();
-    let raw = ctx.trace_ctx.call_typed_with_effect(
+    let helper = pyre_object::lowlevel_string::jit_ll_int2dec as *const ();
+    let payload = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
         &[int_raw],
         &[majit_ir::Type::Int],
         majit_ir::Type::Ref,
         majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::ExtraEffect::ElidableOrMemoryError,
             majit_ir::OopSpecIndex::None,
         ),
     );
+    let storage = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
     ctx.trace_ctx.set_opref_concrete(
-        raw,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+        payload,
+        majit_ir::Value::Ref(majit_ir::GcRef(storage as usize)),
     );
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', raw)?;
+
+    // ASCII decimal: `len(res)` is both `_length` and `len(_utf8)`.
+    let length = ctx.trace_ctx.record_op(OpCode::Strlen, &[payload]);
+    let concrete_len = unsafe {
+        (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
+
+    let wrapped = crate::helpers::emit_box_unicode_inline(ctx.trace_ctx, payload, length, length);
+    ctx.trace_ctx.set_opref_concrete(
+        wrapped,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', wrapped)?;
     Ok(())
 }
 
@@ -21621,11 +21627,12 @@ pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// `descr_add` body: getfield `_utf8` + `ll_strconcat` + `newutf8`
-/// wrap (`w_str_from_storage_and_length`).  The wrap is a residual so a
-/// loop-carried result is a concrete `W_UnicodeObject`; inlining it as
-/// `new_with_vtable` leaves `_utf8` (`_immutable_fields_`) folded to the
-/// preamble payload across the jump.
+/// `descr_add` body: getfield `_utf8` + `ll_strconcat` + `W_UnicodeObject`
+/// (`unicodeobject.py` `W_UnicodeObject(self._utf8 + w_other._utf8,
+/// self._len() + w_other._len())` / `newutf8`).  `StrPtrInfo` inherits
+/// `AbstractVirtualPtrInfo._force_at_the_end_of_preamble` → `force_box`,
+/// so a loop-carried `_utf8` VStrConcat is materialized before export
+/// (`VirtualStateConstructor` has no `visit_vstr*`).
 fn emit_walker_descr_add<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -21665,15 +21672,19 @@ fn emit_walker_descr_add<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(total_len, majit_ir::Value::Int(concrete_len));
 
-    let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
-    let wrapped = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        wrap,
-        &[concat, total_len],
-        &[majit_ir::Type::Ref, majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-    );
+    let lhs_blen = ctx.trace_ctx.record_op(OpCode::Strlen, &[lhs_utf8]);
+    let rhs_blen = ctx.trace_ctx.record_op(OpCode::Strlen, &[rhs_utf8]);
+    let total_blen = ctx
+        .trace_ctx
+        .record_op(OpCode::IntAdd, &[lhs_blen, rhs_blen]);
+    let concrete_blen = unsafe {
+        (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).byte_len as i64
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(total_blen, majit_ir::Value::Int(concrete_blen));
+
+    let wrapped =
+        crate::helpers::emit_box_unicode_inline(ctx.trace_ctx, concat, total_len, total_blen);
     ctx.trace_ctx.set_opref_concrete(
         wrapped,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),

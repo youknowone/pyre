@@ -1395,26 +1395,18 @@ pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
     }
 }
 
-/// `str(i)` over an unboxed integer: render `i` to its decimal
-/// `W_UnicodeObject`.  The argument is a raw machine integer (the `'i'`
-/// argcode operand), not a boxed object pointer.
+/// `str(i)` over an unboxed integer: `ll_int2dec` + `newutf8`.
+/// The argument is a raw machine integer (the `'i'` argcode operand).
 ///
-/// `rint.py:rtype_str` / `rstr.py ll_int2dec` lower `str(int)` to a
-/// `direct_call` of the decimal-render helper during rtyping, so the
-/// blackhole never dispatches a bare `int_str` op.  Pyre keeps `str(x)`
-/// as a graph-level `UnaryOp { op: "str" }`; `jtransform` lowers the
-/// Int-operand form to a residual call here (the Ref-operand form is
-/// identity, mirroring `ll_str` on a string).
-///
-/// NOT elidable, though `ll_int2dec` is: `descr_repr` (intobject.py) renders
-/// with the elidable helper and wraps the result in a separate
-/// `space.newutf8` allocation, and this function does both.  Marking the pair
-/// elidable let the pure pass share one call between two `str(i)` sites, which
-/// `is_w` makes visible — a `str` of `_len() > 1` has storage identity, so the
-/// shared box answered `str(i) is str(i)` True against False everywhere else.
+/// `jtransform` still records this fused residual for graph-level
+/// `UnaryOp { op: "str" }` over an Int operand.  The Python-level
+/// `str(i)` walker splits the same pair so the wrap is a fresh
+/// `W_UnicodeObject` (`descr_repr`).
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_str(v: i64) -> i64 {
-    w_str_new_managed(&int_str_text(v)) as i64
+    let payload = crate::lowlevel_string::jit_ll_int2dec(v);
+    let length = crate::lowlevel_string::bh_lowlevel_string_len(payload);
+    w_str_from_storage_and_length(payload as *mut UnicodeValueStorage, length) as i64
 }
 
 /// `s[i]` on an exact `str` with a non-negative machine-int index: the scalar
