@@ -251,9 +251,15 @@ jobs:
     # file. So the key only chooses what is OFFERED — a stale restore
     # costs a download and is then re-extracted, it cannot survive into
     # the artefact.
-    - name: Cache LLBC (majit-rlib)
+    #
+    # Restore and save are split. Combined `actions/cache` saves under the
+    # new wide key whenever the exact key misses, including restore-keys
+    # hits that extract then skips. That copied ~300 MB interpreter
+    # artefacts on every unrelated edit and pushed the 10 GB budget into
+    # LRU eviction. Save only the crates Charon actually rewrote.
+    - name: Restore LLBC (majit-rlib)
       id: llbc-cache-rlib
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           build/llbc/majit-rlib.ullbc
@@ -263,9 +269,9 @@ jobs:
         key: llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
         restore-keys: |
           llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
-    - name: Cache LLBC (pyre-object)
+    - name: Restore LLBC (pyre-object)
       id: llbc-cache-object
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           build/llbc/pyre-object.ullbc
@@ -275,9 +281,9 @@ jobs:
         key: llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
         restore-keys: |
           llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
-    - name: Cache LLBC (pyre-interpreter)
+    - name: Restore LLBC (pyre-interpreter)
       id: llbc-cache-interpreter
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           build/llbc/pyre-interpreter.ullbc
@@ -287,9 +293,9 @@ jobs:
         key: llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
         restore-keys: |
           llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
-    - name: Cache LLBC (pyre-jit)
+    - name: Restore LLBC (pyre-jit)
       id: llbc-cache-jit
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: |
           build/llbc/pyre-jit.ullbc
@@ -299,16 +305,65 @@ jobs:
         restore-keys: |
           llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
     - name: Extract LLBC
-      # Runs only when some crate's cache missed. extract-llbc.py self-skips
-      # the crates whose .ullbc + matching .fingerprint stamp were restored
-      # above, so only the changed crate(s) recompile.
+      # Runs only when some crate's exact key missed. extract-llbc.py
+      # self-skips the crates whose .ullbc + matching .fingerprint stamp
+      # were restored above, so only the changed crate(s) recompile.
+      id: llbc-extract
       if: >-
         steps.llbc-cache-rlib.outputs.cache-hit != 'true' ||
         steps.llbc-cache-object.outputs.cache-hit != 'true' ||
         steps.llbc-cache-interpreter.outputs.cache-hit != 'true' ||
         steps.llbc-cache-jit.outputs.cache-hit != 'true'
       shell: bash
-      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
+      env:
+        PYTHONUNBUFFERED: "1"
+      run: |
+        log="$RUNNER_TEMP/llbc-extract.log"
+        scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit | tee "$log"
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-jit; do
+          if grep -F -q "=== extracting ${crate} ->" "$log"; then
+            echo "${crate//-/_}_rewrote=1" >> "$GITHUB_OUTPUT"
+          fi
+        done
+    - name: Save LLBC (majit-rlib)
+      if: steps.llbc-extract.outputs.majit_rlib_rewrote == '1'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/majit-rlib.ullbc
+          build/llbc/majit-rlib.ullbc.fingerprint
+          build/llbc/majit-rlib.ullbc.readfiles
+          build/llbc/majit-rlib.*.layouts.ullbc
+        key: llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
+    - name: Save LLBC (pyre-object)
+      if: steps.llbc-extract.outputs.pyre_object_rewrote == '1'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-object.ullbc
+          build/llbc/pyre-object.ullbc.fingerprint
+          build/llbc/pyre-object.ullbc.readfiles
+          build/llbc/pyre-object.*.layouts.ullbc
+        key: llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
+    - name: Save LLBC (pyre-interpreter)
+      if: steps.llbc-extract.outputs.pyre_interpreter_rewrote == '1'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-interpreter.ullbc
+          build/llbc/pyre-interpreter.ullbc.fingerprint
+          build/llbc/pyre-interpreter.ullbc.readfiles
+          build/llbc/pyre-interpreter.*.layouts.ullbc
+        key: llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
+    - name: Save LLBC (pyre-jit)
+      if: steps.llbc-extract.outputs.pyre_jit_rewrote == '1'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          build/llbc/pyre-jit.ullbc
+          build/llbc/pyre-jit.ullbc.fingerprint
+          build/llbc/pyre-jit.ullbc.readfiles
+        key: llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
     - name: Upload LLBC artifact
       # Hand the ullbc set (freshly extracted, or restored from the cache
       # above) to the downstream jobs as a run-scoped artifact. Unlike
