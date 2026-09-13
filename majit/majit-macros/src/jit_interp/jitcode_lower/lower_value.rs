@@ -2611,31 +2611,23 @@ impl<'c> Lowerer<'c> {
                 });
             }
             // 64-bit targets keep the full machine word. Pointer-width
-            // targets are the host crate's `usize`, which is 32 bits on
-            // wasm32 — emit a shift/mask whose count is computed there.
+            // targets are identity on a 64-bit host (`jtransform.py`
+            // `rewrite_op_cast_int_to_uint` / `rewrite_op_cast_uint_to_int`
+            // are `pass` — same representation, drop-and-alias) and a
+            // 32-bit mask / sign-extend on wasm32.
             "i64" | "u64" => return Some(binding),
-            "isize" => (true, 0),
-            "usize" => (false, 0),
+            "isize" => return Some(self.emit_pointer_width_int_cast(binding, true)),
+            "usize" => return Some(self.emit_pointer_width_int_cast(binding, false)),
             _ => return None,
         };
         let depends_on_stack = binding.depends_on_stack;
         let x_reg = binding.reg;
         let result_reg = if signed {
             let shift_reg = self.alloc_reg();
-            let shift_tokens = if bits == 0 {
-                quote! {
-                    __builder.load_const_i_value(
-                        #shift_reg,
-                        (64 - ::core::mem::size_of::<usize>() * 8) as i64,
-                    );
-                }
-            } else {
-                let shift = (64 - bits) as i64;
-                quote! { __builder.load_const_i_value(#shift_reg, #shift); }
-            };
+            let shift = (64 - bits) as i64;
             self.emit_op(
                 OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(shift_reg)]),
-                shift_tokens,
+                quote! { __builder.load_const_i_value(#shift_reg, #shift); },
             );
             let shl_reg = self.alloc_reg();
             let lshift = syn::Ident::new("IntLshift", proc_macro2::Span::call_site());
@@ -2660,27 +2652,10 @@ impl<'c> Lowerer<'c> {
             res_reg
         } else {
             let mask_reg = self.alloc_reg();
-            let mask_tokens = if bits == 0 {
-                quote! {
-                    __builder.load_const_i_value(
-                        #mask_reg,
-                        {
-                            let bits = ::core::mem::size_of::<usize>() * 8;
-                            if bits >= 64 {
-                                -1i64
-                            } else {
-                                ((1u64 << bits) - 1) as i64
-                            }
-                        },
-                    );
-                }
-            } else {
-                let mask = ((1u64 << bits) - 1) as i64;
-                quote! { __builder.load_const_i_value(#mask_reg, #mask); }
-            };
+            let mask = ((1u64 << bits) - 1) as i64;
             self.emit_op(
                 OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(mask_reg)]),
-                mask_tokens,
+                quote! { __builder.load_const_i_value(#mask_reg, #mask); },
             );
             let res_reg = self.alloc_reg();
             let and = syn::Ident::new("IntAnd", proc_macro2::Span::call_site());
@@ -2700,6 +2675,72 @@ impl<'c> Lowerer<'c> {
             depends_on_stack,
             struct_type: None,
         })
+    }
+
+    /// `as usize` / `as isize` on the already-machine-word int bank.
+    ///
+    /// RPython `jtransform.py rewrite_op_cast_int_to_uint` /
+    /// `rewrite_op_cast_uint_to_int` are explicit no-ops: both kinds share
+    /// the `'int'` box, so the cast is a rename. A 64-bit target is the
+    /// same rename (`int_copy` / `move_i`, no resop). A 32-bit target still
+    /// has to mask or sign-extend; that decision is the jitcode-build
+    /// `size_of::<usize>()` so one lowering covers native and wasm32.
+    fn emit_pointer_width_int_cast(&mut self, binding: Binding, signed: bool) -> Binding {
+        let x_reg = binding.reg;
+        let result_reg = self.alloc_reg();
+        let depends_on_stack = binding.depends_on_stack;
+        let emit = if signed {
+            let shift_reg = self.alloc_reg();
+            let shl_reg = self.alloc_reg();
+            quote! {
+                if ::core::mem::size_of::<usize>() >= 8 {
+                    __builder.move_i(#result_reg as u16, #x_reg as u16);
+                } else {
+                    __builder.load_const_i_value(#shift_reg as u16, 32i64);
+                    __builder.record_binop_i(
+                        #shl_reg as u16,
+                        majit_ir::OpCode::IntLshift,
+                        #x_reg as u16,
+                        #shift_reg as u16,
+                    );
+                    __builder.record_binop_i(
+                        #result_reg as u16,
+                        majit_ir::OpCode::IntRshift,
+                        #shl_reg as u16,
+                        #shift_reg as u16,
+                    );
+                }
+            }
+        } else {
+            let mask_reg = self.alloc_reg();
+            quote! {
+                if ::core::mem::size_of::<usize>() >= 8 {
+                    __builder.move_i(#result_reg as u16, #x_reg as u16);
+                } else {
+                    __builder.load_const_i_value(#mask_reg as u16, 0xFFFF_FFFFi64);
+                    __builder.record_binop_i(
+                        #result_reg as u16,
+                        majit_ir::OpCode::IntAnd,
+                        #x_reg as u16,
+                        #mask_reg as u16,
+                    );
+                }
+            }
+        };
+        self.emit_op(
+            OpMeta::linear(
+                OpKind::Aux,
+                vec![Register::int(x_reg)],
+                vec![Register::int(result_reg)],
+            ),
+            emit,
+        );
+        Binding {
+            reg: result_reg,
+            kind: BindingKind::Int,
+            depends_on_stack,
+            struct_type: None,
+        }
     }
 
     pub(super) fn lower_branch_expr(&mut self, expr: &Expr) -> Option<LoweredSequence> {
@@ -2818,6 +2859,45 @@ mod tests {
             depends_on_stack: false,
             struct_type: None,
         }
+    }
+
+    #[test]
+    fn pointer_width_usize_cast_is_int_copy_on_64_bit_and_mask_on_32_bit() {
+        // jtransform.py rewrite_op_cast_int_to_uint / rewrite_op_cast_uint_to_int
+        // are identity. The emitted builder still has to mask on wasm32.
+        let mut lowerer = Lowerer::new(None);
+        lowerer
+            .bindings
+            .insert("x".to_string(), binding(4, BindingKind::Int));
+        let expr: Expr = syn::parse_str("x as usize").expect("parse usize cast");
+
+        let result = lowerer
+            .lower_value_expr(&expr)
+            .expect("usize cast should lower");
+        assert_eq!(result.kind, BindingKind::Int);
+        assert_ne!(result.reg, 4);
+
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("move_i"),
+            "64-bit path must be int_copy, got {emitted}"
+        );
+        assert!(
+            emitted.contains("size_of"),
+            "pointer width must be decided at jitcode-build time, got {emitted}"
+        );
+        assert!(
+            emitted.contains("0xFFFF_FFFFi64") || emitted.contains("4294967295"),
+            "32-bit path must still mask, got {emitted}"
+        );
+        assert!(
+            !emitted.contains("- 1i64") && !emitted.contains("-1i64"),
+            "64-bit must not record IntAnd(x, -1), got {emitted}"
+        );
     }
 
     #[test]

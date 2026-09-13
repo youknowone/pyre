@@ -2147,6 +2147,50 @@ mod arm_is_pure_pc_advance_tests {
     }
 }
 
+#[cfg(test)]
+mod pc_pinned_write_tests {
+    use super::*;
+
+    fn binding(reg: u16, kind: BindingKind) -> Binding {
+        Binding {
+            reg,
+            kind,
+            depends_on_stack: false,
+            struct_type: None,
+        }
+    }
+
+    #[test]
+    fn pc_assign_from_another_reg_is_int_copy_not_add_zero() {
+        let mut lowerer = Lowerer::new(None);
+        lowerer.pc_pinned = true;
+        lowerer
+            .bindings
+            .insert("pc".to_string(), binding(0, BindingKind::Int));
+        lowerer
+            .bindings
+            .insert("tgt".to_string(), binding(3, BindingKind::Int));
+        let expr: Expr = syn::parse_str("pc = tgt").expect("parse pc assign");
+
+        assert_eq!(lowerer.lower_pc_pinned_write(&expr), Some(()));
+        assert_eq!(lowerer.bindings["pc"].reg, 0);
+
+        let emitted = lowerer
+            .statements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(
+            emitted.contains("move_i"),
+            "pc = tgt must be int_copy, got {emitted}"
+        );
+        assert!(
+            !emitted.contains("IntAdd"),
+            "pc = tgt must not record IntAdd(x, 0), got {emitted}"
+        );
+    }
+}
+
 impl<'c> Lowerer<'c> {
     /// Green-pc inline dispatch pc-write pinning (see `Lowerer::pc_pinned`).
     /// Lowers `pc += N`, `pc = pc + N`, and the generic branch `pc = <expr>`
@@ -2154,9 +2198,9 @@ impl<'c> Lowerer<'c> {
     /// merge point reads.  `pc += N` emits `record_binop_i(pc_reg, IntAdd,
     /// pc_reg, const_N)` — the same advance shape as the dispatch-top
     /// opcode-fetch (`try_lower_opcode_fetch_stmt` Pattern 2).  `pc = target`
-    /// lowers the RHS then copies it into pc_reg via `record_binop_i(pc_reg,
-    /// IntAdd, rhs, const_0)`; the JitCode bytecode has no int-move op, and
-    /// the optimizer folds the `+ 0`.  Returns `None` when `!pc_pinned` or
+    /// lowers the RHS then copies it into pc_reg via `int_copy` / `move_i`
+    /// (`blackhole.py bhimpl_int_copy`); that is a register rename, not an
+    /// `IntAdd(rhs, 0)` resop.  Returns `None` when `!pc_pinned` or
     /// `expr` is not a pc-write, so the caller falls through to the normal
     /// statement lowering (and, off the inline path, to the existing
     /// SSA-rebind / drop behaviour — pinning is inert there).
@@ -2201,27 +2245,15 @@ impl<'c> Lowerer<'c> {
                 return None;
             }
             if rhs.reg != pc_reg {
-                let zero_reg = self.alloc_reg();
                 let rhs_reg = rhs.reg;
                 self.emit_op(
-                    OpMeta::linear(OpKind::LoadConstI, vec![], vec![Register::int(zero_reg)]),
-                    quote::quote! {
-                        __builder.load_const_i_value(#zero_reg as u16, 0i64);
-                    },
-                );
-                self.emit_op(
                     OpMeta::linear(
-                        OpKind::BinopI,
-                        vec![Register::int(rhs_reg), Register::int(zero_reg)],
+                        OpKind::Aux,
+                        vec![Register::int(rhs_reg)],
                         vec![Register::int(pc_reg)],
                     ),
                     quote::quote! {
-                        __builder.record_binop_i(
-                            #pc_reg as u16,
-                            majit_ir::OpCode::IntAdd,
-                            #rhs_reg as u16,
-                            #zero_reg as u16,
-                        );
+                        __builder.move_i(#pc_reg as u16, #rhs_reg as u16);
                     },
                 );
             }
