@@ -16,62 +16,9 @@ use super::*;
 ///
 /// All register banks share the frame's owned slots, so replacement follows
 /// `MIFrame.replace_active_box_in_frame` without a retained mutable slice or
-/// delayed replay. Ref-bank GC registration retains the same shared storage.
-/// Walker-only extras (vstack, callee shadow) share the same frame-owned
-/// state and are rewritten at the same time, never replayed on resume.
-/// A paused Python caller also stores those lists on `InlineParentFrame`
-/// so `replace_box` can walk `framestack` like `MetaInterp.replace_box`.
-///
-/// Weak registration neither extends a frame's lifetime nor leaks aliases
-/// into a nested trace session. Heap-owned SubWalkFrames keep this owner
-/// across suspension; recursive callers keep it for precisely the child call.
-/// Convergence for the semantic/color mirrors is one red frame per inlined call
-/// (#1731).
-pub(super) struct FrameBoxReplacements(std::rc::Rc<FrameBoxReplacementInbox>);
-
-pub(crate) struct FrameBoxReplacementInbox {
-    frame_state: std::cell::RefCell<Option<WalkFrameState>>,
-    listening: std::cell::Cell<bool>,
-    banks_r: std::cell::RefCell<Option<RegisterBank>>,
-    banks_i: std::cell::RefCell<Option<RegisterBank>>,
-    banks_f: std::cell::RefCell<Option<RegisterBank>>,
-}
-
-impl FrameBoxReplacements {
-    pub(super) fn new(session: &std::cell::RefCell<WalkSession>) -> Self {
-        let pending = std::rc::Rc::new(FrameBoxReplacementInbox {
-            frame_state: std::cell::RefCell::new(None),
-            listening: std::cell::Cell::new(true),
-            banks_r: std::cell::RefCell::new(None),
-            banks_i: std::cell::RefCell::new(None),
-            banks_f: std::cell::RefCell::new(None),
-        });
-        let mut session = session.borrow_mut();
-        session
-            .box_replacement_frames
-            .retain(|frame| frame.strong_count() != 0);
-        session
-            .box_replacement_frames
-            .push(std::rc::Rc::downgrade(&pending));
-        Self(pending)
-    }
-
-    /// Share each frame-owned list; no captured mutable slice outlives a borrow.
-    pub(super) fn bind_banks(&self, r: &RegisterBank, i: &RegisterBank, f: &RegisterBank) {
-        *self.0.banks_r.borrow_mut() = Some(r.clone());
-        *self.0.banks_i.borrow_mut() = Some(i.clone());
-        *self.0.banks_f.borrow_mut() = Some(f.clone());
-    }
-
-    pub(super) fn bind_frame_state(&self, state: &WalkFrameState) {
-        *self.0.frame_state.borrow_mut() = Some(state.clone());
-    }
-
-    pub(super) fn set_listening(&self, listening: bool) {
-        self.0.listening.set(listening);
-    }
-}
-
+/// delayed replay. A paused Python caller stores those lists on
+/// `InlineParentFrame`; the portal uses `WalkSession.portal_live`; a
+/// transparent helper uses `WalkSession.helper_live`.
 fn replace_slots(slots: &mut [OpRef], oldbox: OpRef, newbox: OpRef) {
     for slot in slots {
         if *slot == oldbox {
@@ -86,18 +33,6 @@ fn replace_box_in_walk_frame<Sym: WalkSym>(
     newbox: OpRef,
 ) {
     ctx.frame_state.replace_active_box(oldbox, newbox);
-}
-
-fn replace_bound_banks(frame: &FrameBoxReplacementInbox, oldbox: OpRef, newbox: OpRef) {
-    let bank = match oldbox.ty() {
-        Some(Type::Int) => &frame.banks_i,
-        Some(Type::Ref) => &frame.banks_r,
-        Some(Type::Float) => &frame.banks_f,
-        _ => panic!("replace_active_box_in_frame requires a typed value: {oldbox:?}"),
-    };
-    if let Some(bank) = bank.borrow().as_ref() {
-        bank.replace_active_box(oldbox, newbox);
-    }
 }
 
 fn replace_live_regs(live: &LiveFrameRegs, oldbox: OpRef, newbox: OpRef) {
@@ -153,21 +88,6 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
             replace_live_regs(live, oldbox, newbox);
         }
     }
-    session.box_replacement_frames.retain(|frame| {
-        if let Some(frame) = frame.upgrade() {
-            if frame.listening.get() {
-                // `MIFrame.replace_active_box_in_frame`: write the bound
-                // banks and every frame-owned mirror now.
-                replace_bound_banks(&frame, oldbox, newbox);
-                if let Some(state) = frame.frame_state.borrow().as_ref() {
-                    state.replace_active_box(oldbox, newbox);
-                }
-            }
-            true
-        } else {
-            false
-        }
-    });
     for frame in &mut session.framestack {
         for parent in &mut frame.parents {
             replace_slots(&mut parent.boxes, oldbox, newbox);
@@ -250,22 +170,8 @@ mod frame_replacement_tests {
         let middle = OpRef::input_arg_ref(1);
         let standard = OpRef::input_arg_ref(2);
         let session = std::cell::RefCell::new(WalkSession::default());
-        let parent = FrameBoxReplacements::new(&session);
-        let suspended = FrameBoxReplacements::new(&session);
         let parent_regs = RegisterBank::new([old]);
         let suspended_regs = RegisterBank::new([old]);
-        parent.bind_banks(
-            &parent_regs,
-            &RegisterBank::default(),
-            &RegisterBank::default(),
-        );
-        suspended.bind_banks(
-            &suspended_regs,
-            &RegisterBank::default(),
-            &RegisterBank::default(),
-        );
-        let active = FrameBoxReplacements::new(&session);
-        active.set_listening(false);
         let make_state = || {
             WalkFrameState::new(WalkFrameStateData {
                 callee_shadow: Some(CalleeLocalsShadow {
@@ -281,9 +187,13 @@ mod frame_replacement_tests {
         let parent_state = make_state();
         let suspended_state = make_state();
         let active_state = make_state();
-        parent.bind_frame_state(&parent_state);
-        suspended.bind_frame_state(&suspended_state);
-        active.bind_frame_state(&active_state);
+        push_helper_live(
+            &session,
+            &suspended_regs,
+            &RegisterBank::default(),
+            &RegisterBank::default(),
+            &suspended_state,
+        );
         session.borrow_mut().framestack.push(InlineFrame {
             w_code: 1,
             recursion_greenkey: true,
@@ -297,10 +207,10 @@ mod frame_replacement_tests {
                 resume_coord: ParentResumeCoord::Backxlat(0),
                 resume_marker_jit_pc: None,
                 boxes: vec![old],
-                registers_r: None,
+                registers_r: Some(parent_regs.clone()),
                 registers_i: None,
                 registers_f: None,
-                frame_state: None,
+                frame_state: Some(parent_state.clone()),
                 caller_py_pc: None,
             }],
             entry_executed_effects: 0,
@@ -313,7 +223,6 @@ mod frame_replacement_tests {
         // The active frame is rewritten directly, never on a later replay
         // where the trace could have reused one of these operation ids.
         assert_eq!(active_state.borrow().vstack_boxes, [old]);
-        drop(active);
         // Guard capture in the child already sees the rewritten caller.
         assert_eq!(
             session.borrow().framestack[0].parents[0].boxes,
@@ -322,9 +231,9 @@ mod frame_replacement_tests {
         // Both frames have already changed before either continuation runs.
         assert_eq!(parent_state.borrow().vstack_boxes, [standard]);
         assert_eq!(suspended_state.borrow().vstack_boxes, [standard]);
-        for (owner, regs, state) in [
-            (parent, parent_regs, parent_state),
-            (suspended, suspended_regs, suspended_state),
+        for (regs, state) in [
+            (parent_regs, parent_state),
+            (suspended_regs, suspended_state),
         ] {
             let mut trace = TraceCtx::for_test_types(&[Type::Ref; 3]);
             let mut ints = Vec::new();
@@ -379,7 +288,6 @@ mod frame_replacement_tests {
             // The traceback emitter is another vable writer, outside the
             // bytecode arms. An alias promoted there must rewrite registers
             // before the next writer can replace the single pending slot.
-            owner.set_listening(false);
             // Explicit guard promotions use the same full-frame operation as
             // nonstandard virtualizable promotion, not just this Ref bank.
             walker_replace_box(&mut ctx, standard, middle);
@@ -423,9 +331,6 @@ mod frame_replacement_tests {
             assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
             assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
         }
-        // Re-entering after the frames die does not retain their aliases.
-        let _next = FrameBoxReplacements::new(&session);
-        assert_eq!(session.borrow().box_replacement_frames.len(), 1);
     }
 
     #[test]
@@ -461,7 +366,6 @@ mod frame_replacement_tests {
             entry_executed_effects: 0,
             live: None,
         });
-        assert!(session.borrow().box_replacement_frames.is_empty());
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
         assert_eq!(parent_regs.get(0), Some(new));
         assert_eq!(parent_state.borrow().vstack_boxes, [new]);
@@ -531,26 +435,22 @@ mod frame_replacement_tests {
             OpRef::input_arg_float(1),
         ];
         let session = std::cell::RefCell::new(WalkSession::default());
-        let parent = FrameBoxReplacements::new(&session);
         let banks = old.map(|value| RegisterBank::new([value, value]));
-        parent.bind_banks(&banks[0], &banks[1], &banks[2]);
-        parent.set_listening(false);
-        for (bank, value) in banks.iter().zip(new) {
-            bank.set(0, value);
-        }
-        parent.set_listening(true);
+        let state = WalkFrameState::new(WalkFrameStateData::default());
+        bind_paused_caller_regs(&session, &banks[0], &banks[1], &banks[2], &state);
         for i in 0..3 {
             replace_box_in_paused_frames(&mut session.borrow_mut(), old[i], new[i]);
             assert_eq!(banks[i].to_vec(), [new[i], new[i]]);
         }
         drop(banks);
-        // Registration owns the storage, not a pointer into the dropped owner.
-        for (bank, (old, new)) in [&parent.0.banks_r, &parent.0.banks_i, &parent.0.banks_f]
+        // portal_live owns the storage, not a pointer into the dropped owner.
+        let live = session.borrow().portal_live.as_ref().unwrap().clone();
+        for (bank, (old, new)) in [&live.registers_r, &live.registers_i, &live.registers_f]
             .into_iter()
             .zip(old.into_iter().zip(new))
         {
             replace_box_in_paused_frames(&mut session.borrow_mut(), new, old);
-            assert_eq!(bank.borrow().as_ref().unwrap().to_vec(), [old, old]);
+            assert_eq!(bank.to_vec(), [old, old]);
         }
     }
 }

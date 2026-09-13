@@ -244,7 +244,7 @@ pub use branch::*;
 mod vstack_mirror;
 pub use vstack_mirror::*;
 mod vable_ops;
-use vable_ops::FrameBoxReplacements;
+
 mod frame_state;
 mod register_bank;
 mod register_list;
@@ -567,10 +567,11 @@ pub struct InlineFrame {
 /// `MetaInterp.replace_box` writes `framestack` frames in place. The portal
 /// is not an `InlineFrame` (depth scans treat `framestack.len()` as the
 /// inlined-callee count), so it lives on [`WalkSession::portal_live`].
+#[derive(Clone)]
 pub(crate) struct LiveFrameRegs {
-    registers_r: RegisterBank,
-    registers_i: RegisterBank,
-    registers_f: RegisterBank,
+    pub(crate) registers_r: RegisterBank,
+    pub(crate) registers_i: RegisterBank,
+    pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
 }
 
@@ -607,7 +608,7 @@ impl LiveFrameRegs {
 pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
-    pub(crate) box_replacement_frames: Vec<std::rc::Weak<vable_ops::FrameBoxReplacementInbox>>,
+
     /// Portal `MIFrame` registers while a child runs. Not on `framestack`
     /// because `framestack.len()` is the inlined-callee depth.
     pub(crate) portal_live: Option<LiveFrameRegs>,
@@ -747,7 +748,7 @@ impl Default for WalkSession {
     fn default() -> Self {
         Self {
             is_being_profiled: false,
-            box_replacement_frames: Vec::new(),
+
             portal_live: None,
             helper_live: Vec::new(),
             framestack: Vec::new(),
