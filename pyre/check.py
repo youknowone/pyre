@@ -1509,6 +1509,10 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
     "bridges_compiled",
     "retraces_compiled",
     "guard_failures",
+    # Wasm deliberately withdraws an attached bridge to replace its module.
+    # These deterministic maintenance exits must stay visible and gated, but
+    # must not tick speculative-guard hotness or masquerade as guard failures.
+    "wasm_inline_merge_exits",
     "fbw_blackhole_adopted_single_frame",
     "fbw_blackhole_adopted_multi_frame",
 )
@@ -1578,7 +1582,10 @@ JITSTATS_SNAPSHOT_FIELDS = JITSTATS_BADNESS_FIELDS + (
 # assembled retrace stopped being attached. The blackhole adoption counters are
 # inverted the same way: a fall means the interpreter stopped receiving an
 # image and went back to replay.
-JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + ("guard_failures",)
+JITSTATS_REGRESSION_ON_RISE = JITSTATS_BADNESS_FIELDS + (
+    "guard_failures",
+    "wasm_inline_merge_exits",
+)
 JITSTATS_REGRESSION_ON_FALL = (
     "loops_compiled",
     "retraces_compiled",

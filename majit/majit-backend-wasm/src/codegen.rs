@@ -10601,6 +10601,8 @@ fn emit_inline_trip_probe(sink: &mut PeepSink<'_, '_>, probe: InlineTripProbe, t
     // guest instead of calling in here. Without it the host is not reached
     // again until the owner's loop finishes, and the merge lands after every
     // crossing it was meant to remove.
+    // The trip callback marks this dispatch withdrawal on the source descr;
+    // metainterp resumes it in blackhole without ticking an attached guard.
     if probe.cells_base_ptr != 0 {
         sink.i32_const(probe.cells_base_ptr as i32);
         sink.i32_load(memarg(0, 2));
@@ -11750,7 +11752,10 @@ fn emit_guard_exit(
         sink.br(inline_region_br_depth(inline, &dispatch, enclosing_frames));
         return;
     }
-    if dispatch.param_type_indices.is_empty() {
+    // A parameter signature does not arm a bridge: the dispatch cell array
+    // must exist too. The native backend harness has signatures but no wasm
+    // cells, and must use the ordinary guard recovery path.
+    if !dispatch.enabled || dispatch.param_type_indices.is_empty() {
         emit_guard_spill(
             sink,
             constants,

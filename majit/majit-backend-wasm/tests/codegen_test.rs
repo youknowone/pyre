@@ -5908,6 +5908,22 @@ fn host_loop_inputargs() -> Vec<InputArg> {
 /// whole owner module.
 #[test]
 fn a_valid_header_owner_defers_the_inline_trial() {
+    assert_valid_owner_defers_inline_trial(false, false);
+}
+
+/// compile.py::record_loop_or_bridge registers dependencies on the token,
+/// not a bridge flag. A valid preamble region can defer its merge too.
+#[test]
+fn a_valid_preamble_owner_defers_an_invalidation_guard_region() {
+    assert_valid_owner_defers_inline_trial(true, false);
+}
+
+#[test]
+fn a_large_header_owner_defers_an_invalidation_guard_region() {
+    assert_valid_owner_defers_inline_trial(false, true);
+}
+
+fn assert_valid_owner_defers_inline_trial(preamble: bool, large_header: bool) {
     use majit_backend::Backend;
 
     let _serialized = HOST_COMPILE_LOCK.lock();
@@ -5920,9 +5936,39 @@ fn a_valid_header_owner_defers_the_inline_trial() {
     clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
     token.set_compiled_loop_token(Some(clt));
     let label_descr = majit_ir::make_loop_target_descr(70, false);
+    let mut loop_ops = host_loop_ops(&label_descr);
+    let mut bridge_target = label_descr.clone();
+    if preamble {
+        bridge_target = majit_ir::make_loop_target_descr(73, false);
+        let entry = OpRc::new(Op::new(
+            OpCode::Label,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::input_arg_int(1))],
+        ));
+        entry.setdescr(bridge_target.clone());
+        loop_ops.insert(
+            0,
+            OpRc::new(make_guard(
+                OpCode::GuardTrue,
+                &[OpRef::input_arg_int(0)],
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            )),
+        );
+        loop_ops.insert(0, entry);
+    }
+    let mut bridge_ops = host_bridge_ops(&bridge_target);
+    if preamble || large_header {
+        bridge_ops.insert(
+            0,
+            OpRc::new(make_guard(
+                OpCode::GuardNotInvalidated,
+                &[],
+                &[OpRef::input_arg_int(40), OpRef::input_arg_int(41)],
+            )),
+        );
+    }
 
     backend
-        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .compile_loop(&host_loop_inputargs(), &loop_ops, &token)
         .expect("the owner loop compiles");
     assert!(!token.is_invalidated());
 
@@ -5933,20 +5979,28 @@ fn a_valid_header_owner_defers_the_inline_trial() {
     let declines_before = majit_backend_wasm::bridge_diag(50);
     let deferred_before = majit_backend_wasm::bridge_diag(54);
     let trials_before = majit_backend_wasm::bridge_diag(37);
+    let invalidation_declines_before = majit_backend_wasm::bridge_diag(56);
     // A merge is only considered once there is a callback to act on the
     // entry-count trip; the guest publishes the real one.
     majit_backend_wasm::set_inline_trip_helper_slot(1);
-    backend
-        .compile_bridge(
-            &fail_descr,
-            &host_bridge_inputargs(),
-            &host_bridge_ops(&label_descr),
-            &token,
-            &[],
-            None,
-        )
-        .expect("the loop-closing bridge compiles");
+    if large_header {
+        // Price even this small test owner above the eager limit. It must
+        // wait for measured hotness, not become permanently ineligible.
+        majit_backend_wasm::set_inline_eager_max_bytes(0);
+    }
+    let compiled = backend.compile_bridge(
+        &fail_descr,
+        &host_bridge_inputargs(),
+        &bridge_ops,
+        &token,
+        &[],
+        None,
+    );
+    if large_header {
+        majit_backend_wasm::set_inline_eager_max_bytes(4096);
+    }
     majit_backend_wasm::set_inline_trip_helper_slot(0);
+    compiled.expect("the loop-closing bridge compiles");
 
     assert_eq!(
         majit_backend_wasm::bridge_diag(50),
@@ -5955,13 +6009,23 @@ fn a_valid_header_owner_defers_the_inline_trial() {
     );
     assert!(
         majit_backend_wasm::bridge_diag(54) > deferred_before,
-        "a header-resuming region waits on the entry-count trip"
+        "a valid region waits on the entry-count trip: {}",
+        majit_backend_wasm::inline_declines()
     );
     assert_eq!(
         majit_backend_wasm::bridge_diag(37),
         trials_before,
         "the deferred region has not tried to rebuild the owner yet"
     );
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(56),
+        invalidation_declines_before
+    );
+    let generation = token.latest_bridge_invalidation_flag().unwrap();
+    assert!(!generation.load(std::sync::atomic::Ordering::Acquire));
+    token.invalidate();
+    assert!(token.is_invalidated());
+    assert!(generation.load(std::sync::atomic::Ordering::Acquire));
 }
 
 /// `model.py:145-152`, pinned upstream by `runner_test.py
@@ -6271,6 +6335,59 @@ fn a_region_attached_to_a_preamble_guard_runs_its_body() {
 }
 
 fn run_preamble_region_repro() -> (i64, i64, i64) {
+    let inputs = preamble_region_inputs();
+    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
+    assert_eq!(exit_index, 1, "the second guard is the one that exits");
+    (slot0, slot1, slot2)
+}
+
+/// llgraph/runner.py::invalidate_loop activates guards in attached traces too.
+/// Mutating the token after module compilation changes its next execution.
+#[test]
+fn an_inlined_preamble_region_observes_later_token_invalidation() {
+    let mut inputs = preamble_region_inputs();
+    inputs.invalidated_flag_addr = 0x1000;
+    inputs.inlined_bridges[0].ops.insert(
+        0,
+        make_guard(
+            OpCode::GuardNotInvalidated,
+            &[],
+            &[OpRef::input_arg_int(10)],
+        ),
+    );
+    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).unwrap();
+    validate_wasm(&bytes);
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).unwrap();
+    let mut store = Store::new(&engine, ());
+    let memory = Memory::new(&mut store, MemoryType::new(2, None)).unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    let instance = linker.instantiate_and_start(&mut store, &module).unwrap();
+    let trace = instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap();
+    for (invalidated, exit_index, value) in [(0u8, 1i64, 5004i64), (1, 2, 2), (1, 2, 2)] {
+        memory.write(&mut store, 0x1000, &[invalidated]).unwrap();
+        memory
+            .write(
+                &mut store,
+                codegen::FRAME_SLOT_BASE as usize,
+                &0i64.to_le_bytes(),
+            )
+            .unwrap();
+        trace.call(&mut store, 0).unwrap();
+        let mut word = [0u8; 8];
+        memory.read(&store, 0, &mut word).unwrap();
+        assert_eq!(i64::from_le_bytes(word), exit_index);
+        memory
+            .read(&store, codegen::FRAME_SLOT_BASE as usize, &mut word)
+            .unwrap();
+        assert_eq!(i64::from_le_bytes(word), value);
+    }
+}
+
+fn preamble_region_inputs() -> codegen::ModuleBuildInputs {
     let descr0 = majit_ir::make_loop_target_descr(50, false);
     let descr1 = majit_ir::make_loop_target_descr(51, false);
 
@@ -6333,7 +6450,7 @@ fn run_preamble_region_repro() -> (i64, i64, i64) {
     ];
 
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
-    let inputs = inline_region_inputs(
+    inline_region_inputs(
         &inputargs,
         ops,
         vec![codegen::InlinedBridge {
@@ -6346,10 +6463,7 @@ fn run_preamble_region_repro() -> (i64, i64, i64) {
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
         }],
-    );
-    let (exit_index, slot0, slot1, slot2) = run_inline_region_trace(&inputs);
-    assert_eq!(exit_index, 1, "the second guard is the one that exits");
-    (slot0, slot1, slot2)
+    )
 }
 
 /// Which of the two region-block families a guard's region belongs to. A guard

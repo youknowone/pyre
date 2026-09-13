@@ -105,9 +105,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// block is opened in; 53 = eligible but no trip callback is published to
 /// defer to; 54 = eligible, merge deferred until the bridge standing in for it
 /// has been entered `INLINE_TRIP_THRESHOLD` times; 55 = that trip fired and the
-/// merge was attempted; 56 = eligible but not deferrable, because the region
-/// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
-/// it reads.
+/// merge was attempted; 56 = reserved (the obsolete per-bridge invalidation
+/// dependency refusal; dependencies now invalidate the whole token).
 ///
 /// 57-63 split slot 1, which says only that some CALL_ASSEMBLER target did not
 /// resolve and leaves the trace unsupported. Each answers one of the questions
@@ -122,14 +121,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// falls in 60-63 names a target that exists, which is the half of slot 1 a
 /// retrace could plausibly resolve; 57-59 name the operation itself.
 ///
-/// 64 = a cross-module region declined the EAGER merge arm. That arm forgoes
-/// the trip threshold to keep a quasi-immutable dependency attached to the
-/// owner's flag, and pays an owner re-emission whether or not the region ever
-/// runs hot; a region that saves only its entry crossing does not earn it.
-///
-/// 65 = the same eager arm declined an owner already too large to re-emit. The
-/// arm cannot wait for the entry evidence the deferred arm waits for, so the
-/// only thing it can read is what the re-emission will cost.
+/// 64-65 = reserved (cross-module / large-owner eager refusals). These regions
+/// now defer until their entry count earns the owner re-emission.
 ///
 /// 66 = `compile_loop` entered (`cl_entered`) but `build_wasm_module` returned
 /// `Unsupported`. Slots 25/26 only name the pre-codegen CALL_ASSEMBLER filter
@@ -555,7 +548,7 @@ fn compiled_wasm_loop(token: &JitCellToken) -> Option<&CompiledWasmLoop> {
         .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
 }
 
-/// Set the owner size at which the eager merge arm declines, from the host
+/// Set the owner size above which eager merging becomes deferred, from the host
 /// before guest execution, in place of [`DEFAULT_INLINE_EAGER_MAX_BYTES`].
 pub fn set_inline_eager_max_bytes(max_bytes: u32) {
     INLINE_EAGER_MAX_BYTES.store(max_bytes, Ordering::Relaxed);
@@ -2414,20 +2407,11 @@ const INLINE_TRIP_THRESHOLD: u64 = 100_000;
 /// already inside the band where postponement dominates.
 const DEFAULT_INLINE_TRIP_BYTES_FACTOR: u64 = 40;
 
-/// Bytes of owner module above which the eager merge arm declines.
-///
-/// That arm merges before the compile returns, so a quasi-immutable fold's
-/// dependencies attach to the owner's flag rather than to a temporary bridge's
-/// — which is why it cannot wait for entry evidence the way
-/// [`inline_trip_threshold_for`] does. What it can read is the re-emission it
-/// is about to buy, and successive merges into one owner re-emit it whole each
-/// time: four merges into one owner re-emit it four times, at every size it
-/// passes through on the way.
-///
-/// The value is where the corpus stops paying for those re-emissions and has
-/// not yet started losing the merges that earn theirs. Below it the fixtures
-/// whose merge removes millions of crossings begin to lose it, and each one
-/// costs several times what the re-emissions saved.
+/// Bytes of owner module above which a header merge waits for entry evidence
+/// through [`inline_trip_threshold_for`], rather than re-emitting immediately.
+/// Quasi-immutable dependencies are token-owned, so deferred installation does
+/// not weaken invalidation. Keep the existing eager cost boundary; a large
+/// owner is not grounds for permanently losing a profitable merge.
 const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 
 /// A merge that passed every inline check and is waiting on
@@ -2436,6 +2420,26 @@ struct PendingInline {
     /// The loop this region merges into.
     owner: Arc<JitCellToken>,
     region: codegen::InlinedBridge,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PendingInline {
+    fn set_dispatch_withdrawn(&self, withdrawn: bool) {
+        let source =
+            compiled_wasm_loop(&self.owner).expect("pending inline owner must be compiled");
+        let guards = source.fail_descrs.borrow();
+        let guard = &guards[self.region.source_fail_index as usize];
+        // get_latest_descr_arc returns the canonical metainterp descriptor,
+        // not this backend wrapper. Backend-only synthetic guards have no
+        // metainterp hotness state to suppress.
+        if let Some(meta) = &guard.meta_descr
+            && (meta.is_resume_guard() || meta.is_resume_guard_copied())
+        {
+            meta.as_fail_descr()
+                .expect("resume guard")
+                .set_wasm_dispatch_withdrawn(withdrawn);
+        }
+    }
 }
 
 thread_local! {
@@ -2450,8 +2454,8 @@ thread_local! {
     /// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`], waiting to be
     /// merged. The probe runs inside the bridge, so the host is between
     /// `run_compiled` and its return and already holds the driver mutably; the
-    /// trip only appends here, and [`take_tripped_inlines`]'s caller installs
-    /// the merge once the trace has returned.
+    /// trip marks the source descriptor and queues here. The caller of
+    /// [`take_tripped_inlines`] installs the merge once the trace has returned.
     static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -2508,8 +2512,15 @@ fn merged_region_fail_index(
 }
 
 /// Note that a bridge has counted its way to the threshold. Called from
-/// compiled code, so it touches nothing but the list above.
+/// compiled code: mark the withdrawn source dispatch and queue its rebuild,
+/// but leave module installation to the caller after compiled code returns.
 pub fn record_inline_trip(pending_id: i64) {
+    #[cfg(target_arch = "wasm32")]
+    PENDING_INLINES.with(|pending| {
+        if let Some(pending) = pending.borrow().get(&pending_id) {
+            pending.set_dispatch_withdrawn(true);
+        }
+    });
     TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
 }
 
@@ -3047,6 +3058,11 @@ impl WasmBackend {
         let Some(pending) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&pending_id)) else {
             return;
         };
+        // The driver has already classified the exit, and no compiled frame
+        // remains. Clear before rebuilding: re-emission preserves the same
+        // canonical descriptor, so replacing its wasm wrapper cannot clear it.
+        #[cfg(target_arch = "wasm32")]
+        pending.set_dispatch_withdrawn(false);
         diag_bump(55);
         let owner = pending.owner.clone();
         let mut regions = vec![pending.region];
@@ -3075,6 +3091,8 @@ impl WasmBackend {
         for id in extra_ids {
             diag_bump(55);
             if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
+                #[cfg(target_arch = "wasm32")]
+                item.set_dispatch_withdrawn(false);
                 regions.push(item.region);
             }
         }
@@ -3230,12 +3248,6 @@ impl WasmBackend {
                 for _ in 0..attached {
                     diag_bump(32);
                 }
-                // The region runs from the owner's module, so its
-                // `GUARD_NOT_INVALIDATED` reads the owner's root flag. Name that
-                // as this compile's generation, or the quasi-immutable
-                // dependencies registered afterwards attach to a flag the merged
-                // code never loads and a mutated field leaves the fold in place.
-                owner.record_bridge_invalidation_flag(owner.invalidation_flag());
                 // `bridge_slots` no longer names these — they were removed
                 // above so re-emission cannot replay them. Keep their
                 // LABEL_TARGETS rows: inbound JUMPs still enter the old
@@ -5316,7 +5328,22 @@ impl majit_backend::Backend for WasmBackend {
                     if !outside_labels_initialized {
                         diag_bump(48);
                         decline("uninitialized_label");
-                    } else if !has_invalidation_guard {
+                    } else if !has_invalidation_guard
+                        || outside_loop
+                        || region_external.is_some()
+                        || compiled_wasm_loop(&owner).is_some_and(|loop_| {
+                            loop_.module_bytes.get()
+                                > INLINE_EAGER_MAX_BYTES.load(Ordering::Relaxed)
+                        })
+                    {
+                        // compile.py::record_loop_or_bridge registers quasi-
+                        // immutable dependencies on the whole JitCellToken.
+                        // LoopInvalidation activates the root and all attached
+                        // bridge flags, as llgraph/runner.py::invalidate_loop
+                        // activates all traces. A mutation before installation
+                        // makes install_inline_region_batch reject the owner;
+                        // a later mutation activates the merged root guard.
+                        // No per-bridge dependency needs moving at the trip.
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
                         // trips. This applies equally to a header-resuming
@@ -5328,39 +5355,10 @@ impl majit_backend::Backend for WasmBackend {
                         defer_inline = Some((owner, merged_fail_index, outside_loop));
                         diag_bump(54);
                         decline("deferred");
-                    } else if region_external.is_some() {
-                        // The eager arm below forgoes the trip threshold to
-                        // keep a quasi-immutable dependency attached to the
-                        // owner's flag, and pays an owner re-emission for it
-                        // whether or not the region is ever hot. A cross-module
-                        // region saves only its entry crossing — the closing
-                        // tail call it keeps is the same one the out-of-line
-                        // bridge made — so that trade goes the other way:
-                        // taking it unmeasured cost `synth/gc_iterator_source_
-                        // drop` 10% of its wall clock and `guard_failures`
-                        // 1816 -> 5280, four eager merges' worth of restarted
-                        // warmup on a workload too short to amortize one.
-                        diag_bump(64);
-                        decline("foreign_eager");
-                    } else if compiled_wasm_loop(&owner).is_some_and(|loop_| {
-                        loop_.module_bytes.get() > INLINE_EAGER_MAX_BYTES.load(Ordering::Relaxed)
-                    }) {
-                        // The re-emission this arm pays for is the whole owner,
-                        // and it takes it without the entry evidence the
-                        // deferred arm waits for. Past this size that trade is
-                        // one the region cannot be shown to earn.
-                        diag_bump(65);
-                        decline("eager_too_large");
                     } else {
-                        // Deferral would register this region's dependencies
-                        // against its temporary bridge flag. Merge before this
-                        // compile returns so they attach to the owner's flag
-                        // from the outset — the same moment
-                        // `patch_jump_for_descr` rewrites the guard. A
-                        // preamble / outside-loop region takes this arm too:
-                        // it cannot defer (the flag would be the temporary
-                        // bridge's) and leaving it out of line makes the
-                        // peel the hot crossing.
+                        // A small header region retains the existing eager
+                        // cost policy. Invalidation itself is token-owned and
+                        // does not require merging before compile returns.
                         let region = codegen::InlinedBridge {
                             source_fail_index: merged_fail_index,
                             external_jump: region_external.clone(),

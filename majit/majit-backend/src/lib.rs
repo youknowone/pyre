@@ -1672,28 +1672,6 @@ impl JitCellToken {
         flag
     }
 
-    /// Record an existing flag as the generation the artifact just compiled
-    /// for this token watches, instead of minting a fresh one.
-    ///
-    /// A loop-closing bridge merged into its owner's module has no code of its
-    /// own: it executes from the owner's module, whose `GUARD_NOT_INVALIDATED`
-    /// reads the root flag. The quasi-immutable dependencies collected while
-    /// tracing it are registered against whatever
-    /// `latest_bridge_invalidation_flag` answers, so without this they would
-    /// land on an earlier bridge's generation — or, when the token has none,
-    /// be dropped entirely — while the code that must stop running watches the
-    /// root.
-    ///
-    /// Pushing a flag already at the end is skipped so a loop that accepts
-    /// many regions does not grow the list without bound.
-    pub fn record_bridge_invalidation_flag(&self, flag: Arc<AtomicBool>) {
-        let mut flags = self.bridge_invalidation_flags.lock();
-        if flags.last().is_some_and(|last| Arc::ptr_eq(last, &flag)) {
-            return;
-        }
-        flags.push(flag);
-    }
-
     /// Return the root and all bridge-generation invalidation flags.
     pub fn all_invalidation_flags(&self) -> Vec<Arc<AtomicBool>> {
         let bridge_flags = self.bridge_invalidation_flags.lock();
@@ -4732,62 +4710,25 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_root_flag_answers_as_the_latest_bridge_generation() {
+    fn quasi_immutable_dependencies_invalidate_the_whole_token() {
+        use majit_ir::QuasiImmutLoopToken;
+
         let token = JitCellToken::new(42);
-        // Nothing compiled yet: the dependencies of a merged region would be
-        // dropped outright, because the registration site returns on `None`.
-        assert!(token.latest_bridge_invalidation_flag().is_none());
-
-        // A region merged into the owner's module runs from the owner's code,
-        // which reads the root flag, so that is the generation to report.
-        token.record_bridge_invalidation_flag(token.invalidation_flag());
-        assert!(Arc::ptr_eq(
-            &token.latest_bridge_invalidation_flag().unwrap(),
-            &token.invalidation_flag()
-        ));
-
-        // A second region on the same token reports the same flag without
-        // growing the list.
-        token.record_bridge_invalidation_flag(token.invalidation_flag());
-        assert_eq!(token.all_invalidation_flags().len(), 2);
-
-        // An out-of-line bridge after it still gets its own generation, and a
-        // region merged after that one reports the root again.
+        // compile.py::record_loop_or_bridge registers the token, not the
+        // newest bridge flag. A dependency registered before a bridge exists
+        // must still invalidate that bridge and any merged root-code region.
+        let dependency = token.quasi_immut_handle();
         let bridge_flag = token.mint_bridge_invalidation_flag();
-        assert!(Arc::ptr_eq(
-            &token.latest_bridge_invalidation_flag().unwrap(),
-            &bridge_flag
-        ));
-        token.record_bridge_invalidation_flag(token.invalidation_flag());
-        assert!(Arc::ptr_eq(
-            &token.latest_bridge_invalidation_flag().unwrap(),
-            &token.invalidation_flag()
-        ));
-
-        // Invalidating the loop still reaches every recorded generation.
-        token.invalidate();
+        dependency.invalidate_for_quasi_immut();
         assert!(bridge_flag.load(std::sync::atomic::Ordering::Acquire));
         assert!(token.is_invalidated());
 
-        // And this is why a merged region may not be installed into an
-        // invalidated owner: recording the root hands back a flag that is
-        // ALREADY set, where `model.py:145-152` says a bridge compiled after an
-        // invalidation starts valid and only a later one activates its guard
-        // (`runner_test.py test_guard_not_invalidated`, steps 3-4). Minting
-        // still obeys that; recording cannot, so the wasm inline arm declines
-        // on `is_invalidated()` and lets the out-of-line path mint.
-        token.record_bridge_invalidation_flag(token.invalidation_flag());
-        assert!(
-            token
-                .latest_bridge_invalidation_flag()
-                .unwrap()
-                .load(std::sync::atomic::Ordering::Acquire)
-        );
-        assert!(
-            !token
-                .mint_bridge_invalidation_flag()
-                .load(std::sync::atomic::Ordering::Acquire)
-        );
+        // runner_test.py::test_guard_not_invalidated: a new bridge starts
+        // valid after invalidation; a later invalidation activates it too.
+        let later_bridge = token.mint_bridge_invalidation_flag();
+        assert!(!later_bridge.load(std::sync::atomic::Ordering::Acquire));
+        dependency.invalidate_for_quasi_immut();
+        assert!(later_bridge.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]

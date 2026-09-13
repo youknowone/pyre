@@ -1294,6 +1294,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let loops_aborted = counter("pyre_jit_loops_aborted", &mut missing);
         let guard_failures = counter("pyre_jit_guard_failures", &mut missing);
         let back_edge_polls = counter("pyre_jit_back_edge_polls", &mut missing);
+        let wasm_inline_merge_exits = counter("pyre_jit_wasm_inline_merge_exits", &mut missing);
         let internal_compile_panics = counter("pyre_jit_internal_compile_panics", &mut missing);
         let descr_set_resolved = counter("pyre_jit_descr_set_resolved", &mut missing);
         let descr_set_absent = counter("pyre_jit_descr_set_absent", &mut missing);
@@ -1437,6 +1438,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
              loops_aborted={loops_aborted} \
              guard_failures={guard_failures} \
              back_edge_polls={back_edge_polls} \
+             wasm_inline_merge_exits={wasm_inline_merge_exits} \
              internal_compile_panics={internal_compile_panics} \
              descr_set_resolved={descr_set_resolved} \
              descr_set_absent={descr_set_absent} \

@@ -727,6 +727,16 @@ pub extern "C" fn pyre_jit_back_edge_polls() -> u64 {
     pyre_jit::eval::driver_pair().0.get_stats().back_edge_polls as u64
 }
 
+/// Explicit deferred-module maintenance, separately gated from guard failures.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn pyre_jit_wasm_inline_merge_exits() -> u64 {
+    pyre_jit::eval::driver_pair()
+        .0
+        .get_stats()
+        .wasm_inline_merge_exits as u64
+}
+
 /// The descr-universe invariants, the remaining `JITSTATS_BADNESS_FIELDS`. The
 /// native backends print these from `descr_set_jit_stats`; the guest has no
 /// stderr, so it exports the counts and the runner prints the line. Without

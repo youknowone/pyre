@@ -17,3 +17,4 @@ internal_compile_panics=0
 loops_aborted=0
 loops_compiled=5
 retraces_compiled=0
+wasm_inline_merge_exits=1

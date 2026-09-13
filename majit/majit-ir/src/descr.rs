@@ -4201,6 +4201,25 @@ pub trait FailDescr: Descr {
         false
     }
 
+    /// Wasm-only dispatch withdrawal for deferred module replacement. Native
+    /// `assembler.py::patch_jump_for_descr` keeps an attached bridge reachable;
+    /// this wasm backend returns from compiled code before replacement. It resumes
+    /// through `compile.py::AbstractResumeGuardDescr.handle_fail`'s blackhole
+    /// arm without ticking the already-attached guard again.
+    /// Keep this reason separate from ST_BUSY_FLAG: a busy guard still reports
+    /// a real failure during bridge tracing, whereas withdrawal is maintenance.
+    /// The remaining status bits hold the jitcounter hash or value-slot index
+    /// (compile.py::AbstractResumeGuardDescr), so no unused bit is borrowed.
+    #[cfg(target_arch = "wasm32")]
+    fn wasm_dispatch_withdrawn(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn set_wasm_dispatch_withdrawn(&self, _withdrawn: bool) {
+        panic!("wasm dispatch withdrawal requires a resume guard descriptor");
+    }
+
     /// Mark [`FailDescr::bridge_declined_terminally`].  Default panics because
     /// only resume-guard descriptors participate in bridge compilation.
     fn set_bridge_declined_terminally(&self) {
