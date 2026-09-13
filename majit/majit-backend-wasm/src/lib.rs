@@ -3186,28 +3186,57 @@ impl WasmBackend {
             return false;
         };
         let mut attached = 0usize;
-        for mut region in regions {
-            let source_fail_index = region.source_fail_index;
-            if candidate
-                .inlined_bridges
-                .iter()
-                .any(|r| r.source_fail_index == source_fail_index)
-            {
-                diag_bump(36);
-                continue;
+        let mut leftover = regions;
+        // A compile-time `uninitialized_label` may become legal after a
+        // sibling peel is attached. Retry leftovers against the growing
+        // candidate; still-doomed regions stay out of line.
+        loop {
+            let mut progressed = false;
+            let mut still = Vec::new();
+            for mut region in leftover {
+                let source_fail_index = region.source_fail_index;
+                if candidate
+                    .inlined_bridges
+                    .iter()
+                    .any(|r| r.source_fail_index == source_fail_index)
+                {
+                    diag_bump(36);
+                    continue;
+                }
+                region.outside_loop = region.outside_loop
+                    || codegen::source_guard_precedes_loop_label(
+                        &candidate.ops,
+                        source_fail_index,
+                    )
+                    || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
+                if region.outside_loop {
+                    // A foreign JUMP has no owner LABEL to have crossed;
+                    // the capture-loader check applies only to in-module
+                    // preamble peels.
+                    if region.external_jump.is_none() {
+                        let mut owner_ops = candidate.ops.clone();
+                        for existing in &candidate.inlined_bridges {
+                            owner_ops.extend(existing.ops.iter().cloned());
+                        }
+                        if !codegen::outside_region_labels_initialized(
+                            &owner_ops,
+                            source_fail_index,
+                            &region.ops,
+                        ) {
+                            still.push(region);
+                            continue;
+                        }
+                    }
+                    diag_bump(52);
+                }
+                candidate.inlined_bridges.push(region);
+                attached += 1;
+                progressed = true;
             }
-            // Re-decided here rather than carried: the candidate may have taken
-            // more regions since, and the placement depends on them. Keep a
-            // non-header region's own outside placement so a deferred install
-            // cannot drop it back inside the loop.
-            region.outside_loop = region.outside_loop
-                || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
-                || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
-            if region.outside_loop {
-                diag_bump(52);
+            leftover = still;
+            if !progressed || leftover.is_empty() {
+                break;
             }
-            candidate.inlined_bridges.push(region);
-            attached += 1;
         }
         if attached == 0 {
             return false;
@@ -5346,6 +5375,12 @@ impl majit_backend::Backend for WasmBackend {
                             )
                         };
                     if !outside_labels_initialized {
+                        // The owner stream may not yet include a sibling
+                        // peel that publishes the JUMP target. Arm the
+                        // trip: `install_pending_inline` re-checks against
+                        // the owner as it stands then, and restores the
+                        // out-of-line cell if the merge is still doomed.
+                        defer_inline = Some((owner.clone(), merged_fail_index, outside_loop));
                         diag_bump(48);
                         decline("uninitialized_label");
                     } else if !has_invalidation_guard
@@ -5372,7 +5407,7 @@ impl majit_backend::Backend for WasmBackend {
                         // bypasses that cost decision entirely. Everything else
                         // about this compile is the ordinary out-of-line path
                         // below.
-                        defer_inline = Some((owner, merged_fail_index, outside_loop));
+                        defer_inline = Some((owner.clone(), merged_fail_index, outside_loop));
                         diag_bump(54);
                         decline("deferred");
                     } else {

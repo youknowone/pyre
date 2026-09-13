@@ -4585,8 +4585,9 @@ pub fn source_guard_precedes_loop_label(ops: &[Op], fail_index: u32) -> bool {
 
 /// An outside-loop region skips its target LABEL's capture loader. The
 /// source path must therefore have crossed that LABEL already. Share this
-/// structural check between emission and deferred-inline eligibility: a
-/// doomed merge must not arm a trip that clears a working bridge cell.
+/// structural check between emission and deferred-inline eligibility.
+/// A failed install restores the out-of-line cell, so a compile-time
+/// miss (sibling peel not yet attached) can still arm a trip.
 pub fn outside_region_labels_initialized(
     owner_ops: &[Op],
     source_fail_index: u32,
