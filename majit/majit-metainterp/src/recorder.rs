@@ -919,7 +919,7 @@ impl Trace {
     /// directly. Frame registers and the public `record_*` API stay OpRef; the
     /// optimizer bridges back with `Operand::to_opref`, which round-trips to the
     /// same `OpRef` the `from_opref` view produced.
-    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 3]> {
+    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 8]> {
         args.iter().map(|&a| self.box_for_operand(a)).collect()
     }
 
