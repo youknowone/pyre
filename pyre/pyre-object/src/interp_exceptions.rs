@@ -687,7 +687,7 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// cluster whose type word is not a constant address does not lower — the word
 /// rides on the allocation or not at all, since a `setfield_gc` whose descr
 /// `is_typeptr()` is removed downstream. The primary allocation is hand-rolled
-/// through `try_gc_alloc_stable_raw` besides, which is not one of the
+/// through `try_gc_alloc_nursery_raw` besides, which is not one of the
 /// `lltype::malloc*` spellings `fuse_boxing_alloc` recognises. Residualise the
 /// whole constructor — the JIT models it by signature as a plain
 /// `PyObjectRef` GCREF and emits a residual call.
@@ -771,13 +771,11 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_weakreflifeline: PY_NULL,
     };
     if !immortal {
-        // GC-manage the exception object: allocate it in the non-moving
-        // oldgen so accessors can deref a bare `*W_BaseException` and the
-        // JIT can carry it as a raw i64 across allocating opcodes without
-        // it moving. Oldgen is mark-sweep, so all carriers must root it
-        // (`walk_in_flight_exception`, the value-stack walker, and the
-        // raw-i64 JIT carriers). Mirrors `w_generator_new`.
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+        // Residual constructor (`dont_look_inside`): the JIT models the
+        // return as a `PyObjectRef` GCREF. Same `malloc_fixedsize` bump
+        // as `w_int_gc_alloc`. The seed walker and `walk_raw_exception_roots`
+        // already visit the object and its children.
+        let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
             W_BASE_EXCEPTION_GC_TYPE_ID,
             W_BASE_EXCEPTION_SIZE,
         );
