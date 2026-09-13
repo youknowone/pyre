@@ -8360,8 +8360,12 @@ where
                     // `frame_anchor_release` is the drop of a tracing-only
                     // shadow-stack slot. `interp_jit.py` `dispatch` has no
                     // counterpart; skip the `CallN` when the helper ran.
+                    // `stack_check` is the same: compiled loops poll the
+                    // breaker on the back-edge (`rstack.py`). Skip only
+                    // when the helper did not publish an exception.
                     if let Some(spec) = crate::box_trace::void_skip_residual()
                         && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) == 0
                     {
                         if is_forces
                             && matches!(
@@ -8719,6 +8723,8 @@ where
                     // the env read is cached. Record the traced constant
                     // instead of `CallI` so compiled loops do not keep the
                     // residual the frozen jitcode still emits.
+                    // `ll_issubclass` is `@elidable_cannot_raise`
+                    // (`rclass.py`); same fold.
                     if let Some(spec) = crate::box_trace::elidable_int_residual()
                         && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
                     {
@@ -8738,6 +8744,37 @@ where
                         }
                         return TraceAction::Continue;
                     }
+                    // `descroperation.py _call_binop_impl` looks inside;
+                    // exact builtin ints never override, so the gate is
+                    // the constant 0.
+                    if let Some(spec) = crate::box_trace::exact_int_false_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && concrete == 0
+                        && raw_r.len() >= 2
+                        && (spec.is_exact_int)(raw_r[0])
+                        && (spec.is_exact_int)(raw_r[1])
+                    {
+                        let folded = ctx.const_int(0);
+                        self.set_int_reg(dst, Some(folded), Some(0));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
+                    // `_ll_2_int_mod` stays a residual CallI: rewriting it
+                    // to `IntMod` here leaves the looked-inside Python rem
+                    // conversion to record `GuardTrue(rem != 0)`, which
+                    // bakes the non-zero path and drops the exception
+                    // bridge. FBW emits `ll_int_py_mod` for the whole `%`.
                     // pyjitpl.py do_residual_call plain branch:
                     //     pure = effectinfo.check_is_elidable()
                     //     return self.execute_varargs(rop.CALL_I,
@@ -9151,6 +9188,28 @@ where
                             }
                             return TraceAction::Continue;
                         }
+                    }
+                    // `pyopcode.py LOAD_CONST` reads the green
+                    // `co_consts_w` slot. Record the traced ConstPtr.
+                    if let Some(spec) = crate::box_trace::elidable_ref_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && concrete != 0
+                    {
+                        let folded = ctx.const_ref(concrete);
+                        self.set_ref_reg(dst, Some(folded), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
                     }
                     // Residual wrapint (`w_int_gc_alloc`): execute already
                     // ran; record `new_with_vtable` + `setfield_gc`
