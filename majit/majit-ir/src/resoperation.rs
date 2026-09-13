@@ -1205,8 +1205,8 @@ pub trait BoxEnv {
         None
     }
     /// bridgeopt.py:79-80: getptrinfo(box).get_known_class(cpu) is not None.
-    /// Returns true if the optimizer knows the class of the given OpRef.
-    fn has_known_class(&self, _opref: OpRef) -> bool {
+    /// Returns true if the optimizer knows the class of this numbered box.
+    fn has_known_class(&self, _box: &Operand) -> bool {
         false
     }
     /// resume.py make_virtual_info(info, fieldnums) parity.

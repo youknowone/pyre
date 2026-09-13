@@ -64,7 +64,7 @@ pub fn tag_box(
 pub fn serialize_optimizer_knowledge(
     memo: &mut crate::resume::ResumeDataLoopMemo,
     numb_state: &mut crate::resume::NumberingState,
-    liveboxes: &[Option<OpRef>],
+    liveboxes: &[Option<majit_ir::operand::Operand>],
     new_liveboxes: &crate::resume::LiveboxMap,
     env: &dyn majit_ir::BoxEnv,
     optimizer_knowledge: Option<&crate::resume::OptimizerKnowledgeForResume>,
@@ -74,16 +74,13 @@ pub fn serialize_optimizer_knowledge(
     // membership set (values are always None). Pyre uses a Vec scanned
     // linearly: the no-HashMap rule precludes a hash-backed mirror, and
     // available_boxes per bridge is bounded by the live-box set.
-    let available_boxes: smallvec::SmallVec<[OpRef; 16]> = liveboxes
+    let available_boxes: smallvec::SmallVec<[majit_ir::operand::Operand; 16]> = liveboxes
         .iter()
-        .filter_map(|opt| *opt)
-        // #160: liveboxes is box-keyed; resolve each backend position to
-        // its canonical box for the membership probe.
-        .filter(|opref| {
-            numb_state
-                .liveboxes
-                .contains_key(&env.get_box_replacement_operand(*opref))
-        })
+        .flatten()
+        // bridgeopt.py serialize_optimizer_knowledge tests the numbered box
+        // itself for membership in liveboxes_from_env.
+        .filter(|b| numb_state.liveboxes.contains_key(b))
+        .cloned()
         .collect();
 
     // `serialize_optimizer_knowledge` records a known-class bit for each Ref
@@ -91,15 +88,9 @@ pub fn serialize_optimizer_knowledge(
     // The actual class pointer is recovered at deserialization time
     // via cpu.cls_of_box(frontend_boxes[i]).
     //
-    // RPython uses the box's intrinsic `type`,
-    // where `box.type` is intrinsic/immutable. Pyre reads the same
-    // type that `finish()` stores in `numb_state.livebox_types` (this
-    // map feeds `fail_arg_types` and deserialization). Querying
-    // `env.get_type()` instead could let an OptContext-side type differ from
-    // its numbering-time type would cause serialize/deserialize to
-    // disagree on which Ref-typed slots get a bitfield bit, producing
-    // an out-of-bounds rd_numb read in `deserialize_optimizer_knowledge`
-    // when super-instruction GEN widens the live register set.
+    // Read the numbered object's intrinsic type, just as fail_arg_types does.
+    // Resolving a position again could classify a different box and make
+    // serialization and deserialization disagree on the class-bit positions.
     //
     // bridgeopt.py `serialize_optimizer_knowledge`:
     //     for box in liveboxes:
@@ -111,14 +102,10 @@ pub fn serialize_optimizer_knowledge(
     let mut bitfield: i32 = 0;
     let mut shifts = 0;
     for slot in liveboxes.iter() {
-        let Some(opref) = *slot else {
+        let Some(b) = slot else {
             continue;
         };
-        let livebox_tp = numb_state
-            .livebox_types
-            .get(&opref)
-            .copied()
-            .unwrap_or_else(|| env.get_type(opref));
+        let livebox_tp = b.type_();
         if livebox_tp != majit_ir::Type::Ref {
             continue;
         }
@@ -126,7 +113,7 @@ pub fn serialize_optimizer_knowledge(
         // `bridgeopt.serialize_optimizer_knowledge` obtains `info` with
         // `getptrinfo(box)` and records whether it has a known class.
         // known_class = info is not None and info.get_known_class(cpu) is not None
-        if env.has_known_class(opref) {
+        if env.has_known_class(b) {
             bitfield |= 1;
         }
         shifts += 1;
@@ -152,8 +139,8 @@ pub fn serialize_optimizer_knowledge(
     let is_const =
         |opref: OpRef| opref.is_constant() || env.is_const(&env.get_box_replacement_operand(opref));
     let field_ok = |obj: OpRef, val: OpRef| {
-        (is_const(obj) || available_boxes.contains(&obj))
-            && (is_const(val) || available_boxes.contains(&val))
+        (is_const(obj) || available_boxes.contains(&env.get_box_replacement_operand(obj)))
+            && (is_const(val) || available_boxes.contains(&env.get_box_replacement_operand(val)))
     };
     numb_state.append_int(
         knowledge
@@ -201,11 +188,15 @@ pub fn serialize_optimizer_knowledge(
         knowledge
             .loopinvariant_results
             .iter()
-            .filter(|&&(_, result)| is_const(result) || available_boxes.contains(&result))
+            .filter(|&&(_, result)| {
+                is_const(result)
+                    || available_boxes.contains(&env.get_box_replacement_operand(result))
+            })
             .count() as i64,
     );
     for &(const_ptr, result) in &knowledge.loopinvariant_results {
-        if !(is_const(result) || available_boxes.contains(&result)) {
+        if !(is_const(result) || available_boxes.contains(&env.get_box_replacement_operand(result)))
+        {
             continue;
         }
         let const_tag = memo.getconst_int(const_ptr)?;

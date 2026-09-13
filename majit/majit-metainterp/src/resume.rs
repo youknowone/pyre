@@ -3503,8 +3503,8 @@ pub struct ResumeDataLoopMemo {
     /// Reused by `number_slices` / `finish` so timed-section guards do not
     /// mint a fresh writer `Vec` and livebox hole list on every bridge.
     writer_scratch: Vec<i32>,
-    livebox_opt_scratch: Vec<Option<majit_ir::OpRef>>,
-    ordered_livebox_scratch: Vec<majit_ir::OpRef>,
+    livebox_opt_scratch: Vec<Option<majit_ir::operand::Operand>>,
+    ordered_livebox_scratch: Vec<majit_ir::operand::Operand>,
     livebox_map_scratch: LiveboxMap,
     new_livebox_map_scratch: LiveboxMap,
     livebox_types_scratch: LiveboxTypeMap,
@@ -3624,7 +3624,7 @@ impl ResumeDataLoopMemo {
 
     /// Return the `finish` livebox list so the next guard reuses its
     /// allocation. The caller must be done reading the boxes.
-    pub fn recycle_ordered_liveboxes(&mut self, mut liveboxes: Vec<majit_ir::OpRef>) {
+    pub fn recycle_ordered_liveboxes(&mut self, mut liveboxes: Vec<majit_ir::operand::Operand>) {
         liveboxes.clear();
         if liveboxes.capacity() > self.ordered_livebox_scratch.capacity() {
             self.ordered_livebox_scratch = liveboxes;
@@ -3894,21 +3894,21 @@ impl ResumeDataLoopMemo {
         num
     }
 
-    /// resume.py variant for `_number_virtuals`: boxes is `Vec<Option<OpRef>>`.
+    /// `ResumeDataLoopMemo.assign_number_to_box` retains the box object.
     /// RPython's `new_liveboxes = [None] * memo.num_cached_boxes()`.
     pub fn assign_number_to_box_opt(
         &mut self,
         b: &majit_ir::operand::Operand,
-        boxes: &mut Vec<Option<OpRef>>,
+        boxes: &mut Vec<Option<majit_ir::operand::Operand>>,
     ) -> i32 {
         if let Some(&num) = self.cached_boxes.get(b) {
             let idx = (-num - 1) as usize;
             if idx < boxes.len() {
-                boxes[idx] = Some(b.to_opref());
+                boxes[idx] = Some(b.clone());
             }
             return num;
         }
-        boxes.push(Some(b.to_opref()));
+        boxes.push(Some(b.clone()));
         let num = -(boxes.len() as i32);
         self.cached_boxes.insert(b.clone(), num);
         num
@@ -4026,7 +4026,7 @@ impl ResumeDataLoopMemo {
     #[allow(clippy::too_many_arguments)]
     fn _number_virtuals(
         &mut self,
-        liveboxes: &mut Vec<Option<majit_ir::OpRef>>,
+        liveboxes: &mut Vec<Option<majit_ir::operand::Operand>>,
         new_liveboxes: &mut LiveboxMap,
         virtual_fields: &indexmap::IndexMap<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
         num_env_virtuals: usize,
@@ -4043,7 +4043,7 @@ impl ResumeDataLoopMemo {
             liveboxes.extend(std::iter::repeat_n(None, n));
             return Ok((Vec::new(), n));
         }
-        let mut new_boxes_list: Vec<Option<majit_ir::OpRef>> = vec![None; self.num_cached_boxes()];
+        let mut new_boxes_list = vec![None; self.num_cached_boxes()];
         let mut count = 0;
         // Iterate in insertion order (RPython dict iteration = insertion order).
         // resoperation.py same_box parity: keys carry the typed OpRef
@@ -4074,7 +4074,7 @@ impl ResumeDataLoopMemo {
         // resume.py:483-484: new_liveboxes.reverse(); liveboxes.extend(new_liveboxes)
         new_boxes_list.reverse();
         for box_id in &new_boxes_list {
-            liveboxes.push(*box_id);
+            liveboxes.push(box_id.clone());
         }
         let nholes = new_boxes_list.len() - count;
 
@@ -4192,7 +4192,7 @@ impl ResumeDataLoopMemo {
     fn _add_optimizer_sections(
         &mut self,
         numb_state: &mut NumberingState,
-        liveboxes: &[Option<majit_ir::OpRef>],
+        liveboxes: &[Option<majit_ir::operand::Operand>],
         new_liveboxes: &LiveboxMap,
         env: &dyn majit_ir::BoxEnv,
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
@@ -4592,7 +4592,7 @@ impl ResumeDataLoopMemo {
             majit_ir::NumberingRef,
             Arc<majit_ir::SharedConstPool>,
             Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
-            Vec<majit_ir::OpRef>,
+            Vec<majit_ir::operand::Operand>,
             LiveboxTypeMap,
         ),
         TagOverflow,
@@ -4616,13 +4616,11 @@ impl ResumeDataLoopMemo {
         // visitor_walk_recursive sequencing. Sorting by tag would
         // observably re-order virtuals across builds.
         //
-        // TAGBOX placement at `liveboxes[i] = opref` uses the
+        // TAGBOX placement at `liveboxes[i] = box` uses the
         // tag-derived index (resume.py), so it is iteration-order-
         // invariant; only the TAGVIRTUAL worklist push order matters.
         //
-        // resoperation.py same_box parity: iter() yields the typed
-        // OpRef each entry was inserted with, so consumers can read
-        // `box.type` (history.py:220) directly via `opref.ty()`.
+        // Keep each dictionary key's box identity in the livebox list.
 
         // Collect virtual fields discovered via env.get_virtual_fields()
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
@@ -4634,13 +4632,12 @@ impl ResumeDataLoopMemo {
         let mut virtual_worklist = self.take_virtual_worklist();
 
         for (b, tagged) in numb_state.liveboxes.iter() {
-            // #160/S11: liveboxes is now box-keyed; the serialized livebox
-            // vector + virtual worklist stay OpRef-based (backend positions).
+            // Only the virtual worklist still uses positional references.
             let opref = b.to_opref();
             let (i, tagbits) = untag(tagged);
             if tagbits == TAGBOX {
                 if (i as usize) < liveboxes.len() {
-                    liveboxes[i as usize] = Some(opref);
+                    liveboxes[i as usize] = Some(b);
                 }
             } else {
                 debug_assert_eq!(tagbits, TAGVIRTUAL);
@@ -4807,52 +4804,16 @@ impl ResumeDataLoopMemo {
         self.writer_scratch = std::mem::take(&mut numb_state.writer.current);
         let rd_consts = self.consts.clone();
 
-        // Resolve each livebox through the forwarding chain so the backend
-        // sees the final concrete OpRef (not an optimizer-internal alias).
-        //
-        // `resume.py:finish` invariant: liveboxes contains ONLY non-Const
-        // boxes — Const values are encoded inline via TAGCONST at numbering
-        // time (`_number_boxes` classifies via `box.is_constant()` before
-        // adding to liveboxes). Backend regalloc enforces the same upstream
-        // contract (the backend `regalloc.rs`'s `!arg.is_constant()` assert mirrors
-        // `regalloc.py assert not isinstance(arg, Const)`).
-        //
-        // The numbering pass that produced this `liveboxes` list already
-        // satisfied that invariant. The re-walk below exists for boxes that
-        // were further forwarded between numbering and finish (e.g.
-        // `make_equal_to` writing a `Forwarded::Op`/`Const` redirect), so the
-        // backend sees the final concrete position. It uses
-        // get_box_replacement(not_const=True) parity and stops before a Const
-        // target; Consts are represented by rd_numb TAGCONST, not backend
-        // livebox slots.
-        //
-        // resume.py:412-417 + regalloc.py:1204: liveboxes contains ONLY
-        // non-Const boxes — `_number_boxes` classifies Const via its
-        // `is_const(opref)` → TAGCONST branch before the box ever
-        // reaches liveboxes. PyPy `resume.py:finish` has
-        // no post-numbering Const→hole step; the invariant is that liveboxes
-        // entries stay non-Const through finish(). Hard-assert that
-        // `get_box_replacement_not_const` does not produce a
-        // constant-namespace OpRef
-        // here — if the assert fires, a writer (e.g. a future
-        // `make_constant` flip without paired numbering) is racing the
-        // numbering snapshot, which would break rd_numb / liveboxes
-        // alignment downstream.
+        // resume.py ResumeDataVirtualAdder.finish returns liveboxes[:]. Keep
+        // those exact numbered objects: looking up their positions again can
+        // bind a different producer and collapse two TAGBOX slots onto one box.
         let mut ordered_liveboxes = std::mem::take(&mut self.ordered_livebox_scratch);
         ordered_liveboxes.clear();
-        ordered_liveboxes.extend(liveboxes.iter().map(|opt| {
-            opt.map(|opref| {
-                let walked = env.get_box_replacement_not_const(opref);
-                debug_assert!(
-                    !walked.is_constant(),
-                    "resume.py:412-417 invariant: liveboxes entry walked to \
-                     constant-namespace OpRef post-numbering ({opref:?} → {walked:?}); \
-                     _number_boxes should have classified this as TAGCONST inline"
-                );
-                walked
-            })
-            .unwrap_or(majit_ir::OpRef::NONE)
-        }));
+        ordered_liveboxes.extend(
+            liveboxes
+                .iter()
+                .map(|b| b.clone().unwrap_or_else(majit_ir::operand::Operand::none)),
+        );
         liveboxes.clear();
         self.livebox_opt_scratch = liveboxes;
         self.return_livebox_map(std::mem::take(&mut numb_state.liveboxes));
@@ -4863,9 +4824,9 @@ impl ResumeDataLoopMemo {
         // Merge livebox_types: numbering-time types + types for boxes
         // discovered during virtual field walking.
         let mut all_livebox_types = numb_state.livebox_types;
-        for &opref in &ordered_liveboxes {
-            if !opref.is_none() && !all_livebox_types.contains_key(&opref) {
-                all_livebox_types.insert(opref, env.get_type(opref));
+        for b in &ordered_liveboxes {
+            if !b.is_none() {
+                all_livebox_types.insert(b.to_opref(), b.type_());
             }
         }
         Ok((
@@ -5769,8 +5730,8 @@ mod tests {
 
         // liveboxes should contain only TAGBOX entries: OpRef::int_op(1) and OpRef::int_op(3)
         assert_eq!(liveboxes.len(), 2);
-        assert_eq!(liveboxes[0], OpRef::int_op(1)); // box #0
-        assert_eq!(liveboxes[1], OpRef::int_op(3)); // box #1
+        assert_eq!(liveboxes[0].to_opref(), OpRef::int_op(1)); // box #0
+        assert_eq!(liveboxes[1].to_opref(), OpRef::int_op(3)); // box #1
 
         // rd_numb should be valid
         let fail_arg_types = vec![majit_ir::Type::Int, majit_ir::Type::Int];
@@ -5794,16 +5755,15 @@ mod tests {
     }
 
     #[test]
-    fn finish_emits_the_collapsed_inputarg_when_the_operand_collapses() {
-        // Phase-2 remap names InputArgRef(231). Numbering TAGBOXes that
-        // opref, but LiveboxMap keys by Operand and `to_opref` can still
-        // be Phase-1 InputArgRef(1). finish() must emit that collapsed input.
+    fn finish_preserves_numbered_box_identity_across_position_collisions() {
+        // A carried Phase-1 box and the current context's inputarg can have
+        // the same position and different identities. ResumeDataVirtualAdder
+        // .finish must retain the numbered objects, as resume.py does.
         use majit_ir::OpRef;
 
         struct KeepNumberedInputArgEnv {
             inner: SimpleBoxEnv,
             numbered: OpRef,
-            collapsed: OpRef,
             collapsed_operand: majit_ir::operand::Operand,
         }
 
@@ -5822,11 +5782,8 @@ mod tests {
                 self.inner.get_box_replacement_operand(opref)
             }
 
-            fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
-                if opref == self.numbered {
-                    return self.collapsed;
-                }
-                self.inner.get_box_replacement_not_const(opref)
+            fn get_box_replacement_not_const(&self, _: OpRef) -> OpRef {
+                panic!("finish must retain the numbered box, not resolve its position again")
             }
 
             fn is_const(&self, box_: &majit_ir::operand::Operand) -> bool {
@@ -5854,7 +5811,6 @@ mod tests {
         let env = KeepNumberedInputArgEnv {
             inner: SimpleBoxEnv::new(),
             numbered,
-            collapsed,
             collapsed_operand: crate::history::test_support::rooted_operand_from_opref(collapsed),
         };
         assert_eq!(env.get_box_replacement(numbered), numbered);
@@ -5862,10 +5818,13 @@ mod tests {
             env.get_box_replacement_operand(numbered).to_opref(),
             collapsed
         );
-        assert_eq!(env.get_box_replacement_not_const(numbered), collapsed);
 
         let mut memo = ResumeDataLoopMemo::new();
-        let snapshot = Snapshot::single_frame(0, 8, vec![numbered]);
+        let first = env.get_box_replacement_operand(numbered);
+        let second = env.get_box_replacement_operand(collapsed);
+        assert!(!first.same_box(&second));
+        assert_eq!(first.to_opref(), second.to_opref());
+        let snapshot = Snapshot::single_frame(0, 8, vec![numbered, collapsed, numbered]);
         let numb_state = memo.number(&snapshot, &env, -1).unwrap();
         // `_number_boxes` inserts `get_box_replacement_operand(raw).to_opref()`,
         // the collapsed box, not the Phase-2 numbering name.
@@ -5876,13 +5835,24 @@ mod tests {
                 .map(|(opref, _)| *opref),
             Some(collapsed),
         );
-        let (_rd_numb, _rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
+        let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None).unwrap();
 
-        // finish() materializes the same Operand key (`to_opref` → 1).
-        // Emitting 231 as the dump home SIGSEGVs Grain, because the
-        // compiled failarg locs are the forwarded box.
-        assert_eq!(liveboxes, vec![collapsed]);
+        assert_eq!(liveboxes.len(), 2);
+        assert!(liveboxes[0].same_box(&first));
+        assert!(liveboxes[1].same_box(&second));
+        let guard = majit_ir::Op::new(majit_ir::OpCode::GuardTrue, &[first.clone()]);
+        guard.store_final_boxes(liveboxes);
+        let (_, _, _, frames) =
+            rebuild_from_numbering(&rd_numb, &rd_consts, &[majit_ir::Type::Ref; 2], None, 0);
+        assert_eq!(
+            frames[0].values,
+            vec![
+                RebuiltValue::Box(0, majit_ir::Type::Ref),
+                RebuiltValue::Box(1, majit_ir::Type::Ref),
+                RebuiltValue::Box(0, majit_ir::Type::Ref),
+            ]
+        );
     }
 
     #[test]

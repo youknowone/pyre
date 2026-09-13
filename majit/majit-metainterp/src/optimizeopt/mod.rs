@@ -1597,12 +1597,9 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         })
     }
 
-    fn has_known_class(&self, opref: OpRef) -> bool {
+    fn has_known_class(&self, box_: &Operand) -> bool {
         // bridgeopt.py:79-80: getptrinfo(box).get_known_class(cpu) is not None
-        let resolved_box = self.ctx.get_box_replacement_operand_opt(opref);
-        resolved_box
-            .as_ref()
-            .and_then(Operand::ptr_info)
+        box_.ptr_info()
             .and_then(|info| info.get_known_class(self.ctx.cpu.as_ref()))
             .is_some()
     }
@@ -7383,7 +7380,7 @@ impl OptContext {
 
         // resume.py, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
-        let Ok((rd_numb, rd_consts, rd_virtuals, mut liveboxes, mut livebox_types)) =
+        let Ok((rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types)) =
             memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref())
         else {
             self.signal_invalid_loop("resume numbering: TagOverflow");
@@ -7426,35 +7423,22 @@ impl OptContext {
             );
         }
 
-        // RPython Box.type parity: types captured at numbering time via
-        // env.get_type(), equivalent to RPython's intrinsic Box.type.
-        // Replaces the fragile 7-level type resolution cascade.
+        // RPython Box.type: use the exact numbered object's intrinsic type.
         let new_types: Vec<majit_ir::Type> = liveboxes
             .iter()
-            .map(|opref| {
-                if opref.is_none() {
+            .map(|b| {
+                if b.is_none() {
                     return majit_ir::Type::Ref;
                 }
-                livebox_types
-                    .get(opref)
-                    .copied()
-                    .unwrap_or(majit_ir::Type::Ref)
+                b.type_()
             })
             .collect();
         memo.recycle_livebox_types(livebox_types);
 
-        // optimizer.py:712 liveboxes are the canonical Box objects returned
-        // by `resumedata.finish()`; resolve each numbering position to its
-        // canonical (possibly producer-bound) operand so `store_final_boxes`
-        // sheds straight to a live-tracking operand. A NONE hole resolves to
-        // `Operand::None`, a Const to `Operand::Const`; a producerless,
-        // non-Const position has no operand to bind and panics at
-        // `Operand::from_opref` — the same contract the operand-union
-        // `_args` model enforces (#9).
-        op.store_final_boxes(liveboxes.iter().map(|a| {
-            self.resolve_to_operand(*a)
-                .unwrap_or_else(|| Operand::from_opref(*a))
-        }));
+        // optimizer.py Optimizer.store_final_boxes_in_guard passes finish()'s
+        // exact box objects to ResumeGuardDescr.store_final_boxes. Rebinding
+        // their positions here loses the identity used by resume numbering.
+        op.store_final_boxes(liveboxes.iter().cloned());
         memo.recycle_ordered_liveboxes(liveboxes);
         let final_operands = op.guard_fail_args().unwrap_or(&[]);
         let logical_rd_locs: majit_ir::RdLocs = final_operands
