@@ -12231,6 +12231,16 @@ fn handle<Sym: WalkSym>(
         "residual_call_ir_v/iIRd" => dispatch_residual_call_iIRd_kind(code, op, ctx, 'v'),
         // `pyjitpl.py opimpl_conditional_call_ir_v`: condition + func + I/R.
         "conditional_call_ir_v/iiIRd" => dispatch_conditional_call_ir_v(code, op, ctx),
+        // `pyjitpl.py _opimpl_conditional_call_value` / `do_conditional_call(is_value=True)`.
+        "conditional_call_value_ir_i/iiIRd>i" => {
+            dispatch_conditional_call_value_ir_i(code, op, ctx)
+        }
+        "conditional_call_value_ir_r/riIRd>r" => {
+            dispatch_conditional_call_value_ir_r(code, op, ctx)
+        }
+        // `pyjitpl.py opimpl_record_known_result_i_ir_v` records only.
+        "record_known_result_i_ir_v/iiIRd" => dispatch_record_known_result_i_ir_v(code, op, ctx),
+        "record_known_result_r_ir_v/riIRd" => dispatch_record_known_result_r_ir_v(code, op, ctx),
         "residual_call_irf_v/iIRFd" => dispatch_residual_call_iIRFd_kind(code, op, ctx, 'v'),
         // The `int_*` / `float_*` / `ptr_*` record families are routed
         // through `dispatch_regular_record` (see `arith.rs`) before this

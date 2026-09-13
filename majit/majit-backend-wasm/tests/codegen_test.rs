@@ -134,8 +134,8 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 /// CALL_ASSEMBLER must not refill a frame on the bump path. The inline
 /// bump leaves `jf_gcmap` unset. Expected `memory.fill`s are the entry
 /// home clear, `emit_zero_bytes` New* payload zeros, and the CA caller
-/// nulling the callee home range from the dispatch snapshot before
-/// publishing that snapshot's gcmap.
+/// nulling the callee home range (`home_slots * SLOT_SIZE` from the
+/// dispatch snapshot) before publishing that snapshot's gcmap.
 #[track_caller]
 fn assert_no_call_assembler_frame_fill(stderr: &str) {
     let home_base = format!(
@@ -170,20 +170,96 @@ fn assert_no_call_assembler_frame_fill(stderr: &str) {
             && lines[index - 2] == "i32.const 0"
             && lines[index - 1].starts_with("i32.const ");
         // dest = cfp + target.home_slot_base, size = home_slots * SLOT_SIZE.
-        let is_ca_callee_home_null = index >= 8
-            && lines[index - 1] == "i32.mul"
-            && lines[index - 2] == "i32.const 8"
-            && lines[index - 3] == home_slots
-            && lines[index - 4].starts_with("local.get ")
-            && lines[index - 5] == "i32.const 0"
-            && lines[index - 6] == "i32.add"
+        // The two `local.get` of the dispatch-entry pointer must name the
+        // same local, and the loads must be the snapshot home fields.
+        let ca_target = lines[index.saturating_sub(8)]
+            .strip_prefix("local.get ")
+            .filter(|s| !s.is_empty());
+        let is_ca_callee_home_null = index >= 9
+            && lines[index - 9].starts_with("local.get ")
+            && ca_target.is_some()
             && lines[index - 7] == home_base
-            && lines[index - 8].starts_with("local.get ");
+            && lines[index - 6] == "i32.add"
+            && lines[index - 5] == "i32.const 0"
+            && lines[index - 4].strip_prefix("local.get ") == ca_target
+            && lines[index - 3] == home_slots
+            && lines[index - 2] == "i32.const 8"
+            && lines[index - 1] == "i32.mul";
         assert!(
             is_entry_home_clear || is_headered_payload || is_object_zero || is_ca_callee_home_null,
             "recursive CA filled a nursery frame on the bump path:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn call_assembler_home_range_fill_is_not_a_frame_refill() {
+    assert_no_call_assembler_frame_fill(
+        "\
+local.get 265
+local.get 267
+i32.load offset=24
+i32.add
+i32.const 0
+local.get 267
+i32.load offset=28
+i32.const 8
+i32.mul
+memory.fill
+",
+    );
+}
+
+#[test]
+#[should_panic(expected = "recursive CA filled a nursery frame")]
+fn call_assembler_unrelated_dynamic_fill_is_rejected() {
+    assert_no_call_assembler_frame_fill(
+        "\
+i32.const 100
+i32.const 0
+i32.const 16
+i32.mul
+memory.fill
+",
+    );
+}
+
+#[test]
+#[should_panic(expected = "recursive CA filled a nursery frame")]
+fn call_assembler_mismatched_target_local_fill_is_rejected() {
+    assert_no_call_assembler_frame_fill(
+        "\
+local.get 265
+local.get 267
+i32.load offset=24
+i32.add
+i32.const 0
+local.get 268
+i32.load offset=28
+i32.const 8
+i32.mul
+memory.fill
+",
+    );
+}
+
+#[test]
+#[should_panic(expected = "recursive CA filled a nursery frame")]
+fn call_assembler_wrong_home_offset_fill_is_rejected() {
+    assert_no_call_assembler_frame_fill(
+        "\
+local.get 265
+local.get 267
+i32.load offset=8
+i32.add
+i32.const 0
+local.get 267
+i32.load offset=28
+i32.const 8
+i32.mul
+memory.fill
+",
+    );
 }
 
 #[test]

@@ -240,7 +240,7 @@ fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
     let getfield_r = *insns.get("getfield_gc_r/rd>r").unwrap();
     let setfield_i = *insns.get("setfield_gc_i/rid").unwrap();
     let setfield_r = *insns.get("setfield_gc_r/rrd").unwrap();
-    let inline_call = majit_metainterp::jitcode::insns::BC_INLINE_CALL;
+    let inline_call_is = |b: &u8| majit_metainterp::jitcode::is_inline_call_opcode(*b);
     let residual_call_r_i = majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_R_I;
     let residual_call_ir_i = majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IR_I;
     let residual_call_irf_i = majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IRF_I;
@@ -277,7 +277,7 @@ fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
 
     let caller = __majit_inline_jitcode_inline_typed_stack_pop_caller_with_asm(&mut asm);
     assert!(
-        caller.code.contains(&inline_call),
+        caller.code.iter().any(inline_call_is),
         "caller helper should splice the typed helper through inline_call; code={:?}",
         caller.code
     );
@@ -349,7 +349,7 @@ fn jit_inline_void_ref_param_field_swap_lowers_to_native_field_ops() {
     let getfield_i = *insns.get("getfield_gc_i/rd>i").unwrap();
     let getfield_r = *insns.get("getfield_gc_r/rd>r").unwrap();
     let setfield_i = *insns.get("setfield_gc_i/rid").unwrap();
-    let inline_call = majit_metainterp::jitcode::insns::BC_INLINE_CALL;
+    let inline_call_is = |b: &u8| majit_metainterp::jitcode::is_inline_call_opcode(*b);
     let void_return = majit_metainterp::jitcode::insns::BC_VOID_RETURN;
     let residual_calls = [
         majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_R_V,
@@ -402,7 +402,7 @@ fn jit_inline_void_ref_param_field_swap_lowers_to_native_field_ops() {
 
     let caller = __majit_inline_jitcode_inline_typed_stack_swap_caller_with_asm(&mut asm);
     assert!(
-        caller.code.contains(&inline_call),
+        caller.code.iter().any(inline_call_is),
         "void caller helper should splice the typed helper through inline_call; code={:?}",
         caller.code
     );
@@ -694,9 +694,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
     jc_builder.inline_call_irf_i(sub_idx, &[(0, 0)], &[(0, 0)], &[(0, 0)], Some(1));
     let jitcode = jc_builder.finish();
 
-    // Route through `handler_inline_call_nested_ext`
-    // (the production builder shape) instead of the legacy
-    // `dispatch_one::BC_INLINE_CALL` fallback.
+    // Canonical `inline_call_irf_i/dIRF>i` (`bhimpl_inline_call_irf_i`).
     let cpu = TestBackend::new();
     let mut bh_builder = build_inline_call_only_bh_builder();
     bh_builder.set_cpu(&cpu);
@@ -838,7 +836,7 @@ fn jit_inline_array_field_keeps_interpreter_behavior() {
 /// one with no diagnostic.
 #[test]
 fn a_discarded_inline_int_result_still_splices_the_helper() {
-    let inline_call = majit_metainterp::jitcode::insns::BC_INLINE_CALL;
+    let inline_call_is = |b: &u8| majit_metainterp::jitcode::is_inline_call_opcode(*b);
     let residual_calls = [
         majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_R_I,
         majit_metainterp::jitcode::insns::BC_RESIDUAL_CALL_IR_I,
@@ -849,7 +847,7 @@ fn a_discarded_inline_int_result_still_splices_the_helper() {
     let caller = __majit_inline_jitcode_inline_typed_stack_pop_discarding_caller_with_asm(&mut asm);
 
     assert!(
-        caller.code.contains(&inline_call),
+        caller.code.iter().any(inline_call_is),
         "a discarded `inline_int` call must still emit BC_INLINE_CALL; \
          code={:?}",
         caller.code
@@ -868,7 +866,7 @@ fn a_discarded_inline_int_result_still_splices_the_helper() {
     // lowerer having changed rather than the discarded arm working.
     let value_caller = __majit_inline_jitcode_inline_typed_stack_pop_caller_with_asm(&mut asm);
     assert!(
-        value_caller.code.contains(&inline_call),
+        value_caller.code.iter().any(inline_call_is),
         "control: the value-position caller over the same helper must splice \
          it too; code={:?}",
         value_caller.code

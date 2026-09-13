@@ -114,26 +114,10 @@ fn arm_names(dispatch: &JitCode) -> Vec<String> {
 fn each_arm_subjitcode_names_the_arm_it_came_from() {
     let dispatch = build_named_dispatch();
     let names = arm_names(&dispatch);
-    // OP_NOP is residual (ArmPattern::Nop) and keeps a named sub-JitCode.
-    // OP_INC_A is Lowerable and is force-inlined into the dispatch body, so
-    // it does not register a sibling JitCode.
-    assert_eq!(
-        names.len(),
-        1,
-        "one residual Nop sub-JitCode; got {names:?}",
-    );
-
-    // The interp prefix is what makes a name readable in a log that carries
-    // more than one machine's traces — `OP_NOP` alone does not say whose.
-    for name in &names {
-        assert!(
-            name.starts_with("NamedState::"),
-            "an arm sub-JitCode names the state type it dispatches on; got {name:?}",
-        );
-    }
-
+    // OP_NOP is ArmPattern::Nop and emits nothing in this frame.
+    // OP_INC_A is Lowerable and is force-inlined into the dispatch body.
     assert!(
-        names.iter().any(|n| n.contains("OP_NOP")),
-        "the residual nop arm names its own pattern; got {names:?}",
+        names.is_empty(),
+        "Nop/Halt no longer register a sibling JitCode; got {names:?}",
     );
 }

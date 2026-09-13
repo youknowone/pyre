@@ -10080,13 +10080,10 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         "inline_call_nested_ext/P".to_string(),
         majit_translate::insns::BC_INLINE_CALL,
     );
-    // P10 — pyre call_assembler / cond_call / record_known_result
-    // adapters.  The `_ext/P` suffix matches the inline_call adapter
-    // pattern so wire_bhimpl_handlers binds the right handler and
-    // strict dispatch resolves the byte without panic.  Producers:
-    // `pyjitpl/dispatch.rs` (call_assembler), `majit-macros/
-    // src/jit_interp/jitcode_lower` + `pyre/pyre-jit/src/
-    // jit/assembler.rs` (cond_call / record_known_result).
+    // Leftover `_ext/P` adapters. Jitcode no longer emits CALL_ASSEMBLER;
+    // the keys stay so a leftover byte still reaches `wire_handler`.
+    // cond/record emit the canonical keys registered below; these ext
+    // keys remain for leftover payloads.
     for (key, byte) in [
         (
             "call_assembler_int_ext/P",
@@ -10571,6 +10568,22 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         majit_translate::insns::BC_CONDITIONAL_CALL_IR_V,
     );
     insns.insert(
+        "conditional_call_value_ir_i/iiIRd>i".to_string(),
+        majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_I,
+    );
+    insns.insert(
+        "conditional_call_value_ir_r/riIRd>r".to_string(),
+        majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_R,
+    );
+    insns.insert(
+        "record_known_result_i_ir_v/iiIRd".to_string(),
+        majit_translate::insns::BC_RECORD_KNOWN_RESULT_I_IR_V,
+    );
+    insns.insert(
+        "record_known_result_r_ir_v/riIRd".to_string(),
+        majit_translate::insns::BC_RECORD_KNOWN_RESULT_R_IR_V,
+    );
+    insns.insert(
         "residual_call_ir_i/iIRd>i".to_string(),
         majit_translate::insns::BC_RESIDUAL_CALL_IR_I,
     );
@@ -10598,10 +10611,7 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     // handlers and their `wire_bhimpl_handlers` calls already exist, but
     // `wire_handler` is a no-op for a key `setup_insns` never registered, so
     // without these entries the bytes reach `dispatch_step`'s unwired panic
-    // instead of their handler. Build-time (LLBC-extracted) jitcodes are the
-    // only producer — the runtime `JitCodeBuilder` emits the pyre-only
-    // `inline_call_nested_ext/P` byte instead — and any of them a
-    // guard-failure resume forward-executes can reach one.
+    // instead of their handler. `JitCodeBuilder` now emits these keys.
     //
     // A target whose path the host never published has no runtime address;
     // `read_inline_call_jitcode` + `is_callable_fnaddr` decline it rather than
@@ -11574,7 +11584,9 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // pyre's nested-bytecode payload, distinct from the canonical
     // `dR`/`dIR`/`dIRF` arglists.
     builder.wire_handler("inline_call_nested_ext/P", handler_inline_call_nested_ext);
-    // P10 — pyre call_assembler / cond_call / record_known_result adapter wiring.
+    // Jitcode no longer emits CALL_ASSEMBLER; keep the handlers wired so a
+    // leftover byte still decodes. cond_call / record_known_result emit
+    // the canonical keys; ext handlers remain for leftover payloads.
     builder.wire_handler("call_assembler_int_ext/P", handler_call_assembler_int_ext);
     builder.wire_handler("call_assembler_ref_ext/P", handler_call_assembler_ref_ext);
     builder.wire_handler(
@@ -13178,13 +13190,6 @@ fn interpret_unresolved_inline_call(
     dest: Option<(JitArgKind, usize)>,
     post_p: usize,
 ) -> Result<usize, DispatchError> {
-    // Grain and other hosts that never install MiniMark cannot execute
-    // Charon-lowered helper bodies: those bodies emit GETFIELD_GC that
-    // expect the collector. Fall back to LeaveFrame; the portal resumes
-    // at its merge point rather than jumping to a symbolic hash.
-    if !majit_gc::gc_sync::is_initialized() {
-        return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
-    }
     let Some(sub_jitcode) = handle.as_callee_jitcode() else {
         return Err(reject_unresolved_inline_call(bh, jitcode_index, fnaddr));
     };
@@ -13704,8 +13709,9 @@ fn handler_call_assembler_void_ext(
 /// TODO: pyre `cond_call` / `record_known_result`
 /// adapters.
 ///
-/// `JitCodeBuilder::call_cond_like` / `call_cond_value_like`
-/// (`jitcode/assembler.rs`) emit a pyre-only flat payload:
+/// `JitCodeBuilder` now emits the canonical `iiIRd` / `riIRd` layout.
+/// The `_ext` handlers below remain for any leftover `call_cond_like`
+/// payload:
 ///   `cond_call_*`:    `[first_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8]`
 ///   `cond_call_value`: `[value_reg: u8, fn_ptr_idx: u16, arg_count: u8, kind × arg_count: u8, reg × arg_count: u8, dst: u8]`
 ///   `record_known_result_*`: same shape as `cond_call_*` (no dst).

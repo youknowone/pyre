@@ -4,8 +4,9 @@
 //! contains the expected portal IR (BC_JIT_MERGE_POINT, BC_LOOP_HEADER) +
 //! pre-dispatch ops in source order + opcode fetch + dispatch chain
 //! (BC_GOTO_IF_NOT_INT_EQ_CONST chain) + Lowerable arm bodies force-inlined
-//! into the dispatch JitCode (`try_inline_dispatch_arm`) + residual
-//! `BC_INLINE_CALL` only for Nop/Halt/abort stubs + loop close.
+//! into the dispatch JitCode (`try_inline_dispatch_arm`). Nop/Halt emit
+//! nothing; AbortPermanent / Unsupported abort this frame. Loop close
+//! follows the arm chain.
 
 use majit_metainterp::jitcode::insns::{
     BC_ABORT, BC_GETARRAYITEM_GC_I_PURE, BC_GOTO_IF_NOT_INT_EQ, BC_INLINE_CALL, BC_INT_ADD,
@@ -77,9 +78,9 @@ fn build_dispatch_minimal() -> JitCode {
 }
 
 /// Dispatch JitCode plus every registered arm sub-JitCode. Lowerable red-pc
-/// arms land in the dispatch body (`try_inline_dispatch_arm`); Nop/Halt/abort
-/// stubs stay as `BC_INLINE_CALL` targets. Shape assertions that only care
-/// that an op was emitted must scan both.
+/// arms land in the dispatch body (`try_inline_dispatch_arm`); Nop/Halt emit
+/// nothing and Unsupported / AbortPermanent abort this frame. Shape
+/// assertions that only care that an op was emitted must scan both.
 fn dispatch_tree(jc: &JitCode) -> impl Iterator<Item = &JitCode> {
     std::iter::once(jc).chain(
         jc.exec
@@ -121,11 +122,11 @@ fn dispatch_jitcode_contains_inline_call_per_arm() {
     let dispatch_jc = build_dispatch_minimal();
     let code = &dispatch_jc.code;
     let inline_call_count = code.iter().filter(|&&b| b == BC_INLINE_CALL).count();
-    // OP_NOP is ArmPattern::Nop and stays a residual empty INLINE_CALL.
+    // OP_NOP is ArmPattern::Nop and emits nothing; the jump is the transfer.
     // OP_INC_A is Lowerable and is force-inlined into the dispatch body.
     assert_eq!(
-        inline_call_count, 1,
-        "dispatch JitCode must emit one BC_INLINE_CALL for the residual Nop arm; got {}",
+        inline_call_count, 0,
+        "dispatch JitCode must not emit BC_INLINE_CALL when Nop/Halt stay in this frame; got {}",
         inline_call_count
     );
 }
@@ -142,8 +143,8 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
 
     assert_eq!(
         sub_jitcodes.len(),
-        1,
-        "only the residual Nop arm registers a sub-JitCode; Lowerable OP_INC_A is inlined"
+        0,
+        "Nop emits nothing and Lowerable OP_INC_A is inlined; no arm sub-JitCode remains"
     );
     assert!(
         dispatch_jc.code.contains(&BC_STORE_STATE_FIELD),
@@ -151,8 +152,9 @@ fn dispatch_arm_subjitcode_lowers_state_field_write() {
         dispatch_jc.code
     );
     assert!(
-        sub_jitcodes.iter().all(|sub| !sub.code.contains(&BC_ABORT)),
-        "lowerable dispatch arms must not degenerate to abort sub-JitCodes"
+        !dispatch_jc.code.contains(&BC_ABORT),
+        "inlined lowerable dispatch arms must not degenerate to an in-frame abort; dispatch={:?}",
+        dispatch_jc.code
     );
 }
 
@@ -1160,7 +1162,7 @@ mod oparg_minimal {
     ///      body (the inlined `can_enter_jit!()`).
     ///   2. The byte immediately after the LH opcode is in valid const-pool
     ///      range and stores the jdindex constant (`0i64` for this invocation).
-    ///   3. No residual Nop/Halt sub-JitCode emits LH of its own.
+    ///   3. No leftover arm sub-JitCode emits LH of its own.
     #[test]
     fn dispatch_oparg_minimal_pins_loop_header_jdindex() {
         use majit_metainterp::jitcode::insns::BC_LOOP_HEADER;
@@ -1214,7 +1216,7 @@ mod oparg_minimal {
             .count();
         assert_eq!(
             arm_lh_emitting, 0,
-            "A.3.4: residual Nop/Halt sub-JitCodes must not emit BC_LOOP_HEADER; got {}",
+            "A.3.4: leftover arm sub-JitCodes must not emit BC_LOOP_HEADER; got {}",
             arm_lh_emitting
         );
     }

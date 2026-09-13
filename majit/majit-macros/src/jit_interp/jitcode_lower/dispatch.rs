@@ -2836,256 +2836,222 @@ pub(super) fn lower_dispatch_chain(
         }
 
         if !inlined {
-            // jtransform.py:473-482 — inline_call_* + trailing -live-.
-            // Build the arm sub-JitCode and register it; emit BC_INLINE_CALL.
-            // This executes when the arm MATCHED (guards fell through); the
-            // sub-JitCode encodes the opcode handler body.
-            //
-            // Dispatch-arm caller-local plumbing: walk the arm
-            // body to collect parent-scope idents (via `collect_arm_caller_locals`),
-            // pre-bind them on the sub-Lowerer at fresh per-bank callee regs
-            // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
-            // emit the typed `inline_call_<types>_v(__sub_idx, args_i, args_r,
-            // args_f)` so the callee jitcode receives them as portal-input
-            // bindings.  Mirrors `jtransform.py:480 inline_call_<types>(jitcode,
-            // args...)`.  When the arm body has no parent-scope refs the layout
-            // is empty and the emit reduces to the no-arg `inline_call_r_v`
-            // (equivalent to the previous `__builder.inline_call(__sub_idx)`).
-            let mut arm_inline_call_reads: Vec<Register> = Vec::new();
-            let (arm_body_tokens, arm_inline_call_emit): (
-                proc_macro2::TokenStream,
-                proc_macro2::TokenStream,
-            ) = match &arm.pattern {
+            // PyPy `pyopcode.py` dispatch is one graph: a matched arm is
+            // more ops in the same JitCode, not `inline_call` to a
+            // per-arm sub-JitCode. Nop/Halt emit nothing (the jump below
+            // is the control transfer). AbortPermanent / Unsupported
+            // abort THIS frame. Only a Lowerable body that could not be
+            // inlined still builds a sub-JitCode (split_dispatch /
+            // infer-call).
+            match &arm.pattern {
+                crate::jit_interp::classify::ArmPattern::Nop
+                | crate::jit_interp::classify::ArmPattern::Halt => {}
+                crate::jit_interp::classify::ArmPattern::AbortPermanent => {
+                    lowerer.emit_op(
+                        OpMeta::terminal(Vec::new()),
+                        quote::quote! { __builder.abort_permanent(); },
+                    );
+                }
+                crate::jit_interp::classify::ArmPattern::Unsupported(reason) => {
+                    let record_degraded = record_degraded_arm(reason);
+                    lowerer.emit_aux(record_degraded);
+                    lowerer.emit_op(
+                        OpMeta::terminal(Vec::new()),
+                        quote::quote! { __builder.abort(); },
+                    );
+                }
                 crate::jit_interp::classify::ArmPattern::Lowerable => {
-                    let caller_locals =
-                        collect_arm_caller_locals(&arm.original_body, &arm.pat, &lowerer.bindings);
-                    let generated_parts = match pc_return_increment {
-                        // `split_dispatch` pure arm: lower into a sub-JitCode
-                        // that RETURNS pc + N; the third tuple slot carries the
-                        // caller pc register the `_i` writeback targets.
-                        Some(increment) => {
-                            try_generate_jitcode_pc_return_body_with_caller_bindings(
+                    // jtransform.handle_regular_call — inline_call_* + trailing -live-.
+                    // Build the arm sub-JitCode and register it; emit BC_INLINE_CALL.
+                    // This executes when the arm MATCHED (guards fell through); the
+                    // sub-JitCode encodes the opcode handler body.
+                    //
+                    // Dispatch-arm caller-local plumbing: walk the arm
+                    // body to collect parent-scope idents (via `collect_arm_caller_locals`),
+                    // pre-bind them on the sub-Lowerer at fresh per-bank callee regs
+                    // (via `try_generate_jitcode_body_parts_with_caller_bindings`), and
+                    // emit the typed `inline_call_<types>_v(__sub_idx, args_i, args_r,
+                    // args_f)` so the callee jitcode receives them as portal-input
+                    // bindings.  Mirrors `handle_regular_call` `inline_call_<types>(jitcode,
+                    // args...)`.  When the arm body has no parent-scope refs the layout
+                    // is empty and the emit reduces to the no-arg `inline_call_r_v`
+                    // (equivalent to the previous `__builder.inline_call(__sub_idx)`).
+                    let mut arm_inline_call_reads: Vec<Register> = Vec::new();
+                    let (arm_body_tokens, arm_inline_call_emit): (
+                        proc_macro2::TokenStream,
+                        proc_macro2::TokenStream,
+                    ) = {
+                        let caller_locals = collect_arm_caller_locals(
+                            &arm.original_body,
+                            &arm.pat,
+                            &lowerer.bindings,
+                        );
+                        let generated_parts = match pc_return_increment {
+                            // `split_dispatch` pure arm: lower into a sub-JitCode
+                            // that RETURNS pc + N; the third tuple slot carries the
+                            // caller pc register the `_i` writeback targets.
+                            Some(increment) => {
+                                try_generate_jitcode_pc_return_body_with_caller_bindings(
+                                    &arm.original_body,
+                                    Some(config),
+                                    &caller_locals,
+                                    increment,
+                                )
+                                .map(|(generated, layout)| {
+                                    let pc_reg = layout
+                                        .iter()
+                                        .find(|e| e.name == "pc")
+                                        .map(|e| e.parent_reg)
+                                        .unwrap_or(0);
+                                    (generated, layout, Some(pc_reg))
+                                })
+                            }
+                            None => try_generate_jitcode_body_parts_with_caller_bindings(
                                 &arm.original_body,
                                 Some(config),
                                 &caller_locals,
-                                increment,
                             )
-                            .map(|(generated, layout)| {
-                                let pc_reg = layout
+                            .map(|(generated, layout)| (generated, layout, None)),
+                        };
+                        match generated_parts {
+                            Ok((generated, layout, pc_return_reg)) => {
+                                let body = generated.body;
+                                let liveness_prebuild = generated.liveness_prebuild;
+                                lowerer.inline_liveness_prebuild.push(liveness_prebuild);
+                                // Carry the parent-side caller regs into the
+                                // BC_INLINE_CALL OpMeta so the liveness walker
+                                // accounts for them as live at the call site
+                                // (assembler.py get_liveness_info reads).
+                                for entry in &layout {
+                                    arm_inline_call_reads
+                                        .push(Register::new(entry.kind, entry.parent_reg));
+                                }
+                                let inline_call_emit = match pc_return_reg {
+                                    Some(pc_reg) => {
+                                        dispatch_arm_inline_call_tokens_i(&layout, pc_reg)
+                                    }
+                                    None => dispatch_arm_inline_call_tokens(&layout),
+                                };
+                                // Reserve the identity-slot prefix in the sub-JitCode
+                                // register file so int[int_identity_base..int_end) /
+                                // ref[ref_identity_base..ref_end) exist as real
+                                // registers — the arm body's state-field ops address
+                                // them and the resume path re-derives them at deopt.
+                                let (__split_int_end, __split_ref_end) = if config.split_dispatch {
+                                    config.split_identity_reg_ends()
+                                } else {
+                                    (0u16, 0u16)
+                                };
+                                let min_i_regs = layout
                                     .iter()
-                                    .find(|e| e.name == "pc")
-                                    .map(|e| e.parent_reg)
+                                    .filter(|e| matches!(e.kind, BindingKind::Int))
+                                    .map(|e| e.callee_reg + 1)
+                                    .max()
+                                    .unwrap_or(0)
+                                    .max(__split_int_end);
+                                let min_r_regs = layout
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, BindingKind::Ref))
+                                    .map(|e| e.callee_reg + 1)
+                                    .max()
+                                    .unwrap_or(0)
+                                    .max(__split_ref_end);
+                                let min_f_regs = layout
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, BindingKind::Float))
+                                    .map(|e| e.callee_reg + 1)
+                                    .max()
                                     .unwrap_or(0);
-                                (generated, layout, Some(pc_reg))
-                            })
-                        }
-                        None => try_generate_jitcode_body_parts_with_caller_bindings(
-                            &arm.original_body,
-                            Some(config),
-                            &caller_locals,
-                        )
-                        .map(|(generated, layout)| (generated, layout, None)),
-                    };
-                    match generated_parts {
-                        Ok((generated, layout, pc_return_reg)) => {
-                            let body = generated.body;
-                            let liveness_prebuild = generated.liveness_prebuild;
-                            lowerer.inline_liveness_prebuild.push(liveness_prebuild);
-                            // Carry the parent-side caller regs into the
-                            // BC_INLINE_CALL OpMeta so the liveness walker
-                            // accounts for them as live at the call site
-                            // (assembler.py get_liveness_info reads).
-                            for entry in &layout {
-                                arm_inline_call_reads
-                                    .push(Register::new(entry.kind, entry.parent_reg));
-                            }
-                            let inline_call_emit = match pc_return_reg {
-                                Some(pc_reg) => dispatch_arm_inline_call_tokens_i(&layout, pc_reg),
-                                None => dispatch_arm_inline_call_tokens(&layout),
-                            };
-                            // Reserve the identity-slot prefix in the sub-JitCode
-                            // register file so int[int_identity_base..int_end) /
-                            // ref[ref_identity_base..ref_end) exist as real
-                            // registers — the arm body's state-field ops address
-                            // them and the resume path re-derives them at deopt.
-                            let (__split_int_end, __split_ref_end) = if config.split_dispatch {
-                                config.split_identity_reg_ends()
-                            } else {
-                                (0u16, 0u16)
-                            };
-                            let min_i_regs = layout
-                                .iter()
-                                .filter(|e| matches!(e.kind, BindingKind::Int))
-                                .map(|e| e.callee_reg + 1)
-                                .max()
-                                .unwrap_or(0)
-                                .max(__split_int_end);
-                            let min_r_regs = layout
-                                .iter()
-                                .filter(|e| matches!(e.kind, BindingKind::Ref))
-                                .map(|e| e.callee_reg + 1)
-                                .max()
-                                .unwrap_or(0)
-                                .max(__split_ref_end);
-                            let min_f_regs = layout
-                                .iter()
-                                .filter(|e| matches!(e.kind, BindingKind::Float))
-                                .map(|e| e.callee_reg + 1)
-                                .max()
-                                .unwrap_or(0);
-                            let record_degraded = record_degraded_arm(
-                                "arm body lowering resolved an unsupported call policy at install",
-                            );
-                            (
-                                quote::quote! {
-                                    // A runtime-resolved unsupported call policy
-                                    // (`inference_failure_tokens` → `return None`,
-                                    // e.g. a `#[dont_look_inside]` helper whose
-                                    // signature has no marshalable C-ABI call
-                                    // target) escapes arm-body lowering as the
-                                    // IIFE's `None`.  Degrade THIS arm to an abort
-                                    // sub-JitCode rather than failing the whole
-                                    // `__dispatch_jitcode_*` build: jtransform.py /
-                                    // `make_jitcodes()` builds the portal jitcode
-                                    // even when an individual opcode lowers to a
-                                    // residual the tracer can't follow — that opcode
-                                    // aborts the trace when hit, it never disables
-                                    // the JIT for every other opcode.
-                                    let __arm_jc: Option<majit_metainterp::JitCode> =
-                                        (|| -> Option<majit_metainterp::JitCode> {
-                                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                                            __sub_builder.set_name(#sub_jitcode_name);
-                                            __sub_builder.ensure_i_regs(#min_i_regs);
-                                            __sub_builder.ensure_r_regs(#min_r_regs);
-                                            __sub_builder.ensure_f_regs(#min_f_regs);
-                                            let _live_offset_patch = __sub_builder.live_placeholder();
-                                            {
-                                                let __builder = &mut __sub_builder;
-                                                #body
+                                let record_degraded = record_degraded_arm(
+                                    "arm body lowering resolved an unsupported call policy at install",
+                                );
+                                (
+                                    quote::quote! {
+                                        // A runtime-resolved unsupported call policy
+                                        // (`inference_failure_tokens` → `return None`,
+                                        // e.g. a `#[dont_look_inside]` helper whose
+                                        // signature has no marshalable C-ABI call
+                                        // target) escapes arm-body lowering as the
+                                        // IIFE's `None`.  Degrade THIS arm to an abort
+                                        // sub-JitCode rather than failing the whole
+                                        // `__dispatch_jitcode_*` build: jtransform.py /
+                                        // `make_jitcodes()` builds the portal jitcode
+                                        // even when an individual opcode lowers to a
+                                        // residual the tracer can't follow — that opcode
+                                        // aborts the trace when hit, it never disables
+                                        // the JIT for every other opcode.
+                                        let __arm_jc: Option<majit_metainterp::JitCode> =
+                                            (|| -> Option<majit_metainterp::JitCode> {
+                                                let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                                __sub_builder.set_name(#sub_jitcode_name);
+                                                __sub_builder.ensure_i_regs(#min_i_regs);
+                                                __sub_builder.ensure_r_regs(#min_r_regs);
+                                                __sub_builder.ensure_f_regs(#min_f_regs);
+                                                let _live_offset_patch = __sub_builder.live_placeholder();
+                                                {
+                                                    let __builder = &mut __sub_builder;
+                                                    #body
+                                                }
+                                                __sub_builder.finalize_liveness(__asm);
+                                                Some(__sub_builder.finish())
+                                            })();
+                                        match __arm_jc {
+                                            Some(__jc) => __jc,
+                                            None => {
+                                                // Abort stub with the arm's register
+                                                // shape so the paired BC_INLINE_CALL's
+                                                // arg copies stay in bounds before the
+                                                // BC_ABORT.
+                                                #record_degraded
+                                                let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
+                                                __sub_builder.set_name(#sub_jitcode_name);
+                                                __sub_builder.ensure_i_regs(#min_i_regs);
+                                                __sub_builder.ensure_r_regs(#min_r_regs);
+                                                __sub_builder.ensure_f_regs(#min_f_regs);
+                                                __sub_builder.abort();
+                                                __sub_builder.finish()
                                             }
-                                            __sub_builder.finalize_liveness(__asm);
-                                            Some(__sub_builder.finish())
-                                        })();
-                                    match __arm_jc {
-                                        Some(__jc) => __jc,
-                                        None => {
-                                            // Abort stub with the arm's register
-                                            // shape so the paired BC_INLINE_CALL's
-                                            // arg copies stay in bounds before the
-                                            // BC_ABORT.
+                                        }
+                                    },
+                                    inline_call_emit,
+                                )
+                            }
+                            // The lowering already knows WHICH statement stopped it;
+                            // carry that reason to the install-time record instead
+                            // of collapsing every cause into one string, the same
+                            // way `ArmPattern::Unsupported(reason)` is carried below.
+                            Err(reason) => {
+                                let record_degraded = record_degraded_arm(&reason);
+                                (
+                                    quote::quote! {
+                                        {
                                             #record_degraded
                                             let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
                                             __sub_builder.set_name(#sub_jitcode_name);
-                                            __sub_builder.ensure_i_regs(#min_i_regs);
-                                            __sub_builder.ensure_r_regs(#min_r_regs);
-                                            __sub_builder.ensure_f_regs(#min_f_regs);
                                             __sub_builder.abort();
                                             __sub_builder.finish()
                                         }
-                                    }
-                                },
-                                inline_call_emit,
-                            )
-                        }
-                        // The lowering already knows WHICH statement stopped it;
-                        // carry that reason to the install-time record instead
-                        // of collapsing every cause into one string, the same
-                        // way `ArmPattern::Unsupported(reason)` is carried below.
-                        Err(reason) => {
-                            let record_degraded = record_degraded_arm(&reason);
-                            (
-                                quote::quote! {
-                                    {
-                                        #record_degraded
-                                        let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                                        __sub_builder.set_name(#sub_jitcode_name);
-                                        __sub_builder.abort();
-                                        __sub_builder.finish()
-                                    }
-                                },
-                                dispatch_arm_inline_call_tokens(&[]),
-                            )
-                        }
-                    }
-                }
-                // `break` arms (`Halt`) use the same empty body as Nop — no
-                // `BC_ABORT_PERMANENT` is emitted for this loop-exit path.
-                //
-                // Nop / Halt / AbortPermanent are DECLARED outcomes, not
-                // degradations: the source arm asked for exactly this, so
-                // none of them records a degraded arm.  Recording them would
-                // make the channel fire on every `_ => break` and
-                // `_ => panic!` in the corpus and stop discriminating.
-                // Both stubs still end in `void_return`: every jitcode the
-                // codewriter builds terminates in a return opcode (an empty
-                // graph keeps its return block), and `dispatch_loop` reads
-                // past the end otherwise — the blackhole treats that as a
-                // frame that never produced a result and panics.
-                crate::jit_interp::classify::ArmPattern::Nop => (
-                    quote::quote! {
-                        {
-                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                            __sub_builder.set_name(#sub_jitcode_name);
-                            __sub_builder.void_return();
-                            __sub_builder.finish()
-                        }
-                    },
-                    dispatch_arm_inline_call_tokens(&[]),
-                ),
-                crate::jit_interp::classify::ArmPattern::Halt => (
-                    quote::quote! {
-                        {
-                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                            __sub_builder.set_name(#sub_jitcode_name);
-                            __sub_builder.void_return();
-                            __sub_builder.finish()
-                        }
-                    },
-                    dispatch_arm_inline_call_tokens(&[]),
-                ),
-                crate::jit_interp::classify::ArmPattern::AbortPermanent => (
-                    quote::quote! {
-                        {
-                            let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                            __sub_builder.set_name(#sub_jitcode_name);
-                            __sub_builder.abort_permanent();
-                            __sub_builder.finish()
-                        }
-                    },
-                    dispatch_arm_inline_call_tokens(&[]),
-                ),
-                // `detect_unsupported_pattern` already produced a reason
-                // String here and it used to be dropped on the floor; carry
-                // it to the install-time record instead of restating it.
-                crate::jit_interp::classify::ArmPattern::Unsupported(reason) => {
-                    let record_degraded = record_degraded_arm(reason);
-                    (
-                        quote::quote! {
-                            {
-                                #record_degraded
-                                let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
-                                __sub_builder.set_name(#sub_jitcode_name);
-                                __sub_builder.abort();
-                                __sub_builder.finish()
+                                    },
+                                    dispatch_arm_inline_call_tokens(&[]),
+                                )
                             }
+                        }
+                    };
+                    lowerer.emit_op(
+                        OpMeta::linear(OpKind::InlineCall, arm_inline_call_reads, vec![]),
+                        quote::quote! {
+                            let __sub_jitcode = { #arm_body_tokens };
+                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            #arm_inline_call_emit
                         },
-                        dispatch_arm_inline_call_tokens(&[]),
-                    )
+                    );
+                    // handle_regular_call — trailing -live- after inline_call_*.
+                    lowerer.emit_op(
+                        OpMeta::live_marker(),
+                        quote::quote! { let _ = __builder.live_placeholder(); },
+                    );
                 }
-            };
-            lowerer.emit_op(
-                OpMeta::linear(OpKind::InlineCall, arm_inline_call_reads, vec![]),
-                quote::quote! {
-                    let __sub_jitcode = { #arm_body_tokens };
-                    let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
-                    #arm_inline_call_emit
-                },
-            );
-            // jtransform.py:480-482 — trailing -live- after inline_call_*.
-            lowerer.emit_op(
-                OpMeta::live_marker(),
-                quote::quote! { let _ = __builder.live_placeholder(); },
-            );
+            }
         }
         // jtransform.py `handle_jit_marker__loop_header`:
         // RPython lowers `can_enter_jit()` at the user's source-code
@@ -3119,8 +3085,15 @@ pub(super) fn lower_dispatch_chain(
         // has no operand and must reach the function-final typed return to get
         // one, whereas a returning arm carries its own value and would have the
         // function's trailing expression lowered over it.
-        if matches!(inline_outcome, InlineArmOutcome::InlinedTerminal) {
-            // No jump: the return terminator is the arm's control transfer.
+        if matches!(inline_outcome, InlineArmOutcome::InlinedTerminal)
+            || matches!(
+                arm.pattern,
+                crate::jit_interp::classify::ArmPattern::AbortPermanent
+                    | crate::jit_interp::classify::ArmPattern::Unsupported(_)
+            )
+        {
+            // No jump: the return terminator or an in-frame abort is the
+            // arm's control transfer.
         } else if matches!(arm.pattern, crate::jit_interp::classify::ArmPattern::Halt) {
             lowerer.emit_jump(&default_label);
         } else {

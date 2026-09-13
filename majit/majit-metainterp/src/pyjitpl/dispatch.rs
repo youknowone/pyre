@@ -9114,7 +9114,195 @@ where
                     action => return action,
                 }
             }
-            // ── conditional_call / record_known_result (jtransform.py:1665, 292) ──
+            // ── canonical conditional_call / record_known_result ──
+            // `rewrite_call(..., force_ir=True)`: lead + funcptr + I + R + d
+            // (`blackhole.rs` `handler_conditional_call_*` / `handler_record_known_result_*`).
+            jitcode::insns::BC_CONDITIONAL_CALL_IR_V
+            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
+            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R
+            | jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V
+            | jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
+                let (first_reg, target, args_i, args_r, calldescr, dst) = {
+                    let frame = self.frames.current_mut();
+                    let first_reg = frame.next_reg() as u16;
+                    let funcptr_reg = frame.next_reg() as u16;
+                    let count_i = frame.next_u8() as usize;
+                    let mut args_i = Vec::with_capacity(count_i);
+                    for _ in 0..count_i {
+                        args_i.push(JitCallArg::int(frame.next_reg() as u16));
+                    }
+                    let count_r = frame.next_u8() as usize;
+                    let mut args_r = Vec::with_capacity(count_r);
+                    for _ in 0..count_r {
+                        args_r.push(JitCallArg::reference(frame.next_reg() as u16));
+                    }
+                    let calldescr_idx = frame.next_u16();
+                    let calldescr = frame
+                        .jitcode
+                        .descr_at(calldescr_idx as usize)
+                        .and_then(crate::jitcode::RuntimeBhDescr::as_bh_descr)
+                        .expect("canonical cond/record descr is not BhDescr")
+                        .as_calldescr()
+                        .clone();
+                    let target = frame
+                        .jitcode
+                        .exec
+                        .call_descr_to_call_target
+                        .get(&calldescr_idx)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            let func =
+                                frame.int_values[funcptr_reg as usize].unwrap_or_else(|| {
+                                    panic!(
+                                        "canonical cond/record: funcptr slot {funcptr_reg} \
+                                     is uninitialized"
+                                    )
+                                });
+                            let func = func as *const ();
+                            JitCallTarget::new(func, func)
+                        });
+                    let dst = if matches!(
+                        bytecode,
+                        jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I
+                            | jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R
+                    ) {
+                        Some(frame.next_reg() as u16)
+                    } else {
+                        None
+                    };
+                    (first_reg, target, args_i, args_r, calldescr, dst)
+                };
+                let (args, concrete_args, arg_types, _raw_i, _raw_r, _raw_f) =
+                    self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &[]);
+                let trace_ptr = if target.trace_ptr.is_null() {
+                    target.concrete_ptr
+                } else {
+                    target.trace_ptr
+                };
+                let concrete_ptr = if target.concrete_ptr.is_null() {
+                    trace_ptr
+                } else {
+                    target.concrete_ptr
+                };
+                let slot = target.effect_info_slot;
+                match bytecode {
+                    jitcode::insns::BC_CONDITIONAL_CALL_IR_V => {
+                        // `_opimpl_conditional_call_*`: skip only when the
+                        // register's own SSA box is already a Const. Inventing
+                        // ConstInt from this iteration's concrete value makes
+                        // `is_constant()` true for a live register and bakes
+                        // the snapshot into the trace.
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                        // `opimpl_conditional_call_ir_v`: ConstInt(0) records
+                        // nothing so the heapcache can keep args virtual.
+                        if first_box.is_constant() && first_val == 0 {
+                            // skip
+                        } else {
+                            ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
+                            if first_val != 0 {
+                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                    concrete_ptr as i64,
+                                ) {
+                                    return report_symbolic_residual_call_target(
+                                        ctx,
+                                        concrete_ptr as usize,
+                                        Some(&calldescr.arg_classes),
+                                    );
+                                }
+                                call_void_function(concrete_ptr, &concrete_args);
+                            }
+                        }
+                    }
+                    jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_I => {
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                        // `_opimpl_conditional_call_value`: Const nonnull
+                        // returns the value box without recording.
+                        if first_box.is_constant() && first_val != 0 {
+                            if let Some(dst) = dst {
+                                self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
+                            }
+                        } else {
+                            let traced = ctx.cond_call_value_int_typed(
+                                first_box, trace_ptr, &args, &arg_types, slot,
+                            );
+                            let concrete_result = if first_val == 0 {
+                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                    concrete_ptr as i64,
+                                ) {
+                                    return report_symbolic_residual_call_target(
+                                        ctx,
+                                        concrete_ptr as usize,
+                                        Some(&calldescr.arg_classes),
+                                    );
+                                }
+                                call_int_function(concrete_ptr, &concrete_args)
+                            } else {
+                                first_val
+                            };
+                            if let Some(dst) = dst {
+                                self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
+                            }
+                        }
+                    }
+                    jitcode::insns::BC_CONDITIONAL_CALL_VALUE_IR_R => {
+                        let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
+                        if first_box.is_constant() && first_val != 0 {
+                            if let Some(dst) = dst {
+                                self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
+                            }
+                        } else {
+                            let traced = ctx.cond_call_value_ref_typed(
+                                first_box, trace_ptr, &args, &arg_types, slot,
+                            );
+                            let concrete_result = if first_val == 0 {
+                                if majit_translate::codewriter::call::is_symbolic_fnaddr(
+                                    concrete_ptr as i64,
+                                ) {
+                                    return report_symbolic_residual_call_target(
+                                        ctx,
+                                        concrete_ptr as usize,
+                                        Some(&calldescr.arg_classes),
+                                    );
+                                }
+                                call_ref_function(concrete_ptr, &concrete_args)
+                            } else {
+                                first_val
+                            };
+                            if let Some(dst) = dst {
+                                self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
+                            }
+                        }
+                    }
+                    jitcode::insns::BC_RECORD_KNOWN_RESULT_I_IR_V => {
+                        let (first_box, _) = self.read_int_reg(first_reg as usize);
+                        ctx.profiler()
+                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
+                        ctx.record_known_result_typed(
+                            first_box,
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Int,
+                            slot,
+                        );
+                    }
+                    jitcode::insns::BC_RECORD_KNOWN_RESULT_R_IR_V => {
+                        let (first_box, _) = self.read_ref_reg(first_reg as usize);
+                        ctx.profiler()
+                            .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
+                        ctx.record_known_result_typed(
+                            first_box,
+                            trace_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Ref,
+                            slot,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // ── helper-side ext payload (no remaining emit; decode kept) ──
             jitcode::insns::BC_COND_CALL_VOID
             | jitcode::insns::BC_COND_CALL_VALUE_INT
             | jitcode::insns::BC_COND_CALL_VALUE_REF
@@ -9170,54 +9358,62 @@ where
                     jitcode::insns::BC_COND_CALL_VOID => {
                         // RPython pyjitpl.py opimpl_conditional_call_ir_v:
                         //   if condition != 0: call func(args)
-                        let first_val =
-                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
-                        ctx.cond_call_void_typed(first_val, trace_ptr, &args, &arg_types, slot);
-                        if first_val != 0 {
-                            call_void_function(concrete_ptr, &concrete_args);
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                        if first_box.is_constant() && first_val == 0 {
+                            // skip
+                        } else {
+                            ctx.cond_call_void_typed(first_box, trace_ptr, &args, &arg_types, slot);
+                            if first_val != 0 {
+                                call_void_function(concrete_ptr, &concrete_args);
+                            }
                         }
                     }
                     jitcode::insns::BC_COND_CALL_VALUE_INT => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_i
-                        let first_val =
-                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
-                        let result = ctx.cond_call_value_int_typed(
-                            first_val, trace_ptr, &args, &arg_types, slot,
-                        );
-                        let concrete_result = if first_val == 0 {
-                            call_int_function(concrete_ptr, &concrete_args)
+                        let (first_box, first_val) = self.read_int_reg(first_reg as usize);
+                        if first_box.is_constant() && first_val != 0 {
+                            if let Some(dst) = dst {
+                                self.set_int_reg(dst as usize, Some(first_box), Some(first_val));
+                            }
                         } else {
-                            first_val
-                        };
-                        if let Some(dst) = dst {
-                            self.frames.current_mut().int_values[dst as usize] =
-                                Some(concrete_result);
+                            let traced = ctx.cond_call_value_int_typed(
+                                first_box, trace_ptr, &args, &arg_types, slot,
+                            );
+                            let concrete_result = if first_val == 0 {
+                                call_int_function(concrete_ptr, &concrete_args)
+                            } else {
+                                first_val
+                            };
+                            if let Some(dst) = dst {
+                                self.set_int_reg(dst as usize, Some(traced), Some(concrete_result));
+                            }
                         }
-                        let _ = result;
                     }
                     jitcode::insns::BC_COND_CALL_VALUE_REF => {
                         // RPython pyjitpl.py opimpl_conditional_call_value_ir_r:
                         // value is a ref — read from ref register bank.
-                        let first_val =
-                            self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
-                        let result = ctx.cond_call_value_ref_typed(
-                            first_val, trace_ptr, &args, &arg_types, slot,
-                        );
-                        let concrete_result = if first_val == 0 {
-                            // `blackhole.py:1113 bhimpl_residual_call_*_r` →
-                            // `cpu.bh_call_r`. Pyre routes through the
-                            // structurally-distinct `call_ref_function`
-                            // even though it currently aliases the int
-                            // ABI.
-                            call_ref_function(concrete_ptr, &concrete_args)
+                        let (first_box, first_val) = self.read_ref_reg(first_reg as usize);
+                        if first_box.is_constant() && first_val != 0 {
+                            if let Some(dst) = dst {
+                                self.set_ref_reg(dst as usize, Some(first_box), Some(first_val));
+                            }
                         } else {
-                            first_val
-                        };
-                        if let Some(dst) = dst {
-                            self.frames.current_mut().ref_values[dst as usize] =
-                                Some(concrete_result);
+                            let traced = ctx.cond_call_value_ref_typed(
+                                first_box, trace_ptr, &args, &arg_types, slot,
+                            );
+                            let concrete_result = if first_val == 0 {
+                                // `bhimpl_residual_call_*_r` → `cpu.bh_call_r`.
+                                // Pyre routes through the structurally-distinct
+                                // `call_ref_function` even though it currently
+                                // aliases the int ABI.
+                                call_ref_function(concrete_ptr, &concrete_args)
+                            } else {
+                                first_val
+                            };
+                            if let Some(dst) = dst {
+                                self.set_ref_reg(dst as usize, Some(traced), Some(concrete_result));
+                            }
                         }
-                        let _ = result;
                     }
                     jitcode::insns::BC_RECORD_KNOWN_RESULT_INT => {
                         // RPython pyjitpl.py opimpl_record_known_result_i.
@@ -9225,13 +9421,12 @@ where
                         // known-result var) as the fake result var for
                         // `getcalldescr`; here that maps to `Type::Int`
                         // because the bytecode is `_i_ir_v`.
-                        let result_val =
-                            self.frames.current_mut().int_values[first_reg as usize].unwrap_or(0);
+                        let (first_box, _) = self.read_int_reg(first_reg as usize);
                         // `opimpl_record_known_result_i_ir_v` records without executing.
                         ctx.profiler()
                             .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                         ctx.record_known_result_typed(
-                            result_val,
+                            first_box,
                             trace_ptr,
                             &args,
                             &arg_types,
@@ -9243,13 +9438,12 @@ where
                         // RPython pyjitpl.py opimpl_record_known_result_r —
                         // `_r_ir_v` opname, calldescr result type is
                         // `Type::Ref`.
-                        let result_val =
-                            self.frames.current_mut().ref_values[first_reg as usize].unwrap_or(0);
+                        let (first_box, _) = self.read_ref_reg(first_reg as usize);
                         // `opimpl_record_known_result_r_ir_v` records without executing.
                         ctx.profiler()
                             .count_ops(OpCode::RecordKnownResult, crate::counters::RECORDED_OPS);
                         ctx.record_known_result_typed(
-                            result_val,
+                            first_box,
                             trace_ptr,
                             &args,
                             &arg_types,
@@ -10041,13 +10235,15 @@ where
         // `descr_at` resolves the callee from the per-jitcode `exec.descrs`
         // pool (runtime-built jitcodes) or the shared global build-time pool
         // (LLBC-extracted jitcodes, whose per-jitcode pool is empty).
+        // `as_jitcode_owned`, so a recursive helper's back edge upgrades
+        // the same way `BC_INLINE_CALL` does. `as_jitcode` is owning-edges
+        // only and would abort a self-call.
         let sub_jitcode = self
             .frames
             .current_mut()
             .jitcode
             .descr_at(sub_idx)
-            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
-            .cloned();
+            .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned);
         let Some(sub_jitcode) = sub_jitcode else {
             // The callee is in neither pool; abort the trace instead of
             // crashing the process.

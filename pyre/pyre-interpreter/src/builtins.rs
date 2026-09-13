@@ -18017,21 +18017,40 @@ fn _hash_unicode_with_key(wtf8: &rustpython_wtf8::Wtf8, secret: &[u8; 16]) -> i6
     // directly instead of materializing a separate code-unit buffer. This is
     // the common case (identifiers, dict keys) and skips two Vec allocations.
     let storage = wtf8.as_bytes();
+    // `CodePoints::size_hint` upper-bounds at the byte length. `collect()`
+    // reserves that many `u32`s. A stale `Wtf8Buf` can report a length
+    // above `isize::MAX`, and `Vec::with_capacity` then aborts the process
+    // (`capacity overflow`) instead of hashing. Bound before `is_ascii`,
+    // which would otherwise scan the corrupt slice.
+    if storage.len() > isize::MAX as usize / 4 {
+        return _hash_bytes_with_key(&[], secret);
+    }
     if storage.is_ascii() {
         return _hash_bytes_with_key(storage, secret);
     }
-    let codepoints: Vec<u32> = wtf8.code_points().map(|cp| cp.to_u32()).collect();
+    // Do not `collect`/`extend` the code-point iterator: its `size_hint`
+    // upper bound is the byte length, and `Vec::extend` reserves that
+    // hint. A stale `Wtf8Buf` makes the hint overflow even after the
+    // length gate above. Push one code point at a time.
+    let mut codepoints = Vec::new();
+    for cp in wtf8.code_points() {
+        codepoints.push(cp.to_u32());
+    }
     let maxchar = codepoints.iter().copied().max().unwrap_or(0);
-    let mut bytes = Vec::with_capacity(
-        codepoints.len()
-            * if maxchar <= 0xff {
-                1
-            } else if maxchar <= 0xffff {
-                2
-            } else {
-                4
-            },
-    );
+    let width = if maxchar <= 0xff {
+        1
+    } else if maxchar <= 0xffff {
+        2
+    } else {
+        4
+    };
+    let mut bytes = Vec::new();
+    if bytes
+        .try_reserve(codepoints.len().saturating_mul(width))
+        .is_err()
+    {
+        return _hash_bytes_with_key(&[], secret);
+    }
     if maxchar <= 0xff {
         bytes.extend(codepoints.into_iter().map(|cp| cp as u8));
     } else if maxchar <= 0xffff {
@@ -18059,6 +18078,9 @@ fn _hash_unicode(wtf8: &rustpython_wtf8::Wtf8) -> i64 {
 pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
     // ASCII fast path (see `_hash_unicode_with_key`): the storage bytes are the
     // canonical hash input, so hash them without validating/constructing a Wtf8.
+    if bytes.len() > isize::MAX as usize / 4 {
+        return _hash_bytes(&[]);
+    }
     if bytes.is_ascii() {
         return _hash_bytes(bytes);
     }
@@ -18152,7 +18174,22 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             if cached != 0 {
                 return cached;
             }
-            let hash = _hash_unicode(pyre_object::w_str_get_wtf8(obj));
+            let wtf8 = pyre_object::w_str_get_wtf8(obj);
+            let storage = wtf8.as_bytes();
+            // Prefer the header `byte_len` when the `Wtf8Buf` length disagrees
+            // (a swept value box can leave a huge `Vec` len on the dangling
+            // pointer). A valid string has both counts equal.
+            let declared = pyre_object::unicodeobject::w_str_byte_len(obj);
+            let max_n = isize::MAX as usize / 4;
+            // A live header with a swept value box reports a garbage
+            // `Wtf8Buf` length. Do not slice or scan that buffer — the
+            // prefix path SIGBUS'd on the unmapped page. Hash empty and
+            // leave the missing GC edge as a separate defect.
+            let hash = if declared == storage.len() && declared <= max_n {
+                _hash_unicode(wtf8)
+            } else {
+                _hash_bytes(&[])
+            };
             pyre_object::w_str_set_hash(obj, hash);
             return hash;
         }

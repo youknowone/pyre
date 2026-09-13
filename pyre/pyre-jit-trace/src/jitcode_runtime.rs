@@ -3601,8 +3601,6 @@ mod tests {
             "cast_int_to_float/i>f",
             "cast_int_to_ptr/i>r",
             "check_neg_index/rid>i",
-            "conditional_call_value_ir_i/iiIRd>i",
-            "conditional_call_value_ir_r/riIRd>r",
             "gc_load_indexed_f/riiii>f",
             "gc_load_indexed_i/riiii>i",
             "getlistitem_gc_f/ridd>f",
@@ -3613,8 +3611,6 @@ mod tests {
             "newlist_clear/idddd>r",
             "newlist_hint/idddd>r",
             "record_exact_class/ri",
-            "record_known_result_i_ir_v/iiIRd",
-            "record_known_result_r_ir_v/riIRd",
             "record_quasiimmut_field/rdd",
             "rvmprof_code/ii",
         ];

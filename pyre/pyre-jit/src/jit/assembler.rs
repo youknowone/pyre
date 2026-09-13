@@ -504,9 +504,6 @@ impl Assembler {
         args: &[Operand],
         result: Option<&Register>,
     ) -> Option<u8> {
-        if is_adapter_only_helper_call_family(opname) {
-            return None;
-        }
         let key = if opname == super::flatten::OPNAME_LIVE {
             "live/".to_string()
         } else {
@@ -544,18 +541,23 @@ impl Assembler {
 static WELLKNOWN_BH_INSNS: LazyLock<indexmap::IndexMap<&'static str, u8>> =
     LazyLock::new(majit_metainterp::jitcode::wellknown_bh_insns);
 
-fn is_adapter_only_helper_call_family(opname: &str) -> bool {
-    matches!(
-        opname,
-        "conditional_call_ir_v"
-            | "conditional_call_value_ir_i"
-            | "conditional_call_value_ir_r"
-            | "record_known_result_i_ir_v"
-            | "record_known_result_r_ir_v"
-    )
-}
-
 fn insn_key(opname: &str, args: &[Operand], result: Option<&Register>) -> String {
+    // `jtransform.rewrite_call(..., force_ir=True)` always emits these
+    // keys. Helper-side SSA still spells the callee as a ConstInt
+    // `fn_ptr_idx`; the JitCodeBuilder projects that to the canonical
+    // `iiIRd` / `riIRd` byte layout.
+    match opname {
+        "conditional_call_ir_v" => return "conditional_call_ir_v/iiIRd".to_string(),
+        "conditional_call_value_ir_i" => {
+            return "conditional_call_value_ir_i/iiIRd>i".to_string();
+        }
+        "conditional_call_value_ir_r" => {
+            return "conditional_call_value_ir_r/riIRd>r".to_string();
+        }
+        "record_known_result_i_ir_v" => return "record_known_result_i_ir_v/iiIRd".to_string(),
+        "record_known_result_r_ir_v" => return "record_known_result_r_ir_v/riIRd".to_string(),
+        _ => {}
+    }
     if opname == "jit_merge_point" {
         let jdindex_argcode = match args {
             [Operand::ConstInt(value), ..] if (-128..=127).contains(value) => 'c',
@@ -2978,11 +2980,13 @@ mod tests {
 
     #[test]
     fn assemble_conditional_call_value_ir_r_keeps_ref_register_bank() {
+        let mut builder = JitCodeBuilder::default();
+        let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
         let mut ssarepr = SSARepr::new("cond_call_value_ir_r");
         ssarepr.insns.push(Insn::op_with_result(
             "conditional_call_value_ir_r",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(i64::from(fn_idx)),
                 Operand::Register(Register::new(Kind::Ref, 1)),
                 Operand::Register(Register::new(Kind::Int, 0)),
                 Operand::Register(Register::new(Kind::Ref, 2)),
@@ -2992,7 +2996,7 @@ mod tests {
 
         let jitcode = assemble(
             &mut ssarepr,
-            JitCodeBuilder::default(),
+            builder,
             Some(NumRegs {
                 int: 1,
                 ref_: 5,
@@ -3006,11 +3010,13 @@ mod tests {
 
     #[test]
     fn assemble_record_known_result_r_ir_v_keeps_ref_register_bank() {
+        let mut builder = JitCodeBuilder::default();
+        let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
         let mut ssarepr = SSARepr::new("record_known_result_r_ir_v");
         ssarepr.insns.push(Insn::op(
             "record_known_result_r_ir_v",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(i64::from(fn_idx)),
                 Operand::Register(Register::new(Kind::Ref, 2)),
                 Operand::Register(Register::new(Kind::Int, 0)),
                 Operand::Register(Register::new(Kind::Ref, 1)),
@@ -3019,7 +3025,7 @@ mod tests {
 
         let jitcode = assemble(
             &mut ssarepr,
-            JitCodeBuilder::default(),
+            builder,
             Some(NumRegs {
                 int: 1,
                 ref_: 3,
@@ -3032,14 +3038,16 @@ mod tests {
     }
 
     #[test]
-    fn assemble_canonical_helper_call_family_does_not_publish_false_insn_keys() {
+    fn assemble_canonical_helper_call_family_publishes_iiird_keys() {
         let mut assembler = Assembler::new();
+        let mut builder = JitCodeBuilder::default();
+        let fn_idx = builder.add_fn_ptr(0x7777usize as *const ());
 
         let mut ssarepr = SSARepr::new("canonical_call_family");
         ssarepr.insns.push(Insn::op(
             "conditional_call_ir_v",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(i64::from(fn_idx)),
                 Operand::Register(Register::new(Kind::Int, 0)),
                 Operand::Register(Register::new(Kind::Int, 1)),
                 Operand::Register(Register::new(Kind::Ref, 0)),
@@ -3048,7 +3056,7 @@ mod tests {
         ssarepr.insns.push(Insn::op_with_result(
             "conditional_call_value_ir_r",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(i64::from(fn_idx)),
                 Operand::Register(Register::new(Kind::Ref, 1)),
                 Operand::Register(Register::new(Kind::Int, 1)),
                 Operand::Register(Register::new(Kind::Ref, 0)),
@@ -3058,7 +3066,7 @@ mod tests {
         ssarepr.insns.push(Insn::op(
             "record_known_result_r_ir_v",
             vec![
-                Operand::ConstInt(7),
+                Operand::ConstInt(i64::from(fn_idx)),
                 Operand::Register(Register::new(Kind::Ref, 2)),
                 Operand::Register(Register::new(Kind::Int, 1)),
                 Operand::Register(Register::new(Kind::Ref, 0)),
@@ -3066,7 +3074,7 @@ mod tests {
         ));
         assembler.assemble(
             &mut ssarepr,
-            JitCodeBuilder::default(),
+            builder,
             Some(NumRegs {
                 int: 2,
                 ref_: 3,
@@ -3076,19 +3084,16 @@ mod tests {
 
         let insns = assembler.insns_snapshot();
         assert_eq!(
-            insns.get("conditional_call_ir_v/iiIRd"),
-            None,
-            "helper-side conditional_call_ir_v payload is not canonical iiIRd",
+            insns.get("conditional_call_ir_v/iiIRd").copied(),
+            Some(majit_translate::insns::BC_CONDITIONAL_CALL_IR_V),
         );
         assert_eq!(
-            insns.get("conditional_call_value_ir_r/riIRd>r"),
-            None,
-            "helper-side conditional_call_value_ir_r payload is not canonical riIRd>r",
+            insns.get("conditional_call_value_ir_r/riIRd>r").copied(),
+            Some(majit_translate::insns::BC_CONDITIONAL_CALL_VALUE_IR_R),
         );
         assert_eq!(
-            insns.get("record_known_result_r_ir_v/riIRd"),
-            None,
-            "helper-side record_known_result_r_ir_v payload is not canonical riIRd",
+            insns.get("record_known_result_r_ir_v/riIRd").copied(),
+            Some(majit_translate::insns::BC_RECORD_KNOWN_RESULT_R_IR_V),
         );
     }
 
