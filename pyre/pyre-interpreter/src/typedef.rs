@@ -6938,14 +6938,20 @@ fn init_str_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "startswith",
-            make_builtin_function("startswith", crate::type_methods::str_method_startswith),
+            make_builtin_function(
+                "startswith",
+                crate::type_methods::__majit_wrap_str_descr_startswith,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "endswith",
-            make_builtin_function("endswith", crate::type_methods::str_method_endswith),
+            make_builtin_function(
+                "endswith",
+                crate::type_methods::__majit_wrap_str_descr_endswith,
+            ),
         )
     };
     unsafe {

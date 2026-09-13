@@ -1084,6 +1084,20 @@ pub unsafe fn w_str_byte_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_UnicodeObject)).byte_len }
 }
 
+/// `s.chars` (`rstr.py` STR `Array(Char)`).  The WTF-8 buffer is the
+/// same byte array `W_UnicodeObject._utf8` holds.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` whose `value` is live.
+#[inline]
+pub unsafe fn w_str_chars(obj: PyObjectRef) -> *const u8 {
+    unsafe {
+        (*(*(obj as *const W_UnicodeObject)).value)
+            .as_bytes()
+            .as_ptr()
+    }
+}
+
 /// `unicodeobject.py W_UnicodeObject.is_ascii` — `self._length ==
 /// len(self._utf8)`.  One byte per code point means a code point index is
 /// already a byte offset.
@@ -1295,6 +1309,82 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
     unsafe { (w_str_len(s) != 0) as i64 }
 }
 
+/// `rstring.py _normalize_start_end`.
+#[inline]
+fn rstring_normalize_start_end(length: i64, mut start: i64, mut end: i64) -> (i64, i64) {
+    if start < 0 {
+        start += length;
+        if start < 0 {
+            start = 0;
+        }
+    }
+    if end < 0 {
+        end += length;
+        if end < 0 {
+            end = 0;
+        }
+    } else if end > length {
+        end = length;
+    }
+    (start, end)
+}
+
+/// `rstring.py startswith` / `rstr.py LLHelpers.ll_startswith`.
+///
+/// Elidable byte walk over `s.chars`.  A later look-inside of this
+/// loop is what unrolls a constant prefix the way
+/// `rtype_method_startswith` does; today the generated wrapper
+/// residualizes [`jit_str_startswith`] so the descent does not die
+/// on this body as an un-lowered helper.
+///
+/// # Safety
+/// Both arguments must be live `W_UnicodeObject`s.
+#[majit_macros::elidable]
+pub unsafe fn startswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -> bool {
+    let length = unsafe { w_str_byte_len(s1) } as i64;
+    let (start, end) = rstring_normalize_start_end(length, start, end);
+    let prefix_len = unsafe { w_str_byte_len(s2) } as i64;
+    let stop = start + prefix_len;
+    if stop > end {
+        return false;
+    }
+    let chars1 = unsafe { w_str_chars(s1) };
+    let chars2 = unsafe { w_str_chars(s2) };
+    let mut j = 0i64;
+    while j < prefix_len {
+        if unsafe { *chars1.add((start + j) as usize) != *chars2.add(j as usize) } {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// `rstring.py endswith` / `rstr.py LLHelpers.ll_endswith`.
+///
+/// # Safety
+/// Both arguments must be live `W_UnicodeObject`s.
+#[majit_macros::elidable]
+pub unsafe fn endswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -> bool {
+    let length = unsafe { w_str_byte_len(s1) } as i64;
+    let (start, end) = rstring_normalize_start_end(length, start, end);
+    let suffix_len = unsafe { w_str_byte_len(s2) } as i64;
+    let begin = end - suffix_len;
+    if begin < start {
+        return false;
+    }
+    let chars1 = unsafe { w_str_chars(s1) };
+    let chars2 = unsafe { w_str_chars(s2) };
+    let mut j = 0i64;
+    while j < suffix_len {
+        if unsafe { *chars1.add((begin + j) as usize) != *chars2.add(j as usize) } {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
 /// `s.startswith(prefix)` / `s.endswith(suffix)` on two exact `str`s with
 /// default bounds.  `rstring.py startswith` / `endswith` are `@jit.elidable`
 /// byte walks; WTF-8 is self-synchronizing, so a byte prefix/suffix match is
@@ -1302,27 +1392,25 @@ pub extern "C" fn jit_str_is_true(s: i64) -> i64 {
 /// before this call, so a tuple needle or a non-str stays on the residual.
 #[majit_macros::elidable]
 pub extern "C" fn jit_str_startswith(s: i64, prefix: i64) -> i64 {
-    let s = s as PyObjectRef;
-    let prefix = prefix as PyObjectRef;
     unsafe {
-        i64::from(
-            w_str_get_wtf8(s)
-                .as_bytes()
-                .starts_with(w_str_get_wtf8(prefix).as_bytes()),
-        )
+        i64::from(startswith(
+            s as PyObjectRef,
+            prefix as PyObjectRef,
+            0,
+            i64::MAX,
+        ))
     }
 }
 
 #[majit_macros::elidable]
 pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
-    let s = s as PyObjectRef;
-    let suffix = suffix as PyObjectRef;
     unsafe {
-        i64::from(
-            w_str_get_wtf8(s)
-                .as_bytes()
-                .ends_with(w_str_get_wtf8(suffix).as_bytes()),
-        )
+        i64::from(endswith(
+            s as PyObjectRef,
+            suffix as PyObjectRef,
+            0,
+            i64::MAX,
+        ))
     }
 }
 
