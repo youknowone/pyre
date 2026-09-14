@@ -35,10 +35,12 @@ pub mod heaptracker;
 pub mod insns;
 // `l[start:]` for the rich-`OpKind` spine — mints `ll_listslice_startonly`.
 pub mod getslice;
+// `core::cmp::{min,max}` for the rich-`OpKind` spine — mints `ll_min` / `ll_max`.
 pub mod iter_lower;
 pub mod jitcode;
 pub mod jtransform;
 pub mod longlong;
+pub mod minmax;
 // Opname-dispatch transducer ("Spine B"): lowers rtyper low-level helper
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s

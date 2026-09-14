@@ -10795,6 +10795,16 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_cmp_minmax(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_word_rotate(
                     mir_bb, &reg.kind, &segments, &args, dest_local, target,
                 )? {
@@ -16385,6 +16395,60 @@ impl<'a> Lowering<'a> {
     /// (`binaryop.py:191` UnionError), so annotating a `usize` sum as
     /// `Int` would poison the merge where it meets the unsigned field
     /// read it came from.
+    /// Normalize Opaque `core::cmp::{min,max}` (free function or
+    /// `impls::<Impl>` method) to the `FunctionPath` the adapter already
+    /// turns into `simple_call(min)` / `simple_call(max)`
+    /// (`rtype_builtin_min`).  Left as a `Method`, the call never meets
+    /// that arm and the rich-graph spine residualizes it.
+    fn try_lower_cmp_minmax(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let [first, family, ..] = segments else {
+            return Ok(false);
+        };
+        if first != "core" || family != "cmp" {
+            return Ok(false);
+        }
+        let Some(leaf) = segments.last() else {
+            return Ok(false);
+        };
+        if !matches!(leaf.as_str(), "min" | "max") {
+            return Ok(false);
+        }
+        let result_ty = tyref_to_value_type(dest_ty, self.llbc);
+        if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "cmp".into(), leaf.clone()],
+                },
+                args: crate::model::call_args(args.iter().cloned()),
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     fn try_lower_wrapping_binop(
         &mut self,
         mir_bb: usize,

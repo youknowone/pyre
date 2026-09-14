@@ -4889,6 +4889,29 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_operation(&helper_call, graph_name, graph);
         }
+        // `core::cmp::{min,max}` — the front's residual of an Opaque
+        // core call.  `rtype_builtin_min` (`rbuiltin.py`) turns the
+        // lifted `simple_call(min, …)` into `ll_min`; a graph on this
+        // spine never met the rtyper, so mint that helper here
+        // (`codewriter::minmax`).  Without a comparable value bank the
+        // marker stays a residual.
+        if let Some(is_max) = crate::codewriter::minmax::is_cmp_minmax(op)
+            && let Some(value_ty) = crate::codewriter::minmax::minmax_value_ty(result_ty)
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::minmax::minmax_path(cc, is_max, &value_ty);
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
         // RPython `jtransform.py rewrite_op_jit_marker`:
         // marker calls never reach `guess_call_kind` — they dispatch straight
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
