@@ -1148,6 +1148,22 @@ pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
     }
 }
 
+#[inline(never)]
+pub extern "C" fn jit_format_simple_w(value: i64) -> i64 {
+    match crate::type_methods::format_simple_w(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_format_w(value: i64, spec: i64) -> i64 {
+    match crate::type_methods::format_w(value as PyObjectRef, spec as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
