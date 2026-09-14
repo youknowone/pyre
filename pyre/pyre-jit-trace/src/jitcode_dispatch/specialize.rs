@@ -16610,6 +16610,57 @@ pub(crate) fn try_walker_specialize_convert_value<Sym: WalkSym>(
     walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)
 }
 
+/// `_parse_spec("d", ">")` (`newformat.py`) then `_type == "d"` (default
+/// included) with no thousands separator, precision, or `z`.
+///
+/// Output-shape matching alone is not enough: `format(1, "x") == "1"`
+/// and `format(1, "b") == "0b1"` look like an unpadded / left-padded
+/// `str(1)`, so a later `10` in the same compiled loop would print
+/// decimal instead of `"a"` / `"0b1010"`.
+fn spec_is_decimal_int_format(spec: &str) -> bool {
+    let chars: Vec<char> = spec.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return true;
+    }
+    let mut i = 0;
+    if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
+        i = 2;
+    } else if matches!(chars[0], '<' | '>' | '=' | '^') {
+        i = 1;
+    }
+    if i < n && matches!(chars[i], '+' | '-' | ' ') {
+        i += 1;
+    }
+    if i < n && chars[i] == 'z' {
+        return false;
+    }
+    if i < n && chars[i] == '#' {
+        i += 1;
+    }
+    if i < n && chars[i] == '0' {
+        i += 1;
+    }
+    while i < n && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < n && matches!(chars[i], ',' | '_') {
+        return false;
+    }
+    if i < n && chars[i] == '.' {
+        return false;
+    }
+    let ty = if i < n {
+        if i + 1 < n {
+            return false;
+        }
+        chars[i]
+    } else {
+        'd'
+    };
+    ty == 'd'
+}
+
 /// FORMAT_WITH_SPEC on an exact `int` plus a constant decimal spec.
 ///
 /// Empty spec is [`try_walker_specialize_format_simple`].  A non-empty
@@ -16650,6 +16701,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
         // simple arm may still decline (bool / subclass), and a guard
         // emitted here would then sit in front of the generic residual.
         return try_walker_specialize_format_simple(ctx, op, &r_args[..1], dst);
+    }
+    if !spec_is_decimal_int_format(spec_text) {
+        return Ok(None);
     }
 
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);

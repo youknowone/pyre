@@ -69,4 +69,19 @@ assert f"{42:d}" == "42"
 assert f"{True}" == "True"
 assert f"{True:05d}" == "00001"
 
+# `format(1, "x") == "1"` must not select ll_int2dec.  A compiled loop
+# that then sees 10 has to print hex, not decimal.
+def hex_loop(n):
+    acc = ""
+    i = 1
+    while i <= n:
+        acc = format(i, "x")
+        i = i + 1
+    return acc
+
+
+assert format(1, "x") == "1"
+assert hex_loop(10) == "a"
+assert hex_loop(16) == "10"
+
 print("OK")
