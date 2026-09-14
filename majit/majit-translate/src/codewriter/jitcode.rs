@@ -814,11 +814,16 @@ impl JitCode {
     /// the resolver falls back to the `pc_map` translation of the stored
     /// Python pc, which lands on the opcode's own start marker.
     pub fn can_decode_live_vars(&self, pc: usize, op_live: u8) -> bool {
+        // Match both instruction-boundary checks in get_live_vars_info.
+        // An argument byte equal to op_live is not a liveness instruction.
+        if !self.is_valid_startpoint(pc) || pc >= self.code.len() {
+            return false;
+        }
         if self.code.get(pc) == Some(&op_live) {
             return true;
         }
         match pc.checked_sub(crate::liveness::OFFSET_SIZE + 1) {
-            Some(back) => self.code.get(back) == Some(&op_live),
+            Some(back) => self.is_valid_startpoint(back) && self.code.get(back) == Some(&op_live),
             None => false,
         }
     }
@@ -2537,6 +2542,29 @@ impl BhDescr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn liveness_decode_rejects_operand_bytes_that_match_live_opcode() {
+        let live = 42;
+        let width = crate::liveness::OFFSET_SIZE + 1;
+        let mut code = vec![0; 3 * width];
+        code[0] = live;
+        // An operand byte can equal live, but it is not an instruction.
+        code[width + 1] = live;
+        let jc = JitCode::new("liveness_instruction_boundaries");
+        jc.set_body(JitCodeBody {
+            code,
+            startpoints: Some([0, width, 2 * width + 1].into_iter().collect()),
+            ..JitCodeBody::default()
+        });
+        for pc in [0, width] {
+            assert!(jc.can_decode_live_vars(pc, live));
+            assert_eq!(jc.get_live_vars_info(pc, live), 0);
+        }
+        assert!(!jc.can_decode_live_vars(width + 1, live));
+        // Even a real instruction must not backtrack into an operand byte.
+        assert!(!jc.can_decode_live_vars(2 * width + 1, live));
+    }
 
     fn test_bh_field(name: &str) -> BhFieldSpec {
         BhFieldSpec {
