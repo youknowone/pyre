@@ -9676,6 +9676,7 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
 /// isinstance.  Walking `binary_value_from_tag` for `/` records the
 /// whole `truediv_impl` dispatcher (`bigint_truediv`, dunder lookup)
 /// and hung `listcomp_float_element_regression`.
+#[allow(dead_code)] // intended `_truediv` walk; gated off until snapshot is cheap
 const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_truediv",
     commit_label: "int_truediv_commit",
