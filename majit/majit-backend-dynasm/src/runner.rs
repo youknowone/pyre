@@ -3315,6 +3315,23 @@ impl Backend for DynasmBackend {
         }
     }
 
+    fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
+        match frame {
+            DeadFrame::JitFrame(jf) => jf.set_savedata_ref(data),
+            DeadFrame::LibcJitFrame(jf) => jf.set_savedata_ref(data),
+            DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
+        }
+    }
+
+    fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
+        let r = match frame {
+            DeadFrame::JitFrame(jf) => jf.get_savedata_ref(),
+            DeadFrame::LibcJitFrame(jf) => jf.get_savedata_ref(),
+            DeadFrame::Boxed(_) => panic!("dynasm deadframe is a jitframe"),
+        };
+        if r.is_null() { None } else { Some(r) }
+    }
+
     fn clear_stored_exception(&self) {
         crate::jit_exc_clear();
     }

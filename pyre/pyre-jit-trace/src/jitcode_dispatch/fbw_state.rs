@@ -2639,8 +2639,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
     let (outer_resume, stack_overrides, blackhole_required) = {
         let session = ctx.session.borrow();
         let outermost = session
-            .framestack
-            .first()
+            .first_inline()
             .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
         let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parents.first()) {
             Some(frame) => (
@@ -2671,8 +2670,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // path then drops it.  Arm the conversion on the same signal the
         // refusal reads, so the item is carried forward instead of lost.
         let blackhole_required = session
-            .framestack
-            .last()
+            .last_inline()
             .is_some_and(|frame| fbw_executed_effect_count() != frame.entry_executed_effects)
             || (fbw_foriter_inflight_active() && fbw_foriter_any_body_effect_signal());
         (outer_resume, stack_overrides, blackhole_required)

@@ -2267,12 +2267,7 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // the intermediate callee's banks here) via the sym-less
     // `collect_callee_active_boxes`.  The stack is empty for a top-level
     // caller, falling through to the `fbw_mode.snapshot_sym` path below.
-    let caller_code = ctx
-        .session
-        .borrow()
-        .framestack
-        .last()
-        .map(|frame| frame.w_code);
+    let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
     if let Some(caller_code) = caller_code {
         return compute_nested_inline_caller_frame(
             ctx,
@@ -2771,12 +2766,7 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_jit_pc: usize,
 ) -> Result<InlineParentFrame, InlineCallerFrameDecline> {
-    let caller_code = ctx
-        .session
-        .borrow()
-        .framestack
-        .last()
-        .map(|frame| frame.w_code);
+    let caller_code = ctx.session.borrow().last_inline().map(|frame| frame.w_code);
     let (jitcode_index, pjc) = if let Some(caller_code) = caller_code {
         let jitcode_index = crate::state::ensure_jitcode_index(caller_code as *const ())
             .ok_or_else(|| unavail("Unavail::Helper/NoJitcodeIndex"))?

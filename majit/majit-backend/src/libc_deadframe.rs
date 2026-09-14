@@ -179,6 +179,18 @@ impl LibcJitFrameDeadFrame {
     pub fn exc_value(&self) -> GcRef {
         GcRef(unsafe { (*self.tip).jf_guard_exc })
     }
+
+    /// `cpu.get_savedata_ref(deadframe)` (llmodel.py) — read
+    /// `jf_savedata` off the frame.
+    pub fn get_savedata_ref(&self) -> GcRef {
+        GcRef(unsafe { (*self.tip).jf_savedata })
+    }
+
+    /// `cpu.set_savedata_ref(deadframe, data)` (llmodel.py) — write
+    /// `jf_savedata` on the frame.
+    pub fn set_savedata_ref(&mut self, data: GcRef) {
+        unsafe { (*self.tip).jf_savedata = data.0 };
+    }
 }
 
 /// Free a libc-allocated jitframe and every frame it forwards to.

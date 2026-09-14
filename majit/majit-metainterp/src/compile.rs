@@ -3562,6 +3562,17 @@ pub fn make_resume_guard_descr_instance_next_foriter(
 }
 
 /// The `ResumeGuardDescr` inside a descr that either is one or is one of its
+/// tag-only newtypes (`ResumeGuardForcedDescr` / `ResumeGuardExcDescr`).
+///
+/// Forced/exc `as_any` returns the wrapper so `is_guard_forced` dispatch
+/// can downcast the subtype. Readers that need the base resume payload
+/// (`rd_numb`, `rd_loop_token_clt`) go through this unwrap — including
+/// Cranelift `cranelift_resumedata_deopt`.
+pub fn resume_guard_descr(descr: &DescrRef) -> Option<&ResumeGuardDescr> {
+    resume_guard_inner(descr)
+}
+
+/// The `ResumeGuardDescr` inside a descr that either is one or is one of its
 /// tag-only newtypes.
 fn resume_guard_inner(descr: &DescrRef) -> Option<&ResumeGuardDescr> {
     let any = descr.as_any()?;
@@ -3898,14 +3909,49 @@ impl AllVirtuals {
         };
         let type_id = ALL_VIRTUALS_GC_TYPE_ID.load(Ordering::Relaxed);
         if type_id == ALL_VIRTUALS_GC_TYPE_ID_UNSET {
+            // Tests that never publish a leaf type keep the object via
+            // this leak; production registers the type and owns it
+            // through the deadframe `jf_savedata` GCREF.
             return majit_ir::GcRef(Box::into_raw(Box::new(value)) as usize);
         }
         let obj = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<AllVirtuals>());
         assert!(!obj.is_null(), "AllVirtuals old-gen allocation failed");
         unsafe { std::ptr::write(obj.0 as *mut AllVirtuals, value) };
-        let root = Box::into_raw(Box::new(obj));
-        unsafe { majit_gc::gc_add_root(root) };
         obj
+    }
+
+    /// Trace the off-heap `ptrs` slice as GCREF slots.
+    ///
+    /// # Safety
+    /// `obj_addr` is an `AllVirtuals` payload the collector is tracing.
+    pub unsafe fn custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+        let obj = obj_addr as *mut AllVirtuals;
+        unsafe {
+            let n = (*obj).n_ptrs;
+            let ptrs = (*obj).ptrs;
+            for i in 0..n {
+                f(ptrs.add(i) as *mut majit_ir::GcRef);
+            }
+        }
+    }
+
+    /// Drop the off-heap `ptrs` / `ints` slices.
+    ///
+    /// # Safety
+    /// `obj_addr` is an `AllVirtuals` payload about to be reclaimed,
+    /// allocated by [`AllVirtuals::hide`].
+    pub unsafe fn destructor(obj_addr: usize) {
+        let obj = obj_addr as *mut AllVirtuals;
+        unsafe {
+            let _ptrs = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                (*obj).ptrs,
+                (*obj).n_ptrs,
+            ));
+            let _ints = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                (*obj).ints,
+                (*obj).n_ints,
+            ));
+        }
     }
 
     /// compile.py `AllVirtuals.show(gcref)`.
@@ -6217,6 +6263,22 @@ mod fail_descr_tests {
             Some((vec![1, 2], vec![3]))
         );
         assert_eq!(AllVirtuals::show(majit_ir::GcRef(0)), None);
+    }
+
+    #[test]
+    fn resume_guard_descr_unwraps_forced_and_exc_wrappers() {
+        let forced = make_resume_guard_forced_descr_typed(vec![Type::Int]);
+        let forced_inner =
+            resume_guard_descr(&forced).expect("Forced as_any is the wrapper, not the base");
+        assert_eq!(forced_inner.fail_arg_types(), &[Type::Int]);
+
+        let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref]);
+        let exc_inner = resume_guard_descr(&exc).expect("Exc as_any is the wrapper, not the base");
+        assert_eq!(exc_inner.fail_arg_types(), &[Type::Ref]);
+
+        let plain = make_resume_guard_descr_typed(vec![Type::Float]);
+        let plain_inner = resume_guard_descr(&plain).expect("plain ResumeGuardDescr unwraps");
+        assert_eq!(plain_inner.fail_arg_types(), &[Type::Float]);
     }
 
     #[test]

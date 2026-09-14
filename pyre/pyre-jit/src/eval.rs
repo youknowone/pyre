@@ -4945,10 +4945,15 @@ fn build_gc() -> Box<MiniMarkGC> {
     // compile.py AllVirtuals — llopaque leaf hidden in jf_savedata.
     // Absolute tail so no hardcoded / `#[pyre_class(type_id = N)]` id
     // moves; published through `set_all_virtuals_gc_type_id`.
-    let all_virtuals_tid =
-        gc.register_type(majit_gc::trace::TypeInfo::simple(std::mem::size_of::<
-            majit_metainterp::AllVirtuals,
-        >()));
+    // Custom trace walks the off-heap GCREF slice; the destructor
+    // frees that slice. The deadframe `jf_savedata` word is the owner.
+    let all_virtuals_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(
+            std::mem::size_of::<majit_metainterp::AllVirtuals>(),
+            majit_metainterp::AllVirtuals::custom_trace,
+        )
+        .with_destructor_fn(majit_metainterp::AllVirtuals::destructor),
+    );
     majit_metainterp::set_all_virtuals_gc_type_id(all_virtuals_tid);
     gc.freeze_types();
     pyre_interpreter::typedef::init_subclass_ranges();

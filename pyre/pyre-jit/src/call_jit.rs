@@ -7782,15 +7782,14 @@ pub fn cranelift_resumedata_deopt(
     let backend = driver.meta_interp().backend();
     let descr = backend.fail_descr_arc_from_addr(descr_addr);
 
-    // 2. Downcast to ResumeGuardDescr.  Synthetic FINISH /
+    // 2. Unwrap to ResumeGuardDescr. Forced/exc wrappers return themselves
+    //    from `as_any` so subtype downcasts work; the resume payload lives
+    //    on the inner base (`resume_guard_descr`). Synthetic FINISH /
     //    ExitFrameWithException / external-JUMP descrs have no `rd_*`
     //    payload upstream (compile.py:624-662) — they short-circuit
     //    here.  Callers fall back to the recovery_layout walker for
     //    these until the synthetic construction path is restructured.
-    let Some(any) = descr.as_any() else {
-        return false;
-    };
-    let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
+    let Some(rgd) = majit_metainterp::resume_guard_descr(&descr) else {
         return false;
     };
 

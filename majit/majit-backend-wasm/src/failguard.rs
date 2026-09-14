@@ -85,6 +85,9 @@ pub struct WasmFrameData {
     /// exited through a GuardNoException / GuardException (0 = none), surfaced
     /// via `grab_exc_value`.
     pub exc_value: i64,
+    /// `cpu.set_savedata_ref` / `get_savedata_ref` word — compile.py
+    /// `jf_savedata`. Rooted while non-zero, same as `exc_value`.
+    pub savedata: i64,
     /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
@@ -113,6 +116,7 @@ impl WasmFrameData {
             raw_values,
             fail_descr,
             exc_value,
+            savedata: 0,
             roots: Vec::new(),
         });
         let ref_count = data
@@ -138,6 +142,25 @@ impl WasmFrameData {
             data.roots = roots;
         }
         data
+    }
+
+    /// `cpu.set_savedata_ref(deadframe, data)` — write the `jf_savedata`
+    /// word and keep it rooted while non-zero.
+    pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
+        let was_nonzero = self.savedata != 0;
+        let now_nonzero = !data.is_null();
+        self.savedata = data.0 as i64;
+        if was_nonzero == now_nonzero {
+            return;
+        }
+        let slot = &mut self.savedata as *mut i64 as usize;
+        if now_nonzero {
+            unsafe { crate::wasm_gc_add_roots(&[slot]) };
+            self.roots.push(slot);
+        } else {
+            crate::wasm_gc_remove_roots(std::iter::once(slot));
+            self.roots.retain(|&s| s != slot);
+        }
     }
 }
 
@@ -381,6 +404,24 @@ mod tests {
         let before = roots.load(Ordering::SeqCst);
         let frame = WasmFrameData::boxed(vec![1, 2], fail_descr(vec![Type::Int, Type::Float]), 0);
         assert_eq!(roots.load(Ordering::SeqCst), before);
+        drop(frame);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn set_savedata_roots_until_cleared_or_drop() {
+        let roots = install_root_counting_gc();
+        let before = roots.load(Ordering::SeqCst);
+        let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+        frame.set_savedata(GcRef(0x40));
+        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        frame.set_savedata(GcRef(0x41));
+        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        frame.set_savedata(GcRef(0));
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+        frame.set_savedata(GcRef(0x42));
+        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
     }

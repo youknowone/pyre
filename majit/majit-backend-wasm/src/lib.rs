@@ -6164,6 +6164,23 @@ impl majit_backend::Backend for WasmBackend {
         GcRef(data.exc_value as usize)
     }
 
+    fn set_savedata_ref(&self, frame: &mut DeadFrame, data: GcRef) {
+        let wasm = frame
+            .boxed_data_mut()
+            .and_then(|d| d.downcast_mut::<WasmFrameData>())
+            .expect("not WasmFrameData");
+        wasm.set_savedata(data);
+    }
+
+    fn get_savedata_ref(&self, frame: &DeadFrame) -> Option<GcRef> {
+        let data = frame
+            .boxed_data()
+            .and_then(|d| d.downcast_ref::<WasmFrameData>())
+            .expect("not WasmFrameData");
+        let r = GcRef(data.savedata as usize);
+        if r.is_null() { None } else { Some(r) }
+    }
+
     fn clear_stored_exception(&self) {
         crate::jit_exc_clear();
     }
