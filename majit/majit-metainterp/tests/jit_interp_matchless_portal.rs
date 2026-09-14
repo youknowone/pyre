@@ -91,3 +91,65 @@ fn a_matchless_portal_compiles_the_while_body() {
     );
     majit_metainterp::assert_no_degraded_dispatch_arms("CountState");
 }
+
+/// A post-merge local `match` is not an opcode dispatch. Selecting it as
+/// one would skip matchless lowering and compile a loop with no body.
+struct LocalMatchState {
+    acc: i64,
+    pos: i64,
+    n: i64,
+}
+
+#[majit_macros::jit_interp(
+    state = LocalMatchState,
+    env = Bytecode,
+    greens = [pc, program],
+    state_fields = { acc: int, pos: int, n: int },
+)]
+#[allow(unused_assignments, unused_variables)]
+fn matchless_with_local_match(program: &Bytecode, threshold: u32, n: i64) -> i64 {
+    let mut driver: JitDriver<LocalMatchState> = JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
+        REC.compiles.fetch_add(1, Ordering::Relaxed);
+        *REC.body.lock() = opcodes.to_vec();
+    });
+    let mut pc: usize = 0;
+    let mut state = LocalMatchState { acc: 0, pos: 0, n };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+    while state.pos < state.n {
+        can_enter_jit!(driver, 0usize, &mut state, program, || {});
+        jit_merge_point!(driver, program, pc; state);
+        match state.acc {
+            0 => state.acc = state.acc + 2i64,
+            _ => state.acc = state.acc + 1i64,
+        }
+        state.pos = state.pos + 1i64;
+    }
+    state.acc
+}
+
+#[test]
+fn a_matchless_portal_with_a_local_match_still_runs_the_body() {
+    REC.compiles.store(0, Ordering::Relaxed);
+    REC.body.lock().clear();
+    let cold = matchless_with_local_match(&PROGRAM, u32::MAX, N);
+    let warm = matchless_with_local_match(&PROGRAM, 3, N);
+    assert_eq!(
+        warm, cold,
+        "a post-merge local match was treated as opcode dispatch"
+    );
+    assert!(
+        REC.compiles.load(Ordering::Relaxed) > 0,
+        "the matchless portal with a local match never compiled a loop",
+    );
+    let body = REC.body.lock().clone();
+    assert!(
+        body.iter().any(|op| *op == OpCode::IntAdd),
+        "the compiled loop carries no increment: {body:#?}",
+    );
+}

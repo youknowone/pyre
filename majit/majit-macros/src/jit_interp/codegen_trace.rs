@@ -7,7 +7,9 @@ use syn::{Block, Expr, ExprMatch, ItemFn, Stmt};
 
 use super::JitInterpConfig;
 use super::classify::classify_arms;
-use super::jitcode_lower::{self, LowererConfig, ValueKind, is_jit_merge_point_macro};
+use super::jitcode_lower::{
+    self, LowererConfig, ValueKind, is_can_enter_jit_macro, is_jit_merge_point_macro,
+};
 
 pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;
@@ -29,7 +31,18 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     let match_expr = find_dispatch_match(&func.block);
     let classified = match match_expr {
         Some(match_expr) => classify_arms(&match_expr.arms),
-        None if portal_loop_body(&func.block).is_some() => Vec::new(),
+        None if portal_loop_body(&func.block).is_some() => {
+            if let Some(stmt) = first_unsupported_pre_merge_stmt(&func.block) {
+                return syn::Error::new_spanned(
+                    stmt,
+                    "matchless portal loop runs this statement before \
+                     jit_merge_point, but the compiled back-edge does not; \
+                     move it after the merge point or bind it with let",
+                )
+                .to_compile_error();
+            }
+            Vec::new()
+        }
         None => {
             return syn::Error::new_spanned(
                 func,
@@ -400,9 +413,14 @@ pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch>
                 collect_matches_in_stmt(stmt, &mut after_merge_point);
             }
         }
-        // A portal loop with no match after the merge point is matchless —
-        // do not fall back to a setup `match` elsewhere in the function.
-        return after_merge_point.into_iter().max_by_key(|m| m.arms.len());
+        // Only a match dominated by an opcode fetch is the dispatch.
+        // A matchless portal may contain an ordinary local `match`; treating
+        // that as dispatch skips `lower_matchless_portal_body` and emits an
+        // empty JitCode body.
+        return after_merge_point
+            .into_iter()
+            .filter(|m| match_is_opcode_dispatch(body, m))
+            .max_by_key(|m| m.arms.len());
     }
 
     // No portal loop this reads. Fall back to the old search so a shape
@@ -410,6 +428,95 @@ pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch>
     let mut all = Vec::new();
     collect_all_matches(block, &mut all);
     all.into_iter().max_by_key(|m| m.arms.len())
+}
+
+/// A match is the opcode dispatch only when an opcode-fetch binding
+/// (`let op = program[pc]` / `program.get_op(...)`) dominates it, or the
+/// scrutinee is itself `program[...]`.
+fn match_is_opcode_dispatch(loop_body: &syn::Block, candidate: &syn::ExprMatch) -> bool {
+    let mut names = Vec::new();
+    let mut seen_merge_point = false;
+    for stmt in &loop_body.stmts {
+        if is_jit_merge_point_macro(stmt) {
+            seen_merge_point = true;
+            continue;
+        }
+        if !seen_merge_point {
+            continue;
+        }
+        if let Some(name) = opcode_fetch_binding_name(stmt) {
+            names.push(name);
+        }
+        let mut matches = Vec::new();
+        collect_matches_in_stmt(stmt, &mut matches);
+        if matches.iter().any(|m| std::ptr::eq(*m, candidate)) {
+            return match_scrutinee_is_opcode_fetch(candidate, &names);
+        }
+    }
+    false
+}
+
+fn opcode_fetch_binding_name(stmt: &syn::Stmt) -> Option<String> {
+    let syn::Stmt::Local(local) = stmt else {
+        return None;
+    };
+    let init = local.init.as_ref()?;
+    let init_expr = match init.expr.as_ref() {
+        syn::Expr::Cast(c) => c.expr.as_ref(),
+        other => other,
+    };
+    let fetches_program = match init_expr {
+        syn::Expr::Index(idx) => expr_is_ident(&idx.expr, "program"),
+        syn::Expr::MethodCall(mc) => expr_is_ident(&mc.receiver, "program"),
+        _ => false,
+    };
+    if !fetches_program {
+        return None;
+    }
+    match &local.pat {
+        syn::Pat::Ident(id) => Some(id.ident.to_string()),
+        syn::Pat::Type(ty) => match ty.pat.as_ref() {
+            syn::Pat::Ident(id) => Some(id.ident.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn match_scrutinee_is_opcode_fetch(m: &syn::ExprMatch, names: &[String]) -> bool {
+    let expr = match m.expr.as_ref() {
+        syn::Expr::Cast(c) => c.expr.as_ref(),
+        other => other,
+    };
+    match expr {
+        syn::Expr::Path(p) => p
+            .path
+            .get_ident()
+            .is_some_and(|id| names.iter().any(|n| n == &id.to_string())),
+        syn::Expr::Index(idx) => expr_is_ident(&idx.expr, "program"),
+        _ => false,
+    }
+}
+
+fn expr_is_ident(expr: &syn::Expr, name: &str) -> bool {
+    matches!(expr, syn::Expr::Path(p) if p.path.is_ident(name))
+}
+
+/// Statements the matchless compiled body will not run: everything before
+/// `jit_merge_point` except `let` bindings and the interpreter-only
+/// `can_enter_jit!` tick (`rewrite_can_enter_jit`).
+fn first_unsupported_pre_merge_stmt(func_block: &syn::Block) -> Option<&syn::Stmt> {
+    let body = portal_loop_body(func_block)?;
+    for stmt in &body.stmts {
+        if is_jit_merge_point_macro(stmt) {
+            return None;
+        }
+        if matches!(stmt, syn::Stmt::Local(_)) || is_can_enter_jit_macro(stmt) {
+            continue;
+        }
+        return Some(stmt);
+    }
+    None
 }
 
 /// The portal loop: a `while`/`loop` statement of the function body whose own
@@ -675,6 +782,7 @@ mod find_dispatch_match_tests {
         let block = fn_block(
             "while pc < program.len() {
                 jit_merge_point!(driver, program, pc; state);
+                let opcode = program[pc];
                 match opcode {
                     0 => {},
                     1 => {},
@@ -692,6 +800,7 @@ mod find_dispatch_match_tests {
             "let label = match sel { 0 => \"a\", 1 => \"b\", 2 => \"c\", 3 => \"d\", _ => \"e\" };
             while pc < program.len() {
                 jit_merge_point!(driver, program, pc; state);
+                let opcode = program[pc];
                 match opcode {
                     0 => {},
                     _ => break,
@@ -700,5 +809,60 @@ mod find_dispatch_match_tests {
         );
         let found = find_dispatch_match(&block).expect("dispatch match");
         assert_eq!(found.arms.len(), 2);
+    }
+
+    #[test]
+    fn a_post_merge_local_match_is_not_the_dispatch() {
+        let block = fn_block(
+            "while pos < len {
+                jit_merge_point!(driver, program, pc; state);
+                match acc {
+                    0 => {},
+                    1 => {},
+                    _ => {},
+                }
+                pos = pos + 1;
+            }",
+        );
+        assert!(find_dispatch_match(&block).is_none());
+        assert!(portal_loop_body(&block).is_some());
+    }
+
+    #[test]
+    fn match_on_program_index_is_the_dispatch() {
+        let block = fn_block(
+            "while pc < program.len() {
+                jit_merge_point!(driver, program, pc; state);
+                match program[pc] {
+                    0 => {},
+                    _ => break,
+                }
+            }",
+        );
+        let found = find_dispatch_match(&block).expect("dispatch match");
+        assert_eq!(found.arms.len(), 2);
+    }
+
+    #[test]
+    fn can_enter_before_merge_is_an_allowed_matchless_prefix() {
+        let block = fn_block(
+            "while pos < len {
+                can_enter_jit!(driver, 0usize, &mut state, program, || {});
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_none());
+    }
+
+    #[test]
+    fn assignment_before_merge_is_an_unsupported_matchless_prefix() {
+        let block = fn_block(
+            "while pos < len {
+                pos = pos + 1;
+                jit_merge_point!(driver, program, pc; state);
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
     }
 }

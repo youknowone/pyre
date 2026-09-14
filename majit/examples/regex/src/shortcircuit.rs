@@ -120,7 +120,7 @@
 //! remark tells you to write, and this module is what the post's code does
 //! before you take that advice.
 //!
-//! # Why the totals differ by three
+//! # Why the totals differ by two
 //!
 //! 153 ops (RPython) against 151 (here). The operational bodies now agree:
 //! RPython's listing contains two zero-cost `debug_merge_point` operations
@@ -919,12 +919,12 @@ mod tests {
         getfield_gc_i: usize,
         setfield_gc: usize,
         int_eq: usize,
-        /// majit's branching body, recorded. Its three-op difference from
-        /// RPython is the two upstream debug merge points plus one guard.
+        /// majit's branching body, recorded. Its two-op difference from
+        /// RPython is the two upstream debug merge points.
         /// Pinned exactly rather than as a band around RPython's: a band wide
         /// enough to hold the real gap is wide enough to hold a *changed* gap, and
         /// this was measured letting a `Char` arm silently switch from
-        /// branching to masking (guards 26 -> 28) straight through.
+        /// branching to masking (guards 27 -> 29) straight through.
         branching_total: usize,
         branching_guards: usize,
         /// majit's masking body, recorded, for the same reason the branching
