@@ -1754,10 +1754,7 @@ fn clear_shutdown_modules(
     released: pyre_interpreter::importing::ReleasedSysModules,
     ec_ptr: *const PyExecutionContext,
 ) {
-    let pyre_interpreter::importing::ReleasedSysModules {
-        modules,
-        dropped_unlisted,
-    } = released;
+    let pyre_interpreter::importing::ReleasedSysModules { modules } = released;
     let _roots = pyre_object::gc_roots::push_roots();
     let roots_start = pyre_object::gc_roots::shadow_stack_len();
     let mut names = Vec::with_capacity(modules.len());
@@ -1774,17 +1771,15 @@ fn clear_shutdown_modules(
         names.push(name);
         let _ = pyre_object::gc_roots::pin_root(module);
     }
-    // `finalize_runtime` sweeps immediately before detaching the import cache,
-    // and every module that detach handed over is pinned just above — so a
-    // sweep here reaches something that one could not only when the detach
-    // dropped an entry this list does not carry: a non-module value, or one
-    // under a key that is not a string. The walk below ends on a sweep either
-    // way, so an import cache holding nothing but named modules — which is
-    // every run that does not assign to `sys.modules` itself — pays one
-    // whole-heap mark-and-sweep less at exit.
-    if dropped_unlisted {
-        collect_and_run_finalizers(ec_ptr);
-    }
+    // CPython v3.14.6 pylifecycle.c finalize_modules collects unconditionally
+    // after detaching sys.modules and before clearing surviving module dicts.
+    // A previous finalizer can release the next link in a chain even when
+    // detaching the cache itself made nothing unreachable. Collect while those
+    // finalizers can still read their globals (test_module's
+    // test_module_finalization_at_shutdown).
+    // PyPy ObjSpace.finish runs module shutdown hooks without this dict-clear
+    // phase; this collection preserves the existing CPython shutdown contract.
+    collect_and_run_finalizers(ec_ptr);
     for index in (0..names.len()).rev() {
         let module = pyre_object::gc_roots::shadow_stack_get(roots_start + index);
         let is_core_module = sys_module_slot.is_some_and(|slot| {

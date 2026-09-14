@@ -3321,10 +3321,6 @@ pub struct ReleasedSysModules {
     /// The real modules it found, newest last, each still referenced by the
     /// import cache's caller until it takes its own hold on them.
     pub modules: Vec<(Wtf8Buf, PyObjectRef)>,
-    /// Whether any detached entry is absent from `modules` and so lost its last
-    /// referrer here. An import cache holding nothing but named modules answers
-    /// `false`, which says the detach alone made nothing unreachable.
-    pub dropped_unlisted: bool,
 }
 
 /// `finalize_remove_modules`: snapshot real modules, then detach import-cache
@@ -3334,23 +3330,19 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
     if dict.is_null() {
         return ReleasedSysModules {
             modules: Vec::new(),
-            dropped_unlisted: false,
         };
     }
     let entries = unsafe { pyre_object::w_dict_items(dict) };
     let mut modules = Vec::new();
-    let mut dropped_unlisted = false;
     for (key, module) in entries {
         let name = if unsafe { pyre_object::is_str(key) } {
             Some(unsafe { pyre_object::w_str_get_wtf8(key) }.to_owned())
         } else {
             None
         };
-        let mut listed = false;
         if !module.is_null() && unsafe { pyre_object::is_module(module) } {
             if let Some(name) = &name {
                 modules.push((name.clone(), module));
-                listed = true;
             }
         }
         let keep_entry = name.as_deref().is_some_and(|name| {
@@ -3358,16 +3350,12 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
             bytes == b"sys" || bytes == b"builtins"
         });
         if !keep_entry {
-            dropped_unlisted |= !listed;
             unsafe {
                 pyre_object::w_dict_delitem(dict, key);
             }
         }
     }
-    ReleasedSysModules {
-        modules,
-        dropped_unlisted,
-    }
+    ReleasedSysModules { modules }
 }
 
 /// GC root walk over every bound module's wrapped name and dict storage.
