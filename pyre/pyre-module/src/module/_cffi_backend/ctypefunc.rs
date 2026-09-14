@@ -244,13 +244,7 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
                 Err(e) => break 'body Err(e),
             }
         }
-        // `clibffi.py c_ffi_call` carries `save_err=RFFI_ERR_ALL |
-        // RFFI_ALT_ERRNO`, which swaps the thread's alternate errno into the C
-        // runtime around the foreign call.  Pyre spells that swap as its own
-        // two calls rather than as a flag the callee reads.
-        super::cerrno::errno_before();
         unsafe { jit_ffi_call(cif, funcaddr, buffer) };
-        super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
@@ -307,9 +301,7 @@ fn do_call_fargs(
                 Err(e) => break 'body Err(e),
             }
         }
-        super::cerrno::errno_before();
         unsafe { jit_ffi_call(cif, funcaddr, buffer) };
-        super::cerrno::errno_after();
         let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
