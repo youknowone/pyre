@@ -489,8 +489,9 @@ macro_rules! py_class {
         $(,)?
     ) => {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
-            static CELL: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
-            *CELL.get_or_init(|| {
+            static CELL: ::pyre_object::gc_roots::RootedOnceRef =
+                ::pyre_object::gc_roots::RootedOnceRef::new();
+            CELL.get_or_init(|| {
                 let tp = $crate::typedef::make_builtin_type($name, |ns| {
                     // `make_builtin_function` (varargs, no arity check) is
                     // used here rather than `_with_arity` because methods
@@ -537,8 +538,8 @@ macro_rules! py_class {
                     )*)?
                 });
                 unsafe { ::pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-                tp as usize
-            }) as ::pyre_object::PyObjectRef
+                tp
+            })
         }
 
         // Publish this accessor's residual-call address so the JIT's
@@ -593,8 +594,9 @@ macro_rules! py_class_typed {
         $(,)?
     ) => {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
-            static CELL: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
-            *CELL.get_or_init(|| {
+            static CELL: ::pyre_object::gc_roots::RootedOnceRef =
+                ::pyre_object::gc_roots::RootedOnceRef::new();
+            CELL.get_or_init(|| {
                 let tp = $crate::typedef::make_builtin_type_with_layout(
                     $name,
                     |ns| {
@@ -636,8 +638,8 @@ macro_rules! py_class_typed {
                     unsafe { &*<$struct as $crate::PyreClassPyTypeOf>::PYTYPE },
                     tp,
                 );
-                tp as usize
-            }) as ::pyre_object::PyObjectRef
+                tp
+            })
         }
 
         // Publish this accessor's residual-call address so the JIT's
