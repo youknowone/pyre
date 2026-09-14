@@ -21,12 +21,14 @@ pub const MARK_RESOP: u8 = MARK_BASE + 2;
 pub const MARK_RESOP_DESCR: u8 = MARK_BASE + 3;
 pub const MARK_TRACE: u8 = MARK_BASE + 6;
 pub const MARK_TRACE_OPT: u8 = MARK_BASE + 7;
+pub const MARK_STITCH_BRIDGE: u8 = MARK_BASE + 9;
 pub const MARK_START_TRACE: u8 = MARK_BASE + 10;
 pub const MARK_INIT_MERGE_POINT: u8 = MARK_BASE + 12;
 pub const MARK_JITLOG_HEADER: u8 = MARK_BASE + 13;
 pub const MARK_MERGE_POINT: u8 = MARK_BASE + 14;
 pub const MARK_COMMON_PREFIX: u8 = MARK_BASE + 15;
 pub const MARK_ABORT_TRACE: u8 = MARK_BASE + 16;
+pub const MARK_REDIRECT_ASSEMBLER: u8 = MARK_BASE + 18;
 pub const MARK_TMP_CALLBACK: u8 = MARK_BASE + 19;
 
 /// `rjitlog.py` MP_* semantic types.
@@ -151,6 +153,31 @@ pub fn register_get_location(types: &[(u8, u8)], get_location: GetLocation) {
     let mut state = lock();
     state.location_types = types.to_vec();
     state.get_location = Some(get_location);
+}
+
+/// `rjitlog.py redirect_assembler`.
+pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
+    jitlog_try_init_using_env();
+    let mut state = lock();
+    if state.file.is_none() {
+        return;
+    }
+    let mut payload = encode_le_addr(old_id).to_vec();
+    payload.extend_from_slice(&encode_le_addr(new_id));
+    payload.extend_from_slice(&encode_le_addr(asm_adr));
+    write_marked(&mut state, MARK_REDIRECT_ASSEMBLER, &payload);
+}
+
+/// `rjitlog.py JitLogger.log_patch_guard`.
+pub fn log_patch_guard(descr_number: u64, addr: u64) {
+    jitlog_try_init_using_env();
+    let mut state = lock();
+    if state.file.is_none() {
+        return;
+    }
+    let mut payload = encode_le_addr(descr_number).to_vec();
+    payload.extend_from_slice(&encode_le_addr(addr));
+    write_marked(&mut state, MARK_STITCH_BRIDGE, &payload);
 }
 
 /// `rjitlog.py tmp_callback`.
@@ -573,12 +600,14 @@ mod tests {
     #[test]
     fn mark_trace_is_the_seventh_mark() {
         assert_eq!(MARK_TRACE, 0x17);
+        assert_eq!(MARK_STITCH_BRIDGE, 0x1a);
         assert_eq!(MARK_START_TRACE, 0x1b);
         assert_eq!(MARK_INIT_MERGE_POINT, 0x1d);
         assert_eq!(MARK_JITLOG_HEADER, 0x1e);
         assert_eq!(MARK_MERGE_POINT, 0x1f);
         assert_eq!(MARK_COMMON_PREFIX, 0x20);
         assert_eq!(MARK_ABORT_TRACE, 0x21);
+        assert_eq!(MARK_REDIRECT_ASSEMBLER, 0x23);
         assert_eq!(MARK_TMP_CALLBACK, 0x24);
     }
 
@@ -600,6 +629,9 @@ mod tests {
     fn write_trace_is_a_no_op_when_disabled() {
         write_trace::<InputArg, Op>(MARK_TRACE, 0, &[], &[]);
         write_trace::<InputArg, Op>(MARK_TRACE_OPT, 0, &[], &[]);
+        redirect_assembler(0, 1, 2);
+        log_patch_guard(0, 0);
+        tmp_callback(0, 0);
     }
 
     #[test]

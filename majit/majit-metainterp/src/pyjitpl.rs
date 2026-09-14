@@ -10346,7 +10346,11 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         match result {
-            Ok(_) => {
+            Ok(info) => {
+                crate::rjitlog::log_patch_guard(
+                    (fail_descr as *const dyn majit_ir::FailDescr).cast::<()>() as u64,
+                    info.code_addr as u64,
+                );
                 self.last_compiled_artifact_token = Some(source_jct.clone());
                 // compile.py `store_hash` for bridge guards.
                 self.assign_guard_hashes(&combined_ops);
@@ -13115,6 +13119,13 @@ impl<M: Clone> MetaInterp<M> {
             let _ = self
                 .backend
                 .redirect_call_assembler(&old_token, &attach_token);
+            // x86/assembler.py redirect_call_assembler: jl.redirect_assembler
+            // after the JMP patch. aarch64 logs newlooptoken.number as asm_adr.
+            crate::rjitlog::redirect_assembler(
+                std::sync::Arc::as_ptr(&old_token) as *const () as u64,
+                std::sync::Arc::as_ptr(&attach_token) as *const () as u64,
+                attach_token.number,
+            );
             // `warmstate.py` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
         }
@@ -13220,6 +13231,11 @@ impl<M: Clone> MetaInterp<M> {
         let new_token = self.warm_state.get_compiled(new_key);
         if let (Some(old), Some(new)) = (old_token, new_token) {
             let _ = self.backend.redirect_call_assembler(&old, &new);
+            crate::rjitlog::redirect_assembler(
+                std::sync::Arc::as_ptr(&old) as *const () as u64,
+                std::sync::Arc::as_ptr(&new) as *const () as u64,
+                new.number,
+            );
         }
     }
 
@@ -15575,7 +15591,13 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         match result {
-            Ok(_) => {
+            Ok(info) => {
+                // x86/assembler.py assemble_bridge: log_patch_guard after
+                // the guard JMP is patched to the new bridge.
+                crate::rjitlog::log_patch_guard(
+                    (fail_descr as *const dyn majit_ir::FailDescr).cast::<()>() as u64,
+                    info.code_addr as u64,
+                );
                 self.last_compiled_artifact_token = Some(source_jct.clone());
                 if crate::majit_log_enabled() {
                     eprintln!(
