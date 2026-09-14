@@ -5402,6 +5402,20 @@ where
     if op.args.len() != 1 {
         return None;
     }
+    let value = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => {
+            let reg = get_register(*var);
+            Register::new(Kind::Int, reg.index)
+        }
+        _ => return None,
+    };
+    // pyopcode.py truth tests → `space.is_true`.
+    if let Some(insn) =
+        build_orthodox_inline_call_r_i(inline_call_targets::IS_TRUE, value.clone(), dst_reg)
+    {
+        return Some(insn);
+    }
     // `truth_fn` returns Int (the boolean 0/1 result), so the
     // dispatcher must emit `dst_reg` with `Kind::Int` regardless of
     // the HLOp result Variable's recorded kind.  `emit_frontend_bool`
@@ -6116,6 +6130,24 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
+    // pyopcode.py STORE_ATTR (jitted): `space.setattr(w_obj, w_name, w_val)`.
+    if op.opname == "setattr" && op.args.len() == 3 {
+        let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+        let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+        let value = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
+        let dst_reg = match &op.result {
+            Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+            _ => return None,
+        };
+        if let Some(insn) = build_orthodox_inline_call_r_r_n(
+            inline_call_targets::SETATTR,
+            vec![obj, name, value],
+            dst_reg,
+        ) {
+            return Some(insn);
+        }
+        return None;
+    }
     if op.opname != "store_attr" || op.args.len() != 4 {
         return None;
     }
@@ -6546,6 +6578,16 @@ mod inline_call_targets {
     pub const FORMAT_W: &str = "pyre_interpreter::type_methods::format_w";
     /// LOAD_ATTR — `lower_getattr_hlop_to_insn`.
     pub const GETATTR: &str = "pyre_interpreter::baseobjspace::getattr";
+    /// STORE_ATTR — `lower_setattr_hlop_to_insn`.
+    pub const SETATTR: &str = "pyre_interpreter::baseobjspace::setattr";
+    /// DELETE_ATTR — `lower_delete_attr_hlop_to_insn`.
+    pub const DELATTR: &str = "pyre_interpreter::baseobjspace::delattr";
+    /// GET_LEN — `lower_get_len_hlop_to_insn`.
+    pub const LEN: &str = "pyre_interpreter::baseobjspace::len";
+    /// BOOL / TO_BOOL — `lower_bool_hlop_to_insn`.
+    pub const IS_TRUE: &str = "pyre_interpreter::baseobjspace::is_true";
+    /// DELETE_SUBSCR — `lower_delsubscr_hlop_to_insn`.
+    pub const DELITEM: &str = "pyre_interpreter::baseobjspace::delitem";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -6633,6 +6675,40 @@ fn build_orthodox_inline_call_r_r_n(
         vec![
             Operand::descr(DescrOperand::JitCode(jitcode)),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
+        ],
+        dst_reg,
+    ))
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref, …) → void` body:
+/// `inline_call_r_v(JitCode, ListR(refs))`.
+fn build_orthodox_inline_call_r_v(
+    canonical_path: &'static str,
+    refs: Vec<Operand>,
+) -> Option<Insn> {
+    let jitcode = fully_bound_callee_body(canonical_path)?;
+    Some(Insn::op(
+        "inline_call_r_v",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
+        ],
+    ))
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref) → Int` body:
+/// `inline_call_r_i(JitCode, ListR([value])) → reg`.
+fn build_orthodox_inline_call_r_i(
+    canonical_path: &'static str,
+    value: Operand,
+    dst_reg: Register,
+) -> Option<Insn> {
+    let jitcode = fully_bound_callee_body(canonical_path)?;
+    Some(Insn::op_with_result(
+        "inline_call_r_i",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
         ],
         dst_reg,
     ))
@@ -6849,6 +6925,12 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if opname == "get_len"
+        && let Some(insn) =
+            build_orthodox_inline_call_r_r(inline_call_targets::LEN, subject.clone(), dst_reg)
+    {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         fn_idx,
         vec![subject],
@@ -7443,6 +7525,13 @@ where
     }
     let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let key_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    // pyopcode.py DELETE_SUBSCR → `space.delitem`.
+    if let Some(insn) = build_orthodox_inline_call_r_v(
+        inline_call_targets::DELITEM,
+        vec![obj_operand.clone(), key_operand.clone()],
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.delete_subscr_fn_idx,
         vec![obj_operand, key_operand],
@@ -7557,6 +7646,21 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
+    // pyopcode.py DELETE_ATTR (jitted): `space.delattr(w_obj, w_name)`.
+    if op.opname == "delattr" && op.args.len() == 2 {
+        let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+        let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+        let dst_reg = match &op.result {
+            Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+            _ => return None,
+        };
+        if let Some(insn) =
+            build_orthodox_inline_call_r_r_n(inline_call_targets::DELATTR, vec![obj, name], dst_reg)
+        {
+            return Some(insn);
+        }
+        return None;
+    }
     if op.opname != "delete_attr" || op.args.len() != 3 {
         return None;
     }
@@ -9163,9 +9267,19 @@ mod tests {
             ssarepr.insns
         );
 
-        // BOOL `bool` → residual_call_r_i with fn_idx=17.
+        // BOOL `bool` → inline_call_r_i of `is_true` when bound, else
+        // residual_call_r_i with fn_idx=17.
         let bool_call = ssarepr.insns.iter().find(|insn| {
             matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "inline_call_r_i"
+                        && matches!(
+                            args.first(),
+                            Some(Operand::Descr(descr))
+                                if matches!(&**descr, DescrOperand::JitCode(jc) if jc.name() == "is_true")
+                        )
+            ) || matches!(
                 insn,
                 Insn::Op { opname, args, .. }
                     if opname == "residual_call_r_i"
@@ -9174,7 +9288,7 @@ mod tests {
         });
         assert!(
             bool_call.is_some(),
-            "expected BOOL residual_call: {:?}",
+            "expected BOOL inline_call or residual_call: {:?}",
             ssarepr.insns
         );
 
@@ -10252,6 +10366,20 @@ mod tests {
             .expect("BOOL HLOp must lower");
 
         match insn {
+            Insn::Op {
+                opname,
+                args,
+                result: Some(reg),
+            } if opname == "inline_call_r_i" => {
+                assert_eq!(reg, Register::new(Kind::Int, 1));
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 1);
+                    }
+                    other => panic!("expected ListR([cond]), got {other:?}"),
+                }
+            }
             Insn::Op {
                 opname,
                 args,
@@ -14907,6 +15035,14 @@ mod tests {
             super::lower_delsubscr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .expect("2-arg delete_subscr lowering must succeed");
         match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } if opname == "inline_call_r_v" => {
+                let _ = args;
+                assert!(result.is_none());
+            }
             Insn::Op {
                 opname,
                 args,

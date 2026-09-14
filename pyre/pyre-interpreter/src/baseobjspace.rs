@@ -1583,6 +1583,9 @@ pub(crate) unsafe fn subclass_special_override(
 /// the by-layout result). Only objects matching no fast path reach the
 /// generic tail, which consults `__bool__` then `__len__`, where the call
 /// exceptions — and the non-bool-`__bool__` TypeError — propagate.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `IS_TRUE` (`space.is_true`).
+#[inline(never)]
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
     // descroperation.py:265 — `__bool__` (anywhere in the MRO) is consulted
     // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
@@ -5461,6 +5464,9 @@ fn _len(obj: PyObjectRef) -> PyResult {
 /// `pypy/objspace/descroperation.py len` — preserve the wrapped
 /// integer returned by `space.index`, but validate negativity and overflow
 /// before exposing it to app-level `len()`.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `LEN` (`space.len`).
+#[inline(never)]
 pub fn len(obj: PyObjectRef) -> PyResult {
     let w_res = _len(obj)?;
     let w_index = space_index(w_res)?;
@@ -7371,6 +7377,10 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 }
 
 /// `space.setattr(w_obj, w_name, w_val)`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `SETATTR`.
+#[inline(never)]
 pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
     if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
         return Err(PyError::type_error(format!(
@@ -7391,6 +7401,10 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
 }
 
 /// `space.delattr(w_obj, w_name)`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `DELATTR`.
+#[inline(never)]
 pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
         return Err(PyError::type_error(format!(
@@ -21734,6 +21748,9 @@ pub fn side_effects_ok() -> bool {
 /// Delete item: `del obj[index]`
 ///
 /// PyPy: descroperation.py delitem → dispatches to type-specific __delitem__.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `DELITEM` (`space.delitem`).
+#[inline(never)]
 pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {
