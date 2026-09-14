@@ -30,10 +30,9 @@
 //! ```
 //!
 //! with `ll_arraycopy` written out as the item loop, because the rich model
-//! has no arraycopy residual.  The graph carries the `unroll_safe` hint: the
-//! sliced array is a gateway's argument array, whose length is the arity of
-//! the CALL being traced, so the loop's trip count is a trace constant and
-//! unrolling it is what makes the copied items virtual.
+//! has no arraycopy residual.  The helper is registered but not a
+//! candidate: `look_inside_graph` refuses a loop without `unroll_safe`,
+//! and `rlist.py` does not mark these helpers `_jit_unroll_safe_`.
 //!
 //! The array's item kind is not on the marker call — the front knows it, the
 //! marker does not carry it.  It is recovered from another array operation on
@@ -186,12 +185,12 @@ pub fn listslice_startonly_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startonly_graph(&name, item_ty, array_type_id);
-        // No `unroll_safe`: the copy loop is data-dependent (`rlist.py`
-        // `ll_listslice_*` have no `_jit_unroll_safe_`).  A Regular
-        // graph is enough for the residual ABI; looking inside would
-        // unroll a runtime-length copy.
+        // No `unroll_safe` and not a candidate: the copy loop is
+        // data-dependent (`rlist.py` `ll_listslice_*` have no
+        // `_jit_unroll_safe_`).  Registering the graph makes the
+        // residual ABI defined; `add_candidate_graph` would bypass
+        // `look_inside_graph` and emit an `InlineCall` of the loop.
         cc.register_function_graph(path.clone(), graph);
-        cc.add_candidate_graph(path.clone());
     }
     path
 }
@@ -208,7 +207,6 @@ pub fn listslice_minusone_path(
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_minusone_graph(&name, item_ty, array_type_id);
         cc.register_function_graph(path.clone(), graph);
-        cc.add_candidate_graph(path.clone());
     }
     path
 }
@@ -225,7 +223,6 @@ pub fn listslice_rangeto_path(
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_rangeto_graph(&name, item_ty, array_type_id);
         cc.register_function_graph(path.clone(), graph);
-        cc.add_candidate_graph(path.clone());
     }
     path
 }
@@ -242,7 +239,6 @@ pub fn listslice_range_path(
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startstop_graph(&name, item_ty, array_type_id);
         cc.register_function_graph(path.clone(), graph);
-        cc.add_candidate_graph(path.clone());
     }
     path
 }
@@ -1100,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_is_minted_once_and_is_a_regular_callee() {
+    fn the_helper_is_minted_once_and_is_not_a_candidate() {
         use crate::codewriter::call::CallKind;
         let mut cc = CallControl::new();
         let first = listslice_startonly_path(&mut cc, &ValueType::Ref(None), Some("objref"));
@@ -1108,6 +1104,7 @@ mod tests {
         assert_eq!(first, again);
         let ints = listslice_startonly_path(&mut cc, &ValueType::Int, Some("ints"));
         assert_ne!(first, ints);
+        assert!(cc.has_function_graph(&first));
         let call = SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::Call {
@@ -1118,11 +1115,11 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        assert_eq!(cc.guess_call_kind(&call), CallKind::Regular);
+        assert_eq!(cc.guess_call_kind(&call), CallKind::Residual);
     }
 
     #[test]
-    fn minusone_helper_is_minted_once_and_is_a_regular_callee() {
+    fn minusone_helper_is_minted_once_and_is_not_a_candidate() {
         use crate::codewriter::call::CallKind;
         let mut cc = CallControl::new();
         let first = listslice_minusone_path(&mut cc, &ValueType::Ref(None), Some("objref"));
@@ -1130,6 +1127,7 @@ mod tests {
         assert_eq!(first, again);
         let startonly = listslice_startonly_path(&mut cc, &ValueType::Ref(None), Some("objref"));
         assert_ne!(first, startonly);
+        assert!(cc.has_function_graph(&first));
         let call = SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::Call {
@@ -1140,7 +1138,7 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        assert_eq!(cc.guess_call_kind(&call), CallKind::Regular);
+        assert_eq!(cc.guess_call_kind(&call), CallKind::Residual);
         assert!(is_getslice_minusone(&SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::Call {

@@ -4837,8 +4837,8 @@ impl<'a> Transformer<'a> {
             return self.rewrite_operation(&helper_call, graph_name, graph);
         }
         // `__getslice_minusone(l)` — the front's deferred `l[:-1]`.
-        // `rtype_getslice` (`rlist.py:906-911`) turns the lifted
-        // `getslice(l, 0, -1)` into `ll_listslice_minusone`; a graph on
+        // `rtype_getslice` turns the lifted `getslice(l, 0, -1)` into
+        // `ll_listslice_minusone`; a graph on
         // this spine never met the rtyper, so mint that helper here the
         // same way `__getslice_rangefrom` mints `ll_listslice_startonly`.
         if crate::codewriter::getslice::is_getslice_minusone(op)
