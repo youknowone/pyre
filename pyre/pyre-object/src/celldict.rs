@@ -667,6 +667,26 @@ impl GlobalCache {
     }
 }
 
+/// `celldict.py` `self.caches.get(key)`. The registry mutex is the 3.14t
+/// wrapper; the lookup itself is the dict get upstream performs under the GIL.
+#[majit_macros::dont_look_inside]
+fn caches_get(
+    caches: &parking_lot::Mutex<Option<GlobalCacheRegistry>>,
+    key: &str,
+) -> Option<std::sync::Arc<parking_lot::Mutex<GlobalCache>>> {
+    caches.lock().as_ref()?.get(key).cloned()
+}
+
+/// `celldict.py` `cache.cell = w_value`. Residual so `MutexGuard::deref_mut`
+/// is not a translation subject.
+#[majit_macros::dont_look_inside]
+fn cache_set_cell(
+    cache: &std::sync::Arc<parking_lot::Mutex<GlobalCache>>,
+    cell: Option<PyObjectRef>,
+) {
+    cache.lock().cell = cell;
+}
+
 /// GC root walk over a single `GlobalCache` and its chained
 /// `builtincache`, forwarding the movable value each `cell` holds.
 ///
@@ -1036,10 +1056,8 @@ impl ModuleDictStrategy {
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
         // round-trip.
-        if let Some(caches) = self.caches.lock().as_mut()
-            && let Some(cache) = caches.get(key)
-        {
-            cache.lock().cell = Some(w_to_store);
+        if let Some(cache) = caches_get(&self.caches, key) {
+            cache_set_cell(&cache, Some(w_to_store));
         }
     }
 
@@ -1077,13 +1095,11 @@ impl ModuleDictStrategy {
         let removed = unsafe {
             crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).remove(key)?
         };
-        if let Some(caches) = self.caches.lock().as_mut()
-            && let Some(cache) = caches.get(key)
-        {
+        if let Some(cache) = caches_get(&self.caches, key) {
             // `celldict.py:117-121`: zero out the per-key cache
             // so LOAD_GLOBAL falls through to the builtins
             // fallback (or NameError) on the next read.
-            cache.lock().cell = None;
+            cache_set_cell(&cache, None);
         }
         self.mutated();
         Some(removed)
