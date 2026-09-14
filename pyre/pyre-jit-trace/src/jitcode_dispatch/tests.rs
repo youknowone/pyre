@@ -883,6 +883,33 @@ fn exact_py_pc_preserves_a_later_disjoint_emission_region() {
     );
 }
 
+#[test]
+fn exact_vstack_step_uses_depth_of_its_own_python_opcode() {
+    let code = pyre_interpreter::compile_exec("answer = f(1)").unwrap();
+    let code = Box::into_raw(Box::new(code));
+    let live = crate::liveness::liveness_for(code);
+    let depths = live.depth_at_py_pc();
+    let (floor_pc, &floor_depth) = depths.iter().enumerate().find(|(_, d)| **d > 0).unwrap();
+    let (exact_pc, &exact_depth) = depths.iter().enumerate().find(|(_, d)| **d == 0).unwrap();
+    let mut pyjit = crate::PyJitCode::skeleton(code);
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, floor_pc as u32)];
+    pyjit.metadata.depth_containing_by_jit_pc = vec![(0, floor_depth)];
+    pyjit.metadata.py_exact_by_jit_pc = vec![(0, exact_pc as u32)];
+    assert_eq!(
+        vstack_step_depth(&pyjit, 0, exact_pc as u32),
+        exact_depth as usize
+    );
+    assert_eq!(
+        vstack_step_depth(&pyjit, 0, floor_pc as u32),
+        floor_depth as usize
+    );
+    let frame = ActiveResumeFrame(std::sync::Arc::new(pyjit));
+    let (pc, _, depth) = frame
+        .vstack_step_coordinate_for_jitcode_pc(0, u32::MAX)
+        .unwrap();
+    assert_eq!((pc, depth), (exact_pc as u32, exact_depth as usize));
+}
+
 /// Build a fresh `TraceCtx`. Uses the public `for_test_types` +
 /// `const_ref` / `make_fail_descr` factories so the fixture stays
 /// out of `pub(crate)` API.

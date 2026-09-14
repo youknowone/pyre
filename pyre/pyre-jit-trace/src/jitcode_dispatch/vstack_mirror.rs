@@ -988,6 +988,33 @@ pub(crate) fn metadata_block_head_py_pc(
         .map(|i| metadata.block_head_py_by_jit_pc[i].1)
 }
 
+/// Read depth for the same Python opcode selected by vstack_step_py_pc.
+/// The floor twin is valid only while its owner equals that opcode; disjoint
+/// emission regions can select a different exact owner. Both portal and
+/// inline frames use their own code's liveness for that owner.
+pub(crate) fn vstack_step_depth(pjc: &crate::PyJitCode, jit_pc: usize, py_pc: u32) -> usize {
+    let raw_depth = || {
+        crate::liveness::liveness_for(pjc.code_ptr)
+            .depth_at_py_pc()
+            .get(py_pc as usize)
+            .copied()
+            .unwrap_or(0) as usize
+    };
+    if pjc.depth_containing_populated() && py_pc == vstack_containing_py_pc(&pjc.metadata, jit_pc) {
+        let depth = pjc.depth_containing_for_jitcode_pc(jit_pc).unwrap_or(0) as usize;
+        if pcmap_containing_audit_enabled() {
+            assert_eq!(
+                depth,
+                raw_depth(),
+                "vstack step depth at jit_pc {jit_pc}, py {py_pc}"
+            );
+        }
+        depth
+    } else {
+        raw_depth()
+    }
+}
+
 pub(crate) fn vstack_step_py_pc(
     metadata: &crate::PyJitCodeMetadata,
     jit_pc: usize,
@@ -1084,35 +1111,7 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
                 return;
             }
             let py_pc = vstack_step_py_pc(&jc.payload.metadata, jit_pc, ctx.vstack_cur_pypc);
-            // The depth is consumed only when the walk crosses a Python-opcode
-            // boundary (`py_pc != ctx.vstack_cur_pypc`; see the early-return
-            // below). On the block-head-marker branch `vstack_step_py_pc`
-            // returns `current_py_pc` and the value is dead; whenever it is
-            // live, `py_pc` is the floor segment py, so the floor twin
-            // reproduces the raw read.
-            let raw_depth = || {
-                crate::liveness::liveness_for(jc.payload.code_ptr)
-                    .depth_at_py_pc()
-                    .get(py_pc as usize)
-                    .copied()
-                    .unwrap_or(0) as usize
-            };
-            let depth = if jc.payload.depth_containing_populated() {
-                let twin = jc
-                    .payload
-                    .depth_containing_for_jitcode_pc(jit_pc)
-                    .unwrap_or(0) as usize;
-                if pcmap_containing_audit_enabled() && py_pc != ctx.vstack_cur_pypc {
-                    assert_eq!(
-                        twin,
-                        raw_depth(),
-                        "PYRE_PCMAP_CONTAINING_AUDIT: vstack-step depth twin diverged (jit_pc {jit_pc}, py {py_pc})"
-                    );
-                }
-                twin
-            } else {
-                raw_depth()
-            };
+            let depth = vstack_step_depth(&jc.payload, jit_pc, py_pc);
             // Stage gate for the per-emission exact segmentation.  The
             // boundary the mirror acts on is currently INFERRED — `py_pc` is
             // the floor segment's owner, and whether an opcode retired is then

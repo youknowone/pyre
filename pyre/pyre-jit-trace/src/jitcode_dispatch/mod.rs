@@ -8105,9 +8105,12 @@ impl ActiveResumeFrame {
         jit_pc: usize,
         current_py_pc: u32,
     ) -> Option<(u32, *const pyre_interpreter::CodeObject, usize)> {
-        let (containing_py_pc, code_ptr, depth) = self.vstack_coordinate_for_jitcode_pc(jit_pc)?;
+        let code_ptr = self.0.code_ptr;
+        if code_ptr.is_null() {
+            return None;
+        }
         let py_pc = vstack_step_py_pc(&self.0.metadata, jit_pc, current_py_pc);
-        debug_assert!(py_pc == current_py_pc || py_pc == containing_py_pc);
+        let depth = vstack_step_depth(&self.0, jit_pc, py_pc);
         Some((py_pc, code_ptr, depth))
     }
 
