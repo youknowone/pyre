@@ -10891,6 +10891,19 @@ fn jump_phi_coalesce_pairs(ops: &[Op]) -> Vec<(u32, u32)> {
         let label_args = find_label_args(ops, jump);
         let jump_args = jump.getarglist();
         let n = jump_args.len().min(label_args.len());
+        // LABEL args are simultaneous phis. `live_across` dates each at
+        // the LABEL (or at -1 for an inputarg), so it does not see two
+        // phis as interfering. A swap `JUMP(p1, p0)` / rotate then
+        // accepts every pair; ValueLocals walks the alias cycle and
+        // falls back to distinct locals, but RefHomes remaps sequentially
+        // and both values keep one home. Refuse a JUMP arg that is
+        // itself a target LABEL arg.
+        let label_arg_ids: Vec<u32> = label_args
+            .iter()
+            .copied()
+            .filter(|a| *a != OpRef::NONE && !a.is_constant())
+            .map(OpRef::raw)
+            .collect();
         for i in 0..n {
             let jarg = jump_args[i].to_opref();
             let larg = label_args[i];
@@ -10906,6 +10919,9 @@ fn jump_phi_coalesce_pairs(ops: &[Op]) -> Vec<(u32, u32)> {
             let jid = jarg.raw();
             let lid = larg.raw();
             if taken_j.contains(&jid) || taken_l.contains(&lid) {
+                continue;
+            }
+            if label_arg_ids.contains(&jid) {
                 continue;
             }
             let def_j = liveness.defined_at(jid);
@@ -13112,6 +13128,68 @@ mod tests {
             jump_phi_coalesce_pairs(&ops).is_empty(),
             "LABEL slot still read after the New must keep its own local"
         );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_swapped_label_args() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let label = Op::new(OpCode::Label, &[rb(p0), rb(p1)]);
+        label.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(p1), rb(p0)]);
+        jump.setdescr(descr);
+        let ops = vec![label, jump];
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "JUMP(p1, p0) onto LABEL(p0, p1) must not alias the two phis"
+        );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_rotated_label_args() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let p2 = OpRef::input_arg_ref(2);
+        let label = Op::new(OpCode::Label, &[rb(p0), rb(p1), rb(p2)]);
+        label.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(p1), rb(p2), rb(p0)]);
+        jump.setdescr(descr);
+        let ops = vec![label, jump];
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "JUMP(p1, p2, p0) onto LABEL(p0, p1, p2) must not alias the rotate"
+        );
+    }
+
+    #[test]
+    fn ref_homes_keep_distinct_slots_for_swapped_label_args() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let label = Op::new(OpCode::Label, &[rb(p0), rb(p1)]);
+        label.setdescr(descr.clone());
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(p1), rb(p0)]);
+        jump.setdescr(descr);
+        let ops = vec![label, new, jump];
+        let inputargs = vec![
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+        ];
+        let homes = RefHomes::collect(&inputargs, &ops, true, &[], &[]);
+        let h0 = homes.home(p0).expect("p0 lives across NewWithVtable");
+        let h1 = homes.home(p1).expect("p1 lives across NewWithVtable");
+        assert_ne!(h0, h1, "swapped LABEL refs must keep distinct GC homes");
     }
 
     #[test]
