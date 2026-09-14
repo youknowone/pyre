@@ -29,23 +29,91 @@ pub struct W_Kevent {
     pub udata: u64,
 }
 
-/// Lexicographic comparison of all six fields, matching
-/// `interp_kqueue.py _compare_all_fields`.  Returns an `Ordering`
-/// the dunder wrappers turn into the requested relation.
+/// `interp_kqueue.py` `_compare_all_fields`. Field-by-field, not a
+/// packed-tuple `cmp`.
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 impl W_Kevent {
-    fn cmp_key(&self) -> (u64, i64, u32, u32, i64, u64) {
-        // `ident`/`udata` unsigned, `filter` widened signed, `flags`/
-        // `fflags` unsigned, `data` signed — the field widths PyPy casts
-        // to before comparing.
-        (
-            self.ident,
-            self.filter as i64,
-            self.flags as u32,
-            self.fflags,
-            self.data,
-            self.udata,
-        )
+    fn compare_all_fields_raw(&self, other: &W_Kevent, op: &str) -> bool {
+        let l_ident = self.ident;
+        let r_ident = other.ident;
+        let l_filter = self.filter as i64;
+        let r_filter = other.filter as i64;
+        let l_flags = self.flags as u32;
+        let r_flags = other.flags as u32;
+        let l_fflags = self.fflags;
+        let r_fflags = other.fflags;
+        let l_data = self.data;
+        let r_data = other.data;
+        let l_udata = self.udata;
+        let r_udata = other.udata;
+        match op {
+            "eq" => {
+                l_ident == r_ident
+                    && l_filter == r_filter
+                    && l_flags == r_flags
+                    && l_fflags == r_fflags
+                    && l_data == r_data
+                    && l_udata == r_udata
+            }
+            "lt" => {
+                l_ident < r_ident
+                    || (l_ident == r_ident && l_filter < r_filter)
+                    || (l_ident == r_ident && l_filter == r_filter && l_flags < r_flags)
+                    || (l_ident == r_ident
+                        && l_filter == r_filter
+                        && l_flags == r_flags
+                        && l_fflags < r_fflags)
+                    || (l_ident == r_ident
+                        && l_filter == r_filter
+                        && l_flags == r_flags
+                        && l_fflags == r_fflags
+                        && l_data < r_data)
+                    || (l_ident == r_ident
+                        && l_filter == r_filter
+                        && l_flags == r_flags
+                        && l_fflags == r_fflags
+                        && l_data == r_data
+                        && l_udata < r_udata)
+            }
+            "gt" => {
+                l_ident > r_ident
+                    || (l_ident == r_ident && l_filter > r_filter)
+                    || (l_ident == r_ident && l_filter == r_filter && l_flags > r_flags)
+                    || (l_ident == r_ident
+                        && l_filter == r_filter
+                        && l_flags == r_flags
+                        && l_fflags > r_fflags)
+                    || (l_ident == r_ident
+                        && l_filter == r_filter
+                        && l_flags == r_flags
+                        && l_fflags == r_fflags
+                        && l_data > r_data)
+                    || (l_ident == r_ident
+                        && l_filter == r_filter
+                        && l_flags == r_flags
+                        && l_fflags == r_fflags
+                        && l_data == r_data
+                        && l_udata > r_udata)
+            }
+            _ => unreachable!("compare_all_fields_raw op"),
+        }
+    }
+
+    /// `interp_kqueue.py` `compare_all_fields`.
+    fn compare_all_fields(&self, other: &W_Kevent, mut op: &str) -> bool {
+        let mut negate = false;
+        if op == "ne" {
+            negate = true;
+            op = "eq";
+        } else if op == "le" {
+            negate = true;
+            op = "gt";
+        } else if op == "ge" {
+            negate = true;
+            op = "lt";
+        }
+        let r = self.compare_all_fields_raw(other, op);
+        if negate { !r } else { r }
     }
 }
 
@@ -126,26 +194,25 @@ impl W_Kevent {
         )
     }
 
-    /// `interp_kqueue.py descr__eq__` and friends — two kevents
-    /// compare by all six fields lexicographically.  A non-kevent other
+    /// `interp_kqueue.py descr__eq__` and friends. A non-kevent other
     /// yields `NotImplemented`.
     fn __eq__(&self, w_other: PyObjectRef) -> PyObjectRef {
-        kevent_compare(self, w_other, |o| o == std::cmp::Ordering::Equal)
+        kevent_compare(self, w_other, "eq")
     }
     fn __ne__(&self, w_other: PyObjectRef) -> PyObjectRef {
-        kevent_compare(self, w_other, |o| o != std::cmp::Ordering::Equal)
+        kevent_compare(self, w_other, "ne")
     }
     fn __lt__(&self, w_other: PyObjectRef) -> PyObjectRef {
-        kevent_compare(self, w_other, |o| o == std::cmp::Ordering::Less)
+        kevent_compare(self, w_other, "lt")
     }
     fn __le__(&self, w_other: PyObjectRef) -> PyObjectRef {
-        kevent_compare(self, w_other, |o| o != std::cmp::Ordering::Greater)
+        kevent_compare(self, w_other, "le")
     }
     fn __gt__(&self, w_other: PyObjectRef) -> PyObjectRef {
-        kevent_compare(self, w_other, |o| o == std::cmp::Ordering::Greater)
+        kevent_compare(self, w_other, "gt")
     }
     fn __ge__(&self, w_other: PyObjectRef) -> PyObjectRef {
-        kevent_compare(self, w_other, |o| o != std::cmp::Ordering::Less)
+        kevent_compare(self, w_other, "ge")
     }
 }
 
@@ -163,16 +230,43 @@ fn newint_from_u64(v: u64) -> PyObjectRef {
 
 /// Shared body for the kevent rich-comparison dunders.
 #[cfg(all(target_os = "macos", feature = "host_env"))]
-fn kevent_compare(
-    this: &W_Kevent,
-    w_other: PyObjectRef,
-    relation: impl Fn(std::cmp::Ordering) -> bool,
-) -> PyObjectRef {
+fn kevent_compare(this: &W_Kevent, w_other: PyObjectRef, op: &str) -> PyObjectRef {
     match W_Kevent::from_obj(w_other) {
-        Some(other) => {
-            let ord = this.cmp_key().cmp(&other.cmp_key());
-            pyre_object::w_bool_from(relation(ord))
-        }
+        Some(other) => pyre_object::w_bool_from(this.compare_all_fields(other, op)),
         None => pyre_object::w_not_implemented(),
+    }
+}
+
+#[cfg(all(test, target_os = "macos", feature = "host_env"))]
+mod tests {
+    use super::W_Kevent;
+
+    fn ev(ident: u64, filter: i16, flags: u16, fflags: u32, data: i64, udata: u64) -> W_Kevent {
+        W_Kevent {
+            ident,
+            filter,
+            flags,
+            fflags,
+            data,
+            udata,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compare_all_fields_follows_pypy_lexicographic_chain() {
+        let a = ev(1, 0, 0, 0, 0, 0);
+        let b = ev(2, 0, 0, 0, 0, 0);
+        assert!(a.compare_all_fields(&a, "eq"));
+        assert!(!a.compare_all_fields(&b, "eq"));
+        assert!(a.compare_all_fields(&b, "lt"));
+        assert!(b.compare_all_fields(&a, "gt"));
+        assert!(a.compare_all_fields(&b, "le"));
+        assert!(b.compare_all_fields(&a, "ge"));
+        let c = ev(1, 1, 0, 0, 0, 0);
+        assert!(a.compare_all_fields(&c, "lt"));
+        let d = ev(1, 0, 0, 0, 0, 1);
+        assert!(a.compare_all_fields(&d, "lt"));
+        assert!(d.compare_all_fields(&a, "ne"));
     }
 }
