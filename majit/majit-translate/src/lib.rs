@@ -2344,6 +2344,14 @@ fn analyze_pipeline_from_module_paths(
         parse::CallPath::from_segments(["ll_arraymove"]),
         "list.ll_arraymove(array, source_start, dest_start, length)".to_string(),
     );
+    // rgc.py `@jit.oopspec('list.ll_arraycopy(source, dest, source_start,
+    // dest_start, length)')`.  The rtyper and the rich-spine getslice
+    // helpers both mint a `direct_call` of this name, so the decorator
+    // cannot be harvested from a Rust source item above.
+    call_control.mark_oopspec(
+        parse::CallPath::from_segments(["ll_arraycopy"]),
+        "list.ll_arraycopy(source, dest, source_start, dest_start, length)".to_string(),
+    );
 
     // `collectanalyze.py analyze_simple_operation` answers True for the
     // allocation operations — `malloc` / `malloc_varsize` with `flavor='gc'`,

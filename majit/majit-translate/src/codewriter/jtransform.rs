@@ -6330,6 +6330,24 @@ impl<'a> Transformer<'a> {
                 None,
             ));
         }
+        // jtransform.py `do_fixed_list_ll_arraycopy` → OS_ARRAYCOPY.
+        // Descriptor analysis still sees the helper graph through `op`;
+        // only the function address is retargeted to the native
+        // barrier+memcpy body (`jit_ll_arraycopy`).
+        if oopspec_name == "list.ll_arraycopy" {
+            let copy_target = CallTarget::function_path(["jit_ll_arraycopy"]);
+            return Some(self._handle_oopspec_call(
+                graph,
+                op,
+                &copy_target,
+                args,
+                &ValueType::Void,
+                graph_name,
+                OopSpecIndex::Arraycopy,
+                None,
+                None,
+            ));
+        }
         // Field owner for the `W_ListObject` storage struct.  The dotted
         // names address the fused offsets the runtime descr group
         // exposes (`int_items.len` → `list_int_items_len_descr`,
@@ -17162,6 +17180,71 @@ mod tests {
         assert!(callinfo.has_oopspec(OopSpecIndex::Arraymove));
         let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraymove);
         assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraymove"));
+    }
+
+    /// jtransform.py `test_list_ll_arraycopy`: two refs plus three integer
+    /// arguments, void result, and OS_ARRAYCOPY (1) callinfo.
+    #[test]
+    fn list_ll_arraycopy_lowers_to_os1_residual_call() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let array_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let args = vec![
+            variable_with_lltype("source", array_ty.clone()),
+            variable_with_lltype("dest", array_ty),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let rewritten = transformer
+            ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
+            .expect("list.ll_arraycopy must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        let residual = ops.iter().find_map(|op| match &op.kind {
+            OpKind::CallResidual {
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                ..
+            } => Some((args_i, args_r, args_f, result_kind)),
+            _ => None,
+        });
+        let Some((args_i, args_r, args_f, result_kind)) = residual else {
+            panic!("expected a CallResidual, got {ops:?}");
+        };
+        assert_eq!(args_i.len(), 3);
+        assert_eq!(args_r.len(), 2);
+        assert!(args_f.is_empty());
+        assert_eq!(*result_kind, 'v');
+        let callinfo = &transformer
+            .callcontrol
+            .as_deref()
+            .unwrap()
+            .callinfocollection;
+        assert!(callinfo.has_oopspec(OopSpecIndex::Arraycopy));
+        let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraycopy);
+        assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraycopy"));
     }
 
     /// Other `rgc.*` spellings are not ported and fall through to the

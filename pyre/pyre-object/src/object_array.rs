@@ -217,6 +217,65 @@ pub extern "C" fn jit_ll_arraymove(array: i64, source_start: i64, dest_start: i6
     }
 }
 
+/// `rgc.ll_arraycopy(source, dest, source_start, dest_start, length)` —
+/// runtime target for the `list.ll_arraycopy` oopspec (OS_ARRAYCOPY / 1).
+///
+/// rgc.py `ll_arraycopy`: `writebarrier_before_copy` when the item
+/// contains GC pointers, then `raw_memcopy`. The residual ABI keeps
+/// those five arguments. A dest write-barrier stands in for the 5-arg
+/// `writebarrier_before_copy` hook (not yet published through gc_hook);
+/// remembering dest is the safe side of that barrier.
+pub extern "C" fn jit_ll_arraycopy(
+    source: i64,
+    dest: i64,
+    source_start: i64,
+    dest_start: i64,
+    length: i64,
+) {
+    if source == 0 || dest == 0 || length <= 0 {
+        return;
+    }
+    assert!(
+        source_start >= 0,
+        "ll_arraycopy source_start must be non-negative"
+    );
+    assert!(
+        dest_start >= 0,
+        "ll_arraycopy dest_start must be non-negative"
+    );
+
+    let source_address = crate::gc_hook::try_gc_current_object_address(source as *mut u8) as usize;
+    let dest_address = crate::gc_hook::try_gc_current_object_address(dest as *mut u8) as usize;
+    let fallback = majit_gc::GcVarSizeLayout {
+        base_size: ITEMS_BLOCK_TOKEN.base_size,
+        item_size: ITEMS_BLOCK_TOKEN.item_size,
+        items_have_gc_ptrs: true,
+    };
+    let dest_layout = majit_gc::gc_varsize_layout(dest_address).unwrap_or(fallback);
+    let source_offset = (source_start as usize)
+        .checked_mul(dest_layout.item_size)
+        .and_then(|offset| dest_layout.base_size.checked_add(offset))
+        .expect("ll_arraycopy source address overflow");
+    let dest_offset = (dest_start as usize)
+        .checked_mul(dest_layout.item_size)
+        .and_then(|offset| dest_layout.base_size.checked_add(offset))
+        .expect("ll_arraycopy destination address overflow");
+    let byte_length = (length as usize)
+        .checked_mul(dest_layout.item_size)
+        .expect("ll_arraycopy byte length overflow");
+
+    if dest_layout.items_have_gc_ptrs {
+        crate::gc_hook::try_gc_write_barrier(dest_address as *mut u8);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (source_address as *const u8).add(source_offset),
+            (dest_address as *mut u8).add(dest_offset),
+            byte_length,
+        );
+    }
+}
+
 /// Allocated capacity (GcArray length header) of an `ItemsBlock`.
 /// Returns 0 for a null pointer so "empty list" is represented by
 /// a null `items` field.
@@ -1634,5 +1693,39 @@ mod tests {
             ]
         );
         unsafe { dealloc_list_items_block(one) };
+    }
+
+    #[test]
+    fn jit_ll_arraycopy_copies_a_range_between_blocks() {
+        let src = unsafe {
+            alloc_list_items_block(&[
+                1usize as PyObjectRef,
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+            ])
+        };
+        let dst = unsafe {
+            alloc_list_items_block(&[
+                0usize as PyObjectRef,
+                0usize as PyObjectRef,
+                0usize as PyObjectRef,
+                0usize as PyObjectRef,
+            ])
+        };
+        jit_ll_arraycopy(src as i64, dst as i64, 1, 0, 3);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(items_block_items_base(dst), 4) },
+            &[
+                2usize as PyObjectRef,
+                3usize as PyObjectRef,
+                4usize as PyObjectRef,
+                0usize as PyObjectRef,
+            ]
+        );
+        unsafe {
+            dealloc_list_items_block(src);
+            dealloc_list_items_block(dst);
+        }
     }
 }

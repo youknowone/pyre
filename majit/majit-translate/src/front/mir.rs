@@ -8892,13 +8892,17 @@ impl<'a> Lowering<'a> {
         // `call.func`.  This is the same two-source type test used for
         // `SliceIndex::index` below and keeps Range* implementations on the
         // separate getslice lowering.
-        let (slice_get_index_is_scalar, slice_get_element) = match &call.func {
+        let (slice_get_index_is_scalar, slice_get_element, slice_first_element) = match &call.func {
             CallFunc::Regular(reg) => {
                 let scalar = self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref());
                 let element = scalar.then(|| self.slice_get_element(reg)).flatten();
-                (scalar, element)
+                // `first` / `last` share `get`'s `T` generic; the same
+                // ARRAY identity / thin-pointer proof feeds their
+                // `ArrayRead`.
+                let first_element = self.slice_get_element(reg);
+                (scalar, element, first_element)
             }
-            _ => (false, None),
+            _ => (false, None, None),
         };
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
@@ -12669,8 +12673,9 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && fmt_path_ends_with(segments, &["slice", "<Impl>", "first"])
-            && let Some(site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
+            self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
             self.slice_first_sites.push(site);
         }
         // `<[T]>::last(slice)` is `first` with index `len-1` and the
@@ -12685,6 +12690,7 @@ impl<'a> Lowering<'a> {
             && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
             site.access = crate::front::slice_first::SliceAccess::Last;
+            self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
             self.slice_first_sites.push(site);
         }
         // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
@@ -15683,7 +15689,33 @@ impl<'a> Lowering<'a> {
             payload_ty,
             niche,
             payload_narrow_root,
+            array_type_id: None,
+            string_byte_view: false,
         })
+    }
+
+    /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
+    /// `as_bytes()` aliases the receiver to the `StringRepr`, so the
+    /// successful arm must emit `__string_byte_getitem`; any other
+    /// proven element spelling rides on `array_type_id` the way
+    /// [`Self::recognize_slice_get_site`] does.
+    fn annotate_slice_first_site(
+        &self,
+        site: &mut crate::front::slice_first::SliceFirstSite,
+        arg_locals: &[Option<usize>],
+        element: Option<(ValueType, Option<String>)>,
+    ) {
+        let string_byte_view = arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        if string_byte_view {
+            site.string_byte_view = true;
+            site.array_type_id = None;
+        } else if let Some((_item_ty, array_type_id)) = element {
+            site.array_type_id = array_type_id;
+        }
     }
 
     /// Resolve a recognized `<[T]>::get(slice, i)` call into a

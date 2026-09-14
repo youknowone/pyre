@@ -500,6 +500,24 @@ fn cpa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, 
 }
 
 #[inline]
+fn cpa5<
+    A1: ResidualSlot,
+    A2: ResidualSlot,
+    A3: ResidualSlot,
+    A4: ResidualSlot,
+    A5: ResidualSlot,
+    R: ResidualRet,
+>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1, A2, A3, A4, A5) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
 fn cpa7<
     A1: ResidualSlot,
     A2: ResidualSlot,
@@ -3208,6 +3226,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::object_array::jit_ll_arraymove",
         "pyre_object::jit_ll_arraymove",
         pyre_object::object_array::jit_ll_arraymove,
+    );
+    // `rgc.ll_arraycopy` / `list.ll_arraycopy` keeps PyPy's five-argument
+    // residual ABI. `_handle_list_call` retargets the oopspec residual to
+    // `["jit_ll_arraycopy"]`.
+    cpa5(
+        &mut entries,
+        "pyre_object::object_array::jit_ll_arraycopy",
+        "pyre_object::jit_ll_arraycopy",
+        pyre_object::object_array::jit_ll_arraycopy,
     );
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /

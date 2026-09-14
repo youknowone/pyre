@@ -101,6 +101,14 @@ pub(crate) struct SliceFirstSite {
     /// Concrete payload class retained on both the successful pointer and
     /// the null arm of a niche result.
     pub payload_narrow_root: Option<String>,
+    /// Concrete ARRAY identity for the element read, or `None` only for a
+    /// proven thin-pointer element.  Threaded the same way
+    /// [`crate::front::slice_get::SliceGetSite::array_type_id`] is.
+    pub array_type_id: Option<String>,
+    /// True when the receiver is a `String|str|Wtf8::as_bytes` view.  That
+    /// base is a `StringRepr`, not a GC array, so the successful arm must
+    /// emit `__string_byte_getitem` rather than `ArrayRead`.
+    pub string_byte_view: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -301,18 +309,33 @@ fn rewire_one_slice_first_site(
                 });
             }
             let elem = graph.alloc_value_var();
-            graph.block_mut(then_bb).operations.push(SpaceOperation {
-                result: Some(elem.clone()),
-                kind: OpKind::ArrayRead {
+            let kind = if site.string_byte_view {
+                // `as_bytes()` aliases the slice to the `StringRepr`; a
+                // generic ArrayRead would address the string object as a
+                // GC array.  The scalar-index path emits this marker so
+                // the adapter can build `ord(s[i])`.
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__string_byte_getitem".to_string()],
+                    },
+                    args: crate::model::call_args(vec![slice_in_then, item_index]),
+                    result_ty: ValueType::Int,
+                }
+            } else {
+                OpKind::ArrayRead {
                     base: slice_in_then,
                     // The element read and the `Some::__pos_0` field write
                     // consume the same value, so their register banks match.
                     item_ty: site.payload_ty.clone(),
                     index: item_index,
-                    array_type_id: None,
+                    array_type_id: site.array_type_id.clone(),
                     nolength: false,
                     pure: false,
-                },
+                }
+            };
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(elem.clone()),
+                kind,
             });
             elem
         }
@@ -474,6 +497,8 @@ mod tests {
             payload_ty: ValueType::Ref(None),
             niche: false,
             payload_narrow_root: None,
+            array_type_id: None,
+            string_byte_view: false,
         }
     }
 
@@ -616,6 +641,99 @@ mod tests {
             })
             .count();
         assert_eq!(disc_writes, 2, "both arms write a discriminant");
+    }
+
+    #[test]
+    fn last_threads_array_type_id_onto_the_element_read() {
+        let mut g = FunctionGraph::new("test_slice_last_id");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "last".into(),
+                        ],
+                    },
+                    args: crate::model::call_args(vec![slice]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::Last;
+        site.payload_ty = ValueType::Int;
+        site.array_type_id = Some("[u8]".into());
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        let ids: Vec<Option<String>> = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::ArrayRead { array_type_id, .. } => Some(array_type_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![Some("[u8]".into())]);
+    }
+
+    #[test]
+    fn last_on_a_string_byte_view_emits_the_string_byte_marker() {
+        let mut g = FunctionGraph::new("test_slice_last_bytes");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "last".into(),
+                        ],
+                    },
+                    args: crate::model::call_args(vec![slice]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::Last;
+        site.payload_ty = ValueType::Int;
+        site.string_byte_view = true;
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        assert!(g.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["__string_byte_getitem"]
+                )
+            })
+        }));
+        assert!(!g.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        }));
     }
 
     /// The production shape: an `Option<&RegisteredStruct>` result appends a

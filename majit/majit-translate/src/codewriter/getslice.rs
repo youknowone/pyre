@@ -29,10 +29,10 @@
 //!     return l
 //! ```
 //!
-//! with `ll_arraycopy` written out as the item loop, because the rich model
-//! has no arraycopy residual.  The helper is registered but not a
-//! candidate: `look_inside_graph` refuses a loop without `unroll_safe`,
-//! and `rlist.py` does not mark these helpers `_jit_unroll_safe_`.
+//! The helper calls `ll_arraycopy` the same way `rlist.py` does; jtransform
+//! turns that call into `OS_ARRAYCOPY` (`do_fixed_list_ll_arraycopy`).
+//! The helper is therefore loop-free, so `look_inside_graph` admits it and
+//! it is a candidate — the residual is the copy, not the slice helper.
 //!
 //! The array's item kind is not on the marker call — the front knows it, the
 //! marker does not carry it.  It is recovered from another array operation on
@@ -41,7 +41,7 @@
 
 use crate::codewriter::call::CallControl;
 use crate::flowspace::model::Variable;
-use crate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 
 /// The leaf every minted helper shares, suffixed per array identity.
@@ -185,12 +185,7 @@ pub fn listslice_startonly_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startonly_graph(&name, item_ty, array_type_id);
-        // No `unroll_safe` and not a candidate: the copy loop is
-        // data-dependent (`rlist.py` `ll_listslice_*` have no
-        // `_jit_unroll_safe_`).  Registering the graph makes the
-        // residual ABI defined; `add_candidate_graph` would bypass
-        // `look_inside_graph` and emit an `InlineCall` of the loop.
-        cc.register_function_graph(path.clone(), graph);
+        register_listslice_helper(cc, path.clone(), graph);
     }
     path
 }
@@ -206,7 +201,7 @@ pub fn listslice_minusone_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_minusone_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph(path.clone(), graph);
+        register_listslice_helper(cc, path.clone(), graph);
     }
     path
 }
@@ -222,7 +217,7 @@ pub fn listslice_rangeto_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_rangeto_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph(path.clone(), graph);
+        register_listslice_helper(cc, path.clone(), graph);
     }
     path
 }
@@ -238,9 +233,18 @@ pub fn listslice_range_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startstop_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph(path.clone(), graph);
+        register_listslice_helper(cc, path.clone(), graph);
     }
     path
+}
+
+/// Register a minted `ll_listslice_*` graph and admit it as a candidate.
+/// The helper is loop-free (`ll_arraycopy` is the residual), so
+/// `look_inside_graph` accepts it — the same seed `call.py` uses for a
+/// helper the BFS could not have reached.
+fn register_listslice_helper(cc: &mut CallControl, path: CallPath, graph: FunctionGraph) {
+    cc.register_function_graph(path.clone(), graph);
+    cc.add_candidate_graph(path);
 }
 
 /// `ll_listslice_*__<item>[__<array identity>]`, the identity
@@ -263,7 +267,7 @@ fn helper_name(leaf: &str, item_ty: &ValueType, array_type_id: Option<&str>) -> 
 }
 
 /// `rlist.py ll_listslice_startonly` in the rich model, with `ll_arraycopy`
-/// spelled as the item loop.
+/// as the residual call (`list.ll_arraycopy` / `OS_ARRAYCOPY`).
 pub fn build_ll_listslice_startonly_graph(
     name: &str,
     item_ty: &ValueType,
@@ -322,16 +326,7 @@ pub fn build_ll_listslice_startonly_graph(
             array_type_id: array_type_id.clone(),
         },
     );
-    emit_ll_arraycopy_loop(
-        &mut graph,
-        start_block,
-        l1,
-        start,
-        new_list,
-        newlength,
-        item_ty,
-        array_type_id,
-    );
+    emit_ll_arraycopy_call(&mut graph, start_block, l1, start, new_list, newlength);
     graph
 }
 
@@ -424,15 +419,13 @@ pub fn build_ll_listslice_minusone_graph(
         },
     );
     let start = push(&mut graph, copy, OpKind::ConstInt(0));
-    emit_ll_arraycopy_loop(
+    emit_ll_arraycopy_call(
         &mut graph,
         copy,
         c_l1.clone(),
         start,
         new_list,
         newlength.clone(),
-        item_ty,
-        array_type_id,
     );
     graph
 }
@@ -520,15 +513,13 @@ pub fn build_ll_listslice_rangeto_graph(
         },
     );
     let start = push(&mut graph, copy, OpKind::ConstInt(0));
-    emit_ll_arraycopy_loop(
+    emit_ll_arraycopy_call(
         &mut graph,
         copy,
         c_l1.clone(),
         start,
         new_list,
         c_len.clone(),
-        item_ty,
-        array_type_id,
     );
     graph
 }
@@ -627,127 +618,41 @@ pub fn build_ll_listslice_startstop_graph(
             array_type_id: array_type_id.clone(),
         },
     );
-    emit_ll_arraycopy_loop(
+    emit_ll_arraycopy_call(
         &mut graph,
         copy,
         c_l1.clone(),
         c_start.clone(),
         new_list,
         newlength,
-        item_ty,
-        array_type_id,
     );
     graph
 }
 
-/// `ll_arraycopy(l1, l, start, 0, newlength)` as the item loop, because the
-/// rich model has no arraycopy residual.
-fn emit_ll_arraycopy_loop(
+/// `ll_arraycopy(l1, l, start, 0, newlength)` as the residual call
+/// `rgc.py` / `rlist.py` emit.  jtransform's `do_fixed_list_ll_arraycopy`
+/// turns this into `OS_ARRAYCOPY`.
+fn emit_ll_arraycopy_call(
     graph: &mut FunctionGraph,
-    start_block: crate::model::BlockId,
+    block: crate::model::BlockId,
     l1: Variable,
     start: Variable,
     new_list: Variable,
     newlength: Variable,
-    item_ty: &ValueType,
-    array_type_id: Option<String>,
 ) {
-    let zero = push(graph, start_block, OpKind::ConstInt(0));
-    let (head, head_args) = graph.create_block_with_arg_vars(5);
-    let (body, body_args) = graph.create_block_with_arg_vars(5);
-    let (done, done_args) = graph.create_block_with_arg_vars(1);
-    graph.set_goto(
-        start_block,
-        head,
-        vec![l1, start, new_list, newlength, zero],
-    );
-
-    let [_h_l1, _h_start, h_list, h_len, h_i] = head_args.as_slice() else {
-        unreachable!("head block was created with five inputargs")
-    };
-    let in_range = push(
-        graph,
-        head,
-        OpKind::BinOp {
-            op: "lt".into(),
-            lhs: h_i.clone(),
-            rhs: h_len.clone(),
-            result_ty: ValueType::Bool,
-        },
-    );
-    graph.set_branch(
-        head,
-        in_range,
-        body,
-        head_args.clone(),
-        done,
-        vec![h_list.clone()],
-    );
-
-    let [b_l1, b_start, b_list, b_len, b_i] = body_args.as_slice() else {
-        unreachable!("body block was created with five inputargs")
-    };
-    let src_index = push(
-        graph,
-        body,
-        OpKind::BinOp {
-            op: "add".into(),
-            lhs: b_start.clone(),
-            rhs: b_i.clone(),
-            result_ty: ValueType::Int,
-        },
-    );
-    let item = push(
-        graph,
-        body,
-        OpKind::ArrayRead {
-            base: b_l1.clone(),
-            index: src_index,
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-            nolength: false,
-            pure: false,
-        },
-    );
+    let dest_start = push(graph, block, OpKind::ConstInt(0));
     graph.push_op_var(
-        body,
-        OpKind::ArrayWrite {
-            base: b_list.clone(),
-            index: b_i.clone(),
-            value: LinkArg::Value(item),
-            item_ty: item_ty.clone(),
-            array_type_id,
-            nolength: false,
+        block,
+        OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["ll_arraycopy".into()],
+            },
+            args: crate::model::call_args(vec![l1, new_list.clone(), start, dest_start, newlength]),
+            result_ty: ValueType::Void,
         },
         false,
     );
-    let one = push(graph, body, OpKind::ConstInt(1));
-    let next_i = push(
-        graph,
-        body,
-        OpKind::BinOp {
-            op: "add".into(),
-            lhs: b_i.clone(),
-            rhs: one,
-            result_ty: ValueType::Int,
-        },
-    );
-    graph.set_goto(
-        body,
-        head,
-        vec![
-            b_l1.clone(),
-            b_start.clone(),
-            b_list.clone(),
-            b_len.clone(),
-            next_i,
-        ],
-    );
-
-    let [d_list] = done_args.as_slice() else {
-        unreachable!("done block was created with one inputarg")
-    };
-    graph.set_return(done, Some(d_list.clone()));
+    graph.set_return(block, Some(new_list));
 }
 
 fn push(graph: &mut FunctionGraph, block: crate::model::BlockId, kind: OpKind) -> Variable {
@@ -807,7 +712,7 @@ pub fn is_getslice_range(op: &SpaceOperation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CallTarget, ExitSwitch};
+    use crate::model::CallTarget;
 
     #[test]
     fn helper_graph_has_the_rlist_shape() {
@@ -816,8 +721,8 @@ mod tests {
             &ValueType::Ref(None),
             Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
         );
-        // start / return / except / head / body / done.
-        assert_eq!(graph.blocks.len(), 6);
+        // start / return / except — the copy is a residual call, not a loop.
+        assert_eq!(graph.blocks.len(), 3);
         let start = graph.block(graph.startblock);
         assert_eq!(start.inputargs.len(), 2);
         assert!(
@@ -832,28 +737,28 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
         );
-        let head = graph.block(crate::model::BlockId(3));
-        assert!(matches!(head.exitswitch, Some(ExitSwitch::Value(_))));
-        assert_eq!(head.exits.len(), 2);
-        let body = graph.block(crate::model::BlockId(4));
         assert!(
-            body.operations
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+            start.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["ll_arraycopy"]
+            )),
+            "the helper calls ll_arraycopy"
         );
         assert!(
-            body.operations
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. }))
+            !start.operations.iter().any(|op| matches!(
+                op.kind,
+                OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. }
+            )),
+            "the copy is not an item loop"
         );
-        assert_eq!(body.exits.len(), 1);
-        assert_eq!(body.exits[0].target, crate::model::BlockId(3));
-        let done = graph.block(crate::model::BlockId(5));
-        assert_eq!(done.exits[0].target, graph.returnblock);
+        assert_eq!(start.exits[0].target, graph.returnblock);
     }
 
     #[test]
-    fn minusone_helper_has_one_list_arg_and_the_copy_loop() {
+    fn minusone_helper_has_one_list_arg_and_arraycopy() {
         let graph = build_ll_listslice_minusone_graph(
             "ll_listslice_minusone__ref",
             &ValueType::Ref(None),
@@ -875,16 +780,23 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
         }));
         assert!(graph.blocks.iter().any(|block| {
-            block
-                .operations
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["ll_arraycopy"]
+                )
+            })
         }));
-        assert!(graph.blocks.iter().any(|block| {
-            block
-                .operations
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. }))
+        assert!(!graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. }
+                )
+            })
         }));
     }
 
@@ -911,10 +823,15 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
         }));
         assert!(graph.blocks.iter().any(|block| {
-            block
-                .operations
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["ll_arraycopy"]
+                )
+            })
         }));
         assert!(is_getslice_rangeto(&SpaceOperation {
             result: Some(Variable::new()),
@@ -951,10 +868,15 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
         }));
         assert!(graph.blocks.iter().any(|block| {
-            block
-                .operations
-                .iter()
-                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["ll_arraycopy"]
+                )
+            })
         }));
         assert!(graph.blocks.iter().any(|block| {
             block
@@ -1096,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_is_minted_once_and_is_not_a_candidate() {
+    fn the_helper_is_minted_once_and_is_a_candidate() {
         use crate::codewriter::call::CallKind;
         let mut cc = CallControl::new();
         let first = listslice_startonly_path(&mut cc, &ValueType::Ref(None), Some("objref"));
@@ -1115,11 +1037,12 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        assert_eq!(cc.guess_call_kind(&call), CallKind::Residual);
+        // Loop-free helper: `look_inside_graph` admits it, so Regular.
+        assert_eq!(cc.guess_call_kind(&call), CallKind::Regular);
     }
 
     #[test]
-    fn minusone_helper_is_minted_once_and_is_not_a_candidate() {
+    fn minusone_helper_is_minted_once_and_is_a_candidate() {
         use crate::codewriter::call::CallKind;
         let mut cc = CallControl::new();
         let first = listslice_minusone_path(&mut cc, &ValueType::Ref(None), Some("objref"));
@@ -1138,7 +1061,7 @@ mod tests {
                 result_ty: ValueType::Ref(None),
             },
         };
-        assert_eq!(cc.guess_call_kind(&call), CallKind::Residual);
+        assert_eq!(cc.guess_call_kind(&call), CallKind::Regular);
         assert!(is_getslice_minusone(&SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::Call {
