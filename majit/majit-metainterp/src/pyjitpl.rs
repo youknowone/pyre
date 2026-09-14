@@ -3396,8 +3396,20 @@ impl<M: Clone> MetaInterp<M> {
     /// rjitlog.py `JitLogger.start_new_trace`: increment even when the
     /// binary log is off. `is_bridge` is true when compile.py passes a
     /// `faildescr` (`compile_trace` / `compile_retrace`).
-    fn jitlog_start_new_trace(&mut self, is_bridge: bool, descr_or_entry: u64) {
-        self.jitlog_trace_id = crate::rjitlog::start_new_trace(is_bridge, descr_or_entry, "");
+    ///
+    /// `jd_name` is `jitdriver_sd.jitdriver.name` only on
+    /// `compile.py compile_trace`; `compile_loop` / `compile_retrace`
+    /// leave it empty.
+    fn jitlog_start_new_trace(&mut self, is_bridge: bool, descr_or_entry: u64, jd_name: &str) {
+        self.jitlog_trace_id = crate::rjitlog::start_new_trace(is_bridge, descr_or_entry, jd_name);
+    }
+
+    /// `compile.py compile_trace`: `jd_name=jitdriver_sd.jitdriver.name`.
+    fn jitlog_jd_name(&self) -> String {
+        self.active_jitdriver_sd
+            .and_then(|idx| self.staticdata.jitdrivers_sd.get(idx))
+            .map(|jd| jd.name.clone())
+            .unwrap_or_else(|| "jitdriver".into())
     }
 
     /// rjitlog.py `JitLogger.trace_aborted`. Binary abort marker only;
@@ -7303,8 +7315,9 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
         // compile_retrace is a separate entry and increments itself.
+        // compile_loop does not pass jd_name.
         if self.partial_trace.is_none() {
-            self.jitlog_start_new_trace(false, 0);
+            self.jitlog_start_new_trace(false, 0, "");
         }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
@@ -9094,6 +9107,9 @@ impl<M: Clone> MetaInterp<M> {
             .map(|b| std::sync::Arc::as_ptr(&b.source_descr) as *const () as u64)
             .or_else(|| entry_bridge.as_ref().map(|(key, _)| *key))
             .unwrap_or(green_key);
+        // compile.py compile_trace: jd_name=jitdriver_sd.jitdriver.name.
+        // Capture before `ctx` so the later field write stays disjoint.
+        let jd_name = self.jitlog_jd_name();
         let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
@@ -9136,7 +9152,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // compile.py compile_trace: start_new_trace after tracing_done.
         // Field write so it does not fight the live `ctx` borrow.
-        self.jitlog_trace_id = crate::rjitlog::start_new_trace(true, descr_id, "");
+        self.jitlog_trace_id = crate::rjitlog::start_new_trace(true, descr_id, &jd_name);
 
         // Keep the recorded operations (including JUMP) alive while the
         // recorder is cut below. `compile.py compile_trace` hands the live
@@ -9395,7 +9411,8 @@ impl<M: Clone> MetaInterp<M> {
             .bridge_info()
             .map(|b| std::sync::Arc::as_ptr(&b.source_descr) as *const () as u64)
             .unwrap_or(0);
-        self.jitlog_start_new_trace(true, descr_id);
+        // compile.py compile_retrace does not pass jd_name.
+        self.jitlog_start_new_trace(true, descr_id, "");
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -10680,7 +10697,9 @@ impl<M: Clone> MetaInterp<M> {
             self.pending_abort_permanent = false;
             return Err(SwitchToBlackhole::giveup());
         }
-        self.jitlog_start_new_trace(true, green_key);
+        // compile.py compile_trace: jd_name=jitdriver_sd.jitdriver.name.
+        let jd_name = self.jitlog_jd_name();
+        self.jitlog_start_new_trace(true, green_key, &jd_name);
         // Snapshots live on TraceCtx; rebuild the TreeLoop with them so
         // downstream consumers (`trace.snapshots`) still observe the
         // captured resumedata. `recorder.get_trace()` on its own returns
@@ -11266,6 +11285,8 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.snapshot_frame_pcs = snapshot_frame_pcs;
 
         // compile.py SimpleCompileData.optimize_trace → MARK_TRACE + optimize_loop.
+        // compile_simple_loop / _create_segmented_trace_and_blackhole do
+        // not call start_new_trace; they reuse the caller's tid (or 0).
         let optimize_start = Instant::now();
         let optimize_result = simple_data.optimize_trace(self.jitlog_trace_id, |_| {
             optimizer.optimize_with_constants_and_inputs_oprc(
@@ -21704,6 +21725,7 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let driver = crate::jitdriver::JitDriverStaticData {
             index: None,
+            name: "jitdriver".into(),
             vars: vec![],
             virtualizable: None,
             flat_entry: None,

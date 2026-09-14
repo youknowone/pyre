@@ -7513,6 +7513,8 @@ impl PyreJitState {
             pypyjit_driver_layout::PYPYJIT_RED_VARS.to_vec(),
             Some(pypyjit_driver_layout::PYPYJIT_VIRTUALIZABLE),
         );
+        // interp_jit.py pypyjitdriver = PyPyJitDriver(name='pypyjit', ...)
+        descriptor.name = "pypyjit".into();
         descriptor.is_recursive = true;
         // The portal's frames are numbered in the CodeObject-keyed runtime
         // store this crate grows, so name that decoder on the driver rather

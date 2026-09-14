@@ -1239,6 +1239,10 @@ pub struct JitDriverStaticData {
     /// through portal-frame bookkeeping plus `JitCellToken` ownership.
     /// It stays `None` until `register_jitdriver_sd` assigns the slot.
     pub index: Option<usize>,
+    /// `rlib/jit.py JitDriver.name`. `compile.py compile_trace` writes
+    /// this as `jd_name` on `MARK_START_TRACE`. Default is the upstream
+    /// constructor default `'jitdriver'`.
+    pub name: String,
     /// All variables in declaration order.
     pub vars: Vec<JitDriverVar>,
     /// Optional name of the virtualizable red variable.
@@ -1460,6 +1464,7 @@ impl JitDriverStaticData {
             .collect();
         let mut sd = JitDriverStaticData {
             index: None,
+            name: "jitdriver".into(),
             vars,
             virtualizable: virtualizable.map(str::to_string),
             flat_entry: None,

@@ -148,16 +148,9 @@ where
     for op in ops {
         let op = op.borrow();
         if op.opcode == OpCode::DebugMergePoint {
-            // rjitlog.py LogTrace.write: DEBUG_MERGE_POINT is not a RESOP.
-            // encode_debug_info returns when get_location is unset; write
-            // MARK_MERGE_POINT with the raw args when we have no locator.
-            let loc = op
-                .getarglist()
-                .iter()
-                .map(|arg| memo.operand(arg))
-                .collect::<Vec<_>>()
-                .join(",");
-            write_marked(&mut state, MARK_MERGE_POINT, &encode_str(&loc));
+            // rjitlog.py LogTrace.encode_debug_info: skip when
+            // get_location is unset. Do not emit MARK_MERGE_POINT
+            // without MARK_INIT_MERGE_POINT.
             continue;
         }
         write_resop(&mut state, &mut memo, op);
@@ -192,16 +185,18 @@ impl VarMemo {
     }
 
     fn op_result(&mut self, op: &Op) -> String {
-        if op.type_ == Type::Void {
-            return String::new();
-        }
+        // rjitlog.py var_to_str: void / unknown type is `?`, and the
+        // memo slot is still allocated.
         let kind = match op.type_ {
             Type::Int => b'i',
             Type::Ref => b'p',
             Type::Float => b'f',
-            Type::Void => b'v',
+            Type::Void => b'?',
         };
         let id = self.assign(kind, op.pos().get().raw() as u64);
+        if op.type_ == Type::Void {
+            return "?".into();
+        }
         format!("{}{id}", kind as char)
     }
 
@@ -211,18 +206,31 @@ impl VarMemo {
             return "-".into();
         }
         if let Some(value) = arg.const_value() {
+            // rjitlog.py var_to_str: ConstInt / ConstFloat / ConstPtr
+            // allocate a memo slot before formatting. Value::Void is
+            // not an upstream constant; do not consume a slot.
             return match value {
-                Value::Int(v) => v.to_string(),
-                Value::Float(v) => v.to_string(),
-                Value::Ref(r) if r.is_null() => "ConstPtr(null)".into(),
+                Value::Int(v) => {
+                    let _ = self.assign(b'I', v as u64);
+                    v.to_string()
+                }
+                Value::Float(v) => {
+                    let _ = self.assign(b'F', v.to_bits());
+                    v.to_string()
+                }
+                Value::Ref(r) if r.is_null() => {
+                    let _ = self.assign(b'P', 0);
+                    "ConstPtr(null)".into()
+                }
                 Value::Ref(r) => {
-                    let id = self.assign(b'c', r.0 as u64);
+                    let id = self.assign(b'P', r.0 as u64);
                     format!("ConstPtr(ptr{id})")
                 }
                 Value::Void => "None".into(),
             };
         }
         if arg.is_null_ref() {
+            let _ = self.assign(b'P', 0);
             return "ConstPtr(null)".into();
         }
         if arg.is_inputarg() {
@@ -261,16 +269,21 @@ fn write_resop(state: &mut JitLogState, memo: &mut VarMemo, op: &Op) {
         MARK_RESOP
     };
     let mut line = encode_le_16bit(op.opcode.as_u16()).to_vec();
+    // rjitlog.py encode_op: memoize arguments, then the result.
+    let arg_strs: Vec<String> = op
+        .getarglist()
+        .iter()
+        .map(|arg| memo.operand(arg))
+        .collect();
     let mut body = memo.op_result(op);
-    for arg in op.getarglist() {
-        if !body.is_empty() {
-            body.push(',');
-        }
-        body.push_str(&memo.operand(&arg));
+    for arg in arg_strs {
+        body.push(',');
+        body.push_str(&arg);
     }
     if let Some(ref d) = descr {
+        // rjitlog.py encode_op: descr.repr_of_descr().
         body.push(',');
-        body.push_str(&format!("{d:?}"));
+        body.push_str(&d.repr());
     }
     line.extend_from_slice(&encode_str(&body));
     if let Some(d) = descr {
@@ -328,6 +341,7 @@ mod tests {
         assert_eq!(MARK_TRACE, 0x17);
         assert_eq!(MARK_START_TRACE, 0x1b);
         assert_eq!(MARK_JITLOG_HEADER, 0x1e);
+        assert_eq!(MARK_MERGE_POINT, 0x1f);
         assert_eq!(MARK_ABORT_TRACE, 0x21);
     }
 
@@ -359,5 +373,33 @@ mod tests {
         assert_eq!(memo.inputarg(&i), "i0");
         assert_eq!(memo.inputarg(&p), "p1");
         assert_eq!(memo.inputarg(&i), "i0");
+    }
+
+    #[test]
+    fn void_result_is_question_mark() {
+        let mut memo = VarMemo::default();
+        let op = Op::new(OpCode::Finish, &[]);
+        assert_eq!(memo.op_result(&op), "?");
+    }
+
+    #[test]
+    fn const_operands_reserve_a_memo_slot() {
+        let mut memo = VarMemo::default();
+        assert_eq!(memo.operand(&Operand::none()), "-");
+        assert_eq!(memo.operand(&Operand::const_from_value(Value::Int(5))), "5");
+        assert_eq!(
+            memo.operand(&Operand::const_from_value(Value::Ref(majit_ir::GcRef(
+                0x1000
+            )))),
+            "ConstPtr(ptr1)"
+        );
+        // ConstInt reserved slot 0; ConstPtr reserved slot 1; the next
+        // named box is 2. Value::Void must not steal a slot.
+        assert_eq!(
+            memo.operand(&Operand::const_from_value(Value::Void)),
+            "None"
+        );
+        let i = InputArg::new_int(0);
+        assert_eq!(memo.inputarg(&i), "i2");
     }
 }
