@@ -3112,9 +3112,7 @@ impl WasmBackend {
             pending
                 .borrow()
                 .iter()
-                .filter(|(_, item)| {
-                    Arc::ptr_eq(&item.owner, &owner) && item.remap.is_some()
-                })
+                .filter(|(_, item)| Arc::ptr_eq(&item.owner, &owner) && item.remap.is_some())
                 .map(|(&id, _)| id)
                 .collect()
         });
@@ -3203,6 +3201,9 @@ impl WasmBackend {
             return;
         };
         let cells_base = source_loop.bridge_cells_base.get();
+        if (source_fail_index as usize) >= source_loop.num_guard_cells.get() {
+            return;
+        }
         let Some(slot) = source_loop
             .bridge_slots
             .borrow()
@@ -3264,11 +3265,9 @@ impl WasmBackend {
             let mut still = Vec::new();
             for (mut region, remap) in leftover {
                 if let Some((parent_trace_id, parent_fail_index)) = remap {
-                    let Some(idx) = merged_region_fail_index(
-                        &candidate,
-                        parent_trace_id,
-                        parent_fail_index,
-                    ) else {
+                    let Some(idx) =
+                        merged_region_fail_index(&candidate, parent_trace_id, parent_fail_index)
+                    else {
                         still.push((region, remap));
                         continue;
                     };
@@ -3284,10 +3283,7 @@ impl WasmBackend {
                     continue;
                 }
                 region.outside_loop = region.outside_loop
-                    || codegen::source_guard_precedes_loop_label(
-                        &candidate.ops,
-                        source_fail_index,
-                    )
+                    || codegen::source_guard_precedes_loop_label(&candidate.ops, source_fail_index)
                     || candidate.inlined_bridges.iter().any(|r| r.outside_loop);
                 if region.outside_loop {
                     // A foreign JUMP has no owner LABEL to have crossed;
@@ -3341,7 +3337,16 @@ impl WasmBackend {
         // them before reemit so the fresh array cannot replay a contradictory
         // slot — the bridge on the stack right now finishes its pass either
         // way, and nothing enters it again.
+        //
+        // A remapped child compiled as `not_direct` stores a merged-stream
+        // ordinal. That index is in the live owner array only after its
+        // parent region is already installed. The same-batch case — parent
+        // and child folded into this rebuild — lands past
+        // `num_guard_cells`, which is the live array. `register_pending_inline`
+        // already refuses to aim the trip probe at an owner cell then;
+        // writing one here would store past the array into the guest heap.
         let source_cells_base = source_loop.bridge_cells_base.get();
+        let live_cell_count = source_loop.num_guard_cells.get();
         let attached_fail_indices: Vec<u32> = candidate.inlined_bridges
             [candidate.inlined_bridges.len() - attached..]
             .iter()
@@ -3349,6 +3354,9 @@ impl WasmBackend {
             .collect();
         let mut old_bridge_slots = Vec::new();
         for &source_fail_index in &attached_fail_indices {
+            if (source_fail_index as usize) >= live_cell_count {
+                continue;
+            }
             if let Some(slot) = source_loop
                 .bridge_slots
                 .borrow_mut()
