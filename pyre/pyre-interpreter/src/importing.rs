@@ -664,7 +664,6 @@ pub fn install_builtin_modules() {
     }
 
     // Core pyre modules backed by `interpleveldefs` tables.
-    pyre_install_module!(math);
     pyre_install_module!(time);
     pyre_install_module!(sys);
     // `moduledef.py applevel_name = '_operator'` — the interp-level table
@@ -753,12 +752,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
 
     pyre_install_module!(atexit);
-    // faulthandler installs host signal handlers and writes tracebacks to a raw
-    // fd, neither of which is mediated; like the other host-access modules below
-    // the sandbox interpreter omits it (PyPy keeps it out of default_modules
-    // under translation.sandbox).
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    pyre_install_module!(faulthandler);
 
     // Host-access modules — network (`_socket`), arbitrary FFI (`_ctypes`),
     // subprocess/`fork`+`exec` (`_posixsubprocess`), shared memory
@@ -829,16 +822,10 @@ pub fn install_builtin_modules() {
         crate::module::array::init_array_module,
         crate::module::array::startup_array_module,
     );
-    register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_queue", crate::module::_queue::init);
     register_builtin_module("_types", crate::module::_types::init);
     register_builtin_module("_json", crate::module::_json::init);
     register_builtin_module("_tokenize", crate::module::_tokenize::init);
-    // `_scproxy` is built only on macOS, and `urllib.request` reaches it only
-    // under `sys.platform == 'darwin'`. Registering it anywhere else puts a
-    // name in `sys.builtin_module_names` that no host has.
-    #[cfg(target_os = "macos")]
-    register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
@@ -1550,40 +1537,6 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ns,
         "_get_object_traceback",
         crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
-    );
-    Ok(())
-}
-
-/// `_scproxy` — the macOS SystemConfiguration proxy probe that
-/// `urllib.request.getproxies_macosx_sysconf` / `proxy_bypass_macosx_sysconf`
-/// import.  Report "no system proxy configured" so the import succeeds and
-/// proxy resolution yields an empty mapping.
-#[cfg(target_os = "macos")]
-fn init_scproxy(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
-        "_get_proxies",
-        crate::make_builtin_function("_get_proxies", |_| Ok(pyre_object::w_dict_new())),
-    );
-    crate::module_ns_store(
-        ns,
-        "_get_proxy_settings",
-        crate::make_builtin_function("_get_proxy_settings", |_| {
-            // The `dict` moves across the allocations each store makes.
-            let roots = pyre_object::gc_roots::push_roots();
-            let d_slot = roots.base();
-            let _ = roots.pin_root(pyre_object::w_dict_new());
-            unsafe {
-                let w_key = pyre_object::w_str_new("exclude_simple");
-                let w_value = pyre_object::w_bool_from(false);
-                pyre_object::w_dict_store(roots.get(d_slot), w_key, w_value);
-                let key_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = roots.pin_root(pyre_object::w_str_new("exceptions"));
-                let w_value = pyre_object::w_list_new(Vec::new());
-                pyre_object::w_dict_store(roots.get(d_slot), roots.get(key_slot), w_value);
-            }
-            Ok(roots.get(d_slot))
-        }),
     );
     Ok(())
 }

@@ -5783,7 +5783,9 @@ mod tests {
     fn jit_trace_fnaddrs_covers_hand_written_csv_dialect_type_object() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         assert!(
-            bindings.contains_key("pyre_interpreter::module::_csv::dialect_class::type_object"),
+            bindings.contains_key("pyre_module::module::_csv::dialect_class::type_object")
+                || bindings
+                    .contains_key("pyre_interpreter::module::_csv::dialect_class::type_object"),
             "hand-written _csv::dialect_class::type_object must publish a residual fnaddr",
         );
         assert!(

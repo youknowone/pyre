@@ -16,7 +16,7 @@
 use pyre_object::PyObjectRef;
 use pyre_object::gc_roots;
 
-use crate::PyError;
+use pyre_interpreter::PyError;
 
 // `interp_csv.py` quoting styles, extended with the 3.14 additions.
 const QUOTE_MINIMAL: i64 = 0;
@@ -61,9 +61,9 @@ struct DialectConfig {
 fn csv_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let msg = msg.into();
     let mut err = PyError::runtime_error(msg.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("_csv.Error") {
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") {
         let args = [cls, pyre_object::w_str_from_wtf8_managed(msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
     }
@@ -99,14 +99,14 @@ fn get_codepoint(
         return Err(PyError::type_error(format!(
             "\"{name}\" must be {}, not {}",
             codepoint_kind(can_be_none),
-            unsafe { crate::baseobjspace::getfulltypename(w_src) },
+            unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
         )));
     }
     if !unsafe { pyre_object::is_str(w_src) } {
         return Err(PyError::type_error(format!(
             "\"{name}\" must be {}, not {}",
             codepoint_kind(can_be_none),
-            unsafe { crate::baseobjspace::getfulltypename(w_src) },
+            unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
         )));
     }
     let s = unsafe { pyre_object::w_str_get_value(w_src) };
@@ -128,7 +128,7 @@ fn get_bool(w_src: PyObjectRef, default: bool) -> Result<bool, PyError> {
     if w_src.is_null() {
         return Ok(default);
     }
-    crate::baseobjspace::is_true(w_src)
+    pyre_interpreter::baseobjspace::is_true(w_src)
 }
 
 /// `_get_int` — absent → default; a non-int (including Python `None`)
@@ -153,7 +153,7 @@ fn get_str(w_src: PyObjectRef, default: &str, name: &str) -> Result<String, PyEr
     if !unsafe { pyre_object::is_str(w_src) } {
         return Err(PyError::type_error(format!(
             "\"{name}\" must be a string, not {}",
-            unsafe { crate::baseobjspace::getfulltypename(w_src) },
+            unsafe { pyre_interpreter::baseobjspace::getfulltypename(w_src) },
         )));
     }
     Ok(unsafe { pyre_object::w_str_get_value(w_src) }.to_string())
@@ -217,15 +217,17 @@ fn valid_quoting(q: i64) -> bool {
 /// `_fetch` — `space.findattr`; a missing attribute (AttributeError) is the
 /// "not provided" marker (`PY_NULL`), other errors propagate.
 fn fetch(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, PyError> {
-    match crate::baseobjspace::getattr_str(obj, name) {
+    match pyre_interpreter::baseobjspace::getattr_str(obj, name) {
         Ok(v) => Ok(v),
-        Err(e) if e.kind == crate::PyErrorKind::AttributeError => Ok(pyre_object::PY_NULL),
+        Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => {
+            Ok(pyre_object::PY_NULL)
+        }
         Err(e) => Err(e),
     }
 }
 
 fn is_csv_dialect(obj: PyObjectRef) -> Result<bool, PyError> {
-    crate::baseobjspace::isinstance(obj, dialect_class::type_object())
+    pyre_interpreter::baseobjspace::isinstance(obj, dialect_class::type_object())
 }
 
 enum BuildOutcome {
@@ -356,7 +358,7 @@ fn config_to_dialect(cfg: &DialectConfig) -> Result<PyObjectRef, PyError> {
     let _ = gc_roots::pin_root(d);
     let set = |name: &str, val: PyObjectRef| -> Result<(), PyError> {
         let d = gc_roots::shadow_stack_get(slot);
-        crate::baseobjspace::setattr_str(d, name, val)?;
+        pyre_interpreter::baseobjspace::setattr_str(d, name, val)?;
         Ok(())
     };
     set("_csv_delimiter", char_obj(cfg.delimiter))?;
@@ -380,7 +382,7 @@ fn config_to_dialect(cfg: &DialectConfig) -> Result<PyObjectRef, PyError> {
 }
 
 fn read_char_field(d: PyObjectRef, name: &str) -> Result<Option<u32>, PyError> {
-    let v = crate::baseobjspace::getattr_str(d, name)?;
+    let v = pyre_interpreter::baseobjspace::getattr_str(d, name)?;
     if unsafe { pyre_object::is_none(v) } {
         return Ok(None);
     }
@@ -401,15 +403,17 @@ fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
     let delimiter = read_char_field(d, "_csv_delimiter")?.unwrap_or(',' as u32);
     let quotechar = read_char_field(d, "_csv_quotechar")?;
     let escapechar = read_char_field(d, "_csv_escapechar")?;
-    let doublequote =
-        crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(d, "_csv_doublequote")?)?;
-    let skipinitialspace = crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(
-        d,
-        "_csv_skipinitialspace",
-    )?)?;
-    let strict = crate::baseobjspace::is_true(crate::baseobjspace::getattr_str(d, "_csv_strict")?)?;
+    let doublequote = pyre_interpreter::baseobjspace::is_true(
+        pyre_interpreter::baseobjspace::getattr_str(d, "_csv_doublequote")?,
+    )?;
+    let skipinitialspace = pyre_interpreter::baseobjspace::is_true(
+        pyre_interpreter::baseobjspace::getattr_str(d, "_csv_skipinitialspace")?,
+    )?;
+    let strict = pyre_interpreter::baseobjspace::is_true(
+        pyre_interpreter::baseobjspace::getattr_str(d, "_csv_strict")?,
+    )?;
     let quoting = {
-        let v = crate::baseobjspace::getattr_str(d, "_csv_quoting")?;
+        let v = pyre_interpreter::baseobjspace::getattr_str(d, "_csv_quoting")?;
         if unsafe { pyre_object::is_int(v) } {
             unsafe { pyre_object::w_int_get_value(v) }
         } else {
@@ -417,7 +421,7 @@ fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
         }
     };
     let lineterminator = {
-        let v = crate::baseobjspace::getattr_str(d, "_csv_lineterminator")?;
+        let v = pyre_interpreter::baseobjspace::getattr_str(d, "_csv_lineterminator")?;
         if unsafe { pyre_object::is_str(v) } {
             unsafe { pyre_object::w_str_get_value(v) }.to_string()
         } else {
@@ -463,7 +467,7 @@ static CSV_DIALECTS: std::sync::atomic::AtomicPtr<pyre_object::PyObject> =
 ///
 /// Runs from the collector inside the stop-the-world window, so no publish can
 /// interleave between this load and the store that forwards it.
-pub(crate) fn walk_csv_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+pub fn walk_csv_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut dialects = CSV_DIALECTS.load(std::sync::atomic::Ordering::Acquire);
     if dialects.is_null() {
         return;
@@ -508,7 +512,7 @@ mod dialect_class {
     macro_rules! dialect_getter {
         ($fn:ident, $slot:literal) => {
             fn $fn(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-                crate::baseobjspace::getattr_str(args[1], $slot)
+                pyre_interpreter::baseobjspace::getattr_str(args[1], $slot)
             }
         };
     }
@@ -546,12 +550,12 @@ mod dialect_class {
         // Process-global immortal type object (see `make_builtin_type`).
         static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *CELL.get_or_init(|| {
-            let tp = crate::typedef::make_builtin_type("_csv.Dialect", |ns| {
+            let tp = pyre_interpreter::typedef::make_builtin_type("_csv.Dialect", |ns| {
                 unsafe {
                     pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                         ns,
                         "__new__",
-                        crate::typedef::make_new_descr(dialect_new),
+                        pyre_interpreter::typedef::make_new_descr(dialect_new),
                     )
                 };
                 // `dialect_new` does all the work; a no-op `__init__`
@@ -561,7 +565,9 @@ mod dialect_class {
                     pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                         ns,
                         "__init__",
-                        crate::make_builtin_function("__init__", |_| Ok(pyre_object::w_none())),
+                        pyre_interpreter::make_builtin_function("__init__", |_| {
+                            Ok(pyre_object::w_none())
+                        }),
                     )
                 };
                 // `W_Dialect.reduce_ex_w` — dialects are not picklable
@@ -570,7 +576,7 @@ mod dialect_class {
                     pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                         ns,
                         "__reduce_ex__",
-                        crate::make_builtin_function("__reduce_ex__", |_| {
+                        pyre_interpreter::make_builtin_function("__reduce_ex__", |_| {
                             Err(PyError::type_error("can't pickle _csv.Dialect objects"))
                         }),
                     )
@@ -579,7 +585,7 @@ mod dialect_class {
                     pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                         ns,
                         "__reduce__",
-                        crate::make_builtin_function("__reduce__", |_| {
+                        pyre_interpreter::make_builtin_function("__reduce__", |_| {
                             Err(PyError::type_error("can't pickle _csv.Dialect objects"))
                         }),
                     )
@@ -601,8 +607,8 @@ mod dialect_class {
                         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                             ns,
                             name,
-                            crate::typedef::make_getset_descriptor_named(
-                                crate::make_builtin_function(name, getter),
+                            pyre_interpreter::typedef::make_getset_descriptor_named(
+                                pyre_interpreter::make_builtin_function(name, getter),
                                 name,
                             ),
                         )
@@ -611,7 +617,7 @@ mod dialect_class {
             });
             // CPython 3.14 Modules/_csv.c:csv_exec uses
             // PyType_FromModuleAndSpec; Dialect_Type_spec is immutable.
-            crate::typedef::mark_cpython_heap_type(tp, true);
+            pyre_interpreter::typedef::mark_cpython_heap_type(tp, true);
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
             tp as usize
         }) as PyObjectRef
@@ -660,18 +666,18 @@ fn save_field(
 }
 
 fn to_float(w_str: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let float_type = crate::typedef::gettypefor(&pyre_object::FLOAT_TYPE)
+    let float_type = pyre_interpreter::typedef::gettypefor(&pyre_object::FLOAT_TYPE)
         .ok_or_else(|| PyError::runtime_error("float type unavailable"))?;
-    crate::call::call_function_impl_result(float_type.as_ptr(), &[w_str])
+    pyre_interpreter::call::call_function_impl_result(float_type.as_ptr(), &[w_str])
 }
 
 /// `W_Reader.next_w` — parse the next CSV record from the underlying line
 /// iterator. Re-entering the reader from its own line iterator (gh-145105) is
 /// rejected with a `_csv.Error`.
 fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let reading = crate::baseobjspace::getattr_str(self_obj, "_reading")
+    let reading = pyre_interpreter::baseobjspace::getattr_str(self_obj, "_reading")
         .ok()
-        .map(|v| crate::baseobjspace::is_true(v).unwrap_or(false))
+        .map(|v| pyre_interpreter::baseobjspace::is_true(v).unwrap_or(false))
         .unwrap_or(false);
     if reading {
         return Err(csv_error("reader is already iterating".to_string()));
@@ -679,7 +685,7 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let _roots = gc_roots::push_roots();
     let self_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(self_obj);
-    crate::baseobjspace::setattr_str(
+    pyre_interpreter::baseobjspace::setattr_str(
         gc_roots::shadow_stack_get(self_slot),
         "_reading",
         pyre_object::w_bool_from(true),
@@ -688,7 +694,7 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     // FINALLY reset of the re-entrancy guard. The inner `result` must be
     // returned/propagated unchanged, so a failure of this reset write is
     // deliberately ignored rather than masking the inner exception.
-    if let Err(_e) = crate::baseobjspace::setattr_str(
+    if let Err(_e) = pyre_interpreter::baseobjspace::setattr_str(
         gc_roots::shadow_stack_get(self_slot),
         "_reading",
         pyre_object::w_bool_from(false),
@@ -697,11 +703,11 @@ fn reader_next_impl(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 }
 
 fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let dialect_obj = crate::baseobjspace::getattr_str(self_obj, "dialect")?;
+    let dialect_obj = pyre_interpreter::baseobjspace::getattr_str(self_obj, "dialect")?;
     let cfg = derive_config(dialect_obj)?;
     let limit = FIELD_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
     let mut line_num = {
-        let v = crate::baseobjspace::getattr_str(self_obj, "line_num")?;
+        let v = pyre_interpreter::baseobjspace::getattr_str(self_obj, "line_num")?;
         if unsafe { pyre_object::is_int(v) } {
             unsafe { pyre_object::w_int_get_value(v) }
         } else {
@@ -711,7 +717,10 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 
     let _roots = gc_roots::push_roots();
     let iter_slot = gc_roots::shadow_stack_len();
-    let _ = gc_roots::pin_root(crate::baseobjspace::getattr_str(self_obj, "_iterator")?);
+    let _ = gc_roots::pin_root(pyre_interpreter::baseobjspace::getattr_str(
+        self_obj,
+        "_iterator",
+    )?);
     let self_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(self_obj);
 
@@ -723,7 +732,7 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 
     'lines: loop {
         let w_iter = gc_roots::shadow_stack_get(iter_slot);
-        let line = match crate::baseobjspace::next(w_iter) {
+        let line = match pyre_interpreter::baseobjspace::next(w_iter) {
             Ok(l) => l,
             Err(e) if e.matches_stop_iteration() => {
                 if state != START_RECORD
@@ -751,7 +760,7 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
         if !unsafe { pyre_object::is_str(line) } {
             return Err(csv_error(format!(
                 "line {line_num}: iterator should return strings, not {} (the file should be opened in text mode)",
-                unsafe { crate::baseobjspace::getfulltypename(line) },
+                unsafe { pyre_interpreter::baseobjspace::getfulltypename(line) },
             )));
         }
         let s = unsafe { pyre_object::w_str_get_value(line) };
@@ -865,7 +874,11 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
 
     let self_obj = gc_roots::shadow_stack_get(self_slot);
-    crate::baseobjspace::setattr_str(self_obj, "line_num", pyre_object::w_int_new(line_num))?;
+    pyre_interpreter::baseobjspace::setattr_str(
+        self_obj,
+        "line_num",
+        pyre_object::w_int_new(line_num),
+    )?;
 
     let result = pyre_object::listobject::w_list_new(Vec::new());
     let result_slot = gc_roots::shadow_stack_len();
@@ -899,7 +912,7 @@ fn reader_next_inner(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
 mod reader_class {
     use super::*;
 
-    crate::py_class! {
+    pyre_interpreter::py_class! {
         "_csv.reader",
         methods: {
             fn __iter__(self_obj: PyObjectRef) -> PyObjectRef {
@@ -933,15 +946,16 @@ fn writer_writerow_impl(
     self_obj: PyObjectRef,
     w_fields: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
-    let dialect_obj = crate::baseobjspace::getattr_str(self_obj, "dialect")?;
+    let dialect_obj = pyre_interpreter::baseobjspace::getattr_str(self_obj, "dialect")?;
     let cfg = derive_config(dialect_obj)?;
-    let w_filewrite = crate::baseobjspace::getattr_str(self_obj, "_write")?;
+    let w_filewrite = pyre_interpreter::baseobjspace::getattr_str(self_obj, "_write")?;
 
-    let row = match crate::builtins::collect_iterable(w_fields) {
+    let row = match pyre_interpreter::builtins::collect_iterable(w_fields) {
         Ok(r) => r,
-        Err(e) if e.kind == crate::PyErrorKind::TypeError => {
-            let r = unsafe { crate::display::py_repr_wtf8(w_fields) }.unwrap_or_default();
-            return Err(csv_error(crate::display::wtf8_format!(
+        Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
+            let r =
+                unsafe { pyre_interpreter::display::py_repr_wtf8(w_fields) }.unwrap_or_default();
+            return Err(csv_error(pyre_interpreter::wtf8_format!(
                 "iterable expected, not ",
                 r
             )));
@@ -973,14 +987,14 @@ fn writer_writerow_impl(
         let field = if unsafe { pyre_object::is_none(w_field) } {
             rustpython_wtf8::Wtf8Buf::new()
         } else if unsafe { pyre_object::is_float(w_field) } {
-            unsafe { crate::display::py_repr_wtf8(w_field) }?
+            unsafe { pyre_interpreter::display::py_repr_wtf8(w_field) }?
         } else {
-            unsafe { crate::display::py_str_wtf8(w_field) }?
+            unsafe { pyre_interpreter::display::py_str_wtf8(w_field) }?
         };
         let w_field = pyre_object::gc_roots::shadow_stack_get(row_base + i);
 
         let mut quoted = match cfg.quoting {
-            QUOTE_NONNUMERIC => crate::baseobjspace::float_w(w_field).is_err(),
+            QUOTE_NONNUMERIC => pyre_interpreter::baseobjspace::float_w(w_field).is_err(),
             QUOTE_ALL => true,
             QUOTE_MINIMAL => {
                 let mut q = false;
@@ -1079,7 +1093,7 @@ fn writer_writerow_impl(
     rec.push_str(&cfg.lineterminator);
     let rec_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(rec));
-    crate::call::call_function_impl_result(
+    pyre_interpreter::call::call_function_impl_result(
         pyre_object::gc_roots::shadow_stack_get(write_slot),
         &[pyre_object::gc_roots::shadow_stack_get(rec_slot)],
     )
@@ -1090,7 +1104,7 @@ fn writer_writerows_impl(
     self_obj: PyObjectRef,
     w_seqseq: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
-    let it = crate::baseobjspace::iter(w_seqseq)?;
+    let it = pyre_interpreter::baseobjspace::iter(w_seqseq)?;
     let _roots = gc_roots::push_roots();
     let it_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(it);
@@ -1098,7 +1112,7 @@ fn writer_writerows_impl(
     let _ = gc_roots::pin_root(self_obj);
     loop {
         let it = gc_roots::shadow_stack_get(it_slot);
-        let row = match crate::baseobjspace::next(it) {
+        let row = match pyre_interpreter::baseobjspace::next(it) {
             Ok(r) => r,
             Err(e) if e.matches_stop_iteration() => break,
             Err(e) => return Err(e),
@@ -1111,7 +1125,7 @@ fn writer_writerows_impl(
 mod writer_class {
     use super::*;
 
-    crate::py_class! {
+    pyre_interpreter::py_class! {
         "_csv.writer",
         methods: {
             fn writerow(self_obj: PyObjectRef, row: PyObjectRef) -> Result<PyObjectRef, PyError> {
@@ -1191,7 +1205,7 @@ fn field_size_limit_fn(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(pyre_object::w_int_new(old))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_csv",
     interpleveldefs: {
         "Dialect" => dialect_class::type_object(),
@@ -1219,7 +1233,7 @@ crate::py_module! {
             #[default(pyre_object::PY_NULL)] skipinitialspace: PyObjectRef,
             #[default(pyre_object::PY_NULL)] strict: PyObjectRef,
         ) -> Result<PyObjectRef, PyError> {
-            let w_iter = crate::baseobjspace::iter(iterable)?;
+            let w_iter = pyre_interpreter::baseobjspace::iter(iterable)?;
             let dialect_obj = resolve_dialect(
                 dialect, delimiter, doublequote, escapechar, lineterminator,
                 quotechar, quoting, skipinitialspace, strict,
@@ -1230,10 +1244,10 @@ crate::py_module! {
             let _ = gc_roots::pin_root(r);
             let _ = gc_roots::pin_root(dialect_obj);
             let _ = gc_roots::pin_root(w_iter);
-            crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "dialect", gc_roots::shadow_stack_get(slot + 1))?;
-            crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_iterator", gc_roots::shadow_stack_get(slot + 2))?;
-            crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "line_num", pyre_object::w_int_new(0))?;
-            crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_reading", pyre_object::w_bool_from(false))?;
+            pyre_interpreter::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "dialect", gc_roots::shadow_stack_get(slot + 1))?;
+            pyre_interpreter::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_iterator", gc_roots::shadow_stack_get(slot + 2))?;
+            pyre_interpreter::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "line_num", pyre_object::w_int_new(0))?;
+            pyre_interpreter::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_reading", pyre_object::w_bool_from(false))?;
             Ok(gc_roots::shadow_stack_get(slot))
         }
 
@@ -1257,9 +1271,9 @@ crate::py_module! {
             // A missing `write` attribute is a TypeError ("argument 1 must
             // have a write method"); a `write` whose access itself raises
             // (e.g. a property) propagates that error unchanged.
-            let w_write = match crate::baseobjspace::getattr_str(fileobj, "write") {
+            let w_write = match pyre_interpreter::baseobjspace::getattr_str(fileobj, "write") {
                 Ok(w) => w,
-                Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+                Err(e) if e.kind == pyre_interpreter::PyErrorKind::AttributeError => {
                     return Err(PyError::type_error("argument 1 must have a write method"));
                 }
                 Err(e) => return Err(e),
@@ -1270,8 +1284,8 @@ crate::py_module! {
             let _ = gc_roots::pin_root(w);
             let _ = gc_roots::pin_root(dialect_obj);
             let _ = gc_roots::pin_root(w_write);
-            crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "dialect", gc_roots::shadow_stack_get(slot + 1))?;
-            crate::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_write", gc_roots::shadow_stack_get(slot + 2))?;
+            pyre_interpreter::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "dialect", gc_roots::shadow_stack_get(slot + 1))?;
+            pyre_interpreter::baseobjspace::setattr_str(gc_roots::shadow_stack_get(slot), "_write", gc_roots::shadow_stack_get(slot + 2))?;
             Ok(gc_roots::shadow_stack_get(slot))
         }
 
@@ -1328,13 +1342,13 @@ crate::py_module! {
         // own `basicsize`, and a spec that does gets no managed weakref.  It
         // is therefore the one module exception class that is not
         // weak-referenceable, together with `ssl.SSLError`.
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "Error",
-            crate::builtins::make_exc_type(
+            pyre_interpreter::builtins::make_exc_type(
                 "_csv.Error",
-                crate::builtins::exc_exception_new,
-                crate::builtins::lookup_exc_class("Exception")
+                pyre_interpreter::builtins::exc_exception_new,
+                pyre_interpreter::builtins::lookup_exc_class("Exception")
                     .expect("Exception must be installed before _csv init"),
             ),
         );
@@ -1343,7 +1357,7 @@ crate::py_module! {
         // the state the accelerator reads, which is what keeps it reachable
         // once the module is not.
         let dialects = pyre_object::w_dict_new();
-        crate::module_ns_store(ns, "_dialects", dialects);
+        pyre_interpreter::module_ns_store(ns, "_dialects", dialects);
         publish_csv_dialects(dialects);
     },
 }

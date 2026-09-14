@@ -5705,14 +5705,13 @@ fn build_jit_driver_pair() -> JitDriverPair {
         );
         let mut faithful = vec![
             // (f64) -> i64
-            pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
-                as usize as i64,
-            // (f64, i64) -> f64
-            pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as usize
+            pyre_module::module::math::interp_math::jit_math_frexp_exponent as *const () as usize
                 as i64,
+            // (f64, i64) -> f64
+            pyre_module::module::math::interp_math::jit_math_ldexp_raw as *const () as usize as i64,
             // (f64, f64) -> i64
-            pyre_interpreter::module::math::interp_math::jit_math_isclose_default as *const ()
-                as usize as i64,
+            pyre_module::module::math::interp_math::jit_math_isclose_default as *const () as usize
+                as i64,
             // (i64, i64) -> f64
             pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
                 as i64,
@@ -5732,8 +5731,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ];
         // (i64) -> f64, one per float-result builtin fold.
         faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());
-        faithful
-            .extend(pyre_interpreter::module::math::interp_math::math_float_fold_helper_addrs());
+        faithful.extend(pyre_module::module::math::interp_math::math_float_fold_helper_addrs());
         faithful.extend(pyre_jit_trace::walker_float_helper_addrs());
         majit_backend_wasm::set_faithful_residual_call_addrs(&faithful);
         for addr in pyre_interpreter::jit_builtin_folds::word_fold_helper_addrs() {
@@ -5755,8 +5753,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ] {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }
-        use pyre_interpreter::module::math::interp_math as math;
         use pyre_interpreter::objspace::descroperation as desc;
+        use pyre_module::module::math::interp_math as math;
         use pyre_object::floatobject as flt;
         use pyre_object::intobject as intobj;
         use pyre_object::listobject as list;

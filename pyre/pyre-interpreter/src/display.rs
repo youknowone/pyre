@@ -150,7 +150,7 @@ unsafe fn dunder_returned_non_string(name: &str, result: PyObjectRef) -> crate::
 /// that round-trips to `val` (lowercase `nan`/`inf`, signed two-digit
 /// exponents, `.0` on integral values). Delegates to the shortest-repr
 /// formatter in `rustpython_literal::float`.
-pub(crate) fn format_float_repr(val: f64) -> String {
+pub fn format_float_repr(val: f64) -> String {
     rustpython_literal::float::to_string(val)
 }
 
@@ -1352,6 +1352,7 @@ impl<T: Wtf8Piece + ?Sized> Wtf8Piece for &T {
 /// substitutes U+FFFD for a lone surrogate — so a message naming a `repr`, a
 /// `__qualname__` or a filename silently loses it. Here the literal chunks stay
 /// `format!` calls and the WTF-8 pieces are concatenated as themselves.
+#[macro_export]
 macro_rules! wtf8_format {
     ($($piece:expr),+ $(,)?) => {{
         let mut buf = rustpython_wtf8::Wtf8Buf::new();

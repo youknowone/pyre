@@ -9314,7 +9314,7 @@ fn install_exception_getsets(ns: PyObjectRef, class_name: &str) {
 }
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
-pub(crate) fn make_exc_type(
+pub fn make_exc_type(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
@@ -11316,7 +11316,7 @@ fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// PyPy's space.get_and_call_function returns normally or raises;
 /// pyre's call_function stashes errors as PY_NULL. This helper
 /// recovers stashed errors as Result.
-pub(crate) fn call_and_check(
+pub fn call_and_check(
     method: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -11796,7 +11796,7 @@ pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 /// read, and an inherited `int.__float__` has to reproduce it: the exactness
 /// gates on the coercion entry points send a subclass to a `__float__` lookup,
 /// and this is what that lookup resolves to.
-pub(crate) fn int_payload_as_f64(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
+pub fn int_payload_as_f64(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
         if is_bool(obj) {

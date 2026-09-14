@@ -14728,7 +14728,7 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        pyre_interpreter::module::math::interp_math::is_math_sqrt_function(callable).then_some((
+        pyre_module::module::math::interp_math::is_math_sqrt_function(callable).then_some((
             MathFloatDomain::NonNegativeFinite,
             MathFloatEmit::Call1(crate::trace_opcode::sqrt_nonneg_jit),
         ))
@@ -14746,7 +14746,7 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        use pyre_interpreter::module::math::interp_math;
+        use pyre_module::module::math::interp_math;
         if interp_math::is_math_log_function(callable) {
             Some((
                 MathFloatDomain::PositiveFinite,
@@ -14796,7 +14796,7 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
     if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
         return Ok(None);
     }
-    if !pyre_interpreter::module::math::interp_math::is_math_frexp_function(concrete_callable) {
+    if !pyre_module::module::math::interp_math::is_math_frexp_function(concrete_callable) {
         return Ok(None);
     }
     let (is_int, x_value) = unsafe {
@@ -14845,15 +14845,14 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
     let x = walker_coerce_operand_to_float(ctx, op.pc, r_args[2], arg_obj, is_int, x_value, false)?;
     let mantissa = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallF,
-        pyre_interpreter::module::math::interp_math::jit_math_frexp_mantissa as *const (),
+        pyre_module::module::math::interp_math::jit_math_frexp_mantissa as *const (),
         &[x],
         &[majit_ir::Type::Float],
         majit_ir::Type::Float,
         majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         &[
             majit_ir::Value::Int(
-                pyre_interpreter::module::math::interp_math::jit_math_frexp_mantissa as *const ()
-                    as i64,
+                pyre_module::module::math::interp_math::jit_math_frexp_mantissa as *const () as i64,
             ),
             majit_ir::Value::Float(x_value),
         ],
@@ -14863,15 +14862,14 @@ pub(crate) fn try_walker_specialize_math_frexp<Sym: WalkSym>(
         .set_opref_concrete(mantissa, majit_ir::Value::Float(mantissa_value));
     let exponent = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallI,
-        pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const (),
+        pyre_module::module::math::interp_math::jit_math_frexp_exponent as *const (),
         &[x],
         &[majit_ir::Type::Float],
         majit_ir::Type::Int,
         majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         &[
             majit_ir::Value::Int(
-                pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
-                    as i64,
+                pyre_module::module::math::interp_math::jit_math_frexp_exponent as *const () as i64,
             ),
             majit_ir::Value::Float(x_value),
         ],
@@ -14939,7 +14937,7 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
         || !null_or_self.is_null()
         || x_obj.is_null()
         || exp_obj.is_null()
-        || !pyre_interpreter::module::math::interp_math::is_math_ldexp_function(concrete_callable)
+        || !pyre_module::module::math::interp_math::is_math_ldexp_function(concrete_callable)
     {
         return Ok(None);
     }
@@ -14993,14 +14991,14 @@ pub(crate) fn try_walker_specialize_math_ldexp<Sym: WalkSym>(
         .set_opref_concrete(exp, majit_ir::Value::Int(exp_value));
     let raw = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallF,
-        pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const (),
+        pyre_module::module::math::interp_math::jit_math_ldexp_raw as *const (),
         &[x, exp],
         &[majit_ir::Type::Float, majit_ir::Type::Int],
         majit_ir::Type::Float,
         majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         &[
             majit_ir::Value::Int(
-                pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as i64,
+                pyre_module::module::math::interp_math::jit_math_ldexp_raw as *const () as i64,
             ),
             majit_ir::Value::Float(x_value),
             majit_ir::Value::Int(exp_value),
@@ -15057,7 +15055,7 @@ pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
     if concrete_callable.is_null()
         || !null_or_self.is_null()
         || arg_obj.is_null()
-        || !pyre_interpreter::module::math::interp_math::is_math_isqrt_function(concrete_callable)
+        || !pyre_module::module::math::interp_math::is_math_isqrt_function(concrete_callable)
     {
         return Ok(None);
     }
@@ -15120,14 +15118,14 @@ pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
 
     let raw_result = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallI,
-        pyre_interpreter::module::math::interp_math::jit_math_isqrt_i64 as *const (),
+        pyre_module::module::math::interp_math::jit_math_isqrt_i64 as *const (),
         &[raw_int],
         &[majit_ir::Type::Int],
         majit_ir::Type::Int,
         majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
         &[
             majit_ir::Value::Int(
-                pyre_interpreter::module::math::interp_math::jit_math_isqrt_i64 as *const () as i64,
+                pyre_module::module::math::interp_math::jit_math_isqrt_i64 as *const () as i64,
             ),
             majit_ir::Value::Int(value),
         ],
@@ -15260,7 +15258,7 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        pyre_interpreter::module::math::interp_math::is_math_fabs_function(callable).then_some((
+        pyre_module::module::math::interp_math::is_math_fabs_function(callable).then_some((
             MathFloatDomain::Total,
             MathFloatEmit::Unary(OpCode::FloatAbs, f64::abs),
         ))
@@ -15317,9 +15315,9 @@ pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
         return Ok(None);
     }
     let is_this_builtin: fn(pyre_object::PyObjectRef) -> bool = match mode {
-        MathRoundMode::Floor => pyre_interpreter::module::math::interp_math::is_math_floor_function,
-        MathRoundMode::Ceil => pyre_interpreter::module::math::interp_math::is_math_ceil_function,
-        MathRoundMode::Trunc => pyre_interpreter::module::math::interp_math::is_math_trunc_function,
+        MathRoundMode::Floor => pyre_module::module::math::interp_math::is_math_floor_function,
+        MathRoundMode::Ceil => pyre_module::module::math::interp_math::is_math_ceil_function,
+        MathRoundMode::Trunc => pyre_module::module::math::interp_math::is_math_trunc_function,
     };
     if !is_this_builtin(concrete_callable) {
         return Ok(None);
@@ -15388,11 +15386,11 @@ pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
         MathRoundMode::Floor | MathRoundMode::Ceil => {
             let (helper, rounded_value) = match mode {
                 MathRoundMode::Floor => (
-                    pyre_interpreter::module::math::interp_math::jit_math_floor_raw as *const (),
+                    pyre_module::module::math::interp_math::jit_math_floor_raw as *const (),
                     value.floor(),
                 ),
                 _ => (
-                    pyre_interpreter::module::math::interp_math::jit_math_ceil_raw as *const (),
+                    pyre_module::module::math::interp_math::jit_math_ceil_raw as *const (),
                     value.ceil(),
                 ),
             };
@@ -15528,7 +15526,7 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        pyre_interpreter::module::math::interp_math::math_float1_fold_helper(callable)
+        pyre_module::module::math::interp_math::math_float1_fold_helper(callable)
             .map(|raw| (MathFloatDomain::ResultFinite, MathFloatEmit::Call1(raw)))
     })
 }
@@ -15545,7 +15543,7 @@ pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     walker_specialize_math_float(ctx, code, op, r_args, dst, 2, |callable| {
-        pyre_interpreter::module::math::interp_math::math_float2_fold_helper(callable)
+        pyre_module::module::math::interp_math::math_float2_fold_helper(callable)
             .map(|raw| (MathFloatDomain::ResultFinite, MathFloatEmit::Call2(raw)))
     })
 }
@@ -15576,7 +15574,7 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    if !pyre_interpreter::module::math::interp_math::is_math_isclose_function(concrete_callable) {
+    if !pyre_module::module::math::interp_math::is_math_isclose_function(concrete_callable) {
         return Ok(None);
     }
     // Settle the result's shape before emitting anything: everything below
@@ -15606,7 +15604,7 @@ pub(crate) fn try_walker_specialize_math_isclose<Sym: WalkSym>(
     if !observed && !std::ptr::eq(boxed_result, pyre_object::w_bool_from(false)) {
         return Ok(None);
     }
-    let helper = pyre_interpreter::module::math::interp_math::jit_math_isclose_default;
+    let helper = pyre_module::module::math::interp_math::jit_math_isclose_default;
     if (helper(a_value, b_value) != 0) != observed {
         return Ok(None);
     }

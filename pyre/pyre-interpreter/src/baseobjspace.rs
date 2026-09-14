@@ -1761,7 +1761,7 @@ pub(crate) unsafe fn normalize_slice(
 /// first, then called with `args_w` alone, so `@staticmethod` /
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
-pub(crate) unsafe fn get_and_call_function(
+pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
     w_type: PyObjectRef,

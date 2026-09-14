@@ -3532,7 +3532,7 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 ///
 /// `__self__` is the owning type, stamped at type-finalisation by
 /// [`stamp_new_descr_self`] because the type does not exist yet here.
-pub(crate) fn make_new_descr(
+pub fn make_new_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
     crate::gateway::make_builtin_function_as_builtin("__new__", func)
@@ -12272,7 +12272,7 @@ fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyOb
 /// descriptor's `name` (so `dict_descr.__name__` is `"__dict__"`,
 /// `weakref_descr.__name__` is `"__weakref__"`, etc.) — without this
 /// pyre's descriptors would all surface as `"<generic property>"`.
-pub(crate) fn make_getset_descriptor_named(
+pub fn make_getset_descriptor_named(
     getter: pyre_object::PyObjectRef,
     name: &str,
 ) -> pyre_object::PyObjectRef {
@@ -21350,7 +21350,7 @@ static __majit_wrap_float_descr_as_integer_ratio_target: crate::gateway::Builtin
     };
 
 #[derive(Copy, Clone)]
-pub(crate) enum FloatToIntMode {
+pub enum FloatToIntMode {
     Trunc,
     Floor,
     Ceil,
@@ -21360,7 +21360,7 @@ pub(crate) enum FloatToIntMode {
 /// NaN → ValueError, ±inf → OverflowError; finite values are reduced
 /// to int and materialised through the BigInt path so values outside
 /// i64 range produce a long rather than saturating.
-pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate::PyError> {
+pub fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate::PyError> {
     if v.is_nan() {
         return Err(crate::PyError::value_error(
             "cannot convert float NaN to integer",

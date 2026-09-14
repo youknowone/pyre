@@ -25,6 +25,7 @@ pub mod module;
 pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
+    pyre_interpreter::importing::register_builtin_module("_csv", module::_csv::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
     pyre_interpreter::importing::register_builtin_module(
@@ -64,8 +65,16 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
+    #[cfg(target_os = "macos")]
+    pyre_interpreter::importing::register_builtin_module("_scproxy", module::_scproxy::init);
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module(
+        "faulthandler",
+        module::faulthandler::init,
+    );
+    pyre_interpreter::importing::register_builtin_module("math", module::math::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -82,4 +91,11 @@ pub fn install_optional_modules() {
 /// Install [`install_optional_modules`] as the interpreter's optional-module hook.
 pub fn register() {
     pyre_interpreter::importing::set_optional_builtin_modules(install_optional_modules);
+    pyre_interpreter::eval::set_optional_prebuilt_slot_walker(|fwd| {
+        module::_csv::walk_csv_state_gc(fwd);
+    });
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_interpreter::eval::set_optional_global_root_walker(|visitor| {
+        module::faulthandler::handler::walk_faulthandler_roots(visitor);
+    });
 }

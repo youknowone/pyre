@@ -26,8 +26,6 @@ pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
 #[allow(non_snake_case)]
-pub mod _csv;
-#[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _ctypes;
 #[allow(non_snake_case)]
@@ -80,15 +78,12 @@ pub mod _wmi;
 pub mod array;
 pub mod atexit;
 pub mod errno;
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-pub mod faulthandler;
 pub mod gc;
 #[allow(non_snake_case)]
 pub mod imp;
 pub mod importlib;
 pub mod itertools;
 pub mod marshal;
-pub mod math;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod mmap;
 #[cfg(all(windows, feature = "host_env"))]
