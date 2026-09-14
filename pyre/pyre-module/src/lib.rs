@@ -29,7 +29,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_posixshmem", module::_posixshmem::init);
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
 }

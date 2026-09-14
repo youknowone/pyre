@@ -10,5 +10,5 @@ pub mod _posixshmem;
 pub mod _uuid;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+#[cfg(all(unix, not(feature = "sandbox")))]
 pub mod syslog;
