@@ -2253,7 +2253,10 @@ impl OptHeap {
         //   if descr.is_always_pure() and self.get_constant_box(arg0):
         //       resbox = self.optimizer.constant_fold(op)
         //       self.optimizer.make_constant(op, resbox)
-        if descr.is_always_pure()
+        // Quasi-immut (`x?`) is the same once `optimize_QUASIIMMUT_FIELD`
+        // has recorded the watcher: the field of a ConstPtr cannot change
+        // without invalidating this loop, so the load is a constant.
+        if (descr.is_always_pure() || descr.is_quasi_immutable())
             && ctx
                 .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .is_some()

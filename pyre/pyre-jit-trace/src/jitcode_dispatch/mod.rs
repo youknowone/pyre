@@ -9404,13 +9404,29 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
         }
     }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, type_addr);
+        let already_this_class = obj.is_constant()
+            && walker_concrete_ref_object(ctx, obj).is_some_and(|o| {
+                !o.is_null()
+                    && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(o))
+                    && std::ptr::eq(
+                        unsafe { (*o).ob_type },
+                        type_addr as *const pyre_object::PyType,
+                    )
+            });
+        if already_this_class {
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        } else {
+            let type_const = ctx.trace_ctx.const_int(type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        }
     }
     Ok(crate::trace_unbox_int(
         ctx.trace_ctx,
@@ -10624,6 +10640,19 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     expected_typeobj: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
+        return Ok(());
+    }
+    // A ConstPtr interned / co_consts box already is the exact builtin.
+    // Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every iteration is
+    // the leftover the `guard_value` comment below exists to kill;
+    // for a compile-time constant the proof is the object itself.
+    if obj.is_constant()
+        && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+    {
         return Ok(());
     }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
