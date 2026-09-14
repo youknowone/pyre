@@ -1,9 +1,4 @@
 # pyre-check: max-pypy-ratio=105
-# pyre-check: jitstats-band=guard_failures=1
-# wasm CI on this branch reads guard_failures 42 against the recorded 43
-# (ubuntu check.py, run 34761125116). The deferred-merge wasm commit left
-# that 1-count mismatch unresolved after repeat verification; loops_compiled
-# and bridges_compiled stay at 3 and 0 on both sides.
 # BUILD_SET (the {...} set literal) hashes every element through
 # space.hash_w, so an unhashable element — a list, or an instance whose
 # __hash__ is None / raises / returns a non-int — raises instead of silently
