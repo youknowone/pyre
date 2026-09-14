@@ -1851,14 +1851,11 @@ pub(crate) fn normalize_closing_jump_args(
 
 fn leftover_inputarg_refs(
     ops: &[majit_ir::OpRc],
-    present: &rustc_hash::FxHashSet<u32>,
+    present: &rustc_hash::FxHashSet<OpRef>,
 ) -> Vec<OpRef> {
     let mut leftover = Vec::new();
     let mut consider = |r: OpRef| {
-        if r.is_input_arg()
-            && !present.contains(&r.raw())
-            && leftover.iter().all(|x: &OpRef| x.raw() != r.raw())
-        {
+        if r.is_input_arg() && !present.contains(&r) && leftover.iter().all(|x: &OpRef| *x != r) {
             leftover.push(r);
         }
     };
@@ -2336,6 +2333,11 @@ pub unsafe extern "C" fn leftover_peel_tos(
     // iterator is on the inlined `_compile` (EC top), not this red.
     let extra = leftover_scan_frame() as *const u8;
     if !extra.is_null() && extra != vable {
+        let extra = if majit_gc::gc_owns_object(extra as usize) {
+            majit_gc::gc_current_object_address(extra as usize) as *const u8
+        } else {
+            extra
+        };
         let extra_found = peel_one(extra);
         if !extra_found.is_null() {
             if std::env::var_os("MAJIT_LEFTOVER").is_some() {
@@ -2413,7 +2415,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     live_from_entry: &[(OpRef, u32)],
     // TOS slot path: portal first, then each inlined callee frame.
     live_tos: Option<Vec<usize>>,
-) {
+) -> bool {
     patch_new_loop_to_load_virtualizable_fields_with_vable(
         ops,
         inputargs,
@@ -2427,7 +2429,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         live_tos,
         std::ptr::null(),
         None,
-    );
+    )
 }
 
 pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
@@ -2443,7 +2445,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     live_tos: Option<Vec<usize>>,
     orig_vable: *const u8,
     inline_vable: Option<OpRef>,
-) {
+) -> bool {
     // `orig_vable` is the compile-time heap frame leftover-empty walked
     // for lengths/TOS. Portal GETFIELDs still use the runtime red
     // (`inputargs[index_of_virtualizable]`). leftover iterator remaps
@@ -2486,7 +2488,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             if source.is_none() || source.is_constant() {
                 return None;
             }
-            let idx = source.raw() as usize;
+            let idx = Self::typed_index(source)?;
             let bank = if source.is_input_arg() {
                 &mut self.inputargs
             } else {
@@ -2502,13 +2504,24 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             if source.is_none() || source.is_constant() {
                 return None;
             }
-            let idx = source.raw() as usize;
+            let idx = Self::typed_index(source)?;
             let bank = if source.is_input_arg() {
                 &self.inputargs
             } else {
                 &self.ops
             };
             bank.get(idx).and_then(|s| s.as_ref())
+        }
+
+        /// Keep Ref/Int/Float of the same raw id in distinct slots.
+        fn typed_index(source: OpRef) -> Option<usize> {
+            let tag = match source.ty()? {
+                Type::Ref => 0,
+                Type::Int => 1,
+                Type::Float => 2,
+                _ => return None,
+            };
+            Some((source.raw() as usize) * 3 + tag)
         }
     }
 
@@ -2619,7 +2632,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         index_of_virtualizable < entry_prefix_len,
         "virtualizable must live inside the entry prefix (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
     );
-    let present: rustc_hash::FxHashSet<u32> = inputargs.iter().map(|ia| ia.index).collect();
+    let present: rustc_hash::FxHashSet<OpRef> = inputargs
+        .iter()
+        .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
+        .collect();
     let leftover = leftover_inputarg_refs(ops, &present);
     let mut walk_lengths = vable_array_lengths.to_vec();
     let mut field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
@@ -2638,10 +2654,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         field_types = expanded_vable_slot_types(vinfo, &walk_lengths);
         expanded_len = entry_prefix_len + field_types.len();
     }
-    let mut field_raws: rustc_hash::FxHashSet<u32> = entry_field_oprefs
+    let mut field_ids: rustc_hash::FxHashSet<OpRef> = entry_field_oprefs
         .iter()
+        .copied()
         .filter(|opref| opref.is_input_arg())
-        .map(|opref| opref.raw())
         .collect();
     // Sequential prefix+offset ids are only the field boxes when
     // `initialize_virtualizable` minted that dense tail (`has_expanded_tail`).
@@ -2650,15 +2666,18 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // virtualstate body leftovers as field slots and, after rebuild, forwards
     // `last_instr` onto a locals GETARRAYITEM (or a leftover local onto the
     // frame). Tests that omit `entry_field_oprefs` still use the dense ids.
-    if field_raws.is_empty() {
-        for raw in entry_prefix_len as u32..expanded_len as u32 {
-            field_raws.insert(raw);
+    if field_ids.is_empty() {
+        for (offset, ty) in field_types.iter().copied().enumerate() {
+            field_ids.insert(OpRef::input_arg_typed(
+                (entry_prefix_len + offset) as u32,
+                ty,
+            ));
         }
     }
     let leftover_fields: Vec<OpRef> = leftover
         .iter()
         .copied()
-        .filter(|r| field_raws.contains(&r.raw()))
+        .filter(|r| field_ids.contains(r))
         .collect();
     // compile.py `box.set_forwarded` on the virtualizable red — one box,
     // `virtualizable_boxes[-1]`. Every leftover Ref that is not a field is
@@ -2675,7 +2694,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         .copied()
         .filter(|r| {
             r.ty() == Some(Type::Ref)
-                && !field_raws.contains(&r.raw())
+                && !field_ids.contains(r)
                 && r.raw() == index_of_virtualizable as u32
         })
         .collect();
@@ -2690,7 +2709,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         let n_static = vinfo.static_fields.len();
         let present_fields = inputargs.len().saturating_sub(entry_prefix_len);
         if present_fields == 0 {
-            return;
+            return false;
         }
         let minted_fields =
             if !entry_field_oprefs.is_empty() && entry_field_oprefs.len() >= n_static {
@@ -2700,7 +2719,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             };
         let walk_fields = present_fields.min(minted_fields);
         if walk_fields < n_static {
-            return;
+            return false;
         }
         fit_walk_lengths(
             &mut walk_lengths,
@@ -2714,7 +2733,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             .is_some_and(|tail| tail.iter().map(|ia| ia.tp).eq(field_types.iter().copied()));
         if !types_match {
             inputargs.truncate(entry_prefix_len);
-            return;
+            return false;
         }
     }
 
@@ -2740,7 +2759,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             if inputargs.len() > expanded_len {
                 inputargs.truncate(expanded_len);
             } else if inputargs.len() <= entry_prefix_len {
-                return;
+                return false;
             }
         }
         if leftover_fields.is_empty() && inputargs.len() <= entry_prefix_len {
@@ -2780,7 +2799,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 emit_forwarded_patch_op(&mut extra_ops, op, &mut forwarding, &mut next_opref);
             }
             *ops = extra_ops;
-            return;
+            return false;
         }
         let mut expanded = Vec::with_capacity(expanded_len);
         for i in 0..entry_prefix_len {
@@ -3454,6 +3473,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         attach_peel_guard_resume(&extra_ops);
     }
     *ops = extra_ops;
+    take_leftover_empty_reject()
 }
 
 /// RPython dependency.py requires GUARD_(NO_)OVERFLOW to be scheduled only
@@ -5869,22 +5889,21 @@ mod tests {
             OpRef::input_arg_ref(6),
         ];
         let live_from_entry = vec![(OpRef::input_arg_ref(99), LISTITER_TOS_RELOAD)];
-        patch_new_loop_to_load_virtualizable_fields_with_vable(
-            &mut ops,
-            &mut inputargs,
-            &vinfo,
-            &[1],
-            2,
-            0,
-            &mut constants,
-            &entry_mints,
-            &live_from_entry,
-            Some(vec![0]),
-            &mut portal as *mut Frame as *const u8,
-            None,
-        );
         assert!(
-            take_leftover_empty_reject(),
+            patch_new_loop_to_load_virtualizable_fields_with_vable(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[1],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &live_from_entry,
+                Some(vec![0]),
+                &mut portal as *mut Frame as *const u8,
+                None,
+            ),
             "ZipInfo portal TOS must reject leftover-empty peel"
         );
         assert!(
@@ -5990,22 +6009,21 @@ mod tests {
             OpRef::input_arg_ref(5),
             OpRef::input_arg_ref(6),
         ];
-        patch_new_loop_to_load_virtualizable_fields_with_vable(
-            &mut ops,
-            &mut inputargs,
-            &vinfo,
-            &[1],
-            2,
-            0,
-            &mut constants,
-            &entry_mints,
-            &[],
-            Some(vec![0]),
-            &mut portal as *mut Frame as *const u8,
-            None,
-        );
         assert!(
-            !take_leftover_empty_reject(),
+            !patch_new_loop_to_load_virtualizable_fields_with_vable(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[1],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &[],
+                Some(vec![0]),
+                &mut portal as *mut Frame as *const u8,
+                None,
+            ),
             "ForIterNext-only leftover must not abort leftover-empty compile"
         );
         assert!(

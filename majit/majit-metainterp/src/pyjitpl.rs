@@ -7341,15 +7341,15 @@ impl<M: Clone> MetaInterp<M> {
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr: *const u8,
-    ) {
+    ) -> bool {
         let Some(vinfo) = self.virtualizable_info() else {
-            return;
+            return false;
         };
         let Some(driver) = driver_descriptor else {
-            return;
+            return false;
         };
         let Some(index_of_vable) = driver.virtualizable_arg_index() else {
-            return;
+            return false;
         };
         // compile.py:431 spells the entry contract's width as
         // `jitdriver_sd.num_red_args`, because upstream's compiled entry is
@@ -7409,7 +7409,7 @@ impl<M: Clone> MetaInterp<M> {
             live_tos,
             orig_vable_ptr,
             self.inline_vable_opref,
-        );
+        )
         // compile.py `patch_new_loop_to_load_virtualizable_fields`
         // does not change LABEL/JUMP *arity*. `emit_op` still rewrites
         // any operand that is the same Box as a stripped inputarg —
@@ -8835,14 +8835,13 @@ impl<M: Clone> MetaInterp<M> {
         // entry contract is `start_state.renamed_inputargs`, body LABEL is
         // `loop_info.label_op`). `emit_op` still rewrites residual body
         // LABEL args that share Box identity with a stripped inputarg.
-        self.patch_new_loop_to_load_virtualizable_fields(
+        if self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
             &mut constants,
             driver_descriptor.as_ref(),
             orig_vable_ptr_loop,
-        );
-        if crate::compile::take_leftover_empty_reject() {
+        ) {
             if crate::majit_log_enabled() || std::env::var_os("MAJIT_LEFTOVER").is_some() {
                 eprintln!("[jit] leftover-empty reject: portal TOS is not a listiter");
             }
@@ -10252,13 +10251,15 @@ impl<M: Clone> MetaInterp<M> {
         // the heap object at entry.
         let mut inputargs = inputargs;
         let mut combined_ops = combined_ops;
-        self.patch_new_loop_to_load_virtualizable_fields(
+        if self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut combined_ops,
             &mut constants,
             driver_descriptor.as_ref(),
             orig_vable_ptr_retrace,
-        );
+        ) {
+            return false;
+        }
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend
@@ -11321,13 +11322,15 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable inputarg at trace-start (captured above via
         // `ctx.initial_inputarg_consts` + `ctx.constants.get_value`), i.e.
         // RPython's `orig_inpargs[idx].getref_base()`.
-        self.patch_new_loop_to_load_virtualizable_fields(
+        if self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut optimized_ops,
             &mut constants,
             driver_descriptor.as_ref(),
             orig_vable_ptr,
-        );
+        ) {
+            return Err(SwitchToBlackhole::giveup());
+        }
 
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
@@ -11765,13 +11768,15 @@ impl<M: Clone> MetaInterp<M> {
         // entry. Without this, the vable inputarg contract differs from
         // the unrolled loop path and guard-failure recovery cannot restore
         // the heap array slots.
-        self.patch_new_loop_to_load_virtualizable_fields(
+        if self.patch_new_loop_to_load_virtualizable_fields(
             &mut inputargs,
             &mut compiled_ops,
             &mut constants,
             driver_descriptor.as_ref(),
             orig_vable_ptr_simple,
-        );
+        ) {
+            return None;
+        }
         let compiled_constants_typed =
             crate::optimizeopt::optimizer::lower_typed_constants_to_const_pool(&constants);
         self.backend
@@ -14889,13 +14894,15 @@ impl<M: Clone> MetaInterp<M> {
         // reds-only input contract as ordinary root loops.  Compiling the
         // optimizer's expanded input list directly makes execute_token pass
         // two red values to a loop expecting dozens of frame-field slots.
-        self.patch_new_loop_to_load_virtualizable_fields(
+        if self.patch_new_loop_to_load_virtualizable_fields(
             &mut entry_inputargs,
             &mut optimized_ops,
             &mut constants,
             driver_descriptor.as_ref(),
             orig_vable_ptr_entry,
-        );
+        ) {
+            return false;
+        }
         let num_optimized_ops = optimized_ops.len();
         let opcodes_after: Vec<OpCode> = optimized_ops.iter().map(|op| op.opcode).collect();
         let compiled_constants_typed =

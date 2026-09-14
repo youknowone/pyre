@@ -4093,11 +4093,15 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| exit_arg_word(frame_ptr, &fail_descr, i))
         .collect();
+    let mut jf_slot = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut jf_slot));
+    }
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
-    // `boxed` may collect and forward a nursery callee. Reload the object
-    // base from the JF shadow stack before reading `jf_savedata`.
-    let jf = jitframe_object_base(frame_ptr).0 as *mut majit_backend::jitframe::JitFrame;
+    let jf = jf_slot as *mut majit_backend::jitframe::JitFrame;
     data.seed_savedata_from_jf(jf);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
     DeadFrame::Boxed(data)
 }
 
@@ -4169,12 +4173,14 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
             value
         })
         .collect();
+    let mut jf_slot = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut jf_slot));
+    }
     let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
-    // `boxed` may collect. Attach the forwarded object base, not the
-    // incoming items pointer.
-    data.attach_origin_jf(
-        jitframe_object_base(frame_ptr).0 as *mut majit_backend::jitframe::JitFrame,
-    );
+    data.attach_origin_jf(jf_slot as *mut majit_backend::jitframe::JitFrame);
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
     DeadFrame::Boxed(data)
 }
 
@@ -6154,11 +6160,7 @@ impl majit_backend::Backend for WasmBackend {
                 glue::execute(func_handle, items as usize as u32);
             }
             majit_gc::shadow_stack::pop_jf_to(saved);
-            // Nothing reads the frame's interior through the gcmap any more,
-            // and the gcmap is about to go out of scope. Keep the libc
-            // registration: `owning` walks this frame as a deadframe root
-            // and unregisters it on drop.
-            unsafe { (*jf).jf_gcmap = std::ptr::null() };
+            install_post_finish_force_gcmap(jf);
             for h in 0..compiled.frame.home_slots {
                 let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);

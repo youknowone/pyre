@@ -4668,13 +4668,18 @@ impl FrameGcMaps {
         let args = exit_fail_args(op);
         let mask = live_fail_arg_mask(op.getdescr().as_ref(), args.len());
         let word = std::mem::size_of::<usize>();
+        let fail_types = op.get_fail_arg_types();
         let mut indices: Vec<_> = args
             .iter()
             .zip(mask)
             .enumerate()
             .filter_map(|(i, (arg, live))| {
-                (live && arg.ty() == Some(Type::Ref))
-                    .then_some((FRAME_SLOT_BASE as usize + i * 8) / word)
+                let is_ref = fail_types
+                    .as_ref()
+                    .and_then(|t| t.get(i).copied())
+                    .or_else(|| arg.ty())
+                    == Some(Type::Ref);
+                (live && is_ref).then_some((FRAME_SLOT_BASE as usize + i * 8) / word)
             })
             .collect();
         if counter_value_spill(op, &args).is_some_and(|arg| arg.ty() == Some(Type::Ref)) {
@@ -11723,8 +11728,7 @@ fn unbound_pool_const_seeds(
             .map(|op| op.pos().get())
             .collect();
         let in_idx: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
-        let unresolved_raws: std::collections::HashSet<u32> =
-            unresolved.iter().map(|(a, _, _)| a.raw()).collect();
+        let unresolved_raws: std::collections::HashSet<u32> = unresolved.iter().copied().collect();
         let mut readers = Vec::new();
         for op in ops {
             let push = |readers: &mut Vec<String>, where_: &str, a: OpRef| {
@@ -12520,13 +12524,17 @@ fn emit_force_arm(
             } else {
                 emit_resolve(sink, constants, value_types, arg_ref);
             }
-        } else if let Some(home) = ref_homes.home(arg_ref) {
-            // `dead_frame_from_forced_frame` still decodes a tagged
-            // home (`offset * 2 + 1`) from this force slot. The home
-            // itself is already stored; publish its offset so a
-            // collection inside the bracketed call forwards the value.
-            let home_offset = frame.home_slot_base + home as u64 * SLOT_SIZE;
-            sink.i64_const((home_offset * 2 + 1) as i64);
+        } else if descr.fail_arg_types.get(i) == Some(&Type::Ref) {
+            if let Some(home) = ref_homes.home(arg_ref) {
+                // `dead_frame_from_forced_frame` still decodes a tagged
+                // home (`offset * 2 + 1`) from this force slot. The home
+                // itself is already stored; publish its offset so a
+                // collection inside the bracketed call forwards the value.
+                let home_offset = frame.home_slot_base + home as u64 * SLOT_SIZE;
+                sink.i64_const((home_offset * 2 + 1) as i64);
+            } else {
+                emit_resolve(sink, constants, value_types, arg_ref);
+            }
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }

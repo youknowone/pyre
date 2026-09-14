@@ -4137,6 +4137,9 @@ fn _flat_pycall_defaults(
     // stack entries are copied only after the callee allocation returns.
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let defs_idx = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(defs);
 
     // FrameBox: header-bearing heap frame for the JIT write barrier.
     let mut new_frame = crate::pyframe::FrameBox::new(
@@ -4162,6 +4165,7 @@ fn _flat_pycall_defaults(
     }
 
     // function.py:224-229 — fill remaining from defs_w
+    let defs = pyre_object::gc_roots::shadow_stack_get(defs_idx);
     if !defs.is_null() {
         let ndefs = unsafe { pyre_object::w_tuple_len(defs) };
         let start = ndefs - defs_to_load;

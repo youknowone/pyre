@@ -448,8 +448,12 @@ impl Digits {
                                 .unwrap_or_else(|| Layout::new::<TypedItemsBlock>()),
                         )
                     });
-            typed_items_block_clear(block);
-            block
+            let mut live = block as i64;
+            let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+            majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut live));
+            typed_items_block_clear(live as *mut TypedItemsBlock);
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            live as *mut TypedItemsBlock
         }
     }
 

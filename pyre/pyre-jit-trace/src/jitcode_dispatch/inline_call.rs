@@ -7684,7 +7684,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // `enter` and `dispatch`.  Snapshot failure still has to reach
             // the matching `leave` below, so a recording miss here drops
             // the pin rather than unwinding past the vref.
-            let _ = super::record_gettrace_promote(ctx, op.pc);
+            if let Err(e) = super::record_gettrace_promote(ctx, op.pc) {
+                let concrete_ec = pyre_interpreter::call::getexecutioncontext()
+                    as *mut pyre_interpreter::PyExecutionContext;
+                walker_ec_leave(
+                    ctx.trace_ctx,
+                    ca_callee_frame,
+                    ca_callee_ec,
+                    ca_concrete_frame,
+                    concrete_ec,
+                    false,
+                );
+                return Err(e);
+            }
             // This inlined level is an activation `execute_frame` would have
             // charged the recursion counter for.  Counting it at RUN time is
             // what a recorded call would do, and that is exactly wrong here: a
@@ -8253,7 +8265,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let got_exception = matches!(callee_outcome, Ok((DispatchOutcome::SubRaise { .. }, _)));
         // `execute_frame.return_trace` — a second `gettrace()` — sits
         // between `dispatch` and `leave`.  Same finally pairing as enter.
-        let _ = super::record_gettrace_promote(ctx, op.pc);
+        if let Err(e) = super::record_gettrace_promote(ctx, op.pc) {
+            walker_ec_leave(
+                ctx.trace_ctx,
+                ca_callee_frame,
+                ca_callee_ec,
+                ca_concrete_frame,
+                concrete_ec,
+                got_exception,
+            );
+            drop(open_activation);
+            return Err(e);
+        }
         walker_ec_leave(
             ctx.trace_ctx,
             ca_callee_frame,

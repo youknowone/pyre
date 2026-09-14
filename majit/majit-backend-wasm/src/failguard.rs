@@ -198,6 +198,7 @@ impl WasmFrameData {
         if now_nonzero {
             unsafe { crate::wasm_gc_add_roots(&[slot]) };
             self.roots.push(slot);
+            self.savedata = majit_gc::gc_current_object_address(self.savedata as usize) as i64;
         } else {
             crate::wasm_gc_remove_roots(std::iter::once(slot));
             self.roots.retain(|&s| s != slot);

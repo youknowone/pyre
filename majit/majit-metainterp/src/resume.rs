@@ -8388,15 +8388,13 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
         }
         vinfo.push_resume_ref_roots(self.virtualizable_ptr);
-        // A cut remapped the identity to NONE (`NULLREF`). The remaining
-        // vable items are still in the stream and must be skipped so the
-        // vref/frame sections stay aligned, but their tags are not a typed
-        // field image — `pycode` has been observed as TAGINT on this path.
-        // The live virtualizable already holds the heap fields; writing the
-        // remapped payload would clobber them.
-        if tagged_eq(tagged_identity, NULLREF) {
+        // resume.py:1404-1408: even a remapped/NULL identity still
+        // consumes the remaining vable payload through
+        // `write_from_resume_data_partial`. Jumping past it leaves
+        // compiled stores unapplied when `identity_override` supplied
+        // a live object.
+        if tagged_eq(tagged_identity, NULLREF) && self.virtualizable_ptr == 0 {
             self.resumecodereader.jump((vable_size - 1) as usize);
-            vinfo.reset_token_gcref(self.virtualizable_ptr);
             return;
         }
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1

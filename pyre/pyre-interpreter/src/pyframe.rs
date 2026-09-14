@@ -1295,15 +1295,19 @@ unsafe fn alloc_frame_locals_array(
         )
         .allocated_or_abort(payload)
         {
-            let arr = raw as *mut FixedObjectArray;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let arr_idx = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
             unsafe {
+                let arr = pyre_object::gc_roots::shadow_stack_get(arr_idx) as *mut FixedObjectArray;
                 (*arr).len = len;
-                let items = (*arr).items_mut_ptr();
                 for i in 0..len {
-                    items.add(i).write(fill);
+                    let arr =
+                        pyre_object::gc_roots::shadow_stack_get(arr_idx) as *mut FixedObjectArray;
+                    (*arr).items_mut_ptr().add(i).write(fill);
                 }
             }
-            return arr;
+            return pyre_object::gc_roots::shadow_stack_get(arr_idx) as *mut FixedObjectArray;
         }
     } else if allocation == FrameLocalsArrayAllocation::OldGenGc {
         let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
@@ -6181,8 +6185,9 @@ impl PyFrame {
                 let family = unsafe {
                     crate::pycode::w_code_cell_family(_roots.get(root_base), num_locals + i)
                 };
+                let cell = pyre_object::w_cell_new(PY_NULL, family);
                 let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
-                arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL, family);
+                arr[num_locals + i] = cell;
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
