@@ -13275,7 +13275,7 @@ impl<M: Clone> MetaInterp<M> {
             crate::rjitlog::redirect_assembler(
                 std::sync::Arc::as_ptr(&old_token) as *const () as u64,
                 std::sync::Arc::as_ptr(&attach_token) as *const () as u64,
-                attach_token.number,
+                Self::jitlog_redirect_asm_adr(&attach_token),
             );
             // `warmstate.py` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
@@ -13374,6 +13374,13 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Redirect existing call_assembler calls from one loop to another.
     ///
+    /// x86/assembler.py logs `_ll_raw_start`; aarch64 logs `number`.
+    /// Use the compiled entry when the backend has stored it.
+    fn jitlog_redirect_asm_adr(token: &JitCellToken) -> u64 {
+        let addr = token.ll_function_addr();
+        if addr != 0 { addr as u64 } else { token.number }
+    }
+
     /// When a loop is recompiled (e.g., with bridges), existing
     /// CALL_ASSEMBLER instructions in other compiled code should be
     /// updated to point to the new version.
@@ -13385,7 +13392,7 @@ impl<M: Clone> MetaInterp<M> {
             crate::rjitlog::redirect_assembler(
                 std::sync::Arc::as_ptr(&old) as *const () as u64,
                 std::sync::Arc::as_ptr(&new) as *const () as u64,
-                new.number,
+                Self::jitlog_redirect_asm_adr(&new),
             );
         }
     }

@@ -576,6 +576,12 @@ impl Operand {
         self.packed == 0
     }
 
+    /// Object-identity token (`AbstractValue` `is`). Distinct mints of
+    /// the same bits get distinct keys; a clone keeps the token.
+    pub fn identity_key(&self) -> u64 {
+        self.packed
+    }
+
     /// `resoperation.py AbstractValue.same_box`: pointer identity
     /// (`Rc::ptr_eq`) for `Op` / `InputArg`, value comparison for `Const`
     /// (`history.py Const.same_box` delegates to `same_constant`), and the

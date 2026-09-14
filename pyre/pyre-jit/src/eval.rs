@@ -6859,6 +6859,20 @@ fn portal_unique_id_from_greens(greens: &[i64]) -> i64 {
     }
 }
 
+/// `pypy.tool.stdlib_opcode.opcode_method_names` — `LOAD_FAST`, not
+/// the Debug payload of the instruction enum.
+fn opcode_method_name(instruction: pyre_interpreter::Instruction) -> String {
+    let debug = format!("{:?}", instruction.as_opcode());
+    let mut out = String::with_capacity(debug.len() + 4);
+    for (i, ch) in debug.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.extend(ch.to_uppercase());
+    }
+    out
+}
+
 /// `interp_jit.py get_location` fields before they become a tuple.
 fn get_location_fields(
     next_instr: usize,
@@ -6875,7 +6889,7 @@ fn get_location_fields(
         code_ptr => {
             let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
             let opname = match pyre_interpreter::decode_instruction_at(code, next_instr) {
-                Some((instruction, _)) => format!("{instruction:?}"),
+                Some((instruction, _)) => opcode_method_name(instruction),
                 None => "<eof>".into(),
             };
             let line = pyre_interpreter::pycode::code_locations(code)

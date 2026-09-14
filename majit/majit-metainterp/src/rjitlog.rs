@@ -302,12 +302,15 @@ impl VarMemo {
             return "-".into();
         }
         if let Some(value) = arg.const_value() {
-            // rjitlog.py var_to_str: ConstInt / ConstFloat / ConstPtr
-            // allocate a memo slot before formatting. Value::Void is
-            // not an upstream constant; do not consume a slot.
+            // rjitlog.py var_to_str: memo is keyed by the box object,
+            // not the printed value. Value::Void is not an upstream
+            // constant; do not consume a slot.
+            if matches!(value, Value::Void) {
+                return "None".into();
+            }
+            let id = self.assign(b'k', arg.identity_key());
             return match value {
                 Value::Int(v) => {
-                    let _ = self.assign(b'I', v as u64);
                     // rjitlog.py var_to_str: ConstClass(name) when the
                     // int could be an address and addr2name hits.
                     if int_could_be_an_address(v)
@@ -318,23 +321,14 @@ impl VarMemo {
                     }
                     v.to_string()
                 }
-                Value::Float(v) => {
-                    let _ = self.assign(b'F', v.to_bits());
-                    v.to_string()
-                }
-                Value::Ref(r) if r.is_null() => {
-                    let _ = self.assign(b'P', 0);
-                    "ConstPtr(null)".into()
-                }
-                Value::Ref(r) => {
-                    let id = self.assign(b'P', r.0 as u64);
-                    format!("ConstPtr(ptr{id})")
-                }
+                Value::Float(v) => python_float_str(v),
+                Value::Ref(r) if r.is_null() => "ConstPtr(null)".into(),
+                Value::Ref(_) => format!("ConstPtr(ptr{id})"),
                 Value::Void => "None".into(),
             };
         }
         if arg.is_null_ref() {
-            let _ = self.assign(b'P', 0);
+            let _ = self.assign(b'k', arg.identity_key());
             return "ConstPtr(null)".into();
         }
         if arg.is_inputarg() {
@@ -584,6 +578,19 @@ fn int_could_be_an_address(x: i64) -> bool {
     !(-32768..=32767).contains(&x)
 }
 
+/// `str(float)` spelling: `1.0` / `-0.0`, not Rust's `1` / `-0`.
+fn python_float_str(v: f64) -> String {
+    if v == 0.0 && v.is_sign_negative() {
+        return "-0.0".into();
+    }
+    let s = v.to_string();
+    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        format!("{s}.0")
+    } else {
+        s
+    }
+}
+
 /// `rjitlog.py encode_str`.
 pub fn encode_str(string: &str) -> Vec<u8> {
     let len = string.len() as u32;
@@ -681,6 +688,29 @@ mod tests {
             "ConstClass(alpha)"
         );
         assert_eq!(memo.operand(&Operand::const_from_value(Value::Int(5))), "5");
+    }
+
+    #[test]
+    fn float_constants_keep_python_spelling() {
+        assert_eq!(python_float_str(1.0), "1.0");
+        assert_eq!(python_float_str(-0.0), "-0.0");
+        assert_eq!(python_float_str(1.5), "1.5");
+        let mut memo = VarMemo::default();
+        assert_eq!(
+            memo.operand(&Operand::const_from_value(Value::Float(1.0))),
+            "1.0"
+        );
+    }
+
+    #[test]
+    fn equal_const_ints_keep_separate_memo_slots() {
+        let mut memo = VarMemo::default();
+        let a = Operand::const_from_value(Value::Int(5));
+        let b = Operand::const_from_value(Value::Int(5));
+        assert_eq!(memo.operand(&a), "5");
+        assert_eq!(memo.operand(&b), "5");
+        let i = InputArg::new_int(0);
+        assert_eq!(memo.inputarg(&i), "i2");
     }
 
     #[test]
