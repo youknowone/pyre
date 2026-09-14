@@ -8189,7 +8189,13 @@ unsafe extern "C" fn leftover_is_listiter(p: *const u8) -> i32 {
     if p.is_null() {
         return 0;
     }
-    unsafe { pyre_object::iterobject::is_list_iter(p as pyre_object::PyObjectRef) as i32 }
+    let obj = p as pyre_object::PyObjectRef;
+    unsafe {
+        (pyre_object::iterobject::is_list_iter(obj)
+            || pyre_object::iterobject::is_tuple_iter(obj)
+            || pyre_object::iterobject::is_seq_iter(obj)
+            || pyre_object::iterobject::is_list_reverse_iter(obj)) as i32
+    }
 }
 
 unsafe extern "C" fn leftover_is_str(p: *const u8) -> i32 {
@@ -8200,24 +8206,26 @@ unsafe extern "C" fn leftover_is_str(p: *const u8) -> i32 {
     unsafe { (pyre_object::is_str(obj) || pyre_object::is_bytes(obj)) as i32 }
 }
 
-/// Publish EC top (`vref_referent`, never a vref) so leftover_peel_tos can
-/// find the inlined `_compile` listiter when the leftover-empty red is the
-/// portal caller (TOS = ZipInfo).
-fn publish_leftover_scan_frame() {
+/// Live EC top (`vref_referent`) for leftover_peel_tos. Read at peel
+/// time so a nested CALL_ASSEMBLER sees the callee frame, not a
+/// host-entry snapshot that a collection can move.
+fn leftover_scan_live_frame() -> *const u8 {
     let ec = pyre_interpreter::call::getexecutioncontext();
     if ec.is_null() {
-        majit_metainterp::register_leftover_scan_frame(std::ptr::null());
-        return;
+        return std::ptr::null();
     }
     let raw = unsafe { (*ec).topframeref };
     let top = pyre_interpreter::executioncontext::vref_referent(raw);
     if top.is_null()
         || unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) }
     {
-        majit_metainterp::register_leftover_scan_frame(std::ptr::null());
-        return;
+        return std::ptr::null();
     }
-    majit_metainterp::register_leftover_scan_frame(top as *const u8);
+    top as *const u8
+}
+
+fn publish_leftover_scan_frame() {
+    majit_metainterp::register_leftover_scan_live(leftover_scan_live_frame);
 }
 
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
@@ -14955,12 +14963,9 @@ fn loop_red_frame(dispatch: &mut PyFrame) -> &mut PyFrame {
     if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) } {
         return dispatch;
     }
-    // Same function only: recursive `_compile` inlined into itself.
-    // A different pycode is another activation (importlib, pip) whose
-    // vable layout is not this loop's leftover-empty prologue.
-    if unsafe { (*top).pycode } != dispatch.pycode {
-        return dispatch;
-    }
+    // One red frame per inlined call (`pyframe.py` `get_w_globals`).
+    // A different pycode is still that call's own frame; filtering it
+    // by identity hands LOAD_GLOBAL the portal's names.
     if unsafe { (*top).locals_cells_stack_w }.is_null() {
         return dispatch;
     }

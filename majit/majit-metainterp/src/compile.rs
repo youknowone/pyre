@@ -2045,9 +2045,23 @@ pub fn register_leftover_scan_frame(frame: *const u8) {
     LEFTOVER_SCAN_FRAME.with(|c| c.set(frame as *mut u8));
 }
 
+/// JIT boot: read the live EC top at leftover_peel_tos time so a nested
+/// CALL_ASSEMBLER sees the callee frame rather than a host-entry snapshot.
+pub fn register_leftover_scan_live(f: fn() -> *const u8) {
+    LEFTOVER_SCAN_LIVE.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
 fn leftover_scan_frame() -> *mut u8 {
+    let live = LEFTOVER_SCAN_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+    if !live.is_null() {
+        let f: fn() -> *const u8 = unsafe { std::mem::transmute(live) };
+        return f() as *mut u8;
+    }
     LEFTOVER_SCAN_FRAME.with(|c| c.get())
 }
+
+static LEFTOVER_SCAN_LIVE: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 thread_local! {
     static LEFTOVER_SCAN_FRAME: std::cell::Cell<*mut u8> =
