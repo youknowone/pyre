@@ -973,6 +973,14 @@ impl VirtualizableInfo {
             .copied()
     }
 
+    /// virtualizable.py `is_token_nonnull_gcref`.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn is_token_nonnull_gcref(&self, obj_ptr: *const u8) -> bool {
+        !matches!(unsafe { self.read_token(obj_ptr) }, VableToken::None)
+    }
+
     /// RPython parity surface: reset the virtualizable token to TOKEN_NONE.
     ///
     /// # Safety
@@ -1717,10 +1725,7 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 /// The caller must ensure `obj_ptr` points to a valid object.
 #[allow(dead_code)]
 unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
-    unsafe {
-        let token_ptr = obj_ptr.add(info.token_offset) as *const usize;
-        *token_ptr != 0
-    }
+    unsafe { info.is_token_nonnull_gcref(obj_ptr) }
 }
 
 /// Force a virtualizable: flush JIT-held values back to the heap.
@@ -2084,6 +2089,20 @@ mod tests {
             write_virtualizable_boxes(&info, obj_ptr, &[100, 200]);
             assert_eq!(*(obj_ptr.add(8) as *const i64), 100);
             assert_eq!(*(obj_ptr.add(16) as *const i64), 200);
+        }
+    }
+
+    #[test]
+    fn is_token_nonnull_gcref_matches_read_token() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+        unsafe {
+            assert!(!info.is_token_nonnull_gcref(obj_ptr));
+            info.write_token(obj_ptr, VableToken::TracingRescall);
+            assert!(info.is_token_nonnull_gcref(obj_ptr));
+            info.reset_vable_token(obj_ptr);
+            assert!(!info.is_token_nonnull_gcref(obj_ptr));
         }
     }
 

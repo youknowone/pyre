@@ -1986,9 +1986,16 @@ impl<'a> Transformer<'a> {
             }
             _ => return,
         };
-        if self.config.virtualizable_field(field).is_none()
-            && self.config.virtualizable_array(field).is_none()
-        {
+        // `my_redirected_fields.get(cname.value)` — prefer the attached
+        // vinfo field maps, then the config stand-in used by tests.
+        let redirected = self
+            .get_vinfo(field.owner_root.as_deref())
+            .map(|vinfo| vinfo.has_static_field(&field.name) || vinfo.has_array_field(&field.name))
+            .unwrap_or_else(|| {
+                self.config.virtualizable_field(field).is_some()
+                    || self.config.virtualizable_array(field).is_some()
+            });
+        if !redirected {
             return;
         }
         let renamed_base = match &renamed_op.kind {

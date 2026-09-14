@@ -3912,6 +3912,19 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
     }
 }
 
+impl ResumeGuardForcedDescr {
+    /// compile.py `ResumeGuardForcedDescr.force_now(cpu, token)`.
+    ///
+    /// Upstream wraps `cpu.force` + `handle_async_forcing` in
+    /// `_stack_criticalcode_start/stop`. The body is supplied by the
+    /// caller (`MetaInterp::force_virtualizable_token_with_allocator`)
+    /// because this descr does not own `metainterp_sd` / `jitdriver_sd`.
+    pub fn force_now(body: impl FnOnce()) {
+        let _cc = crate::CriticalCodeGuard::enter();
+        body();
+    }
+}
+
 impl FailDescr for ResumeGuardForcedDescr {
     fn fail_index(&self) -> u32 {
         // Per-trace key (see ResumeGuardDescr::fail_index).
@@ -6103,6 +6116,16 @@ impl TraceCtx {
 #[cfg(test)]
 mod fail_descr_tests {
     use super::*;
+
+    #[test]
+    fn force_now_runs_the_body() {
+        let ran = std::cell::Cell::new(false);
+        ResumeGuardForcedDescr::force_now(|| ran.set(true));
+        assert!(
+            ran.get(),
+            "compile.py force_now runs cpu.force + handle_async"
+        );
+    }
 
     #[test]
     fn test_attach_vector_info_builds_prev_chain() {

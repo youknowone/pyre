@@ -12246,6 +12246,30 @@ mod tests {
     }
 
     #[test]
+    fn codewriter_vinfo_for_vtype_matches_pyframe_fields() {
+        let vinfo = codewriter_vinfo_for_vtype("PyFrame").expect("PyFrame handle");
+        assert_eq!(vinfo.vtype_name(), Some("PyFrame"));
+        assert!(vinfo.has_static_field("last_instr"));
+        assert!(vinfo.has_static_field("debugdata"));
+        assert!(vinfo.has_array_field("locals_cells_stack_w"));
+        assert!(
+            !vinfo.has_static_field("w_globals"),
+            "w_globals is not a frame field after frame_stores_global"
+        );
+        assert!(codewriter_vinfo_for_vtype("Plain").is_none());
+    }
+
+    #[test]
+    fn get_vinfo_by_owner_finds_the_codewriter_handle() {
+        let mut cc = cc_with_one_driver();
+        cc.jitdrivers_sd[0].virtualizable_info = codewriter_vinfo_for_vtype("PyFrame");
+        let got = cc.get_vinfo_by_owner("PyFrame").expect("owner match");
+        assert_eq!(got.vtype_name(), Some("PyFrame"));
+        assert_eq!(got.static_field_index("pycode"), Some(1));
+        assert!(cc.get_vinfo_by_owner("ExecutionContext").is_none());
+    }
+
+    #[test]
     fn finish_is_noop_when_no_driver_has_virtualizable_info() {
         let cc = cc_with_one_driver();
         cc.finish();

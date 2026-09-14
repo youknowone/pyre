@@ -4644,6 +4644,25 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`.
+    ///
+    /// Residual-call and escape paths in `pyjitpl.py` unwrap the identity
+    /// box, not the host heap pointer. Fall back to
+    /// [`Self::unwrap_standard_virtualizable`] when the box has no concrete
+    /// ref yet.
+    fn unwrap_virtualizable_boxes_last(&self) -> *const u8 {
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| {
+                let concrete = ctx.concrete_of_opref(ctx.standard_virtualizable_box()?)?;
+                let ptr = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(Some(
+                    concrete,
+                ));
+                (!ptr.is_null()).then_some(ptr as *const u8)
+            })
+            .unwrap_or_else(|| self.unwrap_standard_virtualizable())
+    }
+
     /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])`.
     ///
     /// Prefer the host pointer `set_vable_ptr` / `initialize_virtualizable`
@@ -16181,15 +16200,10 @@ impl<M: Clone> MetaInterp<M> {
             None => self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?,
         };
 
-        // compile.py:973-985 don't interrupt me! If the stack runs out
-        // in force_from_resumedata() then we have seen cpu.force() but
-        // not self.save_data(), leaving in an inconsistent state.
-        //
-        // RPython wraps the body in try/finally. CriticalCodeGuard's
-        // Drop impl re-enables report_error on every exit — including
-        // panic unwind — matching the RPython contract.
-        let _cc_guard = crate::CriticalCodeGuard::enter();
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
+        // The stack-critical section lives on
+        // `ResumeGuardForcedDescr.force_now`, which wraps
+        // `cpu.force` + this method.
         // compile.py `ResumeGuardDescr` storage — borrow rd_numb /
         // rd_consts / rd_virtuals / rd_pendingfields off the guard-owned
         // Arc.  resume.py:1345-1351 init the reader with the storage
@@ -16246,7 +16260,6 @@ impl<M: Clone> MetaInterp<M> {
                 None, // ginfo — pyre has no greenfield mechanism
                 allocator,
             );
-        drop(_cc_guard);
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] forced {} ptr + {} int virtuals",
@@ -16287,39 +16300,41 @@ impl<M: Clone> MetaInterp<M> {
         token: u64,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) {
-        let deadframe = self
-            .backend
-            .force(GcRef(token as usize))
-            .expect("active virtualizable must have a backend deadframe");
-        let descr_arc = self.backend.get_latest_descr_arc(&deadframe);
-        let descr = descr_arc
-            .as_fail_descr()
-            .expect("forced virtualizable must have a fail descriptor");
-        let green_key = majit_backend::descr_owning_jct(descr)
-            .expect("forced virtualizable must belong to a compiled loop")
-            .green_key();
-        let trace_id = descr.trace_id();
-        let fail_index = descr.fail_index();
-        let fail_values = descr
-            .fail_arg_types()
-            .iter()
-            .enumerate()
-            .map(|(index, tp)| match tp {
-                Type::Int => self.backend.get_int_value(&deadframe, index),
-                Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
-                Type::Float => self.backend.get_float_value(&deadframe, index).to_bits() as i64,
-                Type::Void => 0,
-            })
-            .collect::<Vec<_>>();
-        // compile.py: faildescr.handle_async_forcing(deadframe)
-        self.handle_async_forcing_with_allocator(
-            Some(descr),
-            green_key,
-            trace_id,
-            fail_index,
-            &fail_values,
-            allocator,
-        );
+        crate::compile::ResumeGuardForcedDescr::force_now(|| {
+            let deadframe = self
+                .backend
+                .force(GcRef(token as usize))
+                .expect("active virtualizable must have a backend deadframe");
+            let descr_arc = self.backend.get_latest_descr_arc(&deadframe);
+            let descr = descr_arc
+                .as_fail_descr()
+                .expect("forced virtualizable must have a fail descriptor");
+            let green_key = majit_backend::descr_owning_jct(descr)
+                .expect("forced virtualizable must belong to a compiled loop")
+                .green_key();
+            let trace_id = descr.trace_id();
+            let fail_index = descr.fail_index();
+            let fail_values = descr
+                .fail_arg_types()
+                .iter()
+                .enumerate()
+                .map(|(index, tp)| match tp {
+                    Type::Int => self.backend.get_int_value(&deadframe, index),
+                    Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
+                    Type::Float => self.backend.get_float_value(&deadframe, index).to_bits() as i64,
+                    Type::Void => 0,
+                })
+                .collect::<Vec<_>>();
+            // compile.py: faildescr.handle_async_forcing(deadframe)
+            self.handle_async_forcing_with_allocator(
+                Some(descr),
+                green_key,
+                trace_id,
+                fail_index,
+                &fail_values,
+                allocator,
+            );
+        });
     }
 
     /// `compile.py cpu.set_savedata_ref(deadframe, obj.hide())`.
@@ -18968,19 +18983,8 @@ impl<M: Clone> MetaInterp<M> {
             return;
         }
         // pyjitpl.py: `virtualizable = vinfo.unwrap_virtualizable_box(
-        //     self.virtualizable_boxes[-1])`. Fall back to the host
-        // pointer when the identity box has no concrete ref yet.
-        let vable_ptr = self
-            .tracing
-            .as_ref()
-            .and_then(|ctx| {
-                let concrete = ctx.concrete_of_opref(ctx.standard_virtualizable_box()?)?;
-                let ptr = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(Some(
-                    concrete,
-                ));
-                (!ptr.is_null()).then_some(ptr as *const u8)
-            })
-            .unwrap_or_else(|| self.unwrap_standard_virtualizable());
+        //     self.virtualizable_boxes[-1])`.
+        let vable_ptr = self.unwrap_virtualizable_boxes_last();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return,
@@ -19352,8 +19356,14 @@ impl<M: Clone> MetaInterp<M> {
             self.vable_after_residual_call(funcbox.2)
                 .map_err(DoResidualCallAbort::from)?;
             // pyjitpl.py: generate_guard(rop.GUARD_NOT_FORCED)
+            // → capture_resumedata(after_residual_call=True)
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+                if ctx.recorder.has_byte_buffer() {
+                    let snapshot_id =
+                        ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, true);
+                    ctx.set_last_guard_resume_position(snapshot_id);
+                }
             }
             // pyjitpl.py:2080-2081: KEEPALIVE for vablebox
             if let Some(vablebox) = vablebox
