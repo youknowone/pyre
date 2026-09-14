@@ -9610,10 +9610,15 @@ pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
 /// Walk `write_cell` for an in-place cell store.  Applies the helper
 /// afterwards so the walk's remaining concrete reads see the write and
 /// `mark_prebuilt_roots_dirty` runs (`celldict::write_cell`).
+///
+/// Pin `version?` and re-read the slot before baking `stored`: a later
+/// delete or replacing store mutates the dict and must revoke this
+/// compiled write, which otherwise mutates the detached old cell.
 pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
-    _ns: pyre_object::PyObjectRef,
+    ns: pyre_object::PyObjectRef,
+    slot: usize,
     stored: pyre_object::PyObjectRef,
     value_opref: OpRef,
     new_value: pyre_object::PyObjectRef,
@@ -9624,6 +9629,12 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     let Some(jc) = crate::jitcode_runtime::write_cell_jitcode() else {
         return Ok(false);
     };
+    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
+    if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
+        return Ok(false);
+    }
     let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
     if descend_named_cell_helper(
         ctx,
@@ -22751,5 +22762,5 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     if !in_place {
         return Ok(false);
     }
-    try_walker_orthodox_write_cell(ctx, op_pc, w_globals, stored, value_opref, new_value)
+    try_walker_orthodox_write_cell(ctx, op_pc, w_globals, slot, stored, value_opref, new_value)
 }
