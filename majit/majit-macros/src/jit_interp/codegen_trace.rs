@@ -21,10 +21,22 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     // live in one module.
     let sym_ty = format_ident!("__JitSym_{}", fn_name);
 
+    // A portal loop with no opcode `match` after `jit_merge_point` is the
+    // marked.py shape: `while i < len { can_enter; merge_point; body }`.
+    // `warmspot.rewrite_can_enter_jit` inserts the header tick when the
+    // source has no `can_enter_jit` of its own. Keep the existing error
+    // only when there is neither a dispatch match nor a portal loop.
     let match_expr = find_dispatch_match(&func.block);
-    let Some(match_expr) = match_expr else {
-        return syn::Error::new_spanned(func, "could not find opcode dispatch match")
+    let classified = match match_expr {
+        Some(match_expr) => classify_arms(&match_expr.arms),
+        None if portal_loop_body(&func.block).is_some() => Vec::new(),
+        None => {
+            return syn::Error::new_spanned(
+                func,
+                "could not find a portal loop or opcode dispatch match",
+            )
             .to_compile_error();
+        }
     };
 
     let portal_greens = super::portal_green_params(config, func);
@@ -69,7 +81,6 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         config.switch_dispatch,
     );
 
-    let classified = classify_arms(&match_expr.arms);
     let env_type = &config.env_type;
 
     // Dispatch JitCode singleton produced by lower_dispatch_body.
@@ -389,14 +400,13 @@ pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch>
                 collect_matches_in_stmt(stmt, &mut after_merge_point);
             }
         }
-        if let Some(dispatch) = after_merge_point.into_iter().max_by_key(|m| m.arms.len()) {
-            return Some(dispatch);
-        }
+        // A portal loop with no match after the merge point is matchless —
+        // do not fall back to a setup `match` elsewhere in the function.
+        return after_merge_point.into_iter().max_by_key(|m| m.arms.len());
     }
 
-    // No portal loop this reads, or none of its statements after the merge
-    // point holds a match. Fall back to the old search so a shape outside the
-    // rule above keeps whatever it did before.
+    // No portal loop this reads. Fall back to the old search so a shape
+    // outside the rule above keeps whatever it did before.
     let mut all = Vec::new();
     collect_all_matches(block, &mut all);
     all.into_iter().max_by_key(|m| m.arms.len())
@@ -406,21 +416,40 @@ pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch>
 /// statements open a merge point. `find_dispatch_loop_body` accepts the same
 /// statement positions, recognising the loop by the dispatch match inside it
 /// instead — which is why it cannot be the one to choose that match.
-fn portal_loop_body(func_block: &syn::Block) -> Option<&syn::Block> {
-    func_block.stmts.iter().find_map(|stmt| {
-        let Stmt::Expr(expr, _) = stmt else {
-            return None;
-        };
-        let body = match expr {
-            Expr::While(while_expr) => &while_expr.body,
-            Expr::Loop(loop_expr) => &loop_expr.body,
-            _ => return None,
-        };
-        body.stmts
-            .iter()
-            .any(is_jit_merge_point_macro)
-            .then_some(body)
-    })
+pub(crate) fn portal_loop_body(func_block: &syn::Block) -> Option<&syn::Block> {
+    find_portal_loop(func_block).map(|found| found.body)
+}
+
+/// A top-level `while`/`loop` whose body contains `jit_merge_point!`.
+pub(crate) struct PortalLoop<'a> {
+    pub index: usize,
+    pub body: &'a syn::Block,
+    pub while_cond: Option<&'a syn::Expr>,
+}
+
+pub(crate) fn find_portal_loop(func_block: &syn::Block) -> Option<PortalLoop<'_>> {
+    func_block
+        .stmts
+        .iter()
+        .enumerate()
+        .find_map(|(index, stmt)| {
+            let Stmt::Expr(expr, _) = stmt else {
+                return None;
+            };
+            let (body, while_cond) = match expr {
+                Expr::While(while_expr) => (&while_expr.body, Some(&*while_expr.cond)),
+                Expr::Loop(loop_expr) => (&loop_expr.body, None),
+                _ => return None,
+            };
+            body.stmts
+                .iter()
+                .any(is_jit_merge_point_macro)
+                .then_some(PortalLoop {
+                    index,
+                    body,
+                    while_cond,
+                })
+        })
 }
 
 fn collect_all_matches<'a>(block: &'a syn::Block, out: &mut Vec<&'a syn::ExprMatch>) {
@@ -617,5 +646,59 @@ pub(crate) fn is_record_exact_class_call_path(func: &syn::Expr) -> bool {
         [ns, name] => name == "record_exact_class" && ns == "jit",
         [_, ns, name] => name == "record_exact_class" && ns == "jit",
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod find_dispatch_match_tests {
+    use super::*;
+
+    fn fn_block(src: &str) -> syn::Block {
+        let item: syn::ItemFn = syn::parse_str(&format!("fn f() {{ {src} }}")).unwrap();
+        *item.block
+    }
+
+    #[test]
+    fn matchless_portal_loop_is_not_a_dispatch() {
+        let block = fn_block(
+            "while pos < len {
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(find_dispatch_match(&block).is_none());
+        assert!(portal_loop_body(&block).is_some());
+    }
+
+    #[test]
+    fn opcode_match_after_merge_point_is_the_dispatch() {
+        let block = fn_block(
+            "while pc < program.len() {
+                jit_merge_point!(driver, program, pc; state);
+                match opcode {
+                    0 => {},
+                    1 => {},
+                    _ => break,
+                }
+            }",
+        );
+        let found = find_dispatch_match(&block).expect("dispatch match");
+        assert_eq!(found.arms.len(), 3);
+    }
+
+    #[test]
+    fn a_setup_match_before_the_loop_does_not_become_the_dispatch() {
+        let block = fn_block(
+            "let label = match sel { 0 => \"a\", 1 => \"b\", 2 => \"c\", 3 => \"d\", _ => \"e\" };
+            while pc < program.len() {
+                jit_merge_point!(driver, program, pc; state);
+                match opcode {
+                    0 => {},
+                    _ => break,
+                }
+            }",
+        );
+        let found = find_dispatch_match(&block).expect("dispatch match");
+        assert_eq!(found.arms.len(), 2);
     }
 }

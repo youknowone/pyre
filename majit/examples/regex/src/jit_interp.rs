@@ -20,15 +20,12 @@
 //!
 //! Two things this file has to say in majit's vocabulary:
 //!
-//! * `#[jit_interp]` drives a bytecode portal, so the loop over the input is
-//!   spelled as a three-instruction program whose back edge closes at `pc = 0`.
-//!   `pc` and `program` are the greens and both are constant there, so the
-//!   whole input is one green key and one trace. That spelling is a tax, not a
-//!   feature of the algorithm: the macro looks for an opcode dispatch `match`
-//!   in the portal loop and errors with `could not find opcode dispatch match`
-//!   without one, so a portal whose loop is a plain `while` over an input has
-//!   to invent a program for it. Letting a matchless portal lower is a
-//!   standing majit follow-up; nothing here is blocked on it.
+//! * The portal is `marked.py`'s `while i < len(s)`: first character outside
+//!   the loop, `can_enter_jit` at the header (what `warmspot.rewrite_can_enter_jit`
+//!   inserts when the source has no tick of its own), then `jit_merge_point`
+//!   and `shift`. `pc` and `program` stay as the portal ABI greens and are
+//!   constant (`pc` is 0); the regex is the promote that the trace specializes
+//!   on.
 //! * The regex root is a red `ref(NodeRec)` promoted once per iteration. The
 //!   promote is what makes the root a `ConstPtr`; the `_immutable_fields_`
 //!   declaration on `NodeRec` is what makes every read below it fold, so the
@@ -111,16 +108,9 @@ fn shift(n: usize, c: i64, mark: bool) -> bool {
 
 pub type Bytecode = [u8];
 
-/// Shift the next character in, and advance.
-const OP_SHIFT: u8 = 0;
-/// Close the back edge while the input has characters left.
-const OP_LOOP: u8 = 1;
-const OP_HALT: u8 = 2;
-
-/// The whole "program". `pc` and `program` are the greens, and the back edge
-/// returns to `pc = 0`, so every character shares one green key — the regex,
-/// which the loop promotes, is what the trace actually specializes on.
-pub const PROGRAM: [u8; 3] = [OP_SHIFT, OP_LOOP, OP_HALT];
+/// Dummy env the portal ABI still threads as a green. The loop does not
+/// dispatch on it; `pc` stays 0 so the green key is the regex.
+pub const PROGRAM: [u8; 1] = [0];
 
 /// The input string, as a headerless buffer plus its length.
 ///
@@ -206,27 +196,15 @@ fn mainloop(
         len,
         result: first,
     };
-    while pc < program.len() {
+    // marked.py: first char is outside; the header tick is what
+    // `rewrite_can_enter_jit` inserts in front of `jit_merge_point`.
+    while state.pos < state.len {
+        can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        let opcode = program[pc];
-        pc += 1;
-        match opcode {
-            OP_SHIFT => {
-                let idx = state.pos as usize;
-                let c = state.inp.data[idx] as i64;
-                state.result = shift(root, c, false) as i64;
-                state.pos = state.pos + 1i64;
-            }
-            OP_LOOP => {
-                if state.pos < state.len {
-                    can_enter_jit!(driver, 0usize, &mut state, program, || {});
-                    pc = 0;
-                    continue;
-                }
-            }
-            OP_HALT => break,
-            _ => break,
-        }
+        let idx = state.pos as usize;
+        let c = state.inp.data[idx] as i64;
+        state.result = shift(root, c, false) as i64;
+        state.pos = state.pos + 1i64;
     }
     state.result
 }

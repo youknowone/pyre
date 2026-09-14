@@ -1663,14 +1663,86 @@ pub(super) fn find_dispatch_loop_body<'b>(
 
 /// Returns `true` if `stmt` is a `jit_merge_point!()` macro invocation.
 pub(crate) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
+    stmt_macro_ends_with(stmt, "jit_merge_point")
+}
+
+/// Returns `true` if `stmt` is a `can_enter_jit!()` macro invocation.
+pub(crate) fn is_can_enter_jit_macro(stmt: &Stmt) -> bool {
+    stmt_macro_ends_with(stmt, "can_enter_jit")
+}
+
+fn stmt_macro_ends_with(stmt: &Stmt, name: &str) -> bool {
     let Stmt::Macro(mac_stmt) = stmt else {
         return false;
     };
-    let path = &mac_stmt.mac.path;
-    path.segments
+    mac_stmt
+        .mac
+        .path
+        .segments
         .last()
-        .map(|seg| seg.ident == "jit_merge_point")
-        .unwrap_or(false)
+        .is_some_and(|seg| seg.ident == name)
+}
+
+/// Lower a matchless portal loop — `while cond { merge_point; body }` —
+/// as one JitCode iteration. `warmspot.rewrite_can_enter_jit` puts the
+/// interpreter tick at the header when the source has no `can_enter_jit`
+/// of its own; that call is not a JitCode `loop_header`. The compiled
+/// back-edge is the while-condition plus a `loop_header` + `goto`, the
+/// same place OP_LOOP closes a three-opcode portal.
+fn lower_matchless_portal_body(
+    lowerer: &mut Lowerer,
+    func_block: &syn::Block,
+    loop_start_label: &syn::Ident,
+) -> Option<()> {
+    let portal = find_portal_loop(func_block)?;
+    let mut seen_merge_point = false;
+    for stmt in &portal.body.stmts {
+        if is_jit_merge_point_macro(stmt) {
+            seen_merge_point = true;
+            continue;
+        }
+        if !seen_merge_point {
+            continue;
+        }
+        // Header `can_enter_jit!` belongs to the interpreter threshold,
+        // not the JitCode (`rewrite_can_enter_jits` runs after
+        // `make_jitcodes`). A copy left after the merge point is the
+        // same tick, not a back-edge `loop_header`.
+        if is_can_enter_jit_macro(stmt) {
+            continue;
+        }
+        lowerer.lower_stmt(stmt)?;
+    }
+    if !seen_merge_point {
+        return None;
+    }
+    if let Some(census_interp) = lowerer.config.map(|c| c.state_type_name.clone()) {
+        // One implicit arm: the post-merge-point while body. The
+        // opcode chain's census is the same install-time marker
+        // `assert_no_degraded_dispatch_arms` reads.
+        lowerer.emit_aux(quote::quote! {
+            majit_metainterp::record_dispatch_arm_census(#census_interp, 1usize);
+        });
+    }
+    // Close the iteration the way marked.py's while does: test the
+    // header condition after the body, then jump to the merge point.
+    // `can_enter_jit!()` here is only the JitCode `loop_header` emit
+    // (`handle_jit_marker__can_enter_jit`); the native tick stays at
+    // the source header.
+    if let Some(cond) = portal.while_cond {
+        let back_edge: syn::Expr = syn::parse_quote! {
+            if #cond {
+                can_enter_jit!();
+                continue;
+            }
+        };
+        lowerer.lower_stmt(&Stmt::Expr(back_edge, None))?;
+    } else {
+        let header: syn::Stmt = syn::parse_quote! { can_enter_jit!(); };
+        lowerer.lower_stmt(&header)?;
+        lowerer.emit_jump(loop_start_label);
+    }
+    Some(())
 }
 
 /// Build the parent-side `__builder.inline_call_<types>_v(__sub_idx, ...)`
@@ -3960,38 +4032,53 @@ pub(crate) fn lower_dispatch_body(
     // Walk: find the dispatch match, then find the while body that contains it,
     // then iterate stmts before the match-containing stmt.
     //
-    // Pin pc-writes to i0 for the whole pre-dispatch walk. The branch-op
-    // match that precedes the dispatch match (the branch opcodes) carries
-    // `pc = program.get_label(pc - 1); ...; continue;` arms. Without the
-    // pin, the assignment SSA-rebinds `pc` to a fresh register that dies
-    // at the `continue` back-edge, so the next merge point reads the
-    // STALE fall-through pc from i0 (pre-advanced `pc += 1`) — the
-    // recorded green-pc channel diverges from concrete execution (an
-    // unconditional JMP at the last program index records pc == len,
-    // and `get_req_size(len)` is out of bounds). RPython has no rebind
-    // hazard: `pc` is one Variable through jtransform, so every write
-    // reaches the merge point by construction.
-    lowerer.pc_pinned = true;
-    let _lowered_pre_dispatch = lower_pre_dispatch_stmts(&mut lowerer, func_block);
-    lowerer.pc_pinned = false;
-    // A.2.3a fail-closed install gate: if pre-dispatch lowering detected
-    // a structurally unrecognized inner construct (currently only the
-    // `Expr::While` shape mismatch path), abort dispatch JitCode body
-    // generation and return None. The caller (`codegen_trace.rs`'s
-    // `generate_trace_fn`)
-    // emits an empty body for the dispatch_jitcode_fn, so the runtime
-    // gate in `generate_state_fields_jit_state` misses `BC_GETARRAYITEM_GC_I`
-    // and refuses to register the singleton.
-    if lowerer.dispatch_tainted_reason.is_some() {
-        return None;
-    }
-
     // Task 1.5: emit dispatch chain.
     // pyopcode.py:183+ if/elif chain over opcode value.
     // jtransform.py optimize_goto_if_not fuses int_eq + goto_if_not
     // into goto_if_not_int_eq/iiL (BC_GOTO_IF_NOT_INT_EQ).
-    let default_label =
-        lower_dispatch_chain(&mut lowerer, classified_arms, config, &loop_start_label);
+    //
+    // A matchless portal has no opcode chain: the post-merge-point
+    // while-body is the iteration, closed by the while condition.
+    let default_label = if classified_arms.is_empty() {
+        let default_label = lowerer.alloc_label();
+        lowerer.emit_aux(quote::quote! { let #default_label = __builder.new_label(); });
+        if lowerer
+            .transactional(|inner| {
+                lower_matchless_portal_body(inner, func_block, &loop_start_label)
+            })
+            .is_none()
+        {
+            return None;
+        }
+        default_label
+    } else {
+        // Pin pc-writes to i0 for the whole pre-dispatch walk. The branch-op
+        // match that precedes the dispatch match (the branch opcodes) carries
+        // `pc = program.get_label(pc - 1); ...; continue;` arms. Without the
+        // pin, the assignment SSA-rebinds `pc` to a fresh register that dies
+        // at the `continue` back-edge, so the next merge point reads the
+        // STALE fall-through pc from i0 (pre-advanced `pc += 1`) — the
+        // recorded green-pc channel diverges from concrete execution (an
+        // unconditional JMP at the last program index records pc == len,
+        // and `get_req_size(len)` is out of bounds). RPython has no rebind
+        // hazard: `pc` is one Variable through jtransform, so every write
+        // reaches the merge point by construction.
+        lowerer.pc_pinned = true;
+        let _lowered_pre_dispatch = lower_pre_dispatch_stmts(&mut lowerer, func_block);
+        lowerer.pc_pinned = false;
+        // A.2.3a fail-closed install gate: if pre-dispatch lowering detected
+        // a structurally unrecognized inner construct (currently only the
+        // `Expr::While` shape mismatch path), abort dispatch JitCode body
+        // generation and return None. The caller (`codegen_trace.rs`'s
+        // `generate_trace_fn`)
+        // emits an empty body for the dispatch_jitcode_fn, so the runtime
+        // gate in `generate_state_fields_jit_state` misses `BC_GETARRAYITEM_GC_I`
+        // and refuses to register the singleton.
+        if lowerer.dispatch_tainted_reason.is_some() {
+            return None;
+        }
+        lower_dispatch_chain(&mut lowerer, classified_arms, config, &loop_start_label)
+    };
 
     // Patch ensure_regs placeholder with actual register counts.
     // The ref bank must cover the ref-scalar identity slots at
@@ -4029,17 +4116,20 @@ pub(crate) fn lower_dispatch_body(
     // state-mutating statement there must fail closed: compiling just the
     // final read would skip the mutation on the machine-code path (TL's
     // `stackpos -= 1; stack[stackpos]` returned the pre-pop slot).
-    let dispatch_match = find_dispatch_match(func_block)?;
-    let dispatch_loop_index = func_block.stmts.iter().position(|stmt| {
-        let Stmt::Expr(expr, _) = stmt else {
-            return false;
-        };
-        match expr {
-            Expr::While(w) => block_contains_match(&w.body, dispatch_match),
-            Expr::Loop(l) => block_contains_match(&l.body, dispatch_match),
-            _ => false,
-        }
-    })?;
+    let dispatch_loop_index = if let Some(dispatch_match) = find_dispatch_match(func_block) {
+        func_block.stmts.iter().position(|stmt| {
+            let Stmt::Expr(expr, _) = stmt else {
+                return false;
+            };
+            match expr {
+                Expr::While(w) => block_contains_match(&w.body, dispatch_match),
+                Expr::Loop(l) => block_contains_match(&l.body, dispatch_match),
+                _ => false,
+            }
+        })?
+    } else {
+        find_portal_loop(func_block)?.index
+    };
     let post_loop = &func_block.stmts[dispatch_loop_index + 1..];
     // Positionally, not by searching backwards for the first expression-shaped
     // statement: a `while` / `if` / `match` / `loop` written in statement

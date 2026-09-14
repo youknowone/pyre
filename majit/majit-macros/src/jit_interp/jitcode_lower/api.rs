@@ -748,8 +748,11 @@ pub(super) fn bind_pre_merge_point_stmts(
     lowerer: &mut Lowerer,
     func_block: &syn::Block,
 ) -> Option<()> {
-    let dispatch_match = find_dispatch_match(func_block)?;
-    let loop_body = find_dispatch_loop_body(func_block, dispatch_match)?;
+    let loop_body = if let Some(dispatch_match) = find_dispatch_match(func_block) {
+        find_dispatch_loop_body(func_block, dispatch_match)?
+    } else {
+        portal_loop_body(func_block)?
+    };
     for stmt in &loop_body.stmts {
         if is_jit_merge_point_macro(stmt) {
             break;
