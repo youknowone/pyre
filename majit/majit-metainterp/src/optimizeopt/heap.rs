@@ -977,41 +977,32 @@ impl OptHeap {
             .fielddescr()
             .as_field_descr()
             .is_some_and(|f| f.is_w_class());
-        // Same-class proof used when the recorded struct or watcher no
-        // longer matches. A later wrapint `New` + `setfield w_class`
-        // revokes the process-global instance (`is_current` goes false)
-        // without this object's class changing; `__class__` assignment
-        // does change the runtime field and still fails the compare.
-        //
-        // `constantfieldbox` can be empty when the tracer recorded
-        // `QUASIIMMUT_FIELD` on a not-yet-allocated virtual (`bh_getfield`
-        // has no pointer). Read both objects' `w_class` now — the same
-        // `get_current_constant_fieldvalue` PyPy stores at `__init__`.
-        let w_class_still_matches = |ctx: &mut OptContext| -> bool {
-            let field = qmutdescr.fielddescr();
-            let recorded = qmutdescr.constantfieldbox().or_else(|| {
-                let recorded_obj =
-                    ctx.make_constant_ref(majit_ir::GcRef(qmutdescr.struct_ptr() as usize));
-                ctx.get_runtime_field(recorded_obj, field)
-                    .and_then(|r| r.inline_const_to_value())
-            });
-            let current = ctx
-                .get_runtime_field(obj, field)
-                .and_then(|r| r.inline_const_to_value());
-            match (recorded, current) {
-                (Some(a), Some(b)) => a == b,
-                _ => false,
-            }
-        };
         if struct_ptr != qmutdescr.struct_ptr() {
-            if !shared_w_class_watcher || !w_class_still_matches(ctx) {
+            if !shared_w_class_watcher {
+                return false;
+            }
+            // Same watcher, different object: accept only when this
+            // object's class still matches the folded constant. Otherwise
+            // a polymorphic replacement would keep A's class on B.
+            let Some(constantfieldbox) = qmutdescr.constantfieldbox() else {
+                return false;
+            };
+            let Some(currentbox) = ctx
+                .get_runtime_field(obj, qmutdescr.fielddescr())
+                .and_then(|r| r.inline_const_to_value())
+            else {
+                return false;
+            };
+            if currentbox != constantfieldbox {
                 return false;
             }
         }
+        // quasiimmut.py `is_still_valid_for`: `qmut is not self.qmut`
+        // is unconditional False. A later wrapint New+setfield that
+        // revokes the process-global watcher must InvalidLoop, not be
+        // rescued by a live w_class compare.
         if !qmutdescr.qmut().is_current() {
-            if !shared_w_class_watcher || !w_class_still_matches(ctx) {
-                return false;
-            }
+            return false;
         }
         if let (Some(constantfieldbox), Some(currentbox)) = (
             qmutdescr.constantfieldbox(),
@@ -2262,14 +2253,11 @@ impl OptHeap {
         let descr = op.getdescr().unwrap();
         let field_idx = Self::field_slot_index(&descr);
 
-        // heap.py:640-643: constant_fold — pure getfield on constant object.
-        //   if descr.is_always_pure() and self.get_constant_box(arg0):
-        //       resbox = self.optimizer.constant_fold(op)
-        //       self.optimizer.make_constant(op, resbox)
-        // Quasi-immut (`x?`) is the same once `optimize_QUASIIMMUT_FIELD`
-        // has recorded the watcher: the field of a ConstPtr cannot change
-        // without invalidating this loop, so the load is a constant.
-        if (descr.is_always_pure() || descr.is_quasi_immutable())
+        // heap.py `optimize_GETFIELD_GC_I`: constant_fold only when
+        // `descr.is_always_pure()` and arg0 is a constant box.
+        // Quasi-immutability is recorded by `optimize_QUASIIMMUT_FIELD`,
+        // not by widening this purity test.
+        if descr.is_always_pure()
             && ctx
                 .get_constant_box(&op.arg(0).get_box_replacement(false))
                 .is_some()

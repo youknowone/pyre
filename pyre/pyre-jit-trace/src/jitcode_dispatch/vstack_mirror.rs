@@ -630,22 +630,15 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
                 let mut top = ctx.frame_state.borrow().vstack_last_ref;
-                if top == OpRef::NONE {
-                    // A value `LOAD_CONST` (large int / float) routes its result
-                    // through the unboxed int/float bank, so `write_ref_reg`
-                    // never stamps `vstack_last_ref` and this slot would stay a
-                    // NONE hole. Unlike a genuine int-bank temp, a constant has
-                    // no live register the resume can re-box from, so `stack_sync`
-                    // omitting it leaves the bridge-resumed slot NULL — fatal when
-                    // it is a following CALL argument (a literal `f(1000)` in a
-                    // hot loop makes the callee parameter reconstruct unbound).
-                    // Materialize the boxed constant so the mirror carries it,
-                    // mirroring `MIFrame.registers_r` holding a `Const` box for
-                    // the same operand (resume numbers it via `getconst`). A
-                    // Ref-typed const (str / code) already stamped
-                    // `vstack_last_ref` through `write_ref_reg`, so it never
-                    // reaches this fallback.
-                    top = loadconst_operand_ref(ctx, code, &instr, op_arg);
+                // `LOAD_CONST` / `LOAD_SMALL_INT` push a Const the way
+                // `MIFrame.registers_r` holds `getconstant_w` / the
+                // interned small-int box. A residual `box_int_fn`
+                // stamps `vstack_last_ref` through `write_ref_reg`; the
+                // interned ConstPtr path does not, so a stale last_ref
+                // (the previous opcode's result) must not win.
+                let const_top = loadconst_operand_ref(ctx, code, &instr, op_arg);
+                if const_top != OpRef::NONE {
+                    top = const_top;
                 }
                 ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
             }

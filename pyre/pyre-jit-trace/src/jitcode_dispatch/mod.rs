@@ -9968,19 +9968,12 @@ fn walker_box_int<Sym: WalkSym>(
     raw: OpRef,
     value: i64,
 ) -> Result<OpRef, DispatchError> {
-    let _ = op_pc;
-    // A residual `box_int_fn(ConstInt(n))` is LOAD_SMALL_INT (or the
-    // `box_int(0)` / lasti cousins). Intern so JUMP can carry ConstPtr
-    // the way `getconstant_w` does for LOAD_CONST. A computed raw
-    // (`IntAdd` etc.) still wrapints — that is not WITHPREBUILTINT.
-    if raw.is_constant()
-        && (pyre_object::intobject::SMALL_INT_CONST_FROM
-            ..pyre_object::intobject::SMALL_INT_CONST_TO)
-            .contains(&value)
-    {
-        let interned = pyre_object::w_small_int_const(value);
-        return Ok(ctx.trace_ctx.const_ref(interned as i64));
-    }
+    let _ = (op_pc, value);
+    // intobject.py `wrapint` (withprebuiltint=False): every boxing
+    // allocates a fresh `W_IntObject`. Interning a constant raw here
+    // is WITHPREBUILTINT for the residual `box_int_fn` path. Only
+    // `LOAD_SMALL_INT` / `getconstant_w` intern, via the codewriter
+    // frontend.
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
 }
 
@@ -10716,22 +10709,12 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
     );
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
-    // Exact `w_class` is stronger than `GuardClass`: subclasses share the
-    // layout vtable and differ only in this field. Stamping `class_now_known`
-    // from the recorded `ob_type` lets a later `walker_unbox_int_typed` /
-    // `walker_guard_class` skip the redundant vtable guard.
-    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
-        && !concrete.is_null()
-        && !(pyre_object::tagged_int::CAN_BE_TAGGED
-            && pyre_object::tagged_int::is_tagged_int(concrete))
-    {
-        let type_addr = unsafe { (*concrete).ob_type } as i64;
-        if type_addr != 0 {
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj, type_addr);
-        }
-    }
+    // Do not stamp `class_now_known` here. Exact `w_class` is a stronger
+    // proof, but `optimize_GETFIELD` / peel import can fold the
+    // Getfield+GuardValue away on a LABEL input. `walker_guard_class`
+    // must still emit `GuardClass` so a later entry whose box is an
+    // int cannot take the long `GetfieldGcR(value)` path and pass
+    // intval to `jit_bigint_int_mul` (`selfrec_bridge_nontail_promote`).
     Ok(())
 }
 

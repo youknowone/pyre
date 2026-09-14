@@ -3553,7 +3553,7 @@ unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
 /// Both operands of a binary operator are exact builtin instances, each
 /// decided by [`is_exact_builtin_instance_promoted`].
 #[inline]
-unsafe fn both_exact_builtin_instances_promoted(a: PyObjectRef, b: PyObjectRef) -> bool {
+pub(crate) unsafe fn both_exact_builtin_instances_promoted(a: PyObjectRef, b: PyObjectRef) -> bool {
     is_exact_builtin_instance_promoted(a) && is_exact_builtin_instance_promoted(b)
 }
 

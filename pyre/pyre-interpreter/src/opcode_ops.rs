@@ -298,14 +298,20 @@ fn compare_value_from_tag_inner(
             )));
         }
     };
-    // Two machine ints: `compare_slot` only, so this graph stays loop-free
-    // for `look_inside_graph`.  `compare` carries the override loop and
-    // is `inline(never)` so it is not pulled in here.
-    let both_int_like = unsafe {
+    // Two exact builtin ints: `compare_slot` only, so this graph stays
+    // loop-free for `look_inside_graph`.  `compare` carries the override
+    // loop (`descroperation.py` `comparison_impl` always
+    // `lookup_in_type_where`s `__lt__`/`__gt__`) and is `inline(never)`
+    // so it is not pulled in here.  `is_int_like` is true for an int
+    // subclass (`is_int` is the vtable/`ob_type` check); taking the
+    // slot on that shape skips `LiarInt.__lt__` and returns the raw
+    // payload (`True` where the override returns `"LT"`).
+    let both_exact_int = unsafe {
         crate::objspace::descroperation::is_int_like(a)
             && crate::objspace::descroperation::is_int_like(b)
+            && crate::objspace::descroperation::both_exact_builtin_instances_promoted(a, b)
     };
-    if both_int_like {
+    if both_exact_int {
         return crate::objspace::descroperation::compare_slot(a, b, op);
     }
     compare(a, b, op)

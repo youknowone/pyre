@@ -4650,35 +4650,12 @@ impl OptContext {
         // matching PyPy `op.set_forwarded(preamble_info)` object sharing.
         let is_virtual = preamble_info_handle.borrow().is_virtual();
         if is_virtual {
-            // A wrapint virtual at JUMP carries the *next* iteration's
-            // `intval` as a constant field. Sharing that Virtual cell
-            // (`unroll.py` `setinfo_from_preamble` virtual arm) makes
-            // Phase 2 `getfield intval` fold to that constant, so a
-            // recorded `GUARD_FALSE(i < n)` becomes `GUARD_FALSE(1)` and
-            // peel raises InvalidLoop. PyPy Loop 2 of fannkuch keeps the
-            // peel: the LABEL slot is a heap box with `_known_class`
-            // only (`guard_nonnull_class` + live getfield).
-            // `IntBound.widen` is the same idea for raw ints, but it
-            // does not expand a small constant range. Install the
-            // forced-New shape instead.
-            let filled_with_constants = {
-                let info = preamble_info_handle.borrow();
-                let items = info.all_items();
-                !items.is_empty()
-                    && items
-                        .iter()
-                        .all(|(_, e)| e.as_seen_operand().const_value().is_some())
-            };
-            if filled_with_constants
-                && let Some(cls) = preamble_info_handle
-                    .borrow()
-                    .get_known_class(self.cpu.as_ref())
-            {
-                crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                    self, &op_box, cls, false,
-                );
-                return;
-            }
+            // unroll.py `setinfo_from_preamble` virtual arm: always
+            // `op.set_forwarded(preamble_info)` and recurse. A
+            // constant-filled wrapint, range, or range-iterator must
+            // stay virtual so Phase 2 still sees the field boxes
+            // (`for _ in range(4)` otherwise becomes
+            // `'int' object is not an iterator`).
             let resolved = op_box.get_box_replacement(false);
             if !resolved.is_constant() {
                 resolved.set_forwarded_info(crate::optimizeopt::info::OpInfo::Ptr(
