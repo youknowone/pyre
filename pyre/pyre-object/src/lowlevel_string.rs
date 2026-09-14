@@ -65,8 +65,11 @@ pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usiz
     };
     let tid = lowlevel_string_gc_type_id(base_size, item_size);
     let gc_ptr = if tid != 0 {
-        let ptr = crate::gc_hook::try_gc_alloc_stable_raw(tid, total_size);
-        ptr
+        // `rstr.malloc` / `malloc_varsize` is a nursery bump
+        // (`incminimark.py malloc_varsize`). The no-collect twin spills
+        // to old-gen when the nursery is full, so this call itself does
+        // not move any live rstr the caller still holds as an i64.
+        crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size)
     } else {
         std::ptr::null_mut()
     };
