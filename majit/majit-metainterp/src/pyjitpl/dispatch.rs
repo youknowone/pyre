@@ -9044,6 +9044,7 @@ where
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
                 let mut raw_i = Vec::new();
                 let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
                 let mut arg_classes = String::new();
                 for arg_spec in &arg_regs {
                     let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
@@ -9059,7 +9060,10 @@ where
                             raw_r.push(concrete);
                             arg_classes.push('r');
                         }
-                        JitArgKind::Float => arg_classes.push('f'),
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
                     }
                 }
                 let (token_number, concrete_ptr) = self
@@ -9075,7 +9079,8 @@ where
                 //    forced vs untouched; then the virtualizable half.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
-                // 3. execute (pyjitpl.py, tp == 'v')
+                // 3. execute (pyjitpl.py, tp == 'v') — `executor.execute_varargs`
+                //    → `cpu.bh_call_v`.
                 if let Some(action) = refuse_walk_local_ref_args(
                     ctx,
                     concrete_ptr as usize,
@@ -9093,7 +9098,17 @@ where
                         Some(&arg_classes),
                     );
                 }
-                call_void_function(concrete_ptr, &concrete_args);
+                if !concrete_ptr.is_null() {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_v_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        );
+                    }
+                }
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
                 {
@@ -9940,6 +9955,7 @@ where
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
                 let mut raw_i = Vec::new();
                 let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
                 let mut arg_classes = String::new();
                 for arg_spec in &arg_regs {
                     let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
@@ -9955,7 +9971,10 @@ where
                             raw_r.push(concrete);
                             arg_classes.push('r');
                         }
-                        JitArgKind::Float => arg_classes.push('f'),
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
                     }
                 }
                 let (token_number, concrete_ptr) = self
@@ -9984,7 +10003,19 @@ where
                         Some(&arg_classes),
                     );
                 }
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                let concrete = if concrete_ptr.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
+                    }
+                };
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
                 {
@@ -10051,6 +10082,7 @@ where
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
                 let mut raw_i = Vec::new();
                 let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
                 let mut arg_classes = String::new();
                 for arg_spec in &arg_regs {
                     let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
@@ -10066,7 +10098,10 @@ where
                             raw_r.push(concrete);
                             arg_classes.push('r');
                         }
-                        JitArgKind::Float => arg_classes.push('f'),
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
                     }
                 }
                 let (token_number, concrete_ptr) = self
@@ -10095,7 +10130,21 @@ where
                         Some(&arg_classes),
                     );
                 }
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                // 3. execute (pyjitpl.py, tp == 'r') — `executor.execute_varargs`
+                //    → `cpu.bh_call_r` / leftover `bh_call_i_by_classes`.
+                let concrete = if concrete_ptr.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
+                    }
+                };
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
                 {
@@ -10162,6 +10211,7 @@ where
                 let mut arg_types = Vec::with_capacity(arg_regs.len());
                 let mut raw_i = Vec::new();
                 let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
                 let mut arg_classes = String::new();
                 for arg_spec in &arg_regs {
                     let (arg, concrete, arg_type) = self.read_call_arg(*arg_spec);
@@ -10177,7 +10227,10 @@ where
                             raw_r.push(concrete);
                             arg_classes.push('r');
                         }
-                        JitArgKind::Float => arg_classes.push('f'),
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
                     }
                 }
                 let (token_number, concrete_ptr) = self
@@ -10206,8 +10259,21 @@ where
                         Some(&arg_classes),
                     );
                 }
-                // Leftover wrappers return packed i64 bits (`f64::to_bits`).
-                let concrete = call_int_function(concrete_ptr, &concrete_args);
+                // 3. execute (pyjitpl.py, tp == 'f') — leftover wrappers
+                //    return packed i64 bits (`f64::to_bits`); `cpu.bh_call_i`.
+                let concrete = if concrete_ptr.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        majit_backend::call_stub::bh_call_i_by_classes(
+                            concrete_ptr as usize,
+                            &arg_classes,
+                            Some(&raw_i),
+                            Some(&raw_r),
+                            Some(&raw_f),
+                        )
+                    }
+                };
                 if let Some(action) =
                     host_requested_walk_abort(ctx, concrete_ptr as usize, &arg_classes)
                 {
