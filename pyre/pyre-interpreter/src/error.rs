@@ -28,14 +28,15 @@ pub(crate) struct ExceptionNormalization {
 /// absence forever.
 #[majit_macros::dont_look_inside]
 pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool {
-    static STOP_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    static STOP_ITERATION_CLASS: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let stop_iteration = match STOP_ITERATION_CLASS.get() {
-        Some(&class) => class as PyObjectRef,
+        Some(class) => class,
         None => {
             let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
                 return false;
             };
-            let _ = STOP_ITERATION_CLASS.set(class as usize);
+            STOP_ITERATION_CLASS.set(class);
             class
         }
     };
@@ -49,14 +50,15 @@ pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool 
 /// `jit_fnaddr`, both of which a refactor would break silently.
 #[majit_macros::dont_look_inside]
 pub fn exception_object_matches_stop_async_iteration(exc_object: PyObjectRef) -> bool {
-    static STOP_ASYNC_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    static STOP_ASYNC_ITERATION_CLASS: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let stop_async_iteration = match STOP_ASYNC_ITERATION_CLASS.get() {
-        Some(&class) => class as PyObjectRef,
+        Some(class) => class,
         None => {
             let Some(class) = crate::builtins::lookup_exc_class("StopAsyncIteration") else {
                 return false;
             };
-            let _ = STOP_ASYNC_ITERATION_CLASS.set(class as usize);
+            STOP_ASYNC_ITERATION_CLASS.set(class);
             class
         }
     };

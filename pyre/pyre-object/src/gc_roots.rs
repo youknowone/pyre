@@ -736,6 +736,20 @@ impl RootedOnceRef {
         });
         unsafe { *self.slot.get() as PyObjectRef }
     }
+
+    pub fn get(&self) -> Option<PyObjectRef> {
+        if !self.once.is_completed() {
+            return None;
+        }
+        Some(unsafe { *self.slot.get() as PyObjectRef })
+    }
+
+    pub fn set(&self, value: PyObjectRef) {
+        self.once.call_once(|| unsafe {
+            *self.slot.get() = value as usize;
+            let _ = crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8);
+        });
+    }
 }
 
 impl Default for RootedItems {
