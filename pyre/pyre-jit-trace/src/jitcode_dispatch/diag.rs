@@ -528,6 +528,20 @@ pub(crate) fn fbw_spec_census_enabled() -> bool {
     })
 }
 
+/// Count a successful look-inside of `str.startswith` / `str.endswith` as
+/// the same spec-fold row the residual `jit_str_startswith` helper used to
+/// occupy.  The wrapper walk replaced that residual, so the fixture that
+/// names `str_startswith` still sees the specialization fire.
+pub(crate) fn spec_census_record_fired(fold: SpecFold) {
+    if !spec_instrumented() || !fbw_spec_census_enabled() {
+        return;
+    }
+    let idx = fold.index();
+    let ordering = std::sync::atomic::Ordering::Relaxed;
+    SPEC_CONSULTED[idx].fetch_add(1, ordering);
+    SPEC_FIRED[idx].fetch_add(1, ordering);
+}
+
 pub(crate) fn spec_census_record_instance_next_route_guard_keyed() {
     if fbw_spec_census_enabled() {
         INSTANCE_NEXT_FORITER_ROUTE_GUARDS_KEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
