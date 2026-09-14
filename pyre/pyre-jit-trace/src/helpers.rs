@@ -805,6 +805,309 @@ pub fn emit_exception_new_inline(
     new_op
 }
 
+/// Portal `CallFn` residual is `[frame, callable, args...]`
+/// (`flatten.rs` `build_call_fn_residual`). FBW's walker residual is
+/// `[callable, PY_NULL, args...]`. Accept either.
+pub fn portal_callfn_callable_index(raw_r: &[i64]) -> Option<usize> {
+    if raw_r.len() < 2 {
+        return None;
+    }
+    let a0 = raw_r[0] as pyre_object::PyObjectRef;
+    let a1 = raw_r[1] as pyre_object::PyObjectRef;
+    let is_class = |p: pyre_object::PyObjectRef| {
+        !p.is_null()
+            && unsafe { pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(p) }
+            && pyre_object::interp_exceptions::is_canonical_exc_class(p)
+    };
+    if is_class(a1) {
+        Some(1)
+    } else if is_class(a0) && a1.is_null() {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// `CallFn` of a canonical builtin exception class. OSError / SystemExit
+/// rebind `args_w` and stay on the residual path
+/// (`try_walker_trace_exception_new`).
+pub fn portal_can_record_exception_new(raw_r: &[i64]) -> bool {
+    let Some(callable_idx) = portal_callfn_callable_index(raw_r) else {
+        return false;
+    };
+    let concrete_callable = raw_r[callable_idx] as pyre_object::PyObjectRef;
+    let args_start = callable_idx + 1 + usize::from(callable_idx == 0);
+    if raw_r[args_start..]
+        .iter()
+        .any(|&p| (p as pyre_object::PyObjectRef).is_null())
+    {
+        return false;
+    }
+    // Constructors that rewrite `args_w` after parse stay residual.
+    if pyre_interpreter::builtins::lookup_exc_class("OSError")
+        .is_some_and(|w| std::ptr::eq(concrete_callable, w))
+        || pyre_interpreter::builtins::lookup_exc_class("SystemExit")
+            .is_some_and(|w| std::ptr::eq(concrete_callable, w))
+    {
+        return false;
+    }
+    true
+}
+
+/// Record `NewWithVtable` + `args_w` for a folded `CallFn` constructor.
+/// The live instance is built on the plain eval loop so later `is_exception`
+/// still sees a concrete pointer (`try_walker_trace_exception_new`).
+pub fn portal_emit_exception_new(
+    ctx: &mut TraceCtx,
+    args: &[OpRef],
+    raw_r: &[i64],
+) -> Option<(OpRef, i64)> {
+    if !portal_can_record_exception_new(raw_r) || args.len() < 2 {
+        return None;
+    }
+    let callable_idx = portal_callfn_callable_index(raw_r)?;
+    let concrete_callable = raw_r[callable_idx] as pyre_object::PyObjectRef;
+    let args_start = callable_idx + 1 + usize::from(callable_idx == 0);
+    let concrete_args: Vec<pyre_object::PyObjectRef> = raw_r[args_start..]
+        .iter()
+        .map(|&p| p as pyre_object::PyObjectRef)
+        .collect();
+    let exc = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(concrete_callable, &concrete_args).ok()?
+    };
+    if unsafe { !pyre_object::is_exception(exc) } {
+        return None;
+    }
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+    let canonical_class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
+    if canonical_class != concrete_callable {
+        return None;
+    }
+    let exc_type_ptr = unsafe {
+        (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+            .ob_header
+            .ob_type
+    };
+    if !std::ptr::eq(
+        exc_type_ptr,
+        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+    ) {
+        return None;
+    }
+    let args_list = emit_object_list_inline(ctx, &args[args_start..]);
+    let list_w_class = pyre_object::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
+    let list_w_class = ctx.const_ref(list_w_class as i64);
+    let list_w_class_descr = crate::descr::list_w_class_descr();
+    let list_w_class_index = list_w_class_descr.index();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[args_list, list_w_class],
+        list_w_class_descr,
+    );
+    ctx.heapcache_setfield_cached(args_list, list_w_class_index, list_w_class);
+    let new_op = emit_exception_new_inline(ctx, kind, args[callable_idx], args_list);
+    ctx.heap_cache_mut()
+        .class_now_known(new_op, exc_type_ptr as usize as i64);
+    ctx.set_opref_concrete(new_op, Value::Ref(GcRef(exc as usize)));
+    Some((new_op, exc as i64))
+}
+
+/// `normalize_raise_varargs_jit(frame, exc, cause)` with no `from` cause.
+pub fn portal_can_record_raise_builtin(raw_r: &[i64]) -> bool {
+    raw_r.len() == 3 && raw_r[2] == 0
+}
+
+/// Emit `__context__` on the still-virtual exception and skip the
+/// residual publish (`try_walker_trace_raise_builtin`).
+pub fn portal_emit_raise_builtin(
+    ctx: &mut TraceCtx,
+    _args: &[OpRef],
+    raw_r: &[i64],
+    exc_op: OpRef,
+    exc_ptr: i64,
+    ec: Option<OpRef>,
+) -> Option<OpRef> {
+    if !portal_can_record_raise_builtin(raw_r) {
+        return None;
+    }
+    let exc = exc_ptr as pyre_object::PyObjectRef;
+    if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
+        return None;
+    }
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
+    let ec = ec?;
+    let active = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[exc_op, active],
+        crate::descr::w_exception_context_descr(kind),
+    );
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    if !active_concrete.is_null() {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
+        }
+    }
+    Some(exc_op)
+}
+
+/// FBW `try_walker_lower_exc_info_residual`: PUSH_EXC_INFO
+/// `prev = GETFIELD_GC_R(ec, sys_exc_value)`.
+pub fn portal_emit_get_current_exception(ctx: &mut TraceCtx, ec: OpRef) -> (OpRef, i64) {
+    let descr = crate::descr::ec_sys_exc_value_descr();
+    let boxed = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[ec], descr);
+    let concrete = pyre_interpreter::eval::get_current_exception() as i64;
+    ctx.set_opref_concrete(boxed, Value::Ref(GcRef(concrete as usize)));
+    (boxed, concrete)
+}
+
+/// FBW `try_walker_lower_exc_info_residual`: PUSH_EXC_INFO /
+/// POP_EXCEPT `SETFIELD_GC(ec, exc, sys_exc_value)`.
+pub fn portal_emit_set_current_exception(ctx: &mut TraceCtx, ec: OpRef, exc: OpRef, exc_ptr: i64) {
+    let descr = crate::descr::ec_sys_exc_value_descr();
+    let idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[ec, exc], descr);
+    ctx.heapcache_setfield_cached(ec, idx, exc);
+    pyre_interpreter::eval::set_current_exception(exc_ptr as pyre_object::PyObjectRef);
+}
+
+/// `LOAD_GLOBAL` of a canonical builtin exception class. `pyopcode.py
+/// LOAD_GLOBAL` looks inside the module-dict cell; pin the namespace
+/// version (`walker_pin_namespace_version`) and keep the immortal
+/// class as `ConstPtr`.
+pub fn portal_try_fold_load_global_exc_class(
+    ctx: &mut TraceCtx,
+    raw_i: &[i64],
+) -> Option<(OpRef, i64)> {
+    if raw_i.len() < 2 {
+        return None;
+    }
+    let value = pyre_interpreter::eval::load_global_nameindex_w(raw_i[0], raw_i[1]);
+    if value.is_null() || !pyre_object::interp_exceptions::is_canonical_exc_class(value) {
+        return None;
+    }
+    let frame_ptr = if raw_i[0] == 0 {
+        pyre_interpreter::eval::current_frame() as i64
+    } else {
+        raw_i[0]
+    };
+    if frame_ptr == 0 {
+        return None;
+    }
+    let frame = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
+    let globals = unsafe { (*frame).get_w_globals() };
+    if !globals.is_null() {
+        let strategy =
+            unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(globals) };
+        if !strategy.is_null() {
+            let strategy_box = ctx.const_ref(strategy as i64);
+            crate::state::record_quasiimmut_field(
+                ctx,
+                strategy_box,
+                crate::descr::module_dict_version_descr(),
+            );
+        }
+    }
+    Some((ctx.const_ref(value as i64), value as i64))
+}
+
+/// `PyError.exc_object` when `to_exc_object` is identity
+/// (`from_exc_object` already stored the instance).
+pub fn portal_pyerror_exc_object(err_ptr: i64) -> Option<i64> {
+    if err_ptr == 0 {
+        return None;
+    }
+    let err = err_ptr as *const pyre_interpreter::error::PyError;
+    let exc = unsafe { (*err).exc_object };
+    if exc.is_null() {
+        None
+    } else {
+        Some(exc as i64)
+    }
+}
+
+/// Concrete `attach_raise_cause(exc, None)` for a folded
+/// `raise_prepared_exc` (`pyopcode.py RAISE_VARARGS` of an instance).
+pub fn portal_attach_raise_cause(exc_ptr: i64) {
+    let exc = exc_ptr as pyre_object::PyObjectRef;
+    if exc.is_null() {
+        return;
+    }
+    let _ = pyre_interpreter::eval::attach_raise_cause(exc, None);
+}
+
+/// `record_fresh_application_traceback`: virtual `PyTraceback`
+/// `NewWithVtable` + SETFIELDs on the still-virtual exception, so a
+/// locally-caught raise DCEs. The recording hook
+/// (`record_top_level_application_traceback`) is a `CallN` that forces.
+pub fn portal_emit_virtual_traceback(
+    ctx: &mut TraceCtx,
+    exc: OpRef,
+    exc_ptr: i64,
+    frame: OpRef,
+    frame_ptr: i64,
+) -> bool {
+    let exc_obj = exc_ptr as pyre_object::PyObjectRef;
+    if exc_obj.is_null() || unsafe { !pyre_object::is_exception(exc_obj) } {
+        return false;
+    }
+    let pyframe = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
+    if pyframe.is_null() {
+        return false;
+    }
+    let last_instr = unsafe { (*pyframe).last_instr as i64 };
+    let w_code = unsafe { (*pyframe).pycode as i64 };
+    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_obj) };
+    let traceback = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::pytraceback_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(traceback);
+    let w_class = ctx.const_ref(pyre_object::pyobject::get_instantiate(
+        &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE,
+    ) as i64);
+    let lasti = ctx.const_int(last_instr.saturating_mul(2));
+    let w_next = ctx.const_ref(0);
+    let lineno = if w_code == 0 {
+        ctx.const_int(-1)
+    } else {
+        ctx.const_int(unsafe {
+            pyre_interpreter::pyframe::offset2lineno(
+                w_code as pyre_object::PyObjectRef,
+                last_instr as isize,
+            ) as i64
+        })
+    };
+    let w_code_box = ctx.const_ref(w_code);
+    let fields = [
+        (w_class, 0usize),
+        (frame, 1),
+        (lasti, 2),
+        (w_next, 3),
+        (lineno, 4),
+        (w_code_box, 5),
+    ];
+    for (value, index) in fields {
+        let descr = crate::descr::pytraceback_field_descr(index);
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[traceback, value], descr.clone());
+        ctx.heapcache_setfield_cached(traceback, descr.index(), value);
+    }
+    let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[exc, traceback],
+        traceback_descr.clone(),
+    );
+    ctx.heapcache_setfield_cached(exc, traceback_descr.index(), traceback);
+    true
+}
+
 /// Emit inline `Method` creation (NewWithVtable + SetfieldGc for
 /// `w_function` / `w_self` / `w_class` and the inherited header
 /// `PyObject.w_class`), mirroring `function.rs w_method_new`.

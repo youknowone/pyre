@@ -4883,12 +4883,7 @@ pub fn pyobject_ob_type_stable_descr() -> DescrRef {
     DESCR
         .get_or_init(|| {
             majit_ir::descr::make_field_descr_full(
-                stable_field_index(
-                    pyre_object::pyobject::OB_TYPE_OFFSET,
-                    8,
-                    Type::Ref,
-                    false,
-                ),
+                stable_field_index(pyre_object::pyobject::OB_TYPE_OFFSET, 8, Type::Ref, false),
                 pyre_object::pyobject::OB_TYPE_OFFSET,
                 8,
                 Type::Ref,
@@ -4903,12 +4898,7 @@ pub fn pyobject_w_class_stable_descr() -> DescrRef {
     DESCR
         .get_or_init(|| {
             majit_ir::descr::make_field_descr_full(
-                stable_field_index(
-                    pyre_object::pyobject::W_CLASS_OFFSET,
-                    8,
-                    Type::Ref,
-                    false,
-                ),
+                stable_field_index(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false),
                 pyre_object::pyobject::W_CLASS_OFFSET,
                 8,
                 Type::Ref,
@@ -5284,6 +5274,39 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
+/// STRUCT name look-inside Getfield of `W_BaseException.kind` was
+/// published under. Emit Setfield on the slim layout must share that
+/// parent `cache_key` and the field_key `kind` — otherwise
+/// `slot_holds_field` treats the later Getfield as a different slot and
+/// folds it to the zeroed allocation (`GuardValue(0, ExcKind)` is then
+/// an InvalidLoop).
+fn translator_w_base_exception_struct_name() -> &'static str {
+    static NAME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    *NAME.get_or_init(|| {
+        const CANDIDATES: &[&str] = &[
+            "interp_exceptions::W_BaseException",
+            "pyre_object::interp_exceptions::W_BaseException",
+        ];
+        let gc = majit_ir::descr::gc_cache().lock();
+        for name in CANDIDATES {
+            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(name));
+            if gc
+                ._cache_size
+                .get(&key)
+                .and_then(|d| d.as_size_descr())
+                .is_some_and(|sd| {
+                    sd.all_fielddescrs()
+                        .iter()
+                        .any(|fd| fd.offset() == EXC_KIND_OFFSET && fd.field_key() == "kind")
+                })
+            {
+                return *name;
+            }
+        }
+        "interp_exceptions::W_BaseException"
+    })
+}
+
 /// SizeDescr + field descrs for exception allocation via NewWithVtable,
 /// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
 /// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
@@ -5383,7 +5406,7 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             "interp_exceptions::W_BaseException",
             &[],
             &[],
-            "W_BaseException",
+            translator_w_base_exception_struct_name(),
             false,
         );
     }
