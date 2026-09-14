@@ -1074,6 +1074,20 @@ fn real_main() {
                     "opcode_ops",
                     "compare_value_from_tag",
                 ]),
+                // `space.newbool` (`baseobjspace.py:896-900`): `if b:
+                // return w_True; else: return w_False`. The residual
+                // wrapper is `dont_look_inside`; these bodies are the
+                // look-inside graphs portal interpret descends.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "opcode_ops",
+                    "bool_value_from_truth",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "boolobject",
+                    "w_bool_from",
+                ]),
             ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {
