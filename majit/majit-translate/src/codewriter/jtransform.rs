@@ -1501,6 +1501,23 @@ fn getsubstruct_offset_for_access(
     }
 }
 
+/// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
+fn lltype_vtype_name(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Struct(s) => Some(s._name.clone()),
+            PtrTarget::ForwardReference(fwd) => fwd.resolved().as_ref().and_then(lltype_vtype_name),
+            _ => None,
+        },
+        LowLevelType::Struct(s) => Some(s._name.clone()),
+        LowLevelType::ForwardReference(fwd) => fwd.resolved().as_ref().and_then(lltype_vtype_name),
+        _ => None,
+    }
+}
+
 impl<'a> Transformer<'a> {
     /// `jtransform.py Transformer.get_vinfo(v_virtualizable)`.
     ///
@@ -1525,6 +1542,23 @@ impl<'a> Transformer<'a> {
             }
         }
         None
+    }
+
+    /// `jtransform.py Transformer.get_vinfo(v_virtualizable)` via
+    /// `v_virtualizable.concretetype`.
+    fn get_vinfo_for_var(
+        &self,
+        var: &crate::flowspace::model::Variable,
+        owner: Option<&str>,
+    ) -> Option<std::sync::Arc<dyn crate::call::VirtualizableInfoHandle>> {
+        if let Some(ct) = var.concretetype() {
+            if let Some(name) = lltype_vtype_name(&ct) {
+                if let Some(vinfo) = self.get_vinfo(Some(&name)) {
+                    return Some(vinfo);
+                }
+            }
+        }
+        self.get_vinfo(owner)
     }
 
     /// `jtransform.py Transformer.get_virtualizable_field_descr`.
@@ -1939,7 +1973,7 @@ impl<'a> Transformer<'a> {
             return VirtualizableGetset::No;
         }
         // jtransform.py: `vinfo = self.get_vinfo(op.args[0])`.
-        if let Some(vinfo) = self.get_vinfo(field.owner_root.as_deref()) {
+        if let Some(vinfo) = self.get_vinfo_for_var(base, field.owner_root.as_deref()) {
             if vinfo.has_array_field(&field.name) {
                 return VirtualizableGetset::Array;
             }

@@ -1924,6 +1924,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // jitframe.py — rgc.register_custom_trace_hook(JITFRAME, jitframe_trace)
     let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
     debug_assert_eq!(jitframe_tid, JITFRAME_GC_TYPE_ID);
+    // compile.py AllVirtuals — llopaque leaf hidden in jf_savedata.
+    let all_virtuals_tid =
+        gc.register_type(majit_gc::trace::TypeInfo::simple(std::mem::size_of::<
+            majit_metainterp::AllVirtuals,
+        >()));
+    majit_metainterp::set_all_virtuals_gc_type_id(all_virtuals_tid);
     // Dynasm allocates jitframes off-GC, so its shadow-stack roots still need
     // the host-side tracer. Cranelift's nursery JITFRAMEs use the registered
     // custom trace directly. Off-GC addresses are inert when encountered in a

@@ -27,7 +27,10 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 #[derive(Clone, Debug, Default)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,
-    pub accessor: crate::translator::rtyper::rclass::FieldListAccessor,
+    /// Shared with `VTYPE._hints['virtualizable_accessor']` so
+    /// `_parse_field_list` initializes the same object the hint names.
+    pub accessor:
+        std::sync::Arc<parking_lot::Mutex<crate::translator::rtyper::rclass::FieldListAccessor>>,
     pub my_redirected_fields: HashMap<String, bool>,
 }
 
@@ -35,7 +38,9 @@ impl VirtualizableInstanceRepr {
     pub fn new(top_of_virtualizable_hierarchy: bool) -> Self {
         VirtualizableInstanceRepr {
             top_of_virtualizable_hierarchy,
-            accessor: crate::translator::rtyper::rclass::FieldListAccessor::default(),
+            accessor: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::translator::rtyper::rclass::FieldListAccessor::default(),
+            )),
             my_redirected_fields: HashMap::new(),
         }
     }

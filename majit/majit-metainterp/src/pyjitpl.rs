@@ -16301,7 +16301,7 @@ impl<M: Clone> MetaInterp<M> {
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) {
         crate::compile::ResumeGuardForcedDescr::force_now(|| {
-            let deadframe = self
+            let mut deadframe = self
                 .backend
                 .force(GcRef(token as usize))
                 .expect("active virtualizable must have a backend deadframe");
@@ -16326,7 +16326,7 @@ impl<M: Clone> MetaInterp<M> {
                 })
                 .collect::<Vec<_>>();
             // compile.py: faildescr.handle_async_forcing(deadframe)
-            self.handle_async_forcing_with_allocator(
+            let cache = self.handle_async_forcing_with_allocator(
                 Some(descr),
                 green_key,
                 trace_id,
@@ -16334,6 +16334,11 @@ impl<M: Clone> MetaInterp<M> {
                 &fail_values,
                 allocator,
             );
+            // compile.py: cpu.set_savedata_ref(deadframe, AllVirtuals(cache).hide())
+            if let Some(cache) = cache {
+                self.backend
+                    .set_savedata_ref(&mut deadframe, crate::compile::AllVirtuals::hide(cache));
+            }
         });
     }
 

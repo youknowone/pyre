@@ -3853,6 +3853,89 @@ pub fn make_resume_at_position_descr() -> DescrRef {
     make_resume_at_position_descr_typed(Vec::new())
 }
 
+/// compile.py `AllVirtuals` — llopaque instance hidden in
+/// `jf_savedata` so `handle_fail` can fish the virtuals
+/// `handle_async_forcing` just materialized.
+pub const ALL_VIRTUALS_VTABLE: usize = 0x414C_5652; // "ALVR"
+
+const ALL_VIRTUALS_GC_TYPE_ID_UNSET: u32 = u32::MAX;
+static ALL_VIRTUALS_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(ALL_VIRTUALS_GC_TYPE_ID_UNSET);
+
+/// Publish the leaf type used by [`AllVirtuals::hide`].
+pub fn set_all_virtuals_gc_type_id(type_id: u32) {
+    ALL_VIRTUALS_GC_TYPE_ID.store(type_id, Ordering::Relaxed);
+}
+
+/// compile.py `class AllVirtuals(object)` with `llopaque = True`.
+#[repr(C)]
+pub struct AllVirtuals {
+    pub super_: crate::virtualref::ObjectHeader,
+    n_ptrs: usize,
+    ptrs: *mut i64,
+    n_ints: usize,
+    ints: *mut i64,
+}
+
+impl AllVirtuals {
+    /// compile.py `AllVirtuals(cache)` + `hide()`.
+    pub fn hide(cache: (Vec<i64>, Vec<i64>)) -> majit_ir::GcRef {
+        let (mut ptrs, mut ints) = cache;
+        ptrs.shrink_to_fit();
+        ints.shrink_to_fit();
+        let n_ptrs = ptrs.len();
+        let n_ints = ints.len();
+        let ptrs = Box::into_raw(ptrs.into_boxed_slice()) as *mut i64;
+        let ints = Box::into_raw(ints.into_boxed_slice()) as *mut i64;
+        let value = AllVirtuals {
+            super_: crate::virtualref::ObjectHeader {
+                typeptr: ALL_VIRTUALS_VTABLE,
+            },
+            n_ptrs,
+            ptrs,
+            n_ints,
+            ints,
+        };
+        let type_id = ALL_VIRTUALS_GC_TYPE_ID.load(Ordering::Relaxed);
+        if type_id == ALL_VIRTUALS_GC_TYPE_ID_UNSET {
+            return majit_ir::GcRef(Box::into_raw(Box::new(value)) as usize);
+        }
+        let obj = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<AllVirtuals>());
+        assert!(!obj.is_null(), "AllVirtuals old-gen allocation failed");
+        unsafe { std::ptr::write(obj.0 as *mut AllVirtuals, value) };
+        let root = Box::into_raw(Box::new(obj));
+        unsafe { majit_gc::gc_add_root(root) };
+        obj
+    }
+
+    /// compile.py `AllVirtuals.show(gcref)`.
+    pub fn show(gcref: majit_ir::GcRef) -> Option<(Vec<i64>, Vec<i64>)> {
+        if gcref.is_null() {
+            return None;
+        }
+        let obj = gcref.0 as *const AllVirtuals;
+        if obj.is_null() {
+            return None;
+        }
+        unsafe {
+            if (*obj).super_.typeptr != ALL_VIRTUALS_VTABLE {
+                return None;
+            }
+            let ptrs = if (*obj).n_ptrs == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts((*obj).ptrs, (*obj).n_ptrs).to_vec()
+            };
+            let ints = if (*obj).n_ints == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts((*obj).ints, (*obj).n_ints).to_vec()
+            };
+            Some((ptrs, ints))
+        }
+    }
+}
+
 /// compile.py: ResumeGuardForcedDescr(ResumeGuardDescr) — subtype
 /// minted by `invent_fail_descr_for_op` for `GUARD_NOT_FORCED` /
 /// `GUARD_NOT_FORCED_2`. Upstream attaches `metainterp_sd` /
@@ -3878,8 +3961,7 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
         self.inner.fail_index
     }
     fn as_any(&self) -> Option<&dyn std::any::Any> {
-        // Hand out the inner ResumeGuardDescr — see ResumeAtPositionDescr.
-        Some(&self.inner)
+        Some(self)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
@@ -3922,6 +4004,15 @@ impl ResumeGuardForcedDescr {
     pub fn force_now(body: impl FnOnce()) {
         let _cc = crate::CriticalCodeGuard::enter();
         body();
+    }
+
+    /// compile.py `ResumeGuardForcedDescr.handle_fail`.
+    ///
+    /// `hidden_all_virtuals = cpu.get_savedata_ref(deadframe)` then
+    /// `AllVirtuals.show`. An empty cache is the miss arm that still
+    /// blackholes (`VirtualCache([], [])`).
+    pub fn handle_fail_savedata(savedata: Option<majit_ir::GcRef>) -> Option<(Vec<i64>, Vec<i64>)> {
+        AllVirtuals::show(savedata?)
     }
 }
 
@@ -6116,6 +6207,17 @@ impl TraceCtx {
 #[cfg(test)]
 mod fail_descr_tests {
     use super::*;
+
+    #[test]
+    fn all_virtuals_hide_show_round_trips_the_cache() {
+        let hidden = AllVirtuals::hide((vec![1, 2], vec![3]));
+        assert_eq!(AllVirtuals::show(hidden), Some((vec![1, 2], vec![3])));
+        assert_eq!(
+            ResumeGuardForcedDescr::handle_fail_savedata(Some(hidden)),
+            Some((vec![1, 2], vec![3]))
+        );
+        assert_eq!(AllVirtuals::show(majit_ir::GcRef(0)), None);
+    }
 
     #[test]
     fn force_now_runs_the_body() {

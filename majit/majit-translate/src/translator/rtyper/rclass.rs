@@ -459,7 +459,8 @@ fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)
-        | ConstValue::HostObject(_) => true,
+        | ConstValue::HostObject(_)
+        | ConstValue::Opaque(_) => true,
     }
 }
 
@@ -3420,7 +3421,8 @@ impl InstanceRepr {
             // `_parse_field_list` only consults `hints['immutable']`.
             // The accessor object itself is stamped on the struct type
             // as `virtualizable_accessor` — see `virtualizable_accessor_hint`.
-            let ranking = self._parse_field_list(&names, &mut vable.accessor, &HashMap::new())?;
+            let ranking =
+                self._parse_field_list(&names, &mut vable.accessor.lock(), &HashMap::new())?;
             vable.my_redirected_fields = ranking.into_keys().map(|name| (name, true)).collect();
         } else if let Some(base) = self.rbase.borrow().as_ref()
             && let Some(base_vable) = base.virtualizable.borrow().clone()
@@ -3433,10 +3435,8 @@ impl InstanceRepr {
 
     /// First step of `VirtualizableInstanceRepr._setup_repr`:
     /// `hints = {'virtualizable_accessor': self.accessor}` passed to
-    /// `MkStruct`. `Struct._hints` is `frozendict<ConstValue>`, so the
-    /// live `FieldListAccessor` cannot sit here yet. Stamp the ranking
-    /// dict (`inst_name → immutable` / `immutable_array`) that
-    /// `VirtualizableInfo.__init__` reads off `accessor.fields`.
+    /// `MkStruct`. The live `FieldListAccessor` is the hint value;
+    /// `_parse_field_list` later initializes that same object.
     fn virtualizable_accessor_hint(&self) -> Result<Vec<(String, ConstValue)>, TyperError> {
         let Some(vable) = self.virtualizable.borrow().clone() else {
             return Ok(vec![]);
@@ -3444,26 +3444,11 @@ impl InstanceRepr {
         if !vable.top_of_virtualizable_hierarchy {
             return Ok(vec![]);
         }
-        let classdesc = self
-            .classdef
-            .as_ref()
-            .map(|cd| cd.borrow().classdesc.clone())
-            .ok_or_else(|| {
-                TyperError::message(
-                    "VirtualizableInstanceRepr._setup_repr needs a classdesc".to_string(),
-                )
-            })?;
-        let vfields = classdesc.borrow().get_param("_virtualizable_", None, false);
-        let names = const_value_field_names(&vfields);
-        let mut accessor = FieldListAccessor::default();
-        let ranking = self._parse_field_list(&names, &mut accessor, &HashMap::new())?;
-        let mut fields = HashMap::new();
-        for (name, rank) in ranking {
-            fields.insert(ConstValue::byte_str(name), ConstValue::byte_str(rank.name));
-        }
         Ok(vec![(
             "virtualizable_accessor".to_string(),
-            ConstValue::Dict(fields),
+            ConstValue::Opaque(crate::flowspace::model::OpaqueConst::from_arc(
+                std::sync::Arc::clone(&vable.accessor),
+            )),
         )])
     }
 }
@@ -6697,20 +6682,19 @@ mod tests {
             ._hints
             .get("virtualizable_accessor")
             .expect("VTYPE._hints['virtualizable_accessor']");
-        let ConstValue::Dict(fields) = hint else {
-            panic!("virtualizable_accessor hint must be a ranking dict, got {hint:?}");
+        let ConstValue::Opaque(opaque) = hint else {
+            panic!("virtualizable_accessor hint must be the live accessor, got {hint:?}");
         };
+        let accessor = opaque
+            .downcast_ref::<parking_lot::Mutex<FieldListAccessor>>()
+            .expect("hint is FieldListAccessor");
+        let accessor = accessor.lock();
         assert_eq!(
-            fields.get(&ConstValue::byte_str("inst_x")),
-            Some(&ConstValue::byte_str("immutable")),
+            accessor.fields.get("inst_x").map(|rank| rank.name),
+            Some("immutable"),
             "accessor.fields maps inst_x to IR_IMMUTABLE"
         );
-        let accessor_ty = repr
-            .virtualizable
-            .borrow()
-            .as_ref()
-            .and_then(|vable| vable.accessor.TYPE.clone())
-            .expect("accessor.TYPE");
+        let accessor_ty = accessor.TYPE.clone().expect("accessor.TYPE");
         assert!(
             matches!(accessor_ty, LowLevelType::Struct(_)),
             "test_rvirtualizable.py test_accessor: accessor.TYPE == TYPE after become"

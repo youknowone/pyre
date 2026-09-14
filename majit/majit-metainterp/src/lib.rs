@@ -186,9 +186,9 @@ pub use call_descr::{
     nursery_alloc_effect_info,
 };
 pub use compile::{
-    make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
+    AllVirtuals, make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
     make_resume_guard_descr_instance_next_foriter, make_resume_guard_descr_range_foriter,
-    raw_exit_values,
+    raw_exit_values, set_all_virtuals_gc_type_id,
 };
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
