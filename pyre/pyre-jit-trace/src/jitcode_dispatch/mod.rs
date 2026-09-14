@@ -10231,7 +10231,7 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     // A young descriptor can move. Baking it as ConstPtr then reading
     // fget at compile time is the convert_to_imm / can_move hazard.
     // Skip the fold; the version-tag pin still covers rebinding the name.
-    if majit_gc::can_move(w_descr as usize) {
+    if majit_gc::can_move(majit_ir::GcRef(w_descr as usize)) {
         return Ok(());
     }
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
