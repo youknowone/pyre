@@ -183,6 +183,7 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     let slot_count = info.num_static_extra_boxes + ARRAY_LEN;
     let initial_boxes = vec![ctx.const_null(); slot_count];
     let initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+    ctx.install_virtualizable_info(info.clone());
     ctx.init_virtualizable_boxes(
         &info,
         standard,

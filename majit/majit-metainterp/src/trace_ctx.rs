@@ -6370,6 +6370,7 @@ mod tests {
         let pointer = Value::Ref(majit_ir::GcRef(0x1000));
         ctx.set_opref_concrete(standard, pointer);
         ctx.set_opref_concrete(alias, pointer);
+        ctx.install_virtualizable_info(info.clone());
         ctx.set_virtualizable_boxes_with_info(
             vec![field, standard],
             vec![Value::Int(0), pointer],
