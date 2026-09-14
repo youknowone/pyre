@@ -2023,21 +2023,36 @@ pub(crate) fn exception_string_override_has_nested_call(
 /// (`format_with_spec_result_type`).  The concat residual is
 /// `RuntimeHelperKind::BinaryOp`.  Any BinaryOp is not enough: `self.x +
 /// self.y; return self.out` must stay residual.  The last residual call
-/// has to be that concat, so the returned value is the built string.
+/// has to be that concat, and every `ref_return` has to name that
+/// call's dest — `x = OUT; "<" + spec; return x` stays residual.
 fn format_body_constructs_str(body_code: &[u8], callee_descr_refs: &[DescrRef]) -> bool {
-    let mut last_is_binary = false;
+    let mut last_binop_dst: Option<u8> = None;
+    let mut saw_return = false;
+    let mut returns_are_concat = true;
     let mut pc = 0usize;
     while pc < body_code.len() {
         let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
             return false;
         };
         if d.opname.starts_with("residual_call") {
-            last_is_binary = residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
+            let is_binary = residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
                 == Some(majit_ir::RuntimeHelperKind::BinaryOp);
+            last_binop_dst = if is_binary && d.argcodes.contains(">r") {
+                body_code.get(d.next_pc.wrapping_sub(1)).copied()
+            } else {
+                None
+            };
+        }
+        if d.opname == "ref_return" {
+            saw_return = true;
+            let ret = body_code.get(d.pc + 1).copied();
+            if ret != last_binop_dst {
+                returns_are_concat = false;
+            }
         }
         pc = d.next_pc;
     }
-    last_is_binary
+    saw_return && returns_are_concat && last_binop_dst.is_some()
 }
 
 /// Active boxes for an inlined callee's OWN frame in a multi-frame snapshot
