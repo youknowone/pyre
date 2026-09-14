@@ -5829,24 +5829,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
     let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
-    // The first recording has no procedure token, so it still inlines the
-    // `fib(2)` shape. A later *bridge* of that same compiled portal must
-    // not unroll the left spine (`bridge_subwalk.rs`: that continuation
-    // is CALL_ASSEMBLER, not a fresh peel). A different hot loop that
-    // calls an already-compiled recursive helper is not a bridge of that
-    // helper and still inlines (`recursion_past_unroll_bound_from_loop`).
-    if recursive_portal_present
-        && ctx.trace_ctx.is_bridge_trace
-        && crate::driver::try_driver_pair().is_some_and(|(driver, _)| {
-            driver
-                .meta_interp()
-                .warm_state_ref()
-                .get_cell_for_key(&callee_green_key)
-                .is_some_and(|cell| cell.is_compiled())
-        })
-    {
-        return resolved_inline_decline(op.pc, line!());
-    }
+    // pyjitpl.py `_opimpl_recursive_call`: look inside while
+    // `count < max_unroll_recursion`, even on a bridge of an already
+    // compiled portal. Forcing CALL_ASSEMBLER here jumped `fib(n>=3)`
+    // into the n==2 entry and deopted (406 guard failures).
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
