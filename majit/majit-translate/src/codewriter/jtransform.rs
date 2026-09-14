@@ -3051,6 +3051,29 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
+            // `lloperation.py float_abs` / `blackhole.py bhimpl_float_abs`.
+            // The front lowers `f64::abs` to UnaryOp("abs"); stamp the
+            // float bank and emit the same `float_abs/f>f` the assembler
+            // already wires.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "abs" && self.get_value_kind_var(operand) == 'f' => {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::Float,
+                );
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: "float_abs".into(),
+                        operand: operand.clone(),
+                        result_ty: ValueType::Float,
+                    },
+                }])
+            }
             // RPython hits Python-`%` / `//` semantics through TWO
             // distinct routes upstream:
             //
