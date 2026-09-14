@@ -320,13 +320,11 @@ mod frame_replacement_tests {
             walker_replace_box(&mut ctx, middle, standard);
             ctx.registers_r.set(0, old);
             ctx.frame_state.borrow_mut().vstack_boxes[0] = old;
-            let mut info =
-                majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
-            info.add_field("last_instr", Type::Int, 0);
-            let info = info.finalize_arc(majit_ir::descr::make_size_descr(8));
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let initial = ctx.trace_ctx.const_int(0);
             let pointer = Value::Ref(majit_ir::GcRef(0x1000));
             ctx.trace_ctx.set_opref_concrete(old, pointer);
+            ctx.trace_ctx.install_virtualizable_info(info.clone());
             ctx.trace_ctx.set_virtualizable_boxes_with_info(
                 vec![initial, standard],
                 vec![Value::Int(0), pointer],

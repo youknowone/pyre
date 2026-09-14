@@ -1709,6 +1709,7 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let vable = tc.const_ref(1);
     let initial_boxes = vec![tc.const_null(); slot_count];
     let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
         vable,
@@ -2146,6 +2147,7 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
         let standard = tc.const_ref(1);
         let initial_boxes = vec![tc.const_null(); slot_count];
         let initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+        tc.install_virtualizable_info(info.clone());
         tc.init_virtualizable_boxes(
             &info,
             standard,
@@ -10617,6 +10619,7 @@ fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
         "fake vable buffer must cover token_offset",
     );
     let vable_ref = tc.const_ref(buf.as_ptr() as i64);
+    tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
         vable_ref,
@@ -16251,6 +16254,7 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
     let vable = tc.const_ref(frame_ptr as i64);
     let initial_boxes = vec![tc.const_null(); slot_count];
     let initial_values = vec![Value::Int(0); slot_count];
+    tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
         vable,

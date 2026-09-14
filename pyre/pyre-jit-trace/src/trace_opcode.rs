@@ -3575,6 +3575,7 @@ mod tests {
         // Boxes cover stack slots 0 and 1 at `nlocals == 0`; the empty values
         // slice disables the concrete shadow.
         let boxes = vec![placeholder; nvs + 4];
+        ctx.install_virtualizable_info(info.clone());
         ctx.set_virtualizable_boxes_with_info(boxes, Vec::new(), &info, &[4]);
         assert!(
             !ctx.has_virtualizable_shadow(),
