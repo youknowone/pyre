@@ -23,12 +23,22 @@ pub(super) fn make_write_blocking_error(written: usize) -> crate::PyError {
     // nonsense when the raw `write` is a Python method that simply returned
     // None, but a caller that asked for a non-blocking fd needs EAGAIN, and
     // the only place it survives is the errno the failed syscall left.
+    // Ints are old-gen; the message is a per-call nursery string.  Mint the
+    // ints first so the only word that can move is already on the root stack
+    // before the constructor allocates.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let errno = w_int_new(crate::builtins::crt_errno() as i64);
+    let written = w_int_new(written as i64);
+    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(
+        "write could not complete without blocking",
+    ));
     match crate::call::call_function_impl_result(
         blocking,
         &[
-            w_int_new(crate::builtins::crt_errno() as i64),
-            w_str_new("write could not complete without blocking"),
-            w_int_new(written as i64),
+            errno,
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+            written,
         ],
     ) {
         Ok(value) => unsafe { crate::PyError::from_exc_object(value) },

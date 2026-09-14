@@ -2184,7 +2184,7 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let format = positional
         .get(1)
         .copied()
-        .unwrap_or_else(|| w_str_new("%a %b %d %H:%M:%S %Y"));
+        .unwrap_or_else(|| w_str_new_managed("%a %b %d %H:%M:%S %Y"));
     // `string`/`format` are native locals held across the import, which allocates
     // and can move young objects; pin and re-read them for the delegated call.
     let _roots = pyre_object::gc_roots::push_roots();

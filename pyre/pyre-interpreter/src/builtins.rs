@@ -1513,8 +1513,15 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let mv = args.first().copied().unwrap_or(w_none());
     let index = args.get(1).copied().unwrap_or(w_none());
     let value = args.get(2).copied().unwrap_or(w_none());
+    // `normalize_slice` / `getindex_w` / `memoryview_pack_value` run user
+    // `__index__` and allocate; the empty-tuple stand-in for `...` is itself
+    // a nursery object.  One livevar set covers the view, the key, and the
+    // rvalue for the whole body.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[mv, index, value]);
     unsafe {
         use pyre_object::memoryview::*;
+        let mv = roots.get(base);
         memoryview_check_released(mv)?;
         memoryview_adjust_fmt(w_memoryview_format_str(mv))?;
         if w_memoryview_readonly(mv) {
@@ -1528,10 +1535,10 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         let fmt = w_memoryview_format_str(mv).to_owned();
         // `memory_ass_sub`: `...` names a zero-dimensional view's one element,
         // exactly as the empty tuple does.
-        let index = match w_memoryview_ndim(mv) == 0 && pyre_object::pyobject::is_ellipsis(index) {
-            true => pyre_object::w_tuple_new(vec![]),
-            false => index,
-        };
+        if w_memoryview_ndim(mv) == 0 && pyre_object::pyobject::is_ellipsis(roots.get(base + 1)) {
+            roots.set(base + 1, pyre_object::w_tuple_new(vec![]));
+        }
+        let index = roots.get(base + 1);
         // Once `...` has become the empty tuple, that tuple is the only key a
         // zero-dimensional view accepts.
         if w_memoryview_ndim(mv) == 0
@@ -1550,9 +1557,11 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "memoryview slice assignments are currently restricted to ndim = 1",
                 ));
             }
-            let (start, stop, step) = crate::baseobjspace::normalize_slice(index, count)?;
+            let (start, stop, step) =
+                crate::baseobjspace::normalize_slice(roots.get(base + 1), count)?;
             // `decode_index4` evaluates arbitrary slice-bound `__index__`
             // methods before the assignment touches the backing.
+            let mv = roots.get(base);
             memoryview_check_released(mv)?;
             let mut indices = Vec::new();
             let mut i = start;
@@ -1560,7 +1569,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 indices.push(i);
                 i += step;
             }
-            return memoryview_copy_single(mv, &indices, isz, value);
+            return memoryview_copy_single(mv, &indices, isz, roots.get(base + 2));
         }
         // Multi-index tuple writes one element of an N-D view; an all-slice
         // tuple is multi-dimensional slice assignment (`_setitem_tuple_indexed`).
@@ -1586,13 +1595,14 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                     "cannot index {length}-dimension view with {ndim}-element tuple"
                 )));
             }
-            let packed = memoryview_pack_value(&fmt, isz, value)?;
+            let packed = memoryview_pack_value(&fmt, isz, roots.get(base + 2))?;
             // memory_ass_sub: pack the value, then re-check release before the
             // write — the value's `__index__`/`__float__` coercion may have
             // released the view (`bytes_from_value` → `_check_released` →
             // `setbytes`).
+            let mv = roots.get(base);
             memoryview_check_released(mv)?;
-            let indices = memoryview_start_from_tuple(mv, index)?;
+            let indices = memoryview_start_from_tuple(mv, roots.get(base + 1))?;
             let target = w_memoryview_view(mv)
                 .element_ptr_mut(&indices)
                 .expect("writable backing checked above");
@@ -1613,13 +1623,15 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 "multi-dimensional sub-views are not implemented",
             ));
         }
-        let i = getindex_w(index)?;
+        let i = getindex_w(roots.get(base + 1))?;
         // `memory_ass_sub`: `__index__` is arbitrary Python code and may have
         // released this view before the offset reads its geometry (gh-92888).
+        let mv = roots.get(base);
         memoryview_check_released(mv)?;
         let element = memoryview_check_dimension(mv, 0, i)?;
-        let packed = memoryview_pack_value(&fmt, isz, value)?;
+        let packed = memoryview_pack_value(&fmt, isz, roots.get(base + 2))?;
         // Re-check release after value coercion (see tuple path above).
+        let mv = roots.get(base);
         memoryview_check_released(mv)?;
         let target = w_memoryview_view(mv)
             .element_ptr_mut(&[element])

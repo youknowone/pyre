@@ -3707,10 +3707,12 @@ pub unsafe fn fget_func_code(obj: PyObjectRef) -> *const () {
 /// PyPy-compatible `descr__reduce__` helper.
 #[inline]
 pub fn descr_function__reduce__(_obj: PyObjectRef) -> PyObjectRef {
-    pyre_object::w_tuple_new(vec![
-        pyre_object::w_tuple_new(vec![]),
-        pyre_object::w_tuple_new(vec![]),
-    ])
+    // Empty tuples are nursery-allocated; pin each inner one before the
+    // next constructor, then build the outer tuple from the reloaded slots.
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_tuple_new(vec![]));
+    fields.push(pyre_object::w_tuple_new(vec![]));
+    pyre_object::w_tuple_new(fields.take())
 }
 
 /// PyPy-compatible `descr__setstate__` helper.

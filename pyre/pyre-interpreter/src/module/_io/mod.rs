@@ -1527,11 +1527,13 @@ pub(crate) fn text_encoding(
             stacklevel + 1,
         )?;
     }
-    Ok(w_str_new(if crate::importing::utf8_mode_flag() != 0 {
-        "utf-8"
-    } else {
-        "locale"
-    }))
+    Ok(w_str_new_managed(
+        if crate::importing::utf8_mode_flag() != 0 {
+            "utf-8"
+        } else {
+            "locale"
+        },
+    ))
 }
 
 crate::py_module! {

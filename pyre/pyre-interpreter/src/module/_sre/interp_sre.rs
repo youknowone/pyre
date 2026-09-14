@@ -536,25 +536,41 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "_sre.compile() requires at least 3 arguments",
         ));
     }
-    let pattern = args[0];
     let flags = unsafe { w_int_get_value(args[1]) };
-    let code_list = args[2];
     let groups = if args.len() > 3 {
         unsafe { w_int_get_value(args[3]) }
     } else {
         0
     };
-    let groupindex = if args.len() > 4 {
-        args[4]
+    // `extract_code` allocates.  Publish every already-live operand first,
+    // then mint the omitted defaults — a sequential pin of a fresh object
+    // after a published live set is safe; pinning an unpublished live
+    // second slice is not.
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = vec![args[0], args[2]];
+    if args.len() > 4 {
+        live.push(args[4]);
+    }
+    if args.len() > 5 {
+        live.push(args[5]);
+    }
+    let base = roots.pin_roots(&live);
+    let pattern_slot = base;
+    let code_list_slot = base + 1;
+    let groupindex_slot = if args.len() > 4 {
+        base + 2
     } else {
-        w_dict_new()
+        let _ = roots.pin_root(w_dict_new());
+        pyre_object::gc_roots::shadow_stack_len() - 1
     };
-    let indexgroup = if args.len() > 5 {
-        args[5]
+    let indexgroup_slot = if args.len() > 5 {
+        base + 3
     } else {
-        w_tuple_new(vec![])
+        let _ = roots.pin_root(w_tuple_new(vec![]));
+        pyre_object::gc_roots::shadow_stack_len() - 1
     };
 
+    let pattern = roots.get(pattern_slot);
     if !unsafe { is_none(pattern) }
         && !unsafe { is_str(pattern) }
         && !unsafe { pyre_object::bytesobject::is_bytes_like(pattern) }
@@ -564,11 +580,16 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
 
-    let code_vec = extract_code(code_list)?;
+    let code_vec = extract_code(roots.get(code_list_slot))?;
     let code_box: &'static [u32] = Box::leak(code_vec.into_boxed_slice());
 
     Ok(w_sre_pattern_new(
-        pattern, flags, code_box, groups, groupindex, indexgroup,
+        roots.get(pattern_slot),
+        flags,
+        code_box,
+        groups,
+        roots.get(groupindex_slot),
+        roots.get(indexgroup_slot),
     ))
 }
 
