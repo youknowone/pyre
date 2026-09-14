@@ -12,7 +12,6 @@
 use super::pyobject::{self, CPyObject};
 use pyre_object::PyObjectRef;
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::OnceLock;
 
 /// Reserved carrier keys, namespaced as `methodobject`'s are.
 const POINTER_KEY: &str = "__pyre_pointer__";
@@ -20,10 +19,11 @@ const NAME_KEY: &str = "__pyre_capsule_name__";
 const CONTEXT_KEY: &str = "__pyre_context__";
 const DESTRUCTOR_KEY: &str = "__pyre_destructor__";
 
-static CAPSULE_TYPE: OnceLock<usize> = OnceLock::new();
+static CAPSULE_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 pub(crate) fn capsule_type() -> PyObjectRef {
-    *CAPSULE_TYPE.get_or_init(|| {
+    CAPSULE_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -49,8 +49,8 @@ pub(crate) fn capsule_type() -> PyObjectRef {
             // without the payload `is_capsule` reads.
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn slot_get(carrier: PyObjectRef, key: &str) -> usize {

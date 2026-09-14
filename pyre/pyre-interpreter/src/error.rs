@@ -7,7 +7,6 @@ use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::Wtf8Buf;
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::OnceLock;
 
 /// Short-lived normalizer for the three-argument generator `throw` surface.
 ///
@@ -2433,8 +2432,8 @@ fn wrap_pos(num: i64) -> PyObjectRef {
 }
 
 fn unraisable_hook_args_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             "sys.UnraisableHookArgs",
             &[
@@ -2444,8 +2443,8 @@ fn unraisable_hook_args_type() -> PyObjectRef {
                 "err_msg",
                 "object",
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// Resolve an exception instance's actual Python class name for display.

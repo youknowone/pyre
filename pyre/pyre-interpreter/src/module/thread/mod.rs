@@ -2366,8 +2366,8 @@ fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `threading.excepthook`.  The storage and descriptors come from pyre's
 /// line-by-line port of PyPy `lib_pypy/_structseq.py`.
 fn except_hook_args_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let _roots = pyre_object::gc_roots::push_roots();
         let ty = crate::_structseq::make_struct_seq(
             "_thread._ExceptHookArgs",
@@ -2390,8 +2390,8 @@ fn except_hook_args_type() -> PyObjectRef {
                 pyre_object::gc_roots::shadow_stack_get(doc_slot),
             );
         }
-        pyre_object::gc_roots::shadow_stack_get(ty_slot) as usize
-    }) as PyObjectRef
+        pyre_object::gc_roots::shadow_stack_get(ty_slot)
+    })
 }
 
 #[inline]
