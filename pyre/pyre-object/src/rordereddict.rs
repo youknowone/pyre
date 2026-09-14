@@ -335,7 +335,10 @@ impl<K, V, S> RDict<K, V, S> {
 }
 
 impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
+    /// `d.keyhash` / `fnkeyhash` (rordereddict.py). The hasher is a
+    /// residual: RandomState::build_hasher is not a translation subject.
     #[inline]
+    #[majit_macros::dont_look_inside]
     fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
         let mut state = self.hash_builder.build_hasher();
         key.hash(&mut state);
