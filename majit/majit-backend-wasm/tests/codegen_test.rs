@@ -7228,6 +7228,7 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
     struct SparseDescr {
         locs: Vec<u16>,
         types: Vec<Type>,
+        counter: std::sync::atomic::AtomicU32,
     }
     impl majit_ir::Descr for SparseDescr {
         fn as_fail_descr(&self) -> Option<&dyn majit_ir::FailDescr> {
@@ -7235,6 +7236,10 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         }
     }
     impl majit_ir::FailDescr for SparseDescr {
+        fn make_a_counter_per_value(&self, index: u32, _type_tag: u64) {
+            self.counter
+                .store(index, std::sync::atomic::Ordering::Relaxed);
+        }
         fn fail_index(&self) -> u32 {
             0
         }
@@ -7249,11 +7254,22 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
     // ResumeDataLoopMemo can leave a wide logical numbering with just two
     // live boxes. Neither normal exits nor force brackets may reserve the
     // intervening holes in the source token's physical frame.
-    for force in [false, true] {
+    // A compared operand may be absent, present only in a logical hole, or
+    // present both in an earlier hole and a later live position.
+    for (force, counter_position) in [
+        (false, None),
+        (false, Some(3)),
+        (false, Some(17)),
+        (true, None),
+    ] {
         let inputargs: Vec<_> = (0..3).map(|i| InputArg::from_type(Type::Int, i)).collect();
         let mut failargs = vec![OpRef::NONE; 100];
         failargs[17] = OpRef::input_arg_int(2);
         failargs[99] = OpRef::input_arg_int(1);
+        if let Some(position) = counter_position {
+            failargs[3] = OpRef::input_arg_int(0);
+            failargs[position] = OpRef::input_arg_int(0);
+        }
         let mut locs = vec![0xFFFF; 100];
         locs[17] = 17;
         locs[99] = 99;
@@ -7266,10 +7282,12 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
                 &failargs,
             )
         };
-        guard.setdescr(std::sync::Arc::new(SparseDescr {
+        let descr = std::sync::Arc::new(SparseDescr {
             locs,
             types: vec![Type::Int; 100],
-        }));
+            counter: std::sync::atomic::AtomicU32::new(u32::MAX),
+        });
+        guard.setdescr(descr.clone());
         let ops = vec![
             guard,
             Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]),
@@ -7287,7 +7305,14 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         assert_eq!(guards[0].fail_locs[17], Some(0));
         assert_eq!(guards[0].fail_locs[99], Some(1));
         assert!(guards[0].fail_locs[..17].iter().all(Option::is_none));
+        let parked = !force && counter_position != Some(17);
         if !force {
+            assert_eq!(
+                descr.counter.load(std::sync::atomic::Ordering::Relaxed),
+                if parked { 100 } else { 17 }
+            );
+        }
+        if parked {
             assert_eq!(
                 guards[0].fail_locs[100],
                 Some(3),
@@ -7323,9 +7348,12 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         } else {
             8
         };
-        assert_eq!(read(offset), 7);
+        assert_eq!(
+            read(offset),
+            if counter_position == Some(17) { 5 } else { 7 }
+        );
         assert_eq!(read(offset + 8), 42);
-        if !force {
+        if parked {
             assert_eq!(
                 read(8 + 3 * 8),
                 5,

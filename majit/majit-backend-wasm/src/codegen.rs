@@ -3803,11 +3803,9 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
             // `normal_frame_value_slots` reserves it and
             // `resolve_guard_value_operand` reads it back through
             // `get_value_direct`.
-            // Decided off the op alone, never off the descr: the emission
-            // (`emit_guard_fail_args_spill`) and the frame sizing
-            // (`normal_frame_value_slots`) both read the same predicate, and a
-            // guard whose descr is absent must still agree with them or the
-            // parked word lands in a slot the frame never reserved.
+            // Stamping, sizing and emission use the same live-position mask.
+            // A compared operand carried only in a logical hole still needs
+            // its own readable counter slot.
             let counter_value_spill = counter_value_spill(op, &fail_args);
             if op.opcode == OpCode::GuardValue
                 && let Some(fd) = meta_descr.as_ref().and_then(|d| d.as_fail_descr())
@@ -3816,7 +3814,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 // The parked case is stamped after this loop, where the
                 // trace-wide slot is known.
                 if counter_value_spill.is_none()
-                    && let Some(idx) = fail_args.iter().position(|r| *r == arg0)
+                    && let Some(idx) = live_fail_arg_position(op, &fail_args, arg0)
                 {
                     let type_tag = match fail_arg_types.get(idx) {
                         Some(Type::Ref) => majit_backend::STATUS_TY_REF,
@@ -12125,7 +12123,7 @@ fn emit_guard_fail_args_spill(
             sink.i64_store(mem64(offset));
         }
     }
-    if let Some((operand, slot)) = counter_value_spill(op, &fail_args).zip(counter_slot) {
+    if let Some((operand, slot)) = counter_value_spill(op, &exit_fail_args(op)).zip(counter_slot) {
         let offset = FRAME_SLOT_BASE + slot * SLOT_SIZE;
         sink.local_get(0);
         emit_resolve_failarg(
@@ -12143,7 +12141,7 @@ fn emit_guard_fail_args_spill(
 
 /// The GUARD_VALUE operand `op` must park in the trace's counter slot so that
 /// `make_a_counter_per_value`'s index is readable, or `None` when the operand
-/// already occupies a fail-argument slot, or is a constant the optimizer has
+/// already occupies a live fail-argument slot, or is a constant the optimizer has
 /// already decided the guard on.
 ///
 /// `regalloc.py prepare_op_guard_value` hands `cpu.all_reg_indexes[arg.value]`
@@ -12161,10 +12159,24 @@ fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
         return None;
     }
     let arg0 = op.arg(0).to_opref();
-    if arg0 == OpRef::NONE || arg0.is_constant() || fail_args.contains(&arg0) {
+    if arg0 == OpRef::NONE
+        || arg0.is_constant()
+        || live_fail_arg_position(op, fail_args, arg0).is_some()
+    {
         return None;
     }
     Some(arg0)
+}
+
+/// Find a readable logical position, skipping holes even when they still
+/// name the same box. Like x86 regalloc.consider_guard_value, the counter
+/// must name a location whose exit actually saves the compared value.
+fn live_fail_arg_position(op: &Op, fail_args: &[OpRef], value: OpRef) -> Option<usize> {
+    let live = live_fail_arg_mask(op.getdescr().as_ref(), fail_args.len());
+    fail_args
+        .iter()
+        .zip(live)
+        .position(|(&arg, live)| live && arg == value)
 }
 
 /// This op's fail arguments as the exit writes them, in slot order.
