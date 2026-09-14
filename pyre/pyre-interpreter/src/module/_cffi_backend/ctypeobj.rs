@@ -742,11 +742,12 @@ pub fn get_vararg_type(w_ctype: PyObjectRef) -> Result<PyObjectRef, PyError> {
 
 // ── the Python type ─────────────────────────────────────────────────────
 
-static CTYPE_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CTYPE_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.CType`.
 pub fn ctype_type() -> PyObjectRef {
-    *CTYPE_TYPE_OBJ.get_or_init(|| {
+    CTYPE_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.CType",
             init_ctype_type,
@@ -757,8 +758,8 @@ pub fn ctype_type() -> PyObjectRef {
             unsafe { &*<W_CType as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// The names `W_CType.dir` reports — `typedef.rawdict` minus the dunders,
