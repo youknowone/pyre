@@ -1478,8 +1478,13 @@ pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     arity_at_least(args, "startswith", 1)?;
     arity_at_most(args, "startswith", 3)?;
     if args.len() == 2 {
-        if let Some(result) = descr_prefix_match_default(args[0], args[1], true) {
-            return result;
+        unsafe {
+            if pyre_object::is_str(args[0])
+                && !pyre_object::is_tuple(args[1])
+                && pyre_object::is_str(args[1])
+            {
+                return Ok(w_bool_from(rstring_prefix_eq(args[0], args[1])));
+            }
         }
     }
     str_prefix_match_slow(args, "startswith", true)
@@ -1489,36 +1494,60 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     arity_at_least(args, "endswith", 1)?;
     arity_at_most(args, "endswith", 3)?;
     if args.len() == 2 {
-        if let Some(result) = descr_prefix_match_default(args[0], args[1], false) {
-            return result;
+        unsafe {
+            if pyre_object::is_str(args[0])
+                && !pyre_object::is_tuple(args[1])
+                && pyre_object::is_str(args[1])
+            {
+                return Ok(w_bool_from(rstring_suffix_eq(args[0], args[1])));
+            }
         }
     }
     str_prefix_match_slow(args, "endswith", false)
 }
 
-/// Default-bounds exact-str arm of `descr_startswith` / `descr_endswith`.
-/// `None` means the shape is not this arm (tuple needle, non-str).
-fn descr_prefix_match_default(
-    w_self: PyObjectRef,
-    w_needle: PyObjectRef,
-    start: bool,
-) -> Option<Result<PyObjectRef, crate::PyError>> {
-    unsafe {
-        if !pyre_object::is_str(w_self)
-            || pyre_object::is_tuple(w_needle)
-            || !pyre_object::is_str(w_needle)
-        {
-            return None;
-        }
+/// `rstring.py startswith` at default bounds: the `@jit.elidable` byte
+/// walk `u_self[i] != prefix[i]`.  Returns `bool` so the generated graph
+/// is not an `Option<Result<…>>` union the rtyper skips.
+///
+/// Bind `as_bytes()` first so `len` is `Rvalue::Len` and `value[i]` is
+/// the frontend's `ord(s[i])` (`__string_byte_getitem`).  A `s[:n] ==
+/// prefix` slice would plant `__getslice_*` markers the Skip spine
+/// cannot expand.
+fn rstring_prefix_eq(w_self: PyObjectRef, w_needle: PyObjectRef) -> bool {
+    let value = unsafe { pyre_object::w_str_get_wtf8(w_self) }.as_bytes();
+    let prefix = unsafe { pyre_object::w_str_get_wtf8(w_needle) }.as_bytes();
+    let n = prefix.len();
+    if value.len() < n {
+        return false;
     }
-    let matched = unsafe {
-        if start {
-            pyre_object::unicodeobject::startswith(w_self, w_needle, 0, i64::MAX)
-        } else {
-            pyre_object::unicodeobject::endswith(w_self, w_needle, 0, i64::MAX)
+    let mut i = 0;
+    while i < n {
+        if value[i] != prefix[i] {
+            return false;
         }
-    };
-    Some(Ok(w_bool_from(matched)))
+        i += 1;
+    }
+    true
+}
+
+/// `rstring.py endswith` at default bounds.
+fn rstring_suffix_eq(w_self: PyObjectRef, w_needle: PyObjectRef) -> bool {
+    let value = unsafe { pyre_object::w_str_get_wtf8(w_self) }.as_bytes();
+    let suffix = unsafe { pyre_object::w_str_get_wtf8(w_needle) }.as_bytes();
+    let n = suffix.len();
+    if value.len() < n {
+        return false;
+    }
+    let start = value.len() - n;
+    let mut i = 0;
+    while i < n {
+        if value[start + i] != suffix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Bounds / tuple / TypeError residual of `descr_startswith`.
@@ -1568,10 +1597,15 @@ pub fn __majit_wrap_str_descr_startswith(
     }
     let w_self = args[0];
     let w_prefix = args[1];
-    if let Some(result) = descr_prefix_match_default(w_self, w_prefix, true) {
-        return result;
+    unsafe {
+        if !pyre_object::is_str(w_self)
+            || pyre_object::is_tuple(w_prefix)
+            || !pyre_object::is_str(w_prefix)
+        {
+            return str_prefix_match_slow(args, "startswith", true);
+        }
     }
-    str_prefix_match_slow(args, "startswith", true)
+    Ok(w_bool_from(rstring_prefix_eq(w_self, w_prefix)))
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
@@ -1583,10 +1617,15 @@ pub fn __majit_wrap_str_descr_endswith(
     }
     let w_self = args[0];
     let w_suffix = args[1];
-    if let Some(result) = descr_prefix_match_default(w_self, w_suffix, false) {
-        return result;
+    unsafe {
+        if !pyre_object::is_str(w_self)
+            || pyre_object::is_tuple(w_suffix)
+            || !pyre_object::is_str(w_suffix)
+        {
+            return str_prefix_match_slow(args, "endswith", false);
+        }
     }
-    str_prefix_match_slow(args, "endswith", false)
+    Ok(w_bool_from(rstring_suffix_eq(w_self, w_suffix)))
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,

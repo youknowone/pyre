@@ -84,6 +84,16 @@ pub const BC_RECURSIVE_CALL_REF: u8 = 224;
 pub const BC_RECURSIVE_CALL_FLOAT: u8 = 225;
 pub const BC_RECURSIVE_CALL_VOID: u8 = 226;
 
+/// `blackhole.py` `bhimpl_strlen` / `bhimpl_strgetitem`
+/// (`@arguments("cpu", "r", returns="i")` /
+/// `@arguments("cpu", "r", "i", returns="i")`).  High-water bytes so
+/// existing serialised assignments stay put.  `pyre_cpu` overrides the
+/// default inline-chars layout to follow `W_UnicodeObject.value`.
+pub const BC_STRLEN: u8 = 242;
+pub const BC_STRGETITEM: u8 = 243;
+/// `strgetitem` with a `USE_C_FORM` index (`assembler.py`).
+pub const BC_STRGETITEM_C: u8 = 244;
+
 /// "This cached control opcode is absent" sentinel for the
 /// `blackhole.py:72-74` fields (`op_live`, `op_catch_exception`,
 /// `op_rvmprof_code`).
@@ -1063,6 +1073,14 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // `@arguments("cpu", "r", "d", "d", returns="i")`) is pinned with
     // its vable siblings above at [`BC_ARRAYLEN_VABLE`] = 74.
     m.insert("arraylen_gc/rd>i", BC_ARRAYLEN_GC);
+
+    // String length / item — `blackhole.py` `bhimpl_strlen` /
+    // `bhimpl_strgetitem`.  The Skip-spine rewrite of
+    // `__strlen` / `__string_byte_getitem` emits these; `pyre_cpu`
+    // follows `W_UnicodeObject.value`.
+    m.insert("strlen/r>i", BC_STRLEN);
+    m.insert("strgetitem/ri>i", BC_STRGETITEM);
+    m.insert("strgetitem/rc>i", BC_STRGETITEM_C);
 
     // Interior-field load — `blackhole.py:1412-1418`
     // `bhimpl_getinteriorfield_gc_{i,r,f}`

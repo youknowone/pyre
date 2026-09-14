@@ -11024,6 +11024,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         // class out) — emitted once a descended helper reads `ob_type`
         // through a graph the codewriter looks inside.
         ("guard_class/r>r", majit_translate::insns::BC_GUARD_CLASS_R),
+        ("strlen/r>i", majit_translate::insns::BC_STRLEN),
+        ("strgetitem/ri>i", majit_translate::insns::BC_STRGETITEM),
+        ("strgetitem/rc>i", majit_translate::insns::BC_STRGETITEM_C),
     ] {
         insns.insert(key.to_string(), byte);
     }
