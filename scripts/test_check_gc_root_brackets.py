@@ -22,21 +22,14 @@ SKIPPED_LIVENESS = """\
 
 
 class GcRootParseTests(unittest.TestCase):
-    def test_skipped_liveness_is_zero_not_a_shape_error(self) -> None:
-        got = CHECKER.parse(SKIPPED_LIVENESS)
-        self.assertEqual(got["brackets_reaching_no_collection"], 0)
-        self.assertEqual(got["unbracketed_calls"], 0)
-        self.assertEqual(got["tier1_calls"], 0)
-        self.assertEqual(got["tier15_calls"], 0)
-        self.assertEqual(got["frames_across_collecting"], 0)
-        self.assertEqual(got["frame_tier1_calls"], 0)
-        self.assertIn(
-            "majit_gc::standalone_alloc_nursery_collecting_typed_rooted",
-            got["unmatched_seeds"],
-        )
+    def test_skipped_liveness_is_a_shape_error(self) -> None:
+        with self.assertRaises(SystemExit) as raised:
+            CHECKER.parse(SKIPPED_LIVENESS)
+        self.assertIn("unbracketed_calls", str(raised.exception))
 
-    def test_module_is_a_subject(self) -> None:
-        self.assertTrue(any("pyre-module" in path for path in CHECKER.SUBJECTS))
+    def test_module_is_not_a_subject(self) -> None:
+        self.assertNotIn("pyre-module", CHECKER.SUBJECT)
+        self.assertTrue(CHECKER.SUBJECT.endswith("pyre-interpreter.ullbc"))
 
 
 if __name__ == "__main__":
