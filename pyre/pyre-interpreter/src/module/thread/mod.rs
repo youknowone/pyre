@@ -795,6 +795,9 @@ const RPY_LOCK_INTR: i64 = 2;
 /// A `pthread_mutex_t` has no poison state — `thread_pthread.c` inspects only
 /// the status code — so a panic taken while lock bookkeeping was held must not
 /// turn every later acquire into an error.
+/// `rthread.py` `c_thread_acquirelock` is `llexternal`. The poison ABI
+/// stays inside this residual leaf.
+#[majit_macros::dont_look_inside]
 fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()

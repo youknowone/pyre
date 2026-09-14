@@ -57,6 +57,26 @@ fn queue_lock<'a>(
     guard
 }
 
+#[majit_macros::dont_look_inside]
+fn queue_push_back(mutex: &Mutex<VecDeque<PyObjectRef>>, item: PyObjectRef) {
+    queue_lock(mutex).push_back(item);
+}
+
+#[majit_macros::dont_look_inside]
+fn queue_pop_front(mutex: &Mutex<VecDeque<PyObjectRef>>) -> Option<PyObjectRef> {
+    queue_lock(mutex).pop_front()
+}
+
+#[majit_macros::dont_look_inside]
+fn queue_is_empty(mutex: &Mutex<VecDeque<PyObjectRef>>) -> bool {
+    queue_lock(mutex).is_empty()
+}
+
+#[majit_macros::dont_look_inside]
+fn queue_len(mutex: &Mutex<VecDeque<PyObjectRef>>) -> usize {
+    queue_lock(mutex).len()
+}
+
 /// `_queue_SimpleQueue_get_impl` reads `timeout` only on the blocking path:
 /// `block=False` is answered from the queue immediately, so the argument is
 /// neither converted nor range-checked there.
@@ -122,9 +142,7 @@ fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(item);
-    let mut guard = queue_lock(&queue.queue);
-    guard.push_back(pyre_object::gc_roots::shadow_stack_get(base));
-    drop(guard);
+    queue_push_back(&queue.queue, pyre_object::gc_roots::shadow_stack_get(base));
     queue.not_empty.notify_one();
     w_none()
 }
@@ -171,16 +189,20 @@ fn simplequeue_get(
     timeout: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     let timeout = parse_timeout(block, timeout)?;
-    let mut guard = if block {
-        simplequeue_wait_for_item(queue, timeout)?
-    } else {
-        queue_lock(&queue.queue)
-    };
-    if let Some(item) = guard.pop_front() {
-        Ok(item)
-    } else {
-        Err(empty_error())
+    if block {
+        return simplequeue_wait_and_pop(queue, timeout);
     }
+    queue_pop_front(&queue.queue).ok_or_else(empty_error)
+}
+
+/// Residual wait+pop so `MutexGuard` never returns into look-inside code.
+#[majit_macros::dont_look_inside]
+fn simplequeue_wait_and_pop(
+    queue: &W_SimpleQueue,
+    timeout: Option<f64>,
+) -> Result<PyObjectRef, crate::PyError> {
+    let mut guard = simplequeue_wait_for_item(queue, timeout)?;
+    guard.pop_front().ok_or_else(empty_error)
 }
 
 mod simplequeue_methods {
@@ -233,11 +255,11 @@ mod simplequeue_methods {
         }
 
         fn empty(&self) -> bool {
-            queue_lock(&self.queue).is_empty()
+            queue_is_empty(&self.queue)
         }
 
         fn qsize(&self) -> i64 {
-            queue_lock(&self.queue).len() as i64
+            queue_len(&self.queue) as i64
         }
 
         #[classmethod]
