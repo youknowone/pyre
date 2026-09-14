@@ -5325,6 +5325,14 @@ impl<'a> RegAlloc<'a> {
         } else {
             self.perform(i, arglocs, result_loc, output);
         }
+        // Residual GCREF results start in call_result_gpr, which the
+        // next collecting call excludes from its gcmap (callbuilder.py).
+        // Publish them to the jitframe so a later collect rewrites the
+        // slot, matching a shadow-stack result local.
+        if result_tp == Type::Ref {
+            self.force_spill_var(op.pos().get(), Type::Ref);
+            self.flush_moves(output);
+        }
     }
 
     fn consider_call_j2(
@@ -5421,6 +5429,11 @@ impl<'a> RegAlloc<'a> {
             self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
         } else {
             self.perform(i, arglocs, result_loc, output);
+        }
+        if result_tp == Type::Ref {
+            let dst = dst.unwrap_or(op.pos().get());
+            self.force_spill_var(dst, Type::Ref);
+            self.flush_moves(output);
         }
     }
 
