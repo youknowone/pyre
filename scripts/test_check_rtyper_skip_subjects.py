@@ -16,6 +16,9 @@ SPEC.loader.exec_module(CHECKER)
 
 
 class SkipSubjectRatchetTests(unittest.TestCase):
+    def test_corpus_names_every_llbc_crate(self) -> None:
+        self.assertIn("pyre-module", CHECKER.CORPUS_CRATES)
+
     @staticmethod
     def empty_skip_census() -> str:
         return (

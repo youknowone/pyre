@@ -56,9 +56,15 @@ PACKAGE = "pyre-jit-trace"
 GATE = "codewriter::dual_gate_publish_concretetypes"
 
 # The corpus this set was measured on.  Each crate's `source=` is the hash
-# the STALE check itself compares, so naming the four donors names the
+# the STALE check itself compares, so naming the LLBC crates names the
 # corpus without hashing the artefacts.
-CORPUS_CRATES = ("majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit")
+CORPUS_CRATES = (
+    "majit-rlib",
+    "pyre-object",
+    "pyre-interpreter",
+    "pyre-module",
+    "pyre-jit",
+)
 
 # `decline::dump_to_stderr`'s banner. Its presence is what tells a census
 # from a build that ran with the switch off -- both print no `[decline]`

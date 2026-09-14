@@ -49,16 +49,20 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "majit" / "gc-root-brackets.baseline.json"
 EXAMPLE = ROOT / "target" / "release" / "examples" / "gc-root-reachability"
 
-# The donor set is not a matter of taste: the example's own header records what
-# each donor moves, and leaving `pyre-object.ullbc` out fails quietly rather
-# than loudly -- the collecting-allocation seed lives there and scores zero
-# against the interpreter artefact alone.
-SUBJECT = "build/llbc/pyre-interpreter.ullbc"
-DONORS = [
-    "build/llbc/pyre-jit.ullbc",
-    "build/llbc/pyre-object.ullbc",
+# Every production LLBC crate. The example joins donors for call-graph
+# reachability but only walks the *subject* bodies, so a module that
+# moved out of the interpreter is invisible unless it is a subject too.
+LLBC = (
     "build/llbc/majit-rlib.ullbc",
-]
+    "build/llbc/pyre-object.ullbc",
+    "build/llbc/pyre-interpreter.ullbc",
+    "build/llbc/pyre-module.ullbc",
+    "build/llbc/pyre-jit.ullbc",
+)
+SUBJECTS = (
+    "build/llbc/pyre-interpreter.ullbc",
+    "build/llbc/pyre-module.ullbc",
+)
 
 # (key, regex, how many groups to keep).  Every one of these must match exactly
 # once, in this order: `tier 1` is printed twice, once for the main scan and
@@ -162,27 +166,60 @@ def merge_base() -> str:
     return ""
 
 
-def run_analysis() -> str:
+def merge_counts(left: dict, right: dict) -> dict:
+    """Add one subject's numbers to another's.
+
+    The ratchet is over the whole production graph, not one crate. A
+    function that moved from the interpreter into `pyre-module` must
+    still count, or the move looks like a backlog pay-down.
+    """
+    merged: dict = {}
+    keys = set(left) | set(right)
+    for key in keys:
+        a, b = left.get(key), right.get(key)
+        if isinstance(a, list) or isinstance(b, list):
+            merged[key] = sorted(set(a or []) | set(b or []))
+        else:
+            merged[key] = (a or 0) + (b or 0)
+    return merged
+
+
+def run_one(subject: str, donors: list[str]) -> str:
+    env = dict(os.environ, GC_JOIN_WITH=",".join(donors))
+    proc = subprocess.run(
+        [str(EXAMPLE), subject],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        sys.exit(f"error: analysis exited {proc.returncode}\n{proc.stderr}")
+    return proc.stdout
+
+
+def run_analysis() -> dict:
     if not EXAMPLE.exists():
         sys.exit(
             f"error: {EXAMPLE.relative_to(ROOT)} is not built.\n"
             "  cargo build -p majit-translate --release "
             "--example gc-root-reachability"
         )
-    missing = [p for p in [SUBJECT, *DONORS] if not (ROOT / p).is_file()]
+    missing = [p for p in LLBC if not (ROOT / p).is_file()]
     if missing:
         sys.exit(
             "error: LLBC artefacts missing: " + ", ".join(missing) + "\n"
             "  python3 scripts/extract-llbc.py majit-rlib pyre-object "
-            "pyre-interpreter pyre-jit"
+            "pyre-interpreter pyre-module pyre-jit"
         )
-    env = dict(os.environ, GC_JOIN_WITH=",".join(DONORS))
-    proc = subprocess.run([str(EXAMPLE), SUBJECT], cwd=ROOT, env=env,
-                          capture_output=True, encoding="utf-8",
-                          errors="replace")
-    if proc.returncode != 0:
-        sys.exit(f"error: analysis exited {proc.returncode}\n{proc.stderr}")
-    return proc.stdout
+    got: dict | None = None
+    for subject in SUBJECTS:
+        donors = [path for path in LLBC if path != subject]
+        part = parse(run_one(subject, donors))
+        got = part if got is None else merge_counts(got, part)
+    assert got is not None
+    return got
 
 
 def parse(report: str) -> dict:
@@ -221,7 +258,7 @@ def main() -> int:
                     help="rewrite the baseline from this run")
     args = ap.parse_args()
 
-    got = parse(run_analysis())
+    got = run_analysis()
     got["base"] = merge_base()
     key = platform_key()
 
