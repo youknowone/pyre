@@ -2,8 +2,10 @@
 # `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
 # rather than any generated code, and reads whatever the host's process
 # spawn cost happens to be that run. The jitstats baselines gate it.
-# `fbw_blackhole_adopted_single_frame=5` is the root walk adopting after
-# frame readers skip the portal sentinel.
+# `fbw_blackhole_adopted_single_frame=0`: the decline now names the
+# paused caller via `first_inline()`, so the walk rewinds at the CALL
+# instead of adopting a single-frame blackhole. The output gate is the
+# journal restore (`len(seen) == loops`).
 # Regression guard: a frame-forcing user @property that forces FIRST (the
 # escape flush commits mid-property) and mutates SECOND (the commit is then
 # withdrawn because the callee entered a user frame). The withdrawal must

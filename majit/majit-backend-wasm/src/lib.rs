@@ -4059,7 +4059,11 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     let raw_values: Vec<i64> = (0..num_outputs)
         .map(|i| exit_arg_word(frame_ptr, &fail_descr, i))
         .collect();
-    DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
+    let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+        as *mut majit_backend::jitframe::JitFrame;
+    data.seed_savedata_from_jf(jf);
+    DeadFrame::Boxed(data)
 }
 
 /// Reconstruct a [`DeadFrame`] for a frame a FORCE interrupted while its call
@@ -4120,7 +4124,11 @@ fn dead_frame_from_forced_frame(frame_ptr: usize, fail_index: u32) -> DeadFrame 
             value
         })
         .collect();
-    DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, 0))
+    let mut data = WasmFrameData::boxed(raw_values, fail_descr, 0);
+    let jf = (frame_ptr - majit_backend::jitframe::FIRST_ITEM_OFFSET)
+        as *mut majit_backend::jitframe::JitFrame;
+    data.attach_origin_jf(jf);
+    DeadFrame::Boxed(data)
 }
 
 /// Install the recovery guard's compile-time map before dropping the execution
@@ -6005,9 +6013,11 @@ impl majit_backend::Backend for WasmBackend {
                 // virtualizable token is an independent edge to this JITFRAME;
                 // its lazy force may arrive after the execution root is gone.
                 install_post_finish_force_gcmap(jf);
+                let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+                data.seed_savedata_from_jf(jf);
                 remember_and_drop_execution_frame(jf, saved);
 
-                return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
+                return DeadFrame::Boxed(data);
             }
 
             // Host-buffer frame path, for an embedder that registered no
@@ -6080,8 +6090,10 @@ impl majit_backend::Backend for WasmBackend {
             let raw_values: Vec<i64> = (0..num_outputs)
                 .map(|i| exit_arg_word(items as usize, &fail_descr, i))
                 .collect();
+            let mut data = WasmFrameData::boxed(raw_values, fail_descr, exc_value);
+            data.seed_savedata_from_jf(jf);
             drop(backing);
-            DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
+            DeadFrame::Boxed(data)
         }
     }
 
