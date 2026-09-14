@@ -5006,19 +5006,17 @@ unsafe fn setitem_bytearray_slice(
     // Both steps run Python — draining an arbitrary iterable source, then
     // every slice component's `__index__` — and `STORE_SUBSCR` popped the
     // receiver and the slice before dispatching here, so root them across the
-    // pair. A bytearray does not move; the root is for liveness alone.
-    let (sequence2, rs, rp, st) = {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
-        let sequence2 = bytearray_assign_source(value)?;
-        let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
-        (sequence2, rs, rp, st)
-    };
+    // pair and reload the receiver after those callbacks.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+    let sequence2 = bytearray_assign_source(value)?;
+    let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let (rs, rp, st) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -5028,6 +5026,7 @@ unsafe fn setitem_bytearray_slice(
     if sequence2.len() as i64 != slicelength {
         crate::builtins::bytearray_check_exports(obj)?;
     }
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
     if step == 1 {

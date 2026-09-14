@@ -651,12 +651,15 @@ pub unsafe fn w_set_discard_key_checked(
     }
 
     let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
     let items = capture_set_items(obj);
     let (found, _) = scan_set_key_reentrant(items, key)?;
     if let Some(index) = found {
         // Remove from the captured box; a `clear` during the probe orphans it,
         // leaving the live storage untouched (`discard` of an absent element).
         set_remove_slot(items, index);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let s = &mut *(obj as *mut W_SetObject);
         s.set_len_relaxed((*s.items).len());
         s.hash = -1;
@@ -954,6 +957,9 @@ unsafe fn w_set_insert_key_into(
     items: *mut SetItemsStorage,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    let _dst_roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let dst = crate::gc_roots::pin_root(dst);
     // Single insert probe (matches `r_dict.setitem`'s one bucket scan), run
     // callback-free so no user `__eq__` mutates the set while the table
     // borrow is live.  When every same-hash comparison stays inside the
@@ -991,6 +997,7 @@ unsafe fn w_set_insert_key_into(
     // repeat its comparisons — the ones that can re-enter this table.  Place it
     // on the digest alone (`ll_call_insert_clean_function`).
     (*items).insert_known_absent(key, ());
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     let set = &mut *(dst as *mut W_SetObject);
     set.set_len_relaxed((*set.items).len());
     set.hash = -1;

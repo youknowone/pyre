@@ -12476,9 +12476,14 @@ impl CraneliftBackend {
                     );
                     if let Some(result) = call_result {
                         builder.def_var(var(vi), result);
-                        // Residual GCREF results start as a CL value; the next
-                        // collecting call's gcmap is the home slots. Publish
-                        // now, matching dynasm `force_spill_var` after CallR.
+                    }
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    builder.ins().set_pinned_reg(jf_ptr);
+                    // Residual GCREF results start as a CL value; the next
+                    // collecting call's gcmap is the home slots. Publish
+                    // after the frame reload so the store hits the live
+                    // jitframe, matching dynasm `force_spill_var` after CallR.
+                    if let Some(result) = call_result {
                         if op.result_type() == Type::Ref {
                             let mut cached_jf = Some(jf_ptr);
                             sync_ref_root_var(
@@ -12493,8 +12498,6 @@ impl CraneliftBackend {
                             );
                         }
                     }
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    builder.ins().set_pinned_reg(jf_ptr);
                 }
 
                 OpCode::CallAssemblerI
@@ -13014,7 +13017,7 @@ impl CraneliftBackend {
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
 
-                    if let Some(result) = emit_indirect_call_from_parts(
+                    let call_result = emit_indirect_call_from_parts(
                         &mut builder,
                         &constants,
                         op.arg(0).to_opref(),
@@ -13032,8 +13035,13 @@ impl CraneliftBackend {
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
-                    ) {
+                    );
+                    if let Some(result) = call_result {
                         builder.def_var(var(vi), result);
+                    }
+                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    builder.ins().set_pinned_reg(jf_ptr);
+                    if let Some(result) = call_result {
                         if op.result_type() == Type::Ref {
                             let mut cached_jf = Some(jf_ptr);
                             sync_ref_root_var(
@@ -13048,8 +13056,6 @@ impl CraneliftBackend {
                             );
                         }
                     }
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                    builder.ins().set_pinned_reg(jf_ptr);
                 }
 
                 OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {

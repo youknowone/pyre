@@ -4794,9 +4794,9 @@ fn call_metaclass_with_kwargs(
     if instance.is_null() {
         return PY_NULL;
     }
-    // A fresh type is allocated stable, so it never moves and needs no
-    // read-back -- but until `type_call_init_type` stores it, this local is
-    // its only reference, and `__init__` below runs Python.
+    // Heap types are nursery-born. `__init__` is arbitrary Python and
+    // can collect, so the slot is the live word after those calls.
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let instance = pyre_object::gc_roots::pin_root(instance);
     if let Some(w_insttype) = type_call_init_type(instance, w_metaclass)
         && let Some(init_fn) =
@@ -4859,7 +4859,7 @@ fn call_metaclass_with_kwargs(
         }
     }
 
-    instance
+    pyre_object::gc_roots::shadow_stack_get(instance_slot)
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
