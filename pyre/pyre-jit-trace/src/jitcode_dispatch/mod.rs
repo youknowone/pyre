@@ -6196,8 +6196,17 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                     // MIFrame registers preserve CONST_NULL in snapshots;
                     // keep it here as well.  Only OpRef::NONE is a hole.
                     if m != OpRef::NONE {
-                        active.push(m);
-                        continue;
+                        // A CALL-site helper snapshot uses the same mirror
+                        // for the live receiver.  Its PUSH_NULL/self_or_null
+                        // slot is a typed ConstPtr(NULL); overlaying that
+                        // through a reused color would plant NULL on a live
+                        // Ref (pickle async-forcing then reads an unwritten
+                        // result home).  Branch-guard reconstruction still
+                        // needs the NULL: that is the kept PUSH_NULL.
+                        if guard_present || !opref_is_null_const_ptr(m) {
+                            active.push(m);
+                            continue;
+                        }
                     }
                     // The mirror did not supply this operand-stack slot.  Two
                     // other per-slot sources remain, and only the absence of
