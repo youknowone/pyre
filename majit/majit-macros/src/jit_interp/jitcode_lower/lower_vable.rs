@@ -640,7 +640,9 @@ impl<'c> Lowerer<'c> {
                 binop_i_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
             );
             let fi = field_index as u16;
-            if let Some(&(index, _)) = config.vable_fields.get(&member_name) {
+            if config.vable_var.as_deref() == Some("state")
+                && let Some(&(index, _)) = config.vable_fields.get(&member_name)
+            {
                 let base = self.vable_base_reg()?;
                 let index = index as u16;
                 self.emit_op(
@@ -683,7 +685,9 @@ impl<'c> Lowerer<'c> {
             binop_f_emit_tokens(dst, &opcode, lhs_reg, rhs_reg),
         );
         let fi = field_index as u16;
-        if let Some(&(index, _)) = config.vable_fields.get(&member_name) {
+        if config.vable_var.as_deref() == Some("state")
+            && let Some(&(index, _)) = config.vable_fields.get(&member_name)
+        {
             let base = self.vable_base_reg()?;
             let index = index as u16;
             self.emit_op(
