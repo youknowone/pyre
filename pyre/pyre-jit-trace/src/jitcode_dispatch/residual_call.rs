@@ -7314,6 +7314,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
     {
+        if let Some(outcome) = spec_gate(SpecFold::UnaryNeg, || {
+            try_walker_orthodox_unary_neg(ctx, op.pc, &r_args, dst, dst_bank)
+        })? {
+            return Ok((outcome, op.next_pc));
+        }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::UnaryNeg, || {

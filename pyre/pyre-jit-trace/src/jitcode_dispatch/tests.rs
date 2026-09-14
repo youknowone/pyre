@@ -4258,6 +4258,139 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
 }
 
 #[test]
+fn float_binop_leaves_are_the_pypy_leaf() {
+    // floatobject.py `descr_add` after `_to_float`: `W_FloatObject(x + y)`.
+    // The descent walks `_float_add`, which must contain the fused New.
+    for (path, arith) in [
+        (
+            "pyre_interpreter::objspace::descroperation::_float_add",
+            "float_add",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_sub",
+            "float_sub",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_mul",
+            "float_mul",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_truediv",
+            "float_truediv",
+        ),
+    ] {
+        let jc = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| *op == arith),
+            "{path} must record {arith}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| *op == "new_with_vtable"),
+            "{path} must box via in-graph new_with_vtable; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("inline_call")),
+            "{path} must not inline_call newfloat; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("residual_call_irf")),
+            "{path} must not residualize the payload; ops={ops:?}"
+        );
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+    }
+}
+
+#[test]
+fn float_cmp_leaves_are_the_pypy_leaf() {
+    // floatobject.py `_compare` after `_to_float`: `space.newbool(x ? y)`.
+    for (path, arith) in [
+        (
+            "pyre_interpreter::objspace::descroperation::_float_lt",
+            "float_lt",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_le",
+            "float_le",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_gt",
+            "float_gt",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_ge",
+            "float_ge",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_eq",
+            "float_eq",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_ne",
+            "float_ne",
+        ),
+    ] {
+        let jc = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| *op == arith),
+            "{path} must record {arith}; ops={ops:?}"
+        );
+        assert!(
+            ops.len() < 32,
+            "{path} must stay the unboxed leaf; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("residual_call_irf")),
+            "{path} must not residualize the payload; ops={ops:?}"
+        );
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+    }
+}
+
+#[test]
+fn unary_neg_leaves_are_the_pypy_leaf() {
+    for (path, arith) in [
+        (
+            "pyre_interpreter::objspace::descroperation::_int_neg",
+            "int_neg",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_neg",
+            "float_neg",
+        ),
+    ] {
+        let jc = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| *op == arith
+                || *op == "int_sub"
+                || *op == "int_sub_ovf"
+                || *op == "int_add"),
+            "{path} must record {arith} (or int_sub/int_add); ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| *op == "new_with_vtable"),
+            "{path} must box via in-graph new_with_vtable; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("inline_call")),
+            "{path} must not inline_call the constructor; ops={ops:?}"
+        );
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+    }
+}
+
+#[test]
 fn append_journal_rollback_rewinds_length() {
     // #171 journal infra: a walked eager `list.append` grows the
     // concrete list at trace time (the fold records the array-op IR but
