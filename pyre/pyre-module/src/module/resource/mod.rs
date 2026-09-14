@@ -5,4 +5,4 @@
 //! Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 //! / RLIMIT_* constants and `struct_rusage`.
 
-crate::pyre_module_init!(resource);
+pyre_interpreter::pyre_module_init!(resource);

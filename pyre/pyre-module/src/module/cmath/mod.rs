@@ -7,7 +7,7 @@ pub mod interp_cmath;
 
 use interp_cmath as m;
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "cmath",
     interpleveldefs: {
         "pi"   => pyre_object::floatobject::w_float_new(pymath::math::PI),

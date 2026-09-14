@@ -11,8 +11,8 @@ use pyre_object::*;
 #[cfg(all(unix, feature = "host_env"))]
 mod imp {
     use super::*;
-    use crate::PyError;
     use core::{convert::Infallible, ffi::CStr, marker::PhantomData};
+    use pyre_interpreter::PyError;
     use rustpython_host_env::posix as host_posix;
     use std::ffi::CString;
     use std::os::fd::{AsFd, BorrowedFd};
@@ -82,7 +82,7 @@ mod imp {
                 // entry that came back from the filesystem holds surrogate
                 // escapes, which fold back to the original bytes here rather
                 // than having no `&str` spelling at all.
-                crate::gateway::fsencode(o)?
+                pyre_interpreter::gateway::fsencode(o)?
             } else if is_bytes(o) {
                 w_bytes_data(o).to_vec()
             } else {
@@ -115,7 +115,7 @@ mod imp {
         seq_items(o, what)?
             .into_iter()
             .map(|x| {
-                let bytes = crate::gateway::fsencode_bytes_w(x)?;
+                let bytes = pyre_interpreter::gateway::fsencode_bytes_w(x)?;
                 CString::new(bytes).map_err(|_| {
                     PyError::value_error(format!("fork_exec(): embedded null in {what}"))
                 })
@@ -127,7 +127,7 @@ mod imp {
         if is_none_obj(o) {
             return Ok(None);
         }
-        let bytes = crate::gateway::fsencode_bytes_w(o)?;
+        let bytes = pyre_interpreter::gateway::fsencode_bytes_w(o)?;
         CString::new(bytes)
             .map(Some)
             .map_err(|_| PyError::value_error(format!("fork_exec(): embedded null in {what}")))
@@ -184,9 +184,9 @@ mod imp {
                 // from the uid/gid fields: `-1` is not an unset sentinel here.
                 // CPython `_Py_Gid_Converter` likewise exposes negative and
                 // over-gid_t entries as ValueError for `extra_groups`.
-                let value = match crate::baseobjspace::int_w(x) {
+                let value = match pyre_interpreter::baseobjspace::int_w(x) {
                     Ok(value) => value,
-                    Err(error) if error.kind == crate::PyErrorKind::OverflowError => {
+                    Err(error) if error.kind == pyre_interpreter::PyErrorKind::OverflowError => {
                         return Err(PyError::value_error("group id is greater than maximum"));
                     }
                     Err(error) => return Err(error),
@@ -277,10 +277,10 @@ mod imp {
 
         // Call preexec_fn after all process setup but before closing FDs.
         if let Some(preexec_fn) = d.preexec_fn {
-            let r = crate::baseobjspace::call_function(preexec_fn, &[]);
+            let r = pyre_interpreter::baseobjspace::call_function(preexec_fn, &[]);
             if r.is_null() {
                 // Cannot safely stringify the exception after fork.
-                let _ = crate::call::take_call_error();
+                let _ = pyre_interpreter::call::take_call_error();
                 *ctx = ExecErrorContext::PreExec;
                 return Err(std::io::Error::from_raw_os_error(0));
             }
@@ -317,7 +317,7 @@ mod imp {
     }
 
     pub fn fork_exec(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-        let (pos, _kwargs) = crate::builtins::split_builtin_kwargs(args);
+        let (pos, _kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
         if pos.len() != 22 {
             return Err(PyError::type_error(format!(
                 "fork_exec() takes exactly 22 arguments ({} given)",
@@ -329,8 +329,8 @@ mod imp {
         // during shutdown, but CPython 3.14 `_posixsubprocess.fork_exec`
         // rejects this observable unsafe call.  Keep PyPy's fork/exec shape
         // and add only the finalization gate required by that public contract.
-        if !is_none_obj(pos[21]) && crate::module::thread::is_finalizing() {
-            return Err(crate::builtins::finalization_error(Some(
+        if !is_none_obj(pos[21]) && pyre_interpreter::module::thread::is_finalizing() {
+            return Err(pyre_interpreter::builtins::finalization_error(Some(
                 "preexec_fn not supported at interpreter shutdown",
             )));
         }
@@ -339,7 +339,7 @@ mod imp {
         // fork(): the child must not allocate before exec.
         let args_list = collect_fsencoded_cstrings(pos[0], "args")?;
         let exec_list = collect_cstrings(pos[1], "executable_list")?;
-        let close_fds = crate::baseobjspace::is_true(pos[2])?;
+        let close_fds = pyre_interpreter::baseobjspace::is_true(pos[2])?;
         let fds_to_keep = collect_fds(pos[3])?;
         let cwd = opt_fsencoded_cstring(pos[4], "cwd")?;
         let env_list = if is_none_obj(pos[5]) {
@@ -355,8 +355,8 @@ mod imp {
         let errwrite = fd_arg(pos[11]);
         let errpipe_read = fd_arg(pos[12]);
         let errpipe_write = fd_arg(pos[13]);
-        let restore_signals = crate::baseobjspace::is_true(pos[14])?;
-        let call_setsid = crate::baseobjspace::is_true(pos[15])?;
+        let restore_signals = pyre_interpreter::baseobjspace::is_true(pos[14])?;
+        let call_setsid = pyre_interpreter::baseobjspace::is_true(pos[15])?;
         let pgid_to_set = (unsafe { w_int_get_value(pos[16]) }) as libc::pid_t;
         let gid = opt_id(pos[17], "gid")?;
         let extra_groups = if is_none_obj(pos[18]) {
@@ -409,14 +409,14 @@ mod imp {
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_posixsubprocess",
     extra_init: |ns| {
         #[cfg(all(unix, feature = "host_env"))]
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "fork_exec",
-            crate::make_builtin_function("fork_exec", imp::fork_exec),
+            pyre_interpreter::make_builtin_function("fork_exec", imp::fork_exec),
         );
         #[cfg(not(all(unix, feature = "host_env")))]
         let _ = ns;

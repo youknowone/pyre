@@ -665,7 +665,6 @@ pub fn install_builtin_modules() {
 
     // Core pyre modules backed by `interpleveldefs` tables.
     pyre_install_module!(math);
-    pyre_install_module!(cmath);
     pyre_install_module!(time);
     pyre_install_module!(sys);
     // `moduledef.py applevel_name = '_operator'` — the interp-level table
@@ -707,8 +706,6 @@ pub fn install_builtin_modules() {
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(winsound);
     pyre_install_module!(_abc);
-    pyre_install_module!(_bisect);
-    pyre_install_module!(_heapq);
 
     // Frozen importlib imports `_stat` while bootstrapping a sandbox that
     // deliberately mounts no stdlib files, so it must stay a builtin.
@@ -746,7 +743,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
     pyre_install_module!(_opcode);
-    pyre_install_module!(_suggestions);
     pyre_install_module!("_imp"(imp));
 
     // importlib package and its submodules load their real source from disk:
@@ -797,16 +793,7 @@ pub fn install_builtin_modules() {
         #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(pwd);
 
-        // `host_env` as well as `unix`: both are wholly gated on that pair, so
-        // without it `sys.builtin_module_names` would advertise a module whose
-        // every call raises.
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(resource);
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(fcntl);
         pyre_install_module!(select);
-        #[cfg(unix)]
-        pyre_install_module!(termios);
         // `socket.py`'s module body subclasses `_socket.socket`, so the type
         // has to be there even where nothing can be connected: a target with
         // no host layer publishes it and the numbers, and leaves out the
@@ -823,17 +810,6 @@ pub fn install_builtin_modules() {
             not(target_arch = "wasm32")
         ))]
         pyre_install_module!(_cffi_backend);
-        // Both are POSIX-only upstream, and their callers know it:
-        // `shared_memory.py` and `resource_tracker.py` import `_posixshmem`
-        // only in their `os.name != 'nt'` arm, and `subprocess.py` imports
-        // `_posixsubprocess` only in the `else` of `if _mswindows`.  PyPy's
-        // pypyoption drops `_posixsubprocess` from `working_modules` on
-        // win32 and builds `_posixshmem` as a cffi shim that Windows never
-        // gets.  Registering an empty module here instead flips availability
-        // probes such as `test_audit`'s `import_module("_posixsubprocess")`
-        // from skip to run.
-        #[cfg(unix)]
-        pyre_install_module!(_posixsubprocess);
         pyre_install_module!(_multiprocessing);
     }
     pyre_install_module!(_locale);

@@ -3361,7 +3361,7 @@ pub(crate) fn clinic_arg_type_name(obj: PyObjectRef) -> String {
     arg_type_name(obj)
 }
 
-pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
+pub fn arg_type_name(obj: PyObjectRef) -> String {
     if obj.is_null() {
         return "object".to_string();
     }

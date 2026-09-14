@@ -49,47 +49,54 @@ fn argument(
     index: usize,
     name: &str,
     function: &str,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+) -> Result<Option<PyObjectRef>, pyre_interpreter::PyError> {
     let positional_value = positional.get(index).copied();
-    let keyword_value = crate::builtins::kwarg_get(kwargs, name);
+    let keyword_value = pyre_interpreter::builtins::kwarg_get(kwargs, name);
     if positional_value.is_some() && keyword_value.is_some() {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{function}() got multiple values for argument '{name}'"
         )));
     }
     Ok(positional_value.or(keyword_value))
 }
 
-fn index_value(value: PyObjectRef) -> Result<i64, crate::PyError> {
-    let index = crate::baseobjspace::space_index(value)?;
-    crate::baseobjspace::int_w(index)
+fn index_value(value: PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
+    let index = pyre_interpreter::baseobjspace::space_index(value)?;
+    pyre_interpreter::baseobjspace::int_w(index)
 }
 
-fn parse_args(args: &[PyObjectRef], function: &str) -> Result<BisectArgs, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    crate::builtins::kwarg_reject_unknown(kwargs, &["a", "x", "lo", "hi", "key"], function)?;
+fn parse_args(
+    args: &[PyObjectRef],
+    function: &str,
+) -> Result<BisectArgs, pyre_interpreter::PyError> {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    pyre_interpreter::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["a", "x", "lo", "hi", "key"],
+        function,
+    )?;
     if positional.len() > 4 {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{function}() takes at most 4 positional arguments ({} given)",
             positional.len()
         )));
     }
 
     let a = argument(positional, kwargs, 0, "a", function)?.ok_or_else(|| {
-        crate::PyError::type_error(format!(
+        pyre_interpreter::PyError::type_error(format!(
             "{function}() missing required argument 'a' (pos 1)"
         ))
     })?;
     let x = argument(positional, kwargs, 1, "x", function)?.ok_or_else(|| {
-        crate::PyError::type_error(format!(
+        pyre_interpreter::PyError::type_error(format!(
             "{function}() missing required argument 'x' (pos 2)"
         ))
     })?;
     let lo_arg = argument(positional, kwargs, 2, "lo", function)?;
     let hi_arg = argument(positional, kwargs, 3, "hi", function)?
         .filter(|value| !unsafe { is_none(*value) });
-    let key_arg =
-        crate::builtins::kwarg_get(kwargs, "key").filter(|value| !unsafe { is_none(*value) });
+    let key_arg = pyre_interpreter::builtins::kwarg_get(kwargs, "key")
+        .filter(|value| !unsafe { is_none(*value) });
 
     // Every operand is rooted before the first callback runs: `__index__` and
     // `__len__` below already execute Python, and `args` is a plain slice a
@@ -105,29 +112,34 @@ fn parse_args(args: &[PyObjectRef], function: &str) -> Result<BisectArgs, crate:
         None => 0,
     };
     if lo < 0 {
-        return Err(crate::PyError::value_error("lo must be non-negative"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "lo must be non-negative",
+        ));
     }
     let hi = match hi_arg {
         Some(slot) => index_value(shadow_stack_get(slot))?,
-        None => crate::baseobjspace::len_w(shadow_stack_get(a))?,
+        None => pyre_interpreter::baseobjspace::len_w(shadow_stack_get(a))?,
     };
     Ok(BisectArgs { a, x, lo, hi, key })
 }
 
-fn call_one(callable: PyObjectRef, arg: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    crate::call::call_function_impl_result(callable, &[arg])
+fn call_one(
+    callable: PyObjectRef,
+    arg: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    pyre_interpreter::call::call_function_impl_result(callable, &[arg])
 }
 
-fn less_than(left: PyObjectRef, right: PyObjectRef) -> Result<bool, crate::PyError> {
-    let result = crate::objspace::descroperation::compare(
+fn less_than(left: PyObjectRef, right: PyObjectRef) -> Result<bool, pyre_interpreter::PyError> {
+    let result = pyre_interpreter::objspace::descroperation::compare(
         left,
         right,
-        crate::objspace::descroperation::CompareOp::Lt,
+        pyre_interpreter::objspace::descroperation::CompareOp::Lt,
     )?;
-    crate::baseobjspace::is_true(result)
+    pyre_interpreter::baseobjspace::is_true(result)
 }
 
-fn bisect(parsed: &mut BisectArgs, right: bool) -> Result<i64, crate::PyError> {
+fn bisect(parsed: &mut BisectArgs, right: bool) -> Result<i64, pyre_interpreter::PyError> {
     while parsed.lo < parsed.hi {
         // Written this way instead of `(lo + hi) / 2` so a search spanning
         // `sys.maxsize` cannot overflow, matching `_bisectmodule.c`.
@@ -136,7 +148,7 @@ fn bisect(parsed: &mut BisectArgs, right: bool) -> Result<i64, crate::PyError> {
         // allocation can collect, and a slot read after it is the forwarded
         // one. `w_int_new` is itself non-moving, so it survives the read.
         let index = w_int_new(mid);
-        let mut item = crate::baseobjspace::getitem(parsed.a(), index)?;
+        let mut item = pyre_interpreter::baseobjspace::getitem(parsed.a(), index)?;
         if let Some(key) = parsed.key() {
             item = call_one(key, item)?;
         }
@@ -158,17 +170,17 @@ fn search(
     args: &[PyObjectRef],
     right: bool,
     function: &str,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let mut parsed = parse_args(args, function)?;
     Ok(w_int_new(bisect(&mut parsed, right)?))
 }
 
-fn bisect_left(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn bisect_left(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     search(args, false, "bisect_left")
 }
 
-fn bisect_right(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn bisect_right(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     search(args, true, "bisect_right")
 }
 
@@ -176,7 +188,7 @@ fn insort(
     args: &[PyObjectRef],
     right: bool,
     function: &str,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let mut parsed = parse_args(args, function)?;
     // The search compares against the KEYED value; the insertion still stores
@@ -189,44 +201,44 @@ fn insort(
     // The `insert` lookup runs the attribute protocol and can relocate a young
     // object, so root the boxed index before it.
     let index = pin(w_int_new(index));
-    let insert = crate::baseobjspace::getattr_str(parsed.a(), "insert")?;
-    crate::call::call_function_impl_result(
+    let insert = pyre_interpreter::baseobjspace::getattr_str(parsed.a(), "insert")?;
+    pyre_interpreter::call::call_function_impl_result(
         insert,
         &[shadow_stack_get(index), shadow_stack_get(original_x)],
     )?;
     Ok(w_none())
 }
 
-fn insort_left(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn insort_left(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     insort(args, false, "insort_left")
 }
 
-fn insort_right(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn insort_right(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     insort(args, true, "insort_right")
 }
 
-pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    let left = crate::gateway::with_module(
+pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let left = pyre_interpreter::gateway::with_module(
         "_bisect",
-        crate::make_module_builtin_function("bisect_left", bisect_left),
+        pyre_interpreter::make_module_builtin_function("bisect_left", bisect_left),
     );
-    let right = crate::gateway::with_module(
+    let right = pyre_interpreter::gateway::with_module(
         "_bisect",
-        crate::make_module_builtin_function("bisect_right", bisect_right),
+        pyre_interpreter::make_module_builtin_function("bisect_right", bisect_right),
     );
-    let insert_left = crate::gateway::with_module(
+    let insert_left = pyre_interpreter::gateway::with_module(
         "_bisect",
-        crate::make_module_builtin_function("insort_left", insort_left),
+        pyre_interpreter::make_module_builtin_function("insort_left", insort_left),
     );
-    let insert_right = crate::gateway::with_module(
+    let insert_right = pyre_interpreter::gateway::with_module(
         "_bisect",
-        crate::make_module_builtin_function("insort_right", insort_right),
+        pyre_interpreter::make_module_builtin_function("insort_right", insort_right),
     );
-    crate::module_ns_store(ns, "bisect_left", left);
-    crate::module_ns_store(ns, "bisect_right", right);
-    crate::module_ns_store(ns, "bisect", right);
-    crate::module_ns_store(ns, "insort_left", insert_left);
-    crate::module_ns_store(ns, "insort_right", insert_right);
-    crate::module_ns_store(ns, "insort", insert_right);
+    pyre_interpreter::module_ns_store(ns, "bisect_left", left);
+    pyre_interpreter::module_ns_store(ns, "bisect_right", right);
+    pyre_interpreter::module_ns_store(ns, "bisect", right);
+    pyre_interpreter::module_ns_store(ns, "insort_left", insert_left);
+    pyre_interpreter::module_ns_store(ns, "insort_right", insert_right);
+    pyre_interpreter::module_ns_store(ns, "insort", insert_right);
     Ok(())
 }

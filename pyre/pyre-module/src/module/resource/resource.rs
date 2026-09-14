@@ -9,7 +9,7 @@ static STRUCT_RUSAGE_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new
 
 fn struct_rusage_type() -> pyre_object::PyObjectRef {
     *STRUCT_RUSAGE_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq(
+        pyre_interpreter::_structseq::make_struct_seq(
             "resource.struct_rusage",
             &[
                 "ru_utime",
@@ -40,13 +40,13 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
 /// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
 /// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     // `lib_pypy/resource.py:13 error = OSError` and
     // `:15-37 class struct_rusage`.
-    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+    let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before init_resource");
-    crate::module_ns_store(ns, "error", w_os_error);
-    crate::module_ns_store(ns, "struct_rusage", struct_rusage_type());
+    pyre_interpreter::module_ns_store(ns, "error", w_os_error);
+    pyre_interpreter::module_ns_store(ns, "struct_rusage", struct_rusage_type());
     // ── struct_rusage tuple (16-field layout matches CPython) ──
     #[cfg(all(unix, feature = "host_env"))]
     fn make_struct_rusage(r: &rustpython_host_env::resource::RUsage) -> pyre_object::PyObjectRef {
@@ -68,12 +68,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fields.push(pyre_object::w_int_new(r.ru_nsignals));
         fields.push(pyre_object::w_int_new(r.ru_nvcsw));
         fields.push(pyre_object::w_int_new(r.ru_nivcsw));
-        crate::_structseq::new_instance(struct_rusage_type(), fields.take())
+        pyre_interpreter::_structseq::new_instance(struct_rusage_type(), fields.take())
     }
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "getrusage",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "getrusage",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
@@ -82,12 +82,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         if unsafe { pyre_object::is_int(a) } {
                             unsafe { pyre_object::w_int_get_value(a) as i32 }
                         } else {
-                            return Err(crate::PyError::type_error(
+                            return Err(pyre_interpreter::PyError::type_error(
                                 "getrusage(): who should be an integer",
                             ));
                         }
                     } else {
-                        return Err(crate::PyError::type_error("getrusage() missing argument"));
+                        return Err(pyre_interpreter::PyError::type_error("getrusage() missing argument"));
                     };
                     match rustpython_host_env::resource::getrusage(who) {
                         Ok(r) => Ok(make_struct_rusage(&r)),
@@ -97,9 +97,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             // an invalid `who`; only other errno values are
                             // surfaced as OSError.
                             if errno == libc::EINVAL {
-                                return Err(crate::PyError::value_error("invalid who parameter"));
+                                return Err(pyre_interpreter::PyError::value_error("invalid who parameter"));
                             }
-                            Err(crate::PyError::os_error_with_errno(
+                            Err(pyre_interpreter::PyError::os_error_with_errno(
                                 errno,
                                 format!("getrusage: {e}"),
                             ))
@@ -109,7 +109,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::not_implemented(
+                    Err(pyre_interpreter::PyError::not_implemented(
                         "resource.getrusage requires host_env feature",
                     ))
                 }
@@ -117,10 +117,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "getrlimit",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "getrlimit",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
@@ -129,12 +129,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         if unsafe { pyre_object::is_int(a) } {
                             unsafe { pyre_object::w_int_get_value(a) as libc::rlim_t }
                         } else {
-                            return Err(crate::PyError::type_error(
+                            return Err(pyre_interpreter::PyError::type_error(
                                 "getrlimit(): resource should be an integer",
                             ));
                         }
                     } else {
-                        return Err(crate::PyError::type_error("getrlimit() missing argument"));
+                        return Err(pyre_interpreter::PyError::type_error("getrlimit() missing argument"));
                     };
                     match rustpython_host_env::resource::getrlimit(res) {
                         Ok(rl) => {
@@ -143,7 +143,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             fields.push(pyre_object::w_int_new(rl.rlim_max as i64));
                             Ok(pyre_object::w_tuple_new(fields.take()))
                         }
-                        Err(e) => Err(crate::PyError::os_error_with_errno(
+                        Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
                             e.raw_os_error().unwrap_or(0),
                             format!("getrlimit: {e}"),
                         )),
@@ -152,7 +152,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::not_implemented(
+                    Err(pyre_interpreter::PyError::not_implemented(
                         "resource.getrlimit requires host_env feature",
                     ))
                 }
@@ -160,22 +160,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             1,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "setrlimit",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "setrlimit",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error(
+                        return Err(pyre_interpreter::PyError::type_error(
                             "setrlimit() requires 2 arguments",
                         ));
                     }
                     let res = unsafe {
                         if !pyre_object::is_int(args[0]) {
-                            return Err(crate::PyError::type_error(
+                            return Err(pyre_interpreter::PyError::type_error(
                                 "setrlimit(): resource should be an integer",
                             ));
                         }
@@ -202,13 +202,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 pyre_object::w_list_getitem(args[1], 1).unwrap(),
                             )
                         } else {
-                            return Err(crate::PyError::type_error(
+                            return Err(pyre_interpreter::PyError::type_error(
                                 "expected a tuple of 2 integers",
                             ));
                         }
                     };
-                    let soft = crate::baseobjspace::int_w(w_soft)? as libc::rlim_t;
-                    let hard = crate::baseobjspace::int_w(w_hard)? as libc::rlim_t;
+                    let soft = pyre_interpreter::baseobjspace::int_w(w_soft)? as libc::rlim_t;
+                    let hard = pyre_interpreter::baseobjspace::int_w(w_hard)? as libc::rlim_t;
                     let rl = libc::rlimit {
                         rlim_cur: soft,
                         rlim_max: hard,
@@ -222,16 +222,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             // as OSError.
                             let errno = e.raw_os_error().unwrap_or(0);
                             if errno == libc::EINVAL {
-                                return Err(crate::PyError::value_error(
+                                return Err(pyre_interpreter::PyError::value_error(
                                     "current limit exceeds maximum limit",
                                 ));
                             }
                             if errno == libc::EPERM {
-                                return Err(crate::PyError::value_error(
+                                return Err(pyre_interpreter::PyError::value_error(
                                     "not allowed to raise maximum limit",
                                 ));
                             }
-                            Err(crate::PyError::os_error_with_errno(
+                            Err(pyre_interpreter::PyError::os_error_with_errno(
                                 errno,
                                 format!("setrlimit: {e}"),
                             ))
@@ -241,7 +241,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::not_implemented(
+                    Err(pyre_interpreter::PyError::not_implemented(
                         "resource.setrlimit requires host_env feature",
                     ))
                 }
@@ -252,68 +252,68 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // ── Constants (POSIX subset matching CPython) ──
     #[cfg(unix)]
     {
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RUSAGE_SELF",
             pyre_object::w_int_new(libc::RUSAGE_SELF as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RUSAGE_CHILDREN",
             pyre_object::w_int_new(libc::RUSAGE_CHILDREN as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_CPU",
             pyre_object::w_int_new(libc::RLIMIT_CPU as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_FSIZE",
             pyre_object::w_int_new(libc::RLIMIT_FSIZE as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_DATA",
             pyre_object::w_int_new(libc::RLIMIT_DATA as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_STACK",
             pyre_object::w_int_new(libc::RLIMIT_STACK as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_CORE",
             pyre_object::w_int_new(libc::RLIMIT_CORE as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_NOFILE",
             pyre_object::w_int_new(libc::RLIMIT_NOFILE as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_AS",
             pyre_object::w_int_new(libc::RLIMIT_AS as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_RSS",
             pyre_object::w_int_new(libc::RLIMIT_RSS as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_NPROC",
             pyre_object::w_int_new(libc::RLIMIT_NPROC as i64),
         );
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIMIT_MEMLOCK",
             pyre_object::w_int_new(libc::RLIMIT_MEMLOCK as i64),
         );
         // RLIM_INFINITY: unsigned max — pyre stores as i64 (-1 on signed widen).
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "RLIM_INFINITY",
             pyre_object::w_int_new(libc::RLIM_INFINITY as i64),

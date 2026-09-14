@@ -10,27 +10,27 @@
 /// `rustpython_host_env::fcntl`.  `ioctl` is still limited to the
 /// integer-argument form; its buffer form needs writable-buffer acquisition
 /// and `mutate_flag` handling from `interp_fcntl.py:252-300`.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::module_ns_store(
         ns,
         "fcntl",
-        crate::make_builtin_function("fcntl", |args| {
+        pyre_interpreter::make_builtin_function("fcntl", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 if !(2..=3).contains(&args.len()) {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "fcntl() takes 2 or 3 arguments",
                     ));
                 }
                 if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "fcntl() arguments must be integers",
                     ));
                 }
                 // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
                 // `space.c_filedescriptor_w`, so an open file answers for the
                 // number it wraps.
-                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 // `interp_fcntl.py fcntl` tries the string-buffer path before
                 // falling back to the integer one and returns exactly the
@@ -39,13 +39,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if args.len() >= 3 && !unsafe { pyre_object::is_int(args[2]) } {
                     let data = arg_readbuf(args[2], "fcntl")?;
                     let Some(mut buf) = stage_arg(data) else {
-                        return Err(crate::PyError::value_error(
+                        return Err(pyre_interpreter::PyError::value_error(
                             "fcntl argument 3 is too long",
                         ));
                     };
                     loop {
                         let outcome = {
-                            let _blocked = crate::module::thread::before_external_block();
+                            let _blocked = pyre_interpreter::module::thread::before_external_block();
                             rustpython_host_env::fcntl::fcntl_with_bytes(fd, cmd, &mut buf)
                         };
                         match outcome {
@@ -55,8 +55,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                     &buf[..data.len()],
                                 ));
                             }
-                            Err(e) => crate::builtins::eintr_retry_with(e, |e| {
-                                crate::PyError::os_error_with_errno(
+                            Err(e) => pyre_interpreter::builtins::eintr_retry_with(e, |e| {
+                                pyre_interpreter::PyError::os_error_with_errno(
                                     e.raw_os_error().unwrap_or(0),
                                     format!("fcntl: {e}"),
                                 )
@@ -74,13 +74,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // wait runs the pending handlers and goes back to waiting.
                 loop {
                     let outcome = {
-                        let _blocked = crate::module::thread::before_external_block();
+                        let _blocked = pyre_interpreter::module::thread::before_external_block();
                         rustpython_host_env::fcntl::fcntl_int(fd, cmd, arg)
                     };
                     match outcome {
                         Ok(v) => return Ok(pyre_object::w_int_new(v as i64)),
-                        Err(e) => crate::builtins::eintr_retry_with(e, |e| {
-                            crate::PyError::os_error_with_errno(
+                        Err(e) => pyre_interpreter::builtins::eintr_retry_with(e, |e| {
+                            pyre_interpreter::PyError::os_error_with_errno(
                                 e.raw_os_error().unwrap_or(0),
                                 format!("fcntl: {e}"),
                             )
@@ -91,36 +91,36 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::not_implemented(
+                Err(pyre_interpreter::PyError::not_implemented(
                     "fcntl.fcntl requires host_env feature",
                 ))
             }
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "ioctl",
-        crate::make_builtin_function("ioctl", |args| {
+        pyre_interpreter::make_builtin_function("ioctl", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 // `interp_fcntl.py ioctl(space, w_fd, w_request, w_arg,
                 // mutate_flag=-1)` / `fcntl_ioctl_impl(module, fd, code, arg,
                 // mutate_arg)`.
                 if !(2..=4).contains(&args.len()) {
-                    return Err(crate::PyError::type_error(format!(
+                    return Err(pyre_interpreter::PyError::type_error(format!(
                         "ioctl expected at most 4 arguments, got {}",
                         args.len()
                     )));
                 }
                 if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "ioctl() arguments must be integers",
                     ));
                 }
                 // `ioctl` reads its descriptor the same way the rest of the
                 // module does.  It alone raises through `_raise_error_always`,
                 // so an interrupted call surfaces rather than being re-issued.
-                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
                 let raw_req = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i64;
                 let request = rustpython_host_env::fcntl::normalize_ioctl_request(raw_req);
                 // The integer arm comes first, before the argument is ever
@@ -131,7 +131,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // exporter that is neither `bytes` nor `str` — those two
                     // always take the read-only form however it is set.
                     let mutate = if args.len() >= 4 {
-                        crate::baseobjspace::is_true(args[3])?
+                        pyre_interpreter::baseobjspace::is_true(args[3])?
                     } else {
                         true
                     };
@@ -140,7 +140,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     if mutate
                         && !immutable
                         && let Ok((slice, _owner, _made_view)) =
-                            unsafe { crate::builtins::fileio_writebuf(arg) }
+                            unsafe { pyre_interpreter::builtins::fileio_writebuf(arg) }
                     {
                         return ioctl_mutable(fd, request, slice);
                     }
@@ -152,12 +152,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     0
                 };
                 let outcome = {
-                    let _blocked = crate::module::thread::before_external_block();
+                    let _blocked = pyre_interpreter::module::thread::before_external_block();
                     rustpython_host_env::fcntl::ioctl_int(fd, request, arg)
                 };
                 match outcome {
                     Ok(v) => Ok(pyre_object::w_int_new(v as i64)),
-                    Err(e) => Err(crate::PyError::os_error_with_errno(
+                    Err(e) => Err(pyre_interpreter::PyError::os_error_with_errno(
                         e.raw_os_error().unwrap_or(0),
                         format!("ioctl: {e}"),
                     )),
@@ -166,45 +166,45 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::not_implemented(
+                Err(pyre_interpreter::PyError::not_implemented(
                     "fcntl.ioctl requires host_env feature",
                 ))
             }
         }),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "flock",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "flock",
             |args| {
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.len() < 2 {
-                        return Err(crate::PyError::type_error("flock() requires 2 arguments"));
+                        return Err(pyre_interpreter::PyError::type_error("flock() requires 2 arguments"));
                     }
                     if !unsafe { pyre_object::is_int(args[1]) } {
-                        return Err(crate::PyError::type_error(
+                        return Err(pyre_interpreter::PyError::type_error(
                             "flock() arguments must be integers",
                         ));
                     }
                     // `flock(space, w_fd, op)` unwraps through
                     // `space.c_filedescriptor_w`, so `fcntl.flock(f, LOCK_EX)`
                     // on an open file is the documented spelling.
-                    let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                    let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
                     let op = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                     // Without LOCK_NB this waits for the lock, and
                     // `_raise_error_maybe` is `eintr_retry=True`: the wait runs
                     // the pending handlers and resumes rather than surfacing.
                     loop {
                         let outcome = {
-                            let _blocked = crate::module::thread::before_external_block();
+                            let _blocked = pyre_interpreter::module::thread::before_external_block();
                             rustpython_host_env::fcntl::flock(fd, op)
                         };
                         match outcome {
                             Ok(_) => return Ok(pyre_object::w_none()),
-                            Err(e) => crate::builtins::eintr_retry_with(e, |e| {
-                                crate::PyError::os_error_with_errno(
+                            Err(e) => pyre_interpreter::builtins::eintr_retry_with(e, |e| {
+                                pyre_interpreter::PyError::os_error_with_errno(
                                     e.raw_os_error().unwrap_or(0),
                                     format!("flock: {e}"),
                                 )
@@ -215,7 +215,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(not(all(unix, feature = "host_env")))]
                 {
                     let _ = args;
-                    Err(crate::PyError::not_implemented(
+                    Err(pyre_interpreter::PyError::not_implemented(
                         "fcntl.flock requires host_env feature",
                     ))
                 }
@@ -223,27 +223,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             2,
         ),
     );
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "lockf",
-        crate::make_builtin_function("lockf", |args| {
+        pyre_interpreter::make_builtin_function("lockf", |args| {
             #[cfg(all(unix, feature = "host_env"))]
             {
                 if !(2..=5).contains(&args.len()) {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "lockf() takes from 2 to 5 arguments",
                     ));
                 }
                 for &a in args.iter().take(5).skip(1) {
                     if !unsafe { pyre_object::is_int(a) } {
-                        return Err(crate::PyError::type_error(
+                        return Err(pyre_interpreter::PyError::type_error(
                             "lockf() arguments must be integers",
                         ));
                     }
                 }
                 // `lockf(space, w_fd, op, length, start, whence)` unwraps its
                 // descriptor through `space.c_filedescriptor_w`.
-                let fd = crate::baseobjspace::c_filedescriptor_w(args[0])?;
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
                 let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
                 let len = if args.len() >= 3 {
                     unsafe { pyre_object::w_int_get_value(args[2]) }
@@ -264,7 +264,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // `_raise_error_maybe`, which is `eintr_retry=True`.
                 loop {
                     let outcome = {
-                        let _blocked = crate::module::thread::before_external_block();
+                        let _blocked = pyre_interpreter::module::thread::before_external_block();
                         rustpython_host_env::fcntl::lockf(fd, cmd, len, start, whence)
                     };
                     match outcome {
@@ -273,16 +273,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // helper was an internal pyre detail.
                         Ok(_) => return Ok(pyre_object::w_none()),
                         Err(rustpython_host_env::fcntl::LockfError::InvalidCmd) => {
-                            return Err(crate::PyError::value_error("lockf: invalid cmd"));
+                            return Err(pyre_interpreter::PyError::value_error("lockf: invalid cmd"));
                         }
                         Err(rustpython_host_env::fcntl::LockfError::Overflow(s)) => {
-                            return Err(crate::PyError::value_error(format!(
+                            return Err(pyre_interpreter::PyError::value_error(format!(
                                 "lockf: overflow: {s}"
                             )));
                         }
                         Err(rustpython_host_env::fcntl::LockfError::Io(e)) => {
-                            crate::builtins::eintr_retry_with(e, |e| {
-                                crate::PyError::os_error_with_errno(
+                            pyre_interpreter::builtins::eintr_retry_with(e, |e| {
+                                pyre_interpreter::PyError::os_error_with_errno(
                                     e.raw_os_error().unwrap_or(0),
                                     format!("lockf: {e}"),
                                 )
@@ -294,7 +294,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             #[cfg(not(all(unix, feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::not_implemented(
+                Err(pyre_interpreter::PyError::not_implemented(
                     "fcntl.lockf requires host_env feature",
                 ))
             }
@@ -309,7 +309,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     {
         macro_rules! cst {
             ($name:literal, $val:expr) => {
-                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         cst!("F_GETFD", libc::F_GETFD);
@@ -411,13 +411,13 @@ const ARG_GUARD: [u8; 8] = [0x00, 0xfa, 0x69, 0xc4, 0x67, 0xa3, 0x6c, 0x58];
 fn arg_readbuf(
     arg: pyre_object::PyObjectRef,
     callable: &str,
-) -> Result<&'static [u8], crate::PyError> {
+) -> Result<&'static [u8], pyre_interpreter::PyError> {
     if unsafe { pyre_object::is_str(arg) } {
-        return Ok(crate::baseobjspace::str_utf8_w(arg)?.as_bytes());
+        return Ok(pyre_interpreter::baseobjspace::str_utf8_w(arg)?.as_bytes());
     }
-    unsafe { crate::builtins::acquire_readbuf(arg) }.map_err(|_| {
+    unsafe { pyre_interpreter::builtins::acquire_readbuf(arg) }.map_err(|_| {
         let type_name = unsafe { pyre_object::type_name_of(arg) };
-        crate::PyError::type_error(format!(
+        pyre_interpreter::PyError::type_error(format!(
             "{callable}() argument 3 must be an integer, a bytes-like object, \
              or a string, not {type_name}"
         ))
@@ -427,19 +427,19 @@ fn arg_readbuf(
 /// Run `ioctl` with `arg` as its third argument, reporting the errno on
 /// failure.
 #[cfg(all(unix, feature = "host_env"))]
-fn ioctl_ptr(fd: i32, request: libc::c_ulong, ptr: *mut u8) -> Result<i32, crate::PyError> {
+fn ioctl_ptr(fd: i32, request: libc::c_ulong, ptr: *mut u8) -> Result<i32, pyre_interpreter::PyError> {
     // The errno is read inside the released region, as
     // `llexternal(..., save_err=rffi.RFFI_SAVE_ERRNO)` does: retaking the GIL
     // goes through `mutex2_lock_timeout`, whose timed wait is a syscall of its
     // own and overwrites what this call left behind.
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         unsafe {
             rustpython_host_env::fcntl::ioctl_ptr(fd, request, ptr as *mut libc::c_void)
         }
     };
     result.map_err(|e| {
-        crate::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), format!("ioctl: {e}"))
+        pyre_interpreter::PyError::os_error_with_errno(e.raw_os_error().unwrap_or(0), format!("ioctl: {e}"))
     })
 }
 
@@ -457,11 +457,11 @@ fn stage_arg(arg: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(all(unix, feature = "host_env"))]
-fn guard_intact(buf: &[u8], len: usize) -> Result<(), crate::PyError> {
+fn guard_intact(buf: &[u8], len: usize) -> Result<(), pyre_interpreter::PyError> {
     if buf[len..len + ARG_GUARD.len()] == ARG_GUARD {
         return Ok(());
     }
-    Err(crate::PyError::system_error("buffer overflow"))
+    Err(pyre_interpreter::PyError::system_error("buffer overflow"))
 }
 
 /// The writable-exporter arm: the kernel's answer lands back in the caller's
@@ -473,7 +473,7 @@ fn ioctl_mutable(
     fd: i32,
     request: libc::c_ulong,
     arg: &mut [u8],
-) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     let Some(mut buf) = stage_arg(arg) else {
         let ret = ioctl_ptr(fd, request, arg.as_mut_ptr())?;
         return Ok(pyre_object::w_int_new(ret as i64));
@@ -492,9 +492,9 @@ fn ioctl_readonly(
     fd: i32,
     request: libc::c_ulong,
     arg: &[u8],
-) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
     let Some(mut buf) = stage_arg(arg) else {
-        return Err(crate::PyError::value_error("ioctl argument 3 is too long"));
+        return Err(pyre_interpreter::PyError::value_error("ioctl argument 3 is too long"));
     };
     ioctl_ptr(fd, request, buf.as_mut_ptr())?;
     guard_intact(&buf, arg.len())?;

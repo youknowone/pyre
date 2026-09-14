@@ -4,4 +4,4 @@
 //! lockf(fd, cmd, len=0, start=0, whence=0).  Integer-argument forms
 //! only.
 
-crate::pyre_module_init!(interp_fcntl);
+pyre_interpreter::pyre_module_init!(interp_fcntl);

@@ -23,15 +23,33 @@ pub mod module;
 /// The interpreter does not depend on this crate. The final binary calls
 /// [`register`] before `install_builtin_modules`.
 pub fn install_optional_modules() {
-    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
+    pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
+    pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
+    pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_posixshmem", module::_posixshmem::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module(
+        "_posixsubprocess",
+        module::_posixsubprocess::init,
+    );
+    pyre_interpreter::importing::register_builtin_module(
+        "_suggestions",
+        module::_suggestions::init,
+    );
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
+    pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
+    #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
-    pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
 }
 
 /// Install [`install_optional_modules`] as the interpreter's optional-module hook.

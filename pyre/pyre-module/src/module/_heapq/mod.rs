@@ -29,7 +29,11 @@ enum Order {
 impl Order {
     /// True when `first` belongs above `second` in this heap's ordering.
     /// Min asks `first < second`, max asks `second < first`.
-    fn precedes(self, first: PyObjectRef, second: PyObjectRef) -> Result<bool, crate::PyError> {
+    fn precedes(
+        self,
+        first: PyObjectRef,
+        second: PyObjectRef,
+    ) -> Result<bool, pyre_interpreter::PyError> {
         match self {
             Order::Min => less_than(first, second),
             Order::Max => less_than(second, first),
@@ -38,13 +42,13 @@ impl Order {
 }
 
 /// `PyObject_RichCompareBool(left, right, Py_LT)`.
-fn less_than(left: PyObjectRef, right: PyObjectRef) -> Result<bool, crate::PyError> {
-    let result = crate::objspace::descroperation::compare(
+fn less_than(left: PyObjectRef, right: PyObjectRef) -> Result<bool, pyre_interpreter::PyError> {
+    let result = pyre_interpreter::objspace::descroperation::compare(
         left,
         right,
-        crate::objspace::descroperation::CompareOp::Lt,
+        pyre_interpreter::objspace::descroperation::CompareOp::Lt,
     )?;
-    crate::baseobjspace::is_true(result)
+    pyre_interpreter::baseobjspace::is_true(result)
 }
 
 /// Pin `value` for the enclosing `push_roots` scope and return the slot that
@@ -69,11 +73,11 @@ impl Heap {
         unsafe { w_list_len(self.get()) as i64 }
     }
 
-    fn item(self, index: i64) -> Result<PyObjectRef, crate::PyError> {
+    fn item(self, index: i64) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         unsafe { w_list_getitem(self.get(), index) }.ok_or_else(index_out_of_range)
     }
 
-    fn set_item(self, index: i64, value: PyObjectRef) -> Result<(), crate::PyError> {
+    fn set_item(self, index: i64, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
         if unsafe { w_list_setitem(self.get(), index, value) } {
             Ok(())
         } else {
@@ -85,7 +89,7 @@ impl Heap {
     /// comparison since it last looked, and `__lt__` may have replaced either.
     /// Both are rooted across the writes — a store that promotes the list off
     /// its integer strategy allocates.
-    fn swap(self, left: i64, right: i64) -> Result<(), crate::PyError> {
+    fn swap(self, left: i64, right: i64) -> Result<(), pyre_interpreter::PyError> {
         let _roots = push_roots();
         let left_item = pin(self.item(left)?);
         let right_item = pin(self.item(right)?);
@@ -96,7 +100,12 @@ impl Heap {
     /// Read two elements and ask `order` which of them comes first. The left
     /// one is rooted because reading the right one can box, and boxing can
     /// collect.
-    fn compare_items(self, left: i64, right: i64, order: Order) -> Result<bool, crate::PyError> {
+    fn compare_items(
+        self,
+        left: i64,
+        right: i64,
+        order: Order,
+    ) -> Result<bool, pyre_interpreter::PyError> {
         let _roots = push_roots();
         let left_item = pin(self.item(left)?);
         let right_item = self.item(right)?;
@@ -104,12 +113,12 @@ impl Heap {
     }
 }
 
-fn index_out_of_range() -> crate::PyError {
-    crate::PyError::index_error("index out of range")
+fn index_out_of_range() -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::index_error("index out of range")
 }
 
-fn changed_size() -> crate::PyError {
-    crate::PyError::runtime_error("list changed size during iteration")
+fn changed_size() -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::runtime_error("list changed size during iteration")
 }
 
 /// The `heap: object(subclass_of='&PyList_Type')` converter. `position` names
@@ -119,23 +128,28 @@ fn heap_argument(
     heap: PyObjectRef,
     function: &str,
     position: Option<usize>,
-) -> Result<PyObjectRef, crate::PyError> {
-    if unsafe { crate::baseobjspace::isinstance_list_w(heap) } {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if unsafe { pyre_interpreter::baseobjspace::isinstance_list_w(heap) } {
         return Ok(heap);
     }
     let argument = match position {
         Some(position) => format!("argument {position}"),
         None => "argument".to_string(),
     };
-    Err(crate::PyError::type_error(format!(
+    Err(pyre_interpreter::PyError::type_error(format!(
         "{function}() {argument} must be list, not {}",
-        crate::type_methods::arg_type_name(heap)
+        pyre_interpreter::type_methods::arg_type_name(heap)
     )))
 }
 
 /// `siftdown` / `siftdown_max`: follow the path to the root, moving parents
 /// down until finding a place the item at `pos` fits.
-fn siftdown(heap: Heap, startpos: i64, pos: i64, order: Order) -> Result<(), crate::PyError> {
+fn siftdown(
+    heap: Heap,
+    startpos: i64,
+    pos: i64,
+    order: Order,
+) -> Result<(), pyre_interpreter::PyError> {
     let size = heap.len();
     if pos >= size {
         return Err(index_out_of_range());
@@ -159,7 +173,7 @@ fn siftdown(heap: Heap, startpos: i64, pos: i64, order: Order) -> Result<(), cra
 /// `siftup` / `siftup_max`: bubble the preceding child up until hitting a
 /// leaf, then bubble the displaced item to its final resting place by sifting
 /// its parents down.
-fn siftup(heap: Heap, pos: i64, order: Order) -> Result<(), crate::PyError> {
+fn siftup(heap: Heap, pos: i64, order: Order) -> Result<(), pyre_interpreter::PyError> {
     let endpos = heap.len();
     let startpos = pos;
     if pos >= endpos {
@@ -213,12 +227,12 @@ fn keep_top_bit(mut n: i64) -> i64 {
    the same heap.  The only difference is that the traversal
    order is optimized for cache efficiency.
 */
-fn cache_friendly_heapify(heap: Heap, order: Order) -> Result<(), crate::PyError> {
+fn cache_friendly_heapify(heap: Heap, order: Order) -> Result<(), pyre_interpreter::PyError> {
     let m = heap.len() >> 1; /* index of first childless node */
     let leftmost = keep_top_bit(m + 1) - 1; /* leftmost node in row of m */
     let mhalf = m >> 1; /* parent of first childless node */
 
-    let sift_ancestors = |start: i64| -> Result<(), crate::PyError> {
+    let sift_ancestors = |start: i64| -> Result<(), pyre_interpreter::PyError> {
         let mut j = start;
         loop {
             siftup(heap, j, order)?;
@@ -237,7 +251,7 @@ fn cache_friendly_heapify(heap: Heap, order: Order) -> Result<(), crate::PyError
     Ok(())
 }
 
-fn heapify_internal(heap: Heap, order: Order) -> Result<(), crate::PyError> {
+fn heapify_internal(heap: Heap, order: Order) -> Result<(), pyre_interpreter::PyError> {
     /* For heaps likely to be bigger than L1 cache, we use the cache
        friendly heapify function.  For smaller heaps that fit entirely
        in cache, we prefer the simpler algorithm with less branching.
@@ -260,7 +274,7 @@ fn heappush_impl(
     args: &[PyObjectRef],
     function: &str,
     order: Order,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let heap = Heap(pin(heap_argument(args[0], function, Some(1))?));
     let item = pin(args[1]);
@@ -273,7 +287,7 @@ fn heappop_impl(
     args: &[PyObjectRef],
     function: &str,
     order: Order,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let heap = Heap(pin(heap_argument(args[0], function, None)?));
     /* raises IndexError if the heap is empty */
@@ -294,7 +308,7 @@ fn heapreplace_impl(
     args: &[PyObjectRef],
     function: &str,
     order: Order,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let heap = Heap(pin(heap_argument(args[0], function, Some(1))?));
     let item = pin(args[1]);
@@ -311,7 +325,7 @@ fn heappushpop_impl(
     args: &[PyObjectRef],
     function: &str,
     order: Order,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let heap = Heap(pin(heap_argument(args[0], function, Some(1))?));
     let item = pin(args[1]);
@@ -337,14 +351,14 @@ fn heapify_impl(
     args: &[PyObjectRef],
     function: &str,
     order: Order,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let heap = Heap(pin(heap_argument(args[0], function, None)?));
     heapify_internal(heap, order)?;
     Ok(w_none())
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_heapq",
     functions: {
         "heappush"        / 2 = |args| heappush_impl(args, "heappush", Order::Min),

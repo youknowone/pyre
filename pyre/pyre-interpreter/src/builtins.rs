@@ -5430,7 +5430,7 @@ static __majit_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor
 /// Signature/unwrap_spec gateway is not yet ported; once it routes builtin
 /// kwargs through `Arguments::_match_signature` into named slots, this helper
 /// and the `__pyre_kw__` marker can be removed.
-pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
+pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if !args.is_empty() {
         let last = args[args.len() - 1];
         // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
@@ -5484,7 +5484,7 @@ pub fn builtin_kwargs_marker_dict(last: PyObjectRef) -> bool {
 /// True when the kwargs dict from [`split_builtin_kwargs`] carries a real
 /// keyword (any entry other than the `__pyre_kw__` marker).  An empty
 /// `**{}` therefore reports `false`.
-pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
+pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
     real_kwarg_count(kwargs) > 0
 }
 
@@ -5526,7 +5526,7 @@ pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
-pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObjectRef> {
+pub fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObjectRef> {
     let dict = kwargs?;
     unsafe { pyre_object::w_dict_getitem_str(dict, name) }
 }
@@ -5543,7 +5543,7 @@ pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObj
 /// ("min", "zip_longest", ...).  The `__pyre_kw__` marker entry the
 /// gateway appends is filtered out; it is an implementation detail of
 /// the kwargs encoding, not a user-visible argument.
-pub(crate) fn kwarg_reject_unknown(
+pub fn kwarg_reject_unknown(
     kwargs: Option<PyObjectRef>,
     allowed: &[&str],
     fn_name: &str,
@@ -9001,7 +9001,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// in a trailing marker dict, so remove it before constructing `args_w`.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
-        pub(crate) fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
             let (positional, _) = split_builtin_kwargs(rest);
@@ -9337,7 +9337,7 @@ pub(crate) fn make_exc_type(
 /// slot: `ssl.SSLError`, `_csv.Error` and `_ctypes.COMError` come from a type
 /// spec that names its own `basicsize`, and a spec that does adds no managed
 /// weakref.  Those three keep [`make_exc_type`] / [`make_exc_type_with_init`].
-pub(crate) fn new_exception_class(
+pub fn new_exception_class(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
@@ -20142,7 +20142,7 @@ impl Drop for WritableBuffer {
 ///
 /// Every readable exporter pyre has: bytes / bytearray, a live mmap, an
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
-pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
+pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
         #[cfg(all(
             feature = "host_env",
@@ -20196,7 +20196,7 @@ pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], c
 
 /// `space.acquire_writebuf` for FileIO.readinto.  These are pyre's native
 /// writable exporters; a memoryview contributes its exact contiguous window.
-pub(crate) unsafe fn fileio_writebuf(
+pub unsafe fn fileio_writebuf(
     obj: PyObjectRef,
 ) -> Result<(&'static mut [u8], PyObjectRef, bool), crate::PyError> {
     fn type_error(obj: PyObjectRef) -> crate::PyError {
@@ -20719,7 +20719,7 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
 /// (`module/mod.rs`'s `pub mod signal` is `cfg`-gated off), and no caller
 /// survives the same gate there.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn eintr_retry_with(
+pub fn eintr_retry_with(
     e: std::io::Error,
     wrap: impl FnOnce(std::io::Error) -> crate::PyError,
 ) -> Result<(), crate::PyError> {
@@ -23243,7 +23243,7 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
 ///
 /// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
 /// components; an instance is asked for `__complex__` then `__float__`.
-pub(crate) fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
+pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_exact_type(obj, &COMPLEX_TYPE) {
