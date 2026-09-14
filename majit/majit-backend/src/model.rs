@@ -102,6 +102,16 @@ pub trait Cpu: Send + Sync {
         if !majit_gc::supports_guard_gc_type() {
             return Ok(());
         }
+        // Header words (`w_class`, typeptr) are not in the parent's
+        // field list (`heaptracker.py` skips them), so they carry no
+        // `parent_descr`. They sit on every PyObject; the only
+        // speculative check that applies is "this is an object".
+        if fielddescr.is_w_class() || fielddescr.is_typeptr() {
+            if !majit_gc::check_is_object(gcptr) {
+                return Err("protect_speculative_field: gcptr is not an object");
+            }
+            return Ok(());
+        }
         let parent = fielddescr
             .get_parent_descr()
             .ok_or("protect_speculative_field: field descr has no parent_descr")?;

@@ -5579,6 +5579,15 @@ fn current_quasiimmut_field_value(
     obj: OpRef,
     descr: &DescrRef,
 ) -> Option<OpRef> {
+    // A virtual `New` has no concrete pointer for `bh_getfield`, but
+    // `note_class_word_after_new` / `heapcache_getfield_now_known` already
+    // stamped the field. That cached box is what eager allocation would
+    // have returned (`quasiimmut.py get_current_constant_fieldvalue`).
+    if let Some(cached) = ctx.heapcache_getfield_cached(obj, descr.index())
+        && cached.inline_const_to_value().is_some()
+    {
+        return Some(cached);
+    }
     let field_type = descr.as_field_descr()?.field_type();
     let majit_ir::Value::Ref(struct_ref) = ctx.box_value(obj)? else {
         return None;
