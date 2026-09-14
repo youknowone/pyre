@@ -12366,6 +12366,20 @@ impl<'a> Lowering<'a> {
         {
             self.slice_first_sites.push(site);
         }
+        // `<[T]>::last(slice)` is `first` with index `len-1` and the
+        // same non-empty guard.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "last"])
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            site.access = crate::front::slice_first::SliceAccess::Last;
+            self.slice_first_sites.push(site);
+        }
         // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
         // `Option<&T>` diamond `front::slice_get` synthesizes.  `get` is the
         // general case of `first` — the same foreign leaf, the same raw

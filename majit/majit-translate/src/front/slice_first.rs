@@ -106,7 +106,12 @@ pub(crate) struct SliceFirstSite {
 #[derive(Clone, Debug)]
 pub(crate) enum SliceAccess {
     First,
-    RangeFrom { range: Variable, start: Variable },
+    /// `<[T]>::last(slice)` — `Some(&slice[len-1])` when non-empty.
+    Last,
+    RangeFrom {
+        range: Variable,
+        start: Variable,
+    },
 }
 
 /// Rewrite every recorded `<[T]>::first` call site into the length-checked
@@ -186,7 +191,7 @@ fn rewire_one_slice_first_site(
 
     // Capture the slice receiver and validate the recorded access operand.
     let slice = match (&graph.blocks[a].operations[ci].kind, &site.access) {
-        (OpKind::Call { args, .. }, SliceAccess::First) if args.len() == 1 => {
+        (OpKind::Call { args, .. }, SliceAccess::First | SliceAccess::Last) if args.len() == 1 => {
             args[0].clone().into_variable()
         }
         (OpKind::Call { args, .. }, SliceAccess::RangeFrom { range, .. })
@@ -246,7 +251,7 @@ fn rewire_one_slice_first_site(
         then_sources.push(slice.clone());
     }
     let success_operand = match &site.access {
-        SliceAccess::First => None,
+        SliceAccess::First | SliceAccess::Last => None,
         SliceAccess::RangeFrom { start, .. } => Some(start),
     };
     if let Some(operand) = success_operand
@@ -261,12 +266,40 @@ fn rewire_one_slice_first_site(
     let slice_in_then = map_source(&then_sources, &then_inputs, &slice)
         .ok_or_else(|| format!("{name}: slice not threaded into Some arm"))?;
     let elem = match &site.access {
-        SliceAccess::First => {
+        SliceAccess::First | SliceAccess::Last => {
             let item_index = graph.alloc_value_var();
-            graph.block_mut(then_bb).operations.push(SpaceOperation {
-                result: Some(item_index.clone()),
-                kind: OpKind::ConstInt(0),
-            });
+            if matches!(site.access, SliceAccess::Last) {
+                let len = graph.alloc_value_var();
+                graph.block_mut(then_bb).operations.push(SpaceOperation {
+                    result: Some(len.clone()),
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec!["__len".to_string()],
+                        },
+                        args: crate::model::call_args(vec![slice_in_then.clone()]),
+                        result_ty: ValueType::Int,
+                    },
+                });
+                let one = graph.alloc_value_var();
+                graph.block_mut(then_bb).operations.push(SpaceOperation {
+                    result: Some(one.clone()),
+                    kind: OpKind::ConstInt(1),
+                });
+                graph.block_mut(then_bb).operations.push(SpaceOperation {
+                    result: Some(item_index.clone()),
+                    kind: OpKind::BinOp {
+                        op: "sub".to_string(),
+                        lhs: len,
+                        rhs: one,
+                        result_ty: ValueType::Int,
+                    },
+                });
+            } else {
+                graph.block_mut(then_bb).operations.push(SpaceOperation {
+                    result: Some(item_index.clone()),
+                    kind: OpKind::ConstInt(0),
+                });
+            }
             let elem = graph.alloc_value_var();
             graph.block_mut(then_bb).operations.push(SpaceOperation {
                 result: Some(elem.clone()),
@@ -507,7 +540,6 @@ mod tests {
             "A compares len > 0"
         );
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
-        // Exactly one arm reads an array element (the Some payload).
         let elem_reads = g
             .blocks
             .iter()
@@ -515,7 +547,66 @@ mod tests {
             .filter(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
             .count();
         assert_eq!(elem_reads, 1, "the Some arm reads slice[0]");
-        // Both arms write an Option `__discriminant` (Some=1, None=0).
+        let disc_writes = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__discriminant")
+            })
+            .count();
+        assert_eq!(disc_writes, 2, "both arms write a discriminant");
+    }
+
+    #[test]
+    fn rewrite_lifts_last_to_length_checked_option() {
+        let mut g = FunctionGraph::new("test_slice_last");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            "core".into(),
+                            "slice".into(),
+                            "<Impl>".into(),
+                            "last".into(),
+                        ],
+                    },
+                    args: crate::model::call_args(vec![slice]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![opt.clone()]);
+        let mut site = slice_first_site(opt);
+        site.access = SliceAccess::Last;
+        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
+        assert!(g.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub"))
+        }));
+        assert!(g.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        }));
+        // Exactly one arm reads an array element (the Some payload).
+        let elem_reads = g
+            .blocks
+            .iter()
+            .flat_map(|blk| &blk.operations)
+            .filter(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
+            .count();
+        assert_eq!(elem_reads, 1, "the Some arm reads slice[len-1]");
         let disc_writes = g
             .blocks
             .iter()
