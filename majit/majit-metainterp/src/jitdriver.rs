@@ -8535,6 +8535,42 @@ impl<S: JitState> JitDriver<S> {
             .function_entry_step(cell_key, green_key_hash, green_key_raw)
     }
 
+    /// `warmspot.py` `ll_portal_runner`: maybe enter from the function's start.
+    ///
+    /// `maybe_compile_and_run(increment_function_threshold, *args)` then the
+    /// interpreter. A runnable procedure token is entered through
+    /// [`Self::back_edge_resolved`] so FINISH, deopt and blackhole resume are
+    /// the same as a back-edge run. A counter hit arms tracing at `target_pc`
+    /// via [`Self::force_start_tracing`] and returns `None` so the caller
+    /// falls into the interpreter; the next merge point records.
+    ///
+    /// Returns `Some(resume_pc)` only when compiled code ran and left a
+    /// resume point. FINISH is published on the same latch as
+    /// [`Self::back_edge`].
+    pub fn function_entry_structured(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<usize> {
+        if self.meta.is_tracing() {
+            return None;
+        }
+        let cell_key = self.resolve_cell_key(green_key_hash, make_green_key);
+        match self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc)) {
+            FunctionEntryStep::RunCompiled(token) => {
+                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+            }
+            FunctionEntryStep::Proceed => {
+                self.force_start_tracing(cell_key, target_pc, state, env);
+                None
+            }
+            FunctionEntryStep::NotHot => None,
+        }
+    }
+
     /// Turn the raw green-key hash a door arrives with into the key that names
     /// exactly one cell, so the door's decision, its token read and the run it
     /// hands them to are all about that one cell.
@@ -10114,6 +10150,40 @@ mod tests {
         assert!(
             driver.is_tracing(),
             "the early ceiling check and typed decision must select the same cell",
+        );
+    }
+
+    #[test]
+    fn function_entry_structured_arms_tracing_on_the_function_threshold() {
+        // warmspot.py ll_portal_runner: maybe_compile_and_run uses
+        // increment_function_threshold, not the back-edge increment.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.meta.warm_state_mut().set_function_threshold(2);
+        let hash = 0xA11u64;
+        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let mut state = CountingDoorState {
+            build_meta_calls: std::cell::Cell::new(0),
+            extract_live_values_calls: std::cell::Cell::new(0),
+            code_ptr: 0,
+        };
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            !driver.is_tracing(),
+            "a single entry must not arm tracing below the function threshold"
+        );
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the function-entry door must arm tracing when the function threshold fires"
         );
     }
 
