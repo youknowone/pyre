@@ -1717,6 +1717,27 @@ pub extern "C" fn jit_int_str(v: i64) -> i64 {
     w_str_from_storage_and_length(payload as *mut UnicodeValueStorage, length) as i64
 }
 
+/// Scalar arm of `descr_getitem` (`unicodeobject.py`): `_getitem_result`
+/// after `getindex_w`.  Negative indices remap against `_len()`; out of
+/// range is `None` so the caller raises `IndexError` — the same nullable
+/// ref `w_tuple_getitem` uses.
+///
+/// Look-inside: the generated JIT records the length test and the wrap.
+/// The walker descends this body instead of emitting `jit_str_getitem`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject`.
+#[inline(never)]
+pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    let len = unsafe { w_str_len(obj) } as i64;
+    let idx = if index < 0 { index + len } else { index };
+    let Ok(idx) = usize::try_from(idx) else {
+        return None;
+    };
+    let cp = unsafe { w_str_codepoint_at(obj, idx) }?;
+    Some(w_str_from_codepoint(cp.to_u32()))
+}
+
 /// `s[i]` on an exact `str` with a non-negative machine-int index: the scalar
 /// arm of `descr_getitem` (`unicodeobject.py`), restricted to what it answers
 /// without running Python.
