@@ -3,7 +3,7 @@
 //! The wrappers mirror `lib_pypy/_blake2/__init__.py`; their object-owned
 //! native RFC 7693 contexts are created by `_hashlib._blake2_new`.
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_blake2",
     int_constants: {
         "_GIL_MINSIZE" => 2048,
@@ -24,8 +24,8 @@ crate::py_module! {
         // their object-owned state, but match CPython 3.14's immutable
         // non-BASETYPE public types at the subclassing boundary.
         for name in ["blake2b", "blake2s"] {
-            let ty = crate::module_ns_get(ns, name).expect("_blake2 app-level type installed");
-            crate::typedef::mark_cpython_heap_type(ty, true);
+            let ty = pyre_interpreter::module_ns_get(ns, name).expect("_blake2 app-level type installed");
+            pyre_interpreter::typedef::mark_cpython_heap_type(ty, true);
             unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
         }
     },

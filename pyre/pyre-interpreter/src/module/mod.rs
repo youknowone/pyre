@@ -13,8 +13,6 @@ pub mod _ast;
 #[allow(non_snake_case)]
 pub mod _bisect;
 #[allow(non_snake_case)]
-pub mod _blake2;
-#[allow(non_snake_case)]
 pub mod _bz2;
 #[allow(non_snake_case)]
 #[cfg(all(
@@ -77,9 +75,6 @@ pub mod _overlapped;
 pub mod _pickle;
 #[allow(non_snake_case)]
 #[cfg(all(unix, not(feature = "sandbox")))]
-pub mod _posixshmem;
-#[allow(non_snake_case)]
-#[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixsubprocess;
 #[allow(non_snake_case)]
 pub mod _pypy_generic_alias;
@@ -98,6 +93,7 @@ pub mod _ssl;
 pub mod _stat;
 #[allow(non_snake_case)]
 pub mod _statistics;
+#[allow(non_snake_case)]
 pub mod _suggestions;
 #[allow(non_snake_case)]
 pub mod _symtable;
@@ -108,11 +104,6 @@ pub mod _tokenize;
 pub mod _types;
 #[allow(non_snake_case)]
 pub mod _typing;
-// `uuid.py` reaches a MAC-derived node only through this module; a build
-// without it answers `getnode()` from `os.urandom`.
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-#[allow(non_snake_case)]
-pub mod _uuid;
 pub mod _warnings;
 pub mod _weakref;
 #[allow(non_snake_case)]
@@ -137,8 +128,6 @@ pub mod faulthandler;
 #[cfg(all(not(feature = "sandbox"), feature = "host_env"))]
 pub mod fcntl;
 pub mod gc;
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-pub mod grp;
 #[allow(non_snake_case)]
 pub mod imp;
 pub mod importlib;

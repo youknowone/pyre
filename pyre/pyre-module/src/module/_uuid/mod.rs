@@ -37,34 +37,34 @@ fn has_stable_node() -> bool {
 }
 
 /// `py_UuidCreate($module, /)`.
-fn uuid_create(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn uuid_create(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let (bytes, status) = sequential_uuid();
     // The two local-only statuses are successes that say the node is random
     // rather than MAC-derived.  If the OS cannot tell, neither can we, so the
     // UUID is taken anyway.
     if status != status_ok() && status != status_local_only() && status != status_no_address() {
-        return Err(crate::PyError::os_error_win32_syscall2(
+        return Err(pyre_interpreter::PyError::os_error_win32_syscall2(
             status, PY_NULL, PY_NULL,
         ));
     }
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_uuid",
     extra_init: |ns| {
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "UuidCreate",
-            crate::gateway::with_module(
+            pyre_interpreter::gateway::with_module(
                 "_uuid",
-                crate::make_module_builtin_function_with_arity("UuidCreate", uuid_create, 0),
+                pyre_interpreter::make_module_builtin_function_with_arity("UuidCreate", uuid_create, 0),
             ),
         );
         // `generate_time_safe` is the libuuid entry point and is not in the
         // method table of a Windows build, so the flag that guards it is 0.
-        crate::module_ns_store(ns, "has_uuid_generate_time_safe", pyre_object::w_int_new(0));
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(ns, "has_uuid_generate_time_safe", pyre_object::w_int_new(0));
+        pyre_interpreter::module_ns_store(
             ns,
             "has_stable_extractable_node",
             pyre_object::w_int_new(i64::from(has_stable_node())),

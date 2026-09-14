@@ -53,7 +53,7 @@ constant.
 
 The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read
 **pre-extracted `.ullbc` under `build/llbc/`, not the Rust source**. A change to
-`pyre-interpreter` / `pyre-object` / `pyre-jit` is invisible until re-extraction;
+`pyre-interpreter` / `pyre-object` / `pyre-module` / `pyre-jit` is invisible until re-extraction;
 `majit-translate` changes take effect immediately, because the translator runs
 live over the frozen bodies.
 
