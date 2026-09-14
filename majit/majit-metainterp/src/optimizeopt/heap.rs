@@ -980,23 +980,34 @@ impl OptHeap {
             .fielddescr()
             .as_field_descr()
             .is_some_and(|f| f.is_w_class());
-        if struct_ptr != qmutdescr.struct_ptr() {
-            if !shared_w_class_watcher {
-                return false;
+        // Same-class proof used when the recorded struct or watcher no
+        // longer matches. A later wrapint `New` + `setfield w_class`
+        // revokes the process-global instance (`is_current` goes false)
+        // without this object's class changing; `__class__` assignment
+        // does change the runtime field and still fails the compare.
+        //
+        // `constantfieldbox` can be empty when the tracer recorded
+        // `QUASIIMMUT_FIELD` on a not-yet-allocated virtual (`bh_getfield`
+        // has no pointer). Read both objects' `w_class` now — the same
+        // `get_current_constant_fieldvalue` PyPy stores at `__init__`.
+        let w_class_still_matches = |ctx: &mut OptContext| -> bool {
+            let field = qmutdescr.fielddescr();
+            let recorded = qmutdescr.constantfieldbox().or_else(|| {
+                let recorded_obj =
+                    ctx.make_constant_ref(majit_ir::GcRef(qmutdescr.struct_ptr() as usize));
+                ctx.get_runtime_field(recorded_obj, field)
+                    .and_then(|r| r.inline_const_to_value())
+            });
+            let current = ctx
+                .get_runtime_field(obj, field)
+                .and_then(|r| r.inline_const_to_value());
+            match (recorded, current) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
             }
-            // Same watcher, different object: accept only when this
-            // object's class still matches the folded constant. Otherwise
-            // a polymorphic replacement would keep A's class on B.
-            let Some(constantfieldbox) = qmutdescr.constantfieldbox() else {
-                return false;
-            };
-            let Some(currentbox) = ctx
-                .get_runtime_field(obj, qmutdescr.fielddescr())
-                .and_then(|r| r.inline_const_to_value())
-            else {
-                return false;
-            };
-            if currentbox != constantfieldbox {
+        };
+        if struct_ptr != qmutdescr.struct_ptr() {
+            if !shared_w_class_watcher || !w_class_still_matches(ctx) {
                 return false;
             }
         }
@@ -1005,7 +1016,9 @@ impl OptHeap {
         // revokes the process-global watcher must InvalidLoop, not be
         // rescued by a live w_class compare.
         if !qmutdescr.qmut().is_current() {
-            return false;
+            if !shared_w_class_watcher || !w_class_still_matches(ctx) {
+                return false;
+            }
         }
         if let (Some(constantfieldbox), Some(currentbox)) = (
             qmutdescr.constantfieldbox(),
