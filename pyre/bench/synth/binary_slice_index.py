@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=115
-# pyre-check: spec-folds=binary_slice_str,subscr_str
+# pyre-check: spec-folds=subscr_str
 # Slice bounds are evaluated through __index__ in both lowering paths:
 #   * a dynamic slice `seq[a:b]` compiles to BINARY_SLICE, handled by
 #     `binary_slice_values`;
