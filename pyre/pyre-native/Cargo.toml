@@ -18,18 +18,15 @@ bitflags = { workspace = true }
 rustpython-common = { workspace = true, features = ["hashlib"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-# rustls-free `_ssl` surface (MemoryBIO, constants, OID) is always linked.
-# The rustls engine is native-only: enabling `ssl` here would feature-unify
-# rustls into the wasm32 extract, and rustls-pki-types has no `UnixTime::now`
-# on that target.
-rustpython-host_env = { workspace = true }
+# `ssl` compiles the whole host_env ssl module. rustls stays native-only
+# inside that crate, so this feature is safe on wasm32.
+rustpython-host_env = { workspace = true, features = ["ssl"] }
 libc = { workspace = true }
 lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
 ], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rustpython-host_env = { workspace = true, features = ["ssl"] }
 rustls = { workspace = true }
 rustls-webpki = { workspace = true }
 rustls-pemfile = { workspace = true }
