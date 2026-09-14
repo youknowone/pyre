@@ -16673,9 +16673,9 @@ fn walker_wrap_int_str_payload<Sym: WalkSym>(
         }
     };
 
-    // Residual wrap, not NewWithVtable: `_utf8` is `_immutable_fields_`,
-    // so an inlined wrapper lets getfield fold to the preamble payload
-    // across a jump.  `newutf8` stays an opaque CallR.
+    // Fold fallback: residual wrap.  The generated `newutf8` is
+    // look-inside `malloc_typed_managed` so a descent records
+    // NewWithVtable; this emit is only reached when that walk declines.
     let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
     let wrapped = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
@@ -23394,9 +23394,9 @@ pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
 }
 
 /// `descr_add` body: getfield `_utf8` + `ll_strconcat` + residual
-/// `newutf8`.  NewWithVtable is not used: `_utf8` is
-/// `_immutable_fields_`, so an inlined wrapper folds getfield to the
-/// preamble payload across a jump.
+/// `newutf8`.  Descent of a look-inside `newutf8` records NewWithVtable;
+/// this fused emit keeps the wrap residual because `descr_add` itself
+/// stays `dont_look_inside`.
 fn emit_walker_descr_add<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

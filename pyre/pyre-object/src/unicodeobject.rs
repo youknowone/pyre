@@ -118,6 +118,10 @@ pub unsafe fn utf8_payload_wtf8(value: *const UnicodeValueStorage) -> &'static W
 /// chars @16).  `byte_len` is `len(_utf8)` (RPython STR `rstr.py
 /// Array(Char)` — `llmodel.py bh_strlen` reads this).  `len` is the
 /// codepoint count (`_length`, `bh_unicodelen`).
+///
+/// `unicodeobject.py W_UnicodeObject._immutable_fields_ = ['_utf8',
+/// '_length']` — `value` is `_utf8`, `len` is `_length`.
+#[majit_macros::jit_immutable_fields("value", "len")]
 #[repr(C)]
 pub struct W_UnicodeObject {
     pub ob_header: PyObject,
@@ -305,6 +309,10 @@ pub fn w_str_new_managed(s: &str) -> PyObjectRef {
 /// pointer syntactically, and a path alias falls through to the primitive
 /// table and yields no `__majit_call_target_*` trampoline.  The subscript fold
 /// records this wrap by that trampoline.
+///
+/// Residual: the walker still emits this helper as an opaque CallR for
+/// `AsciiListStrategy.wrap`.  `newutf8` itself is
+/// [`w_str_from_storage_and_length`], which is look-inside.
 #[majit_macros::dont_look_inside]
 pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
     // AsciiListStrategy accepts only `is_ascii()` values, for which the byte
@@ -315,23 +323,21 @@ pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
 
 /// `space.newutf8(utf8str, length)` — wrap a `STR` payload with an
 /// explicit code-point count (`W_UnicodeObject.__init__`).
-#[majit_macros::dont_look_inside]
+///
+/// Look-inside: `newutf8` is the one-line constructor, so the generated
+/// JIT records `malloc_typed_managed` as `NewWithVtable` plus the `_utf8`
+/// / `_length` stores.  `malloc_typed_managed` is the movable GC malloc
+/// `fuse_boxing_alloc` rewrites; the nursery hook does not collect, so
+/// the payload pointer stays valid across the header alloc.
 pub fn w_str_from_storage_and_length(
     value: *mut UnicodeValueStorage,
     length: usize,
 ) -> *mut PyObject {
-    let _roots = crate::gc_roots::push_roots();
-    let value_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(value as PyObjectRef);
-    let class_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(get_instantiate(&STR_TYPE));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
-    let value = crate::gc_roots::shadow_stack_get(value_slot) as *mut UnicodeValueStorage;
     let byte_len = crate::lowlevel_string::bh_lowlevel_string_len(value as i64);
-    let body = W_UnicodeObject {
+    crate::lltype::malloc_typed_managed(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
-            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+            w_class: get_instantiate(&STR_TYPE),
         },
         value,
         byte_len,
@@ -339,17 +345,7 @@ pub fn w_str_from_storage_and_length(
         w_slots: PY_NULL,
         index_storage: std::ptr::null_mut(),
         hash: 0,
-    };
-    if raw.is_null() {
-        crate::lltype::malloc_typed(body) as PyObjectRef
-    } else {
-        unsafe { std::ptr::write(raw as *mut W_UnicodeObject, body) };
-        // `value` may be an existing young GC storage box.  The new wrapper is
-        // born old, so mirror the creation barrier used by
-        // `w_bytes_from_block` before the list drops its array edge.
-        crate::gc_hook::try_gc_write_barrier_managed(raw);
-        raw as PyObjectRef
-    }
+    }) as PyObjectRef
 }
 
 /// Residual ABI for [`w_str_from_storage_and_length`].
@@ -1575,13 +1571,39 @@ pub extern "C" fn jit_int_str(v: i64) -> i64 {
     w_str_from_storage_and_length(payload as *mut UnicodeValueStorage, length) as i64
 }
 
+/// `unicodeobject.py next_codepoint_pos_dont_look_inside` — `@jit.elidable`.
+/// `_getitem_result` must not inline `rutf8.next_codepoint_pos` or it
+/// produces a guard.
+#[majit_macros::elidable]
+pub fn next_codepoint_pos_dont_look_inside(utf8: *mut Utf8Str, p: usize) -> usize {
+    unsafe { crate::rutf8::next_codepoint_pos(utf8_payload_wtf8(utf8), p) }
+}
+
+/// `W_UnicodeObject.next_codepoint_pos_dont_look_inside`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_UnicodeObject` and `pos` must be a
+/// code-point boundary inside it.
+pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: usize) -> usize {
+    if unsafe { w_str_is_ascii(obj) } {
+        pos + 1
+    } else {
+        next_codepoint_pos_dont_look_inside(unsafe { w_str_storage(obj) }, pos)
+    }
+}
+
 /// Scalar arm of `descr_getitem` (`unicodeobject.py`): `_getitem_result`
 /// after `getindex_w`.  Negative indices remap against `_len()`; out of
 /// range is `None` so the caller raises `IndexError` — the same nullable
 /// ref `w_tuple_getitem` uses.
 ///
-/// Look-inside: the generated JIT records the length test and the wrap.
-/// The walker descends this body instead of emitting `jit_str_getitem`.
+/// `_getitem_result` is `_index_to_byte` + `next_codepoint_pos_dont_look_inside`
+/// + `W_UnicodeObject(self._utf8[start:end], 1)`.  The slice is
+/// `ll_stringslice_startstop` (`@jit.oopspec('stroruni.slice')`); the
+/// wrap is `space.newutf8`.
+///
+/// Look-inside: the generated JIT records that split.  The walker
+/// descends this body instead of emitting `jit_str_getitem`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
@@ -1589,11 +1611,15 @@ pub extern "C" fn jit_int_str(v: i64) -> i64 {
 pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let len = unsafe { w_str_len(obj) } as i64;
     let idx = if index < 0 { index + len } else { index };
-    let Ok(idx) = usize::try_from(idx) else {
+    if idx < 0 || idx >= len {
         return None;
-    };
-    let cp = unsafe { w_str_codepoint_at(obj, idx) }?;
-    Some(w_str_from_codepoint(cp.to_u32()))
+    }
+    let idx = idx as usize;
+    let start = unsafe { w_str_index_to_byte(obj, idx) };
+    let end = unsafe { w_str_next_codepoint_pos_dont_look_inside(obj, start) };
+    let utf8 = unsafe { w_str_storage(obj) };
+    let sliced = crate::lowlevel_string::ll_stringslice_startstop(utf8, start as i64, end as i64);
+    Some(w_str_from_storage_and_length(sliced, 1))
 }
 
 /// `s[i]` on an exact `str` with a non-negative machine-int index: the scalar
@@ -1720,6 +1746,27 @@ mod tests {
         unsafe {
             assert!(w_str_eq_w(left, right));
             assert!(!w_str_eq_w(left, different));
+        }
+    }
+
+    #[test]
+    fn test_str_getitem_is_getitem_result() {
+        unsafe {
+            let ascii = w_str_new("abcde");
+            assert_eq!(w_str_get_value(w_str_getitem(ascii, 0).unwrap()), "a");
+            assert_eq!(w_str_get_value(w_str_getitem(ascii, 4).unwrap()), "e");
+            assert_eq!(w_str_get_value(w_str_getitem(ascii, -1).unwrap()), "e");
+            assert!(w_str_getitem(ascii, 5).is_none());
+            assert!(w_str_getitem(ascii, -6).is_none());
+            let first = w_str_getitem(ascii, 0).unwrap();
+            assert_ne!(first, ascii);
+            assert_eq!(w_str_len(first), 1);
+
+            let wide = w_str_new("aé中");
+            assert_eq!(w_str_get_value(w_str_getitem(wide, 0).unwrap()), "a");
+            assert_eq!(w_str_get_value(w_str_getitem(wide, 1).unwrap()), "é");
+            assert_eq!(w_str_get_value(w_str_getitem(wide, 2).unwrap()), "中");
+            assert_eq!(w_str_get_value(w_str_getitem(wide, -1).unwrap()), "中");
         }
     }
 
