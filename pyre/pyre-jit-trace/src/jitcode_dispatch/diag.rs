@@ -418,6 +418,7 @@ spec_folds! {
     StrCall              => ("str_call",                 "residual_call", "-"),
     FormatSimple         => ("format_simple",            "residual_call", "-"),
     FormatWithSpec       => ("format_with_spec",         "residual_call", "-"),
+    BuildString          => ("build_string",             "residual_call", "-"),
     StrStartswith        => ("str_startswith",           "residual_call", "-"),
     StrEndswith          => ("str_endswith",             "residual_call", "-"),
     StrFind              => ("str_find",                 "residual_call", "-"),
