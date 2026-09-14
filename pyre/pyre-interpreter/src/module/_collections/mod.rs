@@ -440,9 +440,11 @@ pub mod deque_iter {
             let consumed = W_Deque::from_obj(pyre_object::gc_roots::shadow_stack_get(deque_slot))
                 .map(|deque| deque.len - counter)
                 .unwrap_or(0);
+            let consumed_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(consumed));
             let state = w_tuple_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(deque_slot),
-                w_int_new(consumed),
+                pyre_object::gc_roots::shadow_stack_get(consumed_slot),
             ]);
             let state_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(state);
@@ -583,9 +585,11 @@ pub mod deque_rev_iter {
             let consumed = W_Deque::from_obj(pyre_object::gc_roots::shadow_stack_get(deque_slot))
                 .map(|deque| deque.len - counter)
                 .unwrap_or(0);
+            let consumed_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(consumed));
             let state = w_tuple_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(deque_slot),
-                w_int_new(consumed),
+                pyre_object::gc_roots::shadow_stack_get(consumed_slot),
             ]);
             let state_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(state);

@@ -1590,9 +1590,18 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             arg_type_name(pos[2])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(pos[0]) };
-    let old = unsafe { pyre_object::w_str_get_wtf8(pos[1]) };
-    let new = unsafe { pyre_object::w_str_get_wtf8(pos[2]) };
+    // `__index__` on `count` can collect, so pin the three strings and copy
+    // their payloads off the objects first.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let s = unsafe { pyre_object::w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    let old =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .to_wtf8_buf();
+    let new =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 2)) }
+            .to_wtf8_buf();
     // Optional `count`: a negative count means "no limit"; 0 leaves the
     // string untouched. Resolved through `__index__`.
     let maxcount = match pos
@@ -1603,14 +1612,14 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         Some(w_count) => crate::builtins::space_index_w(w_count)?,
         None => -1,
     };
-    let (out, replacements) = wtf8_replace(s, old, new, maxcount);
+    let (out, replacements) = wtf8_replace(&s, &old, &new, maxcount);
     // `descr_replace` (unicodeobject.py) returns `self` when nothing
     // was replaced — keyed on the count, so `s.replace('a', 'a')` still builds
     // a new string.  Exact `str` only: a subclass yields a fresh base `str`,
     // and `is_w` rejects a `user_overridden_class` operand
     // (unicodeobject.py:106).
-    if replacements == 0 && unsafe { pyre_object::is_exact_type(pos[0], &pyre_object::STR_TYPE) } {
-        return Ok(pos[0]);
+    if replacements == 0 && unsafe { pyre_object::is_exact_type(recv(), &pyre_object::STR_TYPE) } {
+        return Ok(recv());
     }
     Ok(w_str_from_wtf8_managed(out))
 }
@@ -5729,26 +5738,37 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             arg_type_name(args[1])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
-    let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    // Cuts allocate, so pin the receiver and separator first and copy
+    // their payloads off the objects before any mint.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let s = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .as_bytes()
+        .to_vec();
+    let sep =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .as_bytes()
+            .to_vec();
     if sep.is_empty() {
         return Err(crate::PyError::value_error("empty separator"));
     }
-    match wtf8_find_bounded(s, sep, 0, s.len()) {
+    match wtf8_find_bounded(&s, &sep, 0, s.len()) {
         Some(i) => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(wtf8_slice_str(&s[..i]));
-            fields.push(args[1]);
-            fields.push(wtf8_slice_str(&s[i + sep.len()..]));
-            Ok(w_tuple_new(fields.take()))
+            let left_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[..i]));
+            let right_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[i + sep.len()..]));
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(left_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(right_slot),
+            ]))
         }
-        None => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(args[0]);
-            fields.push(w_str_new(""));
-            fields.push(w_str_new(""));
-            Ok(w_tuple_new(fields.take()))
-        }
+        None => Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base),
+            w_str_new(""),
+            w_str_new(""),
+        ])),
     }
 }
 
@@ -5761,26 +5781,35 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             arg_type_name(args[1])
         )));
     }
-    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.as_bytes();
-    let sep = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let s = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .as_bytes()
+        .to_vec();
+    let sep =
+        unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }
+            .as_bytes()
+            .to_vec();
     if sep.is_empty() {
         return Err(crate::PyError::value_error("empty separator"));
     }
-    match wtf8_rfind_bounded(s, sep, 0, s.len()) {
+    match wtf8_rfind_bounded(&s, &sep, 0, s.len()) {
         Some(i) => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(wtf8_slice_str(&s[..i]));
-            fields.push(args[1]);
-            fields.push(wtf8_slice_str(&s[i + sep.len()..]));
-            Ok(w_tuple_new(fields.take()))
+            let left_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[..i]));
+            let right_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(wtf8_slice_str(&s[i + sep.len()..]));
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(left_slot),
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(right_slot),
+            ]))
         }
-        None => {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(w_str_new(""));
-            fields.push(w_str_new(""));
-            fields.push(args[0]);
-            Ok(w_tuple_new(fields.take()))
-        }
+        None => Ok(w_tuple_new(vec![
+            w_str_new(""),
+            w_str_new(""),
+            pyre_object::gc_roots::shadow_stack_get(base),
+        ])),
     }
 }
 
@@ -5927,12 +5956,14 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
-    let s = unsafe { w_str_get_wtf8(pos[0]) };
     // [3.14-spec] PyPy `W_UnicodeObject.descr_expandtabs` unwraps a machine
     // `int`; CPython `unicode_expandtabs` declares an Argument Clinic `int`
     // and therefore calls `PyLong_AsInt` before inspecting even an empty
     // receiver.  Keep PyPy's method body below, but narrow this observable
     // argument boundary to a C int.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pos[0]);
     let tabsize = i64::from(
         match pos
             .get(1)
@@ -5943,6 +5974,8 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             None => 8,
         },
     );
+    let s =
+        unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(recv_slot)) }.to_wtf8_buf();
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
     // non-positive `tabsize` drops tabs entirely. The expanded length is

@@ -2128,18 +2128,24 @@ pub(crate) unsafe fn str_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
 }
 
 pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let Some(b_src) = crate::typedef::buffer_as_bytes_like(b)? else {
+    // `buffer_as_bytes_like` can mint a snapshot, so pin both operands
+    // first and copy their payloads off the objects.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = || pyre_object::gc_roots::shadow_stack_get(base);
+    let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let Some(b_src) = crate::typedef::buffer_as_bytes_like(b())? else {
         return Err(PyError::type_error(format!(
             "can't concat {} to {}",
-            crate::baseobjspace::object_functionstr_type_name(b),
-            crate::baseobjspace::object_functionstr_type_name(a)
+            crate::baseobjspace::object_functionstr_type_name(b()),
+            crate::baseobjspace::object_functionstr_type_name(a())
         )));
     };
-    let a_data = pyre_object::bytesobject::bytes_like_data(a);
-    let b_data = pyre_object::bytesobject::bytes_like_data(b_src);
-    let mut result = a_data.to_vec();
-    result.extend_from_slice(b_data);
-    Ok(if pyre_object::bytesobject::is_bytes(a) {
+    let a_data = pyre_object::bytesobject::bytes_like_data(a()).to_vec();
+    let b_data = pyre_object::bytesobject::bytes_like_data(b_src).to_vec();
+    let mut result = a_data;
+    result.extend_from_slice(&b_data);
+    Ok(if pyre_object::bytesobject::is_bytes(a()) {
         pyre_object::bytesobject::w_bytes_from_bytes(&result)
     } else {
         pyre_object::bytearrayobject::w_bytearray_from_bytes(&result)
@@ -2147,13 +2153,20 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
-    let data = pyre_object::bytesobject::bytes_like_data(s);
+    // `repeat_count` runs `__index__`, so pin the receiver first and copy
+    // its payload after that conversion.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(s);
+    let s = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let count = repeat_count(n)?;
+    let data = pyre_object::bytesobject::bytes_like_data(s()).to_vec();
     // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
     // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.
-    if count == 1 && pyre_object::pyobject::is_exact_type(s, &pyre_object::bytesobject::BYTES_TYPE)
+    if count == 1
+        && pyre_object::pyobject::is_exact_type(s(), &pyre_object::bytesobject::BYTES_TYPE)
     {
-        return Ok(s);
+        return Ok(s());
     }
     let cap = data
         .len()
@@ -2172,10 +2185,10 @@ pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
     // walks the count as a trip count.
     if !data.is_empty() {
         for _ in 0..count {
-            buf.extend_from_slice(data);
+            buf.extend_from_slice(&data);
         }
     }
-    Ok(if pyre_object::bytesobject::is_bytes(s) {
+    Ok(if pyre_object::bytesobject::is_bytes(s()) {
         pyre_object::bytesobject::w_bytes_from_bytes(&buf)
     } else {
         pyre_object::bytearrayobject::w_bytearray_from_bytes(&buf)

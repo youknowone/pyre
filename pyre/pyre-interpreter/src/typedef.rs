@@ -23662,7 +23662,13 @@ fn bytes_strip(
     left: bool,
     right: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // Cuts allocate, and `require_bytes_like` can snapshot a memoryview, so
+    // pin the receiver first and copy its payload off the object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let chars: Option<Vec<u8>> = match args.get(1) {
         Some(&a) if !a.is_null() && unsafe { !pyre_object::is_none(a) } => {
             Some(require_bytes_like(a)?.to_vec())
@@ -23685,7 +23691,7 @@ fn bytes_strip(
             hi -= 1;
         }
     }
-    Ok(cut_bytes_like(args[0], &data[lo..hi]))
+    Ok(cut_bytes_like(recv(), &data[lo..hi]))
 }
 
 fn bytes_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -24085,6 +24091,7 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `idx.__index__`.
     let _roots = pyre_object::gc_roots::push_roots();
     let src_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pos[0]);
     let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[1])?);
     let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[2])?);
     let limit = match pos.get(3) {
@@ -24094,20 +24101,25 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         }
         _ => usize::MAX,
     };
-    // Borrowed after the coercion, as `bytes_method_ljust`: all three
-    // operands may be bytearrays, and the `__index__` above can resize any of
-    // them.  The two sources come back off their root slots, since a snapshot
-    // minted by `require_bytes_like_source` had nothing else holding it.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    // Copied after the coercion, as `bytes_method_ljust`: all three operands
+    // may be bytearrays, and the `__index__` above can resize any of them.
+    // The two sources come back off their root slots, since a snapshot minted
+    // by `require_bytes_like_source` had nothing else holding it.
+    let recv = || pyre_object::gc_roots::shadow_stack_get(src_base);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let old = unsafe {
-        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(src_base))
-    };
-    let new = unsafe {
         pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
             src_base + 1,
         ))
-    };
-    let (out, replacements) = replace_bytes(data, old, new, limit);
+    }
+    .to_vec();
+    let new = unsafe {
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
+            src_base + 2,
+        ))
+    }
+    .to_vec();
+    let (out, replacements) = replace_bytes(&data, &old, &new, limit);
     // `descr_replace` returns `self` when nothing was replaced
     // (unicodeobject.py for the str twin) — keyed on the count, so
     // `b.replace(b'a', b'a')` still builds a new object.  Exact `bytes` only:
@@ -24115,12 +24127,12 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `user_overridden_class` operand (bytesobject.py:30-31).
     if replacements == 0
         && unsafe {
-            pyre_object::pyobject::is_exact_type(pos[0], &pyre_object::bytesobject::BYTES_TYPE)
+            pyre_object::pyobject::is_exact_type(recv(), &pyre_object::bytesobject::BYTES_TYPE)
         }
     {
-        return Ok(pos[0]);
+        return Ok(recv());
     }
-    Ok(new_bytes_like(pos[0], &out))
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `stringmethods.py:descr_join` — concatenate the bytes-like elements
@@ -24133,9 +24145,15 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // while materialising the iterable and copying its items (GH-112625).
     // A re-entrant iterator therefore cannot resize/clear the separator out
     // from under the borrowed bytes.  Immutable bytes acquires no export.
-    let acquired_export = unsafe { crate::builtins::buffer_export_incref(args[0]) };
+    // The export lock does not pin the separator against collection, so
+    // copy its payload off the rooted receiver before later mints.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let acquired_export = unsafe { crate::builtins::buffer_export_incref(recv()) };
     let result = (|| {
-        let sep = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+        let sep = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
         let iterable = args[1];
         let items: Vec<PyObjectRef> = unsafe {
             if pyre_object::is_list(iterable) {
@@ -24160,7 +24178,7 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         // a user subclass); `W_BytearrayObject._join_return_one` is always
         // false because its mutable result must be fresh.
         if items.len() == 1
-            && unsafe { pyre_object::bytesobject::is_bytes(args[0]) }
+            && unsafe { pyre_object::bytesobject::is_bytes(recv()) }
             && unsafe {
                 pyre_object::pyobject::is_exact_type(
                     items[0],
@@ -24173,7 +24191,7 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         let mut out: Vec<u8> = Vec::new();
         for (i, &item) in items.iter().enumerate() {
             if i > 0 {
-                out.extend_from_slice(sep);
+                out.extend_from_slice(&sep);
             }
             require_contiguous_buffer(item)?;
             let Some(src) = buffer_as_bytes_like(item)? else {
@@ -24184,10 +24202,10 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             };
             out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(src) });
         }
-        Ok(new_bytes_like(args[0], &out))
+        Ok(new_bytes_like(recv(), &out))
     })();
     if acquired_export {
-        unsafe { crate::builtins::buffer_export_decref(args[0]) };
+        unsafe { crate::builtins::buffer_export_decref(recv()) };
     }
     result
 }
@@ -24198,15 +24216,20 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// ValueError; when not found the whole value lands in the first
 /// (partition) or last (rpartition) slot with empty siblings.
 fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let sep = require_bytes_like(args[1])?;
+    // Cuts allocate, so pin the receiver and separator first and copy
+    // their payloads off the objects before any mint.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
+    let sep = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?.to_vec();
     if sep.is_empty() {
         return Err(crate::PyError::value_error("empty separator"));
     }
     let found = if forward {
-        bytes_find_subslice(data, sep)
+        bytes_find_subslice(&data, &sep)
     } else {
-        bytes_rfind_subslice(data, sep)
+        bytes_rfind_subslice(&data, &sep)
     };
     match found {
         Some(i) => {
@@ -24214,35 +24237,45 @@ fn bytes_partition(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, c
             // itself for a bytes receiver (so a memoryview separator survives
             // as the middle element); `bytearray_partition` builds a fresh
             // bytearray slice for all three parts.
-            let middle = if unsafe { pyre_object::bytesobject::is_bytes(args[0]) } {
-                args[1]
+            let left_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(new_bytes_like(recv(), &data[..i]));
+            let middle_slot = pyre_object::gc_roots::shadow_stack_len();
+            let middle = if unsafe { pyre_object::bytesobject::is_bytes(recv()) } {
+                pyre_object::gc_roots::shadow_stack_get(base + 1)
             } else {
-                new_bytes_like(args[0], sep)
+                new_bytes_like(recv(), &sep)
             };
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(new_bytes_like(args[0], &data[..i]));
-            fields.push(middle);
-            fields.push(new_bytes_like(args[0], &data[i + sep.len()..]));
-            Ok(pyre_object::w_tuple_new(fields.take()))
+            let _ = pyre_object::gc_roots::pin_root(middle);
+            let right_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(new_bytes_like(recv(), &data[i + sep.len()..]));
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(left_slot),
+                pyre_object::gc_roots::shadow_stack_get(middle_slot),
+                pyre_object::gc_roots::shadow_stack_get(right_slot),
+            ]))
         }
         None => {
             // `cut_bytes_like` keeps a bytearray receiver out of the result
             // tuple (mutating it would mutate the tuple) and hands an
             // immutable exact `bytes` back unchanged.
-            let whole = cut_bytes_like(args[0], data);
-            let empty = || empty_bytes_like(args[0]);
+            let whole_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cut_bytes_like(recv(), &data));
+            let empty_a = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(empty_bytes_like(recv()));
+            let empty_b = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(empty_bytes_like(recv()));
             if forward {
-                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(whole);
-                fields.push(empty());
-                fields.push(empty());
-                Ok(pyre_object::w_tuple_new(fields.take()))
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::gc_roots::shadow_stack_get(whole_slot),
+                    pyre_object::gc_roots::shadow_stack_get(empty_a),
+                    pyre_object::gc_roots::shadow_stack_get(empty_b),
+                ]))
             } else {
-                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(empty());
-                fields.push(empty());
-                fields.push(whole);
-                Ok(pyre_object::w_tuple_new(fields.take()))
+                Ok(pyre_object::w_tuple_new(vec![
+                    pyre_object::gc_roots::shadow_stack_get(empty_a),
+                    pyre_object::gc_roots::shadow_stack_get(empty_b),
+                    pyre_object::gc_roots::shadow_stack_get(whole_slot),
+                ]))
             }
         }
     }
@@ -24397,37 +24430,76 @@ fn bytes_fill_char(args: &[PyObjectRef], idx: usize, method: &str) -> Result<u8,
 /// `stringmethods.py:descr_ljust` — left-justify within `width`.
 fn bytes_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "ljust", 1, 2)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    if args.len() > 2 {
+        let _ = pyre_object::gc_roots::pin_roots(&[args[0], args[2]]);
+    } else {
+        let _ = pyre_object::gc_roots::pin_root(args[0]);
+    }
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let width = crate::builtins::space_index_w(args[1])?;
-    let fill = bytes_fill_char(args, 2, "ljust")?;
-    // Borrowed after the coercions, not before: `__index__` on `width` runs
+    let fill = if args.len() > 2 {
+        bytes_fill_char(
+            &[
+                recv(),
+                args[1],
+                pyre_object::gc_roots::shadow_stack_get(recv_slot + 1),
+            ],
+            2,
+            "ljust",
+        )?
+    } else {
+        bytes_fill_char(&[recv(), args[1]], 2, "ljust")?
+    };
+    // Copied after the coercions, not before: `__index__` on `width` runs
     // Python, and a `bytearray` receiver resized there reallocates the buffer
-    // this slice points into.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // this slice would otherwise point into.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let len = data.len() as i64;
     if width <= len {
-        return Ok(new_bytes_like(args[0], data));
+        return Ok(new_bytes_like(recv(), &data));
     }
     let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
-    out.extend_from_slice(data);
+    out.extend_from_slice(&data);
     out.resize(width as usize, fill);
-    Ok(new_bytes_like(args[0], &out))
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `stringmethods.py:descr_rjust` — right-justify within `width`.
 fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "rjust", 1, 2)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    if args.len() > 2 {
+        let _ = pyre_object::gc_roots::pin_roots(&[args[0], args[2]]);
+    } else {
+        let _ = pyre_object::gc_roots::pin_root(args[0]);
+    }
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let width = crate::builtins::space_index_w(args[1])?;
-    let fill = bytes_fill_char(args, 2, "rjust")?;
-    // Borrowed after the coercions, as `bytes_method_ljust`.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let fill = if args.len() > 2 {
+        bytes_fill_char(
+            &[
+                recv(),
+                args[1],
+                pyre_object::gc_roots::shadow_stack_get(recv_slot + 1),
+            ],
+            2,
+            "rjust",
+        )?
+    } else {
+        bytes_fill_char(&[recv(), args[1]], 2, "rjust")?
+    };
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let len = data.len() as i64;
     if width <= len {
-        return Ok(new_bytes_like(args[0], data));
+        return Ok(new_bytes_like(recv(), &data));
     }
     let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
     out.resize((width - len) as usize, fill);
-    out.extend_from_slice(data);
-    Ok(new_bytes_like(args[0], &out))
+    out.extend_from_slice(&data);
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `stringmethods.py:descr_center` — center within `width`; the extra
@@ -24435,33 +24507,55 @@ fn bytes_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// left-offset.
 fn bytes_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_between(args, "center", 1, 2)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    if args.len() > 2 {
+        let _ = pyre_object::gc_roots::pin_roots(&[args[0], args[2]]);
+    } else {
+        let _ = pyre_object::gc_roots::pin_root(args[0]);
+    }
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let width = crate::builtins::space_index_w(args[1])?;
-    let fill = bytes_fill_char(args, 2, "center")?;
-    // Borrowed after the coercions, as `bytes_method_ljust`.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let fill = if args.len() > 2 {
+        bytes_fill_char(
+            &[
+                recv(),
+                args[1],
+                pyre_object::gc_roots::shadow_stack_get(recv_slot + 1),
+            ],
+            2,
+            "center",
+        )?
+    } else {
+        bytes_fill_char(&[recv(), args[1]], 2, "center")?
+    };
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let len = data.len() as i64;
     if width <= len {
-        return Ok(new_bytes_like(args[0], data));
+        return Ok(new_bytes_like(recv(), &data));
     }
     let d = width - len;
     let offset = (d / 2 + (d & width & 1)) as usize;
     let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
     out.resize(offset, fill);
-    out.extend_from_slice(data);
+    out.extend_from_slice(&data);
     out.resize(width as usize, fill);
-    Ok(new_bytes_like(args[0], &out))
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `bytesobject.py:descr_zfill` — left-pad with `b'0'` to `width`,
 /// keeping a leading `+`/`-` sign ahead of the zeros.
 fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_exact(args, "zfill", 1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let width = crate::builtins::space_index_w(args[1])?;
-    // Borrowed after the coercions, as `bytes_method_ljust`.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let len = data.len() as i64;
     if width <= len {
-        return Ok(new_bytes_like(args[0], data));
+        return Ok(new_bytes_like(recv(), &data));
     }
     let pad = (width - len) as usize;
     let mut out = crate::builtins::try_vec_with_capacity(width as usize)?;
@@ -24470,11 +24564,11 @@ fn bytes_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             out.push(first);
             tail
         }
-        _ => data,
+        _ => data.as_slice(),
     };
     out.resize(out.len() + pad, b'0');
     out.extend_from_slice(rest);
-    Ok(new_bytes_like(args[0], &out))
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `bytes.title` — ASCII titlecase: the first alphabetic byte of each
@@ -24553,16 +24647,21 @@ fn bytes_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         )));
     }
     let args = pos;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let prefix = require_bytes_like(args[1])?;
+    // Cuts allocate, and `require_bytes_like` can snapshot a memoryview, so
+    // pin the receiver and prefix first and copy their payloads off.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
+    let prefix = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?.to_vec();
     // `descr_removeprefix` (stringmethods.py) slices on a match and
     // rewraps the receiver's own storage otherwise.  `ll_stringslice_startonly`
     // (rstr.py) goes straight to `_ll_stringslice` with no whole-span
     // shortcut of its own, so even an empty prefix takes the slice arm and
     // builds a fresh object — only the no-match arm can come back identical.
-    match data.strip_prefix(prefix) {
-        Some(rest) => Ok(new_bytes_like(args[0], rest)),
-        None => Ok(cut_bytes_like(args[0], data)),
+    match data.strip_prefix(prefix.as_slice()) {
+        Some(rest) => Ok(new_bytes_like(recv(), rest)),
+        None => Ok(cut_bytes_like(recv(), &data)),
     }
 }
 
@@ -24577,15 +24676,18 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         )));
     }
     let args = pos;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    let suffix = require_bytes_like(args[1])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(base);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
+    let suffix = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?.to_vec();
     // `descr_removesuffix` (stringmethods.py) guards the slice arm with
     // `if suffix and ...`, so an empty suffix falls through to the arm that
     // rewraps the receiver's own storage rather than cutting a whole span.
-    if !suffix.is_empty() && data.ends_with(suffix) {
-        return Ok(new_bytes_like(args[0], &data[..data.len() - suffix.len()]));
+    if !suffix.is_empty() && data.ends_with(suffix.as_slice()) {
+        return Ok(new_bytes_like(recv(), &data[..data.len() - suffix.len()]));
     }
-    Ok(cut_bytes_like(args[0], data))
+    Ok(cut_bytes_like(recv(), &data))
 }
 
 /// `bytesobject.py:descr_translate` — map each byte through a 256-entry
@@ -24595,7 +24697,13 @@ fn bytes_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// second positional slot or the `delete=` keyword, and an explicit
 /// `delete` must be bytes-like — `None` is not "no deletion".
 fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
+    // Table / delete lookups can snapshot a memoryview, so pin the receiver
+    // first and copy its payload off the object before those mints.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
     crate::builtins::clinic_arity(
         "translate",
@@ -24613,11 +24721,11 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         ));
     };
     crate::builtins::kwarg_reject_unknown(kwargs, &["delete"], "translate")?;
-    let table: Option<&[u8]> = unsafe {
+    let table: Option<Vec<u8>> = unsafe {
         if pyre_object::is_none(table_obj) {
             None
         } else {
-            let t = require_bytes_like(table_obj)?;
+            let t = require_bytes_like(table_obj)?.to_vec();
             if t.len() != 256 {
                 return Err(crate::PyError::value_error(
                     "translation table must be 256 characters long",
@@ -24637,16 +24745,16 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         }
     }
     let mut out = Vec::with_capacity(data.len());
-    for &b in data {
+    for &b in &data {
         if deleted[b as usize] {
             continue;
         }
-        out.push(match table {
+        out.push(match table.as_deref() {
             Some(t) => t[b as usize],
             None => b,
         });
     }
-    Ok(new_bytes_like(args[0], &out))
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `stringmethods.py:descr_splitlines` — split on `\n`, `\r`, and
@@ -24816,8 +24924,12 @@ fn bytes_maketrans(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             "maketrans() takes exactly two arguments",
         ));
     }
-    let frm = require_bytes_like(args[0])?;
-    let to = require_bytes_like(args[1])?;
+    // Each `require_bytes_like` can snapshot a memoryview, so copy both
+    // payloads off the pinned sources before the next mint.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let frm = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base))?.to_vec();
+    let to = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(base + 1))?.to_vec();
     if frm.len() != to.len() {
         return Err(crate::PyError::value_error(
             "maketrans arguments must have same length",
@@ -26807,17 +26919,19 @@ fn init_bytearray_type(ns: PyObjectRef) {
                 "__add__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    let a = args[0];
-                    let b = args[1];
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
                     unsafe {
-                        let a_data = pyre_object::bytesobject::bytes_like_data(a);
+                        let a = || pyre_object::gc_roots::shadow_stack_get(base);
+                        let b = || pyre_object::gc_roots::shadow_stack_get(base + 1);
                         // `descr_add` returns NotImplemented for a non-buffer
                         // operand so the `+` operator raises the generic TypeError.
-                        let Some(src) = buffer_as_bytes_like(b)? else {
+                        let Some(src) = buffer_as_bytes_like(b())? else {
                             return Ok(pyre_object::w_not_implemented());
                         };
+                        let a_data = pyre_object::bytesobject::bytes_like_data(a()).to_vec();
                         let b_data = pyre_object::bytesobject::bytes_like_data(src).to_vec();
-                        let mut result = a_data.to_vec();
+                        let mut result = a_data;
                         result.extend_from_slice(&b_data);
                         Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(
                             &result,
