@@ -3139,6 +3139,10 @@ fn emit_frontend_super_attr_unwrap(
     )
 }
 
+fn frontend_load_small_int_flow_value(val: i64) -> super::flow::FlowValue {
+    pyobject_const_ref_value(pyre_object::w_small_int_const(val))
+}
+
 fn frontend_load_const_flow_value(
     w_code: *const (),
     code: &CodeObject,
@@ -8926,38 +8930,12 @@ impl CodeWriter {
 
                         Instruction::LoadSmallInt { i } => {
                             let val = i.get(op_arg) as u32 as i64;
-                            // Graph-side `residual_call_ir_r` for
-                            // `box_int_fn(val:Int) → Ref`.  RPython parity:
-                            // `flowcontext.py self.recorder.append`
-                            // produces a fresh result Variable for every
-                            // residual_call, and the consumer (here, the
-                            // value-stack push) reads that Variable directly
-                            // — no separate fresh Ref placeholder.  Thread
-                            // the call result Variable into the symbolic
-                            // stack so the def-use chain matches the
-                            // upstream "call result is the downstream value"
-                            // shape.
-                            // Walker-orthodoxy: graph residual_call
-                            // dual-write fires unconditionally.  `box_int_fn`
-                            // takes only a literal Int as input, so no
-                            // frame_var or other portal-only Variable is
-                            // threaded — the graph op is well-formed for
-                            // every CodeWriter regardless of frame shape.
-                            let boxed = residual_call!(
-                                box_int_fn_idx,
-                                CallFlavor::Plain,
-                                majit_ir::RuntimeHelperKind::BoxInt,
-                                vec![super::flow::Constant::signed(val).into()],
-                                vec![],
-                                vec![],
-                                vec![Kind::Int],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
-                            let stack_value = boxed
-                                .map(super::flow::FlowValue::from)
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            push_and_bump!(stack_value, py_pc);
+                            // `getconstant_w` / `co_consts_w` for LOAD_CONST:
+                            // push the interned box, not a residual
+                            // `box_int_fn` that wrapints a fresh identity
+                            // and then forces NewWithVtable at JUMP.
+                            let value = frontend_load_small_int_flow_value(val);
+                            push_and_bump!(value, py_pc);
                         }
 
                         Instruction::LoadConst { consti } => {
@@ -17437,6 +17415,25 @@ mod tests {
         let link_borrow = link.borrow();
         assert_eq!(link_borrow.exitcase, Some(Constant::bool(true).into()));
         assert_eq!(link_borrow.llexitcase, Some(Constant::bool(true).into()));
+    }
+
+    #[test]
+    fn frontend_load_small_int_flow_value_is_interned_ref() {
+        let first = frontend_load_small_int_flow_value(1);
+        let second = frontend_load_small_int_flow_value(1);
+        match (first, second) {
+            (FlowValue::Constant(a), FlowValue::Constant(b)) => {
+                assert_eq!(a.kind, Some(Kind::Ref));
+                assert_eq!(a.value, b.value);
+                assert_eq!(
+                    a.value,
+                    super::super::flow::ConstantValue::Signed(
+                        pyre_object::w_small_int_const(1) as i64
+                    ),
+                );
+            }
+            other => panic!("LOAD_SMALL_INT graph value must be a Ref constant, got {other:?}"),
+        }
     }
 
     #[test]

@@ -9915,7 +9915,19 @@ fn walker_box_int<Sym: WalkSym>(
     raw: OpRef,
     value: i64,
 ) -> Result<OpRef, DispatchError> {
-    let _ = (op_pc, value);
+    let _ = op_pc;
+    // A residual `box_int_fn(ConstInt(n))` is LOAD_SMALL_INT (or the
+    // `box_int(0)` / lasti cousins). Intern so JUMP can carry ConstPtr
+    // the way `getconstant_w` does for LOAD_CONST. A computed raw
+    // (`IntAdd` etc.) still wrapints — that is not WITHPREBUILTINT.
+    if raw.is_constant()
+        && (pyre_object::intobject::SMALL_INT_CONST_FROM
+            ..pyre_object::intobject::SMALL_INT_CONST_TO)
+            .contains(&value)
+    {
+        let interned = pyre_object::w_small_int_const(value);
+        return Ok(ctx.trace_ctx.const_ref(interned as i64));
+    }
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
 }
 

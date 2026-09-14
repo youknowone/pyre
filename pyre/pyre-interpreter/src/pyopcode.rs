@@ -583,6 +583,13 @@ pub trait ArithmeticOpcodeHandler: SharedOpcodeHandler {
 
 pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     fn int_constant(&mut self, value: i64) -> Result<Self::Value, PyError>;
+    /// Interned box for `LOAD_SMALL_INT`. Default is a fresh
+    /// [`Self::int_constant`]; `PyFrame` returns the process-lifetime
+    /// identity so JUMP can carry `ConstPtr` the way `getconstant_w`
+    /// does for `LOAD_CONST`.
+    fn small_int_constant(&mut self, value: i64) -> Result<Self::Value, PyError> {
+        self.int_constant(value)
+    }
     fn bigint_constant(&mut self, value: &PyBigInt) -> Result<Self::Value, PyError>;
     fn float_constant(&mut self, value: f64) -> Result<Self::Value, PyError>;
     fn complex_constant(&mut self, re: f64, im: f64) -> Result<Self::Value, PyError>;
@@ -691,7 +698,7 @@ pub fn opcode_load_small_int<H: ConstantOpcodeHandler + ?Sized>(
     handler: &mut H,
     value: i64,
 ) -> Result<(), PyError> {
-    let value = handler.int_constant(value)?;
+    let value = handler.small_int_constant(value)?;
     handler.push_value(value)
 }
 

@@ -291,17 +291,23 @@ pub(crate) fn classify_vstack_opcode(
     }
 }
 
-/// The boxed constant a value `LOAD_CONST` pushes, as a trace-constant OpRef,
-/// or `OpRef::NONE` when `instr` is not a `LOAD_CONST` (or its constant is
-/// unresolvable). Realizes the constant the same way `bh_load_const_fn`
-/// (`call_jit.rs`) and the LOAD_CONST fold (`residual_call.rs`) do, so the
-/// mirror carries the identical box the resume path would.
+/// The boxed constant a value `LOAD_CONST` / `LOAD_SMALL_INT` pushes, as a
+/// trace-constant OpRef, or `OpRef::NONE` when `instr` is neither (or its
+/// constant is unresolvable). Realizes the constant the same way
+/// `bh_load_const_fn` / `w_small_int_const` do, so the mirror carries the
+/// identical box the resume path would.
 fn loadconst_operand_ref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &pyre_interpreter::CodeObject,
     instr: &pyre_interpreter::bytecode::Instruction,
     op_arg: pyre_interpreter::OpArg,
 ) -> OpRef {
+    if let pyre_interpreter::bytecode::Instruction::LoadSmallInt { i } = instr {
+        let val = i.get(op_arg) as u32 as i64;
+        return ctx
+            .trace_ctx
+            .const_ref(pyre_object::w_small_int_const(val) as i64);
+    }
     let pyre_interpreter::bytecode::Instruction::LoadConst { consti } = instr else {
         return OpRef::NONE;
     };

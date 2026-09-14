@@ -9466,8 +9466,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 let intval =
                     unsafe { pyre_object::w_int_get_value(boxed_ptr as pyre_object::PyObjectRef) };
                 let boxed = walker_box_int(ctx, op.pc, raw_arg, intval)?;
-                ctx.trace_ctx
-                    .set_opref_concrete(boxed, box_int_concrete(intval, boxed_ptr));
+                let concrete = if raw_arg.is_constant()
+                    && (pyre_object::intobject::SMALL_INT_CONST_FROM
+                        ..pyre_object::intobject::SMALL_INT_CONST_TO)
+                        .contains(&intval)
+                {
+                    majit_ir::Value::Ref(majit_ir::GcRef(
+                        pyre_object::w_small_int_const(intval) as usize
+                    ))
+                } else {
+                    box_int_concrete(intval, boxed_ptr)
+                };
+                ctx.trace_ctx.set_opref_concrete(boxed, concrete);
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;
                 return Ok((DispatchOutcome::Continue, op.next_pc));
             }
