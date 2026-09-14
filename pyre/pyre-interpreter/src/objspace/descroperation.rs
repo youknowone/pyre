@@ -899,6 +899,65 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+/// intobject.py `_truediv(space, x, y)` success body: zero, then
+/// `space.newfloat(float(x)/float(y))`.  The mantissa overflow
+/// (`r_uint(abs(n)) >> DBL_MANT_DIG`) is the `OverflowError` that
+/// `_make_descr_binop` catches in [`int_truediv`] / [`int_truediv_ovf2long`],
+/// so this graph has no ovf diamond (a backward `goto` into that block
+/// hung the helper walk).
+#[inline(never)]
+pub(crate) fn _truediv(x: i64, y: i64) -> PyResult {
+    if y == 0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    Ok(pyre_object::newfloat((x as f64) / (y as f64)))
+}
+
+/// `descr_truediv`: unbox, then `_truediv`, catching the mantissa
+/// overflow as `_make_ovf2long('truediv')`.
+pub(crate) unsafe fn int_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let x = int_value(a);
+    let y = int_value(b);
+    const MANTISSA_LIM: i64 = 1 << 53;
+    if x <= -MANTISSA_LIM || x >= MANTISSA_LIM || y <= -MANTISSA_LIM || y >= MANTISSA_LIM {
+        return int_truediv_ovf2long(x, y);
+    }
+    _truediv(x, y)
+}
+
+/// `_make_ovf2long('truediv')`: `W_LongObject.fromint` then
+/// `descr_truediv`. Residual so a `_truediv` walk does not record
+/// `rbigint.truediv`.
+#[majit_macros::dont_look_inside]
+fn int_truediv_ovf2long(va: i64, vb: i64) -> PyResult {
+    let a = BigInt::from(va);
+    let b = BigInt::from(vb);
+    Ok(w_float_new(bigint_truediv(&a, &b)?))
+}
+
+/// longobject.py `_truediv` / mixed long-int.  At least one operand is
+/// `W_LongObject`; machine-int pairs stay in [`int_truediv`].
+unsafe fn long_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    if !is_long(b) && as_float(b) == 0.0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    let a_owned;
+    let va = if is_long(a) {
+        w_long_get_value(a)
+    } else {
+        a_owned = BigInt::from(int_value(a));
+        &a_owned
+    };
+    let b_owned;
+    let vb = if is_long(b) {
+        w_long_get_value(b)
+    } else {
+        b_owned = BigInt::from(int_value(b));
+        &b_owned
+    };
+    Ok(w_float_new(bigint_truediv(va, vb)?))
+}
+
 unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
@@ -4389,33 +4448,14 @@ pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str)
             if is_float(a) || is_float(b) {
                 return float_truediv(a, b);
             }
-            if !is_long(b) && as_float(b) == 0.0 {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+            // intobject.py `descr_truediv` / `_truediv` first, then
+            // `_make_ovf2long`.  Long operands use longobject.py `_truediv`.
+            if is_int_like(a) && is_int_like(b) {
+                return int_truediv(a, b);
             }
-            // intobject.py `_truediv`: machine ints wider than the
-            // binary64 mantissa deliberately overflow into the rbigint path
-            // so division is rounded once, after exact integer arithmetic.
-            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
-                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
-            if is_long(a) || is_long(b) || wide_int {
-                let a_owned;
-                let va = if is_long(a) {
-                    w_long_get_value(a)
-                } else {
-                    a_owned = BigInt::from(int_value(a));
-                    &a_owned
-                };
-                let b_owned;
-                let vb = if is_long(b) {
-                    w_long_get_value(b)
-                } else {
-                    b_owned = BigInt::from(int_value(b));
-                    &b_owned
-                };
-                let r = bigint_truediv(va, vb)?;
-                return Ok(w_float_new(r));
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_truediv(a, b);
             }
-            return Ok(w_float_new(as_float(a) / as_float(b)));
         }
         if !numeric_override && is_complex_pair(a, b) {
             return complex_truediv(a, b);
@@ -4559,32 +4599,12 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if is_float(a) || is_float(b) {
                 return float_truediv(a, b);
             }
-            if !is_long(b) && as_float(b) == 0.0 {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+            if is_int_like(a) && is_int_like(b) {
+                return int_truediv(a, b);
             }
-            // Match `_truediv`'s overflow-to-rbigint leg for i64 values that
-            // are not exactly representable in a binary64 mantissa.
-            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
-                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
-            if is_long(a) || is_long(b) || wide_int {
-                let a_owned;
-                let va = if is_long(a) {
-                    w_long_get_value(a)
-                } else {
-                    a_owned = BigInt::from(int_value(a));
-                    &a_owned
-                };
-                let b_owned;
-                let vb = if is_long(b) {
-                    w_long_get_value(b)
-                } else {
-                    b_owned = BigInt::from(int_value(b));
-                    &b_owned
-                };
-                let r = bigint_truediv(va, vb)?;
-                return Ok(w_float_new(r));
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_truediv(a, b);
             }
-            return Ok(w_float_new(as_float(a) / as_float(b)));
         }
         if is_complex_pair(a, b) {
             return complex_truediv(a, b);
@@ -7003,6 +7023,22 @@ mod tests {
         let result = truediv_builtin(w_int_new(63_050_394_783_186_940), w_int_new(7)).unwrap();
         unsafe {
             assert_eq!(w_float_get_value(result), 9_007_199_254_740_991.0);
+        }
+    }
+
+    #[test]
+    fn test_int_truediv_leaf_matches_truediv_for_exact_machine_ints() {
+        // intobject.py `_truediv`: both operands fit the binary64 mantissa,
+        // so the leaf is `newfloat(float(x)/float(y))`.
+        unsafe {
+            let direct = int_truediv(w_int_new(7), w_int_new(2)).unwrap();
+            let leaf = _truediv(7, 2).unwrap();
+            let via_builtin = truediv_builtin(w_int_new(7), w_int_new(2)).unwrap();
+            assert_eq!(w_float_get_value(direct), 3.5);
+            assert_eq!(w_float_get_value(leaf), 3.5);
+            assert_eq!(w_float_get_value(via_builtin), 3.5);
+            assert!(int_truediv(w_int_new(1), w_int_new(0)).is_err());
+            assert!(_truediv(1, 0).is_err());
         }
     }
 

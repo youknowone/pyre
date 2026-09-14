@@ -60,11 +60,9 @@ impl crate::lltype::GcType for W_FloatObject {
 /// unchanged.
 ///
 /// The collector-heap arm is [`w_float_gc_alloc`], residualised like
-/// [`crate::intobject::w_int_gc_alloc`]. Building the struct and writing
-/// it in-line made a descending `truediv` walk record the allocator
-/// body and hang compile (`listcomp_float_element_regression`). The
-/// `malloc_typed` arm is what `fuse_boxing_alloc` rewrites to
-/// `new_with_vtable` + payload `setfield`.
+/// [`crate::intobject::w_int_gc_alloc`]. Exact-int `/` goes through
+/// [`newfloat`] so a helper walk records the `malloc_typed` cluster
+/// `fuse_boxing_alloc` rewrites, not this residual.
 #[inline]
 pub fn w_float_new(value: f64) -> PyObjectRef {
     if crate::gc_interp::enabled() {
@@ -73,6 +71,17 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
             return boxed;
         }
     }
+    newfloat(value)
+}
+
+/// `space.newfloat` / `W_FloatObject(floatval)` (`objspace.py newfloat`,
+/// `floatobject.py` `__init__`). Own graph so `fuse_boxing_alloc` rewrites
+/// the `malloc_typed` cluster to `new_with_vtable` + payload `setfield`.
+/// Looked inside: `@dont_look_inside` would residualise the constructor
+/// PyPy traces. Cross-crate, so `_truediv` still `inline_call`s this
+/// fused body rather than containing the New.
+#[inline(never)]
+pub fn newfloat(value: f64) -> PyObjectRef {
     crate::lltype::malloc_typed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
