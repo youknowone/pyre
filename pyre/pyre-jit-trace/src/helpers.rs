@@ -1596,8 +1596,9 @@ pub fn emit_box_slice_inline(
     w_stop_descr: majit_ir::DescrRef,
     w_step_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
+    note_class_word_after_new(ctx, new_op, &size_descr);
     let w_start_idx = w_start_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_start], w_start_descr);
     ctx.heapcache_setfield_cached(new_op, w_start_idx, w_start);
@@ -1618,8 +1619,9 @@ pub fn emit_box_float_inline(
     floatval_descr: majit_ir::DescrRef,
 ) -> OpRef {
     // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
+    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
     ctx.heap_cache_mut().new_object(new_op);
+    note_class_word_after_new(ctx, new_op, &size_descr);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_float], floatval_descr);
     ctx.heapcache_setfield_cached(new_op, floatval_idx, raw_float);

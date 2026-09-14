@@ -9302,6 +9302,21 @@ fn walker_unbox_int<Sym: WalkSym>(
     )
 }
 
+/// Pin exact `w_class` first, then unbox. Exact class implies the layout
+/// vtable, so [`walker_unbox_int_typed`] sees `is_class_known` and skips
+/// the redundant `GuardClass`.
+fn walker_unbox_int_exact<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+    expected_class: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    walker_guard_exact_w_class(ctx, op_pc, obj, expected_class)?;
+    walker_unbox_int_typed(ctx, op_pc, obj, type_addr, intval_descr)
+}
+
 /// True when `obj` is an InputArg the concrete boundary GUARANTEES was
 /// converted from a tagged immediate to a heap `W_IntObject` — i.e. a
 /// frame LOCALS-region array-item InputArg (`raw() - vable_array_base <
@@ -10653,6 +10668,8 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
             && pyre_object::tagged_int::is_tagged_int(concrete))
         && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
     {
+        // Exact class implies the layout vtable; a later unbox / GuardClass
+        // of this ConstPtr already has its own `already_this_class` fold.
         return Ok(());
     }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
@@ -10672,6 +10689,22 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
     );
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
+    // Exact `w_class` is stronger than `GuardClass`: subclasses share the
+    // layout vtable and differ only in this field. Stamping `class_now_known`
+    // from the recorded `ob_type` lets a later `walker_unbox_int_typed` /
+    // `walker_guard_class` skip the redundant vtable guard.
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+    {
+        let type_addr = unsafe { (*concrete).ob_type } as i64;
+        if type_addr != 0 {
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        }
+    }
     Ok(())
 }
 

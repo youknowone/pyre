@@ -3935,18 +3935,6 @@ pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
 pub(crate) fn wrapint(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     let boxed =
         crate::helpers::emit_box_int_inline(ctx, value, w_int_size_descr(), int_intval_descr());
-    // A JIT-made int box is provably a heap `W_IntObject`; record its class so a
-    // later unbox of a loop-carried box skips the tag block AND the redundant
-    // `GuardClass`, taking the `GetfieldGc` path that folds through this box's
-    // `SetfieldGc` at loop-close. Without this the unbox falls into the
-    // `CastPtrToInt` tag-arith leg (a JIT box is not tag-known), which does NOT
-    // fold through `NewWithVtable`+`SetfieldGc` and leaves a per-iteration
-    // rebox+`GuardTrue(lowbit)` in the steady loop that fails every back-edge.
-    // Gated on `CAN_BE_TAGGED` so flag-false unbox emission is byte-identical.
-    if pyre_object::tagged_int::CAN_BE_TAGGED {
-        let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        ctx.heap_cache_mut().class_now_known(boxed, int_type);
-    }
     boxed
 }
 
