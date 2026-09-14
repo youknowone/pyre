@@ -97,11 +97,12 @@ pub fn address(w_glob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::new_cdata(ptr as usize, w_ctypeptr))
 }
 
-static GLOB_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static GLOB_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.__FFIGlobSupport`.
 pub fn glob_type() -> PyObjectRef {
-    *GLOB_TYPE_OBJ.get_or_init(|| {
+    GLOB_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__FFIGlobSupport",
             |_| {},
@@ -116,6 +117,6 @@ pub fn glob_type() -> PyObjectRef {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }

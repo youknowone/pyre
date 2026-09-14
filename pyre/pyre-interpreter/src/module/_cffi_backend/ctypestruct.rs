@@ -500,11 +500,12 @@ pub fn typeoffsetof_field(ct: &W_CType, fieldname: &str) -> Result<(PyObjectRef,
 
 // ── the Python type ─────────────────────────────────────────────────────
 
-static CFIELD_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CFIELD_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.CField`.
 pub fn cfield_type() -> PyObjectRef {
-    *CFIELD_TYPE_OBJ.get_or_init(|| {
+    CFIELD_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.CField",
             init_cfield_type,
@@ -515,8 +516,8 @@ pub fn cfield_type() -> PyObjectRef {
             unsafe { &*<W_CField as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_cfield_type(ns: PyObjectRef) {

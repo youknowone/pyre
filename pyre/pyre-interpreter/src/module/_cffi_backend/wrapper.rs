@@ -247,11 +247,12 @@ pub fn try_extract_direct_fnptr_as_cdata(w_wrapper: PyObjectRef) -> Result<PyObj
     Ok(cdataobj::new_cdata(wrapper.directfnptr, w_ctype))
 }
 
-static FUNCTION_WRAPPER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static FUNCTION_WRAPPER_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.__FFIFunctionWrapper`.
 pub fn function_wrapper_type() -> PyObjectRef {
-    *FUNCTION_WRAPPER_TYPE_OBJ.get_or_init(|| {
+    FUNCTION_WRAPPER_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.__FFIFunctionWrapper",
             init_function_wrapper_type,
@@ -266,8 +267,8 @@ pub fn function_wrapper_type() -> PyObjectRef {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_function_wrapper_type(ns: PyObjectRef) {
