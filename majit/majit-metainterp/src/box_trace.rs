@@ -399,6 +399,10 @@ pub struct CompareOpResidual {
     pub w_true: i64,
     pub w_false: i64,
     pub newbool_fnaddr: i64,
+    /// Generated `bool_value_from_truth` / `w_bool_from` jitcode
+    /// (`space.newbool`). Portal interpret descends it so `if b:` is a
+    /// real `goto_if_not` with its own `-live-` marker.
+    pub newbool_jitcode: Option<std::sync::Arc<crate::jitcode::JitCode>>,
     pub bool_intval_descr: majit_ir::DescrRef,
     pub w_class_descr: majit_ir::DescrRef,
     pub ob_type_descr: majit_ir::DescrRef,
