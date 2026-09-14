@@ -192,6 +192,8 @@ impl W_StringIO {
         let mut decoded = pyre_object::gc_roots::pin_root(decoded);
         let this = Self::from_slot(slot);
         if !this.writenl.is_null() {
+            let writenl_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(this.writenl);
             let nl_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("\n"));
             decoded = super::call_method_result(
@@ -199,7 +201,7 @@ impl W_StringIO {
                 "replace",
                 &[
                     pyre_object::gc_roots::shadow_stack_get(nl_slot),
-                    this.writenl,
+                    pyre_object::gc_roots::shadow_stack_get(writenl_slot),
                 ],
             )?;
         }

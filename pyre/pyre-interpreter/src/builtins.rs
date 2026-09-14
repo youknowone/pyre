@@ -1538,6 +1538,7 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         if w_memoryview_ndim(mv) == 0 && pyre_object::pyobject::is_ellipsis(roots.get(base + 1)) {
             roots.set(base + 1, pyre_object::w_tuple_new(vec![]));
         }
+        let mv = roots.get(base);
         let index = roots.get(base + 1);
         // Once `...` has become the empty tuple, that tuple is the only key a
         // zero-dimensional view accepts.

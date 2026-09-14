@@ -219,7 +219,13 @@ fn setup_context(
         let globals = crate::importing::get_interpreter_sys_module()
             .map(|module| unsafe { w_module_get_w_dict(module) })
             .unwrap_or_else(w_dict_new);
-        (w_str_new_managed("<sys>"), 0, globals)
+        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(globals);
+        (
+            w_str_new_managed("<sys>"),
+            0,
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+        )
     } else {
         let frame = unsafe { &*frame };
         (

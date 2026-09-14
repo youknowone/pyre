@@ -2489,13 +2489,18 @@ fn eval_program_in_main(
     // records the literal `<stdin>`: there is no path to absolutize and no
     // file to bind a `SourceFileLoader` to.
     if let Some(file) = main_file {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(main_module);
+        let file_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(file));
         let _ = pyre_interpreter::baseobjspace::setattr_str(
-            main_module,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
             "__file__",
-            pyre_object::w_str_new_managed(file),
+            pyre_object::gc_roots::shadow_stack_get(file_slot),
         );
         let _ = pyre_interpreter::baseobjspace::setattr_str(
-            main_module,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
             "__cached__",
             pyre_object::w_none(),
         );

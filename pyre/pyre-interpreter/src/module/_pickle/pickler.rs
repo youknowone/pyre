@@ -1735,10 +1735,15 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
     // proto < 3 emits a `codecs.encode(s, 'latin1')` / `bytes()` reduce
     // instead of a BINBYTES opcode (interp_pickle.py:1349).
     if ctx.proto < 3 {
-        let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let data = unsafe {
+            pyre_object::bytesobject::w_bytes_data(pyre_object::gc_roots::shadow_stack_get(
+                obj_slot,
+            ))
+        }
+        .to_vec();
         if data.is_empty() {
             let w_bytes = crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
             let w_args = pyre_object::tupleobject::w_tuple_new(Vec::new());
@@ -1769,29 +1774,33 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
             Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
         );
     }
-    let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
-    let n = data.len();
     // A large payload streams via `file.write` (arbitrary Python); pin `w_obj`
-    // so the trailing `memoize` reads it at its post-write address.
+    // so the trailing `memoize` reads it at its post-write address, and copy
+    // the payload off it before later allocs.
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let data = unsafe {
+        pyre_object::bytesobject::w_bytes_data(pyre_object::gc_roots::shadow_stack_get(slot))
+    }
+    .to_vec();
+    let n = data.len();
     if n <= 0xff {
         buf.push(op::SHORT_BINBYTES);
         buf.push(n as u8);
-        buf.extend_from_slice(data);
+        buf.extend_from_slice(&data);
     } else if n > 0xffff_ffff && ctx.proto >= 4 {
         let mut header = vec![op::BINBYTES8];
         header.extend_from_slice(&(n as u64).to_le_bytes());
-        buf.write_large_bytes(&header, data)?;
+        buf.write_large_bytes(&header, &data)?;
     } else if n >= FRAME_SIZE_TARGET {
         let mut header = vec![op::BINBYTES];
         header.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.write_large_bytes(&header, data)?;
+        buf.write_large_bytes(&header, &data)?;
     } else {
         buf.push(op::BINBYTES);
         buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.extend_from_slice(data);
+        buf.extend_from_slice(&data);
     }
     memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
     Ok(())

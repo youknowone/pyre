@@ -751,40 +751,54 @@ macro_rules! pyre_module_init {
 /// verbatim.
 #[macro_export]
 macro_rules! pylist {
-    ( $($e:expr),* $(,)? ) => {
-        ::pyre_object::w_list_new(vec![ $( $crate::PywrapKind::into_py($e) ),* ])
-    };
+    ( $($e:expr),* $(,)? ) => {{
+        let mut __items = ::pyre_object::gc_roots::RootedItems::new();
+        $( __items.push($crate::PywrapKind::into_py($e)); )*
+        ::pyre_object::w_list_new(__items.take())
+    }};
 }
 
 #[macro_export]
 macro_rules! pytuple {
-    ( $($e:expr),* $(,)? ) => {
-        ::pyre_object::w_tuple_new(vec![ $( $crate::PywrapKind::into_py($e) ),* ])
-    };
+    ( $($e:expr),* $(,)? ) => {{
+        let mut __items = ::pyre_object::gc_roots::RootedItems::new();
+        $( __items.push($crate::PywrapKind::into_py($e)); )*
+        ::pyre_object::w_tuple_new(__items.take())
+    }};
 }
 
 #[macro_export]
 macro_rules! pydict {
     ( $($k:expr => $v:expr),* $(,)? ) => {{
-        let __d = ::pyre_object::w_dict_new();
+        let __roots = ::pyre_object::gc_roots::push_roots();
+        let __d_slot = ::pyre_object::gc_roots::shadow_stack_len();
+        let _ = ::pyre_object::gc_roots::pin_root(::pyre_object::w_dict_new());
         $(
+            let __k_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root($crate::PywrapKind::into_py($k));
+            let __v_slot = ::pyre_object::gc_roots::shadow_stack_len();
+            let _ = ::pyre_object::gc_roots::pin_root($crate::PywrapKind::into_py($v));
             unsafe {
                 ::pyre_object::w_dict_store(
-                    __d,
-                    $crate::PywrapKind::into_py($k),
-                    $crate::PywrapKind::into_py($v),
+                    ::pyre_object::gc_roots::shadow_stack_get(__d_slot),
+                    ::pyre_object::gc_roots::shadow_stack_get(__k_slot),
+                    ::pyre_object::gc_roots::shadow_stack_get(__v_slot),
                 );
             }
         )*
+        let __d = ::pyre_object::gc_roots::shadow_stack_get(__d_slot);
+        drop(__roots);
         __d
     }};
 }
 
 #[macro_export]
 macro_rules! pyset {
-    ( $($e:expr),* $(,)? ) => {
-        ::pyre_object::w_set_from_items(&[ $( $crate::PywrapKind::into_py($e) ),* ])
-    };
+    ( $($e:expr),* $(,)? ) => {{
+        let mut __items = ::pyre_object::gc_roots::RootedItems::new();
+        $( __items.push($crate::PywrapKind::into_py($e)); )*
+        ::pyre_object::w_set_from_items(&__items.take())
+    }};
 }
 
 /// Per-type wrap trait consumed by `pylist!` / `pytuple!` / `pydict!`

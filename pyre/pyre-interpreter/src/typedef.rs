@@ -3822,7 +3822,11 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
     }
     let name = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__name__")?
         .unwrap_or_else(|| pyre_object::w_str_new_managed("?"));
-    let name_repr = unsafe { crate::display::py_repr_wtf8(name)? };
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(name);
+    let name_repr = unsafe {
+        crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(name_slot))?
+    };
     if let Some(filename) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__file__")? {
         let file_repr = unsafe { crate::display::py_repr_wtf8(filename)? };
         return Ok(wtf8_format!(
@@ -24090,10 +24094,15 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `b"".replace(1, b"y", idx)` raises the TypeError without running
     // `idx.__index__`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let src_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pos[0]);
-    let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[1])?);
-    let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(pos[2])?);
+    let src_base = pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]]);
+    let old_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(
+        pyre_object::gc_roots::shadow_stack_get(src_base + 1),
+    )?);
+    let new_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(require_bytes_like_source(
+        pyre_object::gc_roots::shadow_stack_get(src_base + 2),
+    )?);
     let limit = match pos.get(3) {
         Some(&w_count) if !w_count.is_null() => {
             let c = crate::builtins::space_index_w(w_count)?;
@@ -24108,15 +24117,11 @@ fn bytes_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let recv = || pyre_object::gc_roots::shadow_stack_get(src_base);
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     let old = unsafe {
-        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
-            src_base + 1,
-        ))
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(old_slot))
     }
     .to_vec();
     let new = unsafe {
-        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(
-            src_base + 2,
-        ))
+        pyre_object::bytesobject::bytes_like_data(pyre_object::gc_roots::shadow_stack_get(new_slot))
     }
     .to_vec();
     let (out, replacements) = replace_bytes(&data, &old, &new, limit);
@@ -24148,13 +24153,12 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // The export lock does not pin the separator against collection, so
     // copy its payload off the rooted receiver before later mints.
     let _roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let recv_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
     let acquired_export = unsafe { crate::builtins::buffer_export_incref(recv()) };
     let result = (|| {
         let sep = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
-        let iterable = args[1];
+        let iterable = pyre_object::gc_roots::shadow_stack_get(recv_slot + 1);
         let items: Vec<PyObjectRef> = unsafe {
             if pyre_object::is_list(iterable) {
                 let n = pyre_object::w_list_len(iterable);
@@ -24172,6 +24176,9 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 crate::builtins::sequence_fast(iterable, "can only join an iterable")?
             }
         };
+        let items_base = pyre_object::gc_roots::publish_roots(&items);
+        pyre_object::gc_roots::normalize_roots(items_base, items.len());
+        let item = |i: usize| pyre_object::gc_roots::shadow_stack_get(items_base + i);
         // `StringMethods.descr_join` asks `_join_return_one` before entering
         // `_str_join_many_items`.  `W_BytesObject._join_return_one` accepts
         // only an exact `bytes` item (including when the separator itself is
@@ -24180,16 +24187,14 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         if items.len() == 1
             && unsafe { pyre_object::bytesobject::is_bytes(recv()) }
             && unsafe {
-                pyre_object::pyobject::is_exact_type(
-                    items[0],
-                    &pyre_object::bytesobject::BYTES_TYPE,
-                )
+                pyre_object::pyobject::is_exact_type(item(0), &pyre_object::bytesobject::BYTES_TYPE)
             }
         {
-            return Ok(items[0]);
+            return Ok(item(0));
         }
         let mut out: Vec<u8> = Vec::new();
-        for (i, &item) in items.iter().enumerate() {
+        for i in 0..items.len() {
+            let item = item(i);
             if i > 0 {
                 out.extend_from_slice(&sep);
             }
@@ -24721,11 +24726,25 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         ));
     };
     crate::builtins::kwarg_reject_unknown(kwargs, &["delete"], "translate")?;
+    let delete_obj = positional
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "delete"));
+    let table_none = unsafe { pyre_object::is_none(table_obj) };
+    let extras_base = match (table_none, delete_obj) {
+        (true, None) => None,
+        (true, Some(d)) => Some(pyre_object::gc_roots::pin_roots(&[d])),
+        (false, None) => Some(pyre_object::gc_roots::pin_roots(&[table_obj])),
+        (false, Some(d)) => Some(pyre_object::gc_roots::pin_roots(&[table_obj, d])),
+    };
     let table: Option<Vec<u8>> = unsafe {
-        if pyre_object::is_none(table_obj) {
+        if table_none {
             None
         } else {
-            let t = require_bytes_like(table_obj)?.to_vec();
+            let t = require_bytes_like(pyre_object::gc_roots::shadow_stack_get(
+                extras_base.expect("table is pinned"),
+            ))?
+            .to_vec();
             if t.len() != 256 {
                 return Err(crate::PyError::value_error(
                     "translation table must be 256 characters long",
@@ -24734,14 +24753,13 @@ fn bytes_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             Some(t)
         }
     };
-    let delete_obj = positional
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "delete"));
     let mut deleted = [false; 256];
-    if let Some(d) = delete_obj {
-        for &b in require_bytes_like(d)? {
-            deleted[b as usize] = true;
+    if let Some(d_base) = extras_base {
+        let delete_slot = if table_none { d_base } else { d_base + 1 };
+        if delete_obj.is_some() {
+            for &b in require_bytes_like(pyre_object::gc_roots::shadow_stack_get(delete_slot))? {
+                deleted[b as usize] = true;
+            }
         }
     }
     let mut out = Vec::with_capacity(data.len());

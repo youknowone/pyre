@@ -357,8 +357,10 @@ fn signal_signal(
     } else {
         old
     };
+    let old_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(old);
     set_handler(signum, w_handler());
-    Ok(old)
+    Ok(pyre_object::gc_roots::shadow_stack_get(old_slot))
 }
 
 /// interp_signal.py `getsignal(signum) -> action`.

@@ -1004,15 +1004,6 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         return Ok(str_result_unchanged(item));
     }
-    for i in 0..items.len() {
-        let item = item(i);
-        if unsafe { !is_str(item) } {
-            return Err(crate::PyError::type_error(format!(
-                "sequence item {i}: expected str instance, {} found",
-                arg_type_name(item)
-            )));
-        }
-    }
     let reloaded: Vec<_> = (0..items.len()).map(item).collect();
     str_join_many_items(&sep, &reloaded)
 }

@@ -450,10 +450,15 @@ fn configure_sys_for_repl(sys_module: pyre_object::PyObjectRef) {
 
 fn ensure_sys_prompt(sys_module: pyre_object::PyObjectRef, name: &str, fallback: &str) {
     if pyre_interpreter::baseobjspace::getattr_str(sys_module, name).is_err() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(sys_module);
+        let prompt_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(fallback));
         let _ = pyre_interpreter::baseobjspace::setattr_str(
-            sys_module,
+            pyre_object::gc_roots::shadow_stack_get(module_slot),
             name,
-            pyre_object::w_str_new_managed(fallback),
+            pyre_object::gc_roots::shadow_stack_get(prompt_slot),
         );
     }
 }
