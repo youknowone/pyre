@@ -5081,6 +5081,18 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Err(error);
         }
     };
+    // The residual `jit_str_startswith` / `jit_str_endswith` fold no longer
+    // runs once this wrapper is walked, so the `spec-folds=` census would
+    // otherwise report those names as quiet.
+    if jitcode.name.contains("str_descr_startswith") {
+        crate::jitcode_dispatch::diag::spec_census_record_fired(
+            crate::jitcode_dispatch::diag::SpecFold::StrStartswith,
+        );
+    } else if jitcode.name.contains("str_descr_endswith") {
+        crate::jitcode_dispatch::diag::spec_census_record_fired(
+            crate::jitcode_dispatch::diag::SpecFold::StrEndswith,
+        );
+    }
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
