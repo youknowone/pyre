@@ -1883,6 +1883,13 @@ pub struct JitDriver<S: JitState> {
     /// This driver's payload for the per-thread `frame_value_count` store,
     /// built once by `register_dispatch_jitcode`. `None` until then.
     state_field_fvc: Option<StateFieldFvcData>,
+    /// One-shot skip for the next [`Self::function_entry_structured`].
+    ///
+    /// An embedder whose loop-header door can already serve the call (CEL
+    /// yields when a sibling loop key is runnable) sets this so the generated
+    /// `ll_portal_runner` prefix does not mint a second artifact for the same
+    /// activation. Taken, not read: a skipped door must not stay skipped.
+    function_entry_suppressed: bool,
     /// Reusable buffers for the compiled-entry argument walk.
     ///
     /// `warmstate.py execute_assembler` builds the entry arguments
@@ -2146,6 +2153,7 @@ impl<S: JitState> JitDriver<S> {
             blackhole_allocator: None,
             portal_jd_index: None,
             state_field_fvc: None,
+            function_entry_suppressed: false,
             entry_scratch: Some(Box::default()),
             exit_raw_scratch: Some(Vec::new()),
             #[expect(
@@ -8547,6 +8555,15 @@ impl<S: JitState> JitDriver<S> {
     /// Returns `Some(resume_pc)` only when compiled code ran and left a
     /// resume point. FINISH is published on the same latch as
     /// [`Self::back_edge`].
+    /// Skip the next generated function-entry door.
+    ///
+    /// `warmspot.py` has no equivalent: a portal has one runner. An embedder
+    /// that still has a second, loop-header door and cannot yet coexist two
+    /// artifacts for one program uses this to yield that other door.
+    pub fn suppress_function_entry(&mut self) {
+        self.function_entry_suppressed = true;
+    }
+
     pub fn function_entry_structured(
         &mut self,
         green_key_hash: u64,
@@ -8555,6 +8572,9 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> Option<usize> {
+        if std::mem::replace(&mut self.function_entry_suppressed, false) {
+            return None;
+        }
         if self.meta.is_tracing() {
             return None;
         }
@@ -10184,6 +10204,39 @@ mod tests {
         assert!(
             driver.is_tracing(),
             "the function-entry door must arm tracing when the function threshold fires"
+        );
+    }
+
+    #[test]
+    fn suppress_function_entry_skips_the_next_door_only() {
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.meta.warm_state_mut().set_function_threshold(1);
+        let hash = 0xB0Du64;
+        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let mut state = CountingDoorState {
+            build_meta_calls: std::cell::Cell::new(0),
+            extract_live_values_calls: std::cell::Cell::new(0),
+            code_ptr: 0,
+        };
+        driver.suppress_function_entry();
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            !driver.is_tracing(),
+            "a suppressed door must not arm tracing"
+        );
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "suppress is one-shot: the next door must run"
         );
     }
 
