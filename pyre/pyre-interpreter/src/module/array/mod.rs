@@ -1914,13 +1914,15 @@ fn array_machine_format_code(typecode: u8, itemsize: usize) -> i64 {
 fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__reduce_ex__", true)?;
     check_arity(args, 2, "array.__reduce_ex__")?;
-    let obj = args[0];
-    let protocol = crate::baseobjspace::int_w(args[1])?;
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let protocol = crate::baseobjspace::int_w(args[1])?;
     let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let w_type = crate::typedef::r#type(obj()).map_or(PY_NULL, |p| p.as_ptr());
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(
+        crate::typedef::r#type(obj()).map_or(PY_NULL, |p| p.as_ptr()),
+    );
     let typecode = unsafe { arr::w_array_typecode(obj()) };
     let tc = typecode as char;
     let typecode_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1941,7 +1943,7 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
         let ctor_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(ctor_args);
         return Ok(pyre_object::w_tuple_new(vec![
-            w_type,
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
             pyre_object::gc_roots::shadow_stack_get(ctor_slot),
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
         ]));
@@ -1955,10 +1957,12 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     let w_bytes = array_tobytes_method(&[obj()])?;
     let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_bytes);
+    let format_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(mformat));
     let ctor_args = pyre_object::w_tuple_new(vec![
-        w_type,
+        pyre_object::gc_roots::shadow_stack_get(type_slot),
         pyre_object::gc_roots::shadow_stack_get(typecode_slot),
-        pyre_object::w_int_new(mformat),
+        pyre_object::gc_roots::shadow_stack_get(format_slot),
         pyre_object::gc_roots::shadow_stack_get(bytes_slot),
     ]);
     let ctor_slot = pyre_object::gc_roots::shadow_stack_len();

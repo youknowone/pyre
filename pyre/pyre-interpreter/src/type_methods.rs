@@ -960,8 +960,13 @@ pub fn list_method_remove(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "join", 1)?;
-    let sep = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-    let iterable = args[1];
+    // `sequence_fast` and the type-error path allocate, so pin the separator
+    // and iterable first and copy the separator payload off the object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let sep = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
+        .to_wtf8_buf();
+    let iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let items: Vec<PyObjectRef> = unsafe {
         if is_list(iterable) {
             let n = w_list_len(iterable);
@@ -979,6 +984,9 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             crate::builtins::sequence_fast(iterable, "can only join an iterable")?
         }
     };
+    let items_base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(items_base, items.len());
+    let item = |i: usize| pyre_object::gc_roots::shadow_stack_get(items_base + i);
     // pypy/objspace/std/unicodeobject.py descr_join — each
     // element must be a str; otherwise TypeError("sequence item N:
     // expected str instance, <T> found"). Silently dropping non-str
@@ -987,7 +995,7 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // A single-element join returns that element (unicode_result_unchanged):
     // an exact str unchanged, a str subclass copied to a base str.
     if items.len() == 1 {
-        let item = items[0];
+        let item = item(0);
         if unsafe { !is_str(item) } {
             return Err(crate::PyError::type_error(format!(
                 "sequence item 0: expected str instance, {} found",
@@ -996,7 +1004,17 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         return Ok(str_result_unchanged(item));
     }
-    str_join_many_items(sep, &items)
+    for i in 0..items.len() {
+        let item = item(i);
+        if unsafe { !is_str(item) } {
+            return Err(crate::PyError::type_error(format!(
+                "sequence item {i}: expected str instance, {} found",
+                arg_type_name(item)
+            )));
+        }
+    }
+    let reloaded: Vec<_> = (0..items.len()).map(item).collect();
+    str_join_many_items(&sep, &reloaded)
 }
 
 /// `stringmethods.py _str_join_many_items`:
@@ -6034,8 +6052,12 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// ordinals (int), strings (str), or None (delete).
 pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "translate", 1)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let table = args[1];
+    // Each lookup can collect, so pin the receiver and table and copy the
+    // source payload off the object before the loop.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let s = unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }.to_wtf8_buf();
+    let table = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let mut result = Wtf8Buf::with_capacity(s.len());
     unsafe {
         for cp in s.code_points() {
@@ -6043,7 +6065,7 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             // `unicode_translate` clears any LookupError the lookup raises
             // and keeps the character, so a table that indexes rather than
             // maps (a str, a list) leaves unmapped code points alone.
-            let found = match crate::baseobjspace::finditem(table, key) {
+            let found = match crate::baseobjspace::finditem(table(), key) {
                 Ok(found) => found,
                 Err(e)
                     if matches!(

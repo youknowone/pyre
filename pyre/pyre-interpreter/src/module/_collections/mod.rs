@@ -1347,7 +1347,8 @@ impl W_Deque {
         let self_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(self_obj);
         let self_obj = || pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let ty = unsafe { w_instance_get_type(self_obj()) };
+        let ty_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(unsafe { w_instance_get_type(self_obj()) });
         let m = maxlen_obj(self_obj());
         let args_slot;
         if unsafe { is_none(m) } {
@@ -1374,7 +1375,7 @@ impl W_Deque {
         let items_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(items);
         Ok(w_tuple_new(vec![
-            ty,
+            pyre_object::gc_roots::shadow_stack_get(ty_slot),
             pyre_object::gc_roots::shadow_stack_get(args_slot),
             pyre_object::gc_roots::shadow_stack_get(state_slot),
             pyre_object::gc_roots::shadow_stack_get(items_slot),

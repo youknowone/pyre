@@ -26490,8 +26490,8 @@ fn bytearray_method_clear(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 fn bytearray_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_receiver(args, "copy")?;
     crate::type_methods::arity_no_args(args, "copy")?;
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) };
-    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(data))
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(args[0]) }.to_vec();
+    Ok(pyre_object::bytearrayobject::w_bytearray_from_bytes(&data))
 }
 
 /// `bytearrayobject.py descr_releasebuffer` — the Python 3.12
@@ -26548,7 +26548,7 @@ fn bytearray_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 fn bytearray_reduce_impl(
     obj: PyObjectRef,
-    protocol: Option<i64>,
+    protocol: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
     // The bytearray and every nursery tuple sit on one set: payload
     // constructors and `object_getstate_default` collect.
@@ -26556,6 +26556,10 @@ fn bytearray_reduce_impl(
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let protocol = match protocol {
+        Some(p) => Some(crate::baseobjspace::int_w(p)?),
+        None => None,
+    };
     let owned = unsafe { pyre_object::bytesobject::bytes_like_data(obj()) }.to_vec();
     let args_slot;
     if owned.is_empty() {
@@ -26581,14 +26585,17 @@ fn bytearray_reduce_impl(
         args_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(args);
     }
-    let cls = crate::typedef::r#type(obj())
-        .map(|p| p.as_ptr())
-        .unwrap_or_else(|| gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE));
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(
+        crate::typedef::r#type(obj())
+            .map(|p| p.as_ptr())
+            .unwrap_or_else(|| gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE)),
+    );
     let state = crate::reduce_protocol::object_getstate_default(obj())?;
     let state_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(state);
     Ok(w_tuple_new(vec![
-        cls,
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
         pyre_object::gc_roots::shadow_stack_get(args_slot),
         pyre_object::gc_roots::shadow_stack_get(state_slot),
     ]))
@@ -26601,8 +26608,7 @@ fn bytearray_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn bytearray_descr_reduce_ex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
-    let protocol = crate::baseobjspace::int_w(args[1])?;
-    bytearray_reduce_impl(args[0], Some(protocol))
+    bytearray_reduce_impl(args[0], Some(args[1]))
 }
 
 fn bytearray_descr_alloc(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
