@@ -5456,7 +5456,7 @@ pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyO
 /// every `__majit_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
 #[majit_macros::unroll_safe]
-pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
+pub fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
     // PyPy `argument.py:_match_signature` keeps `num_args`, `upfront`, and
     // every derived argument count as ordinary RPython Signed values.  Rust
     // slice indexing needs `usize`, but that is an indexing adapter, not the
@@ -5596,7 +5596,7 @@ pub(crate) fn bind_pos_or_kw(
 
 /// `true` when the last argument is the `__pyre_kw__`-tagged dict the
 /// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
-pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
+pub fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
     if args.is_empty() {
         return false;
     }
@@ -5702,7 +5702,7 @@ pub(crate) fn clinic_arity(
 // signature and argument count in the same way; without the hint the JIT
 // policy residualizes this gateway step and cannot descend into the builtin.
 #[majit_macros::unroll_safe]
-pub(crate) fn bind_builtin_kwargs(
+pub fn bind_builtin_kwargs(
     args: &[PyObjectRef],
     names: &[&str],
     required: &[bool],
@@ -5920,7 +5920,7 @@ pub(crate) fn kwarg_reject_duplicate(
 /// directly and falls through to looking up `__index__` on the
 /// object's type, mirroring PyPy's `lookup_in_type` pass before
 /// raising `TypeError`.
-pub(crate) fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+pub fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     // Read the machine-word value of a bool / int / long object, raising
     // OverflowError when a bigint does not fit. Returns `None` for anything
     // else so the caller can fall through to the `__index__` lookup / error.

@@ -2847,12 +2847,17 @@ name = "pyre-module"
 version = "0.0.2"
 dependencies = [
  "libc",
+ "linkme",
  "majit-metainterp",
  "num-complex",
+ "paste",
  "pymath",
  "pyre-interpreter",
  "pyre-object",
+ "rustpython-common",
+ "rustpython-compiler-core",
  "rustpython-host_env",
+ "rustpython-wtf8",
 ]
 
 [[package]]

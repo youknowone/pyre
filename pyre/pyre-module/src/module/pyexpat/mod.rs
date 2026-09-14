@@ -75,7 +75,7 @@ impl<'p, 'a> HandlerArgs<'p, 'a> {
         self
     }
 
-    fn call(self) -> Result<(), crate::PyError> {
+    fn call(self) -> Result<(), pyre_interpreter::PyError> {
         self.parser.call_handler(self.name, &self.items.take())
     }
 }
@@ -106,7 +106,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Result<usize, crate::PyError> {
+    fn parse(mut self) -> Result<usize, pyre_interpreter::PyError> {
         self.skip_ws();
         if self.starts_with("<?xml") {
             self.parse_xml_decl()?;
@@ -195,7 +195,7 @@ impl<'a> MiniXmlParser<'a> {
         true
     }
 
-    fn expect(&mut self, s: &str) -> Result<(), crate::PyError> {
+    fn expect(&mut self, s: &str) -> Result<(), pyre_interpreter::PyError> {
         if self.consume(s) {
             Ok(())
         } else {
@@ -209,7 +209,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn read_name(&mut self) -> Result<String, crate::PyError> {
+    fn read_name(&mut self) -> Result<String, pyre_interpreter::PyError> {
         let mut name = String::new();
         while let Some(ch) = self.peek_char() {
             if ch.is_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.') {
@@ -226,7 +226,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn read_quoted(&mut self) -> Result<String, crate::PyError> {
+    fn read_quoted(&mut self) -> Result<String, pyre_interpreter::PyError> {
         let quote = match self.bump_char() {
             Some(q @ ('"' | '\'')) => q,
             _ => return self.fail("expected quoted string"),
@@ -245,7 +245,7 @@ impl<'a> MiniXmlParser<'a> {
         self.fail("unterminated quoted string")
     }
 
-    fn parse_xml_decl(&mut self) -> Result<(), crate::PyError> {
+    fn parse_xml_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<?xml")?;
         // `encoding` and `standalone` are freshly minted and reachable only
@@ -301,7 +301,7 @@ impl<'a> MiniXmlParser<'a> {
             .arg(standalone)
             .call()?;
         if unsafe { is_int(standalone) && w_int_get_value(standalone) == 0 } {
-            crate::baseobjspace::setdictvalue_native(
+            pyre_interpreter::baseobjspace::setdictvalue_native(
                 self.parser,
                 "_pyre_not_standalone_pending",
                 w_bool_from(true),
@@ -310,7 +310,7 @@ impl<'a> MiniXmlParser<'a> {
         Ok(())
     }
 
-    fn parse_comment(&mut self) -> Result<(), crate::PyError> {
+    fn parse_comment(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<!--")?;
         let start = self.pos.index;
@@ -331,7 +331,7 @@ impl<'a> MiniXmlParser<'a> {
             .call()
     }
 
-    fn parse_pi(&mut self) -> Result<(), crate::PyError> {
+    fn parse_pi(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<?")?;
         let target = self.read_name()?;
@@ -355,7 +355,7 @@ impl<'a> MiniXmlParser<'a> {
             .call()
     }
 
-    fn parse_cdata(&mut self) -> Result<(), crate::PyError> {
+    fn parse_cdata(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<![CDATA[")?;
         let start = self.pos.index;
@@ -378,7 +378,7 @@ impl<'a> MiniXmlParser<'a> {
         self.call_handler_raw("EndCdataSectionHandler", &[])
     }
 
-    fn parse_doctype(&mut self) -> Result<(), crate::PyError> {
+    fn parse_doctype(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<!DOCTYPE")?;
         self.skip_ws();
@@ -408,12 +408,12 @@ impl<'a> MiniXmlParser<'a> {
             let _ = roots.pin_root(sysid);
         }
         self.skip_ws();
-        if crate::baseobjspace::getattr_str(self.parser, "_pyre_not_standalone_pending")
+        if pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_not_standalone_pending")
             .map(is_true_obj)
             .unwrap_or(false)
         {
             self.call_not_standalone()?;
-            crate::baseobjspace::setdictvalue_native(
+            pyre_interpreter::baseobjspace::setdictvalue_native(
                 self.parser,
                 "_pyre_not_standalone_pending",
                 w_bool_from(false),
@@ -445,7 +445,7 @@ impl<'a> MiniXmlParser<'a> {
         self.call_handler("EndDoctypeDeclHandler", &[])
     }
 
-    fn parse_internal_subset(&mut self) -> Result<(), crate::PyError> {
+    fn parse_internal_subset(&mut self) -> Result<(), pyre_interpreter::PyError> {
         loop {
             self.skip_ws();
             if self.consume("]") {
@@ -471,7 +471,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn parse_entity_decl(&mut self) -> Result<(), crate::PyError> {
+    fn parse_entity_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<!ENTITY")?;
         self.skip_ws();
@@ -556,14 +556,14 @@ impl<'a> MiniXmlParser<'a> {
             .call()
     }
 
-    fn skip_parameter_entity_ref(&mut self) -> Result<(), crate::PyError> {
+    fn skip_parameter_entity_ref(&mut self) -> Result<(), pyre_interpreter::PyError> {
         self.expect("%")?;
         let _name = self.read_name()?;
         self.expect(";")?;
         self.call_not_standalone()
     }
 
-    fn parse_element_decl(&mut self) -> Result<(), crate::PyError> {
+    fn parse_element_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<!ELEMENT")?;
         self.skip_ws();
@@ -574,7 +574,7 @@ impl<'a> MiniXmlParser<'a> {
                 '(' => {
                     depth += 1;
                     if depth > 100_000 {
-                        return Err(crate::PyError::runtime_error(
+                        return Err(pyre_interpreter::PyError::runtime_error(
                             "maximum recursion depth exceeded",
                         ));
                     }
@@ -609,7 +609,7 @@ impl<'a> MiniXmlParser<'a> {
             .call()
     }
 
-    fn parse_attlist_decl(&mut self) -> Result<(), crate::PyError> {
+    fn parse_attlist_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<!ATTLIST")?;
         self.skip_ws();
@@ -646,7 +646,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn parse_notation_decl(&mut self) -> Result<(), crate::PyError> {
+    fn parse_notation_decl(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<!NOTATION")?;
         self.skip_ws();
@@ -685,7 +685,7 @@ impl<'a> MiniXmlParser<'a> {
             .call()
     }
 
-    fn skip_declaration(&mut self) -> Result<(), crate::PyError> {
+    fn skip_declaration(&mut self) -> Result<(), pyre_interpreter::PyError> {
         if self.starts_with("<!") {
             self.skip_until_gt()
         } else {
@@ -693,7 +693,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn skip_until_gt(&mut self) -> Result<(), crate::PyError> {
+    fn skip_until_gt(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let mut quote: Option<char> = None;
         while let Some(ch) = self.bump_char() {
             if let Some(q) = quote {
@@ -709,7 +709,7 @@ impl<'a> MiniXmlParser<'a> {
         self.fail("unclosed token")
     }
 
-    fn parse_start_element(&mut self) -> Result<(), crate::PyError> {
+    fn parse_start_element(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("<")?;
         if self.eof() {
@@ -775,7 +775,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn parse_end_element(&mut self) -> Result<(), crate::PyError> {
+    fn parse_end_element(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let event_pos = self.pos;
         self.expect("</")?;
         let raw_name = self.read_name()?;
@@ -798,7 +798,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn parse_chardata(&mut self) -> Result<(), crate::PyError> {
+    fn parse_chardata(&mut self) -> Result<(), pyre_interpreter::PyError> {
         let start = self.pos.index;
         while let Some(ch) = self.peek_char() {
             if ch == '<' {
@@ -832,9 +832,10 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn convert_attributes(&self, attrs: &[(String, String)]) -> PyObjectRef {
-        let ordered = crate::baseobjspace::getattr_str(self.parser, "ordered_attributes")
-            .map(is_true_obj)
-            .unwrap_or(false);
+        let ordered =
+            pyre_interpreter::baseobjspace::getattr_str(self.parser, "ordered_attributes")
+                .map(is_true_obj)
+                .unwrap_or(false);
         // Both arms convert one attribute at a time and hold what they have
         // already converted across the next conversion's allocations.
         // `intern_string` hands back whatever the caller's intern map holds under
@@ -873,8 +874,8 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn emit_character_data(&mut self, text: &str) -> Result<(), crate::PyError> {
-        let buffering = crate::baseobjspace::getattr_str(self.parser, "buffer_text")
+    fn emit_character_data(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
+        let buffering = pyre_interpreter::baseobjspace::getattr_str(self.parser, "buffer_text")
             .map(is_true_obj)
             .unwrap_or(false);
         if buffering {
@@ -886,7 +887,7 @@ impl<'a> MiniXmlParser<'a> {
                 return self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(text)]);
             }
             self.char_buffer.push_str(text);
-            crate::baseobjspace::setdictvalue_native(
+            pyre_interpreter::baseobjspace::setdictvalue_native(
                 self.parser,
                 "buffer_used",
                 w_int_new(self.char_buffer.len() as i64),
@@ -897,7 +898,7 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn emit_character_data_split(&mut self, text: &str) -> Result<(), crate::PyError> {
+    fn emit_character_data_split(&mut self, text: &str) -> Result<(), pyre_interpreter::PyError> {
         let Some(first_non_ws) = text.find(|ch: char| !matches!(ch, ' ' | '\t' | '\r' | '\n'))
         else {
             return self.emit_character_data(text);
@@ -919,12 +920,16 @@ impl<'a> MiniXmlParser<'a> {
         Ok(())
     }
 
-    fn flush_character_buffer(&mut self) -> Result<(), crate::PyError> {
+    fn flush_character_buffer(&mut self) -> Result<(), pyre_interpreter::PyError> {
         if self.char_buffer.is_empty() {
             return Ok(());
         }
         let text = std::mem::take(&mut self.char_buffer);
-        crate::baseobjspace::setdictvalue_native(self.parser, "buffer_used", w_int_new(0));
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser,
+            "buffer_used",
+            w_int_new(0),
+        );
         self.call_handler_raw("CharacterDataHandler", &[w_str_new_managed(&text)])
     }
 
@@ -936,7 +941,11 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn call_handler(&mut self, name: &str, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+    fn call_handler(
+        &mut self,
+        name: &str,
+        args: &[PyObjectRef],
+    ) -> Result<(), pyre_interpreter::PyError> {
         // The handler lookup below is a full `getattr`, and the flush hands
         // buffered text to a Python handler; both run Python and so can collect,
         // and an attribute `dict` or `list` in `args` moves under either.  A
@@ -955,7 +964,11 @@ impl<'a> MiniXmlParser<'a> {
         self.call_handler_raw(name, &args)
     }
 
-    fn call_handler_raw(&self, name: &str, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+    fn call_handler_raw(
+        &self,
+        name: &str,
+        args: &[PyObjectRef],
+    ) -> Result<(), pyre_interpreter::PyError> {
         if self.suppress_current {
             return Ok(());
         }
@@ -968,31 +981,32 @@ impl<'a> MiniXmlParser<'a> {
         for &arg in args {
             let _ = roots.pin_root(arg);
         }
-        let Ok(handler) = crate::baseobjspace::getattr_str(self.parser, name) else {
+        let Ok(handler) = pyre_interpreter::baseobjspace::getattr_str(self.parser, name) else {
             return Ok(());
         };
         if handler.is_null() || unsafe { is_none(handler) } {
             return Ok(());
         }
         let args: Vec<PyObjectRef> = (0..args.len()).map(|i| roots.get(base + i)).collect();
-        crate::call::call_function_impl_result(handler, &args)?;
+        pyre_interpreter::call::call_function_impl_result(handler, &args)?;
         Ok(())
     }
 
-    fn call_not_standalone(&self) -> Result<(), crate::PyError> {
+    fn call_not_standalone(&self) -> Result<(), pyre_interpreter::PyError> {
         if self.suppress_current {
             return Ok(());
         }
-        let Ok(handler) = crate::baseobjspace::getattr_str(self.parser, "NotStandaloneHandler")
+        let Ok(handler) =
+            pyre_interpreter::baseobjspace::getattr_str(self.parser, "NotStandaloneHandler")
         else {
             return Ok(());
         };
         if handler.is_null() || unsafe { is_none(handler) } {
             return Ok(());
         }
-        let ret = crate::call::call_function_impl_result(handler, &[])?;
+        let ret = pyre_interpreter::call::call_function_impl_result(handler, &[])?;
         if unsafe { !(is_int(ret) || is_bool(ret)) } {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "NotStandaloneHandler must return an integer",
             ));
         }
@@ -1000,7 +1014,7 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn handler_is_set(&self, name: &str) -> bool {
-        match crate::baseobjspace::getattr_str(self.parser, name) {
+        match pyre_interpreter::baseobjspace::getattr_str(self.parser, name) {
             Ok(handler) => !(handler.is_null() || unsafe { is_none(handler) }),
             Err(_) => false,
         }
@@ -1012,17 +1026,17 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn publish_event_position(&mut self, pos: XmlPos) {
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentLineNumber",
             w_int_new(pos.line as i64),
         );
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentColumnNumber",
             w_int_new(pos.col as i64),
         );
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentByteIndex",
             w_int_new(pos.index as i64),
@@ -1030,14 +1044,15 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn namespace_separator(&self) -> Option<String> {
-        match crate::baseobjspace::getattr_str(self.parser, "_pyre_namespace_separator") {
+        match pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_namespace_separator")
+        {
             Ok(obj) if unsafe { is_str(obj) } => Some(unsafe { w_str_get_value(obj) }.to_string()),
             _ => None,
         }
     }
 
     fn namespace_prefixes(&self) -> bool {
-        crate::baseobjspace::getattr_str(self.parser, "namespace_prefixes")
+        pyre_interpreter::baseobjspace::getattr_str(self.parser, "namespace_prefixes")
             .map(is_true_obj)
             .unwrap_or(false)
     }
@@ -1046,7 +1061,7 @@ impl<'a> MiniXmlParser<'a> {
         &mut self,
         attrs: &[(String, String)],
         declared: &mut Vec<String>,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<(), pyre_interpreter::PyError> {
         if self.namespace_separator().is_none() {
             return Ok(());
         }
@@ -1074,7 +1089,10 @@ impl<'a> MiniXmlParser<'a> {
         Ok(())
     }
 
-    fn end_namespace_scope(&mut self, declared: Vec<String>) -> Result<(), crate::PyError> {
+    fn end_namespace_scope(
+        &mut self,
+        declared: Vec<String>,
+    ) -> Result<(), pyre_interpreter::PyError> {
         for prefix in declared.into_iter().rev() {
             self.namespaces.pop();
             let w_prefix = if prefix.is_empty() {
@@ -1095,7 +1113,7 @@ impl<'a> MiniXmlParser<'a> {
             .map(|(_, uri)| uri.as_str())
     }
 
-    fn expand_name(&self, name: &str, is_attr: bool) -> Result<String, crate::PyError> {
+    fn expand_name(&self, name: &str, is_attr: bool) -> Result<String, pyre_interpreter::PyError> {
         let Some(sep) = self.namespace_separator() else {
             return Ok(name.to_string());
         };
@@ -1122,7 +1140,7 @@ impl<'a> MiniXmlParser<'a> {
     fn expand_attributes(
         &self,
         attrs: &[(String, String)],
-    ) -> Result<Vec<(String, String)>, crate::PyError> {
+    ) -> Result<Vec<(String, String)>, pyre_interpreter::PyError> {
         let mut out = Vec::new();
         for (name, value) in attrs {
             if self.namespace_separator().is_some()
@@ -1198,11 +1216,12 @@ impl<'a> MiniXmlParser<'a> {
         context: &str,
         sysid: &str,
         pubid: Option<&str>,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<(), pyre_interpreter::PyError> {
         if self.suppress_current {
             return Ok(());
         }
-        let Ok(handler) = crate::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler")
+        let Ok(handler) =
+            pyre_interpreter::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler")
         else {
             return Ok(());
         };
@@ -1216,15 +1235,17 @@ impl<'a> MiniXmlParser<'a> {
         // it is the parser's own attribute and stays reachable through it.
         let roots = pyre_object::gc_roots::push_roots();
         let handler = roots.pin_root(handler);
-        let base = crate::baseobjspace::getattr_str(self.parser, "_pyre_base")
+        let base = pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_base")
             .unwrap_or_else(|_| w_none());
         let w_context = roots.pin_root(w_str_new_managed(context));
         let w_sysid = roots.pin_root(w_str_new_managed(sysid));
         let w_pubid = pubid
             .map(|s| roots.pin_root(w_str_new_managed(s)))
             .unwrap_or_else(w_none);
-        let ret =
-            crate::call::call_function_impl_result(handler, &[w_context, base, w_sysid, w_pubid])?;
+        let ret = pyre_interpreter::call::call_function_impl_result(
+            handler,
+            &[w_context, base, w_sysid, w_pubid],
+        )?;
         if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
             return self.fail("error in processing external entity reference");
         }
@@ -1235,10 +1256,11 @@ impl<'a> MiniXmlParser<'a> {
         &self,
         pubid: PyObjectRef,
         sysid: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
-        let use_foreign = crate::baseobjspace::getattr_str(self.parser, "_pyre_use_foreign_dtd")
-            .map(is_true_obj)
-            .unwrap_or(false);
+    ) -> Result<(), pyre_interpreter::PyError> {
+        let use_foreign =
+            pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_use_foreign_dtd")
+                .map(is_true_obj)
+                .unwrap_or(false);
         let parses_external_subset =
             get_parser_int(self.parser, "_pyre_param_entity_parsing", 0) != 0;
         if (!use_foreign && (unsafe { is_none(sysid) } || !parses_external_subset))
@@ -1246,7 +1268,8 @@ impl<'a> MiniXmlParser<'a> {
         {
             return Ok(());
         }
-        let Ok(handler) = crate::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler")
+        let Ok(handler) =
+            pyre_interpreter::baseobjspace::getattr_str(self.parser, "ExternalEntityRefHandler")
         else {
             return Ok(());
         };
@@ -1259,9 +1282,12 @@ impl<'a> MiniXmlParser<'a> {
         // there for the whole doctype.
         let roots = pyre_object::gc_roots::push_roots();
         let handler = roots.pin_root(handler);
-        let base = crate::baseobjspace::getattr_str(self.parser, "_pyre_base")
+        let base = pyre_interpreter::baseobjspace::getattr_str(self.parser, "_pyre_base")
             .unwrap_or_else(|_| w_none());
-        let ret = crate::call::call_function_impl_result(handler, &[w_none(), base, sysid, pubid])?;
+        let ret = pyre_interpreter::call::call_function_impl_result(
+            handler,
+            &[w_none(), base, sysid, pubid],
+        )?;
         if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
             return self.fail("error in processing external entity reference");
         }
@@ -1274,7 +1300,7 @@ impl<'a> MiniXmlParser<'a> {
         let value_roots = pyre_object::gc_roots::push_roots();
         let value_slot = value_roots.base();
         let _ = value_roots.pin_root(w_str_new_managed(value));
-        let Ok(intern) = crate::baseobjspace::getattr_str(self.parser, "intern") else {
+        let Ok(intern) = pyre_interpreter::baseobjspace::getattr_str(self.parser, "intern") else {
             return value_roots.get(value_slot);
         };
         if unsafe { is_none(intern) } {
@@ -1298,28 +1324,32 @@ impl<'a> MiniXmlParser<'a> {
         }
     }
 
-    fn fail<T>(&self, msg: &str) -> Result<T, crate::PyError> {
+    fn fail<T>(&self, msg: &str) -> Result<T, pyre_interpreter::PyError> {
         Err(self.make_error(msg))
     }
 
-    fn make_error(&self, msg: &str) -> crate::PyError {
+    fn make_error(&self, msg: &str) -> pyre_interpreter::PyError {
         let code = error_code_for_message(msg);
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "ErrorLineNumber",
             w_int_new(self.pos.line as i64),
         );
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "ErrorColumnNumber",
             w_int_new(self.pos.col as i64),
         );
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "ErrorByteIndex",
             w_int_new(self.pos.index as i64),
         );
-        crate::baseobjspace::setdictvalue_native(self.parser, "ErrorCode", w_int_new(code));
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            self.parser,
+            "ErrorCode",
+            w_int_new(code),
+        );
         pyexpat_error(
             format!("{msg}: line {}, column {}", self.pos.line, self.pos.col),
             code,
@@ -1329,17 +1359,17 @@ impl<'a> MiniXmlParser<'a> {
     }
 
     fn update_position_slots(&self) {
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentLineNumber",
             w_int_new(self.pos.line as i64),
         );
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentColumnNumber",
             w_int_new(self.pos.col as i64),
         );
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             self.parser,
             "CurrentByteIndex",
             w_int_new(self.pos.index as i64),
@@ -1347,24 +1377,27 @@ impl<'a> MiniXmlParser<'a> {
     }
 }
 
-fn object_to_xml_string(parser: PyObjectRef, obj: PyObjectRef) -> Result<String, crate::PyError> {
+fn object_to_xml_string(
+    parser: PyObjectRef,
+    obj: PyObjectRef,
+) -> Result<String, pyre_interpreter::PyError> {
     unsafe {
         if is_str(obj) {
             Ok(w_str_get_value(obj).to_string())
         } else if pyre_object::bytesobject::is_bytes_like(obj) {
             decode_xml_bytes(parser, pyre_object::bytesobject::bytes_like_data(obj))
         } else {
-            Err(crate::PyError::type_error(
+            Err(pyre_interpreter::PyError::type_error(
                 "Parse() argument must be str or bytes",
             ))
         }
     }
 }
 
-fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, crate::PyError> {
+fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, pyre_interpreter::PyError> {
     let enc = declared_or_forced_encoding(parser, data)?;
     let normalized = normalize_encoding(&enc);
-    crate::baseobjspace::setdictvalue_native(
+    pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_forced_encoding",
         w_str_new_managed(&normalized),
@@ -1391,7 +1424,7 @@ fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, crate::P
                     "unknown encoding: undefined",
                 ))
             } else if normalized == "hex-codec" || normalized == "rot-13" || normalized == "xyz" {
-                Err(crate::PyError::lookup_error(format!(
+                Err(pyre_interpreter::PyError::lookup_error(format!(
                     "unknown encoding: {enc}"
                 )))
             } else {
@@ -1406,7 +1439,10 @@ fn decode_xml_bytes(parser: PyObjectRef, data: &[u8]) -> Result<String, crate::P
     }
 }
 
-fn declared_or_forced_encoding(parser: PyObjectRef, data: &[u8]) -> Result<String, crate::PyError> {
+fn declared_or_forced_encoding(
+    parser: PyObjectRef,
+    data: &[u8],
+) -> Result<String, pyre_interpreter::PyError> {
     if data.starts_with(&[0xff, 0xfe]) {
         return Ok("utf-16le".to_string());
     }
@@ -1425,7 +1461,7 @@ fn declared_or_forced_encoding(parser: PyObjectRef, data: &[u8]) -> Result<Strin
     if data.starts_with(&[0, b'<', 0, b'?', 0, b'x']) {
         return Ok("utf-16be".to_string());
     }
-    if let Ok(obj) = crate::baseobjspace::getattr_str(parser, "_pyre_forced_encoding")
+    if let Ok(obj) = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_forced_encoding")
         && unsafe { is_str(obj) }
     {
         return Ok(unsafe { w_str_get_value(obj) }.to_string());
@@ -1458,7 +1494,7 @@ fn looks_like_utf16(data: &[u8]) -> bool {
         || data.starts_with(&[0, b'<', 0, b'?', 0, b'x'])
 }
 
-fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, crate::PyError> {
+fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, pyre_interpreter::PyError> {
     let (little, start) = if data.starts_with(&[0xff, 0xfe]) {
         (true, 2)
     } else if data.starts_with(&[0xfe, 0xff]) {
@@ -1467,7 +1503,7 @@ fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, crate::PyError> 
         (enc != "utf-16be", 0)
     };
     if !(data.len() - start).is_multiple_of(2) {
-        return Err(crate::PyError::value_error("partial character"));
+        return Err(pyre_interpreter::PyError::value_error("partial character"));
     }
     let words: Vec<u16> = data[start..]
         .chunks_exact(2)
@@ -1480,7 +1516,7 @@ fn decode_utf16_bytes(data: &[u8], enc: &str) -> Result<String, crate::PyError> 
         })
         .collect();
     String::from_utf16(&words)
-        .map_err(|_| crate::PyError::value_error("not well-formed (invalid token)"))
+        .map_err(|_| pyre_interpreter::PyError::value_error("not well-formed (invalid token)"))
 }
 
 fn normalize_encoding(enc: &str) -> String {
@@ -1513,11 +1549,11 @@ fn is_true_obj(obj: PyObjectRef) -> bool {
     }
 }
 
-fn make_builtin_error(name: &str, msg: &str) -> crate::PyError {
-    let mut err = crate::PyError::value_error(msg.to_string());
-    if let Some(cls) = crate::builtins::lookup_exc_class(name) {
+fn make_builtin_error(name: &str, msg: &str) -> pyre_interpreter::PyError {
+    let mut err = pyre_interpreter::PyError::value_error(msg.to_string());
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(name) {
         let args = [cls, w_str_new_managed(msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
     }
@@ -1525,14 +1561,14 @@ fn make_builtin_error(name: &str, msg: &str) -> crate::PyError {
 }
 
 fn parser_pending(parser: PyObjectRef) -> String {
-    match crate::baseobjspace::getattr_str(parser, "_pyre_pending_xml") {
+    match pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_pending_xml") {
         Ok(obj) if unsafe { is_str(obj) } => unsafe { w_str_get_value(obj) }.to_string(),
         _ => String::new(),
     }
 }
 
 fn set_parser_pending(parser: PyObjectRef, pending: &str) {
-    crate::baseobjspace::setdictvalue_native(
+    pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_pending_xml",
         w_str_new_managed(pending),
@@ -1540,7 +1576,7 @@ fn set_parser_pending(parser: PyObjectRef, pending: &str) {
 }
 
 fn get_parser_int(parser: PyObjectRef, name: &str, default: i64) -> i64 {
-    match crate::baseobjspace::getattr_str(parser, name) {
+    match pyre_interpreter::baseobjspace::getattr_str(parser, name) {
         Ok(obj) if unsafe { is_int(obj) } => unsafe { w_int_get_value(obj) },
         _ => default,
     }
@@ -1551,14 +1587,18 @@ fn get_emit_upto(parser: PyObjectRef) -> usize {
 }
 
 fn set_emit_upto(parser: PyObjectRef, value: usize) {
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(value as i64));
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_emit_upto",
+        w_int_new(value as i64),
+    );
 }
 
 fn parse_impl(
     parser: PyObjectRef,
     data: PyObjectRef,
     isfinal: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `data` can be the fresh chunk a Python `read()` just returned, named
     // only by this parameter, and the pending-input lookup below runs a full
     // `getattr` before it is decoded.  One liveness pin; a `str`/`bytes` does
@@ -1566,7 +1606,7 @@ fn parse_impl(
     // stays reachable through the caller.
     let roots = pyre_object::gc_roots::push_roots();
     let data = roots.pin_root(data);
-    if crate::baseobjspace::getattr_str(parser, "_pyre_finished")
+    if pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_finished")
         .map(is_true_obj)
         .unwrap_or(false)
     {
@@ -1581,12 +1621,14 @@ fn parse_impl(
     input.push_str(&object_to_xml_string(parser, data)?);
     let final_flag = is_true_obj(isfinal);
     maybe_reject_amplification(parser, &input)?;
-    let reparse_deferral = crate::baseobjspace::getattr_str(parser, "_pyre_reparse_deferral")
-        .map(is_true_obj)
-        .unwrap_or(true);
-    let deferred_incomplete = crate::baseobjspace::getattr_str(parser, "_pyre_deferred_incomplete")
-        .map(is_true_obj)
-        .unwrap_or(false);
+    let reparse_deferral =
+        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_reparse_deferral")
+            .map(is_true_obj)
+            .unwrap_or(true);
+    let deferred_incomplete =
+        pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_deferred_incomplete")
+            .map(is_true_obj)
+            .unwrap_or(false);
     if !final_flag && reparse_deferral && deferred_incomplete {
         set_parser_pending(parser, &input);
         return Ok(w_int_new(1));
@@ -1601,14 +1643,14 @@ fn parse_impl(
         }
     } else {
         set_parser_pending(parser, &input);
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             parser,
             "_pyre_deferred_incomplete",
             w_bool_from(true),
         );
         return Ok(w_int_new(1));
     };
-    if crate::baseobjspace::getattr_str(parser, "_pyre_use_foreign_dtd")
+    if pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_use_foreign_dtd")
         .map(is_true_obj)
         .unwrap_or(false)
         && !parse_input.contains("<!DOCTYPE")
@@ -1618,15 +1660,19 @@ fn parse_impl(
     let suppress_until = get_emit_upto(parser);
     let parsed = MiniXmlParser::new(parser, &parse_input, final_flag, suppress_until).parse()?;
     if final_flag {
-        crate::baseobjspace::setdictvalue_native(parser, "_pyre_finished", w_bool_from(true));
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_finished",
+            w_bool_from(true),
+        );
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             parser,
             "_pyre_deferred_incomplete",
             w_bool_from(false),
         );
         set_parser_pending(parser, "");
     } else {
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             parser,
             "_pyre_deferred_incomplete",
             w_bool_from(false),
@@ -1641,8 +1687,10 @@ fn call_foreign_dtd_handler(
     parser: PyObjectRef,
     pubid: PyObjectRef,
     sysid: PyObjectRef,
-) -> Result<(), crate::PyError> {
-    let Ok(handler) = crate::baseobjspace::getattr_str(parser, "ExternalEntityRefHandler") else {
+) -> Result<(), pyre_interpreter::PyError> {
+    let Ok(handler) =
+        pyre_interpreter::baseobjspace::getattr_str(parser, "ExternalEntityRefHandler")
+    else {
         return Ok(());
     };
     if handler.is_null() || unsafe { is_none(handler) } {
@@ -1653,8 +1701,12 @@ fn call_foreign_dtd_handler(
     // liveness pin.
     let roots = pyre_object::gc_roots::push_roots();
     let handler = roots.pin_root(handler);
-    let base = crate::baseobjspace::getattr_str(parser, "_pyre_base").unwrap_or_else(|_| w_none());
-    let ret = crate::call::call_function_impl_result(handler, &[w_none(), base, sysid, pubid])?;
+    let base = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_base")
+        .unwrap_or_else(|_| w_none());
+    let ret = pyre_interpreter::call::call_function_impl_result(
+        handler,
+        &[w_none(), base, sysid, pubid],
+    )?;
     if unsafe { is_int(ret) && w_int_get_value(ret) == 0 } {
         return Err(pyexpat_error(
             "error in processing external entity reference: line 1, column 0".to_string(),
@@ -1666,12 +1718,15 @@ fn call_foreign_dtd_handler(
     Ok(())
 }
 
-fn maybe_reject_amplification(parser: PyObjectRef, input: &str) -> Result<(), crate::PyError> {
+fn maybe_reject_amplification(
+    parser: PyObjectRef,
+    input: &str,
+) -> Result<(), pyre_interpreter::PyError> {
     if !input.contains("<!ENTITY row") {
         return Ok(());
     }
     let threshold = get_parser_int(parser, "_pyre_billion_threshold", i64::MAX);
-    let max_one = crate::baseobjspace::getattr_str(parser, "_pyre_billion_max_is_one")
+    let max_one = pyre_interpreter::baseobjspace::getattr_str(parser, "_pyre_billion_max_is_one")
         .map(is_true_obj)
         .unwrap_or(false);
     if threshold <= 3 || max_one {
@@ -1691,11 +1746,11 @@ fn maybe_reject_amplification(parser: PyObjectRef, input: &str) -> Result<(), cr
 /// `xml.parsers.expat.ExpatError`, and the last is the one it is named for.
 const EXPAT_ERROR_NAME: &str = "xml.parsers.expat.ExpatError";
 
-fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> crate::PyError {
-    let mut err = crate::PyError::value_error(msg.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class(EXPAT_ERROR_NAME) {
+fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> pyre_interpreter::PyError {
+    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(EXPAT_ERROR_NAME) {
         let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             // The fresh exception is named only by this local while the three
             // stores below build their values and grow its attribute storage.
             // One liveness pin at the mint; an exception instance does not move,
@@ -1703,9 +1758,9 @@ fn pyexpat_error(msg: String, code: i64, lineno: i64, offset: i64) -> crate::PyE
             // stays reachable through the registry.
             let roots = pyre_object::gc_roots::push_roots();
             let exc = roots.pin_root(exc);
-            crate::baseobjspace::setdictvalue_native(exc, "code", w_int_new(code));
-            crate::baseobjspace::setdictvalue_native(exc, "lineno", w_int_new(lineno));
-            crate::baseobjspace::setdictvalue_native(exc, "offset", w_int_new(offset));
+            pyre_interpreter::baseobjspace::setdictvalue_native(exc, "code", w_int_new(code));
+            pyre_interpreter::baseobjspace::setdictvalue_native(exc, "lineno", w_int_new(lineno));
+            pyre_interpreter::baseobjspace::setdictvalue_native(exc, "offset", w_int_new(offset));
             err.exc_object = exc;
         }
     }
@@ -1731,13 +1786,13 @@ fn copy_parser_config(src: PyObjectRef, dst: PyObjectRef) {
         "_pyre_forced_encoding",
         "_pyre_base",
     ] {
-        if let Ok(value) = crate::baseobjspace::getattr_str(src, name) {
-            crate::baseobjspace::setdictvalue_native(dst, name, value);
+        if let Ok(value) = pyre_interpreter::baseobjspace::getattr_str(src, name) {
+            pyre_interpreter::baseobjspace::setdictvalue_native(dst, name, value);
         }
     }
     for h in HANDLER_NAMES {
-        if let Ok(value) = crate::baseobjspace::getattr_str(src, h) {
-            crate::baseobjspace::setdictvalue_native(dst, h, value);
+        if let Ok(value) = pyre_interpreter::baseobjspace::getattr_str(src, h) {
+            pyre_interpreter::baseobjspace::setdictvalue_native(dst, h, value);
         }
     }
 }
@@ -1745,30 +1800,30 @@ fn copy_parser_config(src: PyObjectRef, dst: PyObjectRef) {
 mod xmlparser_class {
     use super::*;
 
-    crate::py_class! {
+    pyre_interpreter::py_class! {
         "xmlparser",
         methods: {
             fn Parse(
                 self_obj: PyObjectRef,
                 data: PyObjectRef,
                 #[default(w_bool_from(false))] isfinal: PyObjectRef,
-            ) -> Result<PyObjectRef, crate::PyError> {
+            ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 parse_impl(self_obj, data, isfinal)
             }
             fn ParseFile(
                 self_obj: PyObjectRef,
                 file: PyObjectRef,
-            ) -> Result<PyObjectRef, crate::PyError> {
+            ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 // `read` comes back as a freshly bound method that only this
                 // local names, and it is reused after every chunk is parsed —
                 // arbitrary Python runs in between.  One liveness pin; a method
                 // does not move, so the local stays current.
                 let roots = pyre_object::gc_roots::push_roots();
-                let read = crate::baseobjspace::getattr_str(file, "read")?;
+                let read = pyre_interpreter::baseobjspace::getattr_str(file, "read")?;
                 let read = roots.pin_root(read);
                 let mut result = w_int_new(1);
                 loop {
-                    let data = crate::call::call_function_impl_result(read, &[w_int_new(2048)])?;
+                    let data = pyre_interpreter::call::call_function_impl_result(read, &[w_int_new(2048)])?;
                     let eof = if unsafe { is_str(data) } {
                         unsafe { w_str_get_value(data).is_empty() }
                     } else if unsafe { pyre_object::bytesobject::is_bytes_like(data) } {
@@ -1782,15 +1837,15 @@ mod xmlparser_class {
                     }
                 }
             }
-            fn SetBase(self_obj: PyObjectRef, base: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            fn SetBase(self_obj: PyObjectRef, base: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 if unsafe { !is_str(base) } {
-                    return Err(crate::PyError::type_error("SetBase() argument must be str"));
+                    return Err(pyre_interpreter::PyError::type_error("SetBase() argument must be str"));
                 }
-                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_base", base);
+                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_base", base);
                 Ok(w_none())
             }
             fn GetBase(self_obj: PyObjectRef) -> PyObjectRef {
-                crate::baseobjspace::getattr_str(self_obj, "_pyre_base").unwrap_or_else(|_| w_none())
+                pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_base").unwrap_or_else(|_| w_none())
             }
             fn GetInputContext(self_obj: PyObjectRef) -> PyObjectRef {
                 let _ = self_obj;
@@ -1802,7 +1857,7 @@ mod xmlparser_class {
                 } else {
                     is_true_obj(flag)
                 };
-                crate::baseobjspace::setdictvalue_native(
+                pyre_interpreter::baseobjspace::setdictvalue_native(
                     self_obj,
                     "_pyre_param_entity_parsing",
                     w_int_new(if enabled { 1 } else { 0 }),
@@ -1813,35 +1868,35 @@ mod xmlparser_class {
                 self_obj: PyObjectRef,
                 #[default(w_bool_from(true))] flag: PyObjectRef,
             ) -> PyObjectRef {
-                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_use_foreign_dtd", w_bool_from(is_true_obj(flag)));
+                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_use_foreign_dtd", w_bool_from(is_true_obj(flag)));
                 w_none()
             }
             fn GetReparseDeferralEnabled(self_obj: PyObjectRef) -> PyObjectRef {
-                crate::baseobjspace::getattr_str(self_obj, "_pyre_reparse_deferral").unwrap_or_else(|_| w_bool_from(true))
+                pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_reparse_deferral").unwrap_or_else(|_| w_bool_from(true))
             }
             fn SetReparseDeferralEnabled(self_obj: PyObjectRef, flag: PyObjectRef) -> PyObjectRef {
-                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_reparse_deferral", w_bool_from(is_true_obj(flag)));
+                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_reparse_deferral", w_bool_from(is_true_obj(flag)));
                 w_none()
             }
-            fn SetBillionLaughsAttackProtectionActivationThreshold(self_obj: PyObjectRef, threshold: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                if crate::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser").map(is_true_obj).unwrap_or(false) {
+            fn SetBillionLaughsAttackProtectionActivationThreshold(self_obj: PyObjectRef, threshold: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+                if pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser").map(is_true_obj).unwrap_or(false) {
                     return Err(pyexpat_error("parser must be a root parser".to_string(), 0, 0, 0));
                 }
                 if unsafe { !is_int(threshold) } {
-                    return Err(crate::PyError::type_error("threshold must be int"));
+                    return Err(pyre_interpreter::PyError::type_error("threshold must be int"));
                 }
                 if unsafe { w_int_get_value(threshold) } < 0 {
-                    return Err(crate::PyError::value_error("threshold must be non-negative"));
+                    return Err(pyre_interpreter::PyError::value_error("threshold must be non-negative"));
                 }
-                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_threshold", threshold);
+                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_threshold", threshold);
                 Ok(w_none())
             }
-            fn SetBillionLaughsAttackProtectionMaximumAmplification(self_obj: PyObjectRef, max_factor: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-                if crate::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser").map(is_true_obj).unwrap_or(false) {
+            fn SetBillionLaughsAttackProtectionMaximumAmplification(self_obj: PyObjectRef, max_factor: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+                if pyre_interpreter::baseobjspace::getattr_str(self_obj, "_pyre_is_subparser").map(is_true_obj).unwrap_or(false) {
                     return Err(pyexpat_error("parser must be a root parser".to_string(), 0, 0, 0));
                 }
                 if unsafe { !(is_float(max_factor) || is_int(max_factor)) } {
-                    return Err(crate::PyError::type_error("max_factor must be float"));
+                    return Err(pyre_interpreter::PyError::type_error("max_factor must be float"));
                 }
                 let value = unsafe {
                     if is_float(max_factor) {
@@ -1858,7 +1913,7 @@ mod xmlparser_class {
                         0,
                     ));
                 }
-                crate::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_max_is_one", w_bool_from(value <= 1.0));
+                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "_pyre_billion_max_is_one", w_bool_from(value <= 1.0));
                 Ok(w_none())
             }
             fn ExternalEntityParserCreate(
@@ -1875,37 +1930,37 @@ mod xmlparser_class {
                 let parser = roots.pin_root(parser);
                 init_parser_slots(parser);
                 copy_parser_config(self_obj, parser);
-                crate::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(true));
+                pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(true));
                 if unsafe { is_str(encoding) } {
-                    crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
+                    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
                 }
-                crate::baseobjspace::setdictvalue_native(parser, "_pyre_external_context", context);
+                pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_external_context", context);
                 parser
             }
-            fn __setattr__(self_obj: PyObjectRef, name: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+            fn __setattr__(self_obj: PyObjectRef, name: PyObjectRef, value: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
                 if unsafe { !is_str(name) } {
-                    return Err(crate::PyError::type_error("attribute name must be string"));
+                    return Err(pyre_interpreter::PyError::type_error("attribute name must be string"));
                 }
                 let name_s = unsafe { w_str_get_value(name) };
                 if name_s == "returns_unicode" {
-                    return Err(crate::PyError::attribute_error("returns_unicode"));
+                    return Err(pyre_interpreter::PyError::attribute_error("returns_unicode"));
                 }
                 if bool_slot_name(name_s) {
-                    crate::baseobjspace::setdictvalue_native(self_obj, name_s, w_bool_from(is_true_obj(value)));
+                    pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, name_s, w_bool_from(is_true_obj(value)));
                     return Ok(w_none());
                 }
                 if name_s == "buffer_size" {
                     if unsafe { is_float(value) } {
-                        return Err(crate::PyError::type_error("buffer_size must be an integer"));
+                        return Err(pyre_interpreter::PyError::type_error("buffer_size must be an integer"));
                     }
-                    let size = crate::baseobjspace::int_w(value)?;
+                    let size = pyre_interpreter::baseobjspace::int_w(value)?;
                     if size <= 0 {
-                        return Err(crate::PyError::value_error("buffer_size must be greater than zero"));
+                        return Err(pyre_interpreter::PyError::value_error("buffer_size must be greater than zero"));
                     }
-                    crate::baseobjspace::setdictvalue_native(self_obj, "buffer_size", value);
+                    pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, "buffer_size", value);
                     return Ok(w_none());
                 }
-                crate::baseobjspace::setdictvalue_native(self_obj, name_s, value);
+                pyre_interpreter::baseobjspace::setdictvalue_native(self_obj, name_s, value);
                 Ok(w_none())
             }
         }
@@ -1914,13 +1969,13 @@ mod xmlparser_class {
 
 fn init_parser_slots(parser: PyObjectRef) {
     for h in HANDLER_NAMES {
-        crate::baseobjspace::setdictvalue_native(parser, h, w_none());
+        pyre_interpreter::baseobjspace::setdictvalue_native(parser, h, w_none());
     }
     let set_int = |name: &str, v: i64| {
-        crate::baseobjspace::setdictvalue_native(parser, name, w_int_new(v));
+        pyre_interpreter::baseobjspace::setdictvalue_native(parser, name, w_int_new(v));
     };
     let set_bool = |name: &str, v: bool| {
-        crate::baseobjspace::setdictvalue_native(parser, name, w_bool_from(v));
+        pyre_interpreter::baseobjspace::setdictvalue_native(parser, name, w_bool_from(v));
     };
     set_bool("buffer_text", false);
     set_int("buffer_size", 8192);
@@ -1935,31 +1990,51 @@ fn init_parser_slots(parser: PyObjectRef) {
     set_int("CurrentLineNumber", 0);
     set_int("CurrentColumnNumber", 0);
     set_int("CurrentByteIndex", 0);
-    crate::baseobjspace::setdictvalue_native(parser, "intern", w_dict_new());
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new(""));
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(0));
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_finished", w_bool_from(false));
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_base", w_none());
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_use_foreign_dtd", w_bool_from(false));
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_reparse_deferral", w_bool_from(true));
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_is_subparser", w_bool_from(false));
-    crate::baseobjspace::setdictvalue_native(
+    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "intern", w_dict_new());
+    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_pending_xml", w_str_new(""));
+    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_emit_upto", w_int_new(0));
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_finished",
+        w_bool_from(false),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(parser, "_pyre_base", w_none());
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_use_foreign_dtd",
+        w_bool_from(false),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_reparse_deferral",
+        w_bool_from(true),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_is_subparser",
+        w_bool_from(false),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_deferred_incomplete",
         w_bool_from(false),
     );
-    crate::baseobjspace::setdictvalue_native(parser, "_pyre_param_entity_parsing", w_int_new(0));
-    crate::baseobjspace::setdictvalue_native(
+    pyre_interpreter::baseobjspace::setdictvalue_native(
+        parser,
+        "_pyre_param_entity_parsing",
+        w_int_new(0),
+    );
+    pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_billion_threshold",
         w_int_new(i64::MAX),
     );
-    crate::baseobjspace::setdictvalue_native(
+    pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_billion_max_is_one",
         w_bool_from(false),
     );
-    crate::baseobjspace::setdictvalue_native(
+    pyre_interpreter::baseobjspace::setdictvalue_native(
         parser,
         "_pyre_not_standalone_pending",
         w_bool_from(false),
@@ -1969,10 +2044,10 @@ fn init_parser_slots(parser: PyObjectRef) {
 /// `ParserCreate()`'s spelling for a `str`-or-`None` parameter handed
 /// something else.  Both parameters report it, so the argument name is the only
 /// thing that varies.
-fn parser_create_not_str(param: &str, obj: PyObjectRef) -> crate::PyError {
-    crate::PyError::type_error(format!(
+fn parser_create_not_str(param: &str, obj: PyObjectRef) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::type_error(format!(
         "ParserCreate() argument '{param}' must be str or None, not {}",
-        crate::type_methods::arg_type_name(obj)
+        pyre_interpreter::type_methods::arg_type_name(obj)
     ))
 }
 
@@ -1981,7 +2056,7 @@ fn parser_create3(
     encoding: PyObjectRef,
     namespace_separator: PyObjectRef,
     intern: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     // `intern` is whatever the caller passed, so it can be a `dict`, whose
     // header moves; the instance and its slot defaults below allocate all the
     // way down.  Pin it on entry and read it back for the store, or the parser
@@ -2005,21 +2080,25 @@ fn parser_create3(
         // spelling is refused here so that read cannot abort the process;
         // `space.text_w` has no such reader behind it and so does not need the
         // refusal.
-        crate::baseobjspace::str_utf8_w(encoding)?;
-        crate::baseobjspace::setdictvalue_native(parser, "_pyre_forced_encoding", encoding);
+        pyre_interpreter::baseobjspace::str_utf8_w(encoding)?;
+        pyre_interpreter::baseobjspace::setdictvalue_native(
+            parser,
+            "_pyre_forced_encoding",
+            encoding,
+        );
     }
     if unsafe { is_none(namespace_separator) } {
     } else if unsafe { is_str(namespace_separator) } {
         // `namespace_separator` reads this back through `w_str_get_value`, so
         // the refusal the encoding arm makes applies here too; the length check
         // below then runs on a value that has a `&str` view.
-        let value = crate::baseobjspace::str_utf8_w(namespace_separator)?;
+        let value = pyre_interpreter::baseobjspace::str_utf8_w(namespace_separator)?;
         if value.chars().count() > 1 {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "namespace_separator must be at most one character, omitted, or None",
             ));
         }
-        crate::baseobjspace::setdictvalue_native(
+        pyre_interpreter::baseobjspace::setdictvalue_native(
             parser,
             "_pyre_namespace_separator",
             w_str_new_managed(value),
@@ -2037,14 +2116,14 @@ fn parser_create3(
     // `intern_string` reads `None` back as "do not intern".
     let intern = roots.get(intern_slot);
     if !intern.is_null() {
-        crate::baseobjspace::setdictvalue_native(parser, "intern", intern);
+        pyre_interpreter::baseobjspace::setdictvalue_native(parser, "intern", intern);
     }
     Ok(parser)
 }
 
 /// `ErrorString(code)` — map an error code to its message via the `errors`
 /// table.  Returns `None` for an unknown code (matching the C behaviour).
-fn error_string(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn error_string(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let code = match args.first().copied() {
         Some(o) if unsafe { is_int(o) } => unsafe { w_int_get_value(o) },
         _ => return Ok(w_none()),
@@ -2165,7 +2244,7 @@ const ERROR_NAMES: &[&str] = &[
 /// Build a `hasdict` namespace object used for the `model` / `errors`
 /// submodules; constants are written as instance attributes.
 fn make_namespace(name: &'static str) -> PyObjectRef {
-    let tp = crate::typedef::make_builtin_type(name, |_| {});
+    let tp = pyre_interpreter::typedef::make_builtin_type(name, |_| {});
     unsafe { typeobject::w_type_set_hasdict(tp, true) };
     // The fresh instance is named only by this local while the name store below
     // builds its string and installs the instance's attribute storage, so it
@@ -2175,11 +2254,11 @@ fn make_namespace(name: &'static str) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let obj = w_instance_new(tp);
     let obj = roots.pin_root(obj);
-    crate::baseobjspace::setdictvalue_native(obj, "__name__", w_str_new(name));
+    pyre_interpreter::baseobjspace::setdictvalue_native(obj, "__name__", w_str_new(name));
     obj
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "pyexpat",
     interpleveldefs: {
         "EXPAT_VERSION"   => w_str_new("expat_2.6.4"),
@@ -2198,7 +2277,7 @@ crate::py_module! {
             // they mean different things (`parser_create3`) — so the default is
             // the absent marker and not the value.
             #[default(pyre_object::PY_NULL)] intern: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             parser_create3(encoding, namespace_separator, intern)
         }
     },
@@ -2212,14 +2291,14 @@ crate::py_module! {
         // it cannot come from the `exceptions:` arm, which qualifies the key
         // with the module it is declared in.  Both `error` and `ExpatError`
         // name the one class.
-        let err = crate::builtins::new_exception_class(
+        let err = pyre_interpreter::builtins::new_exception_class(
             EXPAT_ERROR_NAME,
-            crate::builtins::exc_exception_new,
-            crate::builtins::lookup_exc_class("Exception")
+            pyre_interpreter::builtins::exc_exception_new,
+            pyre_interpreter::builtins::lookup_exc_class("Exception")
                 .expect("Exception must be installed before pyexpat init"),
         );
-        crate::module_ns_store(ns, "error", err);
-        crate::module_ns_store(ns, "ExpatError", err);
+        pyre_interpreter::module_ns_store(ns, "error", err);
+        pyre_interpreter::module_ns_store(ns, "ExpatError", err);
 
         // model — content-model integer constants.
         // Each submodule object is a fresh instance named only by its local
@@ -2230,9 +2309,9 @@ crate::py_module! {
         let model = make_namespace("pyexpat.model");
         let model = ns_roots.pin_root(model);
         for (name, value) in MODEL_CONSTANTS {
-            crate::baseobjspace::setdictvalue_native(model, name, w_int_new(*value));
+            pyre_interpreter::baseobjspace::setdictvalue_native(model, name, w_int_new(*value));
         }
-        crate::module_ns_store(ns, "model", model);
+        pyre_interpreter::module_ns_store(ns, "model", model);
 
         // errors — XML_ERROR_* message strings plus the `codes`
         // (message -> code) and `messages` (code -> message) maps.
@@ -2258,7 +2337,7 @@ crate::py_module! {
             let (msg, code) = ERROR_TABLE[idx - 1];
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = error_map_roots.pin_root(w_str_new(msg));
-            crate::baseobjspace::setdictvalue_native(
+            pyre_interpreter::baseobjspace::setdictvalue_native(
                 errors,
                 name,
                 error_map_roots.get(msg_slot),
@@ -2271,10 +2350,10 @@ crate::py_module! {
             unsafe { w_dict_store(messages, w_key, error_map_roots.get(msg_slot)) };
         }
         let codes = error_map_roots.get(codes_slot);
-        crate::baseobjspace::setdictvalue_native(errors, "codes", codes);
+        pyre_interpreter::baseobjspace::setdictvalue_native(errors, "codes", codes);
         let messages = error_map_roots.get(messages_slot);
-        crate::baseobjspace::setdictvalue_native(errors, "messages", messages);
-        crate::module_ns_store(ns, "errors", errors);
+        pyre_interpreter::baseobjspace::setdictvalue_native(errors, "messages", messages);
+        pyre_interpreter::module_ns_store(ns, "errors", errors);
 
         // features — list of (name, value) capability tuples.
         // Each name, value and tuple allocates while the pieces already built
@@ -2299,6 +2378,6 @@ crate::py_module! {
             feature_items.push(entry);
         }
         let features = w_list_new(feature_items.take());
-        crate::module_ns_store(ns, "features", features);
+        pyre_interpreter::module_ns_store(ns, "features", features);
     },
 }

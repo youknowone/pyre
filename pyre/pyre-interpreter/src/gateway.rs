@@ -1502,7 +1502,7 @@ pub(crate) fn is_slot_wrapper(type_name: &str, name: &str) -> bool {
 #[cold]
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub(crate) fn receiver_mismatch(
+pub fn receiver_mismatch(
     ty: &str,
     name: &str,
     receiver: Option<PyObjectRef>,

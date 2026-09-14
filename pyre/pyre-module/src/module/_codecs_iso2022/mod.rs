@@ -1,14 +1,14 @@
-//! PyPy `lib_pypy/_codecs_jp.py`:
+//! PyPy `lib_pypy/_codecs_iso2022.py`:
 //! `from _multibytecodec import __getcodec as getcodec`.
 
 use pyre_object::*;
 
-fn getcodec(args: &[PyObjectRef]) -> crate::PyResult {
+fn getcodec(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     super::_multibytecodec::getcodec(args)
 }
 
-crate::py_module! {
-    "_codecs_jp",
+pyre_interpreter::py_module! {
+    "_codecs_iso2022",
     functions: {
         "getcodec" / 1 = getcodec,
     },

@@ -714,19 +714,11 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
-    pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
     // PyPy `_codecs/moduledef.py:87-100 Module.__init__` performs this beside
     // MixedModule installation, not inside the translated CodecState ctor.
     crate::module::_codecs::register_builtin_error_handlers();
-    pyre_install_module!(_codecs_cn);
-    pyre_install_module!(_codecs_jp);
-    pyre_install_module!(_codecs_iso2022);
-    pyre_install_module!(_codecs_hk);
-    pyre_install_module!(_codecs_kr);
-    pyre_install_module!(_codecs_tw);
-    pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
     // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a
     // module literally named `posix` does not exist. os.py picks `os.name` and
@@ -742,7 +734,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(errno);
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
-    pyre_install_module!(_opcode);
     pyre_install_module!("_imp"(imp));
 
     // importlib package and its submodules load their real source from disk:
@@ -810,25 +801,21 @@ pub fn install_builtin_modules() {
             not(target_arch = "wasm32")
         ))]
         pyre_install_module!(_cffi_backend);
-        pyre_install_module!(_multiprocessing);
     }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
     pyre_install_module!(_pypy_generic_alias);
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
-    pyre_install_module!(binascii);
     pyre_install_module!(marshal);
     pyre_install_module!(zlib);
     pyre_install_module!(_bz2);
     pyre_install_module!(_lsprof);
     pyre_install_module!(_lzma);
     pyre_install_module!(_typing);
-    pyre_install_module!(_template);
     pyre_install_module!(_hashlib);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
-    pyre_install_module!(pyexpat);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub
@@ -844,7 +831,6 @@ pub fn install_builtin_modules() {
     );
     register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_queue", crate::module::_queue::init);
-    register_builtin_module("_statistics", crate::module::_statistics::init);
     register_builtin_module("_types", crate::module::_types::init);
     register_builtin_module("_json", crate::module::_json::init);
     register_builtin_module("_tokenize", crate::module::_tokenize::init);

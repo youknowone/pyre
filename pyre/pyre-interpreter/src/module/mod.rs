@@ -22,18 +22,6 @@ pub mod _cffi_backend;
 #[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
-pub mod _codecs_cn;
-#[allow(non_snake_case)]
-pub mod _codecs_hk;
-#[allow(non_snake_case)]
-pub mod _codecs_iso2022;
-#[allow(non_snake_case)]
-pub mod _codecs_jp;
-#[allow(non_snake_case)]
-pub mod _codecs_kr;
-#[allow(non_snake_case)]
-pub mod _codecs_tw;
-#[allow(non_snake_case)]
 pub mod _collections;
 #[allow(non_snake_case)]
 pub mod _contextvars;
@@ -46,8 +34,6 @@ pub mod _ctypes;
 pub mod _functools;
 #[allow(non_snake_case)]
 pub mod _hashlib;
-#[allow(non_snake_case)]
-pub mod _immutables_map;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _json;
@@ -57,13 +43,6 @@ pub mod _locale;
 pub mod _lsprof;
 #[allow(non_snake_case)]
 pub mod _lzma;
-#[allow(non_snake_case)]
-pub mod _multibytecodec;
-#[allow(non_snake_case)]
-#[cfg(not(feature = "sandbox"))]
-pub mod _multiprocessing;
-#[allow(non_snake_case)]
-pub mod _opcode;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _overlapped;
@@ -85,11 +64,7 @@ pub mod _ssl;
 #[allow(non_snake_case)]
 pub mod _stat;
 #[allow(non_snake_case)]
-pub mod _statistics;
-#[allow(non_snake_case)]
 pub mod _symtable;
-#[allow(non_snake_case)]
-pub mod _template;
 pub mod _tokenize;
 #[allow(non_snake_case)]
 pub mod _types;
@@ -104,7 +79,6 @@ pub mod _winapi;
 pub mod _wmi;
 pub mod array;
 pub mod atexit;
-pub mod binascii;
 pub mod errno;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod faulthandler;
@@ -123,7 +97,6 @@ pub mod operator;
 pub mod posix;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod pwd;
-pub mod pyexpat;
 pub mod pypyjit;
 #[cfg(not(feature = "sandbox"))]
 pub mod select;

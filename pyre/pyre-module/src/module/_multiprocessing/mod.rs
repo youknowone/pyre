@@ -32,13 +32,13 @@ type SemRaw = host_mp::RawHandle;
 /// The Win32 code the last call left behind, as an `OSError` carrying it in
 /// `.winerror` (`PyErr_SetExcFromWindowsErr`).
 #[cfg(all(windows, feature = "host_env"))]
-fn last_windows_error() -> crate::PyError {
+fn last_windows_error() -> pyre_interpreter::PyError {
     windows_error(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
 }
 
 #[cfg(all(windows, feature = "host_env"))]
-fn windows_error(winerror: i32) -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(winerror, PY_NULL, PY_NULL)
+fn windows_error(winerror: i32) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::os_error_win32_syscall2(winerror, PY_NULL, PY_NULL)
 }
 
 /// `interp_semaphore.py RECURSIVE_MUTEX, SEMAPHORE = range(2)`.
@@ -49,7 +49,7 @@ const SEMAPHORE: i64 = 1;
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn semlock_get_handle(obj: PyObjectRef) -> SemRaw {
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return core::ptr::null_mut();
     }
@@ -66,7 +66,7 @@ fn semlock_get_handle(obj: PyObjectRef) -> SemRaw {
 /// caller has torn up.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn semlock_get_i64(obj: PyObjectRef, key: &str) -> i64 {
-    let d = crate::baseobjspace::getdict_native(obj);
+    let d = pyre_interpreter::baseobjspace::getdict_native(obj);
     if d.is_null() {
         return 0;
     }
@@ -85,8 +85,9 @@ fn semlock_set_i64(obj: PyObjectRef, key: &str, value: i64) {
     let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
     let boxed_slot = obj_slot + 1;
     let _ = pyre_object::gc_roots::pin_root(w_int_new(value));
-    let dict =
-        crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    let dict = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+    );
     if dict.is_null() {
         return;
     }
@@ -105,30 +106,33 @@ fn semlock_set_i64(obj: PyObjectRef, key: &str, value: i64) {
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn semlock_ismine(obj: PyObjectRef) -> bool {
     semlock_get_i64(obj, "count") > 0
-        && crate::module::thread::current_ident() == semlock_get_i64(obj, "last_tid")
+        && pyre_interpreter::module::thread::current_ident() == semlock_get_i64(obj, "last_tid")
 }
 
 #[cfg(all(unix, feature = "host_env"))]
-fn semlock_post(handle: SemRaw) -> Result<(), crate::PyError> {
-    host_mp::sem_post(handle)
-        .map_err(|error| crate::PyError::os_error_with_errno(error.raw_os_error(), "sem_post"))
+fn semlock_post(handle: SemRaw) -> Result<(), pyre_interpreter::PyError> {
+    host_mp::sem_post(handle).map_err(|error| {
+        pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_post")
+    })
 }
 
 /// `interp_semaphore.py semlock_getvalue`.  Not built on darwin, where
 /// `sem_getvalue` always fails (`HAVE_BROKEN_SEM_GETVALUE`,
 /// `interp_semaphore.py`) and the `sem_trywait` fallbacks run instead.
 #[cfg(all(unix, feature = "host_env", not(target_vendor = "apple")))]
-fn semlock_getvalue(handle: SemRaw) -> Result<i64, crate::PyError> {
+fn semlock_getvalue(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
     // The host helper also clamps implementations that report the number of
     // waiters as a negative value.
     unsafe { host_mp::get_semaphore_value(handle) }
         .map(i64::from)
-        .map_err(|error| crate::PyError::os_error_with_errno(error.raw_os_error(), "sem_getvalue"))
+        .map_err(|error| {
+            pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_getvalue")
+        })
 }
 
 /// `interp_semaphore.py semlock_iszero`.
 #[cfg(all(unix, feature = "host_env"))]
-fn semlock_iszero(handle: SemRaw) -> Result<bool, crate::PyError> {
+fn semlock_iszero(handle: SemRaw) -> Result<bool, pyre_interpreter::PyError> {
     #[cfg(target_vendor = "apple")]
     {
         match host_mp::sem_trywait_status(handle) {
@@ -137,14 +141,12 @@ fn semlock_iszero(handle: SemRaw) -> Result<bool, crate::PyError> {
                 Ok(false)
             }
             host_mp::TryAcquireStatus::WouldBlock => Ok(true),
-            host_mp::TryAcquireStatus::Interrupted => Err(crate::PyError::os_error_with_errno(
-                libc::EINTR,
-                "sem_trywait",
-            )),
-            host_mp::TryAcquireStatus::Error(error) => Err(crate::PyError::os_error_with_errno(
-                error.raw_os_error(),
-                "sem_trywait",
-            )),
+            host_mp::TryAcquireStatus::Interrupted => Err(
+                pyre_interpreter::PyError::os_error_with_errno(libc::EINTR, "sem_trywait"),
+            ),
+            host_mp::TryAcquireStatus::Error(error) => Err(
+                pyre_interpreter::PyError::os_error_with_errno(error.raw_os_error(), "sem_trywait"),
+            ),
         }
     }
     #[cfg(not(target_vendor = "apple"))]
@@ -155,12 +157,12 @@ fn semlock_iszero(handle: SemRaw) -> Result<bool, crate::PyError> {
 
 /// The value the semaphore currently holds, for `_get_value`.
 #[cfg(all(unix, feature = "host_env"))]
-fn semlock_value(handle: SemRaw) -> Result<i64, crate::PyError> {
+fn semlock_value(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
     // interp_semaphore.py:432-434.
     #[cfg(target_vendor = "apple")]
     {
         let _ = handle;
-        Err(crate::PyError::not_implemented(
+        Err(pyre_interpreter::PyError::not_implemented(
             "sem_getvalue is not implemented on this system",
         ))
     }
@@ -174,7 +176,7 @@ fn semlock_value(handle: SemRaw) -> Result<i64, crate::PyError> {
 /// and give it straight back, which is the only way to read it.  A wait that
 /// times out is a semaphore holding nothing.
 #[cfg(all(windows, feature = "host_env"))]
-fn semlock_value(handle: SemRaw) -> Result<i64, crate::PyError> {
+fn semlock_value(handle: SemRaw) -> Result<i64, pyre_interpreter::PyError> {
     host_mp::get_semaphore_value(handle)
         .map(i64::from)
         .map_err(|()| last_windows_error())
@@ -182,7 +184,7 @@ fn semlock_value(handle: SemRaw) -> Result<i64, crate::PyError> {
 
 /// `semaphore.c semlock_iszero`'s Windows arm.
 #[cfg(all(windows, feature = "host_env"))]
-fn semlock_iszero(handle: SemRaw) -> Result<bool, crate::PyError> {
+fn semlock_iszero(handle: SemRaw) -> Result<bool, pyre_interpreter::PyError> {
     let status = host_mp::wait_for_single_object(handle, 0);
     if status == host_mp::wait_object_0() {
         host_mp::release_semaphore(handle).map_err(|code| windows_error(code as i32))?;
@@ -207,7 +209,7 @@ fn semlock_acquire(
     handle: SemRaw,
     block: bool,
     timeout: Option<f64>,
-) -> Result<bool, crate::PyError> {
+) -> Result<bool, pyre_interpreter::PyError> {
     const SLICE_MS: u32 = 100;
     // `None` waits forever; `Some(0)` is the non-blocking poll.
     let mut remaining = match (block, timeout) {
@@ -219,7 +221,9 @@ fn semlock_acquire(
             // than saturated, so no wait silently becomes a different one.
             let msecs = (seconds * 1000.0).max(0.0);
             if msecs >= 0.5 * f64::from(u32::MAX) {
-                return Err(crate::PyError::overflow_error("timeout is too large"));
+                return Err(pyre_interpreter::PyError::overflow_error(
+                    "timeout is too large",
+                ));
             }
             Some((msecs + 0.5) as u32)
         }
@@ -227,7 +231,7 @@ fn semlock_acquire(
     loop {
         let slice = remaining.map_or(SLICE_MS, |left| left.min(SLICE_MS));
         let status = {
-            let _blocked = crate::module::thread::before_external_block();
+            let _blocked = pyre_interpreter::module::thread::before_external_block();
             host_mp::wait_for_single_object(handle, slice)
         };
         // `interp_semaphore.py:311-315` — the wait has taken the count, so it
@@ -240,7 +244,7 @@ fn semlock_acquire(
         if status != host_mp::wait_timeout() {
             return Err(last_windows_error());
         }
-        crate::module::signal::interp_signal::checksignals_now()?;
+        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
         if let Some(left) = &mut remaining {
             *left -= slice;
             if *left == 0 {
@@ -254,11 +258,15 @@ fn semlock_acquire(
 /// maximum is read: `ReleaseSemaphore` enforces the maximum itself, and the
 /// refusal it reports is the one the POSIX arm makes out of `sem_getvalue`.
 #[cfg(all(windows, feature = "host_env"))]
-fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate::PyError> {
+fn semlock_release(
+    handle: SemRaw,
+    kind: i64,
+    maxvalue: i64,
+) -> Result<(), pyre_interpreter::PyError> {
     let _ = (kind, maxvalue);
     host_mp::release_semaphore(handle).map_err(|code| {
         if code == rustpython_host_env::errno::errors::ERROR_TOO_MANY_POSTS {
-            crate::PyError::value_error("semaphore or lock released too many times")
+            pyre_interpreter::PyError::value_error("semaphore or lock released too many times")
         } else {
             windows_error(code as i32)
         }
@@ -273,11 +281,14 @@ fn semlock_create(
     value: i64,
     maxvalue: i64,
     unlink: bool,
-) -> Result<(SemRaw, Option<String>), crate::PyError> {
+) -> Result<(SemRaw, Option<String>), pyre_interpreter::PyError> {
     let _ = maxvalue;
     let (handle, kept_name) = host_mp::SemHandle::create(name, value as libc::c_uint, unlink)
         .map_err(|error| {
-            crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
+            pyre_interpreter::PyError::os_error_with_errno(
+                error.raw_os_error(),
+                error.description(),
+            )
         })?;
     let raw = handle.as_ptr();
     // SemHandle::Drop closes the semaphore. Ownership belongs to the Python
@@ -296,9 +307,9 @@ fn semlock_create(
     value: i64,
     maxvalue: i64,
     unlink: bool,
-) -> Result<(SemRaw, Option<String>), crate::PyError> {
+) -> Result<(SemRaw, Option<String>), pyre_interpreter::PyError> {
     let (Ok(value), Ok(maxvalue)) = (i32::try_from(value), i32::try_from(maxvalue)) else {
-        return Err(crate::PyError::overflow_error(
+        return Err(pyre_interpreter::PyError::overflow_error(
             "SemLock() value out of range",
         ));
     };
@@ -316,13 +327,16 @@ fn semlock_create(
 fn semlock_rebuild_raw(
     w_handle: PyObjectRef,
     name: Option<&str>,
-) -> Result<SemRaw, crate::PyError> {
+) -> Result<SemRaw, pyre_interpreter::PyError> {
     match name {
         // interp_semaphore.py:550-555 — with a name, reopen it and ignore
         // `w_handle`.
         Some(name) => {
             let handle = host_mp::SemHandle::open_existing(name).map_err(|error| {
-                crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
+                pyre_interpreter::PyError::os_error_with_errno(
+                    error.raw_os_error(),
+                    error.description(),
+                )
             })?;
             let raw = handle.as_ptr();
             core::mem::forget(handle);
@@ -330,7 +344,7 @@ fn semlock_rebuild_raw(
         }
         // interp_semaphore.py `handle = handle_w(space, w_handle)`
         // (`:223-224`).
-        None => Ok(crate::baseobjspace::int_w(w_handle)? as usize as SemRaw),
+        None => Ok(pyre_interpreter::baseobjspace::int_w(w_handle)? as usize as SemRaw),
     }
 }
 
@@ -340,9 +354,9 @@ fn semlock_rebuild_raw(
 fn semlock_rebuild_raw(
     w_handle: PyObjectRef,
     name: Option<&str>,
-) -> Result<SemRaw, crate::PyError> {
+) -> Result<SemRaw, pyre_interpreter::PyError> {
     let _ = name;
-    Ok(crate::baseobjspace::int_w(w_handle)? as usize as SemRaw)
+    Ok(pyre_interpreter::baseobjspace::int_w(w_handle)? as usize as SemRaw)
 }
 
 /// `interp_semaphore.py semlock_acquire` — the platform wait alone.
@@ -353,7 +367,7 @@ fn semlock_acquire(
     handle: SemRaw,
     block: bool,
     timeout: Option<f64>,
-) -> Result<bool, crate::PyError> {
+) -> Result<bool, pyre_interpreter::PyError> {
     // PEP 475 — sem_wait/sem_trywait retry on EINTR; otherwise
     // EAGAIN (only meaningful for trywait) yields False and the
     // remaining errnos propagate as OSError instead of being
@@ -364,38 +378,38 @@ fn semlock_acquire(
     if block && timeout.is_none() {
         loop {
             let status = {
-                let _blocked = crate::module::thread::before_external_block();
+                let _blocked = pyre_interpreter::module::thread::before_external_block();
                 host_mp::sem_wait_status(handle, None)
             };
             match status {
                 host_mp::WaitStatus::Acquired => break,
                 host_mp::WaitStatus::Interrupted => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                 }
                 host_mp::WaitStatus::TimedOut => unreachable!("untimed sem_wait timed out"),
                 host_mp::WaitStatus::Error(error) => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         error.raw_os_error(),
                         "sem_wait",
                     ));
                 }
             }
         }
-        crate::module::signal::interp_signal::checksignals_now()?;
+        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
         Ok(true)
     } else if !block {
         loop {
             match host_mp::sem_trywait_status(handle) {
                 host_mp::TryAcquireStatus::Acquired => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                     return Ok(true);
                 }
                 host_mp::TryAcquireStatus::WouldBlock => return Ok(false),
                 host_mp::TryAcquireStatus::Interrupted => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                 }
                 host_mp::TryAcquireStatus::Error(error) => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         error.raw_os_error(),
                         "sem_trywait",
                     ));
@@ -407,7 +421,10 @@ fn semlock_acquire(
             timeout.unwrap(),
         )
         .map_err(|error| {
-            crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
+            pyre_interpreter::PyError::os_error_with_errno(
+                error.raw_os_error(),
+                error.description(),
+            )
         })?;
         #[cfg(target_vendor = "apple")]
         {
@@ -416,16 +433,19 @@ fn semlock_acquire(
                 use rustpython_host_env::multiprocessing::PollWaitStep;
                 // The poll step sleeps between `sem_trywait` attempts.
                 let step = {
-                    let _blocked = crate::module::thread::before_external_block();
+                    let _blocked = pyre_interpreter::module::thread::before_external_block();
                     rustpython_host_env::multiprocessing::sem_timedwait_poll_step(
                         handle, &deadline, delay,
                     )
                 };
                 match step.map_err(|error| {
-                    crate::PyError::os_error_with_errno(error.raw_os_error(), error.description())
+                    pyre_interpreter::PyError::os_error_with_errno(
+                        error.raw_os_error(),
+                        error.description(),
+                    )
                 })? {
                     PollWaitStep::Acquired => {
-                        crate::module::signal::interp_signal::checksignals_now()?;
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                         return Ok(true);
                     }
                     PollWaitStep::Timeout => return Ok(false),
@@ -437,20 +457,20 @@ fn semlock_acquire(
         loop {
             use rustpython_host_env::multiprocessing::WaitStatus;
             let status = {
-                let _blocked = crate::module::thread::before_external_block();
+                let _blocked = pyre_interpreter::module::thread::before_external_block();
                 rustpython_host_env::multiprocessing::sem_wait_status(handle, Some(&deadline))
             };
             match status {
                 WaitStatus::Acquired => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                     return Ok(true);
                 }
                 WaitStatus::TimedOut => return Ok(false),
                 WaitStatus::Interrupted => {
-                    crate::module::signal::interp_signal::checksignals_now()?;
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                 }
                 WaitStatus::Error(error) => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         error.raw_os_error(),
                         error.description(),
                     ));
@@ -462,7 +482,11 @@ fn semlock_acquire(
 
 /// `interp_semaphore.py semlock_release`.
 #[cfg(all(unix, feature = "host_env"))]
-fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate::PyError> {
+fn semlock_release(
+    handle: SemRaw,
+    kind: i64,
+    maxvalue: i64,
+) -> Result<(), pyre_interpreter::PyError> {
     if kind == RECURSIVE_MUTEX {
         return semlock_post(handle);
     }
@@ -476,19 +500,19 @@ fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate
                 host_mp::TryAcquireStatus::Acquired => {
                     // it was not locked so undo wait and raise
                     let _ = host_mp::sem_post(handle);
-                    return Err(crate::PyError::value_error(
+                    return Err(pyre_interpreter::PyError::value_error(
                         "semaphore or lock released too many times",
                     ));
                 }
                 host_mp::TryAcquireStatus::WouldBlock => {}
                 host_mp::TryAcquireStatus::Interrupted => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         libc::EINTR,
                         "sem_trywait",
                     ));
                 }
                 host_mp::TryAcquireStatus::Error(error) => {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         error.raw_os_error(),
                         "sem_trywait",
                     ));
@@ -502,7 +526,7 @@ fn semlock_release(handle: SemRaw, kind: i64, maxvalue: i64) -> Result<(), crate
         // This check is not an absolute guarantee that the semaphore does not
         // rise above maxvalue.
         if semlock_getvalue(handle)? >= maxvalue {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "semaphore or lock released too many times",
             ));
         }
@@ -517,7 +541,7 @@ fn w_semlock_acquire(
     self_obj: PyObjectRef,
     block: bool,
     timeout: Option<f64>,
-) -> Result<bool, crate::PyError> {
+) -> Result<bool, pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
     // Every field helper can collect — `semlock_get_i64` materialises the
@@ -533,7 +557,9 @@ fn w_semlock_acquire(
     }
     let handle = semlock_get_handle(me());
     if handle.is_null() {
-        return Err(crate::PyError::value_error("SemLock handle is null"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "SemLock handle is null",
+        ));
     }
     let got = semlock_acquire(handle, block, timeout)?;
     if got {
@@ -542,7 +568,11 @@ fn w_semlock_acquire(
         // threads.  The wait can run signal handlers, so the receiver comes
         // back off the shadow stack, and again after the `last_tid` store
         // boxes its value.
-        semlock_set_i64(me(), "last_tid", crate::module::thread::current_ident());
+        semlock_set_i64(
+            me(),
+            "last_tid",
+            pyre_interpreter::module::thread::current_ident(),
+        );
         semlock_set_i64(me(), "count", semlock_get_i64(me(), "count") + 1);
     }
     Ok(got)
@@ -551,7 +581,7 @@ fn w_semlock_acquire(
 /// `interp_semaphore.py W_SemLock.release` — shared by `release` and
 /// `__exit__`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn w_semlock_release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
+fn w_semlock_release(self_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
     // As in `w_semlock_acquire`: every field helper can collect, so the
@@ -560,8 +590,8 @@ fn w_semlock_release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
     let kind = semlock_get_i64(me(), "kind");
     if kind == RECURSIVE_MUTEX {
         if !semlock_ismine(me()) {
-            return Err(crate::PyError::new(
-                crate::error::PyErrorKind::AssertionError,
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::error::PyErrorKind::AssertionError,
                 "attempt to release recursive lock not owned by thread",
             ));
         }
@@ -573,7 +603,9 @@ fn w_semlock_release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
     }
     let handle = semlock_get_handle(me());
     if handle.is_null() {
-        return Err(crate::PyError::value_error("SemLock handle is null"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "SemLock handle is null",
+        ));
     }
     semlock_release(handle, kind, semlock_get_i64(me(), "maxvalue"))?;
     semlock_set_i64(me(), "count", semlock_get_i64(me(), "count") - 1);
@@ -587,7 +619,7 @@ fn semlock_instance(
     kind: i64,
     maxvalue: i64,
     kept_name: Option<String>,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let obj = w_instance_new(w_subtype);
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
@@ -595,10 +627,11 @@ fn semlock_instance(
     // `getdict_native` materialises the instance dict, so it can collect and
     // move `obj`; read the receiver back from its slot the way every store
     // below does, rather than handing over the pre-pin copy.
-    let dict =
-        crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(root_base));
+    let dict = pyre_interpreter::baseobjspace::getdict_native(
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+    );
     if dict.is_null() {
-        return Err(crate::PyError::runtime_error(
+        return Err(pyre_interpreter::PyError::runtime_error(
             "SemLock instance has no storage",
         ));
     }
@@ -634,21 +667,21 @@ fn semlock_instance(
 /// positional-or-keyword, so each binds by name and each converter reports
 /// its own argument.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let Some((&w_subtype, rest)) = args.split_first() else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_multiprocessing.SemLock.__new__(): not enough arguments",
         ));
     };
-    let scope = crate::builtins::bind_builtin_kwargs(
+    let scope = pyre_interpreter::builtins::bind_builtin_kwargs(
         rest,
         &["kind", "value", "maxvalue", "name", "unlink"],
         &[true; 5],
         "SemLock",
     )?;
-    let kind = crate::builtins::space_index_w(scope[0])?;
-    let value = crate::builtins::space_index_w(scope[1])?;
-    let maxvalue = crate::builtins::space_index_w(scope[2])?;
+    let kind = pyre_interpreter::builtins::space_index_w(scope[0])?;
+    let value = pyre_interpreter::builtins::space_index_w(scope[1])?;
+    let maxvalue = pyre_interpreter::builtins::space_index_w(scope[2])?;
     if !unsafe { is_str(scope[3]) } {
         // `_PyArg_BadArgument` renders the None singleton as `None` rather
         // than as its class name.
@@ -657,18 +690,18 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         } else {
             unsafe { pyre_object::type_name_of(scope[3]) }
         };
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "SemLock() argument 'name' must be str, not {type_name}"
         )));
     }
-    let name = crate::baseobjspace::str_utf8_w(scope[3])?.to_string();
+    let name = pyre_interpreter::baseobjspace::str_utf8_w(scope[3])?.to_string();
     // `unwrap_spec(unlink=int)` (interp_semaphore.py:572) — the flag is
     // converted the same way `kind`, `value` and `maxvalue` beside it are,
     // so a type whose `__bool__` and `__index__` disagree does not decide it.
-    let unlink = crate::builtins::space_index_w(scope[4])? != 0;
+    let unlink = pyre_interpreter::builtins::space_index_w(scope[4])? != 0;
     // interp_semaphore.py:574-575.
     if kind != RECURSIVE_MUTEX && kind != SEMAPHORE {
-        return Err(crate::PyError::value_error("unrecognized kind"));
+        return Err(pyre_interpreter::PyError::value_error("unrecognized kind"));
     }
     let (raw, kept_name) = semlock_create(&name, value, maxvalue, unlink)?;
     semlock_instance(w_subtype, raw, kind, maxvalue, kept_name)
@@ -677,23 +710,23 @@ fn semlock_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// `interp_semaphore.py W_SemLock.rebuild`, registered as a
 /// classmethod (`:606`), so `args[0]` is the bound class.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-fn semlock_rebuild(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn semlock_rebuild(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if args.len() != 5 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_rebuild() takes exactly 4 arguments",
         ));
     }
     let w_cls = args[0];
-    let kind = crate::baseobjspace::int_w(args[2])?;
-    let maxvalue = crate::baseobjspace::int_w(args[3])?;
+    let kind = pyre_interpreter::baseobjspace::int_w(args[2])?;
+    let maxvalue = pyre_interpreter::baseobjspace::int_w(args[3])?;
     // `unwrap_spec(name='text_or_none')` — an unlinked semaphore carries no
     // name and travels as its raw handle instead.
     let name = if unsafe { is_none(args[4]) } {
         None
     } else if unsafe { is_str(args[4]) } {
-        Some(crate::baseobjspace::str_utf8_w(args[4])?.to_string())
+        Some(pyre_interpreter::baseobjspace::str_utf8_w(args[4])?.to_string())
     } else {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "_rebuild() argument 'name' must be str or None",
         ));
     };
@@ -702,24 +735,24 @@ fn semlock_rebuild(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-crate::py_class! {
+pyre_interpreter::py_class! {
     "SemLock",
     methods: {
         fn acquire(
             self_obj: PyObjectRef,
             blocking: Option<i64>,
             timeout: Option<PyObjectRef>,
-        ) -> Result<bool, crate::PyError> {
+        ) -> Result<bool, pyre_interpreter::PyError> {
             let block = blocking.map(|v| v != 0).unwrap_or(true);
             let timeout = match timeout {
                 Some(value) if unsafe { !is_none(value) } => {
-                    Some(crate::baseobjspace::float_w(value)?)
+                    Some(pyre_interpreter::baseobjspace::float_w(value)?)
                 }
                 _ => None,
             };
             w_semlock_acquire(self_obj, block, timeout)
         }
-        fn release(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
+        fn release(self_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             w_semlock_release(self_obj)
         }
         // interp_semaphore.py W_SemLock.get_count
@@ -735,23 +768,23 @@ crate::py_class! {
             semlock_set_i64(self_obj, "count", 0);
         }
         // interp_semaphore.py W_SemLock.is_zero
-        fn _is_zero(self_obj: PyObjectRef) -> Result<bool, crate::PyError> {
+        fn _is_zero(self_obj: PyObjectRef) -> Result<bool, pyre_interpreter::PyError> {
             let handle = semlock_get_handle(self_obj);
             if handle.is_null() {
-                return Err(crate::PyError::value_error("SemLock handle is null"));
+                return Err(pyre_interpreter::PyError::value_error("SemLock handle is null"));
             }
             semlock_iszero(handle)
         }
         // interp_semaphore.py W_SemLock.get_value
-        fn _get_value(self_obj: PyObjectRef) -> Result<i64, crate::PyError> {
+        fn _get_value(self_obj: PyObjectRef) -> Result<i64, pyre_interpreter::PyError> {
             let handle = semlock_get_handle(self_obj);
             if handle.is_null() {
-                return Err(crate::PyError::value_error("SemLock handle is null"));
+                return Err(pyre_interpreter::PyError::value_error("SemLock handle is null"));
             }
             semlock_value(handle)
         }
         // interp_semaphore.py W_SemLock.enter
-        fn __enter__(self_obj: PyObjectRef) -> Result<bool, crate::PyError> {
+        fn __enter__(self_obj: PyObjectRef) -> Result<bool, pyre_interpreter::PyError> {
             w_semlock_acquire(self_obj, true, None)
         }
         // interp_semaphore.py W_SemLock.exit
@@ -760,7 +793,7 @@ crate::py_class! {
             exc_type: Option<PyObjectRef>,
             exc_value: Option<PyObjectRef>,
             traceback: Option<PyObjectRef>,
-        ) -> Result<(), crate::PyError> {
+        ) -> Result<(), pyre_interpreter::PyError> {
             let _ = (exc_type, exc_value, traceback);
             w_semlock_release(self_obj)
         }
@@ -768,11 +801,12 @@ crate::py_class! {
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-#[crate::pyre_function]
-fn sem_unlink(name: &str) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+fn sem_unlink(name: &str) -> Result<(), pyre_interpreter::PyError> {
     #[cfg(unix)]
     {
-        host_mp::sem_unlink(name).map_err(|_| crate::PyError::os_error("sem_unlink failed"))
+        host_mp::sem_unlink(name)
+            .map_err(|_| pyre_interpreter::PyError::os_error("sem_unlink failed"))
     }
     // A Windows semaphore has no name in the filesystem sense, so there is
     // nothing to remove and `SEM_UNLINK` is the constant success the call
@@ -796,22 +830,22 @@ fn sem_unlink(name: &str) -> Result<(), crate::PyError> {
 /// peer takes to send one — which, when the peer is itself waiting on this
 /// process, is forever.
 #[cfg(all(windows, feature = "host_env"))]
-#[crate::pyre_function]
-fn closesocket(handle: i64) -> Result<(), crate::PyError> {
+#[pyre_interpreter::pyre_function]
+fn closesocket(handle: i64) -> Result<(), pyre_interpreter::PyError> {
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_mp::close_socket(handle as usize as host_mp::RawSocket)
     };
     result.map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))
 }
 
 #[cfg(all(windows, feature = "host_env"))]
-#[crate::pyre_function]
-fn recv(handle: i64, size: i64) -> Result<PyObjectRef, crate::PyError> {
-    let size =
-        usize::try_from(size).map_err(|_| crate::PyError::value_error("negative buffer size"))?;
+#[pyre_interpreter::pyre_function]
+fn recv(handle: i64, size: i64) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let size = usize::try_from(size)
+        .map_err(|_| pyre_interpreter::PyError::value_error("negative buffer size"))?;
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_mp::recv_socket(handle as usize as host_mp::RawSocket, size)
     };
     let data = result.map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))?;
@@ -819,14 +853,14 @@ fn recv(handle: i64, size: i64) -> Result<PyObjectRef, crate::PyError> {
 }
 
 #[cfg(all(windows, feature = "host_env"))]
-#[crate::pyre_function]
-fn send(handle: i64, buf: &[u8]) -> Result<i64, crate::PyError> {
+#[pyre_interpreter::pyre_function]
+fn send(handle: i64, buf: &[u8]) -> Result<i64, pyre_interpreter::PyError> {
     // Copied out before the interpreter is released: the borrow reaches into
     // the argument object, and a collection running in another thread can move
     // it.  `Py_buffer` holds the original still for the same span.
     let buf = buf.to_vec();
     let result = {
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         host_mp::send_socket(handle as usize as host_mp::RawSocket, &buf)
     };
     result
@@ -834,13 +868,13 @@ fn send(handle: i64, buf: &[u8]) -> Result<i64, crate::PyError> {
         .map_err(|error| windows_error(error.raw_os_error().unwrap_or(0)))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_multiprocessing",
     extra_init: |ns| {
         #[cfg(all(any(unix, windows), feature = "host_env"))]
         {
             let semlock_type = type_object();
-            crate::module_ns_store(ns, "SemLock", semlock_type);
+            pyre_interpreter::module_ns_store(ns, "SemLock", semlock_type);
             // interp_semaphore.py W_SemLock.typedef publishes this
             // constant on the class (the module also exports its own copy).
             // `SEM_VALUE_MAX` is what the platform will count to: the
@@ -870,10 +904,10 @@ crate::py_module! {
                     // which hands the body the slots in positional order.
                     // `subtype` stays positional-only: it is the class the
                     // descriptor was reached through, not a parameter.
-                    crate::make_builtin_function_with_signature(
+                    pyre_interpreter::make_builtin_function_with_signature(
                         "__new__",
                         semlock_descr_new,
-                        crate::gateway::Signature::new(
+                        pyre_interpreter::gateway::Signature::new(
                             vec!["subtype", "kind", "value", "maxvalue", "name", "unlink"],
                             None,
                             None,
@@ -887,7 +921,7 @@ crate::py_module! {
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,
                     "_rebuild",
-                    pyre_object::function::w_classmethod_new(crate::make_builtin_function(
+                    pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
                         "_rebuild",
                         semlock_rebuild,
                     )),
@@ -899,32 +933,32 @@ crate::py_module! {
                 pyre_object::w_type_set_acceptable_as_base_class(semlock_type, true);
             }
 
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "sem_unlink",
-                crate::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1),
+                pyre_interpreter::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1),
             );
         }
         #[cfg(all(windows, feature = "host_env"))]
         {
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "closesocket",
-                crate::make_builtin_function_with_arity("closesocket", closesocket, 1),
+                pyre_interpreter::make_builtin_function_with_arity("closesocket", closesocket, 1),
             );
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "recv",
-                crate::make_builtin_function_with_arity("recv", recv, 2),
+                pyre_interpreter::make_builtin_function_with_arity("recv", recv, 2),
             );
-            crate::module_ns_store(
+            pyre_interpreter::module_ns_store(
                 ns,
                 "send",
-                crate::make_builtin_function_with_arity("send", send, 2),
+                pyre_interpreter::make_builtin_function_with_arity("send", send, 2),
             );
             // `flags` reports the build-time semaphore capabilities the
             // POSIX build is configured with; this one has none to report.
-            crate::module_ns_store(ns, "flags", pyre_object::w_dict_new());
+            pyre_interpreter::module_ns_store(ns, "flags", pyre_object::w_dict_new());
         }
     }
 }

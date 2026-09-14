@@ -16,9 +16,9 @@ fn arg_required(
     fn_name: &str,
     param: &str,
     pos: usize,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if w.is_null() {
-        return Err(crate::PyError::type_error(format!(
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{fn_name}() missing required argument '{param}' (pos {pos})"
         )));
     }
@@ -27,27 +27,27 @@ fn arg_required(
 
 /// A slot the `Signature` binder resolved: `PY_NULL` for an omitted optional
 /// argument, and `None` for one passed explicitly, both keep `default`.
-fn slot_bool(w: PyObjectRef, default: bool) -> Result<bool, crate::PyError> {
+fn slot_bool(w: PyObjectRef, default: bool) -> Result<bool, pyre_interpreter::PyError> {
     if w.is_null() || unsafe { is_none(w) } {
         return Ok(default);
     }
-    crate::baseobjspace::is_true(w)
+    pyre_interpreter::baseobjspace::is_true(w)
 }
 
 /// An optional `oldcrc` slot: an omitted slot (`PY_NULL`) keeps `default`;
 /// any supplied value — including `None` — goes through `truncatedint_w`
 /// (`interp_crc32.py` `oldcrc='truncatedint_w'`), which raises `TypeError`
 /// for `None` and keeps the low 32 bits of a wider integer.
-fn slot_u32(w: PyObjectRef, default: u32) -> Result<u32, crate::PyError> {
+fn slot_u32(w: PyObjectRef, default: u32) -> Result<u32, pyre_interpreter::PyError> {
     if w.is_null() {
         return Ok(default);
     }
-    Ok(crate::baseobjspace::truncatedint_w(w)? as u32)
+    Ok(pyre_interpreter::baseobjspace::truncatedint_w(w)? as u32)
 }
 
 /// `ascii_buffer_converter` — accept a str (ASCII) or any bytes-like and
 /// surface the raw bytes.  Only the `a2b_*` decoders take a str source.
-fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     unsafe {
         if is_str(obj) {
             // The ASCII check runs on the raw buffer: a lone surrogate is
@@ -55,7 +55,7 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
             // non-ASCII character.
             let s = w_str_get_wtf8(obj);
             if !s.as_bytes().is_ascii() {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "string argument should contain only ASCII characters",
                 ));
             }
@@ -66,14 +66,14 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
             // non-contiguous memoryview names its own type rather than
             // surfacing the ValueError or BufferError the acquisition
             // raised. Only the `b2a_*` converter keeps those.
-            let acquired = crate::typedef::require_contiguous_buffer(obj)
-                .and_then(|()| crate::typedef::buffer_as_bytes_like(obj))
+            let acquired = pyre_interpreter::typedef::require_contiguous_buffer(obj)
+                .and_then(|()| pyre_interpreter::typedef::buffer_as_bytes_like(obj))
                 .unwrap_or(None);
             match acquired {
                 Some(src) => Ok(bytesobject::bytes_like_data(src).to_vec()),
-                None => Err(crate::PyError::type_error(format!(
+                None => Err(pyre_interpreter::PyError::type_error(format!(
                     "argument should be bytes, buffer or ASCII string, not '{}'",
-                    crate::baseobjspace::object_functionstr_type_name(obj)
+                    pyre_interpreter::baseobjspace::object_functionstr_type_name(obj)
                 ))),
             }
         }
@@ -82,13 +82,13 @@ fn as_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
 
 /// The `Py_buffer` converter — the `b2a_*` encoders and the checksums take a
 /// bytes-like source only, so a str of any kind is rejected by its type.
-fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    crate::typedef::require_contiguous_buffer(obj)?;
-    match unsafe { crate::typedef::buffer_as_bytes_like(obj) }? {
+fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    pyre_interpreter::typedef::require_contiguous_buffer(obj)?;
+    match unsafe { pyre_interpreter::typedef::buffer_as_bytes_like(obj) }? {
         Some(src) => Ok(unsafe { bytesobject::bytes_like_data(src) }.to_vec()),
-        _ => Err(crate::PyError::type_error(format!(
+        _ => Err(pyre_interpreter::PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
-            crate::baseobjspace::object_functionstr_type_name(obj)
+            pyre_interpreter::baseobjspace::object_functionstr_type_name(obj)
         ))),
     }
 }
@@ -96,12 +96,12 @@ fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
 // ── errors ──────────────────────────────────────────────────────────────
 
 /// Build a `binascii.Error` (a `ValueError` subclass) carrying `msg`.
-fn binascii_error(msg: impl Into<String>) -> crate::PyError {
+fn binascii_error(msg: impl Into<String>) -> pyre_interpreter::PyError {
     let msg = msg.into();
-    let mut err = crate::PyError::value_error(msg.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("binascii.Error") {
+    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("binascii.Error") {
         let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
     }
@@ -125,7 +125,7 @@ fn base64_decode_message(e: transforms::Base64DecodeError) -> String {
 }
 
 /// Map a transform [`transforms::Error`] to the matching `binascii.Error`.
-fn transform_error(e: transforms::Error) -> crate::PyError {
+fn transform_error(e: transforms::Error) -> pyre_interpreter::PyError {
     let msg = match e {
         transforms::Error::OddLengthString => "Odd-length string".to_owned(),
         transforms::Error::NonHexadecimalDigit => "Non-hexadecimal digit found".to_owned(),
@@ -145,34 +145,36 @@ fn transform_error(e: transforms::Error) -> crate::PyError {
 fn sep_args(
     w_sep: PyObjectRef,
     w_bytes_per_sep: PyObjectRef,
-) -> Result<(Option<u8>, isize), crate::PyError> {
+) -> Result<(Option<u8>, isize), pyre_interpreter::PyError> {
     let sep = if w_sep.is_null() || unsafe { is_none(w_sep) } {
         None
     } else {
         let bytes = as_bytes(w_sep)?;
         if bytes.len() != 1 {
-            return Err(crate::PyError::value_error("sep must be length 1."));
+            return Err(pyre_interpreter::PyError::value_error(
+                "sep must be length 1.",
+            ));
         }
         if !bytes[0].is_ascii() {
-            return Err(crate::PyError::value_error("sep must be ASCII."));
+            return Err(pyre_interpreter::PyError::value_error("sep must be ASCII."));
         }
         Some(bytes[0])
     };
     let bytes_per_sep = if w_bytes_per_sep.is_null() || unsafe { is_none(w_bytes_per_sep) } {
         1
     } else {
-        crate::builtins::space_index_w(w_bytes_per_sep)? as isize
+        pyre_interpreter::builtins::space_index_w(w_bytes_per_sep)? as isize
     };
     Ok((sep, bytes_per_sep))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "binascii",
     exceptions: {
         // binascii.c — Error subclasses ValueError; Incomplete subclasses
         // Exception (NULL base).
-        "Error" => crate::builtins::lookup_exc_class("ValueError").expect("ValueError installed"),
-        "Incomplete" => crate::builtins::lookup_exc_class("Exception").expect("Exception installed"),
+        "Error" => pyre_interpreter::builtins::lookup_exc_class("ValueError").expect("ValueError installed"),
+        "Incomplete" => pyre_interpreter::builtins::lookup_exc_class("Exception").expect("Exception installed"),
     },
     inline_functions: {
         // interp_hexlify.py `hexlify(data, w_sep=None, w_bytes_per_sep=None)`
@@ -181,14 +183,14 @@ crate::py_module! {
             data: PyObjectRef,
             #[default(w_none())] sep: PyObjectRef,
             #[default(w_none())] bytes_per_sep: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             hexlify_impl(data, sep, bytes_per_sep)
         }
         fn hexlify(
             data: PyObjectRef,
             #[default(w_none())] sep: PyObjectRef,
             #[default(w_none())] bytes_per_sep: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             hexlify_impl(data, sep, bytes_per_sep)
         }
         // interp_qp.py `a2b_qp(data, header=0)` and interp_qp.py
@@ -197,7 +199,7 @@ crate::py_module! {
         fn a2b_qp(
             data: PyObjectRef,
             #[default(w_none())] header: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_bytes(arg_required(data, "a2b_qp", "data", 1)?)?;
             let header = slot_bool(header, false)?;
             Ok(w_bytes_from_bytes(&transforms::a2b_qp(&data, header)))
@@ -207,7 +209,7 @@ crate::py_module! {
             #[default(w_none())] quotetabs: PyObjectRef,
             #[default(w_none())] istext: PyObjectRef,
             #[default(w_none())] header: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_qp", "data", 1)?)?;
             let quotetabs = slot_bool(quotetabs, false)?;
             let istext = slot_bool(istext, true)?;
@@ -225,7 +227,7 @@ crate::py_module! {
             #[kwonly]
             #[default(w_none())]
             strict_mode: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_bytes(arg_required(data, "a2b_base64", "data", 1)?)?;
             let strict_mode = slot_bool(strict_mode, false)?;
             let out = transforms::a2b_base64(&data, strict_mode).map_err(transform_error)?;
@@ -240,7 +242,7 @@ crate::py_module! {
             #[kwonly]
             #[default(w_none())]
             newline: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_base64", "data", 1)?)?;
             let newline = slot_bool(newline, true)?;
             Ok(w_bytes_from_bytes(&transforms::b2a_base64(&data, newline)))
@@ -252,7 +254,7 @@ crate::py_module! {
             #[kwonly]
             #[default(w_none())]
             backtick: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let data = as_buffer_bytes(arg_required(data, "b2a_uu", "data", 1)?)?;
             let backtick = slot_bool(backtick, false)?;
             let out = transforms::b2a_uu(&data, backtick).map_err(transform_error)?;
@@ -289,15 +291,15 @@ crate::py_module! {
         // `oldcrc` is optional, so the argument count is not fixed: the
         // signature is `HOPELESS` and the positional path routes through the
         // binder rather than the fixed-arity fast entry.
-        crate::runtime_ops::module_ns_store(
+        pyre_interpreter::runtime_ops::module_ns_store(
             ns,
             "crc32",
-            crate::gateway::with_module(
+            pyre_interpreter::gateway::with_module(
                 "binascii",
-                crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                     "crc32",
                     crc32,
-                    crate::HOPELESS,
+                    pyre_interpreter::HOPELESS,
                     Some(sig_all_posonly("crc32", &["data", "crc"])),
                 ),
             ),
@@ -305,15 +307,15 @@ crate::py_module! {
         // `HOPELESS` as well: a fixed arity would take the positional fast
         // entry, which skips the binder and would let a surplus positional
         // reach the body unchecked (`finish_builtin_code_positional`).
-        crate::runtime_ops::module_ns_store(
+        pyre_interpreter::runtime_ops::module_ns_store(
             ns,
             "crc_hqx",
-            crate::gateway::with_module(
+            pyre_interpreter::gateway::with_module(
                 "binascii",
-                crate::make_module_builtin_function_with_arity_and_maybe_sig(
+                pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                     "crc_hqx",
                     crc_hqx,
-                    crate::HOPELESS,
+                    pyre_interpreter::HOPELESS,
                     Some(sig_all_posonly("crc_hqx", &["data", "crc"])),
                 ),
             ),
@@ -328,7 +330,7 @@ fn hexlify_impl(
     data: PyObjectRef,
     sep: PyObjectRef,
     bytes_per_sep: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let data = as_buffer_bytes(arg_required(data, "hexlify", "data", 1)?)?;
     let (sep, bytes_per_sep) = sep_args(sep, bytes_per_sep)?;
     Ok(w_bytes_from_bytes(&transforms::hexlify(
@@ -340,7 +342,7 @@ fn hexlify_impl(
 
 /// interp_crc32.py `crc32(space, data, oldcrc=0)` — all-positional-only:
 /// `data` required, `oldcrc` an optional truncated-int.
-fn crc32(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn crc32(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let data = as_buffer_bytes(arg_required(
         args.first().copied().unwrap_or(PY_NULL),
         "crc32",
@@ -353,7 +355,7 @@ fn crc32(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// interp_hqx.py `crc_hqx(space, data, w_oldcrc)` — both positional-only
 /// and required.
-fn crc_hqx(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn crc_hqx(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let data = as_buffer_bytes(arg_required(
         args.first().copied().unwrap_or(PY_NULL),
         "crc_hqx",
@@ -361,14 +363,17 @@ fn crc_hqx(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         1,
     )?)?;
     let crc = arg_required(args.get(1).copied().unwrap_or(PY_NULL), "crc_hqx", "crc", 2)?;
-    let init = crate::baseobjspace::truncatedint_w(crc)? as u32;
+    let init = pyre_interpreter::baseobjspace::truncatedint_w(crc)? as u32;
     Ok(w_int_new(transforms::crc_hqx(&data, init) as i64))
 }
 
 /// gateway `Signature` for an all-positional-only builtin: N appends then
 /// `marker_posonly()` gives `posonlyargcount == N`.
-fn sig_all_posonly(name: &'static str, names: &[&'static str]) -> crate::gateway::Signature {
-    let mut b = crate::SignatureBuilder {
+fn sig_all_posonly(
+    name: &'static str,
+    names: &[&'static str],
+) -> pyre_interpreter::gateway::Signature {
+    let mut b = pyre_interpreter::SignatureBuilder {
         name,
         ..Default::default()
     };

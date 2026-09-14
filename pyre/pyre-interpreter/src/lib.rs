@@ -52,6 +52,10 @@
 //! import machinery (importing.rs), builtin functions (builtins.rs),
 //! type definitions (typedef.rs), and builtin modules (module/).
 
+// So `#[pyre_function]` / `#[pyre_class]` expansions can name
+// `::pyre_interpreter::` from this crate and from `pyre-module`.
+extern crate self as pyre_interpreter;
+
 // ── Bytecode / compiler re-exports (was pyre-bytecode) ──
 pub mod compile;
 pub use compile::*;

@@ -2,14 +2,14 @@
 
 use pyre_object::*;
 
-fn normal_dist_inv_cdf_impl(p: f64, mu: f64, sigma: f64) -> Result<f64, crate::PyError> {
+fn normal_dist_inv_cdf_impl(p: f64, mu: f64, sigma: f64) -> Result<f64, pyre_interpreter::PyError> {
     // `_statisticsmodule.c` refuses `p` outside the open unit interval and
     // checks nothing else -- `sigma` of 0 or below is accepted, and a NaN `p`
     // fails both comparisons and comes back out of the approximation as NaN.
     // `statistics.py`'s own copy has no check at all, because the only caller
     // there, `NormalDist.inv_cdf`, raises before reaching it.
     if p <= 0.0 || p >= 1.0 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "inv_cdf undefined for these parameters",
         ));
     }
@@ -112,18 +112,18 @@ fn normal_dist_inv_cdf_impl(p: f64, mu: f64, sigma: f64) -> Result<f64, crate::P
     Ok(mu + (x * sigma))
 }
 
-#[crate::pyre_function]
-fn _normal_dist_inv_cdf(p: f64, mu: f64, sigma: f64) -> Result<f64, crate::PyError> {
+#[pyre_interpreter::pyre_function]
+fn _normal_dist_inv_cdf(p: f64, mu: f64, sigma: f64) -> Result<f64, pyre_interpreter::PyError> {
     normal_dist_inv_cdf_impl(p, mu, sigma)
 }
 
-pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::module_ns_store(
         ns,
         "_normal_dist_inv_cdf",
-        crate::gateway::with_module(
+        pyre_interpreter::gateway::with_module(
             "_statistics",
-            crate::make_module_builtin_function_with_arity_and_maybe_sig(
+            pyre_interpreter::make_module_builtin_function_with_arity_and_maybe_sig(
                 "_normal_dist_inv_cdf",
                 _normal_dist_inv_cdf,
                 _normal_dist_inv_cdf_pyre_arity(),

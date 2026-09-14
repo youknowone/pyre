@@ -5993,7 +5993,7 @@ fn getdict_backing(obj: PyObjectRef) -> PyResult {
 /// access from a thread runs the subclass initializer (`os_local.py:73
 /// create_new_dict`) — and none of those receivers can be a `_local`, so the
 /// lookup is a plain field or mapdict read.
-pub(crate) fn getdict_native(obj: PyObjectRef) -> PyObjectRef {
+pub fn getdict_native(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(
         !crate::module::thread::is_local(obj),
         "getdict_native on a _thread._local receiver: its dict lookup can raise",
@@ -6043,7 +6043,7 @@ fn getdict_backing_native(obj: PyObjectRef) -> PyObjectRef {
 /// [`setdictvalue`] under the same restriction as [`getdict_native`]: the
 /// receiver's dictionary is a plain field or mapdict slot, so resolving it
 /// cannot run Python and the store is infallible.
-pub(crate) fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
+pub fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectRef) -> bool {
     debug_assert!(
         !crate::module::thread::is_local(obj),
         "setdictvalue_native on a _thread._local receiver: its dict lookup can raise",
@@ -10029,7 +10029,7 @@ pub fn charbuf_w(obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
 
 /// One copied `PyBUF_SIMPLE` export whose owner remains rooted and acquired
 /// until [`SimpleBufferBytes::release`].
-pub(crate) struct SimpleBufferBytes {
+pub struct SimpleBufferBytes {
     _roots: pyre_object::gc_roots::RootScope,
     data: Vec<u8>,
     itemsize: i64,
@@ -10039,7 +10039,7 @@ pub(crate) struct SimpleBufferBytes {
 }
 
 impl SimpleBufferBytes {
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
@@ -10052,7 +10052,7 @@ impl SimpleBufferBytes {
 
     /// `PyBuffer_Release`: release errors are unraisable and must not replace
     /// the operation's success or parsing exception.
-    pub(crate) fn release(mut self) {
+    pub fn release(mut self) {
         if self.native_export_active {
             self.native_export_active = false;
             let owner = pyre_object::gc_roots::shadow_stack_get(
@@ -10081,7 +10081,7 @@ impl SimpleBufferBytes {
 /// `PyObject_GetBuffer(..., PyBUF_SIMPLE)` / `PyBuffer_Release`.
 /// `Ok(None)` is the `BufferInterfaceNotFound` path, so callers can spell
 /// their own operation-specific TypeError.
-pub(crate) fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
+pub fn simple_buffer_bytes(obj: PyObjectRef) -> Result<Option<SimpleBufferBytes>, PyError> {
     buffer_bytes(obj, BufferRequest::Simple)
 }
 
@@ -16617,7 +16617,7 @@ fn object_functionstr_prefix(w_module: PyObjectRef) -> Result<Wtf8Buf, crate::Py
     Ok(out)
 }
 
-pub(crate) fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
+pub fn object_functionstr_type_name(w_obj: PyObjectRef) -> String {
     unsafe {
         match crate::typedef::r#type(w_obj) {
             Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),

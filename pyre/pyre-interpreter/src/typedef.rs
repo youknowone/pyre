@@ -23733,9 +23733,7 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// bytes / bytearray methods accept any buffer argument the way
 /// `space.buffer_w(w_obj, space.BUF_SIMPLE)` does upstream, without treating a
 /// memoryview as bytes-like elsewhere.
-pub(crate) fn buffer_as_bytes_like(
-    obj: PyObjectRef,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
         return buffer_as_bytes_like(target?);
     }
@@ -23789,7 +23787,7 @@ pub(crate) fn buffer_as_bytes_like(
 /// An operand a bytes method consumes as one byte run is refused when its
 /// export is strided; only the `BUF_FULL_RO` request the `bytes()` /
 /// `bytearray()` constructors make linearises such a source.
-pub(crate) fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
+pub fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(obj) {
             crate::builtins::memoryview_check_released(obj)?;
@@ -25427,7 +25425,7 @@ pub(crate) fn utf8_decode_error_from(bytes: &[u8], pos: usize) -> crate::PyError
     unicode_decode_error("utf-8", bytes, start, end.min(bytes.len()), reason)
 }
 
-pub(crate) fn unicode_decode_error(
+pub fn unicode_decode_error(
     encoding: &str,
     data: &[u8],
     start: usize,
@@ -25497,7 +25495,7 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
 /// `W_UnicodeEncodeError.descr_init` (interp_exceptions.py) so the
 /// caught exception carries the full attribute set, not just a message.
 /// `.object` holds the whole str; `start`/`end` index code points into it.
-pub(crate) fn unicode_encode_error(
+pub fn unicode_encode_error(
     encoding: &str,
     w_object: PyObjectRef,
     start: i64,

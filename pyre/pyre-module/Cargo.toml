@@ -17,7 +17,12 @@ cranelift = ["pyre-interpreter/cranelift", "majit-metainterp/cranelift"]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 libc = { workspace = true }
+linkme = { workspace = true }
 majit-metainterp = { workspace = true }
 num-complex = { workspace = true }
+paste = { workspace = true }
 pymath = { workspace = true }
+rustpython-common = { workspace = true }
+rustpython-compiler-core = { workspace = true }
 rustpython-host_env = { workspace = true, optional = true }
+rustpython-wtf8 = { workspace = true }

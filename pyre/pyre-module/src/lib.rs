@@ -25,7 +25,30 @@ pub mod module;
 pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
+    pyre_interpreter::importing::register_builtin_module("_codecs_cn", module::_codecs_cn::init);
+    pyre_interpreter::importing::register_builtin_module("_codecs_hk", module::_codecs_hk::init);
+    pyre_interpreter::importing::register_builtin_module(
+        "_codecs_iso2022",
+        module::_codecs_iso2022::init,
+    );
+    pyre_interpreter::importing::register_builtin_module("_codecs_jp", module::_codecs_jp::init);
+    pyre_interpreter::importing::register_builtin_module("_codecs_kr", module::_codecs_kr::init);
+    pyre_interpreter::importing::register_builtin_module("_codecs_tw", module::_codecs_tw::init);
     pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
+    pyre_interpreter::importing::register_builtin_module(
+        "_immutables_map",
+        module::_immutables_map::init,
+    );
+    pyre_interpreter::importing::register_builtin_module(
+        "_multibytecodec",
+        module::_multibytecodec::init,
+    );
+    #[cfg(not(feature = "sandbox"))]
+    pyre_interpreter::importing::register_builtin_module(
+        "_multiprocessing",
+        module::_multiprocessing::init,
+    );
+    pyre_interpreter::importing::register_builtin_module("_opcode", module::_opcode::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_posixshmem", module::_posixshmem::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
@@ -33,17 +56,21 @@ pub fn install_optional_modules() {
         "_posixsubprocess",
         module::_posixsubprocess::init,
     );
+    pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
     pyre_interpreter::importing::register_builtin_module(
         "_suggestions",
         module::_suggestions::init,
     );
+    pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
+    pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
+    pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
