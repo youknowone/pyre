@@ -198,9 +198,14 @@ impl Cpu for PyreCpu {
 
     fn protect_speculative_string(&self, gcptr: GcRef) -> Result<(), SpeculativeError> {
         // `llmodel.py protect_speculative_string` → `protect_speculative_array`
-        // with `gc_ll_descr.str_descr`.  Fail closed when the typeid is
-        // not the STR tid: an aligned wrapper or other immortal is not a
-        // payload, and `bh_strlen` would read its header as `len`.
+        // with `gc_ll_descr.str_descr`.  A GC object must carry the STR tid:
+        // a `W_UnicodeObject` wrapper is not a payload, and `bh_strlen`
+        // would read its header as `len`.
+        //
+        // Immortal interned `_utf8` is a raw STR (`unicodeobject.rs`
+        // `alloc_utf8_payload`: an immortal wrapper must not grey a young
+        // GC box).  Those have no tid; reject only when the pointer is
+        // itself a Python `str`.
         if gcptr.is_null() {
             return Err(SpeculativeError);
         }
@@ -208,8 +213,17 @@ impl Cpu for PyreCpu {
             return Ok(());
         }
         let want = lowlevel_str_gc_type_id();
-        let actual = majit_gc::get_actual_typeid(gcptr).ok_or(SpeculativeError)?;
-        if want == 0 || actual != want {
+        if let Some(actual) = majit_gc::get_actual_typeid(gcptr) {
+            if want == 0 || actual != want {
+                return Err(SpeculativeError);
+            }
+            return Ok(());
+        }
+        // No GC header.  An exact `str` wrapper stores `ob_type` at
+        // offset 0 (`STR_TYPE`).  A raw STR stores `hash` there (0 or
+        // a siphash) — do not dereference it as a type.
+        let first = unsafe { *(gcptr.0 as *const usize) };
+        if first == std::ptr::from_ref(&pyre_object::STR_TYPE).addr() {
             return Err(SpeculativeError);
         }
         Ok(())
