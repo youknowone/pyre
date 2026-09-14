@@ -34,6 +34,82 @@ use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 #[cfg(target_arch = "x86_64")]
 use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 
+/// RPython's assembler asserts `len(set(inputargs)) == len(inputargs)`
+/// (`x86/assembler.py` assemble_loop / assemble_bridge). Two failargs
+/// recovered from one physical location are one box object there; remint
+/// gives each slot its own InputArg index. Drop the later slot and rewrite
+/// its uses onto the first box so the backend sees one identity per loc.
+///
+/// Without this, `_update_bindings` binds both boxes to the same register,
+/// `possibly_free_var` on the shorter-lived remint puts that register back
+/// in `free_regs` while the longer-lived remint still names it via
+/// `current_register_index`, and a later allocation clobbers the live value.
+/// `exception_bridge_traceback_head` then JUMP-ed an integer into the
+/// ExecutionContext slot (`ldr xN, [x3, #0x68]`).
+fn alias_inputargs_sharing_recovery_loc(
+    inputargs: &[InputArg],
+    locs: &[Loc],
+    ops: &[OpRc],
+) -> (Vec<InputArg>, Vec<Loc>, Vec<OpRc>) {
+    fn loc_same(a: &Loc, b: &Loc) -> bool {
+        match (a, b) {
+            (Loc::Reg(x), Loc::Reg(y)) => x == y,
+            (Loc::Frame(x), Loc::Frame(y)) => x == y,
+            (Loc::Ebp(x), Loc::Ebp(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    let mut first_of_loc: Vec<(Loc, Type, u32)> = Vec::new();
+    let mut remap: IndexMap<OpRef, (Type, u32)> = IndexMap::new();
+    let mut new_inputargs = Vec::with_capacity(inputargs.len());
+    let mut new_locs = Vec::with_capacity(locs.len());
+    for (ia, loc) in inputargs.iter().zip(locs.iter()) {
+        if let Some(&(_, tp, index)) = first_of_loc.iter().find(|(seen, _, _)| loc_same(seen, loc))
+        {
+            debug_assert_eq!(
+                ia.tp, tp,
+                "two inputargs recovered from one loc must share a type"
+            );
+            if ia.tp == tp && ia.opref() != OpRef::input_arg_typed(index, tp) {
+                remap.insert(ia.opref(), (tp, index));
+            }
+            if ia.tp == tp {
+                continue;
+            }
+        }
+        first_of_loc.push((*loc, ia.tp, ia.index));
+        let copy = InputArg::from_type(ia.tp, ia.index);
+        if let Some(value) = ia.get_value() {
+            copy.set_value(value);
+        }
+        new_inputargs.push(copy);
+        new_locs.push(*loc);
+    }
+    if remap.is_empty() {
+        return (new_inputargs, new_locs, ops.to_vec());
+    }
+    let remap_operand = |operand: &Operand| {
+        remap
+            .get(&operand.to_opref())
+            .map(|&(tp, index)| Operand::from_bound_inputarg(&InputArg::from_type_rc(tp, index)))
+            .unwrap_or_else(|| operand.clone())
+    };
+    let new_ops = ops
+        .iter()
+        .map(|op| {
+            let args: smallvec::SmallVec<[Operand; 3]> =
+                op.getarglist().iter().map(&remap_operand).collect();
+            let cloned = OpRc::new(op.copy_and_change(op.opcode, Some(&args), None));
+            if let Some(failargs) = op.getfailargs() {
+                cloned.setfailargs(failargs.iter().map(&remap_operand).collect());
+            }
+            cloned
+        })
+        .collect();
+    (new_inputargs, new_locs, new_ops)
+}
+
 /// Global CALL_ASSEMBLER target registry.
 ///
 /// RPython stores `descr._ll_function_addr` on the target token
@@ -2732,6 +2808,8 @@ impl Backend for DynasmBackend {
         self.next_trace_id += 1;
 
         let arglocs = Asm::rebuild_faillocs_from_descr(fail_descr, inputargs);
+        let (inputargs, arglocs, ops) =
+            alias_inputargs_sharing_recovery_loc(inputargs, &arglocs, ops);
         let (prepared_ops, gcrefs) = self.prepare_ops_for_compile(&inputargs, &ops);
         // format_trace reads raw `i64` values; the assembler stores the
         // typed `Const` pool directly (type rides on `Const::get_type`).
@@ -4110,6 +4188,35 @@ impl Backend for DynasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alias_inputargs_collapses_duplicate_recovery_loc() {
+        let first = InputArg::from_type(Type::Ref, 10);
+        let second = InputArg::from_type(Type::Ref, 11);
+        let other = InputArg::from_type(Type::Int, 12);
+        let shared = Loc::Reg(crate::regloc::RegLoc::new(3, false));
+        let other_loc = Loc::Reg(crate::regloc::RegLoc::new(0, false));
+        let use_second = OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::IntIsTrue,
+            &[Operand::from_bound_inputarg(
+                &majit_ir::InputArg::from_type_rc(Type::Ref, 11),
+            )],
+        ));
+        let (inputargs, locs, ops) = alias_inputargs_sharing_recovery_loc(
+            &[first, second, other],
+            &[shared, shared, other_loc],
+            &[use_second],
+        );
+        assert_eq!(inputargs.len(), 2);
+        assert_eq!(inputargs[0].index, 10);
+        assert_eq!(inputargs[1].index, 12);
+        assert_eq!(locs.len(), 2);
+        assert_eq!(
+            ops[0].arg(0).to_opref(),
+            OpRef::input_arg_typed(10, Type::Ref)
+        );
+    }
+
     #[test]
     fn reference_value_read_does_not_become_a_substructure_address() {
         let referent = 123usize;
