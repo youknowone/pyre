@@ -712,6 +712,7 @@ impl RootedItems {
 pub struct RootedOnceRef {
     slot: std::cell::UnsafeCell<usize>,
     once: std::sync::Once,
+    registered: std::sync::atomic::AtomicBool,
 }
 
 // The slot is written once under `Once`, then only by the collector.
@@ -723,6 +724,27 @@ impl RootedOnceRef {
         Self {
             slot: std::cell::UnsafeCell::new(0),
             once: std::sync::Once::new(),
+            registered: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn try_register(&self) {
+        if self
+            .registered
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let ok = unsafe { crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8) };
+        if !ok {
+            self.registered
+                .store(false, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -731,9 +753,9 @@ impl RootedOnceRef {
             let value = init();
             unsafe {
                 *self.slot.get() = value as usize;
-                let _ = crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8);
             }
         });
+        self.try_register();
         unsafe { *self.slot.get() as PyObjectRef }
     }
 
@@ -741,14 +763,15 @@ impl RootedOnceRef {
         if !self.once.is_completed() {
             return None;
         }
+        self.try_register();
         Some(unsafe { *self.slot.get() as PyObjectRef })
     }
 
     pub fn set(&self, value: PyObjectRef) {
         self.once.call_once(|| unsafe {
             *self.slot.get() = value as usize;
-            let _ = crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8);
         });
+        self.try_register();
     }
 }
 
