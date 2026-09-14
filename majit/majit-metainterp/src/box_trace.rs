@@ -453,6 +453,109 @@ pub fn compare_op_residual() -> Option<&'static CompareOpResidual> {
     COMPARE_OP_RESIDUAL.get()
 }
 
+/// Portal-interpret counterpart of FBW
+/// `try_walker_trace_exception_new` / `try_walker_trace_raise_builtin`.
+/// `interp_exceptions.py` `descr_new` / `descr_init` look inside; the
+/// residual `CallFn` + `RaiseVarargs` pair is rewritten to the same
+/// `NewWithVtable` + `SetfieldGc` shape OptVirtualize DCEs when the
+/// exception never escapes.
+pub struct ExceptionTraceResidual {
+    pub callable_index: fn(raw_r: &[i64]) -> Option<usize>,
+    pub can_new: fn(raw_r: &[i64]) -> bool,
+    pub emit_new: fn(
+        ctx: &mut crate::TraceCtx,
+        args: &[majit_ir::OpRef],
+        raw_r: &[i64],
+    ) -> Option<(majit_ir::OpRef, i64)>,
+    pub can_raise: fn(raw_r: &[i64]) -> bool,
+    pub emit_raise: fn(
+        ctx: &mut crate::TraceCtx,
+        args: &[majit_ir::OpRef],
+        raw_r: &[i64],
+        exc: majit_ir::OpRef,
+        exc_ptr: i64,
+        ec: Option<majit_ir::OpRef>,
+    ) -> Option<majit_ir::OpRef>,
+    /// `eval.rs raise_prepared_exc` — `RAISE_VARARGS 1` after a
+    /// constructed instance. `pyopcode.py RAISE_VARARGS` is look-inside;
+    /// the helper is `dont_look_inside` so portal interpret identity-folds
+    /// it when the operand is the just-built exception.
+    pub raise_prepared_fnaddrs: Vec<i64>,
+    pub attach_raise_cause: fn(exc_ptr: i64),
+    pub emit_virtual_traceback: fn(
+        ctx: &mut crate::TraceCtx,
+        exc: majit_ir::OpRef,
+        exc_ptr: i64,
+        frame: majit_ir::OpRef,
+        frame_ptr: i64,
+    ) -> bool,
+    /// `error.rs pyerror_to_exc_object` — residual because
+    /// `rtype_method_to_exc_object` keeps the conversion as a direct
+    /// call. `to_exc_object` of an already-materialised instance is
+    /// identity (`exc_object` is set); `error.py get_w_value` looks
+    /// inside and returns `_w_value`.
+    pub to_exc_object_fnaddrs: Vec<i64>,
+    pub exc_object_of_pyerror: fn(err_ptr: i64) -> Option<i64>,
+    /// `eval.rs dispatch_exception_handler` — `dont_look_inside_cannot_raise`
+    /// because the extracted body is too large. `pyopcode.py
+    /// handle_operation_error` looks inside the table lookup + push.
+    /// Execute live (stack already moved) and keep the handler pc as a
+    /// const so the virtual exception is not a residual argument.
+    pub dispatch_handler_fnaddrs: Vec<i64>,
+    /// `eval.rs load_global_nameindex_w` of a canonical exception class.
+    /// `pyopcode.py LOAD_GLOBAL` looks inside the module-dict cell.
+    pub load_global_fnaddrs: Vec<i64>,
+    pub emit_load_global_exc:
+        fn(ctx: &mut crate::TraceCtx, raw_i: &[i64]) -> Option<(majit_ir::OpRef, i64)>,
+    /// `eval.rs get_current_exception` / `set_current_exception`.
+    /// FBW `try_walker_lower_exc_info_residual` emits EC field ops.
+    pub get_current_exception_fnaddrs: Vec<i64>,
+    pub set_current_exception_fnaddrs: Vec<i64>,
+    pub emit_get_current_exception:
+        fn(ctx: &mut crate::TraceCtx, ec: majit_ir::OpRef) -> (majit_ir::OpRef, i64),
+    pub emit_set_current_exception:
+        fn(ctx: &mut crate::TraceCtx, ec: majit_ir::OpRef, exc: majit_ir::OpRef, exc_ptr: i64),
+    /// Live `ExecutionContext` pointer (`interp_jit.py reds = ['frame', 'ec']`).
+    pub current_ec_ptr: fn() -> i64,
+}
+
+impl ExceptionTraceResidual {
+    pub fn matches_raise_prepared(&self, fnaddr: i64) -> bool {
+        self.raise_prepared_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_to_exc_object(&self, fnaddr: i64) -> bool {
+        self.to_exc_object_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_dispatch_handler(&self, fnaddr: i64) -> bool {
+        self.dispatch_handler_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_load_global(&self, fnaddr: i64) -> bool {
+        self.load_global_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_get_current_exception(&self, fnaddr: i64) -> bool {
+        self.get_current_exception_fnaddrs.contains(&fnaddr)
+    }
+
+    pub fn matches_set_current_exception(&self, fnaddr: i64) -> bool {
+        self.set_current_exception_fnaddrs.contains(&fnaddr)
+    }
+}
+
+static EXCEPTION_TRACE_RESIDUAL: std::sync::OnceLock<ExceptionTraceResidual> =
+    std::sync::OnceLock::new();
+
+pub fn register_exception_trace_residual(spec: ExceptionTraceResidual) {
+    let _ = EXCEPTION_TRACE_RESIDUAL.set(spec);
+}
+
+pub fn exception_trace_residual() -> Option<&'static ExceptionTraceResidual> {
+    EXCEPTION_TRACE_RESIDUAL.get()
+}
+
 /// `compare_op_from_tag` 0..=5 → `IntLt`/`IntLe`/`IntGt`/`IntGe`/`IntEq`/`IntNe`.
 pub fn int_compare_op_kind(tag: i64) -> Option<majit_ir::OpCode> {
     Some(match tag {

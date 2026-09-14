@@ -111,12 +111,13 @@ pub mod blackhole;
 pub mod box_trace;
 pub use box_trace::{
     CompareOpResidual, ElidableIntResidual, ElidableRefResidual, ExactIntFalseResidual,
-    FrameAnchorLiveResidual, FrameAnchorPushResidual, IdentityRefResidual, IntPyModResidual,
-    VoidSkipResidual, WrapintResidual, register_compare_op_residual,
+    ExceptionTraceResidual, FrameAnchorLiveResidual, FrameAnchorPushResidual, IdentityRefResidual,
+    IntPyModResidual, VoidSkipResidual, WrapintResidual, register_compare_op_residual,
     register_elidable_int_residual, register_elidable_ref_residual,
-    register_exact_int_false_residual, register_frame_anchor_live_residual,
-    register_frame_anchor_push_residual, register_identity_ref_residual,
-    register_int_py_mod_residual, register_void_skip_residual, register_wrapint_residual,
+    register_exact_int_false_residual, register_exception_trace_residual,
+    register_frame_anchor_live_residual, register_frame_anchor_push_residual,
+    register_identity_ref_residual, register_int_py_mod_residual, register_void_skip_residual,
+    register_wrapint_residual,
 };
 pub(crate) mod call_descr;
 pub(crate) mod compile;
