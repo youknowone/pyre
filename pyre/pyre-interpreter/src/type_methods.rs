@@ -1466,6 +1466,57 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     str_strip_impl(args, "rstrip", false, true)
 }
 
+/// `rstring.py startswith` at default bounds: the `@jit.elidable` byte
+/// walk `u_self[i] != prefix[i]`.  A macro so the walk is in the
+/// wrapper's LLBC — a standalone callee is never a CodeWriter candidate.
+/// Bind `as_bytes()` first so `len` is `Rvalue::Len` and `value[i]` is
+/// the frontend's `ord(s[i])` (`__string_byte_getitem`).
+macro_rules! rstring_prefix_eq {
+    ($w_self:expr, $w_needle:expr) => {{
+        let value = unsafe { pyre_object::w_str_get_wtf8($w_self) }.as_bytes();
+        let prefix = unsafe { pyre_object::w_str_get_wtf8($w_needle) }.as_bytes();
+        let n = prefix.len();
+        if value.len() < n {
+            false
+        } else {
+            let mut i = 0;
+            let mut ok = true;
+            while i < n {
+                if value[i] != prefix[i] {
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+            ok
+        }
+    }};
+}
+
+/// `rstring.py endswith` at default bounds.
+macro_rules! rstring_suffix_eq {
+    ($w_self:expr, $w_needle:expr) => {{
+        let value = unsafe { pyre_object::w_str_get_wtf8($w_self) }.as_bytes();
+        let suffix = unsafe { pyre_object::w_str_get_wtf8($w_needle) }.as_bytes();
+        let n = suffix.len();
+        if value.len() < n {
+            false
+        } else {
+            let start = value.len() - n;
+            let mut i = 0;
+            let mut ok = true;
+            while i < n {
+                if value[start + i] != suffix[i] {
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+            ok
+        }
+    }};
+}
+
 /// `unicodeobject.py descr_startswith` — accepts either a single str
 /// prefix or a tuple of str prefixes (CPython parity).
 /// unicodeobject.py descr_startswith(self, prefix, start=0, end=sys.maxsize)
@@ -1483,7 +1534,7 @@ pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
                 && !pyre_object::is_tuple(args[1])
                 && pyre_object::is_str(args[1])
             {
-                return Ok(w_bool_from(rstring_prefix_eq(args[0], args[1])));
+                return Ok(w_bool_from(rstring_prefix_eq!(args[0], args[1])));
             }
         }
     }
@@ -1499,55 +1550,11 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 && !pyre_object::is_tuple(args[1])
                 && pyre_object::is_str(args[1])
             {
-                return Ok(w_bool_from(rstring_suffix_eq(args[0], args[1])));
+                return Ok(w_bool_from(rstring_suffix_eq!(args[0], args[1])));
             }
         }
     }
     str_prefix_match_slow(args, "endswith", false)
-}
-
-/// `rstring.py startswith` at default bounds: the `@jit.elidable` byte
-/// walk `u_self[i] != prefix[i]`.  Returns `bool` so the generated graph
-/// is not an `Option<Result<…>>` union the rtyper skips.
-///
-/// Bind `as_bytes()` first so `len` is `Rvalue::Len` and `value[i]` is
-/// the frontend's `ord(s[i])` (`__string_byte_getitem`).  A `s[:n] ==
-/// prefix` slice would plant `__getslice_*` markers the Skip spine
-/// cannot expand.
-fn rstring_prefix_eq(w_self: PyObjectRef, w_needle: PyObjectRef) -> bool {
-    let value = unsafe { pyre_object::w_str_get_wtf8(w_self) }.as_bytes();
-    let prefix = unsafe { pyre_object::w_str_get_wtf8(w_needle) }.as_bytes();
-    let n = prefix.len();
-    if value.len() < n {
-        return false;
-    }
-    let mut i = 0;
-    while i < n {
-        if value[i] != prefix[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-/// `rstring.py endswith` at default bounds.
-fn rstring_suffix_eq(w_self: PyObjectRef, w_needle: PyObjectRef) -> bool {
-    let value = unsafe { pyre_object::w_str_get_wtf8(w_self) }.as_bytes();
-    let suffix = unsafe { pyre_object::w_str_get_wtf8(w_needle) }.as_bytes();
-    let n = suffix.len();
-    if value.len() < n {
-        return false;
-    }
-    let start = value.len() - n;
-    let mut i = 0;
-    while i < n {
-        if value[start + i] != suffix[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
 }
 
 /// Bounds / tuple / TypeError residual of `descr_startswith`.
@@ -1605,7 +1612,10 @@ pub fn __majit_wrap_str_descr_startswith(
             return str_prefix_match_slow(args, "startswith", true);
         }
     }
-    Ok(w_bool_from(rstring_prefix_eq(w_self, w_prefix)))
+    // Walk is spelled here, not delegated: a callee of this wrapper
+    // is never a CodeWriter candidate, so the call would stay residual
+    // and look-inside would die on `callable type method`.
+    Ok(w_bool_from(rstring_prefix_eq!(w_self, w_prefix)))
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
@@ -1625,7 +1635,7 @@ pub fn __majit_wrap_str_descr_endswith(
             return str_prefix_match_slow(args, "endswith", false);
         }
     }
-    Ok(w_bool_from(rstring_suffix_eq(w_self, w_suffix)))
+    Ok(w_bool_from(rstring_suffix_eq!(w_self, w_suffix)))
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
