@@ -4,7 +4,24 @@
 
 #![cfg(feature = "dynasm")]
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+fn pyre_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pyre-dynasm"));
+    for flag in [
+        "MAJIT_STATS",
+        "MAJIT_LOG",
+        "PYRE_MC_DIAG",
+        "PYRE_GC_DIAG",
+        "PYRE_FBW_SPEC_CENSUS",
+        "PYRE_CELL_CENSUS",
+        "PYRE_FBW_DEPTH_CENSUS",
+    ] {
+        command.env_remove(flag);
+    }
+    command
+}
 
 #[test]
 fn chained_finalizers_run_before_module_globals_are_cleared() {
@@ -35,10 +52,8 @@ class Link:
 Link(Link(Last()))
 ''', module.__dict__)
 "#;
-    let output = Command::new(env!("CARGO_BIN_EXE_pyre-dynasm"))
+    let output = pyre_command()
         .args(["-c", program])
-        .env_remove("MAJIT_STATS")
-        .env_remove("PYRE_GC_DIAG")
         .output()
         .expect("run the shutdown finalizer chain");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -52,10 +67,8 @@ Link(Link(Last()))
 fn mutually_referencing_modules_keep_globals_during_finalization() {
     // The vendored test_module finalization fixture exercises module cycles,
     // private globals, peers, imported functions and builtins in __del__.
-    let output = Command::new(env!("CARGO_BIN_EXE_pyre-dynasm"))
+    let output = pyre_command()
         .args(["-c", "from test.test_module import final_a"])
-        .env_remove("MAJIT_STATS")
-        .env_remove("PYRE_GC_DIAG")
         .output()
         .expect("run the module finalization fixture");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -77,4 +90,44 @@ fn mutually_referencing_modules_keep_globals_during_finalization() {
             "x = b"
         ]
     );
+}
+
+#[test]
+fn new_finalizable_cycles_do_not_extend_shutdown_indefinitely() {
+    let mut child = pyre_command()
+        .args([
+            "-c",
+            r#"
+class Reproducer:
+    def __init__(self):
+        self.cycle = self
+    def __del__(self):
+        type(self)()
+Reproducer()
+print("body done", flush=True)
+"#,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start self-reproducing finalizer");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().expect("query child status").is_none() {
+        if Instant::now() >= deadline {
+            child.kill().expect("stop hung finalization");
+            let output = child.wait_with_output().expect("reap hung child");
+            panic!(
+                "shutdown did not finish: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().expect("read completed child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout.trim(), "body done");
+    assert!(stderr.is_empty(), "{stderr}");
 }

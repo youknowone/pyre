@@ -1805,9 +1805,20 @@ fn clear_shutdown_modules(
     // incminimark.IncrementalMiniMarkGC.deal_with_objects_with_finalizers
     // preserves dependency order across successive collections. Unlike
     // CPython's refcount/cyclic-GC finalization, one collection need not finish
-    // the unreachable module graph. Keep that GC ordering and continue only
-    // while a collection actually delivers finalizers, before clearing globals.
-    while collect_and_run_finalizers(ec_ptr) {}
+    // the unreachable module graph. Allow the required first collection,
+    // then at most one pass per finalizer still registered at entry. The first
+    // pass also drains objects already delivered to the death queue. Stop early
+    // when no finalizer is delivered. Snapshot the bound: a __del__ that
+    // creates another finalizable cycle must not extend shutdown indefinitely.
+    // PyPy ObjSpace.finish and CPython finalize_modules both have bounded
+    // shutdown phases; this bound preserves the GC's dependency ordering
+    // without chasing newly created generations forever.
+    let collection_limit = majit_gc::gc_registered_finalizer_count().saturating_add(1);
+    for _ in 0..collection_limit {
+        if !collect_and_run_finalizers(ec_ptr) {
+            break;
+        }
+    }
     for index in (0..names.len()).rev() {
         let module = module_at(index);
         let is_core_module = sys_module_slot.is_some_and(|slot| module == module_at(slot))
