@@ -4046,9 +4046,20 @@ fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
         .map(|op| op.opname)
         .collect();
     assert!(
-        truediv_ops.iter().any(|op| *op == "new_with_vtable")
-            || truediv_ops.iter().any(|op| op.starts_with("inline_call")),
-        "_truediv must box via new_with_vtable (inlined or called); ops={truediv_ops:?}"
+        truediv_ops.iter().any(|op| *op == "cast_int_to_float"),
+        "_truediv must lower `float(x)` to cast_int_to_float; ops={truediv_ops:?}"
+    );
+    assert!(
+        !truediv_ops.iter().any(|op| op.starts_with("residual_call_irf")),
+        "_truediv must not residualize sitofp; ops={truediv_ops:?}"
+    );
+    assert!(
+        truediv_ops.iter().any(|op| *op == "new_with_vtable"),
+        "_truediv must box via in-graph new_with_vtable; ops={truediv_ops:?}"
+    );
+    assert!(
+        !truediv_ops.iter().any(|op| op.starts_with("inline_call")),
+        "_truediv must not inline_call newfloat; ops={truediv_ops:?}"
     );
     assert!(
         newfloat_ops.iter().any(|op| *op == "new_with_vtable"),
