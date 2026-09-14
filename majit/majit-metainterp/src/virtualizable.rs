@@ -562,10 +562,10 @@ impl VirtualizableInfo {
     /// Upstream rewrites residual `jit_force_virtualizable` via
     /// `replace_force_virtualizable_with_call` and stamps
     /// `clear_vable_ptr` / `clear_vable_descr`. The rewrite lives in
-    /// `rvirtualizable::replace_force_virtualizable_with_call` over
-    /// rtyper graphs this object does not own. The stamp happens at
-    /// construction (`set_clear_vable`). This asserts that stamp for
-    /// machines that have a `vable_token`.
+    /// `CallControl::finish` over remaining MIR force Calls after
+    /// `make_jitcodes`. The stamp happens at construction
+    /// (`set_clear_vable`). This asserts that stamp for machines that
+    /// have a `vable_token`.
     pub fn finish(&self) {
         if self.has_vable_token() {
             assert!(

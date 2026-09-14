@@ -1923,8 +1923,11 @@ impl<'a> Transformer<'a> {
     fn is_fresh_virtualizable(&self, base: &crate::flowspace::model::Variable) -> bool {
         // `flags = self.vable_flags[op.args[0]]` — KeyError if the hook
         // did not file this access. Missing is not "empty flags".
+        // Lookup the same alias key `rewrite_op_jit_force_virtualizable`
+        // inserted.
+        let key = resolve_alias(base, &self.aliases);
         self.vable_flags
-            .get(base)
+            .get(&key)
             .unwrap_or_else(|| {
                 panic!(
                     "vable_flags missing for virtualizable getset \
@@ -1969,31 +1972,39 @@ impl<'a> Transformer<'a> {
         if field.suppresses_virtualizable() || field.base_is_local_aggregate() {
             return VirtualizableGetset::No;
         }
+        // jtransform.py: `vinfo = self.get_vinfo(op.args[0])` then
+        // membership, then `if res: flags = self.vable_flags[op.args[0]]`.
+        // Flags are only filed for redirected fields (`hook_access_field`);
+        // looking them up first KeyError'd every non-vable getset.
+        let membership =
+            if let Some(vinfo) = self.get_vinfo_for_var(base, field.owner_root.as_deref()) {
+                if vinfo.has_array_field(&field.name) {
+                    VirtualizableGetset::Array
+                } else if vinfo.has_static_field(&field.name) {
+                    VirtualizableGetset::Static
+                } else {
+                    VirtualizableGetset::No
+                }
+            } else {
+                // Tests / factory-None: GraphTransformConfig is the codewriter
+                // stand-in for the missing handle.
+                let is_static = self.config.virtualizable_field(field).is_some();
+                let is_array = self.config.virtualizable_array(field).is_some();
+                if is_array {
+                    VirtualizableGetset::Array
+                } else if is_static {
+                    VirtualizableGetset::Static
+                } else {
+                    VirtualizableGetset::No
+                }
+            };
+        if membership == VirtualizableGetset::No {
+            return VirtualizableGetset::No;
+        }
         if self.is_fresh_virtualizable(base) {
             return VirtualizableGetset::No;
         }
-        // jtransform.py: `vinfo = self.get_vinfo(op.args[0])`.
-        if let Some(vinfo) = self.get_vinfo_for_var(base, field.owner_root.as_deref()) {
-            if vinfo.has_array_field(&field.name) {
-                return VirtualizableGetset::Array;
-            }
-            if vinfo.has_static_field(&field.name) {
-                return VirtualizableGetset::Static;
-            }
-            return VirtualizableGetset::No;
-        }
-        // Tests / factory-None: GraphTransformConfig is the codewriter
-        // stand-in for the missing handle.
-        let is_static = self.config.virtualizable_field(field).is_some();
-        let is_array = self.config.virtualizable_array(field).is_some();
-        if !is_static && !is_array {
-            return VirtualizableGetset::No;
-        }
-        if is_array {
-            VirtualizableGetset::Array
-        } else {
-            VirtualizableGetset::Static
-        }
+        membership
     }
 
     /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`:

@@ -8255,6 +8255,10 @@ impl<S: JitState> JitDriver<S> {
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
         let guard_exc = result.exception.exc_value;
+        // compile.py `cpu.get_savedata_ref(deadframe)` — fished here
+        // while the CompileResult still owns the word, then handed to
+        // `ResumeGuardForcedDescr.handle_fail`.
+        let savedata = result.savedata;
         drop(result);
 
         // memmgr.py: keep_loop_alive(loop_token)
@@ -8335,6 +8339,7 @@ impl<S: JitState> JitDriver<S> {
             raw_values,
             exit_layout,
             guard_exc,
+            savedata,
         }
     }
 

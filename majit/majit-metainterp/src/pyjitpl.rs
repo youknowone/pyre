@@ -19879,6 +19879,11 @@ pub enum DetailedDriverRunOutcome {
         /// `_prepare_resume_from_failure`) so an exception guard unwinds
         /// to its handler instead of resuming the no-exception path.
         guard_exc: i64,
+        /// compile.py `cpu.get_savedata_ref(deadframe)` — the
+        /// `AllVirtuals` cache `handle_async_forcing` hid on the
+        /// failing jitframe. `None` when the backend left `jf_savedata`
+        /// empty.
+        savedata: Option<majit_ir::GcRef>,
     },
     Abort {
         restored: bool,

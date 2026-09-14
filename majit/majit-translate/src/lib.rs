@@ -2248,9 +2248,6 @@ fn analyze_pipeline_from_module_paths(
     // complete driver set exists.
     call_control
         .make_virtualizable_infos(|jd_idx, vtypeptr_token| vinfo_factory(jd_idx, vtypeptr_token));
-    // warmspot.py `WarmRunnerDesc.finish` → `vinfo.finish()` after the
-    // driver set exists. `finish_setup_descrs` is the metainterp half.
-    call_control.finish();
     // Register oopspecs for jit.* builtin functions.
     // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;
     // the codewriter converts calls to them into dedicated opcodes.
@@ -2434,6 +2431,11 @@ fn analyze_pipeline_from_module_paths(
     let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
         make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
     mark_phase!("make_jitcodes");
+    // warmspot.py `WarmRunnerDesc.finish` after `make_jitcodes`: unique
+    // `vinfo.finish()` then `replace_force_virtualizable_with_call` over
+    // remaining residual force ops. Looked-inside copies are already
+    // deleted by `rewrite_op_jit_force_virtualizable`.
+    call_control.finish();
     // callee census: how many callees the six `getcalldescr` analyzers answer as
     // upstream's declared-external arm without a declaration behind them.
     // Off by default — it is a whole extra walk of the registered universe,

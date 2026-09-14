@@ -380,12 +380,12 @@ pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
     fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool;
     /// warmspot.py `WarmRunnerDesc.finish` → `vinfo.finish()`.
     ///
-    /// `virtualizable.py VirtualizableInfo.finish` rewrites residual
-    /// `jit_force_virtualizable` ops and stamps `clear_vable_ptr` /
-    /// `clear_vable_descr`. The stamp happens at construction
-    /// (`set_clear_vable` / `build_pyframe_virtualizable_info`); the
-    /// rewrite lives in `rvirtualizable::replace_force_virtualizable_with_call`
-    /// over rtyper graphs this handle does not own. Default is a no-op.
+    /// `virtualizable.py VirtualizableInfo.finish` stamps
+    /// `clear_vable_ptr` / `clear_vable_descr`. The stamp happens at
+    /// construction (`set_clear_vable` / `build_pyframe_virtualizable_info`).
+    /// Residual `jit_force_virtualizable` rewrite lives on
+    /// [`CallControl::finish`] (`replace_force_virtualizable_with_call`
+    /// over the graphs this handle does not own). Default is a no-op.
     fn finish(&self) {}
     /// Codewriter-side VTYPE name (`red_types[index_of_virtualizable]`).
     fn vtype_name(&self) -> Option<&str> {
@@ -1223,6 +1223,25 @@ impl std::fmt::Display for UnknownCalleeCensus {
 
 /// `CallTarget`'s variant name, for bucketing a target no `CallPath`
 /// resolution reached.
+fn is_residual_jit_force_virtualizable(target: &CallTarget) -> bool {
+    matches!(target, CallTarget::FunctionPath { segments }
+        if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
+}
+
+fn link_arg_access_directly(arg: &LinkArg) -> bool {
+    let LinkArg::Const(c) = arg else {
+        return false;
+    };
+    let crate::flowspace::model::ConstValue::Dict(items) = &c.value else {
+        return false;
+    };
+    let key = crate::flowspace::model::ConstValue::byte_str("access_directly");
+    matches!(
+        items.get(&key),
+        Some(crate::flowspace::model::ConstValue::Bool(true))
+    )
+}
+
 fn call_target_variant_name(target: &CallTarget) -> &'static str {
     match target {
         CallTarget::Method { .. } => "Method",
@@ -3949,7 +3968,14 @@ impl CallControl {
     ///     if vinfo is not None:
     ///         vinfo.finish()
     /// ```
-    pub fn finish(&self) {
+    ///
+    /// `VirtualizableInfo.finish` then walks residual
+    /// `jit_force_virtualizable` ops via
+    /// `rvirtualizable.replace_force_virtualizable_with_call`. Production
+    /// MIR has no `VTYPEPTR`; remaining force Calls are rewritten by
+    /// callee name after `make_jitcodes` has deleted the looked-inside
+    /// copies (`jtransform.rewrite_op_jit_force_virtualizable`).
+    pub fn finish(&mut self) {
         let mut seen: Vec<std::sync::Arc<dyn VirtualizableInfoHandle>> = Vec::new();
         for jd in &self.jitdrivers_sd {
             let Some(vinfo) = &jd.virtualizable_info else {
@@ -3965,6 +3991,41 @@ impl CallControl {
         for vinfo in seen {
             vinfo.finish();
         }
+        self.replace_force_virtualizable_with_call();
+    }
+
+    /// `rvirtualizable.replace_force_virtualizable_with_call` over
+    /// remaining `jit_force_virtualizable` Calls.
+    ///
+    /// `access_directly` ops are dropped; every other residual force
+    /// keeps the helper Call and is stripped to the virtualizable
+    /// argument (`op.args = [c_funcptr, op.args[0]]`). The residual
+    /// helper is already `executioncontext::jit_force_virtualizable`.
+    fn replace_force_virtualizable_with_call(&mut self) -> usize {
+        let mut count = 0;
+        for graph in self.function_graphs.values_mut() {
+            for block in &mut graph.blocks {
+                let mut newops = Vec::with_capacity(block.operations.len());
+                for mut op in block.operations.drain(..) {
+                    if let OpKind::Call { target, args, .. } = &op.kind {
+                        if is_residual_jit_force_virtualizable(target) {
+                            if args.last().is_some_and(link_arg_access_directly) {
+                                continue;
+                            }
+                            if let OpKind::Call { args, .. } = &mut op.kind {
+                                if args.len() > 1 {
+                                    args.truncate(1);
+                                }
+                            }
+                            count += 1;
+                        }
+                    }
+                    newops.push(op);
+                }
+                block.operations = newops;
+            }
+        }
+        count
     }
 
     /// `Transformer.get_vinfo` name-token half. `is_vtypeptr` stays the
@@ -12271,7 +12332,7 @@ mod tests {
 
     #[test]
     fn finish_is_noop_when_no_driver_has_virtualizable_info() {
-        let cc = cc_with_one_driver();
+        let mut cc = cc_with_one_driver();
         cc.finish();
     }
 
@@ -12317,6 +12378,84 @@ mod tests {
             1,
             "warmspot.py finish walks a unique set"
         );
+    }
+
+    #[test]
+    fn finish_rewrites_remaining_force_calls_and_drops_access_directly() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::model::{CallTarget, OpKind, ValueType};
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("residual_force");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: crate::model::call_args(vec![frame_var.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let mut flags = std::collections::HashMap::new();
+        flags.insert(
+            ConstValue::byte_str("access_directly"),
+            ConstValue::Bool(true),
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["executioncontext", "jit_force_virtualizable"]),
+                args: vec![
+                    crate::model::LinkArg::from(frame_var.clone()),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("last_instr"))),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(flags))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: vec![
+                    crate::model::LinkArg::from(frame_var),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("pycode"))),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(
+                        std::collections::HashMap::new(),
+                    ))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let path = CallPath::from_segments(["residual_force"]);
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.replace_force_virtualizable_with_call(), 2);
+        let ops = &cc
+            .function_graphs()
+            .get(&path)
+            .expect("registered residual graph")
+            .block(crate::model::BlockId(0))
+            .operations;
+        assert_eq!(
+            ops.len(),
+            2,
+            "access_directly force must be dropped: {ops:?}"
+        );
+        for op in ops {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                panic!("residual force must stay a Call, got {op:?}");
+            };
+            assert!(
+                is_residual_jit_force_virtualizable(target),
+                "replace_force keeps the residual helper Call: {target:?}"
+            );
+            assert_eq!(args.len(), 1, "replace_force strips to the vable arg");
+        }
     }
 
     #[test]
