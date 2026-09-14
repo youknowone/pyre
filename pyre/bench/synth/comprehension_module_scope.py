@@ -10,9 +10,18 @@ squares = [n for n in range(5)]   # noqa: C416 - `n` is a module-scope hidden fa
 n = 100                           # rebind `n` as a real global
 total = 0                         # a second global store must not erase `n`
 
-i = 0
-while i < 300000:
-    total = total + n
-    i = i + 1
 
+def _hot(n, total):
+    # The two STORE_NAMEs above are the correctness test. The trip count
+    # is only a perf loop: keeping `i`/`total` as module names here is
+    # STORE_NAME every iteration and revokes any trace that folded a
+    # LOAD_GLOBAL from this module (`celldict.py notify_version_watchers`).
+    i = 0
+    while i < 300000:
+        total = total + n
+        i = i + 1
+    return total
+
+
+total = _hot(n, total)
 print(squares[-1], n, total)

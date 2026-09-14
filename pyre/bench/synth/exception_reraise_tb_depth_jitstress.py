@@ -28,53 +28,63 @@ def thrower(i):
     raise KeyError(i)
 
 
-bare_depths = set()
-bare_bad = 0
-for i in range(N):
-    try:
+def run():
+    # Keep the except-as bindings and accumulators in locals. A module-level
+    # `except E as e` is STORE_NAME + DELETE_NAME of `e` every iteration, which
+    # mutates the module-dict `version?` quasi-immut and revokes every
+    # function-entry trace that folded a LOAD_GLOBAL from this module
+    # (`celldict.py ModuleDictStrategy.notify_version_watchers`). With
+    # `function_threshold=1` that is a compile per pair of calls.
+    bare_depths = set()
+    bare_bad = 0
+    for i in range(N):
         try:
-            thrower(i)
-        except KeyError:
-            raise
-    except KeyError as e:
-        depth = 0
-        traceback = e.__traceback__
-        while traceback is not None:
-            depth += 1
-            traceback = traceback.tb_next
-        bare_depths.add(depth)
-        bare_bad += depth != 2
-print("bare_depths =", sorted(bare_depths))
-print("bare_bad =", bare_bad)
-
-named_depths = set()
-for i in range(N):
-    try:
-        try:
-            thrower(i)
+            try:
+                thrower(i)
+            except KeyError:
+                raise
         except KeyError as e:
-            raise e
-    except KeyError as e2:
-        depth = 0
-        traceback = e2.__traceback__
-        while traceback is not None:
-            depth += 1
-            traceback = traceback.tb_next
-        named_depths.add(depth)
-print("named_depths =", sorted(named_depths))
+            depth = 0
+            traceback = e.__traceback__
+            while traceback is not None:
+                depth += 1
+                traceback = traceback.tb_next
+            bare_depths.add(depth)
+            bare_bad += depth != 2
+    print("bare_depths =", sorted(bare_depths))
+    print("bare_bad =", bare_bad)
 
-finally_depths = set()
-for i in range(N):
-    try:
+    named_depths = set()
+    for i in range(N):
         try:
-            thrower(i)
-        finally:
-            pass
-    except KeyError as e3:
-        depth = 0
-        traceback = e3.__traceback__
-        while traceback is not None:
-            depth += 1
-            traceback = traceback.tb_next
-        finally_depths.add(depth)
-print("finally_depths =", sorted(finally_depths))
+            try:
+                thrower(i)
+            except KeyError as e:
+                raise e
+        except KeyError as e2:
+            depth = 0
+            traceback = e2.__traceback__
+            while traceback is not None:
+                depth += 1
+                traceback = traceback.tb_next
+            named_depths.add(depth)
+    print("named_depths =", sorted(named_depths))
+
+    finally_depths = set()
+    for i in range(N):
+        try:
+            try:
+                thrower(i)
+            finally:
+                pass
+        except KeyError as e3:
+            depth = 0
+            traceback = e3.__traceback__
+            while traceback is not None:
+                depth += 1
+                traceback = traceback.tb_next
+            finally_depths.add(depth)
+    print("finally_depths =", sorted(finally_depths))
+
+
+run()
