@@ -11551,19 +11551,27 @@ impl<'a> Lowering<'a> {
                 },
                 _ => None,
             }
-            && crate::codewriter::minmax::scalar_cmp_banks_compatible(
-                first_arg_ty
+            && {
+                let lhs = first_arg_ty
                     .as_ref()
-                    .and_then(|ty| self.scalar_cmp_bank(ty))
-                    .as_ref(),
-                second_arg_ty
+                    .and_then(|ty| self.scalar_cmp_bank(ty));
+                let rhs = second_arg_ty
                     .as_ref()
-                    .and_then(|ty| self.scalar_cmp_bank(ty))
-                    .as_ref(),
-                leaf,
-            ) {
+                    .and_then(|ty| self.scalar_cmp_bank(ty));
+                crate::codewriter::minmax::scalar_cmp_banks_compatible(
+                    lhs.as_ref(),
+                    rhs.as_ref(),
+                    leaf,
+                )
+            } {
+            let lhs = first_arg_ty
+                .as_ref()
+                .and_then(|ty| self.scalar_cmp_bank(ty));
+            let rhs = second_arg_ty
+                .as_ref()
+                .and_then(|ty| self.scalar_cmp_bank(ty));
             OpKind::BinOp {
-                op: leaf.to_string(),
+                op: crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref()),
                 lhs: args[0].clone().into_variable(),
                 rhs: args[1].clone().into_variable(),
                 result_ty: ValueType::Int,
@@ -16536,7 +16544,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::BinOp {
-                op: leaf.to_string(),
+                op: crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref()),
                 lhs: args[0].clone(),
                 rhs: args[1].clone(),
                 result_ty: ValueType::Int,

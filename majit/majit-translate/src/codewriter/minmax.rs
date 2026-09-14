@@ -114,6 +114,23 @@ fn banks_agree(lhs: &ValueType, rhs: &ValueType, ordered: bool) -> bool {
     }
 }
 
+/// Assembler `op_kind_to_opname` prefixes a bare `lt` with `int_`.
+/// Unsigned ordered compares must already carry the `uint_` prefix
+/// (`rtyper.rs` `lowlevel_min_max_helper_graph` picks `uint_lt`).
+pub fn scalar_cmp_opname(leaf: &str, lhs: Option<&ValueType>, rhs: Option<&ValueType>) -> String {
+    let unsigned = matches!(
+        (lhs, rhs),
+        (Some(ValueType::Unsigned), Some(ValueType::Unsigned))
+            | (Some(ValueType::Unsigned), None)
+            | (None, Some(ValueType::Unsigned))
+    );
+    if unsigned && matches!(leaf, "lt" | "le" | "gt" | "ge") {
+        format!("uint_{leaf}")
+    } else {
+        leaf.to_string()
+    }
+}
+
 /// The value bank `ll_min` / `ll_max` can compare.  Refs have no
 /// ordering helper; mixed banks stay residual.
 pub fn minmax_value_ty(result_ty: &ValueType) -> Option<ValueType> {
@@ -177,7 +194,12 @@ pub fn build_ll_minmax_graph(name: &str, is_max: bool, value_ty: &ValueType) -> 
             .push(SpaceOperation {
                 result: Some(res.clone()),
                 kind: OpKind::BinOp {
-                    op: if is_max { "gt".into() } else { "lt".into() },
+                    op: match (is_max, value_ty) {
+                        (true, ValueType::Unsigned) => "uint_gt".into(),
+                        (false, ValueType::Unsigned) => "uint_lt".into(),
+                        (true, _) => "gt".into(),
+                        (false, _) => "lt".into(),
+                    },
                     lhs: i1.clone(),
                     rhs: i2.clone(),
                     result_ty: ValueType::Bool,
@@ -368,6 +390,30 @@ mod tests {
             "lt"
         ));
         assert!(!scalar_cmp_banks_compatible(None, None, "eq"));
+        assert_eq!(
+            scalar_cmp_opname("lt", Some(&ValueType::Unsigned), Some(&ValueType::Unsigned)),
+            "uint_lt"
+        );
+        assert_eq!(
+            scalar_cmp_opname("eq", Some(&ValueType::Unsigned), Some(&ValueType::Unsigned)),
+            "eq"
+        );
+        assert_eq!(
+            scalar_cmp_opname("lt", Some(&ValueType::Int), Some(&ValueType::Int)),
+            "lt"
+        );
+    }
+
+    #[test]
+    fn unsigned_minmax_helper_uses_uint_compare() {
+        let graph = build_ll_minmax_graph("ll_min__uint", false, &ValueType::Unsigned);
+        let start = graph.block(graph.startblock);
+        assert!(
+            start
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "uint_lt"))
+        );
     }
 
     #[test]

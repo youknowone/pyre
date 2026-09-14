@@ -874,14 +874,18 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::ArrayLen { .. }))
         );
         assert_eq!(start.exits.len(), 2);
-        assert!(graph.blocks.iter().any(|block| block
-            .operations
-            .iter()
-            .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))));
-        assert!(graph.blocks.iter().any(|block| block
-            .operations
-            .iter()
-            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
+        }));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        }));
         assert!(is_getslice_rangeto(&SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::Call {
@@ -910,17 +914,24 @@ mod tests {
                 .any(|op| matches!(op.kind, OpKind::ArrayLen { .. }))
         );
         assert_eq!(start.exits.len(), 2);
-        assert!(graph.blocks.iter().any(|block| block
-            .operations
-            .iter()
-            .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))));
-        assert!(graph.blocks.iter().any(|block| block
-            .operations
-            .iter()
-            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))));
-        assert!(graph.blocks.iter().any(|block| block.operations.iter().any(
-            |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub")
-        )));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
+        }));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        }));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "sub"))
+        }));
         assert!(is_getslice_range(&SpaceOperation {
             result: Some(Variable::new()),
             kind: OpKind::Call {
