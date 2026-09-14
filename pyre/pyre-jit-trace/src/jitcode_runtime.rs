@@ -399,6 +399,8 @@ static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 static INT_DESCR_STR_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// `baseobjspace::getitem_str` (`unicodeobject.py descr_getitem`).
 static STR_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// `objspace.py StdObjSpace.newutf8` / `W_UnicodeObject.__init__`.
+static NEWUTF8_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of the interpreter-source
 /// `load_super_attr_value_w` body. The fused opcode reaches this ordinary
 /// graph so `_super_check` and `W_Super.getattribute` are traced from their
@@ -608,6 +610,14 @@ pub fn int_descr_str_jitcode() -> Option<Arc<JitCode>> {
 pub fn str_getitem_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*STR_GETITEM_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("pyre_interpreter::baseobjspace::getitem_str")
+    }))?;
+    get_jitcode_by_index(idx)
+}
+
+/// `space.newutf8` — wrap a `STR` payload with an explicit code-point count.
+pub fn newutf8_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*NEWUTF8_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("pyre_object::unicodeobject::w_str_from_storage_and_length")
     }))?;
     get_jitcode_by_index(idx)
 }
