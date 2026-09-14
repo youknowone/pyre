@@ -641,7 +641,7 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
         return false;
     }
     let type_id = unsafe { (*majit_gc::header::header_of(obj as usize)).type_id() };
-    type_id == pyre_object::intobject::W_INT_USER_GC_TYPE_ID
+    type_id == pyre_object::intobject::W_INT_USER_GC_TYPE_ID.get()
         || type_id == pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID.get()
         || type_id == pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.get()
 }

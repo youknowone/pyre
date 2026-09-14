@@ -4680,7 +4680,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         )
         .object_layout_without_subclass_range(),
     );
-    debug_assert_eq!(int_user_tid, pyre_object::intobject::W_INT_USER_GC_TYPE_ID);
+    pyre_object::intobject::W_INT_USER_GC_TYPE_ID.set(int_user_tid);
     let unicode_user_tid = gc.register_type(
         TypeInfo::with_custom_trace(
             pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
