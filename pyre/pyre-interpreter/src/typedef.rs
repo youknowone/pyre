@@ -26405,34 +26405,48 @@ fn bytearray_reduce_impl(
     obj: PyObjectRef,
     protocol: Option<i64>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(obj) };
-    let args = if data.is_empty() {
-        w_tuple_new(vec![])
+    // The bytearray and every nursery tuple sit on one set: payload
+    // constructors and `object_getstate_default` collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let owned = unsafe { pyre_object::bytesobject::bytes_like_data(obj()) }.to_vec();
+    let args_slot;
+    if owned.is_empty() {
+        args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
     } else if protocol.is_some_and(|p| p >= 3) {
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::bytesobject::w_bytes_from_bytes(data));
-        w_tuple_new(fields.take())
+        let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&owned));
+        let args = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(bytes_slot)]);
+        args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args);
     } else {
         // bytearrayobject.py:221-233 — legacy protocols carry a latin-1
         // unicode string plus the explicit codec name.
-        let latin1: String = data.iter().map(|&b| char::from(b)).collect();
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new_managed(&latin1));
-        fields.push(w_str_new("latin-1"));
-        w_tuple_new(fields.take())
-    };
-    let _roots = pyre_object::gc_roots::push_roots();
-    let args_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args);
-    let cls = crate::typedef::r#type(obj)
+        let latin1: String = owned.iter().map(|&b| char::from(b)).collect();
+        let text_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&latin1));
+        let args = w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(text_slot),
+            w_str_new("latin-1"),
+        ]);
+        args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args);
+    }
+    let cls = crate::typedef::r#type(obj())
         .map(|p| p.as_ptr())
         .unwrap_or_else(|| gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE));
-    let state = crate::reduce_protocol::object_getstate_default(obj)?;
-    let mut result = pyre_object::gc_roots::RootedItems::new();
-    result.push(cls);
-    result.push(pyre_object::gc_roots::shadow_stack_get(args_slot));
-    result.push(state);
-    Ok(w_tuple_new(result.take()))
+    let state = crate::reduce_protocol::object_getstate_default(obj())?;
+    let state_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(state);
+    Ok(w_tuple_new(vec![
+        cls,
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+        pyre_object::gc_roots::shadow_stack_get(state_slot),
+    ]))
 }
 
 fn bytearray_descr_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

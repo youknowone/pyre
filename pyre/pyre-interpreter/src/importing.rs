@@ -980,36 +980,41 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 FieldType::Keyword(s) => pyre_object::w_str_from_wtf8_managed(s),
             };
             // `first` is a young managed str or int; pin it across the parts
-            // below, which allocate.
+            // below, which allocate, and reload it for the result tuple.
             let roots = pyre_object::gc_roots::push_roots();
-            let first = roots.pin_root(first);
-            let mut rest = pyre_object::gc_roots::RootedItems::new();
-            for part in parts {
-                let entry = {
-                    let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    match part {
-                        FieldNamePart::Attribute(s) => {
-                            fields.push(pyre_object::w_bool_from(true));
-                            fields.push(pyre_object::w_str_from_wtf8_managed(s));
+            let first_slot = roots.base();
+            let _ = roots.pin_root(first);
+            let rest_list = {
+                let mut rest = pyre_object::gc_roots::RootedItems::new();
+                for part in parts {
+                    let entry = {
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        match part {
+                            FieldNamePart::Attribute(s) => {
+                                fields.push(pyre_object::w_bool_from(true));
+                                fields.push(pyre_object::w_str_from_wtf8_managed(s));
+                            }
+                            FieldNamePart::Index(n) => {
+                                fields.push(pyre_object::w_bool_from(false));
+                                fields.push(pyre_object::w_int_new(n as i64));
+                            }
+                            FieldNamePart::StringIndex(s) => {
+                                fields.push(pyre_object::w_bool_from(false));
+                                fields.push(pyre_object::w_str_from_wtf8_managed(s));
+                            }
                         }
-                        FieldNamePart::Index(n) => {
-                            fields.push(pyre_object::w_bool_from(false));
-                            fields.push(pyre_object::w_int_new(n as i64));
-                        }
-                        FieldNamePart::StringIndex(s) => {
-                            fields.push(pyre_object::w_bool_from(false));
-                            fields.push(pyre_object::w_str_from_wtf8_managed(s));
-                        }
-                    }
-                    pyre_object::w_tuple_new(fields.take())
-                };
-                rest.push(entry);
-            }
-            let rest_list = pyre_object::w_list_new(rest.take());
-            let mut result = pyre_object::gc_roots::RootedItems::new();
-            result.push(first);
-            result.push(rest_list);
-            Ok(pyre_object::w_tuple_new(result.take()))
+                        pyre_object::w_tuple_new(fields.take())
+                    };
+                    rest.push(entry);
+                }
+                pyre_object::w_list_new(rest.take())
+            };
+            let rest_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(rest_list);
+            Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(first_slot),
+                pyre_object::gc_roots::shadow_stack_get(rest_slot),
+            ]))
         }),
     );
     Ok(())

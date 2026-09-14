@@ -591,17 +591,21 @@ impl<'a> MiniXmlParser<'a> {
         // a tuple is nursery-allocated, so the address it was handed in on is
         // the one a collection would leave behind.
         let roots = pyre_object::gc_roots::push_roots();
+        let empty_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_tuple_new(vec![]));
         let model = w_tuple_new(vec![
             w_int_new(2),
             w_int_new(0),
             w_none(),
-            w_tuple_new(vec![]),
+            roots.get(empty_slot),
         ]);
-        let model = roots.pin_root(model);
+        let model_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(model);
         self.set_event_position(event_pos);
+        let name = w_str_new_managed(&name);
         self.handler_args("ElementDeclHandler")
-            .arg(w_str_new_managed(&name))
-            .arg(model)
+            .arg(name)
+            .arg(roots.get(model_slot))
             .call()
     }
 

@@ -184,31 +184,48 @@ fn structseq_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if inst.is_null() {
         return Err(PyError::type_error("structseq __reduce__ missing self"));
     }
-    let cls = unsafe { (*inst).w_class };
-    // `tuple(self)` — the positional body as a plain tuple.
-    let n = unsafe { pyre_object::w_tuple_len(inst) };
-    let mut items = pyre_object::gc_roots::RootedItems::new();
+    // The instance is a nursery tuple subclass; `w_tuple_new` / `w_dict_new`
+    // below collect, so publish it and every already-live item first.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let inst_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(inst);
+    let inst = || pyre_object::gc_roots::shadow_stack_get(inst_slot);
+    let cls = unsafe { (*inst()).w_class };
+    let n = unsafe { pyre_object::w_tuple_len(inst()) };
+    let mut items = Vec::with_capacity(n);
     for i in 0..n {
         items.push(
-            unsafe { pyre_object::w_tuple_getitem(inst, i as i64) }
+            unsafe { pyre_object::w_tuple_getitem(inst(), i as i64) }
                 .unwrap_or_else(pyre_object::w_none),
         );
     }
-    let body_tuple = pyre_object::w_tuple_new(items.take());
+    let items_base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(items_base, items.len());
+    let body_tuple = pyre_object::w_tuple_new(
+        (0..n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+            .collect(),
+    );
+    let body_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(body_tuple);
     // `self.__dict__` carries the named-only extras for reconstruction.
-    let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(body_tuple);
-    let w_dict = crate::baseobjspace::getdict_native(inst);
-    fields.push(if w_dict.is_null() {
+    let w_dict = crate::baseobjspace::getdict_native(inst());
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(if w_dict.is_null() {
         pyre_object::w_dict_new()
     } else {
         w_dict
     });
-    let inner = pyre_object::w_tuple_new(fields.take());
-    let mut result = pyre_object::gc_roots::RootedItems::new();
-    result.push(cls);
-    result.push(inner);
-    Ok(pyre_object::w_tuple_new(result.take()))
+    let inner = pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(body_slot),
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+    ]);
+    let inner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(inner);
+    Ok(pyre_object::w_tuple_new(vec![
+        cls,
+        pyre_object::gc_roots::shadow_stack_get(inner_slot),
+    ]))
 }
 
 /// CPython 3.14 `structseq___replace__` — copy the positional body and

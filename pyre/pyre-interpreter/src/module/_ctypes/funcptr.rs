@@ -1950,8 +1950,13 @@ fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         .map(crate::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
-    let w_fmt = pyre_object::w_str_new("B");
+    let roots = pyre_object::gc_roots::push_roots();
+    let fmt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new_managed("B"));
     let w_obj = pyre_object::w_none();
+    let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
+    let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(mv);
     let view = pyre_object::bufferview::BufferView::Raw {
         backing: pyre_object::buffer::Buffer::External {
             w_obj,
@@ -1960,14 +1965,13 @@ fn internal_memoryview_at(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             readonly,
         },
         w_obj,
-        w_fmt,
+        w_fmt: roots.get(fmt_slot),
         itemsize: 1,
         length: size,
     };
-    let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, false);
     let view = pyre_object::memoryview::bufferview_alloc(view);
-    unsafe { pyre_object::memoryview::w_memoryview_set_view(mv, view) };
-    Ok(mv)
+    unsafe { pyre_object::memoryview::w_memoryview_set_view(roots.get(mv_slot), view) };
+    Ok(roots.get(mv_slot))
 }
 
 fn internal_pybytes_fromstringandsize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

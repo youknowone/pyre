@@ -1736,19 +1736,38 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
     // instead of a BINBYTES opcode (interp_pickle.py:1349).
     if ctx.proto < 3 {
         let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         if data.is_empty() {
             let w_bytes = crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE);
             let w_args = pyre_object::tupleobject::w_tuple_new(Vec::new());
-            return save_reduce(ctx, buf, &[w_bytes, w_args], Some(w_obj));
+            return save_reduce(
+                ctx,
+                buf,
+                &[w_bytes, w_args],
+                Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+            );
         }
         let codecs = import_module("codecs")?;
         let w_encode = crate::baseobjspace::getattr_str(codecs, "encode")?;
-        let w_decoded = call_meth(w_obj, "decode", &[pyre_object::w_str_new("latin1")])?;
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_decoded);
-        fields.push(pyre_object::w_str_new("latin1"));
-        let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
-        return save_reduce(ctx, buf, &[w_encode, w_args], Some(w_obj));
+        let w_decoded = call_meth(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            "decode",
+            &[pyre_object::w_str_new("latin1")],
+        )?;
+        let dec_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_decoded);
+        let w_args = pyre_object::tupleobject::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(dec_slot),
+            pyre_object::w_str_new("latin1"),
+        ]);
+        return save_reduce(
+            ctx,
+            buf,
+            &[w_encode, w_args],
+            Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+        );
     }
     let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
     let n = data.len();
@@ -1986,13 +2005,31 @@ fn save_dict(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resul
 fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.proto < 4 {
         // save_reduce(set, (list(obj),)).
+        // `w_list_new` collects, so publish the set and every already-live
+        // member first and rebuild the list from the forwarded slots.
+        let _roots = pyre_object::gc_roots::push_roots();
         let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
-        let w_list = pyre_object::listobject::w_list_new(items);
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_list);
-        let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
+        let mut live = Vec::with_capacity(items.len() + 1);
+        live.push(w_obj);
+        live.extend_from_slice(&items);
+        let base = pyre_object::gc_roots::publish_roots(&live);
+        pyre_object::gc_roots::normalize_roots(base, live.len());
+        let reloaded: Vec<_> = (0..items.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + 1 + i))
+            .collect();
+        let list_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::listobject::w_list_new(reloaded));
+        let w_args =
+            pyre_object::tupleobject::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(
+                list_slot,
+            )]);
         let w_set_type = crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-        return save_reduce(ctx, buf, &[w_set_type, w_args], Some(w_obj));
+        return save_reduce(
+            ctx,
+            buf,
+            &[w_set_type, w_args],
+            Some(pyre_object::gc_roots::shadow_stack_get(base)),
+        );
     }
     buf.push(op::EMPTY_SET);
     // Pin the set so `memoize` records its current address, then snapshot its
@@ -2007,7 +2044,7 @@ fn save_set(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result
     let items = unsafe {
         pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(set_slot))
     };
-    let items_slot = pin_items(items);
+    let items_slot = pin_published_items(items);
     let result = save_set_items(ctx, buf, items_slot, set_slot);
     fast_save_leave(ctx, fast_token, set_slot);
     result
@@ -2071,14 +2108,30 @@ fn save_frozenset(
 ) -> Result<(), PyError> {
     if ctx.proto < 4 {
         // save_reduce(frozenset, (list(obj),)).
+        let _roots = pyre_object::gc_roots::push_roots();
         let items = unsafe { pyre_object::setobject::w_set_items(w_obj) };
-        let w_list = pyre_object::listobject::w_list_new(items);
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_list);
-        let w_args = pyre_object::tupleobject::w_tuple_new(fields.take());
+        let mut live = Vec::with_capacity(items.len() + 1);
+        live.push(w_obj);
+        live.extend_from_slice(&items);
+        let base = pyre_object::gc_roots::publish_roots(&live);
+        pyre_object::gc_roots::normalize_roots(base, live.len());
+        let reloaded: Vec<_> = (0..items.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + 1 + i))
+            .collect();
+        let list_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::listobject::w_list_new(reloaded));
+        let w_args =
+            pyre_object::tupleobject::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(
+                list_slot,
+            )]);
         let w_frozenset_type =
             crate::typedef::gettypeobject(&pyre_object::setobject::FROZENSET_TYPE);
-        return save_reduce(ctx, buf, &[w_frozenset_type, w_args], Some(w_obj));
+        return save_reduce(
+            ctx,
+            buf,
+            &[w_frozenset_type, w_args],
+            Some(pyre_object::gc_roots::shadow_stack_get(base)),
+        );
     }
     // Pin the frozenset and snapshot its members into a pinned Python `list`
     // re-read per save (a recursive save can relocate them); the frozenset
@@ -2089,7 +2142,7 @@ fn save_frozenset(
     let items = unsafe {
         pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(fs_slot))
     };
-    let slot = pin_items(items);
+    let slot = pin_published_items(items);
     buf.push(op::MARK);
     let n = pinned_len(slot);
     for i in 0..n {
@@ -2120,17 +2173,35 @@ fn save_bytearray(
 ) -> Result<(), PyError> {
     if ctx.proto < 5 {
         // save_reduce(bytearray, ()) for empty, else save_reduce(bytearray, (bytes,)).
-        let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_obj) };
+        // The bytearray is nursery-movable and `w_bytes_from_bytes` /
+        // `w_tuple_new` collect, so pin it before those allocs and copy
+        // the payload off the object before the bytes constructor runs.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_obj);
         let w_bytearray_type =
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE);
+        let data = unsafe {
+            pyre_object::bytearrayobject::w_bytearray_data(pyre_object::gc_roots::shadow_stack_get(
+                obj_slot,
+            ))
+        };
         let w_args = if data.is_empty() {
             pyre_object::tupleobject::w_tuple_new(Vec::new())
         } else {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(pyre_object::w_bytes_from_bytes(data));
-            pyre_object::tupleobject::w_tuple_new(fields.take())
+            let owned = data.to_vec();
+            let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&owned));
+            pyre_object::tupleobject::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(
+                bytes_slot,
+            )])
         };
-        return save_reduce(ctx, buf, &[w_bytearray_type, w_args], Some(w_obj));
+        return save_reduce(
+            ctx,
+            buf,
+            &[w_bytearray_type, w_args],
+            Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
+        );
     }
     let data = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_obj) };
     let n = data.len();
@@ -2179,31 +2250,38 @@ fn save_picklebuffer(
             "PickleBuffer can not be pickled after release",
         ));
     }
-    if !crate::module::__pypy__::interp_buffer::is_contiguous(wrapped)? {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_obj, wrapped]);
+    let obj_slot = base;
+    let wrapped_slot = base + 1;
+    if !crate::module::__pypy__::interp_buffer::is_contiguous(
+        pyre_object::gc_roots::shadow_stack_get(wrapped_slot),
+    )? {
         return Err(pickling_error(
             "PickleBuffer can not be pickled when pointing to a non-contiguous buffer",
         ));
     }
-    let (data, readonly) = crate::module::__pypy__::interp_buffer::buffer_view(wrapped)?;
+    let (data, readonly) = crate::module::__pypy__::interp_buffer::buffer_view(
+        pyre_object::gc_roots::shadow_stack_get(wrapped_slot),
+    )?;
     let mut in_band = true;
     let buffer_callback = ctx.buffer_callback.get();
     if !unsafe { pyre_object::is_none(buffer_callback) } {
-        let w_ret = call_fn(buffer_callback, &[w_obj])?;
+        let w_ret = call_fn(
+            buffer_callback,
+            &[pyre_object::gc_roots::shadow_stack_get(obj_slot)],
+        )?;
         in_band = crate::baseobjspace::is_true(w_ret)?;
     }
     if in_band {
         // In-band buffers memoize the wrapper (`_save_bytes_data` /
-        // `_save_bytearray_data`), so a repeated reference becomes a GET. A
-        // large payload streams via `file.write`; pin `w_obj` for the memoize.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(w_obj);
-        let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        // `_save_bytearray_data`), so a repeated reference becomes a GET.
         if readonly {
             save_raw_bytes(ctx, buf, &data)?;
         } else {
             save_raw_bytearray(buf, &data)?;
         }
-        memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(slot));
+        memoize(ctx, buf, pyre_object::gc_roots::shadow_stack_get(obj_slot));
     } else {
         buf.push(op::NEXT_BUFFER);
         if readonly {
@@ -2270,6 +2348,18 @@ fn pin_items(items: Vec<PyObjectRef>) -> usize {
     let w_list = pyre_object::listobject::w_list_new_object(items);
     let _ = pyre_object::gc_roots::pin_root(w_list);
     pyre_object::gc_roots::shadow_stack_len() - 1
+}
+
+/// Publish an already-live member slice, then [`pin_items`].  The list
+/// constructor is a safepoint, so handing `pin_items` an unpublished
+/// `Vec` would freeze forwarding stubs into the snapshot.
+fn pin_published_items(items: Vec<PyObjectRef>) -> usize {
+    let base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(base, items.len());
+    let reloaded: Vec<_> = (0..items.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect();
+    pin_items(reloaded)
 }
 
 /// Length of the pinned list at `slot`.
@@ -3181,24 +3271,28 @@ fn save_reduce(
     w_obj_opt: Option<PyObjectRef>,
 ) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    // Reach a slot before anything allocates.  The object being reduced can be
-    // a `list` subclass instance, whose header moves, and `pin_items` below
-    // builds a GC-walked `list` -- a collection point.  `pin_root` publishes
-    // whatever word it is handed and does not normalize it under a single
-    // mutator, so a pin taken after that allocation would freeze a forwarding
-    // stub into the slot and every later read of it would return the stub.
-    let w_obj_slot = match w_obj_opt {
-        Some(o) => {
-            let _ = pyre_object::gc_roots::pin_root(o);
-            Some(pyre_object::gc_roots::shadow_stack_len() - 1)
-        }
-        None => None,
-    };
+    // `pin_items` allocates a list.  Publish the reduce object and every
+    // reduce value first, then normalize once: a `pin_root` of `w_obj`
+    // alone is a safepoint that would leave the still-unpublished `rv`
+    // slice invisible to a foreign collection.
+    let has_obj = w_obj_opt.is_some();
+    let mut live = Vec::with_capacity(rv.len() + usize::from(has_obj));
+    if let Some(o) = w_obj_opt {
+        live.push(o);
+    }
+    live.extend_from_slice(rv);
+    let base = pyre_object::gc_roots::publish_roots(&live);
+    pyre_object::gc_roots::normalize_roots(base, live.len());
+    let w_obj_slot = has_obj.then_some(base);
+    let rv_off = usize::from(has_obj);
+    let rv_reloaded: Vec<_> = (0..rv.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + rv_off + i))
+        .collect();
     // Recursive saves (and the reduce callbacks they invoke) relocate young
     // objects, so pin the reduce values in a GC-walked `list` and re-read each
     // one immediately before it is consumed.
     let rv_len = rv.len();
-    let rv_slot = pin_items(rv.to_vec());
+    let rv_slot = pin_items(rv_reloaded);
     let rv_get = |i: usize| pinned_get(rv_slot, i);
     let present = |i: usize| i < rv_len && !unsafe { pyre_object::is_none(pinned_get(rv_slot, i)) };
 
@@ -3391,8 +3485,14 @@ fn save_reduce(
                     rustpython_wtf8::Wtf8::new("reconstructor"),
                 ));
             }
-            let w_empty_args = pyre_object::tupleobject::w_tuple_new(Vec::new());
-            save(ctx, buf, w_empty_args)?;
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ =
+                pyre_object::gc_roots::pin_root(pyre_object::tupleobject::w_tuple_new(Vec::new()));
+            save(
+                ctx,
+                buf,
+                pyre_object::gc_roots::shadow_stack_get(empty_slot),
+            )?;
             buf.push(op::REDUCE);
         }
     } else if ctx.proto >= 2 && func_name.as_deref() == Some("__newobj__") {

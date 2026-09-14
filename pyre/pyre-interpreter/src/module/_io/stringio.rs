@@ -187,14 +187,20 @@ impl W_StringIO {
         } else {
             super::call_method_result(this.w_decoder, "decode", &[w_obj, w_bool_from(true)])?
         };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let decoded_slot = pyre_object::gc_roots::shadow_stack_len();
         let mut decoded = pyre_object::gc_roots::pin_root(decoded);
-        let decoded_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let this = Self::from_slot(slot);
         if !this.writenl.is_null() {
+            let nl_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("\n"));
             decoded = super::call_method_result(
                 pyre_object::gc_roots::shadow_stack_get(decoded_slot),
                 "replace",
-                &[w_str_new("\n"), this.writenl],
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(nl_slot),
+                    this.writenl,
+                ],
             )?;
         }
         if !unsafe { crate::baseobjspace::isinstance_str_w(decoded) } {

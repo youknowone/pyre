@@ -1306,32 +1306,44 @@ impl W_Deque {
         // The instance payload lives in typed fields, leaving a deque
         // subclass's `__dict__` free to round-trip its instance
         // attributes through `object_getstate_default`.
-        let ty = unsafe { w_instance_get_type(self_obj) };
-        let m = maxlen_obj(self_obj);
-        let args = if unsafe { is_none(m) } {
-            w_tuple_new(vec![])
-        } else {
-            let empty = w_tuple_new(vec![]);
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(empty);
-            fields.push(m);
-            w_tuple_new(fields.take())
-        };
+        // `object_getstate_default` and `iter` run Python; the deque and
+        // every nursery tuple built here have to sit on one open set.
         let _roots = pyre_object::gc_roots::push_roots();
-        let args_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(args);
-        let state = crate::reduce_protocol::object_getstate_default(self_obj)?;
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self_obj);
+        let self_obj = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let ty = unsafe { w_instance_get_type(self_obj()) };
+        let m = maxlen_obj(self_obj());
+        let args_slot;
+        if unsafe { is_none(m) } {
+            args_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
+        } else {
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
+            let m_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(m);
+            let args = w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(empty_slot),
+                pyre_object::gc_roots::shadow_stack_get(m_slot),
+            ]);
+            args_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(args);
+        }
+        let state = crate::reduce_protocol::object_getstate_default(self_obj())?;
         let state_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(state);
         // interp_deque.py W_Deque.reduce calls `space.iter(self)`, preserving
         // subclass __iter__ overrides (including an override that raises).
-        let items = crate::baseobjspace::iter(self_obj)?;
-        let mut result = pyre_object::gc_roots::RootedItems::new();
-        result.push(ty);
-        result.push(pyre_object::gc_roots::shadow_stack_get(args_slot));
-        result.push(pyre_object::gc_roots::shadow_stack_get(state_slot));
-        result.push(items);
-        Ok(w_tuple_new(result.take()))
+        let items = crate::baseobjspace::iter(self_obj())?;
+        let items_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(items);
+        Ok(w_tuple_new(vec![
+            ty,
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+            pyre_object::gc_roots::shadow_stack_get(items_slot),
+        ]))
     }
     fn __len__(&self) -> i64 {
         let self_obj = self as *const W_Deque as PyObjectRef;

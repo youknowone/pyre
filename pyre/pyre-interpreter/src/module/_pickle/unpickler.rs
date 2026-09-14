@@ -1719,10 +1719,9 @@ fn audit_find_class(module: &str, name: &str) -> Result<(), PyError> {
 
 fn audit_find_class_objects(w_module: PyObjectRef, w_name: PyObjectRef) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(w_module);
-    let module_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(w_name);
-    let name_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let base = pyre_object::gc_roots::pin_roots(&[w_module, w_name]);
+    let module_slot = base;
+    let name_slot = base + 1;
     if let Ok(sys) = import_module("sys")
         && let Ok(audit) = crate::baseobjspace::getattr_str(sys, "audit")
     {

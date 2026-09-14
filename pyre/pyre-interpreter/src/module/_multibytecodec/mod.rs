@@ -223,9 +223,13 @@ fn encode_rust_codec_with_state(
                     }
                     "ignore" => (Vec::new(), end),
                     "replace" => {
+                        // Per-call replacement character; pin it across the
+                        // nested encode, which allocates.
+                        let q_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = roots.pin_root(w_str_new_managed("?"));
                         let (bytes, next_state) = encode_replacement_text(
                             name,
-                            w_str_new("?"),
+                            roots.get(q_slot),
                             &state,
                             state_sink_slot.map(pyre_object::gc_roots::shadow_stack_get),
                         )?;

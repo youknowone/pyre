@@ -1314,15 +1314,28 @@ impl W_TextIOWrapper {
             .code_points()
             .any(|cp| cp.to_u32() == b'\r' as u32);
 
-        let mut to_encode = text;
+        let roots = pyre_object::gc_roots::push_roots();
+        let text_slot = roots.base();
+        let _ = roots.pin_root(text);
+        let mut to_encode_slot = text_slot;
         if has_lf && let Some(writenl) = self.write_newline() {
-            to_encode =
-                super::call_method_result(text, "replace", &[w_str_new("\n"), w_str_new(writenl)])?;
+            let nl_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(w_str_new_managed("\n"));
+            let wr_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(w_str_new_managed(writenl));
+            let replaced = super::call_method_result(
+                roots.get(text_slot),
+                "replace",
+                &[roots.get(nl_slot), roots.get(wr_slot)],
+            )?;
+            to_encode_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(replaced);
         }
 
         let need_flush = self.line_buffering && (has_lf || has_cr);
         let text_need_flush = self.write_through;
-        let encoded = super::call_method_result(self.w_encoder, "encode", &[to_encode])?;
+        let encoded =
+            super::call_method_result(self.w_encoder, "encode", &[roots.get(to_encode_slot)])?;
         if unsafe { !pyre_object::bytesobject::is_bytes(encoded) } {
             return Err(crate::PyError::type_error(format!(
                 "encoder should return a bytes object, not '{}'",
