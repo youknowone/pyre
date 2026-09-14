@@ -541,13 +541,9 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(bases);
     let _ = crate::gc_roots::pin_root(dict_ptr as PyObjectRef);
-    // Heap types stay in the non-moving old generation.  Callers cache the
-    // resulting pointer in `OnceLock<usize>` (structseq types, sys.flags)
-    // and the JIT caches `w_class`; a nursery type would move and leave
-    // those addresses stale (`getfield_gc_r` sanity check, "no field
-    // verbose").  Full nursery types need those caches to follow
-    // forwarding first (#1449).
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
+    // Heap types are `malloc_fixedsize` (`typeobject.py W_TypeObject`).
+    // structseq identity is a rooted slot, not a raw OnceLock address.
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_TYPE_GC_TYPE_ID, W_TYPE_OBJECT_SIZE);
     // A mortal (GC-managed) heap type boxes its name in a GC-managed storage box
     // reclaimed by the box tid's drop glue (`NameStorage`), greyed through the
     // `name` slot in `type_object_custom_trace`. The immortal fallback (pre-GC /
