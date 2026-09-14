@@ -5279,6 +5279,13 @@ impl TraceCtx {
         arg_types: &[Type],
         result_type: Type,
     ) -> OpRef {
+        // `pyjitpl.py do_residual_call` step 5 invalidates on
+        // `CALL_MAY_FORCE` with `allboxes` (funcbox + args).
+        let func_ref = OpRef::const_int(
+            target_arc
+                ._ll_function_addr
+                .load(std::sync::atomic::Ordering::Acquire) as i64,
+        );
         let descr =
             crate::call_descr::make_call_assembler_descr(target_arc, arg_types, result_type);
         let opcode = OpCode::call_assembler_for_type(result_type);
@@ -5288,10 +5295,12 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
+        let mut allboxes = vec![func_ref];
+        allboxes.extend_from_slice(args);
         self.heap_cache.invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,
-            args,
+            &allboxes,
             oracle,
             const_value,
         );

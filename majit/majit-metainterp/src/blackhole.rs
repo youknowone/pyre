@@ -13594,19 +13594,62 @@ fn handler_inline_call_r_v(
     Ok(p)
 }
 
-/// TODO: pyre `call_assembler_*` adapters.
+/// Leftover `BC_CALL_ASSEMBLER_*` resume.
 ///
-/// `JitCodeBuilder::call_assembler_{int,ref,float,void}_like`
-/// (`jitcode/assembler.rs`) emits a pyre-only flat payload
-/// for `BC_CALL_ASSEMBLER_{INT,REF,FLOAT,VOID}`:
+/// Payload (`JitCodeBuilder::call_assembler_*_like`):
 ///   typed: `[target_idx: u16, dst: u8, num_args: u16, (kind: u8, reg: u8) × num_args]`
 ///   void:  `[target_idx: u16, num_args: u16, (kind: u8, reg: u8) × num_args]`
-/// RPython has no `bhimpl_call_assembler_*`; pyre re-interprets the
-/// recorded operation by direct-calling `target.concrete_ptr` via the
-/// shared `call_int_function` / `call_void_function` C-ABI helpers.
-/// The 4 handlers below are the line-by-line port of the legacy
-/// `dispatch_one::BC_CALL_ASSEMBLER_*` arms (pre-P8) into the
-/// strict-dispatch `(bh, code, position) -> Result<usize, _>` shape.
+/// RPython has no `bhimpl_call_assembler_*`. Resume still goes through
+/// `cpu.bh_call_*` the way leftover `cond_call_*_ext` and
+/// `bhimpl_residual_call_*` do: split mixed kind/reg pairs into I/R/F
+/// and build a `BhCallDescr` from the target's `effect_info_slot`.
+/// Float leftover wrappers return packed i64 bits, so that arm uses
+/// `bh_call_i` not `bh_call_f`.
+fn read_call_assembler_irf(
+    bh: &BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+    num_args: usize,
+) -> (Vec<i64>, Vec<i64>, Vec<i64>, String, usize) {
+    let mut p = p;
+    let mut args_i = Vec::new();
+    let mut args_r = Vec::new();
+    let mut args_f = Vec::new();
+    let mut arg_classes = String::with_capacity(num_args);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let reg = jitcode::read_reg(code, &mut p);
+        let val = bh.read_call_arg(kind, reg as u16);
+        match kind {
+            JitArgKind::Int => {
+                args_i.push(val);
+                arg_classes.push('i');
+            }
+            JitArgKind::Ref => {
+                args_r.push(val);
+                arg_classes.push('r');
+            }
+            JitArgKind::Float => {
+                args_f.push(val);
+                arg_classes.push('f');
+            }
+        }
+    }
+    (args_i, args_r, args_f, arg_classes, p)
+}
+
+fn leftover_call_assembler_target(
+    bh: &mut BlackholeInterpreter,
+    fn_ptr_idx: usize,
+) -> Result<(crate::jitcode::JitCallTarget, i64), DispatchError> {
+    let target = *bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
+    Ok((target, func))
+}
+
 fn handler_call_assembler_int_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -13616,19 +13659,17 @@ fn handler_call_assembler_int_ext(
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let dst = jitcode::read_reg(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let mut args = Vec::with_capacity(num_args);
-    for _ in 0..num_args {
-        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_reg(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg as u16));
-    }
-    let target = bh.jitcode.call_target(fn_ptr_idx);
-    let func = target.concrete_ptr as usize as i64;
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
+    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
+    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Int);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    let result = call_int_function(target.concrete_ptr, &args);
+    let result = bh.cpu().bh_call_i(
+        func,
+        Some(&args_i),
+        Some(&args_r),
+        leftover_cond_call_args_f(&args_f),
+        &calldescr,
+    );
     check_residual_call_exception_after(bh, p)?;
     bh.registers_i[dst] = result;
     Ok(p)
@@ -13643,38 +13684,25 @@ fn handler_call_assembler_ref_ext(
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let dst = jitcode::read_reg(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let mut args = Vec::with_capacity(num_args);
-    for _ in 0..num_args {
-        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_reg(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg as u16));
-    }
-    let target = bh.jitcode.call_target(fn_ptr_idx);
-    let func = target.concrete_ptr as usize as i64;
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
+    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
+    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Ref);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    // RPython `blackhole.py bhimpl_residual_call_irf_r` →
-    // `cpu.bh_call_r(...)`; pyre's ref ABI uses the same i64 carrier
-    // as int (`pyjitpl/dispatch.rs`'s `call_ref_function = call_int_function`),
-    // so the alias is structural-parity only.  Picking the ref-named
-    // helper here keeps the call site readable as `bh_call_r` and
-    // gives a single switch point if the ref ABI ever diverges.
-    let result = call_ref_function(target.concrete_ptr, &args);
+    let result = bh
+        .cpu()
+        .bh_call_r(
+            func,
+            Some(&args_i),
+            Some(&args_r),
+            leftover_cond_call_args_f(&args_f),
+            &calldescr,
+        )
+        .0 as i64;
     check_residual_call_exception_after(bh, p)?;
     bh.registers_r[dst] = result;
     Ok(p)
 }
 
-/// `target.concrete_ptr` is `extern "C" fn(...) -> i64`; the f64 result is
-/// already pre-packed via `f64::to_bits()` inside the wrapper.  Calling
-/// through `call_int_function` and storing the i64 directly into
-/// `registers_f` matches RPython's `longlong.ZEROF` packing convention.
-/// The f64-ABI wrapper at `target.trace_ptr` is consumed only by the
-/// tracing path; using `call_float_function` here would transmute the
-/// i64-returning concrete wrapper through an `extern "C" fn(...) -> f64`
-/// signature and break the ABI.
 fn handler_call_assembler_float_ext(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -13684,19 +13712,19 @@ fn handler_call_assembler_float_ext(
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let dst = jitcode::read_reg(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let mut args = Vec::with_capacity(num_args);
-    for _ in 0..num_args {
-        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_reg(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg as u16));
-    }
-    let target = bh.jitcode.call_target(fn_ptr_idx);
-    let func = target.concrete_ptr as usize as i64;
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
+    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
+    // Leftover wrappers return packed i64 bits (`f64::to_bits`).
+    // `bh_call_f` would use the float ABI and break that convention.
+    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Int);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    let result = call_int_function(target.concrete_ptr, &args);
+    let result = bh.cpu().bh_call_i(
+        func,
+        Some(&args_i),
+        Some(&args_r),
+        leftover_cond_call_args_f(&args_f),
+        &calldescr,
+    );
     check_residual_call_exception_after(bh, p)?;
     bh.registers_f[dst] = result;
     Ok(p)
@@ -13710,19 +13738,17 @@ fn handler_call_assembler_void_ext(
     let mut p = p;
     let fn_ptr_idx = jitcode::read_u16(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let mut args = Vec::with_capacity(num_args);
-    for _ in 0..num_args {
-        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let reg = jitcode::read_reg(code, &mut p);
-        args.push(bh.read_call_arg(kind, reg as u16));
-    }
-    let target = bh.jitcode.call_target(fn_ptr_idx);
-    let func = target.concrete_ptr as usize as i64;
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let (args_i, args_r, args_f, arg_classes, p) = read_call_assembler_irf(bh, code, p, num_args);
+    let (target, func) = leftover_call_assembler_target(bh, fn_ptr_idx)?;
+    let calldescr = leftover_cond_call_descr(&target, arg_classes, majit_ir::Type::Void);
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    call_void_function(target.concrete_ptr, &args);
+    bh.cpu().bh_call_v(
+        func,
+        Some(&args_i),
+        Some(&args_r),
+        leftover_cond_call_args_f(&args_f),
+        &calldescr,
+    );
     check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }
