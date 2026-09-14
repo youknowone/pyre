@@ -2544,8 +2544,8 @@ fn emit_frontend_delattr(
 /// Records the 4-arg `store_attr(obj, value, code, name_idx)` HLOp (void
 /// result) that `flatten.rs::lower_setattr_hlop_to_insn` threads into the
 /// `bh_store_attr_fn(obj, value, code, name_idx)` residual.  Distinct from
-/// the bare `setattr` HLOp (an `is_pyre_canonical_elidable_hlop` rewritten
-/// to `setfield_gc`), so the generic attribute store survives lowering.
+/// the bare `setattr` HLOp that [`emit_frontend_setattr`] records for
+/// `space.setattr`.
 #[allow(dead_code)]
 fn emit_frontend_store_attr(
     block: &super::flow::BlockRef,
@@ -3641,6 +3641,8 @@ struct FnPtrIndices {
     call_kw_fn_13: HelperHandle,
     unbound_local_error_fn: HelperHandle,
     clear_in_flight_exception_fn: HelperHandle,
+    setattr_fn: HelperHandle,
+    delattr_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4385,6 +4387,21 @@ fn register_helper_fn_pointers(
         cpu.load_import_globals_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // 3-arg `space.setattr` / 2-arg `space.delattr` residuals for the
+    // unbound fallback of the flowspace STORE_ATTR / DELETE_ATTR
+    // shapes.  Bound last so every pre-existing helper index remains
+    // stable.  User `__setattr__` / `__delattr__` may force
+    // virtualizables → `MayForce`.
+    let setattr_fn = bind(
+        assembler,
+        pyre_interpreter::opcode_ops::jit_baseobjspace_setattr as *const (),
+        CallFlavor::MayForce,
+    );
+    let delattr_fn = bind(
+        assembler,
+        pyre_interpreter::opcode_ops::jit_baseobjspace_delattr as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4492,6 +4509,8 @@ fn register_helper_fn_pointers(
         set_function_attribute_fn,
         unbound_local_error_fn,
         clear_in_flight_exception_fn,
+        setattr_fn,
+        delattr_fn,
     }
 }
 
@@ -6665,6 +6684,16 @@ impl CodeWriter {
                     idx: clear_in_flight_exception_fn_idx,
                     flavor: _clear_in_flight_exception_fn_flavor,
                 },
+            setattr_fn:
+                HelperHandle {
+                    idx: setattr_fn_idx,
+                    flavor: _setattr_fn_flavor,
+                },
+            delattr_fn:
+                HelperHandle {
+                    idx: delattr_fn_idx,
+                    flavor: _delattr_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -6708,6 +6737,8 @@ impl CodeWriter {
             truth_fn_idx,
             store_subscr_fn_idx,
             getattr_fn_idx,
+            setattr_fn_idx,
+            delattr_fn_idx,
             load_name_fn_idx,
             store_name_fn_idx,
             store_global_fn_idx,
