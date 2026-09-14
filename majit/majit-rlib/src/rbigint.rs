@@ -600,15 +600,19 @@ impl RBigInt {
         // into the flow graph.
         debug_assert!(size >= 0);
         let logical_len = if size == 0 { digits.len() as i64 } else { size };
-        let block = unsafe { Digits::new(digits.len().max(1)) };
+        // `digits` may alias another bigint's GcArray. Copy first so
+        // `Digits::new` (`collect_and_reserve`) cannot evacuate the source
+        // under this slice.
+        let owned: Vec<Digit> = digits.to_vec();
+        let block = unsafe { Digits::new(owned.len().max(1)) };
         unsafe {
             let base = typed_items_block_items_base(block) as *mut Digit;
-            if digits.is_empty() {
+            if owned.is_empty() {
                 *base = NULLDIGIT;
             } else {
                 let mut i = 0;
-                while i < digits.len() {
-                    *base.add(i) = digits[i];
+                while i < owned.len() {
+                    *base.add(i) = owned[i];
                     i += 1;
                 }
             }
@@ -628,16 +632,17 @@ impl RBigInt {
         } else {
             size
         };
-        let allocation_size = digits.len().max(1);
+        let owned: Vec<Digit> = digits.to_vec();
+        let allocation_size = owned.len().max(1);
         let block = unsafe { Digits::try_new(allocation_size) }.ok_or(RBigIntError::Memory)?;
         unsafe {
             let base = typed_items_block_items_base(block) as *mut Digit;
-            if digits.is_empty() {
+            if owned.is_empty() {
                 *base = NULLDIGIT;
             } else {
                 let mut i = 0;
-                while i < digits.len() {
-                    *base.add(i) = digits[i];
+                while i < owned.len() {
+                    *base.add(i) = owned[i];
                     i += 1;
                 }
             }
@@ -2071,22 +2076,23 @@ impl RBigInt {
         }
         let mut wordshift = int_other / SHIFT;
         let remshift = int_other % SHIFT;
+        let this = live_rbigint(self);
         if remshift == 0 {
-            let newsize = self
+            let newsize = this
                 .numdigits()
                 .checked_add(wordshift)
                 .ok_or(RBigIntError::Memory)?;
             let mut result = Self::try_with_size(newsize, selfsign)?;
             let mut i = 0;
-            while i < self.numdigits() {
-                result.setdigit(wordshift + i, self.digit(i));
+            while i < this.numdigits() {
+                result.setdigit(wordshift + i, this.digit(i));
                 i += 1;
             }
             return Ok(result);
         }
 
         let hishift = SHIFT - remshift;
-        let oldsize = self.numdigits();
+        let oldsize = this.numdigits();
         let mut newsize = oldsize
             .checked_add(wordshift)
             .and_then(|size| size.checked_add(1))
@@ -2095,7 +2101,7 @@ impl RBigInt {
         let mut j = 0;
         let mut prevdigit = 0_u64;
         while j < oldsize {
-            let digit = self.udigit(j);
+            let digit = this.udigit(j);
             let newdigit = (digit << remshift) | (prevdigit >> hishift);
             z.setdigit_udigit(wordshift, newdigit);
             prevdigit = digit;
@@ -2114,14 +2120,15 @@ impl RBigInt {
     #[inline]
     pub fn lqshift(&self, int_other: i64) -> Self {
         debug_assert!(int_other > 0 && int_other < SHIFT);
-        let oldsize = self.numdigits();
-        let selfsign = self.get_sign();
+        let this = live_rbigint(self);
+        let oldsize = this.numdigits();
+        let selfsign = this.get_sign();
         let mut z = Self::with_size(oldsize + 1, selfsign);
         let hishift = SHIFT - int_other;
         let mut prevdigit = 0_u64;
         let mut i = 0;
         while i < oldsize {
-            let digit = self.udigit(i);
+            let digit = this.udigit(i);
             let newdigit = (digit << int_other) | (prevdigit >> hishift);
             z.setdigit_udigit(i, newdigit);
             prevdigit = digit;
@@ -2181,14 +2188,15 @@ impl RBigInt {
         } else if int_other == 0 {
             return Ok(self.translated_alias());
         }
-        let selfsign = self.get_sign();
+        let this = live_rbigint(self);
+        let selfsign = this.get_sign();
         if selfsign == -1 && !dont_invert {
-            let a = self.invert().rshift(int_other, false)?;
+            let a = this.invert().rshift(int_other, false)?;
             return Ok(a.invert());
         }
 
         let mut wordshift = int_other / SHIFT;
-        let newsize = self.numdigits() - wordshift;
+        let newsize = this.numdigits() - wordshift;
         if newsize <= 0 {
             return Ok(Self::zero());
         }
@@ -2198,9 +2206,9 @@ impl RBigInt {
         let mut z = Self::with_size(newsize, selfsign);
         let mut i = 0;
         while i < newsize {
-            let mut newdigit = self.digit(wordshift) >> loshift;
+            let mut newdigit = this.digit(wordshift) >> loshift;
             if i + 1 < newsize {
-                newdigit |= self.digit(wordshift + 1).wrapping_shl(hishift as u32);
+                newdigit |= this.digit(wordshift + 1).wrapping_shl(hishift as u32);
             }
             z.setdigit(i, newdigit);
             i += 1;
@@ -2213,21 +2221,22 @@ impl RBigInt {
     #[majit_macros::jit_elidable]
     pub fn rqshift(&self, int_other: i64) -> Self {
         debug_assert!(int_other >= 0);
+        let this = live_rbigint(self);
         let mut wordshift = int_other / SHIFT;
         let loshift = int_other % SHIFT;
-        let newsize = self.numdigits() - wordshift;
+        let newsize = this.numdigits() - wordshift;
         if newsize <= 0 {
             return Self::zero();
         }
         let hishift = SHIFT - loshift;
-        let selfsign = self.get_sign();
+        let selfsign = this.get_sign();
         let mut z = Self::with_size(newsize, selfsign);
         let mut i = 0;
         while i < newsize {
-            let digit = self.udigit(wordshift);
+            let digit = this.udigit(wordshift);
             let mut newdigit = digit >> loshift;
             if i + 1 < newsize {
-                newdigit |= self.udigit(wordshift + 1) << hishift;
+                newdigit |= this.udigit(wordshift + 1) << hishift;
             }
             z.setdigit_udigit(i, newdigit);
             i += 1;
@@ -3117,7 +3126,9 @@ fn args_from_long(value: i128) -> (Vec<Digit>, i64) {
 }
 
 /// rbigint.py `_x_add`.
-fn _x_add<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
+fn _x_add(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let mut a = live_rbigint(a);
+    let mut b = live_rbigint(b);
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
     if size_a < size_b {
@@ -3146,6 +3157,7 @@ fn _x_add<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
 
 /// rbigint.py `_x_int_add`.
 fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let mut z = RBigInt::with_size(size_a + 1, 1);
     let mut carry = a.udigit(0).wrapping_add(b.unsigned_abs());
@@ -3164,7 +3176,9 @@ fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
 }
 
 /// rbigint.py `_x_sub`.
-fn _x_sub<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
+fn _x_sub(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let mut a = live_rbigint(a);
+    let mut b = live_rbigint(b);
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
     let mut sign = 1;
@@ -3210,6 +3224,7 @@ fn _x_sub<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
 
 /// rbigint.py `_x_int_sub`.
 fn _x_int_sub(a: &RBigInt, b: i64) -> RBigInt {
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let bdigit = b.unsigned_abs();
     if size_a == 1 {
@@ -3261,10 +3276,13 @@ const PTWOTABLE: [i64; SHIFT as usize] = make_ptwotable();
 
 /// rbigint.py `_x_mul`.
 fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
+    let same = std::ptr::eq(a, b);
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     let size_a = a.numdigits();
     let size_b = b.numdigits();
 
-    if std::ptr::eq(a, b) {
+    if same {
         let mut z = RBigInt::with_size(size_a + size_b, 1);
         let mut i = 0;
         while i < size_a {
@@ -3302,7 +3320,7 @@ fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
         if digit & (digit - 1) == 0 {
             return b.lqshift(PTWOTABLE[digit.trailing_zeros() as usize]);
         }
-        return _muladd1(b, digit, 0);
+        return _muladd1(&*b, digit, 0);
     }
 
     let mut z = RBigInt::with_size(size_a + size_b, 1);
@@ -3357,21 +3375,28 @@ fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
 
 /// rbigint.py `_kmul_split`.
 fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
+    let n = live_rbigint(n);
     let size_n = n.numdigits();
     let size_lo = size_n.min(size);
+    let lo_digits: Vec<Digit> = if size_lo == 0 {
+        Vec::new()
+    } else {
+        n.digits()[..size_lo as usize].to_vec()
+    };
+    let hi_digits: Vec<Digit> = if size_lo == size_n {
+        Vec::new()
+    } else {
+        n.digits()[size_lo as usize..size_n as usize].to_vec()
+    };
     let mut lo = if size_lo == 0 {
         RBigInt::zero()
     } else {
-        RBigInt::new(&n.digits()[..size_lo as usize], 1, size_lo)
+        RBigInt::new(&lo_digits, 1, size_lo)
     };
     let mut hi = if size_lo == size_n {
         RBigInt::zero()
     } else {
-        RBigInt::new(
-            &n.digits()[size_lo as usize..size_n as usize],
-            1,
-            size_n - size_lo,
-        )
+        RBigInt::new(&hi_digits, 1, size_n - size_lo)
     };
     lo._normalize();
     hi._normalize();
@@ -3380,13 +3405,16 @@ fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
 
 /// rbigint.py `_k_mul`.
 fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let same = std::ptr::eq(a, b);
+    let a = live_rbigint(a);
+    let b = live_rbigint(b);
     let asize = a.numdigits();
     let bsize = b.numdigits();
-    let mut ret = RBigInt::with_size(asize + bsize, 1);
+    let mut ret = live_rbigint(&RBigInt::with_size(asize + bsize, 1));
     let shift = bsize >> 1;
-    let (bh, bl) = _kmul_split(b, shift);
+    let (bh, bl) = _kmul_split(&*b, shift);
 
-    if !std::ptr::eq(a, b) && asize <= shift {
+    if !same && asize <= shift {
         let t1 = a.mul(&bl);
         let mut i = 0;
         while i < t1.numdigits() {
@@ -3397,12 +3425,12 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
         i = ret.numdigits() - shift;
         _v_iadd(&mut ret, shift, i, &t2, t2.numdigits());
         ret._normalize();
-        return ret;
+        return ret.clone();
     }
-    let a_parts = if std::ptr::eq(a, b) {
+    let a_parts = if same {
         None
     } else {
-        Some(_kmul_split(a, shift))
+        Some(_kmul_split(&*a, shift))
     };
     let (ah, al) = match &a_parts {
         None => (&bh, &bl),
@@ -3432,7 +3460,7 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     _v_isub(&mut ret, shift, i, &t1, t1.numdigits());
 
     let t1 = _x_add(ah, al);
-    let t3 = if std::ptr::eq(a, b) {
+    let t3 = if same {
         t1.mul(&t1)
     } else {
         let t2 = _x_add(&bh, &bl);
@@ -3441,7 +3469,7 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     debug_assert!(t3.get_sign() >= 0);
     _v_iadd(&mut ret, shift, i, &t3, t3.numdigits());
     ret._normalize();
-    ret
+    ret.clone()
 }
 
 /// rbigint.py `_inplace_divrem1`.
@@ -3463,9 +3491,10 @@ fn _inplace_divrem1(pout: &mut RBigInt, pin: &RBigInt, n: Digit) -> Digit {
 #[majit_macros::jit_elidable]
 fn _divrem1(a: &RBigInt, n: Digit) -> (RBigInt, Digit) {
     debug_assert!(n > 0 && n <= MASK as Digit);
+    let a = live_rbigint(a);
     let size = a.numdigits();
     let mut z = RBigInt::with_size(size, 1);
-    let rem = _inplace_divrem1(&mut z, a, n);
+    let rem = _inplace_divrem1(&mut z, &*a, n);
     z._normalize();
     (z, rem)
 }
@@ -3537,6 +3566,7 @@ fn _v_isub(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
 /// rbigint.py `_muladd1`.
 fn _muladd1(a: &RBigInt, n: Digit, extra: Digit) -> RBigInt {
     debug_assert!(n > 0);
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let mut z = RBigInt::with_size(size_a + 1, 1);
     debug_assert_eq!(extra & MASK as Digit, extra);
@@ -3582,16 +3612,18 @@ fn _v_rshift(z: &mut RBigInt, a: &RBigInt, m: i64, d: i64) -> UWideDigit {
 
 /// rbigint.py `_x_divrem`.
 pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
+    let v1 = live_rbigint(v1);
+    let w1 = live_rbigint(w1);
     let mut size_v = v1.numdigits();
     let size_w = w1.numdigits();
     debug_assert!(size_v >= size_w && size_w > 1);
-    let mut v = RBigInt::with_size(size_v + 1, 1);
-    let mut w = RBigInt::with_size(size_w, 1);
+    let mut v = live_rbigint(&RBigInt::with_size(size_v + 1, 1));
+    let mut w = live_rbigint(&RBigInt::with_size(size_w, 1));
 
     let d = SHIFT - bits_in_digit(w1.digit(size_w - 1));
-    let carry = _v_lshift(&mut w, w1, size_w, d);
+    let carry = _v_lshift(&mut w, &*w1, size_w, d);
     debug_assert_eq!(carry, 0);
-    let carry = _v_lshift(&mut v, v1, size_v, d);
+    let carry = _v_lshift(&mut v, &*v1, size_v, d);
     if carry != 0 || v.digit(size_v - 1) >= w.digit(size_w - 1) {
         v.setdigit_uwidedigit(size_v, carry);
         size_v += 1;
@@ -3608,9 +3640,9 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
         // rbigint.py deliberately does not return NULLRBIGINT here:
         // callers of this internal division helper may modify the result.
         // Keep both the rbigint value and its digit array fresh.
-        return (RBigInt::new(&[NULLDIGIT], 0, 0), w);
+        return (RBigInt::new(&[NULLDIGIT], 0, 0), w.clone());
     }
-    let mut a = RBigInt::with_size(k, 1);
+    let mut a = live_rbigint(&RBigInt::with_size(k, 1));
     let wm1 = w.widedigit(size_w - 1);
     let wm2 = w.widedigit(size_w - 2);
     let mut j = size_v - 1;
@@ -3657,7 +3689,7 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     debug_assert_eq!(carry, 0);
     a._normalize();
     w._normalize();
-    (a, w)
+    (a.clone(), w.clone())
 }
 
 /// rbigint.py `_divrem`.
@@ -3751,11 +3783,13 @@ fn div3n2n(
     b2: &RBigInt,
     n_s: i64,
 ) -> Result<(RBigInt, RBigInt), RBigIntError> {
+    let a3_container = live_rbigint(a3_container);
     let (mut q, mut r) = div2n1n(a12_container, a12_startindex, b1, n_s)?;
     if r.get_sign() == 0 {
-        r = _extract_digits(a3_container, a3_startindex, n_s);
+        r = _extract_digits(&a3_container, a3_startindex, n_s);
     } else {
-        let r_size = r.numdigits();
+        let r_root = live_rbigint(&r);
+        let r_size = r_root.numdigits();
         let combined_size = n_s.checked_add(r_size).ok_or(RBigIntError::Memory)?;
         let mut combined = RBigInt::try_with_size(combined_size, 1)?;
         let stop = (a3_startindex + n_s).min(a3_container.numdigits());
@@ -3769,7 +3803,7 @@ fn div3n2n(
         index = n_s;
         let mut i = 0;
         while i < r_size {
-            combined.setdigit(index, r.digit(i));
+            combined.setdigit(index, r_root.digit(i));
             index += 1;
             i += 1;
         }
@@ -4814,19 +4848,21 @@ fn _format(
 
 /// rbigint.py `@specialize.arg(1) _bitwise(a, '&', b)`.
 fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let a_live = live_rbigint(a);
+    let b_live = live_rbigint(b);
     let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
+    let (a, mut maska) = if a_live.get_sign() < 0 {
+        a_inverted = a_live.invert();
         (&a_inverted, MASK as Digit)
     } else {
-        (a, 0)
+        (&*a_live, 0)
     };
     let b_inverted;
-    let (b, mut maskb) = if b.get_sign() < 0 {
-        b_inverted = b.invert();
+    let (b, mut maskb) = if b_live.get_sign() < 0 {
+        b_inverted = b_live.invert();
         (&b_inverted, MASK as Digit)
     } else {
-        (b, 0)
+        (&*b_live, 0)
     };
 
     let mut negz = false;
@@ -4874,19 +4910,21 @@ fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
 
 /// The `'|'` graph emitted by upstream's `@specialize.arg(1) _bitwise`.
 fn _bitwise_or(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let a_live = live_rbigint(a);
+    let b_live = live_rbigint(b);
     let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
+    let (a, mut maska) = if a_live.get_sign() < 0 {
+        a_inverted = a_live.invert();
         (&a_inverted, MASK as Digit)
     } else {
-        (a, 0)
+        (&*a_live, 0)
     };
     let b_inverted;
-    let (b, mut maskb) = if b.get_sign() < 0 {
-        b_inverted = b.invert();
+    let (b, mut maskb) = if b_live.get_sign() < 0 {
+        b_inverted = b_live.invert();
         (&b_inverted, MASK as Digit)
     } else {
-        (b, 0)
+        (&*b_live, 0)
     };
 
     let mut negz = false;
@@ -4934,19 +4972,21 @@ fn _bitwise_or(a: &RBigInt, b: &RBigInt) -> RBigInt {
 
 /// The `'^'` graph emitted by upstream's `@specialize.arg(1) _bitwise`.
 fn _bitwise_xor(a: &RBigInt, b: &RBigInt) -> RBigInt {
+    let a_live = live_rbigint(a);
+    let b_live = live_rbigint(b);
     let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
+    let (a, mut maska) = if a_live.get_sign() < 0 {
+        a_inverted = a_live.invert();
         (&a_inverted, MASK as Digit)
     } else {
-        (a, 0)
+        (&*a_live, 0)
     };
     let b_inverted;
-    let (b, maskb) = if b.get_sign() < 0 {
-        b_inverted = b.invert();
+    let (b, maskb) = if b_live.get_sign() < 0 {
+        b_inverted = b_live.invert();
         (&b_inverted, MASK as Digit)
     } else {
-        (b, 0)
+        (&*b_live, 0)
     };
 
     let mut negz = false;

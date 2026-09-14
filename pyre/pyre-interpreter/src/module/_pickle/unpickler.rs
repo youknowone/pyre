@@ -23,25 +23,28 @@ fn packed_list_sentinel_called(_args: &[PyObjectRef]) -> crate::PyResult {
 
 /// Process-global stand-ins for PyPy's two `_W_*ListUnpickler` instances.
 ///
-/// The objects made by `make_builtin_function` have stable old-generation
-/// addresses and are shared by every thread.  They never escape the unpickler
-/// stack: GLOBAL installs one and REDUCE consumes it by identity.
+/// The objects made by `make_builtin_function` are shared by every thread.
+/// They never escape the unpickler stack: GLOBAL installs one and REDUCE
+/// consumes it by identity.  The cache is a `RootedOnceRef` so a move
+/// rewrites the slot.
 fn packed_list_sentinel(kind: PackedListKind) -> PyObjectRef {
-    static ASCII: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static ASCII: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    static BYTES: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let cell = match kind {
         PackedListKind::Ascii => &ASCII,
         PackedListKind::Bytes => &BYTES,
     };
-    *cell.get_or_init(|| {
+    cell.get_or_init(|| {
         crate::make_builtin_function(
             match kind {
                 PackedListKind::Ascii => "_ascii_list_unpickle",
                 PackedListKind::Bytes => "_bytes_list_unpickle",
             },
             packed_list_sentinel_called,
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// Clear `running` through the live shadow-stack owner after a moving

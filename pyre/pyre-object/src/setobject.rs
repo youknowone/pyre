@@ -375,14 +375,11 @@ pub fn w_frozenset_new() -> PyObjectRef {
 }
 
 fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
-    // Allocate the body in GC old-gen (mark-sweep, non-moving) so it
-    // carries TRACK_YOUNG_PTRS, mirroring `w_list_new` / `w_tuple_new`.
-    // `w_set_add` stores possibly-young elements into `items`; the write
-    // barrier (`set_write_barrier`) only remembers the set on a minor
-    // collection when the body is an old-gen object, so a body allocated
-    // through the plain `malloc_typed` (no TRACK_YOUNG_PTRS) would leave
-    // young elements unforwarded and collected. Falls back to
-    // `malloc_typed` when no GC hook is installed (unit tests).
+    // Allocate the body on the same nursery bump as `w_tuple_new`
+    // (`malloc_fixedsize`). `w_set_add` stores possibly-young elements
+    // into `items`; the write barrier remembers an old-gen spill so those
+    // elements survive a later minor. Falls back to `malloc_typed` when
+    // no GC hook is installed (unit tests).
     //
     // The items box has no heap edge until the body is written, and both
     // `get_instantiate` and the body malloc can collect.  Pin the box and
@@ -395,7 +392,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(items as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(set_type));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_SET_GC_TYPE_ID, W_SET_OBJECT_SIZE);
     let items = crate::gc_roots::shadow_stack_get(items_slot) as *mut SetItemsStorage;
     let body = W_SetObject {
         ob_header: PyObject {
@@ -654,12 +651,15 @@ pub unsafe fn w_set_discard_key_checked(
     }
 
     let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
     let items = capture_set_items(obj);
     let (found, _) = scan_set_key_reentrant(items, key)?;
     if let Some(index) = found {
         // Remove from the captured box; a `clear` during the probe orphans it,
         // leaving the live storage untouched (`discard` of an absent element).
         set_remove_slot(items, index);
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
         let s = &mut *(obj as *mut W_SetObject);
         s.set_len_relaxed((*s.items).len());
         s.hash = -1;
@@ -957,6 +957,9 @@ unsafe fn w_set_insert_key_into(
     items: *mut SetItemsStorage,
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
+    let _dst_roots = crate::gc_roots::push_roots();
+    let dst_slot = crate::gc_roots::shadow_stack_len();
+    let dst = crate::gc_roots::pin_root(dst);
     // Single insert probe (matches `r_dict.setitem`'s one bucket scan), run
     // callback-free so no user `__eq__` mutates the set while the table
     // borrow is live.  When every same-hash comparison stays inside the
@@ -994,6 +997,7 @@ unsafe fn w_set_insert_key_into(
     // repeat its comparisons — the ones that can re-enter this table.  Place it
     // on the digest alone (`ll_call_insert_clean_function`).
     (*items).insert_known_absent(key, ());
+    let dst = crate::gc_roots::shadow_stack_get(dst_slot);
     let set = &mut *(dst as *mut W_SetObject);
     set.set_len_relaxed((*set.items).len());
     set.hash = -1;

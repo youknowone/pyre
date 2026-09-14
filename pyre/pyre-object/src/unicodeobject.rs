@@ -232,7 +232,7 @@ pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&STR_TYPE));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let value = crate::gc_roots::shadow_stack_get(value_slot) as *mut UnicodeValueStorage;
     // AsciiListStrategy accepts only `is_ascii()` values, for which the byte
     // length and code-point length are identical.
@@ -389,7 +389,7 @@ pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&STR_TYPE));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
     let value = crate::gc_roots::shadow_stack_get(value_slot) as *mut Wtf8Buf;
     let unicode = W_UnicodeObject {
         ob_header: PyObject {
@@ -573,7 +573,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     let value = crate::gc_storage::gc_alloc_storage_box(value, unicode_value_gc_type_id());
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_UNICODE_USER_GC_TYPE_ID.get(),
         W_UNICODE_USER_OBJECT_SIZE,
     );

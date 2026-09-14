@@ -1288,7 +1288,7 @@ unsafe fn alloc_frame_locals_array(
     if allocation == FrameLocalsArrayAllocation::OldGenGc {
         let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
             + len * std::mem::size_of::<pyre_object::PyObjectRef>();
-        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+        let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
             pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
             payload,
         );
@@ -1301,6 +1301,8 @@ unsafe fn alloc_frame_locals_array(
                     items.add(i).write(fill);
                 }
             }
+            // Nursery-full spill is old-gen; remember young `fill` values.
+            remember_frame_locals_array(arr);
             return arr;
         }
     }
@@ -1914,7 +1916,7 @@ unsafe fn clone_debugdata_ptr(
         if ptr.is_null() {
             std::ptr::null_mut()
         } else if allocation == FrameLocalsArrayAllocation::OldGenGc {
-            let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+            let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                 FRAME_DEBUG_DATA_GC_TYPE_ID,
                 std::mem::size_of::<FrameDebugData>(),
             );
@@ -3629,7 +3631,7 @@ impl PyFrame {
             let frame_anchor = crate::eval::FrameAnchor::new(self);
             let allocation = unsafe { (*frame_anchor.live()).aux_allocation() };
             let raw = if allocation == FrameLocalsArrayAllocation::OldGenGc {
-                pyre_object::gc_hook::try_gc_alloc_stable_raw(
+                pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                     FRAME_DEBUG_DATA_GC_TYPE_ID,
                     std::mem::size_of::<FrameDebugData>(),
                 ) as *mut FrameDebugData
@@ -4208,15 +4210,22 @@ impl PyFrame {
         // Root the fresh globals across the `__name__` store; the frame
         // construction below roots them again for its own span.
         let _root = pyre_object::gc_roots::push_roots();
-        let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_globals);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::intern_str_value("__main__"));
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                w_globals,
+                pyre_object::gc_roots::shadow_stack_get(globals_slot),
                 "__name__",
-                pyre_object::w_str_new("__main__"),
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
             );
         }
-        Self::new_with_context_and_globals(code, execution_context, w_globals)
+        Self::new_with_context_and_globals(
+            code,
+            execution_context,
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+        )
     }
 
     /// `new_with_context` over a globals dict the caller already owns.

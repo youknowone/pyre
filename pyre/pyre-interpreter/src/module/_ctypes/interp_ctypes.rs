@@ -766,19 +766,18 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
         Some(comerror_init),
         w_exception,
     );
-    let _ = COMERROR_TYPE_OBJ.set(comerror as usize);
+    COMERROR_TYPE_OBJ.set(comerror);
     crate::module_ns_store(ns, "COMError", comerror);
 }
 
 #[cfg(all(windows, feature = "host_env"))]
-static COMERROR_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static COMERROR_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// The `COMError` class, once `_ctypes` has been set up.
 #[cfg(all(windows, feature = "host_env"))]
 pub(super) fn comerror_type() -> Option<pyre_object::PyObjectRef> {
-    COMERROR_TYPE_OBJ
-        .get()
-        .map(|&tp| tp as pyre_object::PyObjectRef)
+    COMERROR_TYPE_OBJ.get()
 }
 
 /// `comerror_init` — stamps the three slots and re-points `args` at the tail.
@@ -975,14 +974,15 @@ fn ctypes_resize(
 // ── byref carrier ──────────────────────────────────────────────────────
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-static CARG_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static CARG_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// The minimal `byref` carrier type — holds `_ptr` (address) and `_obj`
 /// (the referenced instance, kept alive).  Foreign-call consumption of the
 /// carrier (the CArgObject P-tag path) is a later slice.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 pub(super) fn carg_type() -> pyre_object::PyObjectRef {
-    let raw = *CARG_TYPE_OBJ.get_or_init(|| {
+    CARG_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("CArgObject", |ns| {
             super::type_ns_store(
                 ns,
@@ -997,9 +997,8 @@ pub(super) fn carg_type() -> pyre_object::PyObjectRef {
             );
         });
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        super::finish_cpython_type(tp, "_ctypes", true) as usize
-    });
-    raw as pyre_object::PyObjectRef
+        super::finish_cpython_type(tp, "_ctypes", true)
+    })
 }
 
 #[cfg(all(any(unix, windows), feature = "host_env"))]

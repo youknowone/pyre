@@ -10228,6 +10228,12 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     w_descr: pyre_object::PyObjectRef,
     field: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
+    // A young descriptor can move. Baking it as ConstPtr then reading
+    // fget at compile time is the convert_to_imm / can_move hazard.
+    // Skip the fold; the version-tag pin still covers rebinding the name.
+    if majit_gc::can_move(majit_ir::GcRef(w_descr as usize)) {
+        return Ok(());
+    }
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
     crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
     walker_flush_guard_not_invalidated(ctx, op_pc)

@@ -15,7 +15,7 @@
 use majit_gc::GcStepTransition;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
-use std::sync::OnceLock;
+
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 pub mod hook;
@@ -341,8 +341,8 @@ fn collect_step_stats_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 }
 
 fn gc_collect_step_stats_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("GcCollectStepStats", |ns| unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 ns,
@@ -402,8 +402,8 @@ fn gc_collect_step_stats_type() -> PyObjectRef {
         });
         unsafe { typeobject::w_type_set_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn new_collect_step_stats(
@@ -547,8 +547,8 @@ fn make_private_stats_type(
 }
 
 fn gc_minor_stats_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         make_private_stats_type(
             "GcMinorStats",
             &[
@@ -559,13 +559,13 @@ fn gc_minor_stats_type() -> PyObjectRef {
                 ("total_memory_used", minor_total_memory_used),
                 ("pinned_objects", minor_pinned_objects),
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 fn gc_collect_stats_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         make_private_stats_type(
             "GcCollectStats",
             &[
@@ -578,8 +578,8 @@ fn gc_collect_stats_type() -> PyObjectRef {
                 ("rawmalloc_bytes_after", collect_rawmalloc_bytes_after),
                 ("pinned_objects", collect_pinned_objects),
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// One private stats field, still unbuilt.
@@ -1016,8 +1016,8 @@ fn format_gc_stat(value: i64) -> String {
 }
 
 fn gc_stats_public_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         // PyPy `app_referents.GcStats` is an ordinary app-level class, not a
         // second interpreter TypeDef beside `referents.W_GcStats`.  Build it
         // through `type.__new__`, so it inherits object's allocator and owns
@@ -1045,8 +1045,8 @@ fn gc_stats_public_type() -> PyObjectRef {
             pyre_object::gc_roots::shadow_stack_get(bases_slot),
             roots.get(ns_slot),
         ];
-        crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats") as usize
-    }) as PyObjectRef
+        crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats")
+    })
 }
 
 fn gc_stats_public_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

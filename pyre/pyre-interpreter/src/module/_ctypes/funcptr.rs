@@ -19,7 +19,6 @@ use super::stginfo::{self, ParamFunc};
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::sync::OnceLock;
 
 /// `_flags_ & FUNCFLAG_USE_ERRNO` — swap the ctypes-local errno around the call.
 pub(super) const FUNCFLAG_USE_ERRNO: i64 = 0x8;
@@ -64,11 +63,12 @@ const INTERNAL_PYOS_SNPRINTF: usize = 6;
 #[cfg(windows)]
 const INTERNAL_PYERR_SETFROMWINDOWSERR: usize = 7;
 
-static CFUNCPTR_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CFUNCPTR_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// The native `CFuncPtr` type object (cached, `hasdict=true`).
 pub(super) fn cfuncptr_type() -> PyObjectRef {
-    *CFUNCPTR_TYPE_OBJ.get_or_init(|| {
+    CFUNCPTR_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "CFuncPtr",
             init_cfuncptr_type,
@@ -79,8 +79,8 @@ pub(super) fn cfuncptr_type() -> PyObjectRef {
             // PyPy `function.py:CFuncPtr.__metaclass__ = CFuncPtrType`.
             (*tp).w_class = super::metaclass::pycfuncptrtype_type();
         }
-        super::finish_cpython_type(tp, "_ctypes", true) as usize
-    }) as PyObjectRef
+        super::finish_cpython_type(tp, "_ctypes", true)
+    })
 }
 
 fn init_cfuncptr_type(ns: PyObjectRef) {

@@ -72,18 +72,17 @@ pub fn w_dict_proxy_new(w_mapping: PyObjectRef) -> PyObjectRef {
     // to mark-sweep and never enters the remembered set, so its registered
     // `w_mapping` offset (`object_subclass_with_gc_ptrs`, eval.rs) is inert
     // and the young mapping dangles after a nursery reset. Routing the
-    // allocation through `try_gc_alloc_stable` makes the proxy old-gen so
-    // mark-sweep follows `w_mapping`; the creation write barrier remembers
-    // it so the young mapping is forwarded on the first minor collection.
+    // allocation through the nursery bump (`malloc_fixedsize`). The
+    // creation write barrier is a no-op on a young header and remembers
+    // an old-gen spill so the mapping is forwarded on the next minor.
     let _roots = crate::gc_roots::push_roots();
-    let save_point = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_mapping);
+    let save_point = crate::gc_roots::pin_roots(&[w_mapping]);
     let header = PyObject {
         ob_type: &MAPPING_PROXY_TYPE as *const PyType,
         w_class: get_instantiate(&MAPPING_PROXY_TYPE),
     };
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_PROXY_GC_TYPE_ID, W_DICT_PROXY_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_DICT_PROXY_GC_TYPE_ID, W_DICT_PROXY_OBJECT_SIZE);
     let w_mapping = crate::gc_roots::shadow_stack_get(save_point);
     if !raw.is_null() {
         unsafe {

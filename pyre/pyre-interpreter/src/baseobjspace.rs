@@ -757,14 +757,15 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
-    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if let Some(&base_exc) = BASE_EXC.get() {
-        return issubtype_w(w_cls, base_exc as PyObjectRef);
+    static BASE_EXC: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    if let Some(base_exc) = BASE_EXC.get() {
+        return issubtype_w(w_cls, base_exc);
     }
     let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
         return false;
     };
-    let _ = BASE_EXC.set(base_exc as usize);
+    BASE_EXC.set(base_exc);
     issubtype_w(w_cls, base_exc)
 }
 
@@ -2346,6 +2347,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let _obj_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
         // stringmethods.py / bytearrayobject.py `descr_getitem`: unpack the
@@ -2353,18 +2358,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // mutate a bytearray), then use `adjust_indices`' explicit slice
         // length.  Iterating by that count also avoids overflowing on the
         // final `start + step` for a step near `sys.maxsize`.
-        let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`; the operand is
-            // rooted for that window and neither `bytes` nor `bytearray`
-            // moves.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            crate::sliceobject::slice_unpack(
-                w_slice_get_start(index),
-                w_slice_get_stop(index),
-                w_slice_get_step(index),
-            )?
-        };
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -2401,18 +2400,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
+    let mut obj = obj;
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = {
-            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
-            // before dispatching here, so nothing else roots it across the
-            // call. A bytes-like operand never moves, so the root is for liveness alone
-            // and the address in hand stays correct.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(index)?
-        };
+        let indexed = space_index(index)?;
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -4821,19 +4814,17 @@ unsafe fn setitem_bytearray_slice(
     // Both steps run Python — draining an arbitrary iterable source, then
     // every slice component's `__index__` — and `STORE_SUBSCR` popped the
     // receiver and the slice before dispatching here, so root them across the
-    // pair. A bytearray does not move; the root is for liveness alone.
-    let (sequence2, rs, rp, st) = {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
-        let sequence2 = bytearray_assign_source(value)?;
-        let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
-        (sequence2, rs, rp, st)
-    };
+    // pair and reload the receiver after those callbacks.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+    let sequence2 = bytearray_assign_source(value)?;
+    let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let (rs, rp, st) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -4843,6 +4834,7 @@ unsafe fn setitem_bytearray_slice(
     if sequence2.len() as i64 != slicelength {
         crate::builtins::bytearray_check_exports(obj)?;
     }
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
     if step == 1 {
@@ -19649,15 +19641,19 @@ unsafe fn generator_invoke_execute_frame(
         )));
     }
     w_generator_set_running(gen_obj, true);
+    let _gen_roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(gen_obj);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     if !ec.is_null() {
-        (*ec).push_gen_or_coroutine(gen_obj);
+        (*ec).push_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
     let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
+    let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     let result = match result {
         Err(e) => {
             generator_frame_is_finished(gen_obj, frame, prompt_finalization);
@@ -19687,6 +19683,7 @@ unsafe fn generator_invoke_execute_frame(
     };
     // generator.py:142-145 `finally`.
     frame.f_backref = std::ptr::null_mut();
+    let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     w_generator_set_running(gen_obj, false);
     if !ec.is_null() {
         (*ec).pop_gen_or_coroutine(gen_obj);
@@ -20276,11 +20273,15 @@ fn gen_close_iter(w_yf: PyObjectRef, prompt_finalizers: bool) -> PyResult {
 fn generator_close_iter(gen_obj: PyObjectRef) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let gen_obj = pyre_object::gc_roots::pin_root(gen_obj);
         debug_assert!(!w_generator_is_running(gen_obj));
         let w_yf = generator_get_delegate(gen_obj);
         generator_set_delegate(gen_obj, PY_NULL);
         w_generator_set_running(gen_obj, true);
         let result = gen_close_iter(w_yf, true);
+        let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
         w_generator_set_running(gen_obj, false);
         result
     }

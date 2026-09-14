@@ -19,10 +19,11 @@ pub struct OffsetInBytes {
     pub offset: i64,
 }
 
-static OFFSET_IN_BYTES_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static OFFSET_IN_BYTES_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn offset_in_bytes_type() -> PyObjectRef {
-    *OFFSET_IN_BYTES_TYPE_OBJ.get_or_init(|| {
+    OFFSET_IN_BYTES_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend._OffsetInBytes",
             |_| {},
@@ -37,8 +38,8 @@ fn offset_in_bytes_type() -> PyObjectRef {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// The positional-or-keyword binding a `gateway.py` `unwrap_spec` wrapper does

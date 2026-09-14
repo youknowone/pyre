@@ -69,7 +69,7 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
         w_slots: PY_NULL,
     };
     if crate::gc_interp::enabled() {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+        let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
         if !raw.is_null() {
             unsafe {
                 std::ptr::write(raw as *mut W_FloatObject, obj);
@@ -99,7 +99,7 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
     if raw.is_null() {
         crate::lltype::malloc_typed(obj) as PyObjectRef
     } else {

@@ -6499,10 +6499,9 @@ fn live_ref_root_slots_at(
 /// load-bearing: a collector that needs no write barrier reports none
 /// (`gc.py GcLLDescr_boehm.write_barrier_descr = None`) and there is
 /// nothing to re-apply for it.
-fn emit_reload_frame_if_necessary(
+fn emit_load_frame_from_shadow_stack(
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
-    call_conv: cranelift_codegen::isa::CallConv,
 ) -> CValue {
     let word = std::mem::size_of::<usize>() as i32;
     // MOV ecx, [rootstacktop]
@@ -6514,9 +6513,17 @@ fn emit_reload_frame_if_necessary(
         .ins()
         .load(ptr_type, MemFlagsData::trusted(), rst_addr, 0);
     // MOV ebp, [ecx - WORD]  — jf_ptr is at top - WORD
-    let jf_ptr = builder
+    builder
         .ins()
-        .load(ptr_type, MemFlagsData::trusted(), rst, -word);
+        .load(ptr_type, MemFlagsData::trusted(), rst, -word)
+}
+
+fn emit_reload_frame_if_necessary(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    call_conv: cranelift_codegen::isa::CallConv,
+) -> CValue {
+    let jf_ptr = emit_load_frame_from_shadow_stack(builder, ptr_type);
     emit_jitframe_write_barrier(
         builder,
         ptr_type,
@@ -12457,8 +12464,33 @@ impl CraneliftBackend {
                     if let Some(result) = call_result {
                         builder.def_var(var(vi), result);
                     }
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    // Load the live jitframe first (the call may have moved
+                    // it). Do not run the write-barrier yet: it can collect
+                    // while the GCREF result is still only a CL value.
+                    jf_ptr = emit_load_frame_from_shadow_stack(&mut builder, ptr_type);
                     builder.ins().set_pinned_reg(jf_ptr);
+                    if let Some(result) = call_result {
+                        if op.result_type() == Type::Ref {
+                            let mut cached_jf = Some(jf_ptr);
+                            sync_ref_root_var(
+                                &mut builder,
+                                ptr_type,
+                                &mut cached_jf,
+                                &ref_root_slots,
+                                vi,
+                                result,
+                                ref_root_base_ofs,
+                                &mut synced_ref_vars,
+                            );
+                        }
+                    }
+                    emit_jitframe_write_barrier(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        jf_ptr,
+                        jitframe_write_barrier_flag(),
+                    );
                 }
 
                 OpCode::CallAssemblerI
@@ -12978,7 +13010,7 @@ impl CraneliftBackend {
                         .as_call_descr()
                         .expect("call op descriptor must be a CallDescr");
 
-                    if let Some(result) = emit_indirect_call_from_parts(
+                    let call_result = emit_indirect_call_from_parts(
                         &mut builder,
                         &constants,
                         op.arg(0).to_opref(),
@@ -12996,11 +13028,34 @@ impl CraneliftBackend {
                         &demoted_failarg_slots,
                         ref_root_base_ofs,
                         per_call_gcmap,
-                    ) {
+                    );
+                    if let Some(result) = call_result {
                         builder.def_var(var(vi), result);
                     }
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    jf_ptr = emit_load_frame_from_shadow_stack(&mut builder, ptr_type);
                     builder.ins().set_pinned_reg(jf_ptr);
+                    if let Some(result) = call_result {
+                        if op.result_type() == Type::Ref {
+                            let mut cached_jf = Some(jf_ptr);
+                            sync_ref_root_var(
+                                &mut builder,
+                                ptr_type,
+                                &mut cached_jf,
+                                &ref_root_slots,
+                                vi,
+                                result,
+                                ref_root_base_ofs,
+                                &mut synced_ref_vars,
+                            );
+                        }
+                    }
+                    emit_jitframe_write_barrier(
+                        &mut builder,
+                        ptr_type,
+                        call_conv,
+                        jf_ptr,
+                        jitframe_write_barrier_flag(),
+                    );
                 }
 
                 OpCode::CallReleaseGilI | OpCode::CallReleaseGilF | OpCode::CallReleaseGilN => {

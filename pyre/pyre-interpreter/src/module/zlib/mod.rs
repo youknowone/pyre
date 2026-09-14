@@ -213,9 +213,12 @@ fn adler32_compute(buf: &[u8], start: u32) -> u32 {
 
 // ── Compress (compressobj) ──────────────────────────────────────────────
 
-static COMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static DECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static ZDECOMPRESS_RUNTIME_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static COMPRESS_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static DECOMPRESS_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static ZDECOMPRESS_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// [3.14-spec] CPython's zlib specs publish `__module__ = "zlib"`; PyPy's
 /// unqualified `TypeDef('Compress')` / `TypeDef('Decompress')` do not.  Keep
@@ -235,7 +238,7 @@ fn publish_cpython_module(ns: PyObjectRef) {
 }
 
 fn compress_type() -> PyObjectRef {
-    *COMPRESS_RUNTIME_TYPE.get_or_init(|| {
+    COMPRESS_RUNTIME_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "Compress",
             init_compress_type,
@@ -249,8 +252,8 @@ fn compress_type() -> PyObjectRef {
             unsafe { &*<W_Compress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_compress_type(ns: PyObjectRef) {
@@ -443,7 +446,7 @@ fn allocate_compress(
 // ── Decompress (decompressobj) ──────────────────────────────────────────
 
 fn decompress_type() -> PyObjectRef {
-    *DECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
+    DECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "Decompress",
             init_decompress_type,
@@ -456,8 +459,8 @@ fn decompress_type() -> PyObjectRef {
             unsafe { &*<W_Decompress as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn decompress_getset(ns: PyObjectRef, name: &'static str, f: crate::gateway::BuiltinCodeFn) {
@@ -693,7 +696,7 @@ fn allocate_decompress(
 // ── _ZlibDecompressor (buffered; used by gzip reading) ──────────────────
 
 fn zdecompress_type() -> PyObjectRef {
-    *ZDECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
+    ZDECOMPRESS_RUNTIME_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_ZlibDecompressor",
             init_zdecompress_type,
@@ -712,8 +715,8 @@ fn zdecompress_type() -> PyObjectRef {
             unsafe { &*<W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn zdecompress_getset(ns: PyObjectRef, name: &'static str, f: crate::gateway::BuiltinCodeFn) {

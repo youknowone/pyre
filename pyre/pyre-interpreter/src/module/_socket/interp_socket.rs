@@ -2596,8 +2596,9 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
 #[cfg(any(unix, windows))]
 fn socket_type() -> pyre_object::PyObjectRef {
     // Process-global immortal type object (see `make_builtin_type`).
-    static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SOCKET_TYPE_OBJ.get_or_init(|| {
+    static SOCKET_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    SOCKET_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
         // PyPy's `W_Socket.typedef` is a builtin immutable type. 3.14
         // exposes the same immutable public type while constructing it from a
@@ -2605,8 +2606,8 @@ fn socket_type() -> pyre_object::PyObjectRef {
         crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
-        tp as usize
-    }) as pyre_object::PyObjectRef
+        tp
+    })
 }
 
 #[cfg(any(unix, windows))]

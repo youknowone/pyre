@@ -230,7 +230,8 @@ fn mmap_io_err(e: std::io::Error, ctx: &str) -> crate::PyError {
 }
 
 #[cfg(any(unix, windows))]
-static MMAP_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MMAP_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// Reads (and lazily installs) the runtime-assigned `mmap` type object, not a
 /// build-time constant, so the JIT residualizes the call instead of tracing
@@ -246,7 +247,7 @@ pub(crate) fn has_mmap_layout(obj: pyre_object::PyObjectRef) -> bool {
 #[cfg(any(unix, windows))]
 #[majit_macros::dont_look_inside]
 pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
-    *MMAP_TYPE_OBJ.get_or_init(|| {
+    MMAP_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "mmap.mmap",
             init_mmap_type,
@@ -264,8 +265,8 @@ pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
         // A view dropped by the collector never reaches `__release_buffer__`,
         // so the buffer layer needs a way back here to drop the count.
         unsafe { pyre_object::buffer::set_external_release_hook(mmap_exports_decref) };
-        tp as usize
-    }) as pyre_object::PyObjectRef
+        tp
+    })
 }
 
 #[cfg(any(unix, windows))]
@@ -667,15 +668,16 @@ fn mmap_get_attr_obj(obj: pyre_object::PyObjectRef, key: &str) -> pyre_object::P
 // generator as a dedicated iterator object holding the source mmap, a
 // cursor, and a step (`+1` forwards, `-1` for `reversed`).
 #[cfg(any(unix, windows))]
-static MMAP_ITER_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MMAP_ITER_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 #[cfg(any(unix, windows))]
 fn mmap_iterator_type() -> pyre_object::PyObjectRef {
-    *MMAP_ITER_TYPE_OBJ.get_or_init(|| {
+    MMAP_ITER_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("mmap_iterator", init_mmap_iterator_type);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as pyre_object::PyObjectRef
+        tp
+    })
 }
 
 #[cfg(any(unix, windows))]

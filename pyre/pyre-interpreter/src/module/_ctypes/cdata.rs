@@ -15,7 +15,6 @@ use super::stginfo::ParamFunc;
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use std::sync::OnceLock;
 
 /// Reserved instance-dict key holding the backing `bytearray` (root storage,
 /// or — for a sub-view — a shared reference to the **root's** bytearray).
@@ -135,18 +134,20 @@ pub(super) fn pyobj_container_get(num: usize) -> Option<PyObjectRef> {
     (!target.is_null()).then_some(target)
 }
 
-static CDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
-static SIMPLECDATA_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CDATA_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
+static SIMPLECDATA_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// PyPy/CPython/RustPython's private `_CData` base shared by every ctypes
 /// value family.  It is discovered as `Structure.__base__` rather than
 /// exported from the module namespace.
 pub(super) fn cdata_type() -> PyObjectRef {
-    *CDATA_TYPE_OBJ.get_or_init(|| {
+    CDATA_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_CData", init_cdata_type);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        super::finish_cpython_type(tp, "_ctypes", true) as usize
-    }) as PyObjectRef
+        super::finish_cpython_type(tp, "_ctypes", true)
+    })
 }
 
 fn init_cdata_type(ns: PyObjectRef) {
@@ -320,13 +321,13 @@ fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_none())
 }
 
-static UNPICKLE_FUNCTION: OnceLock<usize> = OnceLock::new();
+static UNPICKLE_FUNCTION: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_ctypes._unpickle`, the callable [`cdata_reduce`] names.
 pub(super) fn unpickle_function() -> PyObjectRef {
-    *UNPICKLE_FUNCTION
-        .get_or_init(|| crate::make_builtin_function_with_arity("_unpickle", unpickle, 2) as usize)
-        as PyObjectRef
+    UNPICKLE_FUNCTION
+        .get_or_init(|| crate::make_builtin_function_with_arity("_unpickle", unpickle, 2))
 }
 
 /// `_ctypes._unpickle` -- `_ctypes__unpickle_impl`.
@@ -510,7 +511,7 @@ fn cdata_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 /// The native `_SimpleCData` type object (cached, `hasdict=true`).
 pub(super) fn simplecdata_type() -> PyObjectRef {
-    *SIMPLECDATA_TYPE_OBJ.get_or_init(|| {
+    SIMPLECDATA_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "_SimpleCData",
             init_simplecdata_type,
@@ -522,8 +523,8 @@ pub(super) fn simplecdata_type() -> PyObjectRef {
             // `CREATE_TYPE(... PyCSimpleType_Type ...)`.
             (*tp).w_class = super::metaclass::pycsimpletype_type();
         }
-        super::finish_cpython_type(tp, "_ctypes", true) as usize
-    }) as PyObjectRef
+        super::finish_cpython_type(tp, "_ctypes", true)
+    })
 }
 
 fn init_simplecdata_type(ns: PyObjectRef) {

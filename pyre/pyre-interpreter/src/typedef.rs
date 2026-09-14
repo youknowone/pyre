@@ -446,7 +446,7 @@ pub fn init_typeobjects() {
             &INSTANCE_TYPE as *const PyType as usize,
             object_type as usize,
         );
-        let _ = W_OBJECT_TYPEOBJECT.set(object_type as usize);
+        W_OBJECT_TYPEOBJECT.set(object_type);
 
         // type — PyPy: typeobject.py, bases=(object,)
         // type.__new__(metatype, name, bases, dict) creates new types
@@ -474,7 +474,7 @@ pub fn init_typeobjects() {
         // side table; subclassed metaclasses inherit it via copy_flags_from_bases.
         unsafe { pyre_object::w_type_set_weakrefable(type_type, true) };
         reg.insert(&TYPE_TYPE as *const PyType as usize, type_type as usize);
-        let _ = W_TYPE_TYPEOBJECT.set(type_type as usize);
+        W_TYPE_TYPEOBJECT.set(type_type);
 
         // int — intobject.py W_IntObject.typedef, bases=(object,)
         // Layout = INT_TYPE because instances are W_IntObject.
@@ -2013,10 +2013,7 @@ pub fn init_typeobjects() {
         // Set w_class on all built-in type objects to `type`.
         // baseobjspace.py getclass() — for type objects, the class
         // is the metatype (default: `type`).
-        let w_type_type = W_TYPE_TYPEOBJECT
-            .get()
-            .map(|v| *v as PyObjectRef)
-            .unwrap_or(PY_NULL);
+        let w_type_type = W_TYPE_TYPEOBJECT.get().unwrap_or(PY_NULL);
         // `new_builtin_typeobject` stamps every type built once this loop has
         // published `type`. The ones built before that read `PY_NULL` there
         // and are filled here: the registry's own entries, plus
@@ -2025,7 +2022,7 @@ pub fn init_typeobjects() {
         for w_typeobject_addr in reg
             .values()
             .copied()
-            .chain(GETSET_DESCRIPTOR_TYPE.get().copied())
+            .chain(GETSET_DESCRIPTOR_TYPE.get().map(|p| p as usize))
         {
             let w_typeobj = w_typeobject_addr as PyObjectRef;
             unsafe {
@@ -2249,23 +2246,22 @@ fn patch_typeobject_descriptor_names() {
 }
 
 /// The global `object` type object, accessible from builtins.
-static W_OBJECT_TYPEOBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static W_OBJECT_TYPEOBJECT: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 /// The global `type` type object.
-static W_TYPE_TYPEOBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static W_TYPE_TYPEOBJECT: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// Get the wrapped `type` typeobject.
 ///
-/// `dont_look_inside` keeps the JIT from tracing into the `OnceLock`
-/// read: the slot is set once at startup and holds the runtime
+/// `dont_look_inside` keeps the JIT from tracing into the rooted
+/// slot read: the slot is set once at startup and holds the runtime
 /// typeobject address, which has no registry-resolvable accessor, so
 /// the call stays a residual returning that pointer (the trace-side twin
 /// registers the fnaddr in `jit_trace_fnaddrs`).
 #[majit_macros::dont_look_inside]
 pub fn w_type() -> PyObjectRef {
-    W_TYPE_TYPEOBJECT
-        .get()
-        .map(|v| *v as PyObjectRef)
-        .unwrap_or(PY_NULL)
+    W_TYPE_TYPEOBJECT.get().unwrap_or(PY_NULL)
 }
 
 pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
@@ -2284,10 +2280,7 @@ pub fn gettypeobject(tp: &PyType) -> PyObjectRef {
 /// `dont_look_inside` for the same reason as [`w_type`].
 #[majit_macros::dont_look_inside]
 pub fn w_object() -> PyObjectRef {
-    W_OBJECT_TYPEOBJECT
-        .get()
-        .map(|v| *v as PyObjectRef)
-        .unwrap_or(PY_NULL)
+    W_OBJECT_TYPEOBJECT.get().unwrap_or(PY_NULL)
 }
 
 /// The receiver type of every method descriptor a builtin type defines.
@@ -11604,10 +11597,11 @@ fn init_union_type(ns: PyObjectRef) {
     };
 }
 
-static GETSET_DESCRIPTOR_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static GETSET_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn getset_descriptor_type() -> pyre_object::PyObjectRef {
-    *GETSET_DESCRIPTOR_TYPE.get_or_init(|| {
+    GETSET_DESCRIPTOR_TYPE.get_or_init(|| {
         // `typedef.py GetSetProperty.typedef = TypeDef(
         // "getset_descriptor", ...)`.  Pyre owns the static
         // `GETSET_DESCRIPTOR_TYPE` PyType so GetSetProperty
@@ -11638,8 +11632,8 @@ fn getset_descriptor_type() -> pyre_object::PyObjectRef {
         // Setting it eagerly here keeps `w_class` non-null for
         // every descriptor regardless of allocation order.
         pyre_object::pyobject::set_instantiate(&pyre_object::typedef::GETSET_DESCRIPTOR_TYPE, tp);
-        tp as usize
-    }) as pyre_object::PyObjectRef
+        tp
+    })
 }
 
 /// typedef.py readonly_attribute

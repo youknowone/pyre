@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use pyre_object::{PY_NULL, PyObject, PyObjectRef};
 use rustpython_host_env::overlapped as host_overlapped;
 use rustpython_host_env::winapi as host_winapi;
-use std::sync::OnceLock;
+
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -276,10 +276,11 @@ fn init_overlapped_type(ns: PyObjectRef) {
     };
 }
 
-static OVERLAPPED_RUNTIME_TYPE: OnceLock<usize> = OnceLock::new();
+static OVERLAPPED_RUNTIME_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 pub fn overlapped_type() -> PyObjectRef {
-    *OVERLAPPED_RUNTIME_TYPE.get_or_init(|| {
+    OVERLAPPED_RUNTIME_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_winapi.Overlapped",
             init_overlapped_type,
@@ -292,8 +293,8 @@ pub fn overlapped_type() -> PyObjectRef {
             tp,
         );
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(tp, false) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// Sweep the native record: an operation still in flight is cancelled and
