@@ -3343,6 +3343,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_strconcat",
         pyre_object::lowlevel_string::jit_ll_strconcat,
     );
+    pa3(
+        &mut entries,
+        "pyre_object::lowlevel_string::_ll_stringslice",
+        "pyre_object::_ll_stringslice",
+        pyre_object::lowlevel_string::_ll_stringslice,
+    );
+    pa2(
+        &mut entries,
+        "pyre_object::unicodeobject::next_codepoint_pos_dont_look_inside",
+        "pyre_object::next_codepoint_pos_dont_look_inside",
+        pyre_object::unicodeobject::next_codepoint_pos_dont_look_inside,
+    );
     cpa2(
         &mut entries,
         "pyre_object::lowlevel_string::jit_ll_shrink_array",

@@ -248,6 +248,69 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     out
 }
 
+/// `rstr.py LLHelpers._ll_stringslice` — `@jit.elidable` +
+/// `@jit.oopspec('stroruni.slice(s1, start, stop)')`.
+///
+/// The first argument is an rstr `STR` (`Utf8Str` / `rpy_string`), not a
+/// `W_UnicodeObject`.  `_getitem_result` slices `self._utf8[start:end]`
+/// through [`ll_stringslice_startstop`] and wraps the piece afterwards.
+#[majit_macros::oopspec("stroruni.slice(s1, start, stop)")]
+#[majit_macros::elidable]
+pub fn _ll_stringslice(
+    s1: *mut crate::unicodeobject::Utf8Str,
+    start: i64,
+    stop: i64,
+) -> *mut crate::unicodeobject::Utf8Str {
+    if s1.is_null() {
+        return std::ptr::null_mut();
+    }
+    let lgt = stop - start;
+    debug_assert!(start >= 0);
+    if lgt < 0 {
+        let empty = bh_alloc_lowlevel_string(0, LOWLEVEL_STR_BASE_SIZE, 1);
+        return empty as *mut crate::unicodeobject::Utf8Str;
+    }
+    let lgt = lgt as usize;
+    let out = bh_alloc_lowlevel_string(lgt, LOWLEVEL_STR_BASE_SIZE, 1);
+    if out == 0 {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let src = (s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET + start as usize);
+        let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        std::ptr::copy_nonoverlapping(src, dst, lgt);
+    }
+    out as *mut crate::unicodeobject::Utf8Str
+}
+
+/// `rstr.py LLHelpers.ll_stringslice_startstop`.
+///
+/// Interpreter: `start == 0 and stop >= len` hands the source `STR` back
+/// unchanged.  Jitted: clamp `stop` and always go through
+/// [`_ll_stringslice`] (`we_are_jitted()` is folded to true in the
+/// generated body).
+pub fn ll_stringslice_startstop(
+    s1: *mut crate::unicodeobject::Utf8Str,
+    start: i64,
+    stop: i64,
+) -> *mut crate::unicodeobject::Utf8Str {
+    if s1.is_null() {
+        return std::ptr::null_mut();
+    }
+    let n = bh_lowlevel_string_len(s1 as i64) as i64;
+    let stop = if majit_rlib::jit::we_are_jitted() {
+        if stop > n { n } else { stop }
+    } else if stop >= n {
+        if start == 0 {
+            return s1;
+        }
+        n
+    } else {
+        stop
+    };
+    _ll_stringslice(s1, start, stop)
+}
+
 /// `ll_str.py ll_int2dec` — `@jit.elidable` decimal render of a Signed
 /// into a fresh rstr `STR`.  `descr_repr` (intobject.py) wraps the
 /// result with `space.newutf8(res, len(res))`.
@@ -320,6 +383,28 @@ pub fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ll_stringslice_startstop_identity_and_cut() {
+        let buf = bh_alloc_lowlevel_string(5, LOWLEVEL_STR_BASE_SIZE, 1);
+        assert_ne!(buf, 0);
+        for index in 0..5 {
+            bh_write_lowlevel_char(buf, index, (b'a' + index as u8) as i64, 1);
+        }
+        let s1 = buf as *mut crate::unicodeobject::Utf8Str;
+        assert_eq!(ll_stringslice_startstop(s1, 0, 5), s1);
+        let cut = ll_stringslice_startstop(s1, 1, 3);
+        assert!(!cut.is_null());
+        assert_ne!(cut, s1);
+        assert_eq!(bh_lowlevel_string_len(cut as i64), 2);
+        assert_eq!(bh_read_lowlevel_string(cut as i64, 1), vec![98, 99]);
+        let empty = _ll_stringslice(s1, 3, 1);
+        assert!(!empty.is_null());
+        assert_eq!(bh_lowlevel_string_len(empty as i64), 0);
+        bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(cut as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+        bh_free_lowlevel_string(empty as i64, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
 
     #[test]
     fn jit_ll_int2dec_renders_signed_decimal() {
