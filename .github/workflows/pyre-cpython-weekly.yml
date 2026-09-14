@@ -64,7 +64,7 @@ jobs:
       id: llbc-fingerprint
       shell: bash
       run: |
-        value="$(scripts/extract-llbc.py --fingerprint majit-rlib pyre-object pyre-interpreter pyre-jit)"
+        value="$(scripts/extract-llbc.py --fingerprint majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit)"
         echo "value=${value}" >> "$GITHUB_OUTPUT"
     - name: Cache LLBC
       id: llbc-cache
@@ -80,7 +80,7 @@ jobs:
     - name: Extract LLBC
       if: steps.llbc-cache.outputs.cache-hit != 'true'
       shell: bash
-      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-jit
+      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit
     - name: Build the dynasm backend
       id: build-dynasm
       run: cargo build --release -p pyrex --bin pyre-dynasm --no-default-features --features dynasm

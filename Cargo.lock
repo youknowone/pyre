@@ -2796,6 +2796,7 @@ dependencies = [
  "parking_lot",
  "pyre-interpreter",
  "pyre-jit-trace",
+ "pyre-module",
  "pyre-object",
  "rustc-hash",
  "rustpython-wtf8",
@@ -2845,8 +2846,10 @@ dependencies = [
 name = "pyre-module"
 version = "0.0.2"
 dependencies = [
+ "libc",
  "pyre-interpreter",
  "pyre-object",
+ "rustpython-host_env",
 ]
 
 [[package]]
@@ -2912,6 +2915,7 @@ dependencies = [
  "pyre-interpreter",
  "pyre-jit",
  "pyre-jit-trace",
+ "pyre-module",
  "pyre-object",
  "wasm-bindgen",
 ]
@@ -2938,6 +2942,7 @@ version = "0.0.2"
 dependencies = [
  "pyre-interpreter",
  "pyre-jit",
+ "pyre-module",
  "pyre-object",
 ]
 
@@ -2954,6 +2959,7 @@ dependencies = [
  "parking_lot",
  "pyre-interpreter",
  "pyre-jit",
+ "pyre-module",
  "pyre-object",
  "pyre-sandbox",
  "rustpython-compiler",

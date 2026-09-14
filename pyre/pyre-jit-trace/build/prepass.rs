@@ -332,9 +332,10 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
 
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
-/// honour the `MAJIT_MIR_FRONTEND_LLBC` override, else require the canonical
-/// `build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc` set. The third
-/// artifact contains the exact `eval::eval_loop_jit` portal.
+/// honour the `MAJIT_MIR_FRONTEND_LLBC` override, else require the
+/// `LLBC_CRATES` artefacts under `build/llbc/`. `pyre-jit` contains the
+/// exact `eval::eval_loop_jit` portal; `pyre-module` holds optional
+/// builtin-module graphs so look_inside/elidable survive the crate split.
 ///
 /// When neither resolves, emit a clean, copy-pasteable bootstrap message
 /// and fail the build *before* the worker spawns — so the contributor

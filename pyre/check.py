@@ -3176,7 +3176,7 @@ def require_fresh_llbc():
           "the wrong bytes.")
     print("Re-extract, then re-run this script:")
     print("    python3 pyre/scripts/extract-llbc.py "
-          "majit-rlib pyre-object pyre-interpreter pyre-jit")
+          "majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit")
     sys.exit(1)
 
 

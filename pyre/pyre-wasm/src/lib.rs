@@ -954,6 +954,7 @@ fn run_python_impl(source: &str) -> String {
             }
         }
     }
+    pyre_module::register();
     pyre_interpreter::importing::install_builtin_modules();
     // Give the import machinery a source of module bytes. The browser has no
     // filesystem, so the web build serves the embedded stdlib closure from an

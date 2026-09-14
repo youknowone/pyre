@@ -847,6 +847,7 @@ fn real_main(binary_name: &str) {
 
     // Record `-S` before the first `import sys` so `sys.flags.no_site`
     // reflects whether site initialization was skipped.
+    pyre_module::register();
     importing::set_no_site(no_site);
     importing::set_runtime_flags(&flags);
 

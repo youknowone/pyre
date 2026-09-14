@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+pyre-module = { workspace = true }
 # Inherited without a backend feature of its own. This binary drives the plain
 # interpreter and names no `pyre_jit` item; the dependency is here because
 # `pyre-interpreter` reaches `majit-metainterp`, which does not compile with

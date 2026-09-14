@@ -13,3 +13,21 @@
 //!
 //! Everything else belongs here.  Modules will be migrated from
 //! `pyre-interpreter/src/module/` as they grow.
+
+/// Keep the `module::` path prefix so harvested hint paths and
+/// `should_lower_module` stay `module::<name>` after the crate split.
+pub mod module;
+
+/// Register default/working modules into the interpreter builtin table.
+///
+/// The interpreter does not depend on this crate. The final binary calls
+/// [`register`] before `install_builtin_modules`.
+pub fn install_optional_modules() {
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
+}
+
+/// Install [`install_optional_modules`] as the interpreter's optional-module hook.
+pub fn register() {
+    pyre_interpreter::importing::set_optional_builtin_modules(install_optional_modules);
+}

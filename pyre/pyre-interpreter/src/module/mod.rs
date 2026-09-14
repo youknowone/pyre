@@ -170,8 +170,6 @@ pub mod signal;
 pub mod r#struct;
 pub mod sys;
 #[cfg(not(feature = "sandbox"))]
-pub mod syslog;
-#[cfg(not(feature = "sandbox"))]
 pub mod termios;
 #[allow(non_snake_case)]
 pub mod thread;

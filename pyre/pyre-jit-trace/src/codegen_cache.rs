@@ -31,7 +31,13 @@ use std::path::{Path, PathBuf};
 /// added as single files through [`interpreter_fn_calls`], not as a tree.
 ///
 /// Order is the production hash/load order. Changing it rekeys the cache.
-pub const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
+pub const LLBC_CRATES: &[&str] = &[
+    "majit-rlib",
+    "pyre-object",
+    "pyre-interpreter",
+    "pyre-module",
+    "pyre-jit",
+];
 
 /// Repo-relative trees and files the cache key should hash, plus every
 /// manifest read while discovering them (for `cargo::rerun-if-changed`).

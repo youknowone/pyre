@@ -498,6 +498,17 @@ static SYS_PATH_0_PENDING: LazyLock<Mutex<Option<std::ffi::OsString>>> =
 pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinModuleDef>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Optional modules live in `pyre-module` so this crate does not depend on
+/// them. The final binary links both and installs the hook before
+/// [`install_builtin_modules`].
+static OPTIONAL_BUILTIN_MODULES: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the `pyre-module` registry. Call once from the binary before
+/// [`init_sys_path`] / [`install_builtin_modules`].
+pub fn set_optional_builtin_modules(install: fn()) {
+    let _ = OPTIONAL_BUILTIN_MODULES.set(install);
+}
+
 thread_local! {
     static IMPORT_ROOT_AREA: ImportRootArea = ImportRootArea {
         argv_pending: SYS_ARGV_PENDING.with(|p| p as *const _),
@@ -798,8 +809,6 @@ pub fn install_builtin_modules() {
         pyre_install_module!(resource);
         #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(fcntl);
-        #[cfg(unix)]
-        pyre_install_module!(syslog);
         pyre_install_module!(select);
         #[cfg(unix)]
         pyre_install_module!(termios);
@@ -884,6 +893,9 @@ pub fn install_builtin_modules() {
     // `_init_non_posix` and never names this module.
     #[cfg(not(windows))]
     register_builtin_module("_sysconfigdata", init_sysconfigdata);
+    if let Some(install) = OPTIONAL_BUILTIN_MODULES.get() {
+        install();
+    }
 }
 
 fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

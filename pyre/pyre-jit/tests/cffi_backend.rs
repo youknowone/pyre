@@ -32,6 +32,7 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    pyre_module::register();
     importing::init_sys_path(&cwd, cwd.as_os_str());
     importing::add_sys_path_0();
     importing::set_sys_argv(&[std::ffi::OsString::from(name)]);

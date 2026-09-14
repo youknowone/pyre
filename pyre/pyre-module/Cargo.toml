@@ -6,6 +6,15 @@ license.workspace = true
 repository.workspace = true
 description = "Optional builtin modules for pyre interpreter"
 
+[features]
+default = ["host_env"]
+host_env = ["pyre-interpreter/host_env", "dep:rustpython-host_env"]
+sandbox = ["pyre-interpreter/sandbox"]
+dynasm = ["pyre-interpreter/dynasm"]
+cranelift = ["pyre-interpreter/cranelift"]
+
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+libc = { workspace = true }
+rustpython-host_env = { workspace = true, optional = true }

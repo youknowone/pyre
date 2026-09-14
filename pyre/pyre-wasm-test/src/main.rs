@@ -12,6 +12,7 @@ fn capture_print(bytes: &[u8]) {
 fn run_test(name: &str, source: &str, expected: &str) {
     TEST_OUTPUT.with(|buf| buf.borrow_mut().clear());
     pyre_interpreter::set_print_hook(capture_print);
+    pyre_module::register();
     pyre_interpreter::importing::install_builtin_modules();
 
     let code = match compile_source(source, Mode::Exec) {

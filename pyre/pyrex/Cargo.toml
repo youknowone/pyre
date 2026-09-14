@@ -56,7 +56,7 @@ mimalloc = ["dep:mimalloc"]
 # gc_stress = ["pyre-jit/gc_stress"]
 # Build the interpreter as an RPython-style sandbox client: every mediated OS
 # call routes through host_seam's marshalling trampoline (see pyre-interpreter).
-sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox"]
+sandbox = ["pyre-interpreter/sandbox", "pyre-jit/sandbox", "pyre-module/sandbox"]
 # Load C extension modules built against pyre's own ABI (see pyre-interpreter).
 # Off by default; it also exports the C-API entry points the loaded object
 # resolves against, see build.rs.
@@ -71,6 +71,7 @@ seccomp = ["sandbox"]
 parking_lot = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+pyre-module = { workspace = true }
 pyre-jit = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-gc = { workspace = true }

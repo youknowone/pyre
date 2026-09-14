@@ -117,7 +117,16 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-module",
         crate_dir=ROOT / "pyre" / "pyre-module",
         output_name="pyre-module.ullbc",
-        charon_args=PYRE_RUNTIME_CHARON_ARGS,
+        # Charon follows workspace deps, so without these the module
+        # artefact would re-translate interpreter/object bodies the
+        # prepass already loads from their own ullbcs.
+        charon_args=[
+            *PYRE_RUNTIME_CHARON_ARGS,
+            "--opaque",
+            "pyre_interpreter",
+            "--opaque",
+            "pyre_object",
+        ],
         cargo_args=["--features", "pyre-interpreter/{features}"],
     ),
     "pyre-interpreter": CrateSpec(
@@ -159,7 +168,13 @@ SPECS: dict[str, CrateSpec] = {
     ),
 }
 
-DEFAULT_CRATES = ["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"]
+DEFAULT_CRATES = [
+    "majit-rlib",
+    "pyre-object",
+    "pyre-interpreter",
+    "pyre-module",
+    "pyre-jit",
+]
 
 # Targets, besides the extraction host, that get a layout sidecar. The
 # wasm32 build reads the same `build/llbc` set as the native build, and its

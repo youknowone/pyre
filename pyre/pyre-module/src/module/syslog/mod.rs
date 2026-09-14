@@ -3,4 +3,4 @@
 //! openlog / syslog / closelog / setlogmask backed by
 //! `rustpython_host_env::syslog`.  Unix-only.
 
-crate::pyre_module_init!(syslog);
+pyre_interpreter::pyre_module_init!(syslog);
