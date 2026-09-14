@@ -4823,15 +4823,23 @@ impl<M: Clone> MetaInterp<M> {
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
         // `virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)`.
-        // The pending host pointer is kept until TraceCtx exists so a
-        // state-field identity that is not `original_boxes[index]` still
-        // reaches `read_boxes`.
-        let mut virtualizable_ptr = if !self.pending_vable_ptr.is_null() {
-            self.pending_vable_ptr as *mut u8
+        // Prefer that unwrap when it is a real GC pointer: `sync_before` can
+        // still hold a previous frame in `pending_vable_ptr` when this trace's
+        // reds name a different one. Fall back to pending only when the box
+        // is missing or not a dereferenceable identity (test sentinels such
+        // as `0x1234`, or a state-field JIT whose vable is not at `index`).
+        let unwrapped = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
+            original_boxes.get(index).copied(),
+        ) as *mut u8;
+        let pending = self.pending_vable_ptr as *mut u8;
+        let mut virtualizable_ptr = if !unwrapped.is_null()
+            && (unwrapped as usize).is_multiple_of(std::mem::align_of::<usize>())
+        {
+            unwrapped
+        } else if !pending.is_null() {
+            pending
         } else {
-            crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
-                original_boxes.get(index).copied(),
-            ) as *mut u8
+            unwrapped
         };
         if !virtualizable_ptr.is_null() {
             // RPython's `virtualizable` local is a GC pointer: `clear_vable_token`

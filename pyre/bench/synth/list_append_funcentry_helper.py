@@ -1,7 +1,12 @@
 # pyre-check: max-pypy-ratio=125
-# The trip count puts pypy above the startup-subtraction floor, so this ratio
-# is a measurement rather than pyre divided by the floor constant. The ceiling
-# is twice the slowest backend observed (61.9x on cranelift).
+# pyre-check: jitstats-band=guard_failures=25
+# Function-entry `push` deopts on each list realloc. When the helper
+# compiles early the doubling schedule is ~21 failures per list; CI
+# hosts read 64-65, this machine 44. The band covers that schedule
+# jitter. The trip count puts pypy above the startup-subtraction floor,
+# so this ratio is a measurement rather than pyre divided by the floor
+# constant. The ceiling is twice the slowest backend observed (61.9x on
+# cranelift).
 # #171/#34: the orthodox list.append fold fires in function-entry (no-loop)
 # helper traces, not only loop traces.  `push` is a no-loop helper called in a
 # hot loop on two alternating receivers, so it traces from entry (header_pc==0)
