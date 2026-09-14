@@ -843,7 +843,10 @@ pub fn binary_slice_values(
                     fetched += 1;
                 }
             }
-            let items = (0..fetched).map(|i| roots.get(items_base + i)).collect();
+            let mut items = Vec::with_capacity(fetched);
+            for i in 0..fetched {
+                items.push(roots.get(items_base + i));
+            }
             return Ok(pyre_object::w_list_new(items));
         }
         if pyre_object::is_str(obj) {
@@ -914,7 +917,10 @@ pub fn binary_slice_values(
                     fetched += 1;
                 }
             }
-            let items = (0..fetched).map(|i| roots.get(items_base + i)).collect();
+            let mut items = Vec::with_capacity(fetched);
+            for i in 0..fetched {
+                items.push(roots.get(items_base + i));
+            }
             return Ok(pyre_object::w_tuple_new(items));
         }
         // Fall back to slice(start, stop) → getitem dispatch.
@@ -927,18 +933,24 @@ pub fn binary_slice_values(
     }
 }
 
+fn i64_args_as_refs(args: &[i64]) -> Vec<PyObjectRef> {
+    let mut items = Vec::with_capacity(args.len());
+    for &arg in args {
+        items.push(arg as PyObjectRef);
+    }
+    items
+}
+
 fn build_list_from_args(args: &[i64]) -> i64 {
-    let items: Vec<_> = args.iter().map(|&arg| arg as PyObjectRef).collect();
-    build_list_from_refs(&items) as i64
+    build_list_from_refs(&i64_args_as_refs(args)) as i64
 }
 
 fn build_tuple_from_args(args: &[i64]) -> i64 {
-    let items: Vec<_> = args.iter().map(|&arg| arg as PyObjectRef).collect();
-    build_tuple_from_refs(&items) as i64
+    build_tuple_from_refs(&i64_args_as_refs(args)) as i64
 }
 
 fn build_map_from_args(args: &[i64]) -> i64 {
-    let items: Vec<_> = args.iter().map(|&arg| arg as PyObjectRef).collect();
+    let items = i64_args_as_refs(args);
     // Legacy fixed-arity BUILD_MAP residual reached only on the blackhole /
     // deopt path (the codewriter lowers BUILD_MAP through the array-based
     // `bh_build_map_from_array`).  An unhashable key raises; signal it through
@@ -1472,9 +1484,11 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
         for idx in 0..count {
             let _ = pyre_object::gc_roots::pin_root(sequence_getitem(seq(), idx)?);
         }
-        return Ok((0..count)
-            .map(|index| pyre_object::gc_roots::shadow_stack_get(items_base + index))
-            .collect());
+        let mut items = Vec::with_capacity(count);
+        for index in 0..count {
+            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + index));
+        }
+        return Ok(items);
     }
     // Fallback: iteration protocol (handles type objects with metaclass __iter__, etc.)
     // baseobjspace.py _unpackiterable_known_length_jitlook.  pyopcode.py:872
@@ -1540,9 +1554,13 @@ pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObj
             "not enough values to unpack (expected {count}, got {pulled})"
         )));
     }
-    Ok((0..pulled)
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index))
-        .collect())
+    let mut items = Vec::with_capacity(pulled);
+    for index in 0..pulled {
+        items.push(pyre_object::gc_roots::shadow_stack_get(
+            root_base + 1 + index,
+        ));
+    }
+    Ok(items)
 }
 
 /// UNPACK_EX — split `value` for `a, *b, c = value` into `before` head
@@ -1606,7 +1624,10 @@ pub fn unpack_ex_slots(
     }
     let element = |index: usize| pyre_object::gc_roots::shadow_stack_get(elements_base + index);
     let middle_len = elements.len() - min_expected;
-    let middle: Vec<PyObjectRef> = (before..before + middle_len).map(element).collect();
+    let mut middle = Vec::with_capacity(middle_len);
+    for index in before..before + middle_len {
+        middle.push(element(index));
+    }
     let middle_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_list_new(middle));
     // Head and tail are read back only after the middle list exists, so the
