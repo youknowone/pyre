@@ -132,7 +132,14 @@ assert message(m.at_most_two) == 'at_most_two expected at least 1 argument, got 
 
 # A carrier's block holds the definition, the receiver and the module it was
 # built with, and the module is the same reference that was handed over.
-assert m.carrier_fields(m, 'a-module-name') == (True, True, True, True, True)
+assert m.carrier_fields(m, 'a-module-name') == (True, True, True, True, True, True, 4)
+# module-level PyCFunctions are bound to their module; METH_NOARGS is 4,
+# METH_O is 8.  A non-carrier is SystemError.
+assert m.get_self(m.bump) is m
+assert m.get_flags(m.bump) == 4
+assert m.get_flags(m.wrap) == 8
+refuses(SystemError, 'bad argument to internal function', lambda: m.get_self(1))
+refuses(SystemError, 'bad argument to internal function', lambda: m.get_flags(1))
 
 present, text, shown, size, truth = m.inspect([1, 2], 'append')
 assert (present, text, shown, size, truth) == (1, '[1, 2]', '[1, 2]', 2, 1)
