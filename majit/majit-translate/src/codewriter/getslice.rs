@@ -186,7 +186,11 @@ pub fn listslice_startonly_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startonly_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
+        // No `unroll_safe`: the copy loop is data-dependent (`rlist.py`
+        // `ll_listslice_*` have no `_jit_unroll_safe_`).  A Regular
+        // graph is enough for the residual ABI; looking inside would
+        // unroll a runtime-length copy.
+        cc.register_function_graph(path.clone(), graph);
         cc.add_candidate_graph(path.clone());
     }
     path
@@ -203,7 +207,7 @@ pub fn listslice_minusone_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_minusone_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
+        cc.register_function_graph(path.clone(), graph);
         cc.add_candidate_graph(path.clone());
     }
     path
@@ -220,7 +224,7 @@ pub fn listslice_rangeto_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_rangeto_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
+        cc.register_function_graph(path.clone(), graph);
         cc.add_candidate_graph(path.clone());
     }
     path
@@ -237,7 +241,7 @@ pub fn listslice_range_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startstop_graph(&name, item_ty, array_type_id);
-        cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
+        cc.register_function_graph(path.clone(), graph);
         cc.add_candidate_graph(path.clone());
     }
     path
@@ -375,7 +379,7 @@ pub fn build_ll_listslice_minusone_graph(
         },
     );
     let one = push(&mut graph, start_block, OpKind::ConstInt(1));
-    let newlength = push(
+    let raw = push(
         &mut graph,
         start_block,
         OpKind::BinOp {
@@ -385,23 +389,52 @@ pub fn build_ll_listslice_minusone_graph(
             result_ty: ValueType::Int,
         },
     );
-    let new_list = push(
+    let zero = push(&mut graph, start_block, OpKind::ConstInt(0));
+    // `[][:-1]` is `[]`.  Upstream `ll_assert(newlength >= 0)` translates
+    // out; a negative `NewArrayClear` is rejected by the wasm allocator.
+    let nonneg = push(
         &mut graph,
         start_block,
+        OpKind::BinOp {
+            op: "ge".into(),
+            lhs: raw.clone(),
+            rhs: zero.clone(),
+            result_ty: ValueType::Bool,
+        },
+    );
+    let (use_raw, use_raw_args) = graph.create_block_with_arg_vars(2);
+    let (use_zero, use_zero_args) = graph.create_block_with_arg_vars(2);
+    let (copy, copy_args) = graph.create_block_with_arg_vars(2);
+    graph.set_branch(
+        start_block,
+        nonneg,
+        use_raw,
+        vec![l1.clone(), raw],
+        use_zero,
+        vec![l1, zero],
+    );
+    graph.set_goto(use_raw, copy, use_raw_args);
+    graph.set_goto(use_zero, copy, use_zero_args);
+    let [c_l1, newlength] = copy_args.as_slice() else {
+        unreachable!("copy block was created with two inputargs")
+    };
+    let new_list = push(
+        &mut graph,
+        copy,
         OpKind::NewArrayClear {
             length: newlength.clone(),
             item_ty: item_ty.clone(),
             array_type_id: array_type_id.clone(),
         },
     );
-    let start = push(&mut graph, start_block, OpKind::ConstInt(0));
+    let start = push(&mut graph, copy, OpKind::ConstInt(0));
     emit_ll_arraycopy_loop(
         &mut graph,
-        start_block,
-        l1,
+        copy,
+        c_l1.clone(),
         start,
         new_list,
-        newlength,
+        newlength.clone(),
         item_ty,
         array_type_id,
     );
@@ -830,7 +863,6 @@ mod tests {
             &ValueType::Ref(None),
             Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
         );
-        assert_eq!(graph.blocks.len(), 6);
         let start = graph.block(graph.startblock);
         assert_eq!(start.inputargs.len(), 1);
         assert!(
@@ -839,23 +871,25 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::ArrayLen { .. }))
         );
-        assert!(
-            start
+        assert_eq!(start.exits.len(), 2);
+        assert!(graph.blocks.iter().any(|block| {
+            block
                 .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
-        );
-        let body = graph.block(crate::model::BlockId(4));
-        assert!(
-            body.operations
+        }));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
-        );
-        assert!(
-            body.operations
+        }));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .operations
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. }))
-        );
+        }));
     }
 
     #[test]

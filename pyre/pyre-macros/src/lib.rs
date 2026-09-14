@@ -320,7 +320,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let arity_fn_name = format_ident!("{}_pyre_arity", user_name);
     let natural_arity =
         if has_varargs || has_kw_markers || param_required.iter().any(|required| !required) {
-            quote! { crate::BuiltinCodeFlags::HOPELESS.bits() }
+            quote! { crate::HOPELESS }
         } else {
             let n = param_positional
                 .iter()

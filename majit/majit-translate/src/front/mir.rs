@@ -16561,6 +16561,16 @@ impl<'a> Lowering<'a> {
     /// reference so `&i64` compares as `Int`.  Strings and ADTs stay
     /// `None` and keep their own folds.
     fn scalar_cmp_bank(&self, ty: &TyRef) -> Option<ValueType> {
+        // `tyref_peel_ref_to_pointee` also peels `RawPtr`, so `*mut i64`
+        // would look like `i64`.  Ordered pointer compares need
+        // `cast_ptr_to_int`; there is no `ptr_lt`.
+        if tyref_node(ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(|node| node.as_object())
+            .is_some_and(|obj| obj.contains_key("RawPtr"))
+        {
+            return None;
+        }
         let peeled = self.tyref_peel_ref_to_pointee(ty);
         let ty = peeled.as_ref().unwrap_or(ty);
         match tyref_to_value_type(ty, self.llbc) {
