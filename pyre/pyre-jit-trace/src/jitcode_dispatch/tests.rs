@@ -4365,19 +4365,29 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "pyre_interpreter::objspace::descroperation::_float_neg",
             "float_neg",
         ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_pos",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_invert",
+            "int_invert",
+        ),
     ] {
         let jc = crate::jitcode_runtime::pathed_jitcode(path)
             .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
         let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
             .map(|op| op.opname)
             .collect();
-        assert!(
-            ops.iter().any(|op| *op == arith
-                || *op == "int_sub"
-                || *op == "int_sub_ovf"
-                || *op == "int_add"),
-            "{path} must record {arith} (or int_sub/int_add); ops={ops:?}"
-        );
+        if !arith.is_empty() {
+            assert!(
+                ops.iter().any(|op| *op == arith
+                    || *op == "int_sub"
+                    || *op == "int_sub_ovf"
+                    || *op == "int_add"),
+                "{path} must record {arith} (or int_sub/int_add); ops={ops:?}"
+            );
+        }
         assert!(
             ops.iter().any(|op| *op == "new_with_vtable"),
             "{path} must box via in-graph new_with_vtable; ops={ops:?}"
