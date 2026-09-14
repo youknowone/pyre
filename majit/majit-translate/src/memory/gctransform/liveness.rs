@@ -284,7 +284,15 @@ pub fn gc_ptr_type_ids(llbc: &majit_charon_reader::Llbc) -> HashSet<u64> {
     let mut out = HashSet::new();
     for fd in llbc.iter_local_fns() {
         let name = fd.item_meta.name_path();
-        if name.ends_with("gc_roots::pin_root") {
+        // `pin_root` / `shadow_stack_get` live in `pyre-object`. An
+        // optional-module artefact extracted `--opaque pyre_object`
+        // does not carry those names, but it does carry its own
+        // `register_module` / `module_ns_store` signatures, which
+        // take the same artefact-local `PyObjectRef` id.
+        if name.ends_with("gc_roots::pin_root")
+            || name.ends_with("::register_module")
+            || name.ends_with("module_ns_store")
+        {
             if let Some(t) = fd.signature.inputs.first().and_then(ty_id) {
                 out.insert(t);
             }

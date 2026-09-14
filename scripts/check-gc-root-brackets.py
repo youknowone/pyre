@@ -49,21 +49,21 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE = ROOT / "majit" / "gc-root-brackets.baseline.json"
 EXAMPLE = ROOT / "target" / "release" / "examples" / "gc-root-reachability"
 
-# The donor set is not a matter of taste: the example's own header records what
-# each donor moves, and leaving `pyre-object.ullbc` out fails quietly rather
-# than loudly -- the collecting-allocation seed lives there and scores zero
-# against the interpreter artefact alone.
-#
-# `pyre-module` is not a subject. Its extract is `--opaque pyre_object`, so
-# `gc_ptr_type_ids` finds no `pin_root` and the liveness scan is skipped.
-# Recording that skip as zero would bless unbracketed module bodies. A later
-# analyzer that can name `PyObjectRef` in an opaque artefact can add it.
-SUBJECT = "build/llbc/pyre-interpreter.ullbc"
-DONORS = [
-    "build/llbc/pyre-jit.ullbc",
-    "build/llbc/pyre-object.ullbc",
+# Every production LLBC crate. Donors join the call graph; only subject
+# bodies are walked. `gc_ptr_type_ids` now also reads `register_module` /
+# `module_ns_store` signatures, so a `--opaque pyre_object` module
+# artefact still has an artefact-local `PyObjectRef` id.
+LLBC = (
     "build/llbc/majit-rlib.ullbc",
-]
+    "build/llbc/pyre-object.ullbc",
+    "build/llbc/pyre-interpreter.ullbc",
+    "build/llbc/pyre-module.ullbc",
+    "build/llbc/pyre-jit.ullbc",
+)
+SUBJECTS = (
+    "build/llbc/pyre-interpreter.ullbc",
+    "build/llbc/pyre-module.ullbc",
+)
 
 # (key, regex, how many groups to keep).  Every one of these must match exactly
 # once, in this order: `tier 1` is printed twice, once for the main scan and
@@ -88,6 +88,11 @@ PATTERNS = [
 # Held at zero rather than ratcheted.  A frame carried across a collecting call
 # whose callee is a dispatch seed is a stale frame, not a backlog entry.
 INVARIANT_ZERO = ("frame_tier1_calls",)
+
+# A crate with no `PyFrame` (optional modules) skips the frame scan.
+# That is not a liveness skip: `PyObjectRef` was already measured.
+FRAME_KEYS = ("frames_across_collecting", "frame_tier1_calls")
+FRAME_SKIPPED = "frame scan skipped"
 
 # Ratcheted: may fall, may not rise.
 #
@@ -167,27 +172,54 @@ def merge_base() -> str:
     return ""
 
 
-def run_analysis() -> str:
+def merge_counts(left: dict, right: dict) -> dict:
+    """Add one subject's numbers to another's."""
+    merged: dict = {}
+    for key in set(left) | set(right):
+        a, b = left.get(key), right.get(key)
+        if isinstance(a, list) or isinstance(b, list):
+            merged[key] = sorted(set(a or []) | set(b or []))
+        else:
+            merged[key] = (a or 0) + (b or 0)
+    return merged
+
+
+def run_one(subject: str, donors: list[str]) -> str:
+    env = dict(os.environ, GC_JOIN_WITH=",".join(donors))
+    proc = subprocess.run(
+        [str(EXAMPLE), subject],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        sys.exit(f"error: analysis exited {proc.returncode}\n{proc.stderr}")
+    return proc.stdout
+
+
+def run_analysis() -> dict:
     if not EXAMPLE.exists():
         sys.exit(
             f"error: {EXAMPLE.relative_to(ROOT)} is not built.\n"
             "  cargo build -p majit-translate --release "
             "--example gc-root-reachability"
         )
-    missing = [p for p in [SUBJECT, *DONORS] if not (ROOT / p).is_file()]
+    missing = [p for p in LLBC if not (ROOT / p).is_file()]
     if missing:
         sys.exit(
             "error: LLBC artefacts missing: " + ", ".join(missing) + "\n"
             "  python3 scripts/extract-llbc.py majit-rlib pyre-object "
-            "pyre-interpreter pyre-jit"
+            "pyre-interpreter pyre-module pyre-jit"
         )
-    env = dict(os.environ, GC_JOIN_WITH=",".join(DONORS))
-    proc = subprocess.run([str(EXAMPLE), SUBJECT], cwd=ROOT, env=env,
-                          capture_output=True, encoding="utf-8",
-                          errors="replace")
-    if proc.returncode != 0:
-        sys.exit(f"error: analysis exited {proc.returncode}\n{proc.stderr}")
-    return proc.stdout
+    got: dict | None = None
+    for subject in SUBJECTS:
+        donors = [path for path in LLBC if path != subject]
+        part = parse(run_one(subject, donors))
+        got = part if got is None else merge_counts(got, part)
+    assert got is not None
+    return got
 
 
 def parse(report: str) -> dict:
@@ -199,9 +231,13 @@ def parse(report: str) -> dict:
     """
     got: dict = {}
     pos = 0
+    frame_skipped = FRAME_SKIPPED in report
     for key, pattern in PATTERNS:
         m = re.compile(pattern, re.S).search(report, pos)
         if m is None:
+            if frame_skipped and key in FRAME_KEYS:
+                got[key] = 0
+                continue
             sys.exit(
                 f"error: the analysis report has no `{key}` line after "
                 f"offset {pos}. The report shape changed; this gate reads it "
@@ -226,7 +262,7 @@ def main() -> int:
                     help="rewrite the baseline from this run")
     args = ap.parse_args()
 
-    got = parse(run_analysis())
+    got = run_analysis()
     got["base"] = merge_base()
     key = platform_key()
 
