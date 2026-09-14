@@ -16766,9 +16766,9 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Returns `Ok(false)` when the call is not `checked_neg` (or the
-    /// destination's `Option` decl cannot be resolved) so the generic
-    /// `Call` lowering proceeds.
+    /// Returns `Ok(false)` when the call is not `checked_neg` /
+    /// `checked_abs` (or the destination's `Option` decl cannot be
+    /// resolved) so the generic `Call` lowering proceeds.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -16786,13 +16786,17 @@ impl<'a> Lowering<'a> {
         let [first, .., module, impl_seg, leaf] = segments else {
             return Ok(false);
         };
-        if first.as_str() != "core"
-            || module.as_str() != "num"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "checked_neg"
-        {
+        if first.as_str() != "core" || module.as_str() != "num" || impl_seg.as_str() != "<Impl>" {
             return Ok(false);
         }
+        // `checked_abs` overflows at the same `i64::MIN` as `checked_neg`
+        // (`rint.py rtype_abs_ovf` / `ll_int_abs_ovf`).  The Some payload
+        // is wrapping `abs`; the None arm never reads it.
+        let unop = match leaf.as_str() {
+            "checked_neg" => "neg",
+            "checked_abs" => "abs",
+            _ => return Ok(false),
+        };
         let [arg] = args else {
             return Ok(false);
         };
@@ -16848,7 +16852,7 @@ impl<'a> Lowering<'a> {
         let payload = push_op(
             &mut self.graph,
             OpKind::UnaryOp {
-                op: "neg".to_string(),
+                op: unop.to_string(),
                 operand: arg.clone(),
                 result_ty: ValueType::Int,
             },

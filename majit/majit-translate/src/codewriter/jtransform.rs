@@ -3059,6 +3059,30 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
+            } if unop_name == "abs" && self.get_value_kind_var(operand) == 'i' => {
+                // `rint.py rtype_abs` → `int_abs`.  There is no `int_abs`
+                // opcode; mint `ll_int_abs` (`if x < 0: -x else x`) the
+                // same way `ll_min` is minted for `core::cmp::min`.
+                let Some(cc) = self.callcontrol.as_deref_mut() else {
+                    return RewriteResult::Keep;
+                };
+                let path = crate::codewriter::minmax::int_abs_path(cc);
+                let helper_call = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.segments.clone(),
+                        },
+                        args: crate::model::call_args(std::iter::once(operand.clone())),
+                        result_ty: ValueType::Int,
+                    },
+                };
+                return self.rewrite_operation(&helper_call, graph_name, graph);
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
             } if unop_name == "abs" && self.get_value_kind_var(operand) == 'f' => {
                 self.stamp_value_kind(
                     graph,
