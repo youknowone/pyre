@@ -31,6 +31,10 @@ impl Recorder {
 }
 
 static REC: Recorder = Recorder::new();
+/// Serializes every test that touches `REC`, the same way `PROBE_LOCK`
+/// does in `shortcircuit.rs`. `cargo test` runs these `#[test]`s on
+/// multiple threads by default.
+static REC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CountState {
     acc: i64,
@@ -70,6 +74,7 @@ fn matchless_count(program: &Bytecode, threshold: u32, n: i64) -> i64 {
 
 #[test]
 fn a_matchless_portal_compiles_the_while_body() {
+    let _guard = REC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     REC.compiles.store(0, Ordering::Relaxed);
     REC.body.lock().clear();
     let cold = matchless_count(&PROGRAM, u32::MAX, N);
@@ -135,6 +140,7 @@ fn matchless_with_local_match(program: &Bytecode, threshold: u32, n: i64) -> i64
 
 #[test]
 fn a_matchless_portal_with_a_local_match_still_runs_the_body() {
+    let _guard = REC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     REC.compiles.store(0, Ordering::Relaxed);
     REC.body.lock().clear();
     let cold = matchless_with_local_match(&PROGRAM, u32::MAX, N);
