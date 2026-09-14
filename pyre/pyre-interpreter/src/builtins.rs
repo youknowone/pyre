@@ -10356,15 +10356,54 @@ fn exception_group_derive_and_copy(
     Ok(pyre_object::gc_roots::shadow_stack_get(group_slot))
 }
 
+fn exception_group_condition_obj(condition: &ExceptionGroupCondition) -> Option<PyObjectRef> {
+    match *condition {
+        ExceptionGroupCondition::Class(obj) | ExceptionGroupCondition::Callable(obj) => Some(obj),
+        ExceptionGroupCondition::Identity(_) => None,
+    }
+}
+
+fn pin_exception_group_walk(
+    w_self: PyObjectRef,
+    condition: &ExceptionGroupCondition,
+) -> (usize, Option<usize>) {
+    match exception_group_condition_obj(condition) {
+        Some(obj) => {
+            let base = pyre_object::gc_roots::pin_roots(&[w_self, obj]);
+            (base, Some(base + 1))
+        }
+        None => (pyre_object::gc_roots::pin_roots(&[w_self]), None),
+    }
+}
+
+fn live_exception_group_condition(
+    condition: &ExceptionGroupCondition,
+    cond_slot: Option<usize>,
+) -> ExceptionGroupCondition {
+    match *condition {
+        ExceptionGroupCondition::Class(_) => ExceptionGroupCondition::Class(
+            pyre_object::gc_roots::shadow_stack_get(cond_slot.expect("class condition is pinned")),
+        ),
+        ExceptionGroupCondition::Callable(_) => {
+            ExceptionGroupCondition::Callable(pyre_object::gc_roots::shadow_stack_get(
+                cond_slot.expect("callable condition is pinned"),
+            ))
+        }
+        ExceptionGroupCondition::Identity(ref addresses) => {
+            ExceptionGroupCondition::Identity(addresses.clone())
+        }
+    }
+}
+
 fn exception_group_subgroup_inner(
     w_self: PyObjectRef,
     condition: &ExceptionGroupCondition,
 ) -> Result<PyObjectRef, crate::PyError> {
     let _self_roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let (self_slot, cond_slot) = pin_exception_group_walk(w_self, condition);
     let w_self = || pyre_object::gc_roots::shadow_stack_get(self_slot);
-    if condition.matches(w_self())? {
+    let live_condition = || live_exception_group_condition(condition, cond_slot);
+    if live_condition().matches(w_self())? {
         return Ok(w_self());
     }
     let (_, exceptions) = exception_group_fields(w_self())?;
@@ -10375,14 +10414,14 @@ fn exception_group_subgroup_inner(
     let mut modified = false;
     for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
         if crate::baseobjspace::isinstance(exc, base_group)? {
-            let subgroup = exception_group_subgroup_inner(exc, condition)?;
+            let subgroup = exception_group_subgroup_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
             }
             if !std::ptr::eq(subgroup, exc) {
                 modified = true;
             }
-        } else if condition.matches(exc)? {
+        } else if live_condition().matches(exc)? {
             selected.push(exc);
         } else {
             modified = true;
@@ -10402,10 +10441,10 @@ fn exception_group_split_inner(
     condition: &ExceptionGroupCondition,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
     let _self_roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let (self_slot, cond_slot) = pin_exception_group_walk(w_self, condition);
     let w_self = || pyre_object::gc_roots::shadow_stack_get(self_slot);
-    if condition.matches(w_self())? {
+    let live_condition = || live_exception_group_condition(condition, cond_slot);
+    if live_condition().matches(w_self())? {
         return Ok((w_self(), pyre_object::w_none()));
     }
     let (_, exceptions) = exception_group_fields(w_self())?;
@@ -10420,7 +10459,7 @@ fn exception_group_split_inner(
     let mut nonmatching_at = Vec::new();
     for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
         if crate::baseobjspace::isinstance(exc, base_group)? {
-            let (yes, no) = exception_group_split_inner(exc, condition)?;
+            let (yes, no) = exception_group_split_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(yes) } {
                 matching_at.push(kept.len());
                 kept.push(yes);
@@ -10429,7 +10468,7 @@ fn exception_group_split_inner(
                 nonmatching_at.push(kept.len());
                 kept.push(no);
             }
-        } else if condition.matches(exc)? {
+        } else if live_condition().matches(exc)? {
             matching_at.push(kept.len());
             kept.push(exc);
         } else {
