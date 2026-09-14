@@ -12476,6 +12476,22 @@ impl CraneliftBackend {
                     );
                     if let Some(result) = call_result {
                         builder.def_var(var(vi), result);
+                        // Residual GCREF results start as a CL value; the next
+                        // collecting call's gcmap is the home slots. Publish
+                        // now, matching dynasm `force_spill_var` after CallR.
+                        if op.result_type() == Type::Ref {
+                            let mut cached_jf = Some(jf_ptr);
+                            sync_ref_root_var(
+                                &mut builder,
+                                ptr_type,
+                                &mut cached_jf,
+                                &ref_root_slots,
+                                vi,
+                                result,
+                                ref_root_base_ofs,
+                                &mut synced_ref_vars,
+                            );
+                        }
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
@@ -13018,6 +13034,19 @@ impl CraneliftBackend {
                         per_call_gcmap,
                     ) {
                         builder.def_var(var(vi), result);
+                        if op.result_type() == Type::Ref {
+                            let mut cached_jf = Some(jf_ptr);
+                            sync_ref_root_var(
+                                &mut builder,
+                                ptr_type,
+                                &mut cached_jf,
+                                &ref_root_slots,
+                                vi,
+                                result,
+                                ref_root_base_ofs,
+                                &mut synced_ref_vars,
+                            );
+                        }
                     }
                     jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
