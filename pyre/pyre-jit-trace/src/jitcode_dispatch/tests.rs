@@ -4348,6 +4348,14 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "pyre_interpreter::objspace::descroperation::_int_invert",
             "int_invert",
         ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_abs",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_abs",
+            "int_sub",
+        ),
     ] {
         let jc = crate::jitcode_runtime::pathed_jitcode(path)
             .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));

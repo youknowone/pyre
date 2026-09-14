@@ -684,7 +684,15 @@ pm1_edom!(gamma, "expected a noninteger or positive integer");
 pm1_edom!(lgamma, "expected a noninteger or positive integer");
 
 // Misc
-pm1!(fabs);
+/// `math.fabs` after `_get_double`: the unboxed `_float_abs` leaf.
+pub fn fabs(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "fabs() takes exactly one argument",
+        ));
+    }
+    crate::objspace::descroperation::_float_abs(try_get_double(args[0])?)
+}
 pm1_plain!(ulp);
 
 // ── 2-arg float→float via pymath ─────────────────────────────────────
