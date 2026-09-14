@@ -52,6 +52,10 @@ EXAMPLE = ROOT / "target" / "release" / "examples" / "gc-root-reachability"
 # Every production LLBC crate. The example joins donors for call-graph
 # reachability but only walks the *subject* bodies, so a module that
 # moved out of the interpreter is invisible unless it is a subject too.
+# `pyre-module` is extracted `--opaque pyre_object`, so its report often
+# skips the liveness columns (`no PyObjectRef type id`); `parse` then
+# records those as zero rather than treating the shorter report as a
+# shape change.
 LLBC = (
     "build/llbc/majit-rlib.ullbc",
     "build/llbc/pyre-object.ullbc",
@@ -87,6 +91,17 @@ PATTERNS = [
 # Held at zero rather than ratcheted.  A frame carried across a collecting call
 # whose callee is a dispatch seed is a stale frame, not a backlog entry.
 INVARIANT_ZERO = ("frame_tier1_calls",)
+
+# Printed only when the subject artefact has a PyObjectRef type id.
+# A `--opaque pyre_object` crate skips the liveness scan and omits them.
+LIVENESS_KEYS = (
+    "unbracketed_calls",
+    "tier1_calls",
+    "tier15_calls",
+    "frames_across_collecting",
+    "frame_tier1_calls",
+)
+LIVENESS_SKIPPED = "liveness scan skipped"
 
 # Ratcheted: may fall, may not rise.
 #
@@ -231,9 +246,13 @@ def parse(report: str) -> dict:
     """
     got: dict = {}
     pos = 0
+    skipped = LIVENESS_SKIPPED in report
     for key, pattern in PATTERNS:
         m = re.compile(pattern, re.S).search(report, pos)
         if m is None:
+            if skipped and key in LIVENESS_KEYS:
+                got[key] = 0
+                continue
             sys.exit(
                 f"error: the analysis report has no `{key}` line after "
                 f"offset {pos}. The report shape changed; this gate reads it "
