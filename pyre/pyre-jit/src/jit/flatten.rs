@@ -4116,23 +4116,17 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    // pyopcode.py `COMPARE_OP` calls `space.lt`/`le`/`eq`/`ne`/`gt`/`ge`.
-    // Those six tags (0..=5) are `compare_value_from_tag`'s comparison
-    // arms; `jtransform.py handle_regular_call` emits `inline_call_ir_r`
-    // when the body is bound.  `is` / `is_not` stay residual: walking
-    // `is_w` records `GuardSubclass` against an unbound type constant
-    // (classptr 0) on the value-comparing arms, and the assembler panics
-    // looking up that range.  The residual fold (`try_walker_fold_is_op`)
-    // already emits `ptr_eq` for pointer-identity classes.
-    // `in` / `not in` / CHECK_EXC_MATCH keep their own residual folds.
-    if (0..=5).contains(&op_val)
-        && let Some(insn) = build_orthodox_inline_call_ir_r(
-            inline_call_targets::COMPARE_VALUE_FROM_TAG,
-            vec![Operand::ConstInt(op_val)],
-            vec![lhs_operand.clone(), rhs_operand.clone()],
-            result_reg,
-        )
-    {
+    // pyopcode.py `COMPARE_OP` / `IS_OP` / `CONTAINS_OP` all become one
+    // `compare_value_from_tag` call with the opcode tag as a constant.
+    // `jtransform.py handle_regular_call` emits `inline_call_ir_r` when
+    // that body is bound; the tag folds the unused arms away.  Residual
+    // only if this build did not bind the graph.
+    if let Some(insn) = build_orthodox_inline_call_ir_r(
+        inline_call_targets::COMPARE_VALUE_FROM_TAG,
+        vec![Operand::ConstInt(op_val)],
+        vec![lhs_operand.clone(), rhs_operand.clone()],
+        result_reg,
+    ) {
         return Some(insn);
     }
     Some(build_residual_call_ir_r_insn_from_operands(
@@ -6247,6 +6241,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    // pyopcode.py `FORMAT_VALUE` without a spec is `space.format(w_value,
+    // space.newtext(''))`.  `format_simple_w` is that call.
+    if let Some(insn) =
+        build_orthodox_inline_call_r_r(inline_call_targets::FORMAT_SIMPLE, value.clone(), dst_reg)
+    {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.format_simple_fn_idx,
         vec![value],
@@ -6514,8 +6515,12 @@ where
 mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
-    /// COMPARE_OP tags 0..=5 — `lower_compare_op_hlop_to_insn`.
+    /// COMPARE_OP / IS_OP / CONTAINS_OP — `lower_compare_op_hlop_to_insn`.
     pub const COMPARE_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::compare_value_from_tag";
+    /// FORMAT_SIMPLE — `lower_format_simple_hlop_to_insn`.
+    pub const FORMAT_SIMPLE: &str = "pyre_interpreter::type_methods::format_simple_w";
+    /// FORMAT_WITH_SPEC — `lower_format_with_spec_hlop_to_insn`.
+    pub const FORMAT_W: &str = "pyre_interpreter::type_methods::format_w";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -6587,12 +6592,22 @@ fn build_orthodox_inline_call_r_r(
     value: Operand,
     dst_reg: Register,
 ) -> Option<Insn> {
+    build_orthodox_inline_call_r_r_n(canonical_path, vec![value], dst_reg)
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref, …) → Ref` body:
+/// `inline_call_r_r(JitCode, ListR(refs)) → reg`.
+fn build_orthodox_inline_call_r_r_n(
+    canonical_path: &'static str,
+    refs: Vec<Operand>,
+    dst_reg: Register,
+) -> Option<Insn> {
     let jitcode = fully_bound_callee_body(canonical_path)?;
     Some(Insn::op_with_result(
         "inline_call_r_r",
         vec![
             Operand::descr(DescrOperand::JitCode(jitcode)),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
         ],
         dst_reg,
     ))
@@ -7023,6 +7038,14 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    // pyopcode.py `FORMAT_VALUE` with a spec is `space.format(w_value, w_spec)`.
+    if let Some(insn) = build_orthodox_inline_call_r_r_n(
+        inline_call_targets::FORMAT_W,
+        vec![value.clone(), spec.clone()],
+        dst_reg,
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.format_with_spec_fn_idx,
         vec![value, spec],
@@ -10102,13 +10125,13 @@ mod tests {
         let mut lower_constant = test_constant_lowering();
 
         let insn = lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-            .expect("IS_OP HLOp must lower through the compare residual");
+            .expect("IS_OP HLOp must lower through compare_value_from_tag");
 
         match insn {
             Insn::Op { opname, args, .. } => {
-                assert_eq!(
-                    opname, "residual_call_ir_r",
-                    "is / is_not must stay residual (GuardSubclass on is_w)"
+                assert!(
+                    opname == "inline_call_ir_r" || opname == "residual_call_ir_r",
+                    "unexpected compare lowering {opname}"
                 );
                 let tag_list = &args[1];
                 match tag_list {
@@ -13149,6 +13172,20 @@ mod tests {
                 opname,
                 args,
                 result,
+            } if opname == "inline_call_r_r" => {
+                assert!(result.is_some());
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 1);
+                    }
+                    other => panic!("expected ListR([value]), got {other:?}"),
+                }
+            }
+            Insn::Op {
+                opname,
+                args,
+                result,
             } => {
                 assert_eq!(opname, "residual_call_r_r");
                 assert!(
@@ -14757,6 +14794,20 @@ mod tests {
         )
         .expect("2-arg format_with_spec lowering must succeed");
         match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } if opname == "inline_call_r_r" => {
+                assert!(result.is_some());
+                match &args[1] {
+                    Operand::ListOfKind(list) => {
+                        assert_eq!(list.kind, Kind::Ref);
+                        assert_eq!(list.content.len(), 2);
+                    }
+                    other => panic!("expected ListR([value, spec]), got {other:?}"),
+                }
+            }
             Insn::Op {
                 opname,
                 args,
