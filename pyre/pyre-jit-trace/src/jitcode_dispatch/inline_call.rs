@@ -6506,16 +6506,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // an MIFrame for every admitted callee.  The replay screen below is only
     // for an unseeded sub-walk, whose guards resume at the caller's CALL
     // boundary and would double a live-heap write.  A seeded frame
-    // (`try_multiframe` / `strict_seed`, the `perform_call` shape) carries the
-    // callee's own resume coordinate, so the screen does not apply.  The
-    // foriter Dirty flag is the same exemption, but only `fbw_foriter_inflight`
-    // ever sets it; a regular CALL that already owns a seeded frame was still
-    // residualized here (`mutate_then_raise_caught`'s `step`).
+    // (`try_multiframe` / `strict_seed`) carries the callee's own resume
+    // coordinate, which is enough for `DeferredCall` (`mutate_then_raise_caught`
+    // `step`).  A `Dirty` handler-bearing body still abort_trace's under that
+    // seed (`blackhole_inlined_callee_local_after_escape_declined` 0 → 5).
     let seeded_inline = try_multiframe || strict_seed;
+    let seeded_deferred =
+        seeded_inline && branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall);
     if matches!(branchy_handler_safety, Some(s) if s != CalleeReplaySafety::Clean)
         && !foriter_dirty_seeded_resume_admit
         && !branchy_poison_admit
-        && !seeded_inline
+        && !seeded_deferred
     {
         crate::jitcode_dispatch::census_record(
             if branchy_handler_safety == Some(CalleeReplaySafety::DeferredCall) {

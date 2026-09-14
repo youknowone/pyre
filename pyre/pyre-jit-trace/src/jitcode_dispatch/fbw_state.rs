@@ -140,20 +140,17 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 /// frame is present.
 ///
 /// Raising chains keep a shallower local bound because the carrier unwind
-/// crosses suspended frames.  The second flag is "this callee is already on
-/// the stack, or two live frames already share a `w_code`" — that is the
-/// `selfrec_tail_exception_unwind` storm (a third copy of the same frame,
-/// `guard_failures` 937 → 7408).  A distinct `shape → mid → leaf` chain is
-/// not that shape and is admitted one level deeper so it matches
-/// `perform_call`, which has no raise-depth screen.
+/// crosses suspended frames.  Admitting a third inlined raising frame
+/// (`shape → mid → leaf`) abort_trace's the exception-edge bridges on
+/// `exception_try_call_inlined_callee_raise`.  The second flag is "this
+/// callee is already on the stack, or two live frames already share a
+/// `w_code`" — that is the `selfrec_tail_exception_unwind` storm.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
     recursive_or_duplicate: bool,
 ) -> usize {
-    if contains_raise && recursive_or_duplicate {
+    if contains_raise {
         2
-    } else if contains_raise {
-        3
     } else if recursive_or_duplicate {
         usize::MAX
     } else {
@@ -196,8 +193,8 @@ mod recursion_depth_policy_tests {
     }
 
     #[test]
-    fn non_recursive_raising_admits_portal_mid_leaf() {
-        assert_eq!(fbw_effective_multiframe_depth(true, false), 3);
+    fn non_recursive_raising_keeps_the_carrier_unwind_safety_bound() {
+        assert_eq!(fbw_effective_multiframe_depth(true, false), 2);
     }
 
     #[test]
