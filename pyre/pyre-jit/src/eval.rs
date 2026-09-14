@@ -5216,8 +5216,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
                     .into_iter()
                     .filter_map(|(name, addr)| {
                         (name.contains("compare_slot")
-                            || name.contains("jit_compare_value_from_tag")
-                            || name.contains("bh_compare_fn"))
+                            || name.contains("jit_compare_value_from_tag"))
                         .then_some(addr)
                     })
                     .collect();
@@ -5228,7 +5227,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 addrs.push(
                     pyre_interpreter::opcode_ops::jit_compare_value_from_tag as *const () as i64,
                 );
-                addrs.push(crate::call_jit::bh_compare_fn as *const () as i64);
                 addrs.push(
                     pyre_interpreter::opcode_ops::__majit_call_target_jit_compare_value_from_tag
                         as *const () as i64,
