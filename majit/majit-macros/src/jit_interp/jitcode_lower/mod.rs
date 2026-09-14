@@ -73,8 +73,8 @@ use super::call_policy_byte::{
     VOID_MAY_FORCE, VOID_RELEASE_GIL,
 };
 use super::codegen_trace::{
-    block_contains_match, find_dispatch_match, is_assert_not_none_call_path, is_promote_call_path,
-    is_record_exact_class_call_path, stmt_contains_match,
+    block_contains_match, find_dispatch_match, find_portal_loop, is_assert_not_none_call_path,
+    is_promote_call_path, is_record_exact_class_call_path, portal_loop_body, stmt_contains_match,
 };
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprCast, ExprIf, ExprLit, ExprMatch,
