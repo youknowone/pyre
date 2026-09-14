@@ -1539,6 +1539,8 @@ fn str_prefix_match_slow(
 pub fn __majit_wrap_str_descr_startswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
+    arity_at_least(args, "startswith", 1)?;
+    arity_at_most(args, "startswith", 3)?;
     if args.len() != 2 {
         return str_prefix_match_slow(args, "startswith", true);
     }
@@ -1562,6 +1564,8 @@ pub fn __majit_wrap_str_descr_startswith(
 pub fn __majit_wrap_str_descr_endswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
+    arity_at_least(args, "endswith", 1)?;
+    arity_at_most(args, "endswith", 3)?;
     if args.len() != 2 {
         return str_prefix_match_slow(args, "endswith", false);
     }

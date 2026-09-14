@@ -8900,6 +8900,10 @@ impl<'a> Lowering<'a> {
             .args
             .first()
             .is_some_and(|op| self.operand_is_string_byte_view(op));
+        let second_arg_is_string_byte_view = call
+            .args
+            .get(1)
+            .is_some_and(|op| self.operand_is_string_byte_view(op));
         // Second argument's MIR-declared type — `bool::then`'s closure env
         // operand.  Captured before the operands are consumed so the
         // `front::bool_then` recording can resolve the closure ADT's
@@ -11414,7 +11418,8 @@ impl<'a> Lowering<'a> {
                 // `BinOp("eq")` that becomes `ll_streq`.
                 if args.len() == 2
                     && fmt_path_ends_with(&segments, &["slice", "cmp", "<Impl>", "eq"])
-                    && !self.string_byte_view_locals.is_empty()
+                    && first_arg_is_string_byte_view
+                    && second_arg_is_string_byte_view
                 {
                     let res = self
                         .graph
