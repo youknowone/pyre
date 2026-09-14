@@ -1,7 +1,11 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=root:rec
+# pyre-check: selfcheck-compiles=entry-bridge:rec,loop:<module>
 # `step` inlines into the module loop once `rec`'s self-rec CALL residualizes
-# instead of aborting the enclosing walk. `rec` stays the compiled root.
+# instead of aborting the enclosing walk. Require both that caller loop and
+# `rec`'s FINISH-only procedure. In upstream compile.py,
+# ResumeFromInterpDescr.compile_and_attach publishes the latter as an
+# "entry bridge" after pyjitpl.py MetaInterp.compile_done_with_this_frame;
+# the census follows that classification rather than calling it a root loop.
 # A self-recursive callee reached through a multi-frame adopt returned `None`
 # from a function whose every path returns an `int` (gh#1444).
 #

@@ -915,7 +915,18 @@ def pyre_env():
     # sensitivity this note is here to name outlives the convergence: a change
     # in interpreter-path allocation volume moves the wasm numbers while the
     # native ones sit still.
-    env.setdefault("PYPY_GC_MIN", str(512 * 1024 * 1024))
+    # selfrec_bridge_nontail_promote now keeps its wasm overflow bridges
+    # compiled. Its live allocation volume crosses 512 MiB: wasm and Windows
+    # cranelift then add one guard exit (634 vs 633), with the same two loops,
+    # four bridges and zero aborts. At 1 GiB every backend retains 633 without
+    # changing a baseline. The wasm reading goes from one major collection
+    # to zero, at a measured linear-memory cost of 586 MB -> 602 MB. Keep this
+    # fixture beyond the same collection boundary as the cases above.
+    # The same preset removes two/one major collections from wasm's
+    # build_set_hashability/minmax_key_rooting: guards become 43/257 instead
+    # of 42/256. Both the old and new guest reproduce those exact numbers
+    # when changing only this minimum, so those baselines follow the preset.
+    env.setdefault("PYPY_GC_MIN", str(1024 * 1024 * 1024))
     # Keep the bench directory off `sys.path` (`-P`), so the jit-stats counters
     # describe the fixture rather than the directory it happens to sit in.
     #
