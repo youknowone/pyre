@@ -47,6 +47,8 @@ use crate::parse::CallPath;
 pub const LL_LISTSLICE_STARTONLY: &str = "ll_listslice_startonly";
 /// `rlist.py ll_listslice_minusone` — `l[:-1]`.
 pub const LL_LISTSLICE_MINUSONE: &str = "ll_listslice_minusone";
+/// `rlist.py ll_listslice_startstop` with start 0 — `l[:end]`.
+pub const LL_LISTSLICE_RANGETO: &str = "ll_listslice_rangeto";
 
 /// The item kind and ARRAY identity of the GC array `base` names, read off an
 /// `ArrayRead` / `ArrayWrite` / `ArrayLen` / `NewArrayClear` on the same
@@ -197,6 +199,23 @@ pub fn listslice_minusone_path(
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_minusone_graph(&name, item_ty, array_type_id);
+        cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
+        cc.add_candidate_graph(path.clone());
+    }
+    path
+}
+
+/// The helper path for `__getslice_rangeto`, minting
+/// `rlist.py ll_listslice_startstop` with start 0 on first use.
+pub fn listslice_rangeto_path(
+    cc: &mut CallControl,
+    item_ty: &ValueType,
+    array_type_id: Option<&str>,
+) -> CallPath {
+    let name = helper_name(LL_LISTSLICE_RANGETO, item_ty, array_type_id);
+    let path = CallPath::from_segments([name.as_str()]);
+    if !cc.has_function_graph(&path) {
+        let graph = build_ll_listslice_rangeto_graph(&name, item_ty, array_type_id);
         cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
         cc.add_candidate_graph(path.clone());
     }
@@ -368,6 +387,102 @@ pub fn build_ll_listslice_minusone_graph(
     graph
 }
 
+/// `rlist.py ll_listslice_startstop(RESLIST, l1, 0, stop)` in the rich model.
+///
+/// ```python
+/// length = l1.ll_length()
+/// if stop > length:
+///     stop = length
+/// newlength = stop
+/// l = RESLIST.ll_newlist(newlength)
+/// ll_arraycopy(l1, l, 0, 0, newlength)
+/// ```
+pub fn build_ll_listslice_rangeto_graph(
+    name: &str,
+    item_ty: &ValueType,
+    array_type_id: Option<&str>,
+) -> FunctionGraph {
+    let array_type_id = array_type_id.map(str::to_string);
+    let mut graph = FunctionGraph::new(name);
+    let start_block = graph.startblock;
+
+    let l1 = graph.alloc_value_var();
+    let stop = graph.alloc_value_var();
+    for (var, param, ty) in [
+        (&l1, "l1", ValueType::Ref(None)),
+        (&stop, "stop", ValueType::Int),
+    ] {
+        graph.push_inputarg_var(start_block, var.clone());
+        graph.push_op_with_result_var(
+            start_block,
+            OpKind::Input {
+                name: param.to_string(),
+                ty,
+                class_root: None,
+            },
+            var.clone(),
+        );
+    }
+
+    let len1 = push(
+        &mut graph,
+        start_block,
+        OpKind::ArrayLen {
+            base: l1.clone(),
+            array_type_id: array_type_id.clone(),
+            nolength: false,
+        },
+    );
+    let in_range = push(
+        &mut graph,
+        start_block,
+        OpKind::BinOp {
+            op: "le".into(),
+            lhs: stop.clone(),
+            rhs: len1.clone(),
+            result_ty: ValueType::Bool,
+        },
+    );
+    let (use_stop, use_stop_args) = graph.create_block_with_arg_vars(2);
+    let (use_len, use_len_args) = graph.create_block_with_arg_vars(2);
+    let (copy, copy_args) = graph.create_block_with_arg_vars(2);
+    graph.set_branch(
+        start_block,
+        in_range,
+        use_stop,
+        vec![l1.clone(), stop],
+        use_len,
+        vec![l1, len1],
+    );
+    graph.set_goto(use_stop, copy, use_stop_args);
+    graph.set_goto(use_len, copy, use_len_args);
+
+    let [c_l1, c_len] = copy_args.as_slice() else {
+        unreachable!("copy block was created with two inputargs")
+    };
+    let new_list = push(
+        &mut graph,
+        copy,
+        OpKind::NewArrayClear {
+            length: c_len.clone(),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
+    );
+    let start = push(&mut graph, copy, OpKind::ConstInt(0));
+    emit_ll_arraycopy_loop(
+        &mut graph,
+        copy,
+        c_l1.clone(),
+        start,
+        new_list,
+        c_len.clone(),
+        item_ty,
+        array_type_id,
+    );
+    graph
+}
+
 /// `ll_arraycopy(l1, l, start, 0, newlength)` as the item loop, because the
 /// rich model has no arraycopy residual.
 fn emit_ll_arraycopy_loop(
@@ -508,6 +623,18 @@ pub fn is_getslice_minusone(op: &SpaceOperation) -> bool {
     )
 }
 
+/// The op is the front's `__getslice_rangeto(slice, end)` marker (`l[:end]`).
+pub fn is_getslice_rangeto(op: &SpaceOperation) -> bool {
+    matches!(
+        &op.kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if segments.len() == 1 && segments[0] == "__getslice_rangeto" && args.len() == 2
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +716,42 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. }))
         );
+    }
+
+    #[test]
+    fn rangeto_helper_clamps_stop_then_copies() {
+        let graph = build_ll_listslice_rangeto_graph(
+            "ll_listslice_rangeto__ref",
+            &ValueType::Ref(None),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
+        let start = graph.block(graph.startblock);
+        assert_eq!(start.inputargs.len(), 2);
+        assert!(
+            start
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. }))
+        );
+        assert_eq!(start.exits.len(), 2);
+        assert!(graph.blocks.iter().any(|block| block
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))));
+        assert!(graph.blocks.iter().any(|block| block
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))));
+        assert!(is_getslice_rangeto(&SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangeto".into()],
+                },
+                args: crate::model::call_args(vec![Variable::new(), Variable::new()]),
+                result_ty: ValueType::Ref(None),
+            },
+        }));
     }
 
     #[test]
