@@ -237,6 +237,70 @@ pub fn do_getfield_raw_f(
     cpu.bh_getfield_raw_f(structbox, fielddescr)
 }
 
+/// Walker leftover of `_do_call` when there is no `MetaInterp`/`cpu`:
+/// split positional `args` by `descr.arg_types()` into I/R/F and call
+/// `bh_call_*_by_classes`. Float results use the real f64 ABI
+/// (`executor.py` `cpu.bh_call_f`) and return packed bits.
+fn do_call_positional(descr: &dyn majit_ir::descr::CallDescr, func_ptr: i64, args: &[i64]) -> i64 {
+    let arg_types = descr.arg_types();
+    let mut args_i = Vec::new();
+    let mut args_r = Vec::new();
+    let mut args_f = Vec::new();
+    let mut arg_classes = String::new();
+    for (i, ty) in arg_types.iter().enumerate().take(args.len()) {
+        let concrete = args[i];
+        match ty {
+            majit_ir::Type::Int => {
+                args_i.push(concrete);
+                arg_classes.push('i');
+            }
+            majit_ir::Type::Ref => {
+                args_r.push(concrete);
+                arg_classes.push('r');
+            }
+            majit_ir::Type::Float => {
+                args_f.push(concrete);
+                arg_classes.push('f');
+            }
+            majit_ir::Type::Void => panic!("typed call: void argument class at slot {i}"),
+        }
+    }
+    let func = func_ptr as usize;
+    match descr.result_type() {
+        majit_ir::Type::Int | majit_ir::Type::Ref => unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                func,
+                &arg_classes,
+                leftover_bh_args(&args_i),
+                leftover_bh_args(&args_r),
+                leftover_bh_args(&args_f),
+            )
+        },
+        majit_ir::Type::Void => {
+            unsafe {
+                majit_backend::call_stub::bh_call_v_by_classes(
+                    func,
+                    &arg_classes,
+                    leftover_bh_args(&args_i),
+                    leftover_bh_args(&args_r),
+                    leftover_bh_args(&args_f),
+                );
+            }
+            0
+        }
+        majit_ir::Type::Float => unsafe {
+            majit_backend::call_stub::bh_call_f_by_classes(
+                func,
+                &arg_classes,
+                leftover_bh_args(&args_i),
+                leftover_bh_args(&args_r),
+                leftover_bh_args(&args_f),
+            )
+            .to_bits() as i64
+        },
+    }
+}
+
 fn leftover_bh_args(v: &[i64]) -> Option<&[i64]> {
     if v.is_empty() { None } else { Some(v) }
 }
@@ -906,7 +970,7 @@ pub fn execute_cast_const_row(opcode: OpCode, arg: majit_ir::Value) -> ConstFold
 /// callee. Pyre's walker (`pyre-jit-trace::jitcode_dispatch::
 /// dispatch_residual_call_*`) cannot thread `&mut MetaInterp` through the
 /// trace recorder seam, so this helper exposes the `exc=False` shape via
-/// direct `call_int_function` / `call_void_function` dispatch.
+/// `cpu.bh_call_*`.
 ///
 /// **Caller contract** (debug-asserted): `descr.get_extra_info()` must report
 /// both `check_is_elidable()` true AND `check_can_raise(false)` false.  Any
@@ -915,9 +979,9 @@ pub fn execute_cast_const_row(opcode: OpCode, arg: majit_ir::Value) -> ConstFold
 ///
 /// `args` follows `_build_allboxes` (`pyjitpl.py`) layout
 /// **excluding** the funcbox: the funcbox concrete int is `func_ptr` and the
-/// remaining concrete operand values pass straight through to the host ABI
-/// dispatcher (`pyjitpl::call_int_function` / `call_void_function`).  Up to
-/// `MAX_HOST_CALL_ARITY` (16) operand slots.
+/// remaining concrete operand values pass straight through to
+/// `cpu.bh_call_*` (`executor.py _do_call`).  Up to `MAX_HOST_CALL_ARITY`
+/// (16) operand slots.
 pub fn execute_pure_call(
     descr: &dyn majit_ir::descr::CallDescr,
     func_ptr: i64,
@@ -928,44 +992,7 @@ pub fn execute_pure_call(
             && !descr.get_extra_info().check_can_raise(false),
         "execute_pure_call requires EF_ELIDABLE_CANNOT_RAISE EI"
     );
-    let func_ptr = func_ptr as *const ();
-    match descr.result_type() {
-        // executor.py dispatches Int through `cpu.bh_call_i` and Ref
-        // through `cpu.bh_call_r`; both return a machine word, so pyre shares
-        // one dispatcher — Ref is bit-identical to Int at the ABI level.  The
-        // descr goes along for the *arguments*: a Float parameter belongs in
-        // the floating-point register file whatever the result type is.
-        majit_ir::Type::Int | majit_ir::Type::Ref => {
-            crate::pyjitpl::call_int_function_typed(func_ptr, args, descr.arg_types())
-        }
-        majit_ir::Type::Void => {
-            crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
-            0
-        }
-        // executor.py:66-68 `if rettype == FLOAT: cpu.bh_call_f(...)`.  The
-        // funcbox reaching this seam is always the callee's own address —
-        // `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)`
-        // (`jitcode/assembler.rs`), which is what pyre's codewriter
-        // registers, and the LLBC path bakes a plain `ConstInt` fnaddr that
-        // mints no `JitCallTarget` at all.  So the f64 comes back in the
-        // floating-point return register, exactly as the blackhole
-        // (`bhimpl_residual_call_irf_f`) and the metainterp's own IRF_F
-        // dispatcher (`pyjitpl/dispatch.rs`) already assume for it.
-        //
-        // The `f64::to_bits`-packing `_concrete` wrapper the helper policy
-        // attributes emit for a Float helper (`emit_helper_call_target_fn`,
-        // `majit-macros/src/lib.rs`) reaches a residual call only
-        // through the explicit `*_float_wrapped` call policies, which no crate
-        // declares.  The CALL_ASSEMBLER arms are a separate opcode family and
-        // keep `call_int_function` for their own i64-returning `call_assembler`
-        // entry wrapper (`pyjitpl/dispatch.rs`), which is a different wrapper.
-        //
-        // The result is returned as raw bits so the caller's `f64::from_bits`
-        // stamp is unchanged (`longlong` float-storage parity).
-        majit_ir::Type::Float => {
-            crate::pyjitpl::call_float_function(func_ptr, args, descr.arg_types()).to_bits() as i64
-        }
-    }
+    do_call_positional(descr, func_ptr, args)
 }
 
 /// `executor.execute_varargs` parity for the walker layer, simplified
@@ -1006,24 +1033,7 @@ pub fn execute_residual_call(
     args: &[i64],
 ) -> Result<i64, i64> {
     crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    let func_ptr = func_ptr as *const ();
-    let result = match descr.result_type() {
-        majit_ir::Type::Int | majit_ir::Type::Ref => {
-            crate::pyjitpl::call_int_function_typed(func_ptr, args, descr.arg_types())
-        }
-        majit_ir::Type::Void => {
-            crate::pyjitpl::call_void_function_typed(func_ptr, args, descr.arg_types());
-            0
-        }
-        // executor.py `cpu.bh_call_f` — same funcbox provenance as
-        // `execute_pure_call`'s Float arm; see its comment for why the
-        // callee's own address, not the `f64::to_bits` wrapper, is what
-        // reaches this seam.  Returned as raw bits for the caller's
-        // `f64::from_bits` stamp.
-        majit_ir::Type::Float => {
-            crate::pyjitpl::call_float_function(func_ptr, args, descr.arg_types()).to_bits() as i64
-        }
-    };
+    let result = do_call_positional(descr, func_ptr, args);
     let bh_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| {
         let v = c.get();
         c.set(0);
