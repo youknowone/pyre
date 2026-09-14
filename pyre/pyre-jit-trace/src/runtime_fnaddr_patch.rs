@@ -571,16 +571,13 @@ mod tests {
         assert_eq!(
             (addr as u64) & SENTINEL_HIGH_MASK,
             0,
-            "a real W_UnicodeObject address must have the sentinel high bits clear",
+            "a real STR payload address must have the sentinel high bits clear",
         );
-        // `bh_strlen` / `bh_strgetitem` read rstr `STR` (`llmodel.py`),
-        // the `_utf8` payload, not the `W_UnicodeObject` wrapper.
+        // The slot holds `_utf8` (`StringRepr.convert_const` → `Ptr(STR)`).
         let cpu = crate::pyre_cpu::PyreCpu::new();
-        let payload =
-            unsafe { pyre_object::unicodeobject::w_str_storage(addr as pyre_object::PyObjectRef) };
-        assert_eq!(cpu.bh_strlen(GcRef(payload as usize)), Some(5));
+        assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(5));
         let got: Vec<u8> = (0..5)
-            .map(|i| cpu.bh_strgetitem(GcRef(payload as usize), i).unwrap() as u8)
+            .map(|i| cpu.bh_strgetitem(GcRef(addr as usize), i).unwrap() as u8)
             .collect();
         assert_eq!(got, b"hello");
     }
@@ -601,7 +598,7 @@ mod tests {
         let a1 = jcs[1].body().constants_r[0].get();
         assert_eq!(
             a0, a1,
-            "identical literals must share one immortal W_UnicodeObject",
+            "identical literals must share one immortal STR payload",
         );
         assert_ne!(a0, sentinel(0));
     }
@@ -756,8 +753,6 @@ mod tests {
         materialize_str_consts(&mut jcs);
         let addr = jcs[0].body().constants_r[0].get();
         let cpu = crate::pyre_cpu::PyreCpu::new();
-        let payload =
-            unsafe { pyre_object::unicodeobject::w_str_storage(addr as pyre_object::PyObjectRef) };
-        assert_eq!(cpu.bh_strlen(GcRef(payload as usize)), Some(0));
+        assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
     }
 }
