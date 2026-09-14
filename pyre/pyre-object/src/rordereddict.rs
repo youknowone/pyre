@@ -162,6 +162,36 @@ impl<K, V, S> RDict<K, V, S> {
         self.num_live_items == 0
     }
 
+    /// `ll_getitem_nonneg` / `ll_getitem_fast` on `d.entries`.
+    #[inline]
+    fn entry_at(&self, slot: usize) -> &Option<Entry<K, V>> {
+        debug_assert!(slot < self.entries.len());
+        unsafe { &*self.entries.as_ptr().add(slot) }
+    }
+
+    /// `ll_setitem_fast` on `d.entries`.
+    #[inline]
+    fn entry_at_mut(&mut self, slot: usize) -> &mut Option<Entry<K, V>> {
+        debug_assert!(slot < self.entries.len());
+        unsafe { &mut *self.entries.as_mut_ptr().add(slot) }
+    }
+
+    /// `ll_getitem_nonneg` on `d.indexes`.
+    #[inline]
+    fn index_at(&self, i: usize) -> u32 {
+        debug_assert!(i < self.indexes.len());
+        unsafe { *self.indexes.as_ptr().add(i) }
+    }
+
+    /// `ll_setitem_fast` on `d.indexes`.
+    #[inline]
+    fn set_index_at(&mut self, i: usize, value: u32) {
+        debug_assert!(i < self.indexes.len());
+        unsafe {
+            *self.indexes.as_mut_ptr().add(i) = value;
+        }
+    }
+
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan
     /// (rordereddict.py:1373): "while i < num_ever_used_items: if
     /// entries.valid(i)".  A cursor stays valid across an unrelated delete
@@ -169,7 +199,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// moves.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
-        (from..self.entries.len()).find(|&i| self.entries[i].is_some())
+        (from..self.entries.len()).find(|&i| self.entry_at(i).is_some())
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
@@ -179,7 +209,7 @@ impl<K, V, S> RDict<K, V, S> {
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
         (0..before.min(self.entries.len()))
             .rev()
-            .find(|&i| self.entries[i].is_some())
+            .find(|&i| self.entry_at(i).is_some())
     }
 
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
@@ -189,7 +219,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// paired with the slot holding it.
     pub fn next_entry(&self, from: usize) -> Option<(usize, &K, &V)> {
         let slot = self.next_valid_slot(from)?;
-        let e = self.entries[slot].as_ref()?;
+        let e = self.entry_at(slot).as_ref()?;
         Some((slot, &e.key, &e.value))
     }
 
@@ -409,11 +439,11 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let mask = self.indexes.len() - 1;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
-        while self.indexes[i] != FREE {
+        while self.index_at(i) != FREE {
             i = Self::probe_next(i, perturb, mask);
             perturb >>= PERTURB_SHIFT;
         }
-        self.indexes[i] = slot + VALID_OFFSET;
+        self.set_index_at(i, slot + VALID_OFFSET);
     }
 
     /// `ll_dict_reindex` (rordereddict.py:1000).
@@ -422,7 +452,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.indexes = vec![FREE; new_size];
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
         for slot in 0..self.entries.len() {
-            let hash = match &self.entries[slot] {
+            let hash = match self.entry_at(slot) {
                 Some(e) => e.hash,
                 None => continue,
             };
@@ -476,7 +506,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        self.entries[slot].as_ref().map(|e| &e.value)
+        self.entry_at(slot).as_ref().map(|e| &e.value)
     }
 
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
@@ -485,7 +515,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     {
         let hash = self.hash_of(key);
         let slot = self.lookup(hash, key)?;
-        self.entries[slot].as_mut().map(|e| &mut e.value)
+        self.entry_at_mut(slot).as_mut().map(|e| &mut e.value)
     }
 
     pub fn contains_key<Q>(&self, key: &Q) -> bool
@@ -514,7 +544,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         }
         let index_slot = match self.lookup_for_store(hash, &key) {
             Ok(slot) => {
-                let e = self.entries[slot].as_mut().expect("valid slot");
+                let e = self.entry_at_mut(slot).as_mut().expect("valid slot");
                 return Some(std::mem::replace(&mut e.value, value));
             }
             Err(index_slot) => index_slot,
@@ -574,7 +604,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         // index and then initialize the preallocated entry, with no allocation
         // between them. Only a reindex invalidates the original probe's slot.
         match index_slot.filter(|_| !reindexed) {
-            Some(index_slot) => self.indexes[index_slot] = self.next_slot() + VALID_OFFSET,
+            Some(index_slot) => self.set_index_at(index_slot, self.next_slot() + VALID_OFFSET),
             None => {
                 let slot = self.next_slot();
                 self.insert_clean(hash, slot);
@@ -592,15 +622,15 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let target = slot as u32 + VALID_OFFSET;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
-        while self.indexes[i] != target {
+        while self.index_at(i) != target {
             // `ll_dict_delete_by_entry_index` checks for FREE, not a probe
             // count: the perturb prefix may revisit slots before becoming a
             // full-period walk, so a valid search can exceed indexes.len().
-            debug_assert_ne!(self.indexes[i], FREE, "no index slot names entry {slot}");
+            debug_assert_ne!(self.index_at(i), FREE, "no index slot names entry {slot}");
             i = Self::probe_next(i, perturb, mask);
             perturb >>= PERTURB_SHIFT;
         }
-        self.indexes[i] = DELETED;
+        self.set_index_at(i, DELETED);
     }
 
     /// `ll_dict_pop` (rordereddict.py:1497).  Order-preserving and O(1): the
@@ -635,7 +665,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
 
     fn take_slot(&mut self, hash: u64, slot: usize) -> (K, V) {
         self.delete_by_entry_index(hash, slot);
-        let entry = self.entries[slot].take().expect("valid slot");
+        let entry = self.entry_at_mut(slot).take().expect("valid slot");
         self.num_live_items -= 1;
 
         if self.num_live_items == 0 {
@@ -659,7 +689,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
                 return None;
             }
             slot -= 1;
-            if self.entries[slot].is_some() {
+            if self.entry_at(slot).is_some() {
                 return self.remove_slot(slot);
             }
         }
