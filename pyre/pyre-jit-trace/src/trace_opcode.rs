@@ -2472,80 +2472,28 @@ impl MIFrame {
                 fail_arg_opref_for_typed_value(ctx, typed_null)
             };
         }
-        let mut dedup_changed: Vec<(usize, OpRef)> = Vec::new();
-        {
-            use std::collections::HashSet;
-            let mut duplicates: HashSet<OpRef> = HashSet::new();
-            for i in 0..args.len() {
-                let opref = args[i];
-                if opref.is_constant() || !duplicates.insert(opref) {
-                    // pyjitpl.py `record_same_as(box)` uses the
-                    // `box.type` intrinsic to pick `same_as_i/r/f` — the
-                    // SameAs op's result type matches the input box, NEVER
-                    // the slot's declared type. When `args[i]` is a constant
-                    // whose Value type differs from the slot's declared
-                    // `inputarg_types[i]` (e.g. an Int constant placeholder
-                    // routed into a Ref-typed vable header slot), wrapping
-                    // it as `same_as_for_type(slot_type)` produces a
-                    // cross-type SameAs whose `make_equal_to` absorb in
-                    // `optimizer.rs::propagate_from_pass_range` violates the
-                    // Box.type invariant in `OptContext::replace_op`.
-                    //
-                    // Match RPython by deriving the SameAs op from the
-                    // OpRef's actual type via `ctx.get_opref_type`, falling
-                    // back to the slot type only when the OpRef has no
-                    // recoverable type (which would be a separate bug).
-                    let tp = ctx
-                        .get_opref_type(opref)
-                        .or_else(|| inputarg_types.get(i).copied())
-                        .unwrap_or(majit_ir::Type::Ref);
-                    let new_opref = ctx.record_same_as(opref, tp);
-                    args[i] = new_opref;
-                    dedup_changed.push((i, new_opref));
-                }
+        let before_dedup = args.clone();
+        // pyjitpl.py `remove_consts_and_duplicates` over reds, then over
+        // `virtualizable_boxes[:-1]`, sharing one `duplicates` set.
+        // `args` is already that concatenated list (`frame` + extra reds
+        // + `virtualizable_boxes[:-1]`), so one pass matches both calls.
+        ctx.remove_consts_and_duplicates_untyped(&mut args);
+        let dedup_changed: Vec<(usize, OpRef)> = args
+            .iter()
+            .enumerate()
+            .filter(|(i, opref)| before_dedup[*i] != **opref)
+            .map(|(i, opref)| (i, *opref))
+            .collect();
+        // `remove_consts_and_duplicates` mutates `virtualizable_boxes[:-1]`
+        // in place. `args[1+extra_reds..]` is that element block.
+        let payload_start = 1 + extra_reds;
+        if let Some(boxes) = ctx.collect_virtualizable_boxes() {
+            let end = boxes.len().saturating_sub(1);
+            if args.len() >= payload_start + end {
+                ctx.adopt_normalized_virtualizable_elements(
+                    &args[payload_start..payload_start + end],
+                );
             }
-        }
-        // pyjitpl.py:2961-2963 in-place mutation of self.virtualizable_boxes:
-        //     self.remove_consts_and_duplicates(
-        //         self.virtualizable_boxes,
-        //         len(self.virtualizable_boxes)-1,
-        //         duplicates)
-        //
-        // RPython's `remove_consts_and_duplicates` writes the SameAs results
-        // back into `self.virtualizable_boxes[i]` IN PLACE for `i` in
-        // `range(len-1)`. The trailing element (`virtualizable_boxes[-1]`,
-        // the standard vable identity itself = pyre's frame OpRef) is
-        // intentionally skipped. The mutated `self.virtualizable_boxes`
-        // then feeds the GUARD_FUTURE_CONDITION snapshot below.
-        //
-        // pyre's `args` Vec layout is `[frame, ni, code, vsd, ns,
-        // locals..., stack...]` where `args[0]` is the trailing
-        // virtualizable identity (mapped to `vb[len-1]`) and `args[1..]`
-        // is `vb[0..len-1]`. The line-by-line mirror here mutates
-        // `ctx.virtualizable_boxes[i-1]` for every dedup'd `args[i]`
-        // with `i >= 1`, leaving `vb[len-1]` (the trailing identity)
-        // untouched.
-        //
-        // Note: pyjitpl.py `put_back_list_of_boxes3` writes the
-        // dedup'd `redboxes` back to the FRAME's `registers_i/r/f`
-        // arrays. RPython only runs `put_back_list_of_boxes3` from the
-        // `opimpl_jit_merge_point` failed-to-close path (i.e. when
-        // `reached_loop_header` returns normally instead of raising
-        // SwitchToBlackhole). pyre's `close_loop_args_at` is the
-        // SUCCESS path (the trace is closing), so the put_back has no
-        // matching call site here — it would belong on the path where
-        // pyre fails to close at a merge point and continues tracing,
-        // which pyre's tracer does not currently expose.
-        for &(idx, new_opref) in &dedup_changed {
-            if idx <= extra_reds {
-                // args[0] = frame = ctx.virtualizable_boxes[len-1].
-                // Any extra reds that follow it are not part of
-                // `virtualizable_boxes`, so only the virtualizable payload
-                // starting after `[frame, extra_reds...]` is mirrored back.
-                continue;
-            }
-            let vb_idx = idx - (1 + extra_reds);
-            ctx.set_virtualizable_box_at(vb_idx, new_opref);
         }
         // pyjitpl.py put_back_list_of_boxes3: write dedup'd values back
         // to frame symbolic state so subsequent tracing sees the SameAs-wrapped
