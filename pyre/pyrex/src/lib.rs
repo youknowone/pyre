@@ -1595,6 +1595,11 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
 /// the death-queue trigger only for a queue it has just put something in, so a
 /// bumped `finalizer_trigger_count` is that sweep reporting what it found.
 fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) -> bool {
+    // pypy.module.gc.interp_gc.collect clears both semantic lookup caches
+    // before collecting: cached finalizer methods otherwise retain their
+    // declaring type and globals after the finalizer returns.
+    pyre_interpreter::baseobjspace::clear_method_cache();
+    pyre_interpreter::objspace::std::mapdict::clear_map_attr_cache();
     let triggers_before = pyre_interpreter::executioncontext::finalizer_trigger_count();
     pyre_object::gc_hook::try_gc_collect(2);
     let made_finalizable =
@@ -1772,6 +1777,23 @@ fn clear_shutdown_modules(
         names.push(name);
         let _ = pyre_object::gc_roots::pin_root(module);
     }
+    // finalize_remove_modules in CPython v3.14.6 retains weak references:
+    // holding these modules strongly would keep their cycles alive until
+    // their globals are cleared. PyPy Module objects likewise have ordinary
+    // GC lifetime; ObjSpace.finish does not clear their dictionaries. Keep
+    // only GC-managed weak carriers across the collection so finalizers can
+    // inspect the intact graph (test_module_finalization_at_shutdown).
+    for index in 0..names.len() {
+        let slot = roots_start + index;
+        let module = pyre_object::gc_roots::shadow_stack_get(slot);
+        let weak = unsafe { pyre_object::weakref::w_weakref_new(module) };
+        pyre_object::gc_roots::shadow_stack_set(slot, weak.cast());
+    }
+    let module_at = |index| unsafe {
+        pyre_object::weakref::w_weakref_deref(
+            pyre_object::gc_roots::shadow_stack_get(roots_start + index).cast(),
+        )
+    };
     // CPython v3.14.6 pylifecycle.c finalize_modules collects unconditionally
     // after detaching sys.modules and before clearing surviving module dicts.
     // A previous finalizer can release the next link in a chain even when
@@ -1780,20 +1802,26 @@ fn clear_shutdown_modules(
     // test_module_finalization_at_shutdown).
     // PyPy ObjSpace.finish runs module shutdown hooks without this dict-clear
     // phase; this collection preserves the existing CPython shutdown contract.
-    collect_and_run_finalizers(ec_ptr);
+    // incminimark.IncrementalMiniMarkGC.deal_with_objects_with_finalizers
+    // preserves dependency order across successive collections. Unlike
+    // CPython's refcount/cyclic-GC finalization, one collection need not finish
+    // the unreachable module graph. Keep that GC ordering and continue only
+    // while a collection actually delivers finalizers, before clearing globals.
+    while collect_and_run_finalizers(ec_ptr) {}
     for index in (0..names.len()).rev() {
-        let module = pyre_object::gc_roots::shadow_stack_get(roots_start + index);
-        let is_core_module = sys_module_slot.is_some_and(|slot| {
-            module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
-        }) || builtins_module_slot.is_some_and(|slot| {
-            module == pyre_object::gc_roots::shadow_stack_get(roots_start + slot)
-        });
+        let module = module_at(index);
+        let is_core_module = sys_module_slot.is_some_and(|slot| module == module_at(slot))
+            || builtins_module_slot.is_some_and(|slot| module == module_at(slot));
         if is_core_module {
             continue;
         }
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
         }
+        // _PyWeakref_GET_REF owns the surviving module through _PyModule_Clear.
+        // The weak carrier alone must not be its root while a store allocates.
+        let module_root = pyre_object::gc_roots::push_roots();
+        let module = module_root.pin_root(module);
         let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
         clear_shutdown_module_dict(dict);
     }

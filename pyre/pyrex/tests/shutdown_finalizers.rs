@@ -47,3 +47,34 @@ Link(Link(Last()))
     assert_eq!(stdout.trim(), "globals alive", "{stderr}");
     assert!(stderr.is_empty(), "{stderr}");
 }
+
+#[test]
+fn mutually_referencing_modules_keep_globals_during_finalization() {
+    // The vendored test_module finalization fixture exercises module cycles,
+    // private globals, peers, imported functions and builtins in __del__.
+    let output = Command::new(env!("CARGO_BIN_EXE_pyre-dynasm"))
+        .args(["-c", "from test.test_module import final_a"])
+        .env_remove("MAJIT_STATS")
+        .env_remove("PYRE_GC_DIAG")
+        .output()
+        .expect("run the module finalization fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.is_empty(), "{stdout}\n{stderr}");
+    assert_eq!(stdout.lines().count(), 16, "{stdout}");
+    let mut lines: Vec<_> = stdout.lines().collect();
+    lines.sort_unstable();
+    lines.dedup();
+    assert_eq!(
+        lines,
+        [
+            "final_a.x = a",
+            "final_b.x = b",
+            "len = len",
+            "shutil.rmtree = rmtree",
+            "x = a",
+            "x = b"
+        ]
+    );
+}
