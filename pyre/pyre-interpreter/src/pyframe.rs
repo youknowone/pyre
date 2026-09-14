@@ -2951,22 +2951,24 @@ fn cell_slot(code: &CodeObject, idx: usize) -> bool {
 /// `framelocalsproxy_getkeyindex` scans this order and
 /// `frame_locals_proxy_snapshot` fills a dict in it, so a name resolves to the
 /// same slot on both routes only as long as they walk it the same way.
-fn locals_plus_names(code: &CodeObject) -> impl Iterator<Item = (usize, &str, bool)> {
-    let locals = code
-        .varnames
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (index, name.as_str(), cell_slot(code, index)));
-    let pure_cellvars = code
-        .cellvars
-        .iter()
-        .filter(|name| !code.varnames.iter().any(|local| local == *name));
-    locals.chain(
-        pure_cellvars
-            .chain(code.freevars.iter())
-            .enumerate()
-            .map(|(offset, name)| (code.varnames.len() + offset, name.as_str(), true)),
-    )
+fn locals_plus_names(code: &CodeObject) -> Vec<(usize, &str, bool)> {
+    let mut names = Vec::new();
+    for (index, name) in code.varnames.iter().enumerate() {
+        names.push((index, name.as_str(), cell_slot(code, index)));
+    }
+    let mut extra = 0usize;
+    for name in &code.cellvars {
+        if code.varnames.iter().any(|local| local == name) {
+            continue;
+        }
+        names.push((code.varnames.len() + extra, name.as_str(), true));
+        extra += 1;
+    }
+    for name in &code.freevars {
+        names.push((code.varnames.len() + extra, name.as_str(), true));
+        extra += 1;
+    }
+    names
 }
 
 /// True when localsplus slot `idx` carries `CO_FAST_HIDDEN`, i.e. an inlined
