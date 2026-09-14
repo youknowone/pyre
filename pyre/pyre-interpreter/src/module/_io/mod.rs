@@ -88,7 +88,8 @@ pub(crate) fn release_buffered_lock(handle: usize) {
 // The module-local exception class is process-global, like PyPy's module
 // definition object.  Keep the immortal type pointer shared across threads;
 // runtime semantic state must not be duplicated in TLS.
-static UNSUPPORTED_OPERATION_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static UNSUPPORTED_OPERATION_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn type_method(ns: PyObjectRef, name: &str, function: PyObjectRef) {
     unsafe {
@@ -132,7 +133,7 @@ pub(crate) fn iobase_set_internal_closed(
 pub(crate) fn unsupported_operation_type() -> PyObjectRef {
     UNSUPPORTED_OPERATION_TYPE
         .get()
-        .map_or(std::ptr::null_mut(), |&addr| addr as PyObjectRef)
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `space.getexecutioncontext().checksignals()` as the buffered writer's
@@ -1383,8 +1384,8 @@ fn init_text_iobase_type(ns: PyObjectRef) {
 /// `TypeDef` instances; they are shared by every import and are the actual
 /// bases used by the typed concrete stream payloads below.
 pub(crate) fn io_base_type() -> PyObjectRef {
-    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "_io._IOBase",
             init_iobase_type,
@@ -1398,13 +1399,13 @@ pub(crate) fn io_base_type() -> PyObjectRef {
             pyre_object::w_type_set_weakrefable(tp, true);
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 pub(super) fn raw_iobase_type() -> PyObjectRef {
-    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let base = io_base_type();
         let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
         // `W_RawIOBase.typedef.applevel_subclasses_base = W_IOBase`;
@@ -1423,8 +1424,8 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
             pyre_object::w_type_set_weakrefable(tp, true);
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// PyPy `space.gettypefor(W_FileIO)`: one process-global concrete raw type.
@@ -1432,8 +1433,8 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
 /// `open()` needs the same type object exported by `_io`, rather than a
 /// second wrapper-shaped allocation path.
 pub(crate) fn fileio_type() -> PyObjectRef {
-    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "_io.FileIO",
             |type_ns| {
@@ -1459,8 +1460,8 @@ pub(crate) fn fileio_type() -> PyObjectRef {
             pyre_object::w_type_set_weakrefable(tp, true);
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
@@ -1481,8 +1482,8 @@ pub(crate) fn buffered_random_type() -> PyObjectRef {
 }
 
 pub(super) fn buffered_iobase_type() -> PyObjectRef {
-    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "_io._BufferedIOBase",
             init_buffered_iobase_type,
@@ -1495,13 +1496,13 @@ pub(super) fn buffered_iobase_type() -> PyObjectRef {
             pyre_object::w_type_set_weakrefable(tp, true);
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn text_iobase_type() -> PyObjectRef {
-    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(
             "_io._TextIOBase",
             init_text_iobase_type,
@@ -1514,8 +1515,8 @@ fn text_iobase_type() -> PyObjectRef {
             pyre_object::w_type_set_weakrefable(tp, true);
             pyre_object::typeobject::w_type_set_hasdict(tp, true);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 pub(crate) fn call_method_result(
@@ -1595,7 +1596,7 @@ crate::py_module! {
             crate::builtins::exc_os_error_new,
             bases,
         );
-        let _ = UNSUPPORTED_OPERATION_TYPE.set(unsupported as usize);
+        UNSUPPORTED_OPERATION_TYPE.set(unsupported);
         crate::module_ns_store(ns, "UnsupportedOperation", unsupported);
 
         // `_io.BlockingIOError` aliases the builtin BlockingIOError.

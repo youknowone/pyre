@@ -327,8 +327,8 @@ mod hash_state_class {
 /// `W_HashState` layout instead of inventing a parallel payload or side table.
 #[majit_macros::dont_look_inside]
 fn hash_xof_type() -> PyObjectRef {
-    static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_hashlib.HASHXOF",
             |ns| unsafe {
@@ -348,8 +348,8 @@ fn hash_xof_type() -> PyObjectRef {
         // CPython 3.14 Modules/_hashopenssl.c creates HASHXOF from the same
         // immutable module heap family as HASH.
         crate::typedef::mark_cpython_heap_type(tp, true);
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// The `name: str` clinic conversion: `name` must be a str (or subclass, per

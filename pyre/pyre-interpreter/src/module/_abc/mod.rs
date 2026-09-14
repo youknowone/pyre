@@ -54,12 +54,13 @@ fn root_forever(obj: PyObjectRef) {
 /// the way `weakref_type` stashes its own.  The registry and both caches are
 /// instances of it, so the collection this module installs is the one
 /// `_get_dump` describes and a collected member drops itself.
-static SIMPLE_WEAK_SET_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SIMPLE_WEAK_SET_TYPE: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 fn simple_weak_set_type() -> PyObjectRef {
-    *SIMPLE_WEAK_SET_TYPE
+    SIMPLE_WEAK_SET_TYPE
         .get()
-        .expect("_abc.SimpleWeakSet must be installed at module init") as PyObjectRef
+        .expect("_abc.SimpleWeakSet must be installed at module init")
 }
 
 /// The `__contains__` `app_abc.py` defines, stashed beside its type as the four
@@ -1002,7 +1003,7 @@ crate::py_module! {
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         root_forever(simple_weak_set);
-        let _ = SIMPLE_WEAK_SET_TYPE.set(simple_weak_set as usize);
+        SIMPLE_WEAK_SET_TYPE.set(simple_weak_set);
         let installed = simple_weak_set_contains_identity();
         if installed != (0, 0, 0, 0) {
             // Each word is an address the comparison keeps naming, so a match

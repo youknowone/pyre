@@ -19,13 +19,14 @@ use pyre_object::PyObjectRef;
 /// The `socket` type: real enough to subclass, empty of anything that would
 /// need a descriptor behind it.
 fn socket_type() -> PyObjectRef {
-    static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SOCKET_TYPE_OBJ.get_or_init(|| {
+    static SOCKET_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    SOCKET_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
         crate::typedef::mark_cpython_heap_type(tp, false);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_socket_type(ns: PyObjectRef) {

@@ -254,10 +254,11 @@ fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
 
 /// `os.terminal_size` structseq — `(columns, lines)`.
 fn terminal_size_seq_type() -> PyObjectRef {
-    static TERMINAL_SIZE_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *TERMINAL_SIZE_SEQ_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]) as usize
-    }) as PyObjectRef
+    static TERMINAL_SIZE_SEQ_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    TERMINAL_SIZE_SEQ_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"])
+    })
 }
 
 /// `posix.listdir(path=None)` — the entry names the seam reports, in its
@@ -363,13 +364,14 @@ fn entry_self(
 /// false for every entry, not as a claim that nothing is a link but because a
 /// name and what it resolves to are the only two things this seam separates.
 fn dir_entry_type() -> PyObjectRef {
-    static DIR_ENTRY_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DIR_ENTRY_TYPE.get_or_init(|| {
+    static DIR_ENTRY_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    DIR_ENTRY_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("posix.DirEntry", init_dir_entry_type);
         crate::typedef::mark_cpython_heap_type(tp, false);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_dir_entry_type(ns: PyObjectRef) {
@@ -454,14 +456,15 @@ fn new_dir_entry(bytes_mode: bool, dir_bytes: &[u8], name: &[u8]) -> PyObjectRef
 /// `close` drops that, which is what makes an exhausted or closed iterator
 /// report the end rather than the directory again.
 fn scandir_iterator_type() -> PyObjectRef {
-    static SCANDIR_ITERATOR_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SCANDIR_ITERATOR_TYPE.get_or_init(|| {
+    static SCANDIR_ITERATOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    SCANDIR_ITERATOR_TYPE.get_or_init(|| {
         let tp =
             crate::typedef::make_builtin_type("posix.ScandirIterator", init_scandir_iterator_type);
         crate::typedef::mark_cpython_heap_type(tp, false);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// The iterator's own position, or `None` once it has been closed.
@@ -993,13 +996,14 @@ fn unsetenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// `os.uname_result` structseq — the five fields `uname` fills.
 fn uname_seq_type() -> PyObjectRef {
-    static UNAME_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *UNAME_SEQ_TYPE.get_or_init(|| {
+    static UNAME_SEQ_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    UNAME_SEQ_TYPE.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             "os.uname_result",
             &["sysname", "nodename", "release", "version", "machine"],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// `posix.uname()` — the record wasi's own `uname` fills in, which names the
