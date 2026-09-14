@@ -375,7 +375,17 @@ pub unsafe fn grow_instance_items_block(
     live_len: usize,
 ) -> *mut ItemsBlock {
     unsafe {
+        let _roots = crate::gc_roots::push_roots();
+        let old_slot = crate::gc_roots::shadow_stack_len();
+        if !old.is_null() {
+            let _ = crate::gc_roots::pin_root(old as PyObjectRef);
+        }
         let fresh = alloc_mapdict_storage_block(new_cap);
+        let old = if old.is_null() {
+            old
+        } else {
+            crate::gc_roots::shadow_stack_get(old_slot) as *mut ItemsBlock
+        };
         let new_base = items_block_items_base(fresh);
         let copy = live_len.min(new_cap);
         if !old.is_null() && copy > 0 {

@@ -1672,12 +1672,14 @@ impl PyError {
         // below: `exc` lives only in this Rust local while `w_list_new` (and the
         // setters) run, so a collection there could sweep the unrooted
         // (non-moving oldgen) exception before it is written through.
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         let exc = pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_from_wtf8_managed(self.message.clone());
             let msg = pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
+            let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
             // dedicated `msg` slot (`ImportError.__init__` stores `args[0]`
@@ -1712,6 +1714,7 @@ impl PyError {
         // above pop when this scope ends, and `walk_gc_refs` keeps forwarding
         // both fields afterwards, so leaving the pre-move address here would
         // hand the collector a moved-from slot.
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if !self.w_name_context.is_null() {
             let w_name_context = pyre_object::gc_roots::shadow_stack_get(name_ctx_slot);
             self.w_name_context = w_name_context;

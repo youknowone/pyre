@@ -20272,11 +20272,15 @@ fn gen_close_iter(w_yf: PyObjectRef, prompt_finalizers: bool) -> PyResult {
 fn generator_close_iter(gen_obj: PyObjectRef) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let gen_obj = pyre_object::gc_roots::pin_root(gen_obj);
         debug_assert!(!w_generator_is_running(gen_obj));
         let w_yf = generator_get_delegate(gen_obj);
         generator_set_delegate(gen_obj, PY_NULL);
         w_generator_set_running(gen_obj, true);
         let result = gen_close_iter(w_yf, true);
+        let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
         w_generator_set_running(gen_obj, false);
         result
     }

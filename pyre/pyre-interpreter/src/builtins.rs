@@ -2586,7 +2586,9 @@ fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
 /// bytes `hex(sep, bytes_per_sep)` formatter on a gathered copy.
 fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mv = pyre_object::gc_roots::pin_root(args.first().copied().unwrap_or(w_none()));
     let w_bytes = unsafe {
         memoryview_check_released(mv)?;
         pyre_object::bytesobject::w_bytes_from_bytes(&memoryview_gather_bytes(mv))
@@ -2600,6 +2602,7 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // live view, so retain the identical release guard across the formatter.
     unsafe { pyre_object::memoryview::w_memoryview_exports_incref(mv) };
     let result = crate::typedef::bytes_method_hex(&fwd);
+    let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
     unsafe { pyre_object::memoryview::w_memoryview_exports_decref(mv) };
     result
 }
@@ -2636,9 +2639,13 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
             // temporary export.  The digest is deliberately discarded; the
             // call validates hashability and, crucially, prevents a
             // re-entrant `mv.release()` from freeing the bytes being hashed.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mv = pyre_object::gc_roots::pin_root(mv);
             let backing = pyre_object::memoryview::w_memoryview_obj(mv);
             pyre_object::memoryview::w_memoryview_exports_incref(mv);
             let backing_hash = crate::baseobjspace::hash_w_strict(backing);
+            let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
             pyre_object::memoryview::w_memoryview_exports_decref(mv);
             backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
