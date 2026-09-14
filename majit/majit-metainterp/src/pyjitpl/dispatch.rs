@@ -9210,7 +9210,7 @@ where
                     };
                     (first_reg, target, args_i, args_r, calldescr, dst)
                 };
-                let (args, concrete_args, arg_types, raw_i, raw_r, _raw_f) =
+                let (args, concrete_args, arg_types, raw_i, raw_r, raw_f) =
                     self.read_canonical_call_args(&calldescr.arg_classes, &args_i, &args_r, &[]);
                 let trace_ptr = if target.trace_ptr.is_null() {
                     target.concrete_ptr
@@ -9268,7 +9268,18 @@ where
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
-                                call_void_function(concrete_ptr, &concrete_args);
+                                // `do_conditional_call` → `execute_varargs` → `cpu.bh_call_v`.
+                                if !concrete_ptr.is_null() {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_v_by_classes(
+                                            concrete_ptr as usize,
+                                            &calldescr.arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        );
+                                    }
+                                }
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9329,7 +9340,20 @@ where
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
-                                let n = call_int_function(concrete_ptr, &concrete_args);
+                                // `do_conditional_call(is_value=True)` → `cpu.bh_call_i`.
+                                let n = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &calldescr.arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9428,7 +9452,20 @@ where
                                         Some(&calldescr.arg_classes),
                                     );
                                 }
-                                let p = call_ref_function(concrete_ptr, &concrete_args);
+                                // `do_conditional_call(is_value=True)` → `cpu.bh_call_r`.
+                                let p = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &calldescr.arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9585,6 +9622,7 @@ where
                 let extra_info = crate::call_descr::effect_info_for_slot(slot);
                 let mut raw_i = Vec::new();
                 let mut raw_r = Vec::new();
+                let mut raw_f = Vec::new();
                 let mut arg_classes = String::new();
                 for (spec, &concrete) in arg_regs.iter().zip(concrete_args.iter()) {
                     match spec.kind {
@@ -9596,7 +9634,10 @@ where
                             raw_r.push(concrete);
                             arg_classes.push('r');
                         }
-                        JitArgKind::Float => arg_classes.push('f'),
+                        JitArgKind::Float => {
+                            raw_f.push(concrete);
+                            arg_classes.push('f');
+                        }
                     }
                 }
                 match bytecode {
@@ -9637,7 +9678,18 @@ where
                                         Some(&arg_classes),
                                     );
                                 }
-                                call_void_function(concrete_ptr, &concrete_args);
+                                // leftover cond_call_void_ext → `cpu.bh_call_v`.
+                                if !concrete_ptr.is_null() {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_v_by_classes(
+                                            concrete_ptr as usize,
+                                            &arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        );
+                                    }
+                                }
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9693,7 +9745,20 @@ where
                                         Some(&arg_classes),
                                     );
                                 }
-                                let n = call_int_function(concrete_ptr, &concrete_args);
+                                // leftover cond_call_value_int_ext → `cpu.bh_call_i`.
+                                let n = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
@@ -9791,7 +9856,20 @@ where
                                         Some(&arg_classes),
                                     );
                                 }
-                                let p = call_ref_function(concrete_ptr, &concrete_args);
+                                // leftover cond_call_value_ref_ext → `cpu.bh_call_r`.
+                                let p = if concrete_ptr.is_null() {
+                                    0
+                                } else {
+                                    unsafe {
+                                        majit_backend::call_stub::bh_call_i_by_classes(
+                                            concrete_ptr as usize,
+                                            &arg_classes,
+                                            Some(&raw_i),
+                                            Some(&raw_r),
+                                            Some(&raw_f),
+                                        )
+                                    }
+                                };
                                 if let Some(action) = host_requested_walk_abort(
                                     ctx,
                                     concrete_ptr as usize,
