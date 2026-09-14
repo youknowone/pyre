@@ -3062,7 +3062,7 @@ pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
     if result.is_infinite() && ar.is_finite() && ai.is_finite() {
         return Err(PyError::overflow_error("absolute value too large"));
     }
-    Ok(w_float_new(result))
+    _float_abs(result)
 }
 
 /// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
@@ -6621,6 +6621,32 @@ pub(crate) fn _float_pos(x: f64) -> PyResult {
         floatval: x,
         w_dict: PY_NULL,
         w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
+#[inline(never)]
+pub(crate) fn _float_abs(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.abs(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// intobject.py `descr_abs` after `ovfcheck(abs(a))`.
+#[inline(never)]
+pub(crate) fn _int_abs(x: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: if x < 0 { 0i64.wrapping_sub(x) } else { x },
     }) as PyObjectRef)
 }
 

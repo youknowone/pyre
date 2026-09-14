@@ -9781,6 +9781,23 @@ const FLOAT_POS_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-POS-SUBWALK",
 };
 
+/// floatobject.py `descr_abs` / `ll_math_fabs`.
+const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_abs",
+    commit_label: "float_abs_commit",
+    call_site_label: "float_abs_call_site",
+    decline_tag: "FLOAT-ABS-SUBWALK",
+};
+
+/// intobject.py `descr_abs` after `ovfcheck`.
+#[allow(dead_code)]
+const INT_ABS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_abs",
+    commit_label: "int_abs_commit",
+    call_site_label: "int_abs_call_site",
+    decline_tag: "INT-ABS-SUBWALK",
+};
+
 /// intobject.py `descr_invert`.
 const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_int_invert",
@@ -15634,6 +15651,42 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Exact builtin float/int `math.fabs` / `abs`: walk `_float_abs`.
+pub(crate) fn try_walker_orthodox_float_abs<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
+        (false, unsafe { pyre_object::w_float_get_value(obj) })
+    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
+    } else {
+        return Ok(None);
+    };
+    let xa =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[],
+        &[(xa, x.abs())],
+        dst,
+        dst_bank,
+        &FLOAT_ABS_DESCENT,
+    )
+}
+
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
 /// `ll_math_fabs` to a sign mask, so the whole builtin is one `FloatAbs` once
 /// the operand is unboxed, and `fabs` raises for no input, which is why the
@@ -15643,6 +15696,7 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
 /// screens the authentic result through `fold_finite_float_result`, so
 /// `fabs(inf)` and `fabs(nan)` decline at trace time and keep the residual
 /// even though the sign mask would answer them correctly.
+/// Exact operands walk [`try_walker_orthodox_float_abs`] first.
 pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -15650,6 +15704,20 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if pyre_interpreter::module::math::interp_math::is_math_fabs_function(callable)
+            && r_args.len() >= 3
+        {
+            if let Some(DispatchOutcome::SubReturn {
+                result: Some(boxed),
+            }) = try_walker_orthodox_float_abs(
+                ctx, op.pc, r_args[2], operands[0], dst, 'r',
+            )? {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         pyre_module::module::math::interp_math::is_math_fabs_function(callable).then_some((
             MathFloatDomain::Total,
