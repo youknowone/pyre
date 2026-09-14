@@ -4781,6 +4781,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -4793,7 +4795,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             "builtin_wrapper_call_site",
-            None,
+            vstack,
             &[],
             None,
         )

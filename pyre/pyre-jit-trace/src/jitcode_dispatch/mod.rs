@@ -6160,18 +6160,15 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
         .iter()
         .map(|&(dst, v)| (dst as u32, v))
         .collect();
-    // Mirror-sourced kept operand-stack slots: at a branch guard the
-    // not-taken arm preserves the operand-stack bottom, so the live walk-level
-    // box mirror (`ctx.vstack_boxes`, indexed by absolute operand-stack depth)
-    // holds the exact kept value for resume operand slot `s`.  This replaces
-    // the stale `registers_r[merge_color]` / edge-recovery color heuristics
-    // below, which read a color the regalloc reused between the guard pc and
-    // the resume pc (the #424 merge-color-staleness corruption).  Scoped to
-    // the branch-guard reconstruction (`guard_present`); the merge-color
-    // heuristics below remain only as the fallback for slots the mirror does
-    // not cover (mirror invalid, or an Int-bank temp the Ref-only mirror does
-    // not hold).
-    let vstack_mirror: Option<&[OpRef]> = vstack.filter(|_| guard_present);
+    // Mirror-sourced operand-stack slots: the walk-level box mirror
+    // (`ctx.vstack_boxes`, indexed by absolute operand-stack depth) is the
+    // analog of `MIFrame.registers_r` for the valuestack.  A branch guard
+    // uses it for the not-taken arm's kept bottom; a CALL-site helper
+    // snapshot uses it for the live receiver / argument boxes so a guard
+    // inside the helper resumes those same OpRefs rather than a peel
+    // ConstPtr.  The merge-color heuristics below remain the fallback for
+    // slots the mirror does not cover.
+    let vstack_mirror = vstack;
     for &idx in &banks.ref_ {
         let color = idx as usize;
         // The semantic slot this color owns AT THE GUARD PC.  Where it equals

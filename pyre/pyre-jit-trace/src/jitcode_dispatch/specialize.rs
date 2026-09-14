@@ -17248,7 +17248,11 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
 /// Running `dunder_import` here would execute a finder on a miss, then
 /// swallow the error as null and let the result guard retry the same
 /// import.
-extern "C" fn jit_import_cached(name: i64) -> i64 {
+///
+/// `fromlist_empty != 0` is `import a.b` (no fromlist): `__import__`
+/// answers the top-level package, so a dotted name returns
+/// `sys.modules["a"]` after the leaf is confirmed present.
+extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
     let w_name = name as pyre_object::PyObjectRef;
     if w_name.is_null() {
         return 0;
@@ -17256,10 +17260,17 @@ extern "C" fn jit_import_cached(name: i64) -> i64 {
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return 0;
     };
-    match pyre_interpreter::importing::get_sys_module(s) {
-        Some(module) => module as i64,
-        None => 0,
+    let Some(leaf) = pyre_interpreter::importing::get_sys_module(s) else {
+        return 0;
+    };
+    if fromlist_empty != 0
+        && let Some(dot) = s.find('.')
+    {
+        return pyre_interpreter::importing::get_sys_module(&s[..dot])
+            .map(|head| head as i64)
+            .unwrap_or(0);
     }
+    leaf as i64
 }
 
 /// Cached absolute `import name` / `from name import ...` on a module already
@@ -17335,16 +17346,16 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_mod = jit_import_cached(w_name as i64);
-    if w_mod == 0 {
-        return Ok(None);
-    }
-    let w_mod = w_mod as pyre_object::PyObjectRef;
     let fromlist_empty = w_fromlist.is_null() || unsafe { pyre_object::is_none(w_fromlist) };
     let fromlist_empty = fromlist_empty
         || unsafe {
             pyre_object::is_tuple(w_fromlist) && pyre_object::w_tuple_len(w_fromlist) == 0
         };
+    let w_mod = jit_import_cached(w_name as i64, i64::from(fromlist_empty));
+    if w_mod == 0 {
+        return Ok(None);
+    }
+    let w_mod = w_mod as pyre_object::PyObjectRef;
     if !fromlist_empty {
         // Package fromlist goes through `_handle_fromlist`.  A non-package
         // answers the module itself (`interp___import__`).
@@ -17409,11 +17420,12 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     // Impure `CallR`: `sys.modules` is mutable, so an elidable / `CallPureR`
     // rewrite would fold the entry observed while tracing.  The helper
     // only reads the dict and cannot raise.
+    let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
-        &[name_op],
-        &[majit_ir::Type::Ref],
+        &[name_op, fromlist_empty_op],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
         majit_ir::Type::Ref,
         majit_metainterp::cannot_raise_effect_info(),
     );
@@ -18334,6 +18346,8 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -18346,7 +18360,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             op_pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             call_site_label,
-            None,
+            vstack,
             &[],
             // Not a branch-guard reconstruction: this is the pre-call site
             // snapshot, so there is no kept operand-stack slot to report as

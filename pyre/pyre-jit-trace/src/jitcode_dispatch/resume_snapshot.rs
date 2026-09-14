@@ -2805,6 +2805,8 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
         )
         .map_err(|_| unavail("Unavail::Helper/BoxesErr"))?
     } else {
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
         // SAFETY: checked non-null above and valid for this full-body walk.
         let caller_sym = unsafe { &*caller_sym_ptr };
@@ -2820,15 +2822,23 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
             call_jit_pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             "builtin_wrapper_call_entry",
-            None,
+            vstack,
             &[],
             None,
         )
     };
+    let call_stack_overrides = if caller_code.is_some() {
+        Vec::new()
+    } else {
+        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
+        // SAFETY: same non-null snapshot_sym as the box collection above.
+        let caller_sym = unsafe { &*caller_sym_ptr };
+        collect_call_stack_overrides(caller_sym, ctx, call_jit_pc).unwrap_or_default()
+    };
     Ok(InlineParentFrame {
         jitcode_index,
-        call_jitcode_pc: None,
-        call_stack_overrides: Vec::new(),
+        call_jitcode_pc: Some(call_jit_pc),
+        call_stack_overrides,
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::Backxlat(resume_marker_jit_pc),
         resume_marker_jit_pc: Some(resume_marker_jit_pc),
