@@ -18967,7 +18967,20 @@ impl<M: Clone> MetaInterp<M> {
         if !vinfo.has_vable_token() {
             return;
         }
-        let vable_ptr = self.unwrap_standard_virtualizable();
+        // pyjitpl.py: `virtualizable = vinfo.unwrap_virtualizable_box(
+        //     self.virtualizable_boxes[-1])`. Fall back to the host
+        // pointer when the identity box has no concrete ref yet.
+        let vable_ptr = self
+            .tracing
+            .as_ref()
+            .and_then(|ctx| {
+                let concrete = ctx.concrete_of_opref(ctx.standard_virtualizable_box()?)?;
+                let ptr = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(Some(
+                    concrete,
+                ));
+                (!ptr.is_null()).then_some(ptr as *const u8)
+            })
+            .unwrap_or_else(|| self.unwrap_standard_virtualizable());
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return,

@@ -1128,7 +1128,8 @@ fn real_main() {
     // here; the codewriter slot stays empty until the runtime metainterp
     // setter overrides it.  TODO: documented at
     // `CallControl::make_virtualizable_infos`.
-    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, _vtype| None;
+    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> =
+        &|_jd_idx, vtype| majit_translate::call::codewriter_vinfo_for_vtype(vtype);
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
     // Prebuilt object-space singleton addresses (static `PyType` pointers
     // and dict-strategy refs).  `majit-translate` is the translation

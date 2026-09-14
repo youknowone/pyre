@@ -12240,10 +12240,25 @@ fn vable_clear_token_and_get_vinfo(
              a null pointer here is a contract bug, not a recoverable case"
         );
     }
-    let vinfo = unsafe { &*bh.virtualizable_info };
+    let bh_vinfo = unsafe { &*bh.virtualizable_info };
+    // blackhole.py `fielddescr.get_vinfo().clear_vable_token(struct)`.
+    // `BhDescr::VableField` is an index; recover the stamped FieldDescr
+    // and prefer that backref when `finalize_arc` installed it.
+    let upgraded = bh_vinfo
+        .static_field_descrs()
+        .first()
+        .and_then(|descr| descr.as_field_descr()?.get_vinfo());
+    let clear_info = upgraded
+        .as_ref()
+        .and_then(|marker| {
+            marker
+                .as_any()
+                .downcast_ref::<crate::virtualizable::VirtualizableInfo>()
+        })
+        .unwrap_or(bh_vinfo);
     let vable =
-        unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, vable as *mut u8) } as i64;
-    (vinfo, vable)
+        unsafe { crate::virtualizable::bh_clear_vable_token(clear_info, vable as *mut u8) } as i64;
+    (bh_vinfo, vable)
 }
 
 /// Decode the vable-array descr pair after the register operands and

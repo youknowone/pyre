@@ -2248,6 +2248,9 @@ fn analyze_pipeline_from_module_paths(
     // complete driver set exists.
     call_control
         .make_virtualizable_infos(|jd_idx, vtypeptr_token| vinfo_factory(jd_idx, vtypeptr_token));
+    // warmspot.py `WarmRunnerDesc.finish` → `vinfo.finish()` after the
+    // driver set exists. `finish_setup_descrs` is the metainterp half.
+    call_control.finish();
     // Register oopspecs for jit.* builtin functions.
     // rlib/jit.py: these functions carry @oopspec("jit.*") decorators;
     // the codewriter converts calls to them into dedicated opcodes.

@@ -3387,7 +3387,17 @@ impl InstanceRepr {
             }
             ranking.insert(mangled_name, rank);
         }
-        accessor.initialize(self.object_type.clone(), ranking.clone());
+        // `FieldListAccessor.initialize(self.object_type, ranking)` after
+        // `object_type.become(Struct)`. A still-forward `object_type` is
+        // the pre-`become` hint walk; `resolved()` is the Struct
+        // `test_rvirtualizable.TestVirtualizable.test_accessor` compares.
+        let type_for_accessor = match &self.object_type {
+            LowLevelType::ForwardReference(fwd) => {
+                fwd.resolved().unwrap_or_else(|| self.object_type.clone())
+            }
+            other => other.clone(),
+        };
+        accessor.initialize(type_for_accessor, ranking.clone());
         Ok(ranking)
     }
 
@@ -6694,6 +6704,16 @@ mod tests {
             fields.get(&ConstValue::byte_str("inst_x")),
             Some(&ConstValue::byte_str("immutable")),
             "accessor.fields maps inst_x to IR_IMMUTABLE"
+        );
+        let accessor_ty = repr
+            .virtualizable
+            .borrow()
+            .as_ref()
+            .and_then(|vable| vable.accessor.TYPE.clone())
+            .expect("accessor.TYPE");
+        assert!(
+            matches!(accessor_ty, LowLevelType::Struct(_)),
+            "test_rvirtualizable.py test_accessor: accessor.TYPE == TYPE after become"
         );
 
         let child = ClassDef::new_standalone("W", Some(&classdef));

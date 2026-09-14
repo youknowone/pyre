@@ -163,7 +163,9 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
         // the vinfo is immutable through the shared handle.
         info.clear_vable_ptr = Some(pyre_clear_vable_token as *const () as usize);
         info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
-        info.finalize_arc(crate::state::pyframe_size_descr())
+        let info = info.finalize_arc(crate::state::pyframe_size_descr());
+        info.finish();
+        info
     })
     .clone()
 }

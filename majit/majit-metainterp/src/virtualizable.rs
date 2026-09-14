@@ -293,6 +293,24 @@ impl majit_translate::call::VirtualizableInfoHandle for VirtualizableInfo {
             None => false,
         }
     }
+
+    fn finish(&self) {
+        VirtualizableInfo::finish(self);
+    }
+
+    fn has_static_field(&self, name: &str) -> bool {
+        self.static_fields.iter().any(|field| field.name == name)
+    }
+
+    fn has_array_field(&self, name: &str) -> bool {
+        self.array_fields.iter().any(|field| field.name == name)
+    }
+
+    fn static_field_index(&self, name: &str) -> Option<usize> {
+        self.static_fields
+            .iter()
+            .position(|field| field.name == name)
+    }
 }
 
 /// majit-ir's `FieldDescr::get_vinfo()` returns `Option<Arc<dyn VinfoMarker>>`;
@@ -537,6 +555,24 @@ impl VirtualizableInfo {
             descr = descr.with_vinfo(w);
         }
         Arc::new(descr)
+    }
+
+    /// virtualizable.py `VirtualizableInfo.finish`.
+    ///
+    /// Upstream rewrites residual `jit_force_virtualizable` via
+    /// `replace_force_virtualizable_with_call` and stamps
+    /// `clear_vable_ptr` / `clear_vable_descr`. The rewrite lives in
+    /// `rvirtualizable::replace_force_virtualizable_with_call` over
+    /// rtyper graphs this object does not own. The stamp happens at
+    /// construction (`set_clear_vable`). This asserts that stamp for
+    /// machines that have a `vable_token`.
+    pub fn finish(&self) {
+        if self.has_vable_token() {
+            assert!(
+                self.clear_vable_ptr.is_some() && self.clear_vable_descr.is_some(),
+                "virtualizable.py finish: clear_vable_ptr/descr must be stamped"
+            );
+        }
     }
 
     /// virtualizable.py `finish()` registers the `clear_vable_ptr`
@@ -2049,6 +2085,16 @@ mod tests {
             assert_eq!(*(obj_ptr.add(8) as *const i64), 100);
             assert_eq!(*(obj_ptr.add(16) as *const i64), 200);
         }
+    }
+
+    #[test]
+    fn finish_asserts_clear_vable_is_stamped() {
+        let mut info = VirtualizableInfo::new(0);
+        info.set_clear_vable(
+            std::ptr::null(),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        info.finish();
     }
 
     #[test]

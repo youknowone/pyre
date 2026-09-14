@@ -4421,7 +4421,11 @@ impl TraceCtx {
                     Some(Value::Int(isstandard)),
                     0,
                 );
-                self.promote_int(eqbox, isstandard, 0);
+                let promoted = self.promote_int(eqbox, isstandard, 0);
+                // `MIFrame.implement_guard_value`: `self.metainterp.replace_box(box, promoted)`.
+                if promoted != eqbox {
+                    self.replace_standard_vable(eqbox, promoted);
+                }
                 if isstandard != 0 {
                     // `_nonstandard_virtualizable`'s `if box.type == 'r':
                     //     self.metainterp.replace_box(box, standard_box)`.
