@@ -2022,6 +2022,8 @@ static LISTITER_TYPE_WORD: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// null and use `LISTITER_TYPE_WORD`.
 static LISTITER_PRED: std::sync::atomic::AtomicPtr<()> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static STR_PRED: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// JIT boot: `&LIST_ITER_TYPE as *const _ as usize`.
 pub fn register_listiter_type_word(word: usize) {
@@ -2031,6 +2033,11 @@ pub fn register_listiter_type_word(word: usize) {
 /// JIT boot: `is_list_iter` as a C predicate. Preferred over the type word.
 pub fn register_listiter_pred(f: unsafe extern "C" fn(*const u8) -> i32) {
     LISTITER_PRED.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// JIT boot: `is_str || is_bytes` as a C predicate.
+pub fn register_str_pred(f: unsafe extern "C" fn(*const u8) -> i32) {
+    STR_PRED.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `execute_assembler`: the live EC top frame (`vref_referent`, never a vref).
@@ -2099,6 +2106,18 @@ fn leftover_ptr_is_listiter(p: *const u8) -> bool {
     let obj_ty = unsafe { *(p as *const usize) };
     let obj_class = unsafe { *(p as *const usize).add(1) };
     obj_ty == ty || obj_class == ty
+}
+
+fn leftover_ptr_is_str(p: *const u8) -> bool {
+    if p.is_null() || (p as usize) & 1 != 0 {
+        return false;
+    }
+    let pred = STR_PRED.load(std::sync::atomic::Ordering::Relaxed);
+    if pred.is_null() {
+        return false;
+    }
+    let f: unsafe extern "C" fn(*const u8) -> i32 = unsafe { std::mem::transmute(pred) };
+    unsafe { f(p) != 0 }
 }
 
 /// TOS slots from the portal frame down through inlined callee
@@ -3175,6 +3194,33 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // TOS_RELOAD can fall back to GETFIELD when peel preview is not a
     // listiter (range-for). Aborting those traces SNAPDIFF'd unrelated
     // fixtures.
+    // ForIterNext leftover extras past the mint do not need a live TOS
+    // path: densify already left them as high-id InputArgs. Scan every
+    // residual so leftover-empty cannot install FOR_ITER on a frame when
+    // `live_tos` is empty (`re/_compiler.py`).
+    for op in ops.iter() {
+        if !op.opcode.is_call() {
+            continue;
+        }
+        let is_foriter = op.getdescr().is_some_and(|d| {
+            d.as_call_descr().is_some_and(|cd| {
+                cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
+            })
+        });
+        if !is_foriter {
+            continue;
+        }
+        for arg in op.getarglist() {
+            let src = arg.to_opref();
+            if src.is_input_arg()
+                && src.ty() == Some(Type::Ref)
+                && src.raw() >= expanded_len as u32
+                && !tos_sources.contains(&src)
+            {
+                tos_sources.push(src);
+            }
+        }
+    }
     let listiter_leftover = tos_sources.iter().any(|s| s.raw() >= expanded_len as u32);
     // ForIterNext residual leftover (no Getfield seq). Bind it to the
     // peeled TOS only when leftover-empty would otherwise GETFIELD a
@@ -3215,8 +3261,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                     let below_portal = src.raw() < portal_tos_inputarg;
                     let at_peeled_frame = peeled && src.raw() == portal_tos_inputarg;
                     let at_unpeeled_tos = !peeled && src.raw() == portal_tos_inputarg;
-                    if src.raw() >= entry_prefix_len as u32
+                    // Leftover extras past the mint (high-id virtualstate
+                    // boxes) are never below_portal. Leaving them positional
+                    // is leftover-empty FOR_ITER on a frame
+                    // (`re/_compiler.py` `'frame' object is not an iterator`).
+                    let past_mint = src.raw() >= expanded_len as u32;
+                    if (src.raw() >= entry_prefix_len as u32
                         && (below_portal || at_peeled_frame)
+                        || past_mint)
                         && !tos_sources.contains(&src)
                     {
                         tos_sources.push(src);
@@ -3374,7 +3426,130 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         tos_sources.clear();
         note_leftover_empty_reject();
     }
-    if leftover_has_listiter_id() && !tos_sources.is_empty() && !orig_vable.is_null() {
+    // Leftover extras past the mint cannot stay positional
+    // (`compile.py` `inputargs[:num_red_args]`). A high-id leftover is
+    // a virtualstate box densify dropped, not a minted field — leaving
+    // it as a residual receiver is `'frame' object has no attribute
+    // 'find'` on pip's urllib3 charset walk. Production has a listiter
+    // type word; tests leave it unset so peel still emits.
+    let leftover_extras_any = leftover
+        .iter()
+        .any(|r| r.is_input_arg() && r.raw() >= expanded_len as u32);
+    // leftover-empty GETFIELD of a mint field used as a method receiver
+    // is required when that slot is the virtualizable itself (frame
+    // `f_locals` / `f_code` on exception_reused). A string leftover
+    // (`charmap.find`) has no class guard: a later `_compile` entry
+    // puts a frame in that slot. Abort only the non-frame, non-listiter
+    // case so the interpreter runs.
+    let mint_string_method = leftover_has_listiter_id()
+        && !orig_vable.is_null()
+        && ops.iter().any(|op| {
+            if !op.opcode.is_call() {
+                return false;
+            }
+            let is_foriter = op.getdescr().is_some_and(|d| {
+                d.as_call_descr().is_some_and(|cd| {
+                    cd.get_extra_info().runtime_helper
+                        == majit_ir::RuntimeHelperKind::ForIterNext
+                })
+            });
+            if is_foriter {
+                return false;
+            }
+            op.getarglist().iter().any(|a| {
+                let src = a.to_opref();
+                if !src.is_input_arg()
+                    || src.ty() != Some(Type::Ref)
+                    || src.raw() < entry_prefix_len as u32
+                    || (src.raw() as usize) >= expanded_len
+                {
+                    return false;
+                }
+                let idx = src.raw() as usize - entry_prefix_len;
+                let n_static = vinfo.static_fields.len();
+                let slot = if idx < n_static {
+                    unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
+                } else if !vinfo.array_fields.is_empty() {
+                    unsafe { vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8 }
+                } else {
+                    std::ptr::null()
+                };
+                leftover_ptr_is_str(slot)
+            })
+        });
+    // leftover-empty GETFIELD of a Call leftover whose mint slot is not
+    // a GC object hands the collector a non-object (`type_id=4294967254`
+    // on pip download). Frame leftovers stay on GETFIELD
+    // (exception_reused `f.f_locals`).
+    let mint_nongc_call = leftover_has_listiter_id()
+        && !orig_vable.is_null()
+        && ops.iter().any(|op| {
+            if !op.opcode.is_call() {
+                return false;
+            }
+            let is_foriter = op.getdescr().is_some_and(|d| {
+                d.as_call_descr().is_some_and(|cd| {
+                    cd.get_extra_info().runtime_helper
+                        == majit_ir::RuntimeHelperKind::ForIterNext
+                })
+            });
+            if is_foriter {
+                return false;
+            }
+            op.getarglist().iter().any(|a| {
+                let src = a.to_opref();
+                if !src.is_input_arg()
+                    || src.ty() != Some(Type::Ref)
+                    || src.raw() < entry_prefix_len as u32
+                    || (src.raw() as usize) >= expanded_len
+                {
+                    return false;
+                }
+                let idx = src.raw() as usize - entry_prefix_len;
+                let n_static = vinfo.static_fields.len();
+                let slot = if idx < n_static {
+                    unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
+                } else if !vinfo.array_fields.is_empty() {
+                    unsafe { vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8 }
+                } else {
+                    std::ptr::null()
+                };
+                !slot.is_null()
+                    && (slot as usize) & 1 == 0
+                    && !majit_gc::gc_owns_object(slot as usize)
+            })
+        });
+    // Extras still sitting on the entry list (`inputargs[expanded_len..]`)
+    // are not leftover yet — they are present, so the scan above misses
+    // them. After leftover-empty truncates to the mint they become
+    // positional residuals. A Call/Getfield that still names one is
+    // `'frame' object has no attribute 'find'` on pip's charset walk.
+    let extras_on_entry_used = inputargs.len() > expanded_len
+        && ops.iter().any(|op| {
+            if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
+                return false;
+            }
+            op.getarglist().iter().any(|a| {
+                let src = a.to_opref();
+                src.is_input_arg() && (src.raw() as usize) >= expanded_len
+            })
+        });
+    if leftover_has_listiter_id()
+        && (listiter_leftover
+            || leftover_extras_any
+            || extras_on_entry_used
+            || mint_string_method
+            || mint_nongc_call)
+    {
+        if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+            eprintln!(
+                "leftover-empty reject extras past mint tos_src={:?}",
+                tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>()
+            );
+        }
+        tos_sources.clear();
+        note_leftover_empty_reject();
+    } else if leftover_has_listiter_id() && !tos_sources.is_empty() && !orig_vable.is_null() {
         let vsd_f = vinfo
             .static_fields
             .iter()
@@ -6030,6 +6205,89 @@ mod tests {
             !ops.iter()
                 .any(|op| op.opcode == OpCode::CallR && op.num_args() == 8),
             "non-listiter TOS must leave ForIterNext leftover positional"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rejects_foriter_leftover_extra_past_mint() {
+        // leftover-empty ForIterNext leftover at a high-id extra
+        // (`InputArg(99)`). compile.py `inputargs[:num_red_args]` drops
+        // extras; leaving the residual positional is
+        // `'frame' object is not an iterator`.
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_embedded_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            8,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::ForIterNext;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 99),
+            ],
+        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 99)]);
+        call.setdescr(descr);
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+        let prev = LISTITER_TYPE_WORD.swap(0x1A13, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+                let _ = take_leftover_empty_reject();
+            }
+        }
+        let _restore = Restore(prev);
+        let _ = take_leftover_empty_reject();
+        assert!(
+            patch_new_loop_to_load_virtualizable_fields(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[1],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &[],
+                None,
+            ),
+            "ForIterNext leftover extra past the mint must abort leftover-empty"
         );
     }
 

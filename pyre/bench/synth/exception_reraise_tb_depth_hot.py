@@ -1,5 +1,9 @@
 # pyre-check: max-pypy-ratio=3.5
 # pyre-check: max-wasm-ratio=5.1
+# `_opimpl_recursive_call` looks inside on bridges of a compiled portal
+# (`pyjitpl.py`) until `max_unroll_recursion`. wasm compiles each extra
+# trace as its own module; ubuntu-24.04 run 34810630624 measured 4.4x
+# against dynasm, so 5.1x is that reading plus WASM_RATIO_FIT_HEADROOM.
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The module-level loop makes the recording iteration itself

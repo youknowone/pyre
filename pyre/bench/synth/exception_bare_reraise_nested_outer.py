@@ -1,4 +1,9 @@
 # pyre-check: max-pypy-ratio=8
+# pyre-check: max-wasm-ratio=9.9
+# `_opimpl_recursive_call` looks inside on bridges of a compiled portal
+# (`pyjitpl.py`) until `max_unroll_recursion`. wasm compiles each extra
+# trace as its own module; ubuntu-24.04 run 34810630624 measured 8.6x
+# against dynasm, so 9.9x is that reading plus WASM_RATIO_FIT_HEADROOM.
 # Ubuntu run 33279264115: 4x; the ceiling is twice the slowest,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython

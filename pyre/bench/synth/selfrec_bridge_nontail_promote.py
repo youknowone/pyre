@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=25
+# pyre-check: max-wasm-ratio=15.8
+# `_opimpl_recursive_call` looks inside on bridges of a compiled
+# portal (`pyjitpl.py`) until `max_unroll_recursion`. wasm compiles
+# each extra trace as its own module; ubuntu-24.04 run 34810630624
+# measured 13.7x against dynasm (deopt storm before leftover-empty
+# extras reject), so 15.8x is that reading plus WASM_RATIO_FIT_HEADROOM.
 # Coverage for the self-recursive root-bridge inline when the recursion is
 # non-tail and carries a Ref local.
 #

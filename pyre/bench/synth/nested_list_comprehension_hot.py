@@ -1,5 +1,9 @@
 # pyre-check: max-pypy-ratio=44
 # pyre-check: max-wasm-ratio=5.7
+# `_opimpl_recursive_call` looks inside on bridges of a compiled portal
+# (`pyjitpl.py`) until `max_unroll_recursion`. wasm compiles each extra
+# trace as its own module; ubuntu-24.04 run 34810630624 measured 4.7x
+# against dynasm, so 5.7x is the later main ceiling.
 # An inlined list comprehension whose LIST_APPEND element is a non-empty nested
 # list (`[[i] …]` / `[[i, i + 1] …]`). The #171 fold virtualizes the inner list,
 # whose separately allocated backing block (NewArray / NewArrayClear) carries no

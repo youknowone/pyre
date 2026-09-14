@@ -8192,6 +8192,14 @@ unsafe extern "C" fn leftover_is_listiter(p: *const u8) -> i32 {
     unsafe { pyre_object::iterobject::is_list_iter(p as pyre_object::PyObjectRef) as i32 }
 }
 
+unsafe extern "C" fn leftover_is_str(p: *const u8) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    let obj = p as pyre_object::PyObjectRef;
+    unsafe { (pyre_object::is_str(obj) || pyre_object::is_bytes(obj)) as i32 }
+}
+
 /// Publish EC top (`vref_referent`, never a vref) so leftover_peel_tos can
 /// find the inlined `_compile` listiter when the leftover-empty red is the
 /// portal caller (TOS = ZipInfo).
@@ -8231,6 +8239,7 @@ pub fn init_jit_hooks() {
         &pyre_object::iterobject::LIST_ITER_TYPE as *const _ as usize,
     );
     majit_metainterp::register_listiter_pred(leftover_is_listiter);
+    majit_metainterp::register_str_pred(leftover_is_str);
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
