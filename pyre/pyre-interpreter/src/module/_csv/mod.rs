@@ -544,8 +544,9 @@ mod dialect_class {
 
     pub fn type_object() -> PyObjectRef {
         // Process-global immortal type object (see `make_builtin_type`).
-        static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| {
+        static CELL: pyre_object::gc_roots::RootedOnceRef =
+            pyre_object::gc_roots::RootedOnceRef::new();
+        CELL.get_or_init(|| {
             let tp = crate::typedef::make_builtin_type("_csv.Dialect", |ns| {
                 unsafe {
                     pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -613,8 +614,8 @@ mod dialect_class {
             // PyType_FromModuleAndSpec; Dialect_Type_spec is immutable.
             crate::typedef::mark_cpython_heap_type(tp, true);
             unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-            tp as usize
-        }) as PyObjectRef
+            tp
+        })
     }
 
     // Publish this accessor's residual-call address so the JIT's
