@@ -18741,16 +18741,28 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         return Ok(None);
     }
     let arr = r_args[0];
+    // Same as [`try_walker_specialize_newtuple_object`]: length comes
+    // from `heapcache.arraylen`, not from probing until a miss.  A
+    // prefix of cached slots would otherwise concatenate only that
+    // prefix while `boxed_result` used the same truncated list.
+    let len = {
+        let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+            return Ok(None);
+        };
+        match len_op.inline_const_to_value() {
+            Some(majit_ir::Value::Int(n)) if n >= 1 => n as usize,
+            _ => return Ok(None),
+        }
+    };
     let descr_idx = crate::state::pyobject_gcarray_descr().index();
-    let mut fragments = Vec::new();
-    let mut concretes = Vec::new();
-    loop {
-        let index = fragments.len() as i64;
+    let mut fragments = Vec::with_capacity(len);
+    let mut concretes = Vec::with_capacity(len);
+    for i in 0..len {
         let Some(elem) =
             ctx.trace_ctx
-                .heapcache_getarrayitem(arr, OpRef::ConstInt(index), descr_idx)
+                .heapcache_getarrayitem(arr, OpRef::ConstInt(i as i64), descr_idx)
         else {
-            break;
+            return Ok(None);
         };
         let Some(obj) = walker_concrete_ref_object(ctx, elem) else {
             return Ok(None);
@@ -18760,9 +18772,6 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         }
         fragments.push(elem);
         concretes.push(obj);
-    }
-    if fragments.is_empty() {
-        return Ok(None);
     }
 
     let boxed_result = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes);

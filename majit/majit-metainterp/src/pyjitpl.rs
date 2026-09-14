@@ -5526,6 +5526,9 @@ impl<M: Clone> MetaInterp<M> {
                     return self.make_optimizer();
                 }
                 opt.recycle_for_next_compile();
+                // optimizer.py Optimizer.__init__: `self.cpu = metainterp_sd.cpu`.
+                // Recycle keeps the previous cpu; re-pin to this MetaInterp.
+                opt.cpu = self.cpu.clone();
                 opt.supports_efficient_uint_mul_high =
                     self.backend.supports_efficient_uint_mul_high();
                 opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
