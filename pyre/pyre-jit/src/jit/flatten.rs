@@ -4075,6 +4075,7 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
         "not_contains" => pyre_interpreter::runtime_ops::COMPARE_OP_NOT_CONTAINS,
         "is" => pyre_interpreter::runtime_ops::COMPARE_OP_IS,
         "is_not" => pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT,
+        "check_exc_match" => pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
         _ => return None,
     })
 }
@@ -5876,16 +5877,38 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "getattr" || op.args.len() != 4 {
+    if op.opname != "getattr" {
+        return None;
+    }
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    // pyopcode.py `LOAD_ATTR` (jitted): `space.getattr(w_obj, w_attributename)`.
+    if op.args.len() == 2 {
+        let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+        let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
+        if let Some(insn) = build_orthodox_inline_call_r_r_n(
+            inline_call_targets::GETATTR,
+            vec![obj.clone(), name.clone()],
+            dst_reg,
+        ) {
+            return Some(insn);
+        }
+        return Some(build_residual_call_r_r_insn_from_operands(
+            ctx.getattr_fn_idx,
+            vec![obj, name],
+            CallFlavor::MayForce,
+            majit_ir::RuntimeHelperKind::LoadAttr,
+            dst_reg,
+        ));
+    }
+    if op.args.len() != 4 {
         return None;
     }
     let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
     let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
     let name_idx = const_int_for_value_arg(&op.args[3])?;
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
     // Tag the LOAD_ATTR helper calldescr so the full-body walker recognizes the
     // call and folds a monomorphic instance-attribute read to a guarded inline
@@ -6522,6 +6545,8 @@ mod inline_call_targets {
     pub const FORMAT_SIMPLE: &str = "pyre_interpreter::type_methods::format_simple_w";
     /// FORMAT_WITH_SPEC — `lower_format_with_spec_hlop_to_insn`.
     pub const FORMAT_W: &str = "pyre_interpreter::type_methods::format_w";
+    /// LOAD_ATTR — `lower_getattr_hlop_to_insn`.
+    pub const GETATTR: &str = "pyre_interpreter::baseobjspace::getattr";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -9972,6 +9997,7 @@ mod tests {
             ("not_contains", 7),
             ("is", 8),
             ("is_not", 9),
+            ("check_exc_match", 10),
         ] {
             assert_eq!(
                 compare_op_tag_for_opname(opname),
@@ -12360,10 +12386,8 @@ mod tests {
     }
 
     #[test]
-    fn lower_getattr_hlop_declines_two_arg_legacy_shape() {
-        // Upstream's bare 2-arg `op.getattr(w_obj, w_attributename)`
-        // (legacy/test graphs without the rtyper-surrogate operands) must
-        // pass through, not lower with garbage operands.
+    fn lower_getattr_hlop_two_arg_is_space_getattr() {
+        // pyopcode.py `LOAD_ATTR` (jitted): `space.getattr(w_obj, w_name)`.
         let obj_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
@@ -12378,10 +12402,18 @@ mod tests {
             index: 101,
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
-        assert!(
+        let insn =
             super::lower_getattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .is_none()
-        );
+                .expect("2-arg getattr must lower through space.getattr");
+        match insn {
+            Insn::Op { opname, .. } => {
+                assert!(
+                    opname == "inline_call_r_r" || opname == "residual_call_r_r",
+                    "unexpected getattr lowering {opname}"
+                );
+            }
+            other => panic!("expected Insn::Op, got {other:?}"),
+        }
     }
 
     #[test]

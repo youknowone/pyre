@@ -1575,6 +1575,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::type_methods::format_w",
         crate::opcode_ops::jit_format_w,
     );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::getattr",
+        crate::opcode_ops::jit_baseobjspace_getattr,
+    );
     cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",

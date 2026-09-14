@@ -2666,32 +2666,28 @@ fn emit_accumulator_reload(
     .into()
 }
 
+fn interned_attr_name(name: &str) -> super::flow::FlowValue {
+    let w_name = pyre_object::intern_str_value(name);
+    super::flow::Constant::new(
+        super::flow::ConstantValue::Signed(w_name as i64),
+        Some(Kind::Ref),
+    )
+    .into()
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     attr_name: super::flow::FlowValue,
-    code_const: super::flow::FlowValue,
-    name_idx_const: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py LOAD_ATTR ->
-    // `op.getattr(w_obj, w_attributename).eval(self)`, extended with
-    // two rtyper-surrogate operands (the code object as a post-rtype
-    // `Signed(ptr) + Kind::Ref` constant and the `co_names` index)
-    // that `flatten.rs::lower_getattr_hlop_to_insn` threads into the
-    // `bh_load_attr_fn(obj, code, name_idx)` residual — pyre runs no
-    // `rclass.py rtype_getattr` to rewrite the HLOp post-record.
+    // flowcontext.py LOAD_ATTR → `op.getattr(w_obj, w_attributename)`.
     emit_graph_op_with_result(
         graph,
         block,
         "getattr",
-        vec![
-            obj.into(),
-            attr_name.into(),
-            code_const.into(),
-            name_idx_const.into(),
-        ],
+        vec![obj.into(), attr_name.into()],
         Kind::Ref,
         offset,
     )
@@ -3006,6 +3002,23 @@ fn compare_opname(op: pyre_interpreter::bytecode::ComparisonOperator) -> &'stati
         C::Greater => "gt",
         C::GreaterOrEqual => "ge",
     }
+}
+
+fn emit_frontend_check_exc_match(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    exc: super::flow::FlowValue,
+    match_type: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "check_exc_match",
+        vec![exc.into(), match_type.into()],
+        Kind::Ref,
+        offset,
+    )
 }
 
 fn emit_frontend_compare(
@@ -10451,23 +10464,15 @@ impl CodeWriter {
                             // already records the same `compare_fn(...,
                             // ISINSTANCE_OP:Int) → Ref` `residual_call_ir_r`
                             // shape (recorded in this arm).
-                            // Walker-orthodoxy: compare_fn(exc,
-                            // match_type, ISINSTANCE_OP:Int) → Ref shape
-                            // residual_call_ir_r.  No frame_var threading.
-                            let cmp_result = residual_call!(
-                                compare_fn_idx,
-                                CallFlavor::MayForce,
-                                majit_ir::RuntimeHelperKind::CompareOp,
-                                vec![
-                                    super::flow::Constant::signed(
-                                        pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
-                                    )
-                                    .into(),
-                                ],
-                                vec![exc_value, match_type_value],
-                                vec![],
-                                vec![Kind::Ref, Kind::Ref, Kind::Int],
-                                ResKind::Ref,
+                            // pyopcode.py `cmp_exc_match` →
+                            // `exception_match(type(exc), T)`.  Flatten
+                            // lowers `check_exc_match` through
+                            // `compare_value_from_tag` tag 10.
+                            let cmp_result = emit_frontend_check_exc_match(
+                                &mut graph,
+                                &current_block.block(),
+                                exc_value,
+                                match_type_value,
                                 py_pc as i64,
                             );
                             // Push the compare result itself, not a fresh
@@ -10483,10 +10488,7 @@ impl CodeWriter {
                             // PopJumpIfFalse's pop re-pins the same value to the
                             // same slot and `truth_fn` reads the compare's own
                             // register.
-                            let result_value: super::flow::FlowValue = match cmp_result {
-                                Some(v) => v.into(),
-                                None => fresh_ref_value(&mut graph).into(),
-                            };
+                            let result_value: super::flow::FlowValue = cmp_result.into();
                             current_state.stack.push(result_value.clone());
                             emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }
@@ -10948,14 +10950,7 @@ impl CodeWriter {
                             // arm pops null_or_self first).
                             let attr = namei.get(op_arg);
                             let name_idx = attr.name_idx() as usize;
-                            let attr_name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
-                            // rtyper-surrogate operands for the splice
-                            // lowering: the jitcode's own PyCode as a
-                            // post-rtype `Signed(ptr) + Kind::Ref` constant
-                            // (per-code jitcode ⇒ fixed pointer) and the
-                            // co_names index `bh_load_attr_fn` resolves the
-                            // name with.
+                            let attr_name = interned_attr_name(code.names[name_idx].as_str());
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
                                 super::flow::ConstantValue::Signed(w_code as i64),
                                 Some(Kind::Ref),
@@ -10969,9 +10964,7 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 obj_value.clone(),
-                                attr_name.into(),
-                                code_const.clone(),
-                                name_idx_const.clone(),
+                                attr_name,
                                 py_pc as i64,
                             );
                             current_state.stack.push(result_value.into());
@@ -12658,15 +12651,12 @@ impl CodeWriter {
                                     vec![cls_value, self_value],
                                     py_pc as i64,
                                 );
-                                let attr_name =
-                                    super::flow::Constant::string(code.names[name_idx].as_str());
+                                let attr_name = interned_attr_name(code.names[name_idx].as_str());
                                 emit_frontend_getattr(
                                     &mut graph,
                                     &current_block.block(),
                                     proxy_value.into(),
-                                    attr_name.into(),
-                                    code_const,
-                                    name_idx_const,
+                                    attr_name,
                                     py_pc as i64,
                                 )
                             } else {
@@ -17330,36 +17320,13 @@ mod tests {
         let mut graph = FunctionGraph::new("getattr", start.clone(), None);
         let obj = Variable::new(VariableId(34), Kind::Ref);
         let name = Constant::string("field");
-        // rtyper-surrogate operands (post-rtype code-object ConstRef + the
-        // co_names index) trail the upstream 2-arg flowspace shape.
-        let code_const = Constant::new(
-            super::super::flow::ConstantValue::Signed(0x1000),
-            Some(Kind::Ref),
-        );
-        let name_idx_const = Constant::signed(3);
 
-        let result = emit_frontend_getattr(
-            &mut graph,
-            &start,
-            obj.into(),
-            name.clone().into(),
-            code_const.clone().into(),
-            name_idx_const.clone().into(),
-            57,
-        );
+        let result = emit_frontend_getattr(&mut graph, &start, obj.into(), name.clone().into(), 57);
 
         let op = last_recorded_op(&start);
         assert_eq!(op.opname, "getattr");
         assert_eq!(op.offset, 57);
-        assert_eq!(
-            op.args,
-            vec![
-                obj.into(),
-                name.into(),
-                code_const.into(),
-                name_idx_const.into(),
-            ]
-        );
+        assert_eq!(op.args, vec![obj.into(), name.into()]);
         assert_eq!(op.result, Some(result.into()));
     }
 
