@@ -282,24 +282,30 @@ pub fn set_reduce(w_obj: PyObjectRef) -> PyResult {
     let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
     let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
-    // PySequence_List(self): no GC between reading the items and `w_list_new`
-    // (which re-pins them).
+    // `w_list_new` collects, so publish every already-live member first
+    // and rebuild the list from the forwarded slots.
     let items = unsafe {
         pyre_object::setobject::w_set_items(pyre_object::gc_roots::shadow_stack_get(obj_slot))
     };
-    let w_list = pyre_object::listobject::w_list_new(items);
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(w_list);
-    let w_args = pyre_object::w_tuple_new(args.take());
+    let items_base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(items_base, items.len());
+    let reloaded: Vec<_> = (0..items.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+        .collect();
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::listobject::w_list_new(reloaded));
+    let w_args = pyre_object::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(list_slot)]);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_args);
-    let args_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
 
     let w_state = object_getstate_default(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let state_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_state);
 
     Ok(pyre_object::w_tuple_new(vec![
         pyre_object::gc_roots::shadow_stack_get(type_slot),
         pyre_object::gc_roots::shadow_stack_get(args_slot),
-        w_state,
+        pyre_object::gc_roots::shadow_stack_get(state_slot),
     ]))
 }
 

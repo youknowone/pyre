@@ -3101,21 +3101,30 @@ pub(crate) fn range_reversed_method(args: &[PyObjectRef]) -> PyResult {
 /// `range.__reduce__()` — `functional.py W_Range.descr_reduce`:
 /// `(type(self), (start, stop, step))`.
 pub(crate) fn range_reduce_method(args: &[PyObjectRef]) -> PyResult {
-    let (start, stop, step) = unsafe { pyre_object::w_range_fields(args[0]) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let range_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let (start, stop, step) =
+        unsafe { pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(range_slot)) };
     // `range` is bound in builtins as a constructor function, not as the
     // registry type object, so the reconstructor must be that name-bound
     // callable: `pickle.save_global` matches it to `builtins.range`, and
     // `range(start, stop, step)` rebuilds the instance.
+    let fields = pyre_object::gc_roots::pin_roots(&[start, stop, step]);
     let range_ctor = builtin_callable("range");
-    let mut state = pyre_object::gc_roots::RootedItems::new();
-    state.push(start);
-    state.push(stop);
-    state.push(step);
-    let state = w_tuple_new(state.take());
-    let mut result = pyre_object::gc_roots::RootedItems::new();
-    result.push(range_ctor);
-    result.push(state);
-    Ok(w_tuple_new(result.take()))
+    let ctor_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(range_ctor);
+    let state = w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(fields),
+        pyre_object::gc_roots::shadow_stack_get(fields + 1),
+        pyre_object::gc_roots::shadow_stack_get(fields + 2),
+    ]);
+    let state_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(state);
+    Ok(w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(ctor_slot),
+        pyre_object::gc_roots::shadow_stack_get(state_slot),
+    ]))
 }
 
 /// `range.__hash__()` — `functional.py W_Range.descr_hash`: hashes the
@@ -3270,8 +3279,8 @@ pub(crate) fn callable_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let _ = pyre_object::gc_roots::pin_root(builtin_callable("iter"));
-    let obj = pyre_object::gc_roots::shadow_stack_get(sp);
-    let callable = unsafe { pyre_object::operation::w_callable_iterator_get_callable(obj) };
+    let obj = || pyre_object::gc_roots::shadow_stack_get(sp);
+    let callable = unsafe { pyre_object::operation::w_callable_iterator_get_callable(obj()) };
     let state = if callable.is_null() {
         let empty = w_tuple_new(vec![]);
         let _ = pyre_object::gc_roots::pin_root(empty);
@@ -3279,12 +3288,11 @@ pub(crate) fn callable_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
             pyre_object::gc_roots::shadow_stack_len() - 1,
         )])
     } else {
-        let sentinel = unsafe { pyre_object::operation::w_callable_iterator_get_sentinel(obj) };
-        let _ = pyre_object::gc_roots::pin_root(callable);
-        let _ = pyre_object::gc_roots::pin_root(sentinel);
+        let sentinel = unsafe { pyre_object::operation::w_callable_iterator_get_sentinel(obj()) };
+        let pair = pyre_object::gc_roots::pin_roots(&[callable, sentinel]);
         w_tuple_new(vec![
-            pyre_object::gc_roots::shadow_stack_get(sp + 2),
-            pyre_object::gc_roots::shadow_stack_get(sp + 3),
+            pyre_object::gc_roots::shadow_stack_get(pair),
+            pyre_object::gc_roots::shadow_stack_get(pair + 1),
         ])
     };
     let _ = pyre_object::gc_roots::pin_root(state);
@@ -3819,12 +3827,13 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(args[0]);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let self_type = crate::typedef::r#type(self_).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        let self_ = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type =
+            crate::typedef::r#type(self_()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
         let _ = pyre_object::gc_roots::pin_root(self_type);
         let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let i64_index = pyre_object::functional::w_enumerate_get_index(self_);
-        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_);
+        let i64_index = pyre_object::functional::w_enumerate_get_index(self_());
+        let raw = pyre_object::functional::w_enumerate_get_iter_or_list(self_());
         let w_iter = if raw.is_null() {
             // `W_Enumerate.descr_next` clears the source after exhaustion.
             // An empty list iterator preserves that exhausted state and the
@@ -3844,8 +3853,7 @@ pub(crate) fn enumerate_reduce_method(args: &[PyObjectRef]) -> PyResult {
         };
         let _ = pyre_object::gc_roots::pin_root(w_iter);
         let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(self_);
+        let w_index_slot = pyre_object::functional::w_enumerate_get_w_index(self_());
         let index = if w_index_slot.is_null() {
             w_int_new(i64_index)
         } else {
@@ -3905,12 +3913,13 @@ pub(crate) fn reversed_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self_);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let self_type = crate::typedef::r#type(self_).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        let self_ = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type =
+            crate::typedef::r#type(self_()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
         let _ = pyre_object::gc_roots::pin_root(self_type);
         let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let seq = pyre_object::functional::w_reversed_get_sequence(self_);
-        let remaining = pyre_object::functional::w_reversed_get_remaining(self_);
+        let seq = pyre_object::functional::w_reversed_get_sequence(self_());
+        let remaining = pyre_object::functional::w_reversed_get_remaining(self_());
         // A cursor that has walked off the front is exhausted even while the
         // sequence is still referenced, so it pickles as `reversed(())` too.
         // PyPy selects the empty form on the cleared sequence alone and reports
@@ -4045,21 +4054,20 @@ pub(crate) fn filter_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self_);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let self_type = crate::typedef::r#type(self_).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-        let _ = pyre_object::gc_roots::pin_root(self_type);
-        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let raw_predicate = pyre_object::functional::w_filter_get_predicate(self_);
+        let self_ = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type =
+            crate::typedef::r#type(self_()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        let raw_predicate = pyre_object::functional::w_filter_get_predicate(self_());
         let w_predicate = if raw_predicate.is_null() {
             w_none()
         } else {
             raw_predicate
         };
-        let _ = pyre_object::gc_roots::pin_root(w_predicate);
-        let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_iterable = pyre_object::functional::w_filter_get_iterable(self_);
-        let _ = pyre_object::gc_roots::pin_root(w_iterable);
-        let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let w_iterable = pyre_object::functional::w_filter_get_iterable(self_());
+        let live = pyre_object::gc_roots::pin_roots(&[self_type, w_predicate, w_iterable]);
+        let self_type_slot = live;
+        let predicate_slot = live + 1;
+        let iterable_slot = live + 2;
         let state = w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(predicate_slot),
             pyre_object::gc_roots::shadow_stack_get(iterable_slot),
@@ -4237,29 +4245,34 @@ pub(crate) fn map_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self_);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let self_type = crate::typedef::r#type(self_).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-        let _ = pyre_object::gc_roots::pin_root(self_type);
-        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_fun = pyre_object::functional::w_map_get_fun(self_);
-        let _ = pyre_object::gc_roots::pin_root(w_fun);
-        let fun_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_iterators = pyre_object::functional::w_map_get_iterators(self_);
-        let w_iterators = pyre_object::gc_roots::pin_root(w_iterators);
-        let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type =
+            crate::typedef::r#type(self_()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        let w_fun = pyre_object::functional::w_map_get_fun(self_());
+        let w_iterators = pyre_object::functional::w_map_get_iterators(self_());
+        let live = pyre_object::gc_roots::pin_roots(&[self_type, w_fun, w_iterators]);
+        let self_type_slot = live;
+        let fun_slot = live + 1;
+        let iterators_slot = live + 2;
+        let w_iterators = pyre_object::gc_roots::shadow_stack_get(iterators_slot);
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize + 1);
         state_items.push(pyre_object::gc_roots::shadow_stack_get(fun_slot));
         for i in 0..n {
-            let w_iter = pyre_object::w_list_getitem(
-                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
-                i as i64,
-            )
-            .unwrap();
-            let w_iter = pyre_object::gc_roots::pin_root(w_iter);
-            state_items.push(w_iter);
+            state_items.push(
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                    i as i64,
+                )
+                .unwrap(),
+            );
         }
-        let state = w_tuple_new(state_items);
+        let state_base = pyre_object::gc_roots::pin_roots(&state_items);
+        let state = w_tuple_new(
+            (0..state_items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(state_base + i))
+                .collect(),
+        );
         let _ = pyre_object::gc_roots::pin_root(state);
         let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if pyre_object::functional::w_map_get_strict(pyre_object::gc_roots::shadow_stack_get(
@@ -4326,25 +4339,31 @@ pub(crate) fn zip_reduce_method(args: &[PyObjectRef]) -> PyResult {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self_);
         let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
-        let self_type = crate::typedef::r#type(self_).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
-        let _ = pyre_object::gc_roots::pin_root(self_type);
-        let self_type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_iterators = pyre_object::functional::w_zip_get_iterators(self_);
-        let w_iterators = pyre_object::gc_roots::pin_root(w_iterators);
-        let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        let self_ = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+        let self_type =
+            crate::typedef::r#type(self_()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+        let w_iterators = pyre_object::functional::w_zip_get_iterators(self_());
+        let live = pyre_object::gc_roots::pin_roots(&[self_type, w_iterators]);
+        let self_type_slot = live;
+        let iterators_slot = live + 1;
+        let w_iterators = pyre_object::gc_roots::shadow_stack_get(iterators_slot);
         let n = pyre_object::w_list_len(w_iterators);
         let mut state_items = Vec::with_capacity(n as usize);
         for i in 0..n {
-            let w_iter = pyre_object::w_list_getitem(
-                pyre_object::gc_roots::shadow_stack_get(iterators_slot),
-                i as i64,
-            )
-            .unwrap();
-            let w_iter = pyre_object::gc_roots::pin_root(w_iter);
-            state_items.push(w_iter);
+            state_items.push(
+                pyre_object::w_list_getitem(
+                    pyre_object::gc_roots::shadow_stack_get(iterators_slot),
+                    i as i64,
+                )
+                .unwrap(),
+            );
         }
-        let state = w_tuple_new(state_items);
+        let state_base = pyre_object::gc_roots::pin_roots(&state_items);
+        let state = w_tuple_new(
+            (0..state_items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(state_base + i))
+                .collect(),
+        );
         let _ = pyre_object::gc_roots::pin_root(state);
         let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         if pyre_object::functional::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(

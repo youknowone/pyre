@@ -17641,17 +17641,37 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                             "descriptor '__reduce__' requires a 'member_descriptor' object",
                         ));
                     }
-                    let owner = unsafe { pyre_object::w_member_get_cls(member) };
-                    let mut args = pyre_object::gc_roots::RootedItems::new();
-                    args.push(owner);
-                    args.push(pyre_object::w_str_new_managed(unsafe {
-                        pyre_object::w_member_get_name(member)
-                    }));
-                    let args = pyre_object::w_tuple_new(args.take());
-                    let mut result = pyre_object::gc_roots::RootedItems::new();
-                    result.push(crate::baseobjspace::builtin_callable("getattr"));
-                    result.push(args);
-                    Ok(pyre_object::w_tuple_new(result.take()))
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let member_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(member);
+                    let owner = unsafe {
+                        pyre_object::w_member_get_cls(pyre_object::gc_roots::shadow_stack_get(
+                            member_slot,
+                        ))
+                    };
+                    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(owner);
+                    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ =
+                        pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
+                            pyre_object::w_member_get_name(pyre_object::gc_roots::shadow_stack_get(
+                                member_slot,
+                            ))
+                        }));
+                    let args = pyre_object::w_tuple_new(vec![
+                        pyre_object::gc_roots::shadow_stack_get(owner_slot),
+                        pyre_object::gc_roots::shadow_stack_get(name_slot),
+                    ]);
+                    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(args);
+                    let getattr_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable(
+                        "getattr",
+                    ));
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::gc_roots::shadow_stack_get(getattr_slot),
+                        pyre_object::gc_roots::shadow_stack_get(args_slot),
+                    ]))
                 },
                 1,
             ),
@@ -29177,41 +29197,60 @@ fn set_iter_length_hint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::require_set_iterator_receiver(args, "__reduce__", true)?;
     unsafe {
-        let w_set = pyre_object::w_set_iter_get_set(args[0]);
-        let startlen = pyre_object::w_set_iter_get_startlen(args[0]);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args[0]);
+        let iter = || pyre_object::gc_roots::shadow_stack_get(iter_slot);
+        let w_set = pyre_object::w_set_iter_get_set(iter());
         if w_set.is_null() {
-            let empty = pyre_object::w_list_new(vec![]);
-            let mut state = pyre_object::gc_roots::RootedItems::new();
-            state.push(empty);
-            let state = pyre_object::w_tuple_new(state.take());
-            let mut result = pyre_object::gc_roots::RootedItems::new();
-            result.push(crate::baseobjspace::builtin_callable("iter"));
-            result.push(state);
-            return Ok(pyre_object::w_tuple_new(result.take()));
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(vec![]));
+            let state =
+                pyre_object::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(empty_slot)]);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(state);
+            let iter_fn = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable("iter"));
+            return Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(iter_fn),
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ]));
         }
-        if startlen == usize::MAX || pyre_object::w_set_len(w_set) != startlen {
+        let set_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_set);
+        let w_set = || pyre_object::gc_roots::shadow_stack_get(set_slot);
+        let startlen = pyre_object::w_set_iter_get_startlen(iter());
+        if startlen == usize::MAX || pyre_object::w_set_len(w_set()) != startlen {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::RuntimeError,
                 "Set changed size during iteration",
             ));
         }
-        let index = pyre_object::w_set_iter_get_index(args[0]);
-        let mut remaining = pyre_object::gc_roots::RootedItems::new();
-        let mut i = pyre_object::w_set_iter_get_slot(args[0]);
-        while let Some(slot) = pyre_object::w_set_next_slot(w_set, i) {
-            if let Some(key) = pyre_object::w_set_key_at(w_set, slot) {
+        let mut remaining = Vec::new();
+        let mut i = pyre_object::w_set_iter_get_slot(iter());
+        while let Some(slot) = pyre_object::w_set_next_slot(w_set(), i) {
+            if let Some(key) = pyre_object::w_set_key_at(w_set(), slot) {
                 remaining.push(key.obj);
             }
             i = slot + 1;
         }
-        let list = pyre_object::w_list_new(remaining.take());
-        let mut state = pyre_object::gc_roots::RootedItems::new();
-        state.push(list);
-        let state = pyre_object::w_tuple_new(state.take());
-        let mut result = pyre_object::gc_roots::RootedItems::new();
-        result.push(crate::baseobjspace::builtin_callable("iter"));
-        result.push(state);
-        Ok(pyre_object::w_tuple_new(result.take()))
+        let keys_base = pyre_object::gc_roots::publish_roots(&remaining);
+        pyre_object::gc_roots::normalize_roots(keys_base, remaining.len());
+        let reloaded: Vec<_> = (0..remaining.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(keys_base + i))
+            .collect();
+        let list_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(reloaded));
+        let state =
+            pyre_object::w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(list_slot)]);
+        let state_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(state);
+        let iter_fn = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable("iter"));
+        Ok(pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(iter_fn),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ]))
     }
 }
 
