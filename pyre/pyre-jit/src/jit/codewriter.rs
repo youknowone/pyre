@@ -16821,22 +16821,36 @@ mod tests {
         // entered with the exception slot refilled.  Jumping into the landing
         // instead reaches its `last_exc_value` read with the slot already
         // drained by the match residual.
+        //
+        // Locate the FOR_ITER catch relative to its own `last_exc_value`,
+        // not the first `residual_call_*>i` in the whole stream: a Python
+        // `try` serializes more Int residuals (and the matcher itself may
+        // be an `inline_call` of `compare_value_from_tag`).
+        let last_exc_value_index = ops
+            .iter()
+            .position(|op| op.key == "last_exc_value/>r")
+            .expect("FOR_ITER catch must materialize the caught exception value");
+        let is_int_call = |key: &str| {
+            (key.starts_with("residual_call_") || key.starts_with("inline_call_"))
+                && key.ends_with(">i")
+        };
+        let match_call_index = ops
+            .iter()
+            .enumerate()
+            .skip(last_exc_value_index + 1)
+            .find_map(|(index, op)| is_int_call(op.key).then_some(index))
+            .expect("FOR_ITER catch must call the Python-level exception matcher");
         let raise_index = ops
             .iter()
-            .position(|op| op.key == "raise/r")
+            .enumerate()
+            .skip(match_call_index + 1)
+            .find_map(|(index, op)| (op.key == "raise/r").then_some(index))
             .expect("a mismatched FOR_ITER exception inside a try must re-raise");
         assert_eq!(
             ops[raise_index + 1].key,
             "catch_exception/L",
             "the re-raise must carry the catch dispatch its handler entry needs"
         );
-        let match_call_index = ops
-            .iter()
-            .enumerate()
-            .find_map(|(index, op)| {
-                (op.key.starts_with("residual_call_") && op.key.ends_with(">i")).then_some(index)
-            })
-            .expect("FOR_ITER catch must call the Python-level exception matcher");
         assert!(
             !ops[match_call_index + 1..raise_index]
                 .iter()

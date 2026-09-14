@@ -2702,6 +2702,8 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "load_import_globals"
             | "simple_call"
             | "getattr"
+            | "setattr"
+            | "delattr"
             | "load_special"
             | "load_fast_check"
             | "store_attr"
@@ -10476,8 +10478,18 @@ mod tests {
         let mut lower_constant = test_constant_lowering();
         let lowered = lower_bool_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
             .expect("BOOL HLOp must lower");
-        let prod = build_truth_fn_residual_call_r_i_insn(31, 0, 1);
-        assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+        match &lowered {
+            Insn::Op { opname, .. }
+                if *opname == "inline_call_r_i" || *opname == "residual_call_r_i" => {}
+            other => panic!("BOOL must lower through space.is_true, got {other:?}"),
+        }
+        if matches!(
+            &lowered,
+            Insn::Op { opname, .. } if *opname == "residual_call_r_i"
+        ) {
+            let prod = build_truth_fn_residual_call_r_i_insn(31, 0, 1);
+            assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
+        }
     }
 
     #[test]
