@@ -467,7 +467,12 @@ fn opcode_fetch_binding_name(stmt: &syn::Stmt) -> Option<String> {
     };
     let fetches_program = match init_expr {
         syn::Expr::Index(idx) => expr_is_ident(&idx.expr, "program"),
-        syn::Expr::MethodCall(mc) => expr_is_ident(&mc.receiver, "program"),
+        // Only `get_op` is the opcode fetch. `program.len()` / `get_operand`
+        // are ordinary values; treating them as the dispatch would send a
+        // local match through `lower_dispatch_chain` and drop the body.
+        syn::Expr::MethodCall(mc) => {
+            expr_is_ident(&mc.receiver, "program") && mc.method == "get_op"
+        }
         _ => false,
     };
     if !fetches_program {
@@ -795,6 +800,23 @@ mod find_dispatch_match_tests {
     }
 
     #[test]
+    fn get_op_method_match_is_the_dispatch() {
+        let block = fn_block(
+            "while pc < program.len() {
+                jit_merge_point!(driver, program, pc; state);
+                let opcode = program.get_op(pc);
+                match opcode {
+                    0 => {},
+                    1 => {},
+                    _ => break,
+                }
+            }",
+        );
+        let found = find_dispatch_match(&block).expect("dispatch match");
+        assert_eq!(found.arms.len(), 3);
+    }
+
+    #[test]
     fn a_setup_match_before_the_loop_does_not_become_the_dispatch() {
         let block = fn_block(
             "let label = match sel { 0 => \"a\", 1 => \"b\", 2 => \"c\", 3 => \"d\", _ => \"e\" };
@@ -817,6 +839,24 @@ mod find_dispatch_match_tests {
             "while pos < len {
                 jit_merge_point!(driver, program, pc; state);
                 match acc {
+                    0 => {},
+                    1 => {},
+                    _ => {},
+                }
+                pos = pos + 1;
+            }",
+        );
+        assert!(find_dispatch_match(&block).is_none());
+        assert!(portal_loop_body(&block).is_some());
+    }
+
+    #[test]
+    fn program_len_match_is_not_the_dispatch() {
+        let block = fn_block(
+            "while pos < len {
+                jit_merge_point!(driver, program, pc; state);
+                let n = program.len();
+                match n {
                     0 => {},
                     1 => {},
                     _ => {},
