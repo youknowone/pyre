@@ -607,7 +607,10 @@ impl UnrollOptimizer {
             string_content_resolver: None,
             string_constant_alloc: None,
             vrefinfo: None,
-            pureop_historylength: 0,
+            // Same default as `Optimizer::new` / `PARAMETERS.pureop_historylength`.
+            // Tests construct this without a WarmState pin; 0 makes
+            // `RecentPureOps` an empty ring and panics on the first CSE insert.
+            pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
             compile_resume_memos_slot: None,

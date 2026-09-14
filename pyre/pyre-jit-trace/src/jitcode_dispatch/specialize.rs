@@ -10715,6 +10715,124 @@ fn try_walker_specialize_subscr_str_slice<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Descend `baseobjspace::getitem_str` (`descr_getitem` after
+/// `getindex_w`) instead of emitting `jit_str_getitem` by hand.
+/// A missing jitcode declines so the caller can keep the fold.
+///
+/// The boxed index is not frozen: a loop over `s[i]` must keep the
+/// live key so the generated length test stays in the body.
+/// Specialised-tuple descent freezes because that reader is a
+/// two-slot `match`.
+fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    seq_op: OpRef,
+    key_op: OpRef,
+    seq_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_int(key_obj) } {
+        return Ok(None);
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(key_obj) {
+        // The fold emit is not tag-aware; the helper takes a machine
+        // index, but a tagged key has no header for the class guard
+        // the generated body does not emit.  Keep that shape on the
+        // residual until the tag-aware unbox is the body itself.
+        return Ok(None);
+    }
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    let raw_key = unsafe {
+        if !std::ptr::eq((*key_obj).ob_type, &pyre_object::pyobject::INT_TYPE)
+            || !std::ptr::eq((*key_obj).w_class, int_typeobj)
+        {
+            return Ok(None);
+        }
+        pyre_object::w_int_get_value(key_obj)
+    };
+    let len = unsafe { pyre_object::w_str_len(seq_obj) } as i64;
+    let index = if raw_key < 0 { raw_key + len } else { raw_key };
+    if usize::try_from(index).ok().is_none() {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::w_str_codepoint_at(seq_obj, index as usize) }.is_none() {
+        return Ok(None);
+    }
+
+    let Some(jc_arc) = crate::jitcode_runtime::str_getitem_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
+    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
+    walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, seq_op, str_typeobj)?;
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
+    ctx.trace_ctx.set_opref_concrete(
+        seq_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        key_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
+    );
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "str_getitem_commit",
+        "getitem_str_call_site",
+        &[],
+        &[],
+        &[seq_op, key_op],
+        &[ConcreteValue::Ref(seq_obj), ConcreteValue::Ref(key_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] STR-GETITEM-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
 fn try_walker_specialize_subscr_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10734,6 +10852,11 @@ fn try_walker_specialize_subscr_str<Sym: WalkSym>(
         return try_walker_specialize_subscr_str_slice(
             ctx, op_pc, seq_op, key_op, seq_obj, key_obj, allboxes, call_descr, dst, dst_bank,
         );
+    }
+    if try_walker_orthodox_str_getitem(ctx, op_pc, seq_op, key_op, seq_obj, key_obj, dst, dst_bank)?
+        .is_some()
+    {
+        return Ok(Some(()));
     }
     // A tagged immediate has no header for the `w_class` and unbox guards to
     // read, and this emit is not tag-aware.
@@ -16297,9 +16420,81 @@ pub(crate) fn try_walker_specialize_str_call<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // --- emit the specialized IR (walker-native) ---
     walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
+    if try_walker_orthodox_int_descr_str(ctx, op.pc, r_args[2], arg_obj, dst)?.is_some() {
+        return Ok(Some(()));
+    }
     walker_emit_jit_int_str(ctx, op.pc, r_args[2], boxed_result, dst)
+}
+
+/// Descend `intobject.py descr_str` / `descr_repr` instead of emitting
+/// the `ll_int2dec` + wrap split by hand.  The generated body is that
+/// split; a missing jitcode declines so the caller can keep the fold.
+fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    let Some(jc_arc) = crate::jitcode_runtime::int_descr_str_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
+    ctx.trace_ctx
+        .set_opref_concrete(operand, majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)));
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "int_descr_str_commit",
+        "int_descr_str_call_site",
+        &[],
+        &[],
+        &[operand],
+        &[ConcreteValue::Ref(obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] INT-DESCR-STR-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', result)?;
+    Ok(Some(()))
 }
 
 /// Guard exact `int`, unbox, and emit `ll_int2dec` + `newutf8`.
@@ -16537,6 +16732,9 @@ pub(crate) fn try_walker_specialize_format_simple<Sym: WalkSym>(
     if !renders_the_same {
         return Ok(None);
     }
+    if try_walker_orthodox_int_descr_str(ctx, op.pc, value, concrete, dst)?.is_some() {
+        return Ok(Some(()));
+    }
     walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)
 }
 
@@ -16606,6 +16804,9 @@ pub(crate) fn try_walker_specialize_convert_value<Sym: WalkSym>(
     };
     if !renders_the_same {
         return Ok(None);
+    }
+    if try_walker_orthodox_int_descr_str(ctx, op.pc, value, concrete, dst)?.is_some() {
+        return Ok(Some(()));
     }
     walker_emit_jit_int_str(ctx, op.pc, value, boxed_result, dst)
 }

@@ -3315,10 +3315,18 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
         if unsafe { pyre_object::is_exact_type(val, &pyre_object::STR_TYPE) } {
             return Ok(val);
         }
+        // `w_class` of a `W_LongObject` is `int`, so `is_exact_type(INT)`
+        // also matches a long.  Machine int is the storage `ob_type`.
+        // A subclass keeps that `ob_type` and may override `__str__`.
         if unsafe {
-            pyre_object::is_exact_type(val, &pyre_object::INT_TYPE)
-                || pyre_object::is_exact_type(val, &pyre_object::LONG_TYPE)
+            std::ptr::eq((*val).ob_type, &pyre_object::INT_TYPE)
+                && pyre_object::is_exact_builtin_instance(val)
         } {
+            // `format_int_or_long` empty spec is `space.str(w_num)` —
+            // `intobject.py descr_str`.
+            return Ok(unsafe { pyre_object::descr_str(val) });
+        }
+        if unsafe { std::ptr::eq((*val).ob_type, &pyre_object::LONG_TYPE) } {
             return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                 crate::py_str_wtf8(val)?
             }));

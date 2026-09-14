@@ -312,6 +312,27 @@ pub unsafe fn w_int_get_value(obj: PyObjectRef) -> i64 {
     unsafe { (*(obj as *const W_IntObject)).intval }
 }
 
+/// `intobject.py descr_repr` / `descr_str` (they share a body).
+/// `res = str(self.intval)` is `ll_int2dec`; the wrap is `space.newutf8`.
+///
+/// Look-inside: the generated JIT records that split, so a walker
+/// descent of this function is the same graph the rtyper would emit
+/// from the interpreter source.  `jit_int_str` stays the fused residual
+/// for graph-level `UnaryOp { op: "str" }` only.
+///
+/// # Safety
+/// `obj` must be a machine `int` (not bool, not long).
+#[inline(never)]
+pub unsafe fn descr_str(obj: PyObjectRef) -> PyObjectRef {
+    let v = unsafe { w_int_get_value(obj) };
+    let payload = crate::lowlevel_string::jit_ll_int2dec(v);
+    let length = crate::lowlevel_string::bh_lowlevel_string_len(payload) as usize;
+    crate::unicodeobject::w_str_from_storage_and_length(
+        payload as *mut crate::unicodeobject::UnicodeValueStorage,
+        length,
+    )
+}
+
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
     w_int_new(value) as i64
