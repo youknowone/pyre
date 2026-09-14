@@ -26,7 +26,10 @@ import _imp
 import _sysconfig
 import sys
 expected_suffix = %SUFFIX%
-assert _imp.extension_suffixes() == [expected_suffix]
+suffixes = _imp.extension_suffixes()
+assert suffixes[0] == expected_suffix
+assert '.abi3.so' in suffixes
+assert '.so' not in suffixes
 config = _sysconfig.config_vars()
 assert config['EXT_SUFFIX'] == expected_suffix
 assert expected_suffix == '.' + config['SOABI'] + '.so'
