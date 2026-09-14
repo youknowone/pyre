@@ -7202,18 +7202,30 @@ impl OptContext {
     /// Number the assembled Vm inputarg, not a Phase-2 remap that import
     /// forwarded onto a Scope. `densify_root_loop_inputargs` then maps
     /// that InputArg onto the dense loc the backend allocated.
-    fn pin_vm_red_in_snapshot(&self, boxes: &mut [crate::resume::SnapshotBox]) {
+    fn snapshot_needs_vm_red_pin(&self, boxes: &[crate::resume::SnapshotBox]) -> bool {
         let Some(vm) = self.declared_vm_red() else {
-            return;
+            return false;
         };
+        if boxes.iter().any(|b| b.opref() == vm) {
+            return false;
+        }
+        boxes
+            .iter()
+            .any(|b| self.is_vm_red_name(b.opref()) && b.opref() != vm)
+    }
+
+    fn pin_vm_red_in_snapshot(&self, boxes: &mut [crate::resume::SnapshotBox]) {
+        if !self.snapshot_needs_vm_red_pin(boxes) {
+            return;
+        }
+        let vm = self
+            .declared_vm_red()
+            .expect("snapshot_needs_vm_red_pin requires a declared vm red");
         // Remap at most one Phase-2 host onto the assembled name.
         // Stealing another live Ref (or rewriting every host) puts the
         // same InputArg in two snapshot slots; `store_final_boxes`
         // then panics on a duplicate failarg, and pending-field
         // tagging never sees the stolen box.
-        if boxes.iter().any(|b| b.opref() == vm) {
-            return;
-        }
         if let Some(slot) = boxes
             .iter_mut()
             .find(|b| self.is_vm_red_name(b.opref()) && b.opref() != vm)
@@ -7371,11 +7383,25 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        let mut snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position())
-            .cloned()
-            .unwrap_or_default();
-        self.pin_vm_red_in_snapshot(snapshot_boxes.as_mut_slice());
-        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position())
+        //
+        // resume.py numbers the live snapshot; it does not clone the
+        // stored list. pin_vm_red rewrites at most one Phase-2 host, so
+        // clone only when that rewrite would land.
+        let stored_snapshot = snapshot_get(&self.snapshot_boxes, resume_pos);
+        let needs_pin =
+            stored_snapshot.is_some_and(|list| self.snapshot_needs_vm_red_pin(list.as_slice()));
+        let mut pinned_snapshot = None;
+        if needs_pin {
+            let mut owned = stored_snapshot.cloned().unwrap_or_default();
+            self.pin_vm_red_in_snapshot(owned.as_mut_slice());
+            pinned_snapshot = Some(owned);
+        }
+        let snapshot_boxes: &[crate::resume::SnapshotBox] = pinned_snapshot
+            .as_ref()
+            .map(|list| list.as_slice())
+            .or_else(|| stored_snapshot.map(|list| list.as_slice()))
+            .unwrap_or(&[]);
+        let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, resume_pos)
             .map(|v| v.as_slice())
             .unwrap_or_default();
         let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position())
