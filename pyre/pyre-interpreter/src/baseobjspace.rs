@@ -7301,6 +7301,10 @@ pub(crate) unsafe fn super_getattribute_code_name(
 // valid UTF-8 name takes the `&str` fast path unchanged.
 
 /// `space.getattr(w_obj, w_name)`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `GETATTR` (`pyopcode.py LOAD_ATTR` → `space.getattr`).
+#[inline(never)]
 pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     // `getattr` accepts a wrapped attribute name.  Validate it before the
     // Unicode storage access below: callers such as `_abc._abc_init` can
