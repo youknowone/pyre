@@ -5102,6 +5102,7 @@ impl<M: Clone> MetaInterp<M> {
                 info.identity_ref_bank_index, live_values,
             );
         }
+        ctx.install_virtualizable_info(std::sync::Arc::clone(info));
         ctx.init_virtualizable_boxes(
             info,
             virtualizable_box,

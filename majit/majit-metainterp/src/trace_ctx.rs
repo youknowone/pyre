@@ -2639,8 +2639,28 @@ impl TraceCtx {
             self.virtualizable_live_null_slots = Some(vec![false; values.len()]);
             self.virtualizable_values = Some(values);
         }
-        self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
+        self.retain_or_store_vinfo(info);
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
+    }
+
+    /// Keep `jitdriver_sd.virtualizable_info` as the trace's vinfo so
+    /// `vinfo is fielddescr.get_vinfo()` can be object identity.
+    pub fn install_virtualizable_info(
+        &mut self,
+        info: std::sync::Arc<crate::virtualizable::VirtualizableInfo>,
+    ) {
+        self.virtualizable_info = Some(info);
+    }
+
+    fn retain_or_store_vinfo(&mut self, info: &crate::virtualizable::VirtualizableInfo) {
+        if self
+            .virtualizable_info
+            .as_ref()
+            .is_some_and(|existing| std::ptr::eq(existing.as_ref(), info))
+        {
+            return;
+        }
+        self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
     }
 
     /// \[FR\] The current standard virtualizable's info (shape), if any.  A
@@ -3813,7 +3833,7 @@ impl TraceCtx {
             self.virtualizable_live_null_slots = None;
         }
         self.virtualizable_boxes = Some(boxes);
-        self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
+        self.retain_or_store_vinfo(info);
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
 
@@ -4352,19 +4372,16 @@ impl TraceCtx {
             // same behaviour as upstream when the fielddescr came from a
             // different jitdriver's vinfo.
             let descriptor_vinfo = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
-            let descriptor_has_matching_vinfo = match descriptor_vinfo {
-                // Backref stamped by `finalize_arc` → concrete type must be
-                // our `VirtualizableInfo`.  Pyre's single-driver model means
-                // every marker that downcasts successfully is the active
-                // vinfo; this is the structural mirror of upstream's Python
-                // `vinfo is fielddescr.get_vinfo()` identity check.
-                Some(ref m) => m.as_any().is::<VirtualizableInfo>(),
-                // `vinfo is fielddescr.get_vinfo()` is false when the
-                // descr has no vinfo. Skip the PTR_EQ / replace_box arm
-                // and fall through to emit_force, same as a foreign
-                // jitdriver's fielddescr.
-                None => false,
-            };
+            // pyjitpl.py `_nonstandard_virtualizable`:
+            // `vinfo is fielddescr.get_vinfo()`. Object identity, not type.
+            let descriptor_has_matching_vinfo =
+                match (self.virtualizable_info.as_ref(), descriptor_vinfo.as_ref()) {
+                    (Some(active), Some(marker)) => marker
+                        .as_any()
+                        .downcast_ref::<VirtualizableInfo>()
+                        .is_some_and(|descr_info| std::ptr::eq(active.as_ref(), descr_info)),
+                    _ => false,
+                };
             if descriptor_has_matching_vinfo {
                 let standard_concrete = self.standard_virtualizable_concrete();
                 // pyjitpl.py `eqbox = self.metainterp.execute_and_record(
@@ -6994,6 +7011,84 @@ mod tests {
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
+    }
+
+    /// `pyjitpl.py _nonstandard_virtualizable`: `vinfo is fielddescr.get_vinfo()`
+    /// is false for a different VirtualizableInfo object.
+    #[test]
+    fn foreign_vinfo_skips_standard_ptr_eq() {
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info_a = make_test_vable_info();
+        info_a.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info_a = info_a.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let mut info_b = make_test_vable_info();
+        info_b.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info_b = info_b.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info_a.static_field_descr(0);
+
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let other = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.install_virtualizable_info(info_b);
+        ctx.virtualizable_boxes = Some(vec![standard]);
+        ctx.set_opref_concrete(standard, Value::Ref(majit_ir::GcRef(1)));
+        ctx.set_opref_concrete(other, Value::Ref(majit_ir::GcRef(1)));
+        let _ = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, other, 0, fd);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::PtrEq),
+            "vinfo is fielddescr.get_vinfo() is false for a different info, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn matching_vinfo_takes_the_standard_ptr_eq_arm() {
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info = make_test_vable_info();
+        info.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info.static_field_descr(0);
+
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let other = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let field_box = ctx.const_int(0);
+        ctx.install_virtualizable_info(info.clone());
+        ctx.init_virtualizable_boxes(
+            &info,
+            standard,
+            Value::Ref(majit_ir::GcRef(1)),
+            &[field_box],
+            &[Value::Int(0)],
+            &[],
+        );
+        ctx.set_opref_concrete(standard, Value::Ref(majit_ir::GcRef(1)));
+        ctx.set_opref_concrete(other, Value::Ref(majit_ir::GcRef(1)));
+        let _ = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, other, 0, fd);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::PtrEq),
+            "the same vinfo must enter the PTR_EQ arm, got {ops:?}"
+        );
     }
 
     /// `pyjitpl.py _nonstandard_virtualizable`: empty `virtualizable_boxes`

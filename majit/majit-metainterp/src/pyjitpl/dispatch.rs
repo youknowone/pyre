@@ -14506,6 +14506,7 @@ mod tests {
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
         let standard_box = ctx.const_ref(999);
+        ctx.install_virtualizable_info(info.clone());
         ctx.init_virtualizable_boxes(
             &info,
             standard_box,
