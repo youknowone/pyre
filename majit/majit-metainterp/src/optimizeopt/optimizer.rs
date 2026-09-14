@@ -38,6 +38,49 @@ use crate::optimizeopt::info::{PtrInfo, PtrInfoExt};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 
+/// Drop `CALL_PURE_*` / elidable `CALL_*` whose result is not an
+/// argument of any remaining op. `baseobjspace.py newbool` is
+/// look-inside; a residual left after `replace_box` would otherwise
+/// survive as `CALL` in the assembled peel (`simplify.py` is not in
+/// ENABLE_ALL_OPTS). Failargs are ignored: `replace_box` already
+/// rewrote those to the singleton.
+pub(crate) fn strip_unused_call_pure(ops: &mut Vec<OpRc>) {
+    loop {
+        let mut used = indexmap::IndexSet::new();
+        for op in ops.iter() {
+            for i in 0..op.num_args() {
+                used.insert(op.arg(i).to_opref());
+            }
+        }
+        let before = ops.len();
+        ops.retain(|op| {
+            if !is_elidable_call_result(op) {
+                return true;
+            }
+            used.contains(&op.pos().get())
+        });
+        if ops.len() == before {
+            break;
+        }
+    }
+}
+
+fn is_elidable_call_result(op: &Op) -> bool {
+    if op.opcode.is_call_pure() {
+        return true;
+    }
+    if !matches!(op.opcode, OpCode::CallI | OpCode::CallR | OpCode::CallF) {
+        return false;
+    }
+    op.getdescr()
+        .as_ref()
+        .and_then(|d| d.as_call_descr())
+        .is_some_and(|cd| {
+            let ei = cd.get_extra_info();
+            ei.check_is_elidable() && !ei.check_can_raise(false)
+        })
+}
+
 /// optimizer.py OptimizationResult: result of an optimization pass.
 #[derive(Debug)]
 pub enum OptimizationResult {
@@ -4221,6 +4264,7 @@ impl Optimizer {
 
         // Preserve final context for jump_to_existing_trace.
         let mut ops = ctx.take_new_operations();
+        strip_unused_call_pure(&mut ops);
 
         // RPython compile.py:327 final loop assembly:
         //   loop.operations = ([start_label] + preamble_ops
