@@ -2502,25 +2502,43 @@ fn emit_frontend_delsubscr(
     );
 }
 
-#[allow(dead_code)]
 fn emit_frontend_setattr(
-    _graph: &mut super::flow::FunctionGraph,
+    graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     attr_name: super::flow::FlowValue,
     value: super::flow::FlowValue,
     offset: i64,
-) {
-    // flowcontext.py STORE_ATTR ->
-    // `op.setattr(w_obj, w_attributename, w_newvalue).eval(self)`.
-    // See `emit_frontend_setitem` for the void-result rationale.
-    record_graph_op(
+) -> super::flow::Variable {
+    // flowcontext.py STORE_ATTR → `op.setattr(w_obj, w_name, w_newvalue)`.
+    // The opcode discards the return; flatten still needs the dest so
+    // `inline_call_r_r` of `space.setattr` can write it.
+    emit_graph_op_with_result(
+        graph,
         block,
         "setattr",
         vec![obj.into(), attr_name.into(), value.into()],
-        None,
+        Kind::Ref,
         offset,
-    );
+    )
+}
+
+fn emit_frontend_delattr(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    attr_name: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py DELETE_ATTR → `op.delattr(w_obj, w_name)`.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "delattr",
+        vec![obj.into(), attr_name.into()],
+        Kind::Ref,
+        offset,
+    )
 }
 
 /// STORE_ATTR — the residual counterpart of [`emit_frontend_getattr`].
@@ -2529,6 +2547,7 @@ fn emit_frontend_setattr(
 /// `bh_store_attr_fn(obj, value, code, name_idx)` residual.  Distinct from
 /// the bare `setattr` HLOp (an `is_pyre_canonical_elidable_hlop` rewritten
 /// to `setfield_gc`), so the generic attribute store survives lowering.
+#[allow(dead_code)]
 fn emit_frontend_store_attr(
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
@@ -2555,6 +2574,7 @@ fn emit_frontend_store_attr(
 /// with no stored value.  Records the 3-arg `delete_attr(obj, code,
 /// name_idx)` HLOp (void result) that `flatten.rs::lower_delete_attr_hlop_to_insn`
 /// threads into the `bh_delete_attr_fn(obj, code, name_idx)` residual.
+#[allow(dead_code)]
 fn emit_frontend_delete_attr(
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
@@ -10904,32 +10924,19 @@ impl CodeWriter {
                         }
                         Instruction::StoreAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            // rtyper-surrogate operands threaded into the
-                            // `bh_store_attr_fn(obj, value, code, name_idx)`
-                            // residual, identical to the LoadAttr arm: the
-                            // jitcode's own PyCode as a post-rtype
-                            // `Signed(ptr) + Kind::Ref` constant and the
-                            // `co_names` index the helper resolves the name
-                            // with.
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(name_idx as i64).into();
+                            let attr_name = interned_attr_name(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            emit_frontend_store_attr(
+                            let _ = emit_frontend_setattr(
+                                &mut graph,
                                 &current_block.block(),
                                 obj_value,
+                                attr_name,
                                 stored_value,
-                                code_const,
-                                name_idx_const,
                                 py_pc as i64,
                             );
                         }
@@ -12114,27 +12121,15 @@ impl CodeWriter {
                         // DeleteAttr: pops 1 (obj). Net: -1.
                         Instruction::DeleteAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            // rtyper-surrogate operands threaded into the
-                            // `bh_delete_attr_fn(obj, code, name_idx)` residual,
-                            // identical to the StoreAttr arm: the jitcode's own
-                            // PyCode as a post-rtype `Signed(ptr) + Kind::Ref`
-                            // constant and the `co_names` index the helper resolves
-                            // the name with.
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(name_idx as i64).into();
+                            let attr_name = interned_attr_name(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            emit_frontend_delete_attr(
+                            let _ = emit_frontend_delattr(
+                                &mut graph,
                                 &current_block.block(),
                                 obj_value,
-                                code_const,
-                                name_idx_const,
+                                attr_name,
                                 py_pc as i64,
                             );
                         }
@@ -17294,7 +17289,7 @@ mod tests {
         let name = Constant::string("field");
         let value = Variable::new(VariableId(33), Kind::Ref);
 
-        emit_frontend_setattr(
+        let result = emit_frontend_setattr(
             &mut graph,
             &start,
             obj.into(),
@@ -17311,7 +17306,7 @@ mod tests {
         assert_eq!(op.opname, "setattr");
         assert_eq!(op.offset, 56);
         assert_eq!(op.args, vec![obj.into(), name.into(), value.into()]);
-        assert_eq!(op.result, None);
+        assert_eq!(op.result, Some(result.into()));
     }
 
     #[test]
