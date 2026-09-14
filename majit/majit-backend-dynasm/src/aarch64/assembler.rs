@@ -2233,10 +2233,12 @@ impl<'a> AssemblerARM64<'a> {
                 }
                 RegAllocOp::Perform {
                     op_index,
-                    arglocs,
+                    arglocs_start,
+                    arglocs_len,
                     result_loc,
                     gcmap,
                 } => {
+                    let arglocs = ra.arglocs(*arglocs_start, *arglocs_len);
                     let op = &ops[*op_index];
                     if crate::majit_ops_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
@@ -2291,11 +2293,13 @@ impl<'a> AssemblerARM64<'a> {
                 }
                 RegAllocOp::PerformGuard {
                     op_index,
-                    arglocs,
+                    arglocs_start,
+                    arglocs_len,
                     result_loc,
                     faillocs_start,
                     faillocs_len,
                 } => {
+                    let arglocs = ra.arglocs(*arglocs_start, *arglocs_len);
                     let faillocs = ra.faillocs(*faillocs_start, *faillocs_len);
                     let op = &ops[*op_index];
                     if crate::majit_ops_log_enabled() {

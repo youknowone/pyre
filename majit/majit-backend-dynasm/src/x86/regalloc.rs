@@ -173,7 +173,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, false);
-        self.perform(i, vec![loc, argloc], Some(loc), output);
+        self.perform(i, [loc, argloc], Some(loc), output);
     }
 
     /// x86/regalloc.py `_consider_binop_symm` — symmetric binop
@@ -187,7 +187,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, true);
-        self.perform(i, vec![loc, argloc], Some(loc), output);
+        self.perform(i, [loc, argloc], Some(loc), output);
     }
 
     /// x86/regalloc.py `_consider_lea` — emits `LEA dst, [lhs +
@@ -205,7 +205,7 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(lhs, self.tp(lhs));
         let argloc = self.loc(rhs, self.tp(rhs));
         let resloc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
-        self.perform(i, vec![loc, argloc], Some(resloc), output);
+        self.perform(i, [loc, argloc], Some(resloc), output);
     }
 
     /// x86/regalloc.py `consider_int_add` — LEA shortcut when
@@ -278,7 +278,7 @@ impl<'a> RegAlloc<'a> {
             &self.constants,
             &mut self.pending_moves,
         );
-        self.perform(i, vec![loc1, loc2], Some(loc1), output);
+        self.perform(i, [loc1, loc2], Some(loc1), output);
     }
 
     /// x86/regalloc.py `consider_int_add_ovf = _consider_binop_symm`.

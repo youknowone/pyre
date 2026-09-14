@@ -184,7 +184,7 @@ impl TracePlan {
 
     pub(crate) fn build<T: AsRef<Op>, A: AsRef<InputArg>>(inputargs: &[A], ops: &[T]) -> Self {
         let lowered = Self::lower_ops(ops);
-        let live_points = compute_live_points(&lowered);
+        let live_points = compute_live_points(&lowered, ops);
         let max_live = live_points
             .iter()
             .map(|point| point.live_in.len())
@@ -351,10 +351,10 @@ fn lower_op(op: &Op) -> LirOp {
         opcode if opcode.is_guard() => LirOp::Guard {
             kind: guard_kind(opcode),
             args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
-            fail_args: op
-                .guard_fail_args()
-                .map(|fa| fa.iter().map(|a| a.to_opref()).collect())
-                .unwrap_or_default(),
+            // resume.py / regalloc.py read `guard.getfailargs()` on the
+            // op. Copying them into SmallVec<[OpRef; 4]> spilled to
+            // 128 B per guard on the regex and/or compile path.
+            fail_args: LirRefs::new(),
         },
         opcode if opcode.is_call() => LirOp::Call {
             opcode,
@@ -373,15 +373,22 @@ fn lower_op(op: &Op) -> LirOp {
     }
 }
 
-fn compute_live_points(ops: &[LirOp]) -> Vec<LivePoint> {
+fn compute_live_points<T: AsRef<Op>>(lir: &[LirOp], src_ops: &[T]) -> Vec<LivePoint> {
     let mut live = Vec::new();
-    let mut points = Vec::with_capacity(ops.len());
+    let mut points = Vec::with_capacity(lir.len());
 
-    for (op_index, op) in ops.iter().enumerate().rev() {
+    for (op_index, op) in lir.iter().enumerate().rev() {
         if let Some(dst) = op.def() {
             remove_ref(&mut live, dst);
         }
         op.add_fail_uses(&mut live);
+        if let Some(src) = src_ops.get(op_index)
+            && let Some(fa) = src.as_ref().guard_fail_args()
+        {
+            for a in fa.iter() {
+                add_ref(&mut live, a.to_opref());
+            }
+        }
         op.add_uses(&mut live);
         points.push(LivePoint {
             op_index,
@@ -650,7 +657,7 @@ mod tests {
                 LirOp::Guard {
                     kind: GuardKind::True,
                     args: smallvec::smallvec![OpRef::int_op(2)],
-                    fail_args: smallvec::smallvec![OpRef::int_op(1)],
+                    fail_args: smallvec::smallvec![],
                 },
                 LirOp::Jump {
                     args: smallvec::smallvec![OpRef::int_op(1)],
@@ -691,6 +698,30 @@ mod tests {
         let add_live = &plan.live_points[0].live_in;
         assert!(add_live.contains(&i0));
         assert!(!add_live.contains(&c1));
+    }
+
+    #[test]
+    fn lower_op_does_not_copy_guard_fail_args() {
+        // regalloc.py reads `guard.getfailargs()` on the op. A SmallVec
+        // copy of 9–16 fail args was the 128 B class on the regex
+        // and/or compile path (`j2plan::lower_op`).
+        let cond = OpRef::int_op(2);
+        let mut fail = Vec::new();
+        for i in 0..10u32 {
+            fail.push(rb(OpRef::int_op(10 + i)));
+        }
+        let guard = Op::new(OpCode::GuardTrue, &[rb(cond)]);
+        guard.setfailargs(fail.into());
+        let lowered = TracePlan::lower_ops(&[guard]);
+        match &lowered[0] {
+            LirOp::Guard { fail_args, .. } => {
+                assert!(
+                    fail_args.is_empty(),
+                    "fail_args stay on the guard op; do not spill a 128 B SmallVec"
+                );
+            }
+            other => panic!("expected Guard, got {other:?}"),
+        }
     }
 
     #[test]

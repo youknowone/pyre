@@ -269,10 +269,14 @@ impl Op {
     /// wrapped; callers no longer hold a borrow across other `Op`
     /// accesses.
     pub fn get_fail_arg_types(&self) -> Option<Vec<crate::value::Type>> {
-        // Immutable extra borrow: callers often hold `guard_fail_args()`
-        // (also an extra borrow) while reading types.
+        self.with_fail_arg_types(|t| t.to_vec())
+    }
+
+    /// history.py Box.type lives on the box. Walk the descr / extra slice
+    /// in place — `get_fail_arg_types` clones a `Vec<Type>` per call.
+    pub fn with_fail_arg_types<R>(&self, f: impl FnOnce(&[crate::value::Type]) -> R) -> Option<R> {
         self.try_guard_extra()
-            .and_then(|g| g.fail_arg_types().map(|t| t.to_vec()))
+            .and_then(|g| g.fail_arg_types().map(f))
     }
 
     /// Owned-clone variant — RPython would write `fail_arg_types[:]`.
