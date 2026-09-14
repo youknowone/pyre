@@ -84,4 +84,26 @@ assert format(1, "x") == "1"
 assert hex_loop(10) == "a"
 assert hex_loop(16) == "10"
 
+# `format(-1, "+d") == "-1"` must not select unpadded `str(i)`.
+# A compiled loop that then sees `1` has to print `+1`.
+def plus_d_loop(lo, hi):
+    acc = []
+    i = lo
+    while i <= hi:
+        acc.append(format(i, "+d"))
+        i = i + 1
+    return acc
+
+
+assert plus_d_loop(-2, 2) == ["-2", "-1", "+0", "+1", "+2"]
+assert plus_d_loop(1, 3) == ["+1", "+2", "+3"]
+
+
+class WideFmt(int):
+    def __format__(self, spec):
+        return "X"
+
+
+assert format(WideFmt(1 << 100), "") == "X"
+
 print("OK")

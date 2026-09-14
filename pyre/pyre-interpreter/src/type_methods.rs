@@ -3326,7 +3326,10 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
             // `intobject.py descr_str`.
             return Ok(unsafe { pyre_object::descr_str(val) });
         }
-        if unsafe { std::ptr::eq((*val).ob_type, &pyre_object::LONG_TYPE) } {
+        if unsafe {
+            std::ptr::eq((*val).ob_type, &pyre_object::LONG_TYPE)
+                && pyre_object::is_exact_builtin_instance(val)
+        } {
             return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
                 crate::py_str_wtf8(val)?
             }));

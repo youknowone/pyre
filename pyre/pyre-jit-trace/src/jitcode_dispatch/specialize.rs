@@ -16562,6 +16562,25 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
             majit_ir::OopSpecIndex::None,
         ),
     );
+    // A pad is taken from one sign.  `format(-42, "05d")` is
+    // `"-0042"` while `format(42, "05d")` is `"00042"`; pin the
+    // recorded sign so the other deopts to the residual.
+    if pad.is_some() {
+        let Some(majit_ir::Value::Int(int_value)) = ctx.trace_ctx.box_value(int_raw) else {
+            return Ok(None);
+        };
+        let zero = ctx.trace_ctx.const_int(0);
+        let is_neg = ctx.trace_ctx.record_op(OpCode::IntLt, &[int_raw, zero]);
+        if int_value < 0 {
+            ctx.trace_ctx
+                .set_opref_concrete(is_neg, majit_ir::Value::Int(1));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_neg])?;
+        } else {
+            ctx.trace_ctx
+                .set_opref_concrete(is_neg, majit_ir::Value::Int(0));
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_neg])?;
+        }
+    }
     // `ll_int2dec` yields the unpadded decimal.  With a pad the
     // formatted wrapper's `_utf8` is the concat, so the payload
     // concrete has to be a fresh unpadded storage.
@@ -16862,6 +16881,26 @@ fn spec_is_decimal_int_format(spec: &str) -> bool {
     ty == 'd'
 }
 
+/// `+` / space after align (`newformat.py` `_parse_spec`).  Those force a
+/// sign on a non-negative value, so an unpadded `str(i)` recorded on a
+/// negative is wrong for a later positive (`format(-1, "+d") == "-1"`
+/// but `format(1, "+d") == "+1"`).  Default / `-` keep the minus-only
+/// shape of `str(i)`.
+fn spec_has_plus_or_space_sign(spec: &str) -> bool {
+    let chars: Vec<char> = spec.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return false;
+    }
+    let mut i = 0;
+    if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
+        i = 2;
+    } else if matches!(chars[0], '<' | '>' | '=' | '^') {
+        i = 1;
+    }
+    i < n && matches!(chars[i], '+' | ' ')
+}
+
 /// FORMAT_WITH_SPEC on an exact `int` plus a constant decimal spec.
 ///
 /// Empty spec is [`try_walker_specialize_format_simple`].  A non-empty
@@ -16947,6 +16986,9 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
+    if pad.is_none() && spec_has_plus_or_space_sign(spec_text) {
+        return Ok(None);
+    }
     if !spec.is_constant() {
         let spec_const = ctx.trace_ctx.const_ref(concrete_spec as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[spec, spec_const])?;
