@@ -1586,6 +1586,31 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
+    /// Fold `bool_singleton` inside a descended `w_bool_from` body.
+    /// `baseobjspace.py newbool` returns the prebuilt `w_True`/`w_False`
+    /// after the `if b:` guard; the OnceLock helper is not in the
+    /// fnaddr table, so the residual must not run.
+    fn try_record_newbool_singleton(
+        &mut self,
+        ctx: &mut TraceCtx,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let name = self.frames.current_mut().jitcode.name();
+        if name != "w_bool_from" && name != "bool_value_from_truth" {
+            return None;
+        }
+        let spec = crate::box_trace::compare_op_residual()?;
+        let observed = self.frames.current_mut().int_values.first().copied().flatten()?;
+        let ptr = if observed != 0 {
+            spec.w_true
+        } else {
+            spec.w_false
+        };
+        let boxed = ctx.const_ref(ptr);
+        self.set_ref_reg(dst, Some(boxed), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
     /// Specialise residual `compare_slot_jit_abi` of two ints to unbox +
     /// `int_OP` + `newbool`, before `ForceToken` escapes the boxes.
     /// A mid-helper `GuardTrue` fail-resumes with a desynced snapshot
@@ -1693,6 +1718,7 @@ where
     fn try_record_truth_bool(
         &mut self,
         ctx: &mut TraceCtx,
+        _sym: &mut S,
         concrete_ptr: i64,
         trace_ptr: i64,
         args: &[OpRef],
@@ -1728,15 +1754,16 @@ where
         if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 {
             return None;
         }
-        let raw = crate::box_trace::trace_unbox_int(
-            ctx,
-            args[0],
-            spec.bool_type_addr,
-            spec.bool_intval_descr.clone(),
-        );
+        // Cached `intval` only — `trace_unbox_int` would `GuardClass`
+        // the boxed CallR and pin it in that snapshot.
+        let raw = ctx.heapcache_getfield_cached(args[0], spec.bool_intval_descr.index())?;
         let truth = ctx.record_op(OpCode::IntIsTrue, &[raw]);
         ctx.set_opref_concrete(truth, majit_ir::Value::Int(concrete));
         self.set_int_reg(dst, Some(truth), Some(concrete));
+        if !args[0].is_constant() {
+            let singleton = ctx.const_ref(raw_r[0]);
+            self.replace_box(ctx, args[0], singleton, Type::Ref);
+        }
         Some(TraceAction::Continue)
     }
 
@@ -8511,6 +8538,7 @@ where
                     // (heapcache hit) before `ForceToken`.
                     if let Some(action) = self.try_record_truth_bool(
                         ctx,
+                        sym,
                         concrete_ptr as i64,
                         trace_ptr as i64,
                         &args,
@@ -8993,6 +9021,14 @@ where
                     // int boxes. Matching wrapint (an int `NewWithVtable`)
                     // here made the following `GUARD_ISNULL(w_class)` an
                     // InvalidLoop — bools have a null `w_class`.
+                    // `w_bool_from` look-inside: `bool_singleton` is
+                    // `dont_look_inside` so its residual is a symbolic
+                    // hash. The `goto_if_not` guard is already recorded;
+                    // fold the residual to the immortal singleton.
+                    if let Some(action) = self.try_record_newbool_singleton(ctx, dst) {
+                        return action;
+                    }
+
                     if let Some(action) = self.try_record_int_compare(
                         ctx,
                         sym,

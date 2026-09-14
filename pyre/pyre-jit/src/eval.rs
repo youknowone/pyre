@@ -5673,6 +5673,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
             w_false: pyre_object::w_bool_from(false) as i64,
             newbool_fnaddr: pyre_interpreter::opcode_ops::jit_bool_value_from_truth as *const ()
                 as i64,
+            newbool_jitcode: pyre_jit_trace::jitcode_runtime::newbool_jitcode(),
             bool_intval_descr: pyre_jit_trace::descr::bool_intval_descr(),
             w_class_descr: pyre_jit_trace::descr::pyobject_w_class_stable_descr(),
             ob_type_descr: pyre_jit_trace::descr::pyobject_ob_type_stable_descr(),
