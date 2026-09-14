@@ -220,15 +220,11 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
 /// A nursery-full request spills to the old generation rather than collecting,
 /// so the block this hands back is never worse placed than the stable twin's.
 ///
-/// Not for a constructor a compiled trace calls directly.  One bound in
-/// `jit_fnaddr` hands its block back in a machine register the gcmap does not
-/// describe as a reference, so a minor collection between the return and the
-/// store leaves the caller naming moved bytes, and the non-moving old
-/// generation is what stands in for that missing root today.
-/// `PYPY_GC_NURSERY=64K` tells the two apart in one run: routing
-/// `w_int_gc_alloc` here puts recycled nursery bytes in an old-gen
-/// `W_BaseException.w_start` (`type_name_surrogate_reject`,
-/// `site=minor_fixed_field_target`).
+/// A compiled residual whose result is `Type::Ref` is spilled to the
+/// jitframe immediately after the call (`regalloc.rs` `consider_call`),
+/// so the next collecting call's gcmap rewrites it. Constructors that
+/// return an integer-class word (`i64` ABI with no Ref descr) still
+/// need the stable twin.
 ///
 /// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the same reason as its
 /// twin: the hook dispatch is process-global state the trace carries nothing by
