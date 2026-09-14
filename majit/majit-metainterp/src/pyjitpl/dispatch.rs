@@ -1722,10 +1722,17 @@ where
             // `finish_residual_call_exception_path`, which records the
             // GUARD_NO_EXCEPTION that follows this guard.
             let Some(resume_pc) = self.after_residual_live_pc(ctx) else {
+                // pyjitpl.py `generate_guard(rop.GUARD_NOT_FORCED)` is
+                // unconditional after a may-force residual. A missing
+                // trailing `-live-` cannot suppress that guard: the
+                // compiled CALL_MAY_FORCE would then keep stale
+                // virtualizable state when a later invocation forces.
+                // Decline the trace so lowering can grow the marker;
+                // do not emit the call unguarded.
                 if materialized {
                     ctx.reload_tokenless_virtualizable_after_residual_call();
                 }
-                return TraceAction::Continue;
+                return TraceAction::Abort;
             };
             self.record_state_guard(
                 ctx,
