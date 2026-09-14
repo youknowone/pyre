@@ -261,9 +261,8 @@ pub unsafe fn try_alloc_typed_items_block_nursery(
         );
         // `GcArray(Signed)` / `GcArray(Float)` bodies: no finalizer, not a
         // WEAKREF, so `gct_fv_gc_malloc` (`framework.py`) reaches
-        // `malloc_fast`. That is a copy of `malloc_fixedsize`
-        // (`framework.py:366-373`) whose nursery bump reaches
-        // `collect_and_reserve` on overflow (`incminimark.py:676-680`).
+        // `malloc_fast`. That is a copy of `malloc_fixedsize` whose
+        // nursery bump reaches `collect_and_reserve` on overflow.
         // Live unboxed `RBigInt` handles must sit in `RBigIntGcRoot` across
         // this call, the same way the translator puts `_digits` on the
         // shadow stack.

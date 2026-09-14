@@ -2571,11 +2571,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
+    let mut obj = obj;
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
         let indexed = space_index(index)?;
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {

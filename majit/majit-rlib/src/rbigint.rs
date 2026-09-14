@@ -3410,7 +3410,7 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let b = live_rbigint(b);
     let asize = a.numdigits();
     let bsize = b.numdigits();
-    let mut ret = RBigInt::with_size(asize + bsize, 1);
+    let mut ret = live_rbigint(&RBigInt::with_size(asize + bsize, 1));
     let shift = bsize >> 1;
     let (bh, bl) = _kmul_split(&*b, shift);
 
@@ -3425,7 +3425,7 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
         i = ret.numdigits() - shift;
         _v_iadd(&mut ret, shift, i, &t2, t2.numdigits());
         ret._normalize();
-        return ret;
+        return ret.clone();
     }
     let a_parts = if same {
         None
@@ -3469,7 +3469,7 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     debug_assert!(t3.get_sign() >= 0);
     _v_iadd(&mut ret, shift, i, &t3, t3.numdigits());
     ret._normalize();
-    ret
+    ret.clone()
 }
 
 /// rbigint.py `_inplace_divrem1`.
@@ -3491,9 +3491,10 @@ fn _inplace_divrem1(pout: &mut RBigInt, pin: &RBigInt, n: Digit) -> Digit {
 #[majit_macros::jit_elidable]
 fn _divrem1(a: &RBigInt, n: Digit) -> (RBigInt, Digit) {
     debug_assert!(n > 0 && n <= MASK as Digit);
+    let a = live_rbigint(a);
     let size = a.numdigits();
     let mut z = RBigInt::with_size(size, 1);
-    let rem = _inplace_divrem1(&mut z, a, n);
+    let rem = _inplace_divrem1(&mut z, &*a, n);
     z._normalize();
     (z, rem)
 }
@@ -3565,6 +3566,7 @@ fn _v_isub(x: &mut RBigInt, xofs: i64, m: i64, y: &RBigInt, n: i64) -> UDigit {
 /// rbigint.py `_muladd1`.
 fn _muladd1(a: &RBigInt, n: Digit, extra: Digit) -> RBigInt {
     debug_assert!(n > 0);
+    let a = live_rbigint(a);
     let size_a = a.numdigits();
     let mut z = RBigInt::with_size(size_a + 1, 1);
     debug_assert_eq!(extra & MASK as Digit, extra);
@@ -3615,8 +3617,8 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     let mut size_v = v1.numdigits();
     let size_w = w1.numdigits();
     debug_assert!(size_v >= size_w && size_w > 1);
-    let mut v = RBigInt::with_size(size_v + 1, 1);
-    let mut w = RBigInt::with_size(size_w, 1);
+    let mut v = live_rbigint(&RBigInt::with_size(size_v + 1, 1));
+    let mut w = live_rbigint(&RBigInt::with_size(size_w, 1));
 
     let d = SHIFT - bits_in_digit(w1.digit(size_w - 1));
     let carry = _v_lshift(&mut w, &*w1, size_w, d);
@@ -3638,9 +3640,9 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
         // rbigint.py deliberately does not return NULLRBIGINT here:
         // callers of this internal division helper may modify the result.
         // Keep both the rbigint value and its digit array fresh.
-        return (RBigInt::new(&[NULLDIGIT], 0, 0), w);
+        return (RBigInt::new(&[NULLDIGIT], 0, 0), w.clone());
     }
-    let mut a = RBigInt::with_size(k, 1);
+    let mut a = live_rbigint(&RBigInt::with_size(k, 1));
     let wm1 = w.widedigit(size_w - 1);
     let wm2 = w.widedigit(size_w - 2);
     let mut j = size_v - 1;
@@ -3687,7 +3689,7 @@ pub(crate) fn _x_divrem(v1: &RBigInt, w1: &RBigInt) -> (RBigInt, RBigInt) {
     debug_assert_eq!(carry, 0);
     a._normalize();
     w._normalize();
-    (a, w)
+    (a.clone(), w.clone())
 }
 
 /// rbigint.py `_divrem`.
