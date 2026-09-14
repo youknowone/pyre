@@ -9189,6 +9189,28 @@ where
                             return TraceAction::Continue;
                         }
                     }
+                    // `frame_anchor_push` publishes a tracing-only slot.
+                    // `interp_jit.py` has none; record the frame argument.
+                    if let Some(spec) = crate::box_trace::frame_anchor_push_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && let Some(&frame_op) = args.first()
+                    {
+                        let frame_bits = raw_r.first().copied().unwrap_or(concrete);
+                        self.set_ref_reg(dst, Some(frame_op), Some(frame_bits));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
                     // `pyopcode.py LOAD_CONST` reads the green
                     // `co_consts_w` slot. Record the traced ConstPtr.
                     if let Some(spec) = crate::box_trace::elidable_ref_residual()
