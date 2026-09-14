@@ -4467,7 +4467,7 @@ fn is_descriptor_carrier(w_type: PyObjectRef) -> bool {
             &GETSET_DESCRIPTOR_TYPE,
         ]
         .into_iter()
-        .any(|cell| cell.get() == Some(&(w_type as usize)))
+        .any(|cell| cell.get() == Some(w_type))
 }
 
 /// Whether `w_type` is `wrapper_descriptor`, whose blocks carry a slot and the
