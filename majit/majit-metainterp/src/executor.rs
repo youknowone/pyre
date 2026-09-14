@@ -17,15 +17,13 @@ use majit_ir::{OpCode, OpRef};
 /// ```
 ///
 /// For CALL_* opcodes, `func` ultimately calls `cpu.bh_call_*(funcaddr,
-/// args)`.  Pyre routes every arm through `dispatch::call_int_function`
-/// / `dispatch::call_void_function` using the concrete values carried
-/// alongside each typed argbox.  The Float arm shares the i64-return
-/// ABI: helper concrete pointers built by `#[jit_module]` pre-pack the
-/// f64 result via `f64::to_bits` (majit-macros/src/lib.rs
-/// `helper_return_to_i64`), and
-/// callers recover the f64 with `f64::from_bits(resvalue as u64)`
-/// (pyjitpl.rs `miframe_execute_varargs`) — bit-identical to the
-/// BC_CALL_FLOAT family in blackhole.rs which uses the same convention.
+/// args)` (`executor.py _do_call`).  Split the typed argboxes into I/R/F
+/// and hand them to `cpu.bh_call_{i,r,v}`.  The Float arm shares the
+/// i64-return ABI: helper concrete pointers built by `#[jit_module]`
+/// pre-pack the f64 result via `f64::to_bits` (majit-macros
+/// `helper_return_to_i64`), so that arm uses `cpu.bh_call_i` with an
+/// Int descr — the leftover CA BH packed-bits convention. Callers
+/// recover the f64 with `f64::from_bits` (`miframe_execute_varargs`).
 /// `argboxes[0]` is the funcbox (carrying the function pointer in its
 /// `i64` slot) and the remaining slots are the typed call arguments.
 ///
@@ -239,6 +237,80 @@ pub fn do_getfield_raw_f(
     cpu.bh_getfield_raw_f(structbox, fielddescr)
 }
 
+fn leftover_bh_args(v: &[i64]) -> Option<&[i64]> {
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// `executor.py _do_call`: split argboxes[1..] into I/R/F and call
+/// `cpu.bh_call_*`. `argboxes[0]` is the funcbox.
+fn do_call<M: Clone>(
+    metainterp: &crate::pyjitpl::MetaInterp<M>,
+    argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
+    descr: &dyn majit_ir::descr::CallDescr,
+    result_type: majit_ir::Type,
+) -> i64 {
+    let func = argboxes[0].2;
+    let mut args_i = Vec::new();
+    let mut args_r = Vec::new();
+    let mut args_f = Vec::new();
+    for (kind, _, concrete) in &argboxes[1..] {
+        match kind {
+            crate::jitcode::JitArgKind::Int => args_i.push(*concrete),
+            crate::jitcode::JitArgKind::Ref => args_r.push(*concrete),
+            crate::jitcode::JitArgKind::Float => args_f.push(*concrete),
+        }
+    }
+    let cpu = metainterp.blackhole_cpu();
+    // Float leftover wrappers return packed i64 bits (`f64::to_bits`);
+    // leftover CA BH uses an Int descr + `cpu.bh_call_i` so
+    // `verify_result_type` accepts the i64 ABI.
+    let calldescr = if result_type == majit_ir::Type::Float {
+        majit_translate::jitcode::BhCallDescr::from_signature(
+            descr.arg_classes(),
+            majit_ir::Type::Int,
+            descr.get_extra_info().clone(),
+        )
+    } else {
+        majit_translate::jitcode::BhCallDescr::from_call_descr(descr)
+    };
+    match result_type {
+        majit_ir::Type::Int => cpu.bh_call_i(
+            func,
+            leftover_bh_args(&args_i),
+            leftover_bh_args(&args_r),
+            leftover_bh_args(&args_f),
+            &calldescr,
+        ),
+        majit_ir::Type::Ref => {
+            cpu.bh_call_r(
+                func,
+                leftover_bh_args(&args_i),
+                leftover_bh_args(&args_r),
+                leftover_bh_args(&args_f),
+                &calldescr,
+            )
+            .0 as i64
+        }
+        majit_ir::Type::Void => {
+            cpu.bh_call_v(
+                func,
+                leftover_bh_args(&args_i),
+                leftover_bh_args(&args_r),
+                leftover_bh_args(&args_f),
+                &calldescr,
+            );
+            0
+        }
+        majit_ir::Type::Float => cpu.bh_call_i(
+            func,
+            leftover_bh_args(&args_i),
+            leftover_bh_args(&args_r),
+            leftover_bh_args(&args_f),
+            &calldescr,
+        ),
+    }
+}
+
 pub fn execute_varargs<M: Clone>(
     metainterp: &mut crate::pyjitpl::MetaInterp<M>,
     opnum: OpCode,
@@ -280,15 +352,12 @@ pub fn execute_varargs<M: Clone>(
                 argboxes.len() >= 2,
                 "COND_CALL_N requires [condbox, funcbox, *args]",
             );
-            let cond = argboxes[0].2;
-            if cond == 0 {
-                // condition false → skip the call.
+            // `executor.py do_cond_call`: skip when the condbox is 0,
+            // else `do_call_n(..., argboxes[1:], descr)`.
+            if argboxes[0].2 == 0 {
                 return 0;
             }
-            let func_ptr = argboxes[1].2 as *const ();
-            let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
-            crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
-            return 0;
+            return do_call(metainterp, &argboxes[1..], descr, majit_ir::Type::Void);
         }
         if matches!(opnum, OpCode::CondCallValueI | OpCode::CondCallValueR) {
             debug_assert!(
@@ -297,59 +366,21 @@ pub fn execute_varargs<M: Clone>(
             );
             let value = argboxes[0].2;
             if value != 0 {
-                // blackhole.py:1267 / 1274: nonzero `value` short-circuits
-                // and returns the existing value without calling.
+                // `do_cond_call_value_{i,r}`: nonzero short-circuits.
                 return value;
             }
-            // value == 0 → call and return the call's result.
-            let func_ptr = argboxes[1].2 as *const ();
-            let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
-            return crate::pyjitpl::call_int_function(func_ptr, &concrete_args);
+            let result_type = if matches!(opnum, OpCode::CondCallValueR) {
+                majit_ir::Type::Ref
+            } else {
+                majit_ir::Type::Int
+            };
+            return do_call(metainterp, &argboxes[1..], descr, result_type);
         }
         debug_assert!(
             !argboxes.is_empty(),
             "execute_varargs: argboxes must include funcbox at slot 0",
         );
-        let func_ptr = argboxes[0].2 as *const ();
-        let concrete_args: Vec<i64> = argboxes[1..].iter().map(|(_, _, c)| *c).collect();
-        match descr.result_type() {
-            // RPython dispatches Int and Ref through the same backend
-            // primitive cpu.bh_call_i (returns i64); pyre's
-            // call_int_function does the same — Ref is bit-identical to Int
-            // at the ABI level.
-            majit_ir::Type::Int | majit_ir::Type::Ref => {
-                crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
-            }
-            majit_ir::Type::Void => {
-                crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
-                0
-            }
-            majit_ir::Type::Float => {
-                // pyjitpl.py:2119 — CALL_F dispatches through cpu.bh_call_f.
-                // Caller-contract: every path that reaches this arm carries
-                // `funcbox.2` as a hand-written or `#[jit_module]`-generated
-                // function pointer with i64-return ABI:
-                //   * `do_recursive_call` (`pyjitpl.rs`) sets funcbox.2
-                //     to `targetjitdriver_sd.portal_runner_adr`, which is
-                //     `bh_portal_runner_c(i64, i64, i64, i64, i64) -> i64`
-                //     (pyre-jit/src/call_jit.rs); it never declares an f64
-                //     return.
-                //   * `#[jit_module]` (majit-macros/src/lib.rs) emits a
-                //     Float helper's `concrete_ptr` as `extern "C" fn(...)
-                //     -> i64` with the f64 result pre-packed via
-                //     `f64::to_bits`; the f64-ABI `trace_ptr` is consumed
-                //     only by pyre-jit-trace's `TraceCtx::call_may_force_*`
-                //     family, which has its own seam and never reaches
-                //     this arm.
-                // Therefore route through `call_int_function` and let the
-                // caller recover the f64 via `f64::from_bits` when needed
-                // — bit-identical to the blackhole.rs BC_CALL_FLOAT
-                // family which makes the same ABI choice for the same
-                // reason (`registers_f` is an i64-carrier mirroring
-                // RPython's `longlong.ZEROF` packing).
-                crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
-            }
-        }
+        do_call(metainterp, argboxes, descr, descr.result_type())
     })();
     // Mirror RPython's executor.py:52-78 post-call exception flow:
     // each `cpu.bh_call_*` arm wraps the call in `try: ... except

@@ -22594,9 +22594,9 @@ mod metainterp_static_data_tests {
         // `trace_ptr` is consumed only by pyre-jit-trace's
         // `TraceCtx::call_may_force_*` family, which has its own seam
         // and never reaches this arm.  The executor routes through
-        // `call_int_function` (i64-bits ABI), and callers recover the
+        // `cpu.bh_call_i` (packed i64 bits), and callers recover the
         // f64 via `f64::from_bits` when the slot needs to be interpreted
-        // as a float (`miframe_execute_varargs` in this file).  This test pins that
+        // as a float (`miframe_execute_varargs`).  This test pins that
         // contract so a regression that re-introduces the f64-ABI
         // transmute path is caught.
         use crate::executor;
