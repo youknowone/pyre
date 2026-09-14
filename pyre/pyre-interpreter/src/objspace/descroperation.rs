@@ -1053,7 +1053,7 @@ pub(crate) fn ll_int_py_div(x: i64, y: i64) -> i64 {
 
 /// rint.py `ll_int_py_mod`, the remainder companion of [`ll_int_py_div`].
 #[majit_macros::oopspec("int.py_mod(x, y)")]
-pub(crate) fn ll_int_py_mod(x: i64, y: i64) -> i64 {
+pub fn ll_int_py_mod(x: i64, y: i64) -> i64 {
     let r = x.wrapping_rem(y);
     let u = if y < 0 { r.wrapping_neg() } else { r };
     r.wrapping_add(y & (u >> (i64::BITS - 1)))

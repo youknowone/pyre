@@ -5241,9 +5241,45 @@ fn build_jit_driver_pair() -> JitDriverPair {
             w_false: pyre_object::w_bool_from(false) as i64,
             newbool_fnaddr: pyre_interpreter::opcode_ops::jit_bool_value_from_truth as *const ()
                 as i64,
+            bool_intval_descr: pyre_jit_trace::descr::bool_intval_descr(),
+            w_class_descr: pyre_jit_trace::descr::pyobject_w_class_stable_descr(),
+            ob_type_descr: pyre_jit_trace::descr::pyobject_ob_type_stable_descr(),
+            bool_type_addr: &pyre_object::BOOL_TYPE as *const _ as i64,
+            truth_fnaddrs: {
+                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| {
+                        (name.contains("jit_truth_value") || name.contains("truth_value"))
+                            .then_some(addr)
+                    })
+                    .collect();
+                addrs.push(pyre_interpreter::opcode_ops::jit_truth_value as *const () as i64);
+                addrs
+            },
             is_exact_int: |ptr| {
                 let obj = ptr as pyre_object::PyObjectRef;
                 !obj.is_null() && unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) }
+            },
+            is_bool: |ptr| {
+                let obj = ptr as pyre_object::PyObjectRef;
+                !obj.is_null() && unsafe { pyre_object::is_bool(obj) }
+            },
+        });
+        majit_metainterp::register_int_py_mod_residual(majit_metainterp::IntPyModResidual {
+            fnaddrs: {
+                let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                    .into_iter()
+                    .filter_map(|(name, addr)| {
+                        (name.contains("ll_int_py_mod") && !name.contains("uint")
+                            || name.contains("_ll_2_int_mod"))
+                        .then_some(addr)
+                    })
+                    .collect();
+                addrs.push(
+                    pyre_interpreter::objspace::descroperation::ll_int_py_mod as *const () as i64,
+                );
+                addrs.push(majit_metainterp::blackhole::_ll_2_int_mod as *const () as i64);
+                addrs
             },
         });
     }
