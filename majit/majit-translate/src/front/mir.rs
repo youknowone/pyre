@@ -162,6 +162,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
         &jitdriver_receiver_roots,
         None,
         None,
+        true,
     )
 }
 
@@ -193,6 +194,27 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
         jitdriver_receiver_roots,
         module_filter.as_ref(),
         None,
+        true,
+    )
+}
+
+/// Lower one already-linked artefact. The caller applied
+/// [`discover_transparent_scalar_kinds`] across the whole set first so
+/// this crate can be dropped before the next file is parsed.
+pub(crate) fn build_semantic_program_from_prelinked_llbc(
+    llbc: &Llbc,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+    jitdriver_receiver_roots: &[String],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let module_filter = normalize_module_filter(module_paths);
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(
+        std::slice::from_ref(llbc),
+        static_addrs,
+        jitdriver_receiver_roots,
+        module_filter.as_ref(),
+        None,
+        false,
     )
 }
 
@@ -226,7 +248,88 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
         &jitdriver_receiver_roots,
         module_filter.as_ref(),
         function_filter.as_ref(),
+        true,
     )
+}
+
+pub(crate) fn semantic_function_dedup_key(f: &crate::front::semantic::SemanticFunction) -> String {
+    let path = if f.module_path.is_empty() {
+        f.name.clone()
+    } else {
+        format!("{}::{}", f.module_path, f.name)
+    };
+    match f.self_ty_root.as_deref() {
+        Some(owner) => format!("{path}@{owner}"),
+        None => path,
+    }
+}
+
+pub(crate) fn absorb_semantic_program(
+    merged: &mut Option<crate::front::semantic::SemanticProgram>,
+    prog: crate::front::semantic::SemanticProgram,
+    seen_function_keys: &mut std::collections::HashSet<String>,
+    seen_struct_names: &mut std::collections::HashSet<String>,
+    seen_trait_names: &mut std::collections::HashSet<String>,
+    dedup_key: &dyn Fn(&crate::front::semantic::SemanticFunction) -> String,
+) {
+    match merged {
+        None => {
+            for f in &prog.functions {
+                seen_function_keys.insert(dedup_key(f));
+            }
+            for n in &prog.known_struct_names {
+                seen_struct_names.insert(n.clone());
+            }
+            for n in &prog.known_trait_names {
+                seen_trait_names.insert(n.clone());
+            }
+            *merged = Some(prog);
+        }
+        Some(acc) => {
+            for f in prog.functions {
+                if seen_function_keys.insert(dedup_key(&f)) {
+                    acc.functions.push(f);
+                }
+            }
+            for n in prog.known_struct_names {
+                if seen_struct_names.insert(n.clone()) {
+                    acc.known_struct_names.insert(n);
+                }
+            }
+            for n in prog.known_trait_names {
+                if seen_trait_names.insert(n.clone()) {
+                    acc.known_trait_names.insert(n);
+                }
+            }
+            for (key, fields) in prog.struct_fields.fields {
+                acc.struct_fields.fields.entry(key).or_insert(fields);
+            }
+            for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
+                acc.enum_variant_by_discriminant
+                    .entry(enum_key)
+                    .or_insert(by_discr);
+            }
+            for (leaf, module) in prog.struct_origins {
+                acc.struct_origins.entry(leaf).or_insert(module);
+            }
+            for (key, rows) in prog.struct_field_attrs {
+                acc.struct_field_attrs.entry(key).or_insert(rows);
+            }
+            for (key, layout) in prog.exact_layouts {
+                acc.exact_layouts.insert(key, layout);
+            }
+            for (key, id) in prog.struct_ids {
+                acc.struct_ids
+                    .entry(key)
+                    .and_modify(|slot| {
+                        if *slot != id {
+                            *slot = None;
+                        }
+                    })
+                    .or_insert(id);
+            }
+        }
+    }
 }
 
 fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
@@ -235,8 +338,11 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
+    link_scalars: bool,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    link_transparent_scalar_types(llbcs);
+    if link_scalars {
+        link_transparent_scalar_types(llbcs);
+    }
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -250,17 +356,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     let mut seen_function_keys = std::collections::HashSet::new();
     let mut seen_struct_names = std::collections::HashSet::new();
     let mut seen_trait_names = std::collections::HashSet::new();
-    let dedup_key = |f: &crate::front::semantic::SemanticFunction| -> String {
-        let path = if f.module_path.is_empty() {
-            f.name.clone()
-        } else {
-            format!("{}::{}", f.module_path, f.name)
-        };
-        match f.self_ty_root.as_deref() {
-            Some(owner) => format!("{path}@{owner}"),
-            None => path,
-        }
-    };
+    let dedup_key = semantic_function_dedup_key;
     for llbc in llbcs {
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
@@ -269,75 +365,14 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             module_filter,
             function_filter,
         )?;
-        match &mut merged {
-            None => {
-                for f in &prog.functions {
-                    seen_function_keys.insert(dedup_key(f));
-                }
-                for n in &prog.known_struct_names {
-                    seen_struct_names.insert(n.clone());
-                }
-                for n in &prog.known_trait_names {
-                    seen_trait_names.insert(n.clone());
-                }
-                merged = Some(prog);
-            }
-            Some(acc) => {
-                for f in prog.functions {
-                    if seen_function_keys.insert(dedup_key(&f)) {
-                        acc.functions.push(f);
-                    }
-                }
-                for n in prog.known_struct_names {
-                    if seen_struct_names.insert(n.clone()) {
-                        acc.known_struct_names.insert(n);
-                    }
-                }
-                for n in prog.known_trait_names {
-                    if seen_trait_names.insert(n.clone()) {
-                        acc.known_trait_names.insert(n);
-                    }
-                }
-                for (key, fields) in prog.struct_fields.fields {
-                    acc.struct_fields.fields.entry(key).or_insert(fields);
-                }
-                for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
-                    acc.enum_variant_by_discriminant
-                        .entry(enum_key)
-                        .or_insert(by_discr);
-                }
-                for (leaf, module) in prog.struct_origins {
-                    acc.struct_origins.entry(leaf).or_insert(module);
-                }
-                for (key, rows) in prog.struct_field_attrs {
-                    acc.struct_field_attrs.entry(key).or_insert(rows);
-                }
-                // Last-writer-wins, unlike the first-writer merges around it:
-                // a cross-target layout sidecar is appended after the host
-                // artefacts (`auto_discover_workspace_llbc_paths`) precisely so
-                // its target field offsets overwrite the host's here, while its
-                // (body-stripped, so partly unresolvable) per-type-string
-                // tables lose to the host above.  Among the host artefacts this
-                // is a no-op: they describe one target, so a shared struct's
-                // layout is identical in each.
-                for (key, layout) in prog.exact_layouts {
-                    acc.exact_layouts.insert(key, layout);
-                }
-                // Merge the name → StructId resolver, collapsing a key to
-                // `None` when two crates disagree on the identity (a
-                // cross-crate bare-leaf clash).
-                for (key, id) in prog.struct_ids {
-                    acc.struct_ids
-                        .entry(key)
-                        .and_modify(|slot| {
-                            if *slot != id {
-                                *slot = None;
-                            }
-                        })
-                        .or_insert(id);
-                }
-            }
-        }
+        absorb_semantic_program(
+            &mut merged,
+            prog,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup_key,
+        );
     }
     // The per-file builder hardened each program individually, but the
     // `or_insert` merges above can re-introduce a bare-leaf alias that
@@ -2175,7 +2210,7 @@ fn derive_program_metadata(
 /// their full/canonical spellings through the existing `StructId` object
 /// identity.  The pass is therefore idempotent and safe to re-run after the
 /// cross-LLBC merge re-introduces a per-crate-unique alias.
-fn harden_duplicate_leaf_metadata(
+pub(crate) fn harden_duplicate_leaf_metadata(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_origins: &mut std::collections::HashMap<String, String>,
     enum_variant_by_discriminant: &mut std::collections::HashMap<
@@ -23850,28 +23885,36 @@ fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
 /// both declarations share the same qualified Rust path. RPython translates a
 /// linked type universe, so collect that one register-bank fact before lowering
 /// any body and publish it to every artefact in the same translation input.
+pub(crate) fn discover_transparent_scalar_kinds(
+    llbc: &Llbc,
+) -> Vec<(String, majit_charon_reader::TransparentScalarKind)> {
+    let mut discovered = Vec::new();
+    for decl in llbc.iter_type_decls() {
+        if !decl.is_repr_transparent() {
+            continue;
+        }
+        let TypeDeclKind::Struct(fields) = &decl.kind else {
+            continue;
+        };
+        let [field] = fields.as_slice() else {
+            continue;
+        };
+        let kind = match tyref_to_value_type(&field.ty, llbc) {
+            ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
+            ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
+            ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
+            ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
+            _ => continue,
+        };
+        discovered.push((decl.item_meta.name_path(), kind));
+    }
+    discovered
+}
+
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
     let mut discovered = Vec::new();
     for llbc in llbcs {
-        for decl in llbc.iter_type_decls() {
-            if !decl.is_repr_transparent() {
-                continue;
-            }
-            let TypeDeclKind::Struct(fields) = &decl.kind else {
-                continue;
-            };
-            let [field] = fields.as_slice() else {
-                continue;
-            };
-            let kind = match tyref_to_value_type(&field.ty, llbc) {
-                ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
-                ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
-                ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
-                ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
-                _ => continue,
-            };
-            discovered.push((decl.item_meta.name_path(), kind));
-        }
+        discovered.extend(discover_transparent_scalar_kinds(llbc));
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();

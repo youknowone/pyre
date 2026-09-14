@@ -231,92 +231,98 @@ fn build_semantic_program_via_active_frontend(
                     .filter(|paths: &Vec<String>| !paths.is_empty())
             });
         if let Some(paths) = resolved_paths {
-            let llbcs: Vec<majit_charon_reader::Llbc> = paths
-                .iter()
-                .map(|p| {
-                    let llbc = majit_charon_reader::Llbc::load(p)
-                        .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
-                    prof.mark(&format!("    load {p}"));
-                    llbc
-                })
-                .collect();
-            // Seed the local-crate alias roots from the loaded set so
-            // `free_function_alias_paths` and the registry's canonical
-            // dedup treat every extracted crate name as an alias root
-            // (`local_crates.rs`); consumers resolve crate-qualified
-            // cross-crate callsites through this set.
-            crate::local_crates::register_local_crate_roots(
-                llbcs.iter().map(|l| l.crate_name().to_string()),
-            );
-            let mut program =
-                front::mir::build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
-                    &llbcs,
+            // Parse one artefact at a time. Holding every crate's Llbc
+            // (interpreter ~825MB JSON plus its typed tree) together with
+            // the merged SemanticProgram is what blew a 12GB container.
+            let mut discovered = Vec::new();
+            let mut crate_names = Vec::new();
+            let mut hints = std::collections::HashMap::new();
+            let mut immutable_fields = std::collections::HashMap::new();
+            let mut unsafe_fn_stubs = Vec::new();
+            let mut foreign_opaque_method_externals = Vec::new();
+            for p in &paths {
+                let llbc = majit_charon_reader::Llbc::load(p)
+                    .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                prof.mark(&format!("    harvest {p}"));
+                crate_names.push(llbc.crate_name().to_string());
+                discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
+                for (k, v) in
+                    front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc))
+                {
+                    hints.entry(k).or_insert(v);
+                }
+                for (k, v) in front::llbc_hints::harvest_immutable_fields_from_llbcs(
+                    std::slice::from_ref(&llbc),
+                ) {
+                    immutable_fields.entry(k).or_insert(v);
+                }
+                unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
+                    &llbc,
+                    static_addrs.error_carrier,
+                ));
+                unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
+                    &llbc,
+                    static_addrs.error_carrier,
+                ));
+                unsafe_fn_stubs
+                    .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
+                foreign_opaque_method_externals
+                    .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
+            }
+            discovered.sort_by(|a, b| a.0.cmp(&b.0));
+            discovered.dedup();
+            crate::local_crates::register_local_crate_roots(crate_names);
+
+            let mut merged = None;
+            let mut seen_function_keys = std::collections::HashSet::new();
+            let mut seen_struct_names = std::collections::HashSet::new();
+            let mut seen_trait_names = std::collections::HashSet::new();
+            for p in &paths {
+                let llbc = majit_charon_reader::Llbc::load(p)
+                    .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
+                llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+                let prog = front::mir::build_semantic_program_from_prelinked_llbc(
+                    &llbc,
                     static_addrs,
                     module_paths,
                     jitdriver_receiver_roots,
                 )
-                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
-            prof.mark("    build_semantic_program_from_llbcs");
-            // JIT-hint pass.  pyre's proc-macro attributes
-            // (`#[majit_macros::elidable*]` / `dont_look_inside` /
-            // `loop_invariant` / `unroll_safe`) are consumed by the
-            // proc-macro at expansion time and do not survive in
-            // Charon's `attr_info`, so the macros leave `#[doc(hidden)]`
-            // marker consts (`_elidable_function_<NAME>`, …) next to each
-            // annotated fn.  Charon extracts those into `global_decls`;
-            // `front::llbc_hints` reads them back and the hints merge into
-            // the MIR-driven SemanticProgram by qualified path — the analog of
-            // RPython's translator reading `func._elidable_function_` off
-            // the function object.
-            merge_hints_from_llbcs(&mut program, &llbcs);
-            // Same carrier for the struct-level declaration:
-            // `#[jit_immutable_fields(...)]` leaves
-            // `_immutable_fields_<Struct>` next to the struct, which is
-            // read back here into the field the layout provider and
-            // `CallControl::field_immutability` consume — the analog of
-            // RPython reading `cls._immutable_fields_` off the class
-            // (`rclass.py _parse_field_list`).
-            program.immutable_fields =
-                front::llbc_hints::harvest_immutable_fields_from_llbcs(&llbcs);
-            // Re-source the annotator-only residual-stub carrier from Charon:
-            // unsafe function paths missing from GraphStore, every declaration
-            // the JIT policy rejects (`dont_look_inside` and `elidable` alike,
-            // whose bodies JitPolicy correctly excludes), and the
-            // `#[pyre_class]` allocation constructors all need a FunctionDesc
-            // signature even though they must not become JitCode candidates.
-            program.unsafe_fn_stubs = llbcs
-                .iter()
-                .flat_map(|llbc| {
-                    front::mir::collect_unsafe_fn_stubs_from_llbc(llbc, static_addrs.error_carrier)
-                })
-                .chain(llbcs.iter().flat_map(|llbc| {
-                    front::mir::collect_policy_opaque_fn_stubs_from_llbc(
-                        llbc,
-                        static_addrs.error_carrier,
-                    )
-                }))
-                .chain(
-                    llbcs
-                        .iter()
-                        .flat_map(front::mir::collect_marked_class_ctor_stubs_from_llbc),
-                )
-                .collect();
-            // Foreign opaque-ADT methods (`<BigInt as Add>::add`, …) that
-            // `impl_method_owner` routes through `CallTarget::FunctionPath`
-            // for an opaque owner.  Declared external here so the residual
-            // `FunctionPath` lookup resolves rather than panicking
-            // `SomeInstance.getattr` on the classdef-less receiver.
-            program.foreign_opaque_method_externals = llbcs
-                .iter()
-                .flat_map(front::mir::collect_foreign_opaque_method_externals)
-                .collect();
-            // Whole-program type metadata (`known_struct_names`,
-            // `known_trait_names`, `struct_fields`) comes from the MIR
-            // builder's `derive_program_metadata` walk over Charon's
-            // `type_decls` / `trait_decls`; struct field-type strings are
-            // resolved by `tyref_to_ast_string` (Charon-resolved types,
-            // e.g. `*mut PyObject`, `Vec<u8>`, `i64`) rather than the syn
-            // re-parse.
+                .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower {p}: {e}"));
+                prof.mark(&format!("    lower {p}"));
+                front::mir::absorb_semantic_program(
+                    &mut merged,
+                    prog,
+                    &mut seen_function_keys,
+                    &mut seen_struct_names,
+                    &mut seen_trait_names,
+                    &front::mir::semantic_function_dedup_key,
+                );
+            }
+            let mut program = merged.unwrap_or_else(|| front::SemanticProgram {
+                functions: Vec::new(),
+                harvested_hints: std::collections::HashMap::new(),
+                known_struct_names: std::collections::HashSet::new(),
+                known_trait_names: std::collections::HashSet::new(),
+                struct_fields: front::semantic::StructFieldRegistry::default(),
+                immutable_fields: std::collections::HashMap::new(),
+                enum_variant_by_discriminant: std::collections::HashMap::new(),
+                struct_origins: std::collections::HashMap::new(),
+                struct_field_attrs: std::collections::HashMap::new(),
+                exact_layouts: std::collections::HashMap::new(),
+                struct_ids: std::collections::HashMap::new(),
+                unsafe_fn_stubs: Vec::new(),
+                foreign_opaque_method_externals: Vec::new(),
+            });
+            front::mir::harden_duplicate_leaf_metadata(
+                &mut program.struct_fields,
+                &mut program.struct_origins,
+                &mut program.enum_variant_by_discriminant,
+                Some(&program.struct_ids),
+            );
+            merge_hints_from_map(&mut program, &hints);
+            program.immutable_fields = immutable_fields;
+            program.unsafe_fn_stubs = unsafe_fn_stubs;
+            program.foreign_opaque_method_externals = foreign_opaque_method_externals;
             return program;
         }
     }
@@ -350,7 +356,15 @@ fn merge_hints_from_llbcs(
     llbcs: &[majit_charon_reader::Llbc],
 ) {
     let hints_by_path = front::llbc_hints::harvest_hints_from_llbcs(llbcs);
-    program.harvested_hints.clone_from(&hints_by_path);
+    merge_hints_from_map(program, &hints_by_path);
+}
+
+#[cfg(feature = "mir-frontend")]
+fn merge_hints_from_map(
+    program: &mut front::SemanticProgram,
+    hints_by_path: &std::collections::HashMap<String, Vec<String>>,
+) {
+    program.harvested_hints.clone_from(hints_by_path);
     for f in &mut program.functions {
         let path = if f.module_path.is_empty() {
             f.name.clone()
