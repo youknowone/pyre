@@ -239,15 +239,17 @@ fn cdata_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             .collect()
     };
     let roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = roots.base();
-    let _ = roots.pin_root(obj);
-    let cls_slot = obj_slot + 1;
-    let _ = roots.pin_root(cls);
-    let attribute_base = cls_slot + 1;
+    let mut live = Vec::with_capacity(2 + attributes.len() * 2);
+    live.push(obj);
+    live.push(cls);
     for &(key, value) in &attributes {
-        let _ = roots.pin_root(key);
-        let _ = roots.pin_root(value);
+        live.push(key);
+        live.push(value);
     }
+    let obj_slot = pyre_object::gc_roots::publish_roots(&live);
+    pyre_object::gc_roots::normalize_roots(obj_slot, live.len());
+    let cls_slot = obj_slot + 1;
+    let attribute_base = cls_slot + 1;
     let state_slot = attribute_base + 2 * attributes.len();
     let _ = roots.pin_root(pyre_object::w_dict_new());
     for i in 0..attributes.len() {
@@ -303,13 +305,15 @@ fn cdata_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let items = unsafe { pyre_object::dictmultiobject::w_dict_items(args[1]) };
     let roots = pyre_object::gc_roots::push_roots();
-    let d_slot = roots.base();
-    let _ = roots.pin_root(d);
-    let item_base = d_slot + 1;
+    let mut live = Vec::with_capacity(1 + items.len() * 2);
+    live.push(d);
     for &(key, value) in &items {
-        let _ = roots.pin_root(key);
-        let _ = roots.pin_root(value);
+        live.push(key);
+        live.push(value);
     }
+    let d_slot = pyre_object::gc_roots::publish_roots(&live);
+    pyre_object::gc_roots::normalize_roots(d_slot, live.len());
+    let item_base = d_slot + 1;
     for i in 0..items.len() {
         crate::baseobjspace::setitem(
             roots.get(d_slot),

@@ -16206,17 +16206,30 @@ pub(crate) fn slot_wrapper_check_instance(
 /// `method_descriptor`; without it `copyreg._reduce_ex` refuses the object at
 /// protocols 0 and 1.
 fn descr_reduce(descr: PyObjectRef) -> crate::PyResult {
-    let owner = unsafe { crate::function::fget_func_objclass(descr)? };
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(owner);
-    args.push(pyre_object::w_str_new_managed(unsafe {
-        crate::function::function_get_name(descr)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(descr);
+    let owner = unsafe {
+        crate::function::fget_func_objclass(pyre_object::gc_roots::shadow_stack_get(descr_slot))?
+    };
+    let owner_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(owner);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
+        crate::function::function_get_name(pyre_object::gc_roots::shadow_stack_get(descr_slot))
     }));
-    let args = pyre_object::w_tuple_new(args.take());
-    let mut result = pyre_object::gc_roots::RootedItems::new();
-    result.push(crate::baseobjspace::builtin_callable("getattr"));
-    result.push(args);
-    Ok(pyre_object::w_tuple_new(result.take()))
+    let args = pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(owner_slot),
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    ]);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    let getattr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable("getattr"));
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(getattr_slot),
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+    ]))
 }
 
 fn init_slot_wrapper_type(ns: PyObjectRef) {

@@ -4724,11 +4724,17 @@ impl PyFrame {
     /// PyPy-compatible `descr__reduce__`.
     #[inline]
     pub fn descr__reduce__(&self) -> PyObjectRef {
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(pyre_object::w_none());
-        fields.push(pyre_object::w_none());
-        fields.push(self._reduce_state());
-        pyre_object::w_tuple_new(fields.take())
+        // `_reduce_state` opens its own set; close it before this one
+        // pins the returned nursery tuple.
+        let state = self._reduce_state();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let state_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(state);
+        pyre_object::w_tuple_new(vec![
+            pyre_object::w_none(),
+            pyre_object::w_none(),
+            pyre_object::gc_roots::shadow_stack_get(state_slot),
+        ])
     }
 
     /// PyPy-compatible `descr__setstate__`.

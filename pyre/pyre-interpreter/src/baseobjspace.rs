@@ -3190,12 +3190,12 @@ fn iterator_reduce_tuple(
     empty_kind: u8,
 ) -> PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(callable);
     // A negative cursor is the exhausted sentinel the list iterators store,
     // and `listiter_reduce`/`listreviter_reduce` report the empty producer for
     // it even while the source list is still referenced.
     if seq.is_null() || index < 0 {
+        let sp = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(callable);
         // CPython 3.14 retains the concrete producer shape for the
         // specialized string/list iterators; generic sequence, bytes and
         // tuple iterators use the canonical empty tuple.
@@ -3212,7 +3212,7 @@ fn iterator_reduce_tuple(
             pyre_object::gc_roots::shadow_stack_get(sp + 2),
         ]));
     }
-    let _ = pyre_object::gc_roots::pin_root(seq);
+    let sp = pyre_object::gc_roots::pin_roots(&[callable, seq]);
     let state = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(sp + 1)]);
     let _ = pyre_object::gc_roots::pin_root(state);
     let w_index = w_int_new(index);

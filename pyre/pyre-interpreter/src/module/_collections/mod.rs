@@ -423,18 +423,33 @@ pub mod deque_iter {
 
         fn __reduce__(&self) -> PyObjectRef {
             let self_obj = self as *const W_DequeIter as PyObjectRef;
-            let ty = unsafe { w_instance_get_type(self_obj) };
-            let consumed = W_Deque::from_obj(self.deque)
-                .map(|deque| deque.len - self.counter)
+            let _roots = pyre_object::gc_roots::push_roots();
+            let self_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(self_obj);
+            let ty =
+                unsafe { w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
+            let deque = unsafe {
+                (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeIter)).deque
+            };
+            let deque_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(deque);
+            let counter = unsafe {
+                (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeIter))
+                    .counter
+            };
+            let consumed = W_Deque::from_obj(pyre_object::gc_roots::shadow_stack_get(deque_slot))
+                .map(|deque| deque.len - counter)
                 .unwrap_or(0);
-            let mut state = pyre_object::gc_roots::RootedItems::new();
-            state.push(self.deque);
-            state.push(w_int_new(consumed));
-            let state = w_tuple_new(state.take());
-            let mut result = pyre_object::gc_roots::RootedItems::new();
-            result.push(ty);
-            result.push(state);
-            w_tuple_new(result.take())
+            let state = w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(deque_slot),
+                w_int_new(consumed),
+            ]);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(state);
+            w_tuple_new(vec![
+                ty,
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ])
         }
     }
 
@@ -550,18 +565,34 @@ pub mod deque_rev_iter {
 
         fn __reduce__(&self) -> PyObjectRef {
             let self_obj = self as *const W_DequeRevIter as PyObjectRef;
-            let ty = unsafe { w_instance_get_type(self_obj) };
-            let consumed = W_Deque::from_obj(self.deque)
-                .map(|deque| deque.len - self.counter)
+            let _roots = pyre_object::gc_roots::push_roots();
+            let self_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(self_obj);
+            let ty =
+                unsafe { w_instance_get_type(pyre_object::gc_roots::shadow_stack_get(self_slot)) };
+            let deque = unsafe {
+                (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeRevIter))
+                    .deque
+            };
+            let deque_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(deque);
+            let counter = unsafe {
+                (*(pyre_object::gc_roots::shadow_stack_get(self_slot) as *const W_DequeRevIter))
+                    .counter
+            };
+            let consumed = W_Deque::from_obj(pyre_object::gc_roots::shadow_stack_get(deque_slot))
+                .map(|deque| deque.len - counter)
                 .unwrap_or(0);
-            let mut state = pyre_object::gc_roots::RootedItems::new();
-            state.push(self.deque);
-            state.push(w_int_new(consumed));
-            let state = w_tuple_new(state.take());
-            let mut result = pyre_object::gc_roots::RootedItems::new();
-            result.push(ty);
-            result.push(state);
-            w_tuple_new(result.take())
+            let state = w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(deque_slot),
+                w_int_new(consumed),
+            ]);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(state);
+            w_tuple_new(vec![
+                ty,
+                pyre_object::gc_roots::shadow_stack_get(state_slot),
+            ])
         }
     }
 

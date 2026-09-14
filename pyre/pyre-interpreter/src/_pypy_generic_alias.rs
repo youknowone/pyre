@@ -863,32 +863,49 @@ pub(crate) fn make_starred(ga: PyObjectRef) -> crate::PyResult {
 /// `Objects/genericaliasobject.c:ga_reduce`).
 fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
-    let origin = unsafe { w_generic_alias_get_origin(self_) };
-    let ga_args = unsafe { w_generic_alias_get_args(self_) };
-    if unsafe { w_generic_alias_get_unpacked(self_) } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let self_ = || pyre_object::gc_roots::shadow_stack_get(self_slot);
+    let origin = unsafe { w_generic_alias_get_origin(self_()) };
+    let ga_args = unsafe { w_generic_alias_get_args(self_()) };
+    let pair = pyre_object::gc_roots::pin_roots(&[origin, ga_args]);
+    if unsafe { w_generic_alias_get_unpacked(self_()) } {
         // 3.14 reconstructs a starred alias as `next(iter(orig))`.  This
         // replaces PyPy's app-level `_make_starred` reduce target and keeps
         // the callable globally pickleable without a synthetic module.
-        let orig = make_generic_alias(origin, ga_args)?;
-        let iterator = crate::baseobjspace::iter(orig)?;
-        let mut args = pyre_object::gc_roots::RootedItems::new();
-        args.push(iterator);
-        let args = w_tuple_new(args.take());
-        let mut result = pyre_object::gc_roots::RootedItems::new();
-        result.push(crate::baseobjspace::builtin_callable("next"));
-        result.push(args);
-        return Ok(w_tuple_new(result.take()));
+        let orig = make_generic_alias(
+            pyre_object::gc_roots::shadow_stack_get(pair),
+            pyre_object::gc_roots::shadow_stack_get(pair + 1),
+        )?;
+        let orig_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(orig);
+        let iterator =
+            crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(orig_slot))?;
+        let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(iterator);
+        let args = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(iter_slot)]);
+        let args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args);
+        let next_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable("next"));
+        return Ok(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(next_slot),
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+        ]));
     }
     // `(type(self), (origin, args))`.
     let ga_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(origin);
-    args.push(ga_args);
-    let args = w_tuple_new(args.take());
-    let mut result = pyre_object::gc_roots::RootedItems::new();
-    result.push(ga_type);
-    result.push(args);
-    Ok(w_tuple_new(result.take()))
+    let args = w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(pair),
+        pyre_object::gc_roots::shadow_stack_get(pair + 1),
+    ]);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    Ok(w_tuple_new(vec![
+        ga_type,
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+    ]))
 }
 
 /// `GenericAlias.__unpacked__` getset — the unpacked flag as a bool.

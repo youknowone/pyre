@@ -1301,24 +1301,36 @@ pub unsafe fn builtin_function_repr_text(name: &str, w_self: PyObjectRef) -> Str
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_builtin_function_reduce(obj: PyObjectRef) -> crate::PyResult {
-    let w_self = unsafe { function_get_self_or_none(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_self = unsafe { function_get_self_or_none(obj()) };
     if !w_self.is_null()
         && !unsafe { pyre_object::is_none(w_self) }
         && !unsafe { pyre_object::is_module(w_self) }
     {
-        let mut args = pyre_object::gc_roots::RootedItems::new();
-        args.push(w_self);
-        args.push(pyre_object::w_str_new_managed(unsafe {
-            crate::function_get_name(obj)
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_self);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(unsafe {
+            crate::function_get_name(obj())
         }));
-        let args = pyre_object::w_tuple_new(args.take());
-        let mut result = pyre_object::gc_roots::RootedItems::new();
-        result.push(crate::baseobjspace::builtin_callable("getattr"));
-        result.push(args);
-        return Ok(pyre_object::w_tuple_new(result.take()));
+        let args = pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        ]);
+        let args_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(args);
+        let getattr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable("getattr"));
+        return Ok(pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(getattr_slot),
+            pyre_object::gc_roots::shadow_stack_get(args_slot),
+        ]));
     }
     Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-        function_get_qualname(obj)
+        function_get_qualname(obj())
     }))
 }
 
@@ -3634,17 +3646,31 @@ pub unsafe fn descr_method_hash(obj: PyObjectRef) -> Result<i64, crate::PyError>
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn descr_method__reduce__(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let obj = require_method(obj, "__reduce__")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let function = unsafe { pyre_object::w_method_get_func(obj) };
     let instance = unsafe { pyre_object::w_method_get_self(obj) };
-    let name = crate::baseobjspace::getattr_str(function, "__name__")?;
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(instance);
-    args.push(name);
-    let args = pyre_object::w_tuple_new(args.take());
-    let mut result = pyre_object::gc_roots::RootedItems::new();
-    result.push(crate::baseobjspace::builtin_callable("getattr"));
-    result.push(args);
-    Ok(pyre_object::w_tuple_new(result.take()))
+    let pair = pyre_object::gc_roots::pin_roots(&[function, instance]);
+    let name = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(pair),
+        "__name__",
+    )?;
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name);
+    let args = pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(pair + 1),
+        pyre_object::gc_roots::shadow_stack_get(name_slot),
+    ]);
+    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args);
+    let getattr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(crate::baseobjspace::builtin_callable("getattr"));
+    Ok(pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(getattr_slot),
+        pyre_object::gc_roots::shadow_stack_get(args_slot),
+    ]))
 }
 
 #[inline]

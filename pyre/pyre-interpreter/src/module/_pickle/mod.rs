@@ -446,10 +446,9 @@ pub(crate) fn getattribute_dotted_obj(
     w_qualname: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let mut cur_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(w_qualname);
-    let qualname_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_qualname]);
+    let mut cur_slot = base;
+    let qualname_slot = base + 1;
     let w_dot = pyre_object::w_str_new(".");
     let _ = pyre_object::gc_roots::pin_root(w_dot);
     let dot_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
