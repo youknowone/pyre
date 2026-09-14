@@ -2181,17 +2181,23 @@ pub fn strptime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )));
     }
     let string = positional[0];
-    // `w_str_new_managed` can collect, so publish `string` before minting the
-    // omitted-format default, then pin that default onto the same set.
+    // `string` and an explicit `format` are already live; publish them
+    // together.  The omitted-format default is minted after `string` is
+    // published, then pinned onto the same set.
     let _roots = pyre_object::gc_roots::push_roots();
-    let string_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(string);
-    let format = match positional.get(1).copied() {
-        Some(format) => format,
-        None => w_str_new_managed("%a %b %d %H:%M:%S %Y"),
+    let (string_slot, format_slot) = match positional.get(1).copied() {
+        Some(format) => {
+            let base = pyre_object::gc_roots::pin_roots(&[string, format]);
+            (base, base + 1)
+        }
+        None => {
+            let string_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(string);
+            let format_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("%a %b %d %H:%M:%S %Y"));
+            (string_slot, format_slot)
+        }
     };
-    let format_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(format);
     let w_mod = match crate::importing::get_sys_module("_strptime") {
         Some(m) => m,
         None => crate::importing::importhook(

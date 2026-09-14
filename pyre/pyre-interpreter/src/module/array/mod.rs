@@ -1915,9 +1915,9 @@ fn array_reduce_ex_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "__reduce_ex__", true)?;
     check_arity(args, 2, "array.__reduce_ex__")?;
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let protocol = crate::baseobjspace::int_w(args[1])?;
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let protocol =
+        crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(obj_slot + 1))?;
     let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(
