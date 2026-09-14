@@ -3474,6 +3474,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // piece has to carry the exemption the whole used to.
     let is_rerunnable_bookkeeping =
         pyre_interpreter::is_rerunnable_bookkeeping_residual(func_ptr as usize);
+    // Same re-runnability question as `stack_check`: `dont_look_inside`
+    // (`rlib/jit.py dont_look_inside`) residualises the call but does not
+    // license the optimizer to drop it (`elidable`).  A rewind re-pins from
+    // the save point it finds, so the odometer must not count the bracket
+    // the way the descent scan already does not.
+    let is_rewindable_root_bracket =
+        pyre_interpreter::is_rewindable_root_bracket_residual(func_ptr as usize);
     if allboxes.len() - 1 > majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY {
         return Ok(declined_symbolic(call_opcode));
     }
@@ -4000,6 +4007,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     );
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
+        || is_rewindable_root_bracket
         || helper == majit_ir::RuntimeHelperKind::ForIterNext
         || observed_exact_scalar_str
         || observed_exact_str_iter

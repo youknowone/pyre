@@ -988,11 +988,10 @@ pub fn is_rerunnable_bookkeeping_residual(addr: usize) -> bool {
 /// re-executed body re-pins from the top it finds.  What a rewind leaves behind
 /// is slots above the save point, which is retention and not a wrong answer.
 ///
-/// This is [`is_rerunnable_bookkeeping_residual`]'s question asked by the
-/// static descent scan rather than by the walk's odometer.  The two are
-/// separate because the odometer sees an executed call and this sees a funcbox
-/// constant, but they must agree: a body the scan calls effectful and the walk
-/// does not is a descent refused for an effect that never happens.
+/// This is [`is_rerunnable_bookkeeping_residual`]'s question for the
+/// root bracket: `dont_look_inside` (`rlib/jit.py dont_look_inside`)
+/// residualises the call without making it `elidable`.  The walk's
+/// `provably_side_effect_free` and the descent scan both ask it.
 pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
     use std::sync::OnceLock;
     static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();

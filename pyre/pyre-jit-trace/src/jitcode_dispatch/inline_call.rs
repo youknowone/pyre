@@ -1149,15 +1149,13 @@ struct DescentPoint {
     fresh_r: Vec<bool>,
 }
 
-/// True when a funcbox constant names a residual the walk's odometer does not
-/// count.
+/// True when a funcbox constant names a residual
+/// `do_residual_call`'s `provably_side_effect_free` already spares by
+/// address: a re-runnable bookkeeping helper or a root-bracket one.
 ///
-/// The union of the two families `do_residual_call`'s
-/// `provably_side_effect_free` already spares by address: the re-runnable
-/// bookkeeping helpers and the root bracket's own.  The scan asks this of a
-/// constant where the walk asks it of an executed call, and the two have to
-/// agree — a body the scan calls effectful and the walk does not is a descent
-/// refused for an effect that never happens.
+/// The scan asks this of a constant where the walk asks it of an executed
+/// call.  They have to agree — a body the scan calls effectful and the walk
+/// does not is a descent refused for an effect that never happens.
 fn effect_free_residual_fnaddr(fnaddr: i64) -> bool {
     pyre_interpreter::is_rewindable_root_bracket_residual_i64(fnaddr)
         || pyre_interpreter::is_rerunnable_bookkeeping_residual(fnaddr as usize)
@@ -1709,11 +1707,6 @@ pub(crate) fn summarize_body_blockers_with(
             // operand, so it is the byte right after the opcode.
             let funcbox = code.get(d.pc + 1).copied().unwrap_or(0) as usize;
             if let Some(Some(fnaddr)) = known_i.get(funcbox)
-                && !majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
-            {
-                effect_free_residual = effect_free_residual_fnaddr(*fnaddr);
-            }
-            if let Some(Some(fnaddr)) = known_i.get(funcbox)
                 && majit_translate::codewriter::call::is_symbolic_fnaddr(*fnaddr)
             {
                 let slot = if effect {
@@ -1769,12 +1762,17 @@ pub(crate) fn summarize_body_blockers_with(
         // allocation goes with the trace, so a rewind leaves nothing that could
         // read what the store wrote.  The three `_gc` store families all put
         // the written object in their first operand.  A residual is spared
-        // when its calldescr reports no undoable effect, or when its funcbox
-        // names a helper the odometer does not count.
+        // when its calldescr reports no undoable effect (`rlib/jit.py
+        // elidable` / `not_in_trace`), or when its funcbox names a helper
+        // the walk's `provably_side_effect_free` already spares by address.
+        let residual_odometer_exempt = d.opname.starts_with("residual_call")
+            && (descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index))
+                || code
+                    .get(d.pc + 1)
+                    .and_then(|&slot| known_i.get(slot as usize).copied().flatten())
+                    .is_some_and(effect_free_residual_fnaddr));
         let applies_effect = descent_op_applies_effect(d.opname)
-            && !effect_free_residual
-            && !(d.opname.starts_with("residual_call")
-                && descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index)))
+            && !residual_odometer_exempt
             && !heap_write_into_fresh_object(code, &d, &fresh_r);
         // Every blocker a body reports reads as `after_effect` once one early
         // op arms the flag, so the reachable set alone does not say what to
