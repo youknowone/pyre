@@ -515,6 +515,8 @@ impl<'c> Lowerer<'c> {
             "majit_uint_le" => UintEmit::Opcode("UintLe"),
             "majit_uint_div" => UintEmit::OopspecCall("record_uint_py_div"),
             "majit_uint_mod" => UintEmit::OopspecCall("record_uint_py_mod"),
+            "majit_int_py_div" => UintEmit::OopspecCall("record_int_py_div"),
+            "majit_int_py_mod" => UintEmit::OopspecCall("record_int_py_mod"),
             _ => return None,
         };
         if call.args.len() != 2 {
@@ -3477,6 +3479,24 @@ mod tests {
             assert!(
                 !text.contains("record_int_py_div"),
                 "must not emit Python-floor `ll_int_py_div`:\n{text}"
+            );
+        }
+
+        #[test]
+        fn majit_int_py_div_records_the_expandable_oopspec() {
+            let (lowerer, out) = lower("majit_int_py_div(a, b)", |l| {
+                l.bindings.insert("a".into(), binding(1, BindingKind::Int));
+                l.bindings.insert("b".into(), binding(2, BindingKind::Int));
+            });
+            assert!(out.is_some());
+            let text = emitted(&lowerer);
+            assert!(
+                text.contains("record_int_py_div"),
+                "the constant-divisor expander matches this oopspec, got:\n{text}"
+            );
+            assert!(
+                !text.contains("record_int_floordiv"),
+                "must not take the C-truncating residual:\n{text}"
             );
         }
 
