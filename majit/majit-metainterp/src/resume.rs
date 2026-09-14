@@ -5853,6 +5853,23 @@ mod tests {
                 RebuiltValue::Box(0, majit_ir::Type::Ref),
             ]
         );
+        // initialize_state_from_guard_failure creates one recorder InputArg
+        // per TAGBOX number. Repeated frame references must share that object
+        // before bridge knowledge and optimization, not be merged by location
+        // later in the backend.
+        let mut recorder = crate::recorder::Trace::with_input_types(&[majit_ir::Type::Ref; 2]);
+        let restored: Vec<_> = frames[0]
+            .values
+            .iter()
+            .map(|value| match value {
+                RebuiltValue::Box(index, tp) => {
+                    recorder.box_for_operand(OpRef::input_arg_typed(*index as u32, *tp))
+                }
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(restored[0].same_box(&restored[2]));
+        assert!(!restored[0].same_box(&restored[1]));
     }
 
     #[test]

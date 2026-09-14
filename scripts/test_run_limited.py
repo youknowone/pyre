@@ -1,19 +1,68 @@
 """Small resource-limit probes; run only inside a RAM-capped Linux VM."""
 from pathlib import Path
 import subprocess
+import os
+import re
 import sys
 import unittest
+from unittest import mock
+import importlib.util
 
 RUNNER = Path(__file__).with_name("run-limited.py")
 
 
-@unittest.skipUnless(sys.platform.startswith("linux"), "use a RAM-capped Linux VM")
+SUPPORTED_KERNEL = (sys.platform.startswith("linux") and
+                    tuple(map(int, re.match(r"(\d+)\.(\d+)", os.uname().release).groups())) >= (4, 7))
+
+
+@unittest.skipUnless(SUPPORTED_KERNEL, "requires Linux >= 4.7 in a RAM-capped VM")
 class Limits(unittest.TestCase):
     def run_guard(self, code, *limits):
         return subprocess.run(
-            [sys.executable, str(RUNNER), *limits, "--", sys.executable, "-c", code],
+            [sys.executable, str(RUNNER), "--seconds", "5", *limits, "--", sys.executable, "-c", code],
             capture_output=True, text=True, timeout=10,
         )
+
+    def test_immediately_detached_descendants_are_reaped(self):
+        child = "import os,time; print('detachedpid=' + str(os.getpid()), flush=True); time.sleep(30)"
+        code = f"import subprocess,sys; subprocess.Popen([sys.executable,'-c',{child!r}], start_new_session=True)"
+        # A pid file is written before detaching, so the parent need not wait
+        # for our watchdog's first observation of the new process.
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "pid"
+            code = f"import subprocess,sys,pathlib; p=subprocess.Popen([sys.executable,'-c',{child!r}], start_new_session=True); pathlib.Path({str(pidfile)!r}).write_text(str(p.pid))"
+            result = self.run_guard(code)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(Path(f"/proc/{pidfile.read_text()}").exists())
+
+    def load_runner(self):
+        spec = importlib.util.spec_from_file_location("limited_runner", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_reused_pid_is_not_in_historical_tree(self):
+        runner = self.load_runner()
+        rows = {10: (1, 10, 100, 1), 20: (1, 20, 99999, 3)}
+        with mock.patch.object(runner.Path, "iterdir", return_value=[Path("10"), Path("20")]), mock.patch.object(runner, "process_info", side_effect=rows.get):
+            found = runner.process_tree(10, {20: (10, 20, 10, 2)})
+        self.assertEqual(set(found), {10})
+
+    def test_census_failure_still_kills_and_waits(self):
+        runner = self.load_runner()
+        spawn = subprocess.Popen
+        children = []
+        def capture(*args, **kwargs):
+            child = spawn(*args, **kwargs)
+            children.append(child)
+            return child
+        argv = [str(RUNNER), "--seconds", "1", "--", sys.executable, "-c", "import time; time.sleep(30)"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(runner, "process_tree", side_effect=OSError("census failed")), mock.patch.object(subprocess, "Popen", side_effect=capture):
+            with self.assertRaisesRegex(OSError, "census failed"):
+                runner.main()
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
 
     def test_tree_memory_limit(self):
         child = "import time; data=bytearray(32*1024*1024); time.sleep(30)"

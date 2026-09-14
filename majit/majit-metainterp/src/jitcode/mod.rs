@@ -1270,9 +1270,32 @@ mod tests {
             let cd = first.as_call_descr().unwrap();
             assert_eq!(cd.arg_classes(), "ir");
             assert_eq!(cd.result_class(), result_class);
+            assert_eq!(
+                cd.result_type(),
+                match result_class {
+                    'i' | 'S' => majit_ir::Type::Int,
+                    'r' => majit_ir::Type::Ref,
+                    'f' | 'L' => majit_ir::Type::Float,
+                    'v' => majit_ir::Type::Void,
+                    _ => unreachable!(),
+                }
+            );
             assert_eq!(cd.is_result_signed(), signed);
             assert_eq!(cd.result_size(), size);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "singlefloat call arguments require a raw ABI descriptor")]
+    fn unresolved_singlefloat_argument_abi_is_rejected() {
+        let bh = CanonicalBhCallDescr::from_arg_classes(
+            "S".to_owned(),
+            'v',
+            crate::call_descr::default_effect_info(),
+        );
+        RuntimeBhDescr::Descr(Box::new(CanonicalBhDescr::Call { calldescr: bh }))
+            .into_resolved()
+            .as_optimizer_descr();
     }
 
     #[test]

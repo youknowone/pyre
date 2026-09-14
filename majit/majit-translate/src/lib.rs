@@ -985,10 +985,15 @@ fn unique_trait_impl_roots(
 /// Generate only explicit helper roots for a macro-owned portal. Unlike the
 /// full portal API this does not manufacture JIT-driver metadata. This is a
 /// Rust consumer adapter; it uses the same codewriter graph transformation.
+/// Host bindings and static/error-carrier metadata are supplied by the consumer
+/// just as for portal analysis, including callees reached only from a helper.
 pub fn analyze_helper_pipeline_with_modules(
     module_paths: &[&str],
     helper_roots: &[CallPath],
     config: &AnalyzeConfig,
+    fnaddr_bindings: &FnAddrBindings<'_>,
+    impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
+    static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
     assert!(
         !helper_roots.is_empty(),
@@ -1005,9 +1010,9 @@ pub fn analyze_helper_pipeline_with_modules(
         config,
         None,
         &|_, _| None,
-        &[],
-        &[],
-        HostStaticAddrs::default(),
+        fnaddr_bindings,
+        impl_fnaddr_bindings,
+        static_addrs,
     )
 }
 

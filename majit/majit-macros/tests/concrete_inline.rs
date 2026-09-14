@@ -43,6 +43,21 @@ mod concrete {
         state.node.value
     }
 
+    fn bump(state: &mut State) {
+        state.node += 1;
+    }
+
+    #[majit_macros::jit_interp(
+        trace_cfg = (any()),
+        state = State,
+        env = Program,
+        recursive_entry = bump,
+        state_fields = { node: int },
+    )]
+    pub fn recursive_statement(state: &mut State, _program: &Program) {
+        majit_macros::recursive_portal_call!(missing_driver, state);
+    }
+
     #[majit_macros::jit_inline(
         trace_cfg = (any()),
         ref_params = { node: ref(Node) },
@@ -64,4 +79,11 @@ fn concrete_ref_reads_and_writes_survive_without_metadata() {
     };
     assert_eq!(concrete::run(&mut state, &Program), 43);
     assert_eq!(node.value, 43);
+}
+
+#[test]
+fn concrete_statement_recursive_call_needs_no_jit_metadata() {
+    let mut state = State { node: 0 };
+    concrete::recursive_statement(&mut state, &Program);
+    assert_eq!(state.node, 1);
 }

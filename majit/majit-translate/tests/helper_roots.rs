@@ -32,6 +32,14 @@ fn helper_roots_compile_their_callees_without_a_portal_or_unrelated_graphs() {
     call_control.register_function_graph(helper.clone(), graph);
     call_control.register_function_graph(callee.clone(), return_graph("callee"));
     call_control.register_function_graph(unrelated.clone(), return_graph("engine_setup"));
+    let wrapper = CallPath::from_segments(["fixture", "__majit_wrap_unrelated"]);
+    call_control.register_function_graph(wrapper.clone(), return_graph("wrapper"));
+    call_control.register_function_fnaddr(wrapper.clone(), 0x1234);
+    assert!(
+        call_control
+            .builtin_wrapper_indirect_graphs()
+            .contains(&wrapper)
+    );
     call_control.find_helper_graphs(&mut DefaultJitPolicy::new(), &[helper.clone()]);
     let jitcodes =
         CodeWriter::new().make_jitcodes(&mut call_control, &GraphTransformConfig::default());
@@ -40,6 +48,7 @@ fn helper_roots_compile_their_callees_without_a_portal_or_unrelated_graphs() {
     assert!(jitcodes.by_path.contains_key(&helper));
     assert!(jitcodes.by_path.contains_key(&callee));
     assert!(!jitcodes.by_path.contains_key(&unrelated));
+    assert!(!jitcodes.by_path.contains_key(&wrapper));
 }
 
 #[test]

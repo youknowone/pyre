@@ -333,11 +333,16 @@ impl LowererConfig {
 
     /// One past the last float-bank identity slot.
     pub(super) fn float_identity_end(&self) -> u16 {
-        if self.state_float_scalars.is_empty() {
-            0
-        } else {
-            self.float_identity_base() + self.state_float_scalars.len() as u16
-        }
+        self.state_float_scalars
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, index)| self.float_identity_base() + *index as u16 + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn is_state_vable_field(&self, name: &str) -> bool {
+        self.vable_var.as_deref() == Some("state") && self.vable_fields.contains_key(name)
     }
 
     /// Exclusive end of the int-bank and ref-bank identity-slot ranges
@@ -360,16 +365,20 @@ impl LowererConfig {
         // the 256-register JitCode ceiling.
         let int_scalars = self
             .state_scalars
-            .keys()
-            .filter(|name| !self.vable_fields.contains_key(*name))
-            .count() as u16;
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, index)| *index as u16 + 1)
+            .max()
+            .unwrap_or(0);
         let int_end =
             self.int_identity_base() + int_scalars + u16::from(!self.state_virt_arrays.is_empty());
         let ref_scalars = self
             .state_ref_scalars
-            .keys()
-            .filter(|name| !self.vable_fields.contains_key(*name))
-            .count() as u16;
+            .iter()
+            .filter(|(name, _)| !self.is_state_vable_field(name))
+            .map(|(_, (index, _))| *index as u16 + 1)
+            .max()
+            .unwrap_or(0);
         let ref_end = if ref_scalars == 0 {
             0
         } else {
@@ -2134,6 +2143,105 @@ impl LoweredSequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_cast_temporaries_are_colored_with_their_builder_operands() {
+        for expr in [
+            syn::parse_quote!(arg as isize),
+            syn::parse_quote!(arg as usize),
+        ] {
+            let mut lowerer = Lowerer::new(None);
+            lowerer
+                .bindings
+                .insert("arg".into(), binding(0, BindingKind::Int));
+            lowerer.next_reg = 200;
+            let result = lowerer.lower_value_expr(&expr).unwrap();
+            let (_, result) = regalloc::compact_registers(
+                &mut lowerer,
+                regalloc::RegisterCounts {
+                    ints: 1,
+                    ..Default::default()
+                },
+                Some(Register::int(result.reg)),
+            );
+            assert!(result.unwrap().index < 8);
+            let statements = &lowerer.statements;
+            let body = quote!(#(#statements)*).to_string();
+            for old in 200..205 {
+                assert!(
+                    !body.contains(&format!("{old}u16")),
+                    "uncolored register in {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_virtualizable_does_not_hide_state_field_reads_or_writes() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("frame".into());
+        config
+            .vable_fields
+            .insert("value".into(), (0, ValueKind::Int));
+        config.state_scalars.insert("value".into(), 0);
+        let mut lowerer = Lowerer::new(Some(&config));
+        assert!(
+            lowerer
+                .lower_value_expr(&syn::parse_quote!(state.value))
+                .is_some()
+        );
+        assert!(
+            lowerer
+                .lower_stmt(&syn::parse_quote!(state.value = 7;))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn identity_ranges_preserve_sparse_indices_and_exclude_state_vable_fields() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.vable_var = Some("state".into());
+        config.state_scalars.insert("redirected".into(), 0);
+        config.state_scalars.insert("kept".into(), 3);
+        config
+            .state_ref_scalars
+            .insert("redirected".into(), (0, syn::parse_quote!(Object)));
+        config
+            .state_ref_scalars
+            .insert("kept".into(), (2, syn::parse_quote!(Object)));
+        config.state_float_scalars.insert("redirected".into(), 250);
+        config.state_float_scalars.insert("kept".into(), 1);
+        config
+            .vable_fields
+            .insert("redirected".into(), (0, ValueKind::Int));
+        assert_eq!(
+            config.split_identity_reg_ends(),
+            (
+                config.int_identity_base() + 4,
+                config.ref_identity_base() + 3
+            )
+        );
+        assert_eq!(
+            config.float_identity_end(),
+            config.float_identity_base() + 2
+        );
+        config
+            .vable_fields
+            .insert("kept".into(), (1, ValueKind::Int));
+        assert_eq!(config.float_identity_end(), 0);
+        config.vable_var = Some("frame".into());
+        assert_eq!(
+            config.split_identity_reg_ends(),
+            (
+                config.int_identity_base() + 4,
+                config.ref_identity_base() + 3
+            )
+        );
+        assert_eq!(
+            config.float_identity_end(),
+            config.float_identity_base() + 251
+        );
+    }
 
     #[test]
     fn liveness_records_alive_at_marker_after_use() {

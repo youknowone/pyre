@@ -638,7 +638,7 @@ impl VirtualizableInfo {
         match field_type {
             Type::Int => assert!(matches!(field_size, 1 | 2 | 4 | 8)),
             Type::Ref => assert_eq!(field_size, std::mem::size_of::<usize>()),
-            Type::Float => assert_eq!(field_size, std::mem::size_of::<f64>()),
+            Type::Float => assert!(matches!(field_size, 4 | 8)),
             Type::Void => panic!("virtualizable fields cannot be void"),
         }
         self.static_fields.push(VableFieldInfo {
@@ -2542,6 +2542,38 @@ mod tests {
             assert_eq!(*(array_data.as_ptr().add(8) as *const i64), 500);
             assert_eq!(*(array_data.as_ptr().add(16) as *const i64), 600);
         }
+    }
+
+    #[test]
+    fn single_float_field_roundtrip_preserves_neighbors() {
+        #[repr(C)]
+        struct Fields {
+            value: f32,
+            neighbor: u32,
+        }
+        let mut fields = Fields {
+            value: 1.25,
+            neighbor: 0xa5a5a5a5,
+        };
+        let mut info = VirtualizableInfo::without_vable_token();
+        info.add_field_sized("value", Type::Float, 0, 4, false);
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(
+            std::mem::size_of::<Fields>(),
+        ));
+        let ptr = (&mut fields as *mut Fields).cast::<u8>();
+        unsafe {
+            assert_eq!(f64::from_bits(info.read_field(ptr, 0) as u64), 1.25);
+            info.write_field(ptr, 0, (-2.5f64).to_bits() as i64);
+        }
+        assert_eq!(fields.value, -2.5);
+        assert_eq!(fields.neighbor, 0xa5a5a5a5);
+        assert_eq!(
+            info.static_field_descr(0)
+                .as_field_descr()
+                .unwrap()
+                .field_size(),
+            4
+        );
     }
 
     #[test]

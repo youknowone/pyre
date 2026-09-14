@@ -2147,6 +2147,21 @@ fn rewrite_recursive_portal_calls(block: &mut syn::Block, recursive_entry: Optio
         recursive_entry: Option<&'a syn::Path>,
     }
     impl VisitMut for Visitor<'_> {
+        fn visit_stmt_mut(&mut self, stmt: &mut syn::Stmt) {
+            if let syn::Stmt::Macro(sm) = stmt {
+                let mut expr = Expr::Macro(syn::ExprMacro {
+                    attrs: sm.attrs.clone(),
+                    mac: sm.mac.clone(),
+                });
+                self.visit_expr_mut(&mut expr);
+                if !matches!(expr, Expr::Macro(_)) {
+                    *stmt = syn::Stmt::Expr(expr, sm.semi_token);
+                    return;
+                }
+            }
+            syn::visit_mut::visit_stmt_mut(self, stmt);
+        }
+
         fn visit_expr_mut(&mut self, expr: &mut Expr) {
             syn::visit_mut::visit_expr_mut(self, expr);
             let Expr::Macro(em) = expr else {

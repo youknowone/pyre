@@ -559,7 +559,9 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
-        if config.vable_fields.contains_key(&member_name) {
+        if config.vable_var.as_deref() == Some("state")
+            && config.vable_fields.contains_key(&member_name)
+        {
             return self.lower_vable_field_write(expr);
         }
         if let Some(&field_index) = config.state_scalars.get(&member_name) {
@@ -1079,7 +1081,9 @@ impl<'c> Lowerer<'c> {
             return None;
         }
         let member_name = named_member(&field.member)?;
-        if config.vable_fields.contains_key(&member_name) {
+        if config.vable_var.as_deref() == Some("state")
+            && config.vable_fields.contains_key(&member_name)
+        {
             return self.lower_vable_field_read(expr);
         }
         if let Some(&field_index) = config.state_scalars.get(&member_name) {

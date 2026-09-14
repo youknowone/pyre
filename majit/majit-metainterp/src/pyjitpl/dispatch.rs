@@ -7797,7 +7797,11 @@ where
                     return action;
                 }
 
-                let effectinfo = &calldescr.extra_info;
+                let effect_descr = trace_descr.clone();
+                let effectinfo = effect_descr
+                    .as_call_descr()
+                    .expect("resolved call descriptor")
+                    .get_extra_info();
 
                 // pyjitpl.py do_not_in_trace_call parity:
                 // `@not_in_trace`-decorated callees execute but are not
@@ -8159,7 +8163,11 @@ where
                     return action;
                 }
 
-                let effectinfo = &calldescr.extra_info;
+                let effect_descr = trace_descr.clone();
+                let effectinfo = effect_descr
+                    .as_call_descr()
+                    .expect("resolved call descriptor")
+                    .get_extra_info();
 
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     // pyjitpl.py do_not_in_trace_call:
@@ -8248,7 +8256,7 @@ where
                                 trace_ptr,
                                 &arg_types,
                                 majit_ir::Type::Int,
-                                &calldescr.extra_info,
+                                effectinfo,
                             )
                     {
                         self.set_int_reg(dst, Some(cached_traced), Some(cached_concrete));
@@ -8509,7 +8517,11 @@ where
                     return action;
                 }
 
-                let effectinfo = &calldescr.extra_info;
+                let effect_descr = trace_descr.clone();
+                let effectinfo = effect_descr
+                    .as_call_descr()
+                    .expect("resolved call descriptor")
+                    .get_extra_info();
 
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     // pyjitpl.py do_not_in_trace_call: route the
@@ -8589,7 +8601,7 @@ where
                                 trace_ptr,
                                 &arg_types,
                                 majit_ir::Type::Ref,
-                                &calldescr.extra_info,
+                                effectinfo,
                             )
                     {
                         self.set_ref_reg(dst, Some(cached_traced), Some(cached_concrete));
@@ -8811,7 +8823,11 @@ where
                     return action;
                 }
 
-                let effectinfo = &calldescr.extra_info;
+                let effect_descr = trace_descr.clone();
+                let effectinfo = effect_descr
+                    .as_call_descr()
+                    .expect("resolved call descriptor")
+                    .get_extra_info();
 
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     // pyjitpl.py do_not_in_trace_call: route the
@@ -8880,7 +8896,7 @@ where
                                 trace_ptr,
                                 &arg_types,
                                 majit_ir::Type::Float,
-                                &calldescr.extra_info,
+                                effectinfo,
                             )
                     {
                         self.set_float_reg(dst, Some(cached_traced), Some(cached_concrete_bits));

@@ -518,15 +518,18 @@ impl OptPure {
     /// typed-constant path first (`ConstPtr(NULL)` etc.) before falling back
     /// to opref_type metadata.
     fn matches_result_type(op: &Op, result: OpRef, ctx: &OptContext) -> bool {
-        if let Some(result_box) = ctx.get_box_replacement_operand_opt(result)
-            && let Some((_raw, result_type)) = ctx.getconst(&result_box)
-        {
-            return result_type == op.result_type();
+        // Prefer the emitted producer's intrinsic type. Legacy contexts can
+        // reuse a positional index for an inputarg of a different bank.
+        if let Some(producer) = ctx.producer_in_new_operations(result) {
+            return Operand::from_bound_op(&producer)
+                .get_box_replacement(false)
+                .type_()
+                == op.result_type();
         }
-        match ctx.opref_type(result) {
-            Some(result_type) => result_type == op.result_type(),
-            None => false,
+        if let Some(result_box) = ctx.get_box_replacement_operand_opt(result) {
+            return result_box.type_() == op.result_type();
         }
+        ctx.opref_type(result) == Some(op.result_type())
     }
 
     /// Try to find a cached result for this operation, considering commutativity.
@@ -540,7 +543,8 @@ impl OptPure {
         // A PreambleOp hit is forced and the ring slot replaced, as
         // RecentPureOps.force_preamble_op does.
         let commutative = Self::is_commutative(op.opcode);
-        self.cache.lookup_forcing(op, ctx, commutative)
+        let found = self.cache.lookup_forcing(op, ctx, commutative);
+        found.filter(|(_, result)| Self::matches_result_type(op, *result, ctx))
     }
 
     /// Record a pure operation in the CSE cache.
@@ -1182,17 +1186,6 @@ impl Optimization for OptPure {
                 return OptimizationResult::Remove;
             }
 
-            let key = PureOpKey::from_operand_op(op);
-            self.cache.insert(key, op.pos().get());
-            // pure.py produce_potential_short_preamble_ops reads the actual
-            // operations. Retain this producer when it is the live op; a
-            // preceding replacement still needs its own operation object.
-            let shared = if std::ptr::eq(op, op_rc.as_ref()) {
-                op_rc.clone()
-            } else {
-                OpRc::new(op.clone())
-            };
-            self.short_preamble_pure_ops.push(shared);
             return OptimizationResult::PassOn;
         }
 
@@ -1396,8 +1389,12 @@ impl Optimization for OptPure {
         }
         // pure.py DefaultOptimizationResult._callback records a saved pure
         // op after downstream passes and emission have processed it.
-        if op.opcode.is_always_pure() {
-            self.pure(op);
+        if op.opcode.is_always_pure()
+            && let Some(shared) = ctx.producer_in_new_operations(op.pos().get())
+            && shared.opcode.is_always_pure()
+        {
+            self.pure(&shared);
+            self.short_preamble_pure_ops.push(shared);
         }
         if self.pending_call_pure_position
             && (op.opcode.is_real_call() || op.opcode.is_cond_call_value())
@@ -1669,6 +1666,85 @@ mod tests {
             .collect();
         drop(producers);
         result
+    }
+
+    #[test]
+    fn pure_history_keeps_the_configured_number_of_distinct_emitted_ops() {
+        let limit = crate::jit::PARAMETERS.pureop_historylength as u32;
+        let mut specs: Vec<_> = (0..limit)
+            .map(|i| op_spec(OpCode::IntNeg, &[Arg::In(i)]))
+            .collect();
+        specs.push(op_spec(OpCode::IntNeg, &[Arg::In(0)]));
+        let result = run_pure(
+            limit,
+            &specs,
+            &mut majit_ir::ConstMap::default(),
+            &[],
+            false,
+        );
+        assert_eq!(result.len(), limit as usize);
+    }
+
+    #[test]
+    fn downstream_removed_pure_op_is_not_reused() {
+        struct RemoveFirst(bool);
+        impl Optimization for RemoveFirst {
+            fn name(&self) -> &'static str {
+                "remove-first"
+            }
+            fn propagate_forward(
+                &mut self,
+                _: &Op,
+                _: &OpRc,
+                _: &mut OptContext,
+            ) -> OptimizationResult {
+                if std::mem::replace(&mut self.0, true) {
+                    OptimizationResult::PassOn
+                } else {
+                    OptimizationResult::Remove
+                }
+            }
+        }
+        let (ops, types) = build_trace(
+            1,
+            &[
+                op_spec(OpCode::IntNeg, &[Arg::In(0)]),
+                op_spec(OpCode::IntNeg, &[Arg::In(0)]),
+            ],
+        );
+        let mut optimizer = Optimizer::new();
+        optimizer.add_pass(Box::new(OptPure::new()));
+        optimizer.add_pass(Box::new(RemoveFirst(false)));
+        let result = optimizer
+            .optimize_with_constants_and_inputs_oprc(
+                &ops,
+                &mut majit_ir::ConstMap::default(),
+                types.len(),
+            )
+            .unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn ring_lookup_rejects_a_forced_preamble_result_in_another_bank() {
+        let mut ctx = OptContext::with_inputarg_types(8, &[Type::Int, Type::Ref]);
+        let arg = ctx.materialize_operand_at(OpRef::input_arg_typed(0, Type::Int));
+        let wrong = ctx.materialize_operand_at(OpRef::input_arg_typed(1, Type::Ref));
+        let query = OpRc::new(Op::new(OpCode::IntNeg, &[arg]));
+        let pop = PreambleOp {
+            op: wrong.clone(),
+            invented_name: false,
+            preamble_op: query.clone(),
+            same_as_source: None,
+        };
+        let mut pass = OptPure::new();
+        pass.cache
+            .insert_preamble(PureOpKey::from_operand_op(&query), pop);
+        let bucket = pass.cache.buckets.iter_mut().flatten().next().unwrap();
+        if let Some((_, PureRingValue::Preamble { forced, .. })) = &mut bucket.lst[0] {
+            *forced = Some(wrong.to_opref());
+        }
+        assert_eq!(pass.lookup_pure(&query, &mut ctx), None);
     }
 
     #[test]
@@ -2022,6 +2098,8 @@ mod tests {
         op0.pos().set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &OpRc::new(op0.clone()), &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
+        ctx.push_new_operation(OpRc::new(op0.clone()));
+        pass.propagate_postprocess(&op0, &mut ctx);
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[a.clone(), b.clone()]);
@@ -2982,6 +3060,11 @@ mod tests {
         op.pos().set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
+
+        // Only downstream emission makes the producer a preamble candidate.
+        assert!(pass.short_preamble_pure_ops.is_empty());
+        ctx.push_new_operation(OpRc::new(op.clone()));
+        pass.propagate_postprocess(&op, &mut ctx);
 
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::int_op(0),

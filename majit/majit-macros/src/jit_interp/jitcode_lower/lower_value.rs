@@ -2689,52 +2689,56 @@ impl<'c> Lowerer<'c> {
         let x_reg = binding.reg;
         let result_reg = self.alloc_reg();
         let depends_on_stack = binding.depends_on_stack;
-        let emit = if signed {
+        if signed {
             let shift_reg = self.alloc_reg();
             let shl_reg = self.alloc_reg();
-            quote! {
-                if ::core::mem::size_of::<usize>() >= 8 {
-                    __builder.move_i(#result_reg as u16, #x_reg as u16);
-                } else {
-                    __builder.load_const_i_value(#shift_reg as u16, 32i64);
-                    __builder.record_binop_i(
-                        #shl_reg as u16,
-                        majit_ir::OpCode::IntLshift,
-                        #x_reg as u16,
-                        #shift_reg as u16,
-                    );
-                    __builder.record_binop_i(
-                        #result_reg as u16,
-                        majit_ir::OpCode::IntRshift,
-                        #shl_reg as u16,
-                        #shift_reg as u16,
-                    );
-                }
-            }
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], Register::ints(&[shift_reg])),
+                quote! {
+                    if ::core::mem::size_of::<usize>() < 8 {
+                        __builder.load_const_i_value(#shift_reg as u16, 32i64);
+                    }
+                },
+            );
+            self.emit_op(
+                OpMeta::linear(OpKind::BinopI, Register::ints(&[x_reg, shift_reg]), Register::ints(&[shl_reg])),
+                quote! {
+                    if ::core::mem::size_of::<usize>() < 8 {
+                        __builder.record_binop_i(#shl_reg as u16, majit_ir::OpCode::IntLshift, #x_reg as u16, #shift_reg as u16);
+                    }
+                },
+            );
+            self.emit_op(
+                OpMeta::linear(OpKind::Aux, Register::ints(&[x_reg, shl_reg, shift_reg]), Register::ints(&[result_reg])),
+                quote! {
+                    if ::core::mem::size_of::<usize>() >= 8 {
+                        __builder.move_i(#result_reg as u16, #x_reg as u16);
+                    } else {
+                        __builder.record_binop_i(#result_reg as u16, majit_ir::OpCode::IntRshift, #shl_reg as u16, #shift_reg as u16);
+                    }
+                },
+            );
         } else {
             let mask_reg = self.alloc_reg();
-            quote! {
-                if ::core::mem::size_of::<usize>() >= 8 {
-                    __builder.move_i(#result_reg as u16, #x_reg as u16);
-                } else {
-                    __builder.load_const_i_value(#mask_reg as u16, 0xFFFF_FFFFi64);
-                    __builder.record_binop_i(
-                        #result_reg as u16,
-                        majit_ir::OpCode::IntAnd,
-                        #x_reg as u16,
-                        #mask_reg as u16,
-                    );
-                }
-            }
-        };
-        self.emit_op(
-            OpMeta::linear(
-                OpKind::Aux,
-                vec![Register::int(x_reg)],
-                vec![Register::int(result_reg)],
-            ),
-            emit,
-        );
+            self.emit_op(
+                OpMeta::linear(OpKind::LoadConstI, vec![], Register::ints(&[mask_reg])),
+                quote! {
+                    if ::core::mem::size_of::<usize>() < 8 {
+                        __builder.load_const_i_value(#mask_reg as u16, 0xFFFF_FFFFi64);
+                    }
+                },
+            );
+            self.emit_op(
+                OpMeta::linear(OpKind::Aux, Register::ints(&[x_reg, mask_reg]), Register::ints(&[result_reg])),
+                quote! {
+                    if ::core::mem::size_of::<usize>() >= 8 {
+                        __builder.move_i(#result_reg as u16, #x_reg as u16);
+                    } else {
+                        __builder.record_binop_i(#result_reg as u16, majit_ir::OpCode::IntAnd, #x_reg as u16, #mask_reg as u16);
+                    }
+                },
+            );
+        }
         Binding {
             reg: result_reg,
             kind: BindingKind::Int,

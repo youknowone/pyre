@@ -7,10 +7,12 @@ No command is executed through a shell. Logs are retained outside process RAM.
 """
 
 import argparse
+import ctypes
 import fcntl
 import os
 from pathlib import Path
 import resource
+import re
 import signal
 import subprocess
 import sys
@@ -20,38 +22,79 @@ import time
 MIB = 1024 * 1024
 
 
-def process_tree(root, extra_pids=()):
+def process_info(pid):
+    # proc_pid_stat(5): parse after the last ')' because comm can contain spaces.
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return (int(fields[1]), int(fields[2]),
+                int(fields[21]) * os.sysconf("SC_PAGE_SIZE"), int(fields[19]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_tree(root, seen=None):
     rows = {}
-    text = subprocess.check_output(["ps", "-axo", "pid=,ppid=,pgid=,rss="], text=True)
-    for line in text.splitlines():
-        pid, parent, group, rss = map(int, line.split())
-        rows[pid] = (parent, group, rss * 1024)
-    selected = {pid for pid, (_, group, _) in rows.items() if group == root}
+    for path in Path("/proc").iterdir():
+        if path.name.isdigit() and (info := process_info(int(path.name))) is not None:
+            rows[int(path.name)] = info
+    selected = {pid for pid, (parent, group, _, _) in rows.items()
+                if group == root or parent == os.getpid()}
     selected.add(root)
-    selected.update(extra_pids)
+    # Historical descendants can detach, but a recycled PID is another process.
+    for pid, old in (seen or {}).items():
+        if pid in rows and rows[pid][3] == old[3]:
+            selected.add(pid)
     while True:
-        more = {
-            pid
-            for pid, (parent, group, _) in rows.items()
-            if pid not in selected and (parent in selected or group in selected)
-        }
+        more = {pid for pid, (parent, _, _, _) in rows.items()
+                if pid not in selected and parent in selected}
         if not more:
             break
         selected.update(more)
     return {pid: rows[pid] for pid in selected if pid in rows}
 
 
-def stop_tree(root, members):
-    # Stop before killing so a runaway cannot keep spawning while we clean up.
+def become_subreaper():
+    # PR_SET_CHILD_SUBREAPER: even a child detached before our first sample
+    # is adopted here when its parent exits (prctl(2)).
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, ctypes.c_ulong(1), 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def stop_tree(root):
+    # The root has not been reaped yet: its process-group ID cannot be reused.
     for sig in (signal.SIGSTOP, signal.SIGKILL):
         try:
             os.killpg(root, sig)
-        except ProcessLookupError:
+        except OSError:
             pass
-        for pid in members:
+
+
+def cleanup(proc):
+    # Group cleanup must run without depending on a successful process census.
+    try:
+        stop_tree(proc.pid)
+    finally:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait()
+    # Detached descendants are now our children. Signal only these unreaped
+    # children, never historical PID numbers. Their PIDs cannot be recycled
+    # until waitpid below; repeat to collect descendants adopted as they die.
+    children_path = Path(f"/proc/self/task/{os.getpid()}/children")
+    while children := children_path.read_text().split():
+        for pid in map(int, children):
             try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        for pid in map(int, children):
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
                 pass
 
 
@@ -67,8 +110,12 @@ def main():
     parser.add_argument("--seconds", type=float, default=300)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    if sys.platform == "darwin":
-        parser.error("macOS cannot enforce this kernel memory budget; run inside a RAM-capped Linux VM/container")
+    if not sys.platform.startswith("linux"):
+        parser.error("run inside a RAM-capped Linux VM/container")
+    # getrlimit(2): RLIMIT_DATA covers mmap allocations starting with Linux 4.7.
+    version = tuple(map(int, re.match(r"(\d+)\.(\d+)", os.uname().release).groups()))
+    if version < (4, 7):
+        parser.error("Linux 4.7 or newer is required for the allocation budget")
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]
@@ -110,24 +157,26 @@ def main():
         peak = 0
         with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr, (directory / "rss.tsv").open("w", buffering=1) as samples:
             samples.write("seconds\tpid\tppid\trss_bytes\n")
+            become_subreaper()
             proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
                                     env=env, start_new_session=True, preexec_fn=limits)
             started = time.monotonic()
             members = {}
-            seen_pids = {proc.pid}
+            seen = {}
             next_sample = 0.0
             sample_bytes = 0
             try:
-                while proc.poll() is None:
-                    members = process_tree(proc.pid, seen_pids)
-                    seen_pids.update(members)
+                # WNOWAIT keeps the root PID reserved until cleanup completes.
+                while os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    members = process_tree(proc.pid, seen)
+                    seen.update(members)
                     rss = sum(row[2] for row in members.values())
                     peak = max(peak, rss)
                     elapsed = time.monotonic() - started
                     # Preserve the allocating PID and growth curve, not just
                     # a final aggregate peak. Bound this diagnostic file too.
                     if elapsed >= next_sample and sample_bytes < MIB:
-                        for pid, (parent, _, resident) in sorted(members.items()):
+                        for pid, (parent, _, resident, _) in sorted(members.items()):
                             row = f"{elapsed:.3f}\t{pid}\t{parent}\t{resident}\n"
                             if sample_bytes + len(row) > MIB:
                                 break
@@ -143,13 +192,11 @@ def main():
                     elif os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size >= args.output_mib * MIB:
                         reason = "output limit exceeded"
                     if reason:
-                        stop_tree(proc.pid, members)
                         break
                     time.sleep(0.1)
-                code = proc.wait()
             finally:
-                stop_tree(proc.pid, process_tree(proc.pid, seen_pids))
-                proc.wait()
+                cleanup(proc)
+            code = proc.returncode
         # Bound our own memory too: never read the complete captured log.
         for path in (directory / "stdout.log", directory / "stderr.log"):
             with path.open("rb") as stream:

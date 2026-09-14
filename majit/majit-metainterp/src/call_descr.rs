@@ -829,12 +829,16 @@ fn make_call_descr_sized(
 /// Resolve the serialized half of an Assembler.descrs call entry once.
 /// pyjitpl.py do_residual_call records that same descriptor on every use.
 pub(crate) fn call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> DescrRef {
+    assert!(
+        !bh.arg_classes.contains('S'),
+        "singlefloat call arguments require a raw ABI descriptor"
+    );
     let type_of = |class| match class {
-        'i' => Type::Int,
+        'i' | 'S' => Type::Int,
         'r' => Type::Ref,
-        // 'S' is singlefloat, 'L' is long-float. Both are float-bank
-        // values; collapsing 'S' to Int would take the integer ABI.
-        'f' | 'L' | 'S' => Type::Float,
+        // descr.py CallDescr.get_normalized_result_type / verify_types:
+        // singlefloat bits use the integer bank; longlong uses the float bank.
+        'f' | 'L' => Type::Float,
         'v' => Type::Void,
         _ => panic!("invalid call descriptor class {class:?}"),
     };
