@@ -18,7 +18,7 @@ pub struct TypeCache {
 }
 
 impl TypeCache {
-    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
+    pub const fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
         Self {
             base: SpaceCache::new(space),
         }

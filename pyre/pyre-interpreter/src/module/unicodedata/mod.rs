@@ -37,8 +37,8 @@ type PyResult = Result<PyObjectRef, PyError>;
 const UCD_MODERN: ucd_core::Ucd = ucd_core::Ucd::new(true);
 const UCD_LEGACY: ucd_core::Ucd = ucd_core::Ucd::new(false);
 
-fn ucd(legacy: bool) -> ucd_core::Ucd {
-    if legacy { UCD_LEGACY } else { UCD_MODERN }
+fn ucd(legacy: bool) -> &'static ucd_core::Ucd {
+    if legacy { &UCD_LEGACY } else { &UCD_MODERN }
 }
 
 /// Extract the single-code-point argument of a character function.
@@ -112,14 +112,14 @@ fn char_and_default(
 // Version-sensitive queries take a `Ucd` built from `W_UCD.legacy`
 // (`interp_ucd.py` `self._unicodedb`).
 
-fn category_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn category_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(db.category(one_char("category", args)?)))
 }
 fn category(args: &[PyObjectRef]) -> PyResult {
     category_impl(ucd(false), args)
 }
 
-fn bidirectional_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn bidirectional_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         db.bidirectional(one_char("bidirectional", args)?),
     ))
@@ -128,7 +128,7 @@ fn bidirectional(args: &[PyObjectRef]) -> PyResult {
     bidirectional_impl(ucd(false), args)
 }
 
-fn east_asian_width_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn east_asian_width_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         db.east_asian_width(one_char("east_asian_width", args)?),
     ))
@@ -137,21 +137,21 @@ fn east_asian_width(args: &[PyObjectRef]) -> PyResult {
     east_asian_width_impl(ucd(false), args)
 }
 
-fn combining_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn combining_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_int_new(db.combining(one_char("combining", args)?) as i64))
 }
 fn combining(args: &[PyObjectRef]) -> PyResult {
     combining_impl(ucd(false), args)
 }
 
-fn mirrored_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn mirrored_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_int_new(db.mirrored(one_char("mirrored", args)?) as i64))
 }
 fn mirrored(args: &[PyObjectRef]) -> PyResult {
     mirrored_impl(ucd(false), args)
 }
 
-fn decomposition_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn decomposition_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     Ok(w_str_new_managed(
         &db.decomposition(one_char("decomposition", args)?),
     ))
@@ -160,7 +160,7 @@ fn decomposition(args: &[PyObjectRef]) -> PyResult {
     decomposition_impl(ucd(false), args)
 }
 
-fn digit_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn digit_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("digit", args)?;
     match db.digit(cp) {
         Some(v) => Ok(w_int_new(v as i64)),
@@ -171,7 +171,7 @@ fn digit(args: &[PyObjectRef]) -> PyResult {
     digit_impl(ucd(false), args)
 }
 
-fn decimal_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn decimal_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("decimal", args)?;
     match db.decimal(cp) {
         Some(v) => Ok(w_int_new(v as i64)),
@@ -182,7 +182,7 @@ fn decimal(args: &[PyObjectRef]) -> PyResult {
     decimal_impl(ucd(false), args)
 }
 
-fn numeric_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn numeric_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("numeric", args)?;
     match db.numeric(cp) {
         Some(v) => Ok(w_float_new(v)),
@@ -196,7 +196,7 @@ fn numeric(args: &[PyObjectRef]) -> PyResult {
 /// Short general-category name of an unassigned code point.
 const UNASSIGNED_CATEGORY: &str = "Cn";
 
-fn name_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn name_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     let (cp, default) = char_and_default("name", args)?;
     // A view has no name for a code point its own release leaves unassigned,
     // so the version's general category gates the name table: `ucd_3_2_0.name`
@@ -217,7 +217,7 @@ fn name(args: &[PyObjectRef]) -> PyResult {
 // `lookup` is versioned: aliases and named sequences exist only on the
 // modern UCD.
 
-fn lookup_impl(db: ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
+fn lookup_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
         return Err(PyError::type_error(format!(
             "lookup expected 1 argument, got {}",

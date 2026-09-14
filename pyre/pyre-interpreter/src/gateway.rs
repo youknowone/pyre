@@ -359,7 +359,7 @@ pub struct GatewayCache {
 }
 
 impl GatewayCache {
-    pub fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
+    pub const fn new(space: crate::baseobjspace::SpaceHandle) -> Self {
         Self {
             base: crate::baseobjspace::SpaceCache::new(space),
         }
@@ -520,12 +520,7 @@ pub fn interp2app_spacebind(
     gateway: PyObjectRef,
     space: &crate::baseobjspace::ObjSpace,
 ) -> PyObjectRef {
-    let crate::baseobjspace::SpaceCacheInstance::GatewayCache(cache) =
-        space.fromcache(crate::baseobjspace::SpaceCacheClass::GatewayCache)
-    else {
-        unreachable!()
-    };
-    cache.getorbuild(gateway)
+    space.gateway_cache().getorbuild(gateway)
 }
 
 #[cfg(test)]

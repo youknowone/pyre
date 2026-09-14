@@ -270,10 +270,10 @@ impl<K, V, B: SpaceCacheBuild<K, V>> majit_rlib::cache::CacheBuilder<K, V>
 }
 
 impl<K, V, S> SpaceCache<K, V, S> {
-    pub fn new(space: S) -> Self {
+    pub const fn new(space: S) -> Self {
         Self {
             space,
-            base: majit_rlib::cache::Cache::default(),
+            base: majit_rlib::cache::Cache::EMPTY,
         }
     }
 
@@ -639,6 +639,8 @@ pub struct ObjSpace {
     fromcache: InternalSpaceCache<SpaceCacheClass, SpaceHandle>,
     sys_state: crate::module::sys::state::SysState,
     class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy,
+    gateway_cache: crate::gateway::GatewayCache,
+    type_cache: crate::objspace::std::typeobject::TypeCache,
 }
 
 impl ObjSpace {
@@ -651,6 +653,8 @@ impl ObjSpace {
         class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(
             SpaceHandle::ProcessWide,
         ),
+        gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::ProcessWide),
+        type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::ProcessWide),
     };
 
     pub fn sys_state(&self) -> &crate::module::sys::state::SysState {
@@ -661,6 +665,14 @@ impl ObjSpace {
         &self.class_dict_strategy
     }
 
+    pub fn gateway_cache(&self) -> &crate::gateway::GatewayCache {
+        &self.gateway_cache
+    }
+
+    pub fn type_cache(&self) -> &crate::objspace::std::typeobject::TypeCache {
+        &self.type_cache
+    }
+
     pub fn new() -> std::sync::Arc<Self> {
         let space = std::sync::Arc::new_cyclic(|space| Self {
             fromcache: InternalSpaceCache::new(SpaceHandle::Isolated(space.clone())),
@@ -668,6 +680,10 @@ impl ObjSpace {
             class_dict_strategy: crate::objspace::std::classdict::ClassDictStrategy::new(
                 SpaceHandle::Isolated(space.clone()),
             ),
+            gateway_cache: crate::gateway::GatewayCache::new(SpaceHandle::Isolated(space.clone())),
+            type_cache: crate::objspace::std::typeobject::TypeCache::new(SpaceHandle::Isolated(
+                space.clone(),
+            )),
         });
         OBJECT_SPACE_ROOTS
             .lock()
@@ -683,6 +699,8 @@ impl ObjSpace {
     }
 
     pub fn walk_cache_roots(&self, forward: &mut dyn FnMut(&mut PyObjectRef)) {
+        self.gateway_cache.walk_roots(forward);
+        self.type_cache.walk_roots(forward);
         self.fromcache.visit_values_mut(|cache| match cache {
             SpaceCacheInstance::GatewayCache(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::TypeCache(cache) => cache.walk_roots(forward),
@@ -697,11 +715,7 @@ impl ObjSpace {
         &self,
         definition: *const pyre_object::typedef::TypeDef,
     ) -> Result<PyObjectRef, majit_rlib::cache::CacheError<crate::PyError>> {
-        let SpaceCacheInstance::TypeCache(cache) = self.fromcache(SpaceCacheClass::TypeCache)
-        else {
-            unreachable!()
-        };
-        unsafe { cache.getorbuild(definition) }
+        unsafe { self.type_cache.getorbuild(definition) }
     }
 }
 
