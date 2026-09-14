@@ -9121,7 +9121,10 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
 )> {
     let (lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val) =
         walker_int_specialization_input_operands(ctx, r_args)?;
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    // A virtual wrapint has no concrete pointer, so the authentic helper
+    // cannot run.  `walker_newbool_guarded` / wrapint of the raw result
+    // does not need that shadow; 0 is only the residual-box fallback.
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr).unwrap_or(0);
     Some((
         lhs,
         rhs,
@@ -9153,31 +9156,50 @@ fn walker_int_specialization_input_operands<Sym: WalkSym>(
     }
     let lhs = r_args[0];
     let rhs = r_args[1];
-    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
-    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
-    let (lhs_val, rhs_val) = unsafe {
-        // `bool` is a `W_IntObject` subclass sharing the `intval` layout; the
-        // consumer unboxes it through its own `&BOOL_TYPE` guard, so it stays
-        // on the int path. Returns the concrete objects so the consumer can
-        // pick the per-operand class/descr.
-        if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
-            return None;
-        }
-        // A numeric subclass keeps the builtin `ob_type` layout while its
-        // Python-visible class lives in `w_class`.  The raw int specialization
-        // bypasses special-method dispatch, so only exact builtin ints/bools
-        // may enter it; subclasses continue through the residual BINARY_OP.
-        if !pyre_object::is_exact_builtin_instance(lhs_obj)
-            || !pyre_object::is_exact_builtin_instance(rhs_obj)
-        {
-            return None;
-        }
-        (
-            pyre_object::w_int_get_value(lhs_obj),
-            pyre_object::w_int_get_value(rhs_obj),
-        )
-    };
+    let (lhs_obj, lhs_val) = walker_int_specialization_one_operand(ctx, lhs)?;
+    let (rhs_obj, rhs_val) = walker_int_specialization_one_operand(ctx, rhs)?;
     Some((lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val))
+}
+
+/// One operand of [`walker_int_specialization_input_operands`].
+///
+/// A heap `W_IntObject` / `W_BoolObject` still answers from its concrete
+/// shadow.  A walker-made wrapint (`emit_box_int_inline`) has no concrete
+/// pointer — `set_opref_concrete` is not called — so the concrete path
+/// declines and COMPARE/BINARY residualise as `CallMayForceR`.  That New
+/// already has `intval` in the heapcache and `class_now_known`; read those
+/// the way `optimizeopt` folds `getfield intval` on a virtual wrapint.
+fn walker_int_specialization_one_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    operand: OpRef,
+) -> Option<(pyre_object::PyObjectRef, i64)> {
+    if let Some(obj) = walker_concrete_ref_object(ctx, operand) {
+        let val = unsafe {
+            if !pyre_object::is_int(obj) {
+                return None;
+            }
+            // A numeric subclass keeps the builtin `ob_type` layout while its
+            // Python-visible class lives in `w_class`.  The raw int
+            // specialization bypasses special-method dispatch, so only exact
+            // builtin ints/bools may enter it; subclasses continue through
+            // the residual BINARY_OP / COMPARE_OP.
+            if !pyre_object::is_exact_builtin_instance(obj) {
+                return None;
+            }
+            pyre_object::w_int_get_value(obj)
+        };
+        return Some((obj, val));
+    }
+    if !ctx.trace_ctx.heap_cache().is_class_known(operand) {
+        return None;
+    }
+    let cached = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(operand, crate::descr::int_intval_descr().index())?;
+    let majit_ir::Value::Int(n) = ctx.trace_ctx.box_value(cached)? else {
+        return None;
+    };
+    Some((std::ptr::null_mut(), n))
 }
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
@@ -10570,6 +10592,11 @@ unsafe fn walker_exact_builtin_class(
 /// already sufficient. Heap operands were admitted by
 /// `is_exact_builtin_instance` in the shared operand gate.
 fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    // A walker-made wrapint has no concrete object; it is always `int`
+    // (`emit_box_int_inline` / `note_class_word_after_new`).
+    if obj.is_null() {
+        return pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    }
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         pyre_object::PY_NULL
     } else if unsafe { pyre_object::is_bool(obj) } {

@@ -5729,7 +5729,14 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 }
 
 /// Comparison operation dispatch.
-
+///
+/// `inline(never)`: this body contains the override-loop arm
+/// (`try_compare_override`).  Inlining it into
+/// `compare_value_from_tag` makes `look_inside_graph` reject that
+/// helper, so a traced `int < int` residualises as `CallMayForceR`.
+/// `compare_slot` is the loop-free int path the trace must reach
+/// (`compare_slot_rest` is already split out for the same reason).
+#[inline(never)]
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.

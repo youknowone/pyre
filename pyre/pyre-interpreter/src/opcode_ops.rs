@@ -298,6 +298,16 @@ fn compare_value_from_tag_inner(
             )));
         }
     };
+    // Two machine ints: `compare_slot` only, so this graph stays loop-free
+    // for `look_inside_graph`.  `compare` carries the override loop and
+    // is `inline(never)` so it is not pulled in here.
+    let both_int_like = unsafe {
+        crate::objspace::descroperation::is_int_like(a)
+            && crate::objspace::descroperation::is_int_like(b)
+    };
+    if both_int_like {
+        return crate::objspace::descroperation::compare_slot(a, b, op);
+    }
     compare(a, b, op)
 }
 
