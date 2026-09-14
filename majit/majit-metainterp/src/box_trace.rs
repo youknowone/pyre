@@ -399,7 +399,38 @@ pub struct CompareOpResidual {
     pub w_true: i64,
     pub w_false: i64,
     pub newbool_fnaddr: i64,
+    pub bool_intval_descr: majit_ir::DescrRef,
+    pub w_class_descr: majit_ir::DescrRef,
+    pub ob_type_descr: majit_ir::DescrRef,
+    pub bool_type_addr: i64,
+    pub truth_fnaddrs: Vec<i64>,
     pub is_exact_int: fn(i64) -> bool,
+    pub is_bool: fn(i64) -> bool,
+}
+
+/// Residual `Int, Int -> Int` Python rem (`rint.py ll_int_py_mod`).
+/// `int_mod` looks inside; the oopspec helper is residual so the
+/// sign-correction stays out of the trace. Record `CallI` with
+/// `OS_INT_PY_MOD` so `optimize_call_int_py_mod` can fold it.
+#[derive(Clone, Default)]
+pub struct IntPyModResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl IntPyModResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static INT_PY_MOD_RESIDUAL: std::sync::OnceLock<IntPyModResidual> = std::sync::OnceLock::new();
+
+pub fn register_int_py_mod_residual(spec: IntPyModResidual) {
+    let _ = INT_PY_MOD_RESIDUAL.set(spec);
+}
+
+pub fn int_py_mod_residual() -> Option<&'static IntPyModResidual> {
+    INT_PY_MOD_RESIDUAL.get()
 }
 
 impl CompareOpResidual {

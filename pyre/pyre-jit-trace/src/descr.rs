@@ -4791,6 +4791,49 @@ pub fn bool_intval_descr() -> DescrRef {
     field_descr_from_group(&W_BOOL_DESCR_GROUP, 0)
 }
 
+/// Look-inside `is_true` reads `PyObject.ob_type` / `w_class` through the
+/// translator's `stable_field_index` descrs, not [`w_class_descr`]'s
+/// reserved tag. Cache against these so those Getfields hit.
+pub fn pyobject_ob_type_stable_descr() -> DescrRef {
+    static DESCR: std::sync::OnceLock<DescrRef> = std::sync::OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            majit_ir::descr::make_field_descr_full(
+                stable_field_index(
+                    pyre_object::pyobject::OB_TYPE_OFFSET,
+                    8,
+                    Type::Ref,
+                    false,
+                ),
+                pyre_object::pyobject::OB_TYPE_OFFSET,
+                8,
+                Type::Ref,
+                false,
+            )
+        })
+        .clone()
+}
+
+pub fn pyobject_w_class_stable_descr() -> DescrRef {
+    static DESCR: std::sync::OnceLock<DescrRef> = std::sync::OnceLock::new();
+    DESCR
+        .get_or_init(|| {
+            majit_ir::descr::make_field_descr_full(
+                stable_field_index(
+                    pyre_object::pyobject::W_CLASS_OFFSET,
+                    8,
+                    Type::Ref,
+                    false,
+                ),
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                8,
+                Type::Ref,
+                false,
+            )
+        })
+        .clone()
+}
+
 pub fn float_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_DESCR_GROUP, 0)
 }

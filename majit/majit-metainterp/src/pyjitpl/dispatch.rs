@@ -1588,15 +1588,14 @@ where
 {
     /// Specialise residual `compare_slot_jit_abi` of two ints to unbox +
     /// `int_OP` + `newbool`, before `ForceToken` escapes the boxes.
-    /// FBW `try_walker_specialize_compare_op_int` uses a snapshot
-    /// `newbool` guard; interpret cannot — a `GuardTrue`/`GuardFalse`
-    /// here sits mid-caller jitcode and fail-resumes with a desynced
-    /// shadow stack. Emit `jit_bool_value_from_truth` (`EF_CANNOT_RAISE`)
-    /// so the existing `w_class`/`intval` checks still see a bool and
-    /// keep their own branch guard.
+    /// A mid-helper `GuardTrue` fail-resumes with a desynced snapshot
+    /// (hang). Cache `intval` on the elidable `newbool` box instead:
+    /// JUMP_IF's `is_true` hits the cache and records `GuardTrue` at
+    /// its own live marker, then the unused `CallR` DCEs.
     fn try_record_int_compare(
         &mut self,
         ctx: &mut TraceCtx,
+        _sym: &mut S,
         concrete_ptr: i64,
         trace_ptr: i64,
         args: &[OpRef],
@@ -1659,20 +1658,85 @@ where
             spec.int_type_addr,
             spec.intval_descr.clone(),
         );
-        let boxed = ctx.call_ref_typed_with_effect(
+        let boxed = ctx.call_typed_with_effect_pure(
+            OpCode::CallR,
             spec.newbool_fnaddr as *const (),
             &[truth],
             &[majit_ir::Type::Int],
-            majit_ir::EffectInfo::new(
-                majit_ir::ExtraEffect::CannotRaise,
-                majit_ir::OopSpecIndex::None,
-            ),
+            majit_ir::Type::Ref,
+            crate::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+            &[
+                majit_ir::Value::Int(spec.newbool_fnaddr),
+                majit_ir::Value::Int(if boxed_ptr == spec.w_true { 1 } else { 0 }),
+            ],
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
         );
+        ctx.heap_cache_mut()
+            .class_now_known(boxed, spec.bool_type_addr);
+        ctx.heapcache_setfield_cached(boxed, spec.bool_intval_descr.index(), truth);
+        let w_class_null = ctx.const_ref(0);
+        ctx.heapcache_setfield_cached(boxed, spec.w_class_descr.index(), w_class_null);
+        let ob_type = ctx.const_ref(spec.bool_type_addr);
+        ctx.heapcache_setfield_cached(boxed, spec.ob_type_descr.index(), ob_type);
         ctx.set_opref_concrete(
             boxed,
             majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
         );
         self.set_ref_reg(dst, Some(boxed), Some(boxed_ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `try_walker_specialize_truth_bool`: `is_true` of a bool is
+    /// `intval` then `int_is_true`. The compare fold caches `intval` on
+    /// the newbool box so this Getfield hits and JUMP_IF guards the
+    /// live compare at its own snapshot.
+    fn try_record_truth_bool(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        args: &[OpRef],
+        raw_r: &[i64],
+        arg_classes: &str,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::compare_op_residual()?;
+        if !spec.truth_fnaddrs.contains(&concrete_ptr) && !spec.truth_fnaddrs.contains(&trace_ptr)
+        {
+            return None;
+        }
+        if args.len() != 1 || raw_r.is_empty() {
+            return None;
+        }
+        if !(spec.is_bool)(raw_r[0]) {
+            return None;
+        }
+        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
+        {
+            return None;
+        }
+        self.clear_exception();
+        let concrete = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                arg_classes,
+                Some(&[]),
+                Some(raw_r),
+                Some(&[]),
+            )
+        };
+        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 {
+            return None;
+        }
+        let raw = crate::box_trace::trace_unbox_int(
+            ctx,
+            args[0],
+            spec.bool_type_addr,
+            spec.bool_intval_descr.clone(),
+        );
+        let truth = ctx.record_op(OpCode::IntIsTrue, &[raw]);
+        ctx.set_opref_concrete(truth, majit_ir::Value::Int(concrete));
+        self.set_int_reg(dst, Some(truth), Some(concrete));
         Some(TraceAction::Continue)
     }
 
@@ -8443,6 +8507,20 @@ where
                         return TraceAction::Continue;
                     }
 
+                    // `is_true` of a compare-folded bool: unbox `intval`
+                    // (heapcache hit) before `ForceToken`.
+                    if let Some(action) = self.try_record_truth_bool(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &args,
+                        &raw_r,
+                        &calldescr.arg_classes,
+                        dst,
+                    ) {
+                        return action;
+                    }
+
                     // pyjitpl.py:2005-2010 MAY_FORCE_I branch parity:
                     //     clear_exception  ← FIRST
                     //     vable_and_vrefs_before_residual_call
@@ -8549,11 +8627,50 @@ where
                         }
                         return TraceAction::Continue;
                     }
-                    // `_ll_2_int_mod` stays a residual CallI: rewriting it
-                    // to `IntMod` here leaves the looked-inside Python rem
-                    // conversion to record `GuardTrue(rem != 0)`, which
-                    // bakes the non-zero path and drops the exception
-                    // bridge. FBW emits `ll_int_py_mod` for the whole `%`.
+                    // `rint.py ll_int_py_mod` residual: record `OS_INT_PY_MOD`
+                    // (FBW `walker_emit_int_py_div_or_mod`). Look-inside of
+                    // `int_mod` still emits `_ll_2_int_mod` plus the
+                    // sign-correction; rewriting that C rem to Python rem
+                    // makes the correction a no-op (`(r ^ y) < 0` is false
+                    // for a same-sign remainder) so `optimize_call_int_py_mod`
+                    // can fold the call. Emitting `IntMod` instead would keep
+                    // C rem and leave `GuardTrue(rem != 0)` as a live bake.
+                    if let Some(spec) = crate::box_trace::int_py_mod_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && args.len() == 2
+                        && raw_i.len() >= 2
+                    {
+                        let func_ptr = crate::blackhole::ll_int_py_mod as *const ();
+                        let traced = ctx.call_typed_with_effect_pure(
+                            majit_ir::OpCode::CallI,
+                            func_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Int,
+                            crate::INT_PY_MOD_EFFECT_INFO,
+                            &[
+                                majit_ir::Value::Int(func_ptr as usize as i64),
+                                majit_ir::Value::Int(raw_i[0]),
+                                majit_ir::Value::Int(raw_i[1]),
+                            ],
+                            majit_ir::Value::Int(concrete),
+                        );
+                        ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
+                        self.set_int_reg(dst, Some(traced), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
                     // pyjitpl.py do_residual_call plain branch:
                     //     pure = effectinfo.check_is_elidable()
                     //     return self.execute_varargs(rop.CALL_I,
@@ -8878,6 +8995,7 @@ where
                     // InvalidLoop — bools have a null `w_class`.
                     if let Some(action) = self.try_record_int_compare(
                         ctx,
+                        sym,
                         concrete_ptr as i64,
                         trace_ptr as i64,
                         &args,
