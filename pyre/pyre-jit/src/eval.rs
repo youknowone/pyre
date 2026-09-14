@@ -6673,52 +6673,93 @@ fn portal_unique_id_from_greens(greens: &[i64]) -> i64 {
     }
 }
 
+/// `interp_jit.py get_location` fields before they become a tuple.
+fn get_location_fields(
+    next_instr: usize,
+    w_pycode: pyre_object::PyObjectRef,
+) -> (String, i64, String, i64, String) {
+    match unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) } {
+        x if x.is_null() => (
+            "<unknown>".into(),
+            0,
+            "<unknown>".into(),
+            next_instr as i64,
+            "<eof>".into(),
+        ),
+        code_ptr => {
+            let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
+            let opname = match pyre_interpreter::decode_instruction_at(code, next_instr) {
+                Some((instruction, _)) => format!("{instruction:?}"),
+                None => "<eof>".into(),
+            };
+            let line = pyre_interpreter::pycode::code_locations(code)
+                .get(next_instr)
+                .map(|(start, _)| start.line.get() as i64)
+                .unwrap_or_else(|| {
+                    code.first_line_number
+                        .map(|line| line.get() as i64)
+                        .unwrap_or(0)
+                        .saturating_add(next_instr as i64)
+                });
+            (
+                code.source_path.to_string(),
+                line,
+                code.obj_name.to_string(),
+                next_instr as i64,
+                opname,
+            )
+        }
+    }
+}
+
+/// `interp_jit.py get_location` for jitlog `DEBUG_MERGE_POINT` greens.
+///
+/// Greens are `(next_instr, is_being_profiled, pycode)`.
+fn pypyjit_jitlog_get_location(greens: &[i64]) -> Option<Vec<majit_metainterp::rjitlog::MpValue>> {
+    use majit_metainterp::rjitlog::{
+        MP_FILENAME, MP_INDEX, MP_LINENO, MP_OPCODE, MP_SCOPE, MpValue,
+    };
+    let &[next_instr, _profiled, pycode] = greens else {
+        return None;
+    };
+    let (filename, line, name, index, opcode) =
+        get_location_fields(next_instr as usize, pycode as pyre_object::PyObjectRef);
+    Some(vec![
+        MpValue::Str {
+            sem: MP_FILENAME,
+            value: filename,
+        },
+        MpValue::Int {
+            sem: MP_LINENO,
+            value: line,
+        },
+        MpValue::Str {
+            sem: MP_SCOPE,
+            value: name,
+        },
+        MpValue::Int {
+            sem: MP_INDEX,
+            value: index,
+        },
+        MpValue::Str {
+            sem: MP_OPCODE,
+            value: opcode,
+        },
+    ])
+}
+
 /// RPython interp_jit.py helper: get_location.
 pub fn get_location(
     next_instr: usize,
     _is_being_profiled: bool,
     w_pycode: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    let (filename, line, name, opcode) =
-        match unsafe { pyre_interpreter::pycode::w_code_get_ptr(w_pycode) } {
-            x if x.is_null() => (
-                "<unknown>".to_string(),
-                0,
-                "<unknown>".to_string(),
-                "<eof>".to_string(),
-            ),
-            code_ptr => {
-                let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
-                let (_opcode, opname) =
-                    match pyre_interpreter::decode_instruction_at(code, next_instr) {
-                        Some((instruction, _)) => {
-                            (format!("{instruction:?}"), format!("{:?}", instruction))
-                        }
-                        None => ("<eof>".to_string(), "<eof>".to_string()),
-                    };
-                let line = pyre_interpreter::pycode::code_locations(code)
-                    .get(next_instr)
-                    .and_then(|(start, _)| Some(start.line.get() as usize))
-                    .unwrap_or_else(|| {
-                        code.first_line_number
-                            .map(|line| line.get())
-                            .unwrap_or(0)
-                            .saturating_add(next_instr)
-                    });
-                (
-                    code.source_path.to_string(),
-                    line,
-                    code.obj_name.to_string(),
-                    opname,
-                )
-            }
-        };
-    let _ = opcode;
+    let (filename, line, name, index, opcode) = get_location_fields(next_instr, w_pycode);
     let mut fields = gc_roots::RootedItems::new();
     fields.push(w_str_new_managed(&filename));
-    fields.push(w_int_new(line as i64));
+    fields.push(w_int_new(line));
     fields.push(w_str_new_managed(&name));
-    fields.push(w_int_new(next_instr as i64));
+    fields.push(w_int_new(index));
     fields.push(w_str_new_managed(&opcode));
     w_tuple_new(fields.take())
 }
@@ -7997,6 +8038,17 @@ pub fn init_jit_hooks() {
     majit_metainterp::loop_census::register_location_printer(|next_instr, profiled, w_pycode| {
         get_printable_location(next_instr, profiled, w_pycode as pyre_object::PyObjectRef)
     });
+    // interp_jit.py `@jl.returns(MP_FILENAME, MP_LINENO, MP_SCOPE, MP_INDEX, MP_OPCODE)`.
+    majit_metainterp::rjitlog::register_get_location(
+        &[
+            (majit_metainterp::rjitlog::MP_FILENAME, b's'),
+            (majit_metainterp::rjitlog::MP_LINENO, b'i'),
+            (majit_metainterp::rjitlog::MP_SCOPE, b's'),
+            (majit_metainterp::rjitlog::MP_INDEX, b'i'),
+            (majit_metainterp::rjitlog::MP_OPCODE, b's'),
+        ],
+        pypyjit_jitlog_get_location,
+    );
     pyre_interpreter::call::register_set_jit_param_hook(set_jit_param_via_warmstate);
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
