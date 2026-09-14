@@ -1,14 +1,16 @@
-//! `l[start:]` on a GC array in a graph the rtyper never lifted.
+//! `l[start:]` and `l[:-1]` on a GC array in a graph the rtyper never lifted.
 //!
 //! The front spells a Rust `&slice[start..]` as the deferred marker call
-//! `__getslice_rangefrom(slice, start)` (`front/slice_index.rs`).  A lifted
+//! `__getslice_rangefrom(slice, start)` and `&slice[..slice.len() - 1]` as
+//! `__getslice_minusone(slice)` (`front/slice_index.rs`).  A lifted
 //! graph meets the rtyper, whose `rtype_getslice` (`rlist.py`) replaces the
-//! `getslice` with `gendirectcall(ll_listslice_startonly, RESLIST, l, start)`
-//! and mints that helper graph (`translator/rtyper/rlist.rs`).  A graph that
-//! stays on the rich-`OpKind` spine never meets the rtyper, so the marker
-//! survived to the codewriter as a call with no graph — a symbolic residual
-//! no host symbol backs, and the one wall between a builtin gateway body and
-//! its trace whenever the body passes `&args[1..]` on.
+//! `getslice` with `gendirectcall(ll_listslice_startonly, …)` or
+//! `ll_listslice_minusone` and mints that helper graph
+//! (`translator/rtyper/rlist.rs`).  A graph that stays on the rich-`OpKind`
+//! spine never meets the rtyper, so the marker survived to the codewriter as
+//! a call with no graph — a symbolic residual no host symbol backs, and the
+//! wall between a builtin gateway body and its trace whenever the body
+//! passes `&args[1..]` or `&args[..n-1]` on.
 //!
 //! This module gives that spine the same answer: [`listslice_startonly_path`]
 //! mints an `ll_listslice_startonly` graph in the rich model for the array's
@@ -43,6 +45,8 @@ use crate::parse::CallPath;
 
 /// The leaf every minted helper shares, suffixed per array identity.
 pub const LL_LISTSLICE_STARTONLY: &str = "ll_listslice_startonly";
+/// `rlist.py ll_listslice_minusone` — `l[:-1]`.
+pub const LL_LISTSLICE_MINUSONE: &str = "ll_listslice_minusone";
 
 /// The item kind and ARRAY identity of the GC array `base` names, read off an
 /// `ArrayRead` / `ArrayWrite` / `ArrayLen` / `NewArrayClear` on the same
@@ -172,7 +176,7 @@ pub fn listslice_startonly_path(
     item_ty: &ValueType,
     array_type_id: Option<&str>,
 ) -> CallPath {
-    let name = helper_name(item_ty, array_type_id);
+    let name = helper_name(LL_LISTSLICE_STARTONLY, item_ty, array_type_id);
     let path = CallPath::from_segments([name.as_str()]);
     if !cc.has_function_graph(&path) {
         let graph = build_ll_listslice_startonly_graph(&name, item_ty, array_type_id);
@@ -182,15 +186,32 @@ pub fn listslice_startonly_path(
     path
 }
 
-/// `ll_listslice_startonly__<item>[__<array identity>]`, the identity
+/// The helper path for `__getslice_minusone`, minting
+/// `rlist.py ll_listslice_minusone` on first use.
+pub fn listslice_minusone_path(
+    cc: &mut CallControl,
+    item_ty: &ValueType,
+    array_type_id: Option<&str>,
+) -> CallPath {
+    let name = helper_name(LL_LISTSLICE_MINUSONE, item_ty, array_type_id);
+    let path = CallPath::from_segments([name.as_str()]);
+    if !cc.has_function_graph(&path) {
+        let graph = build_ll_listslice_minusone_graph(&name, item_ty, array_type_id);
+        cc.register_function_graph_with_hints(path.clone(), graph, vec!["unroll_safe".into()]);
+        cc.add_candidate_graph(path.clone());
+    }
+    path
+}
+
+/// `ll_listslice_*__<item>[__<array identity>]`, the identity
 /// reduced to identifier characters so the leaf stays a plain path segment.
-fn helper_name(item_ty: &ValueType, array_type_id: Option<&str>) -> String {
+fn helper_name(leaf: &str, item_ty: &ValueType, array_type_id: Option<&str>) -> String {
     let item = match item_ty {
         ValueType::Ref(_) => "ref",
         ValueType::Float => "float",
         _ => "int",
     };
-    let mut name = format!("{LL_LISTSLICE_STARTONLY}__{item}");
+    let mut name = format!("{leaf}__{item}");
     if let Some(id) = array_type_id {
         name.push_str("__");
         name.extend(
@@ -261,11 +282,105 @@ pub fn build_ll_listslice_startonly_graph(
             array_type_id: array_type_id.clone(),
         },
     );
-    let zero = push(&mut graph, start_block, OpKind::ConstInt(0));
+    emit_ll_arraycopy_loop(
+        &mut graph,
+        start_block,
+        l1,
+        start,
+        new_list,
+        newlength,
+        item_ty,
+        array_type_id,
+    );
+    graph
+}
 
-    // ll_arraycopy(l1, l, start, 0, newlength):
-    //   i = 0
-    //   while i < newlength: l[i] = l1[start + i]; i += 1
+/// `rlist.py ll_listslice_minusone` in the rich model.
+///
+/// ```python
+/// def ll_listslice_minusone(RESLIST, l1):
+///     newlength = l1.ll_length() - 1
+///     l = RESLIST.ll_newlist(newlength)
+///     ll_arraycopy(l1, l, 0, 0, newlength)
+///     return l
+/// ```
+pub fn build_ll_listslice_minusone_graph(
+    name: &str,
+    item_ty: &ValueType,
+    array_type_id: Option<&str>,
+) -> FunctionGraph {
+    let array_type_id = array_type_id.map(str::to_string);
+    let mut graph = FunctionGraph::new(name);
+    let start_block = graph.startblock;
+
+    let l1 = graph.alloc_value_var();
+    graph.push_inputarg_var(start_block, l1.clone());
+    graph.push_op_with_result_var(
+        start_block,
+        OpKind::Input {
+            name: "l1".to_string(),
+            ty: ValueType::Ref(None),
+            class_root: None,
+        },
+        l1.clone(),
+    );
+
+    let len1 = push(
+        &mut graph,
+        start_block,
+        OpKind::ArrayLen {
+            base: l1.clone(),
+            array_type_id: array_type_id.clone(),
+            nolength: false,
+        },
+    );
+    let one = push(&mut graph, start_block, OpKind::ConstInt(1));
+    let newlength = push(
+        &mut graph,
+        start_block,
+        OpKind::BinOp {
+            op: "sub".into(),
+            lhs: len1,
+            rhs: one,
+            result_ty: ValueType::Int,
+        },
+    );
+    let new_list = push(
+        &mut graph,
+        start_block,
+        OpKind::NewArrayClear {
+            length: newlength.clone(),
+            item_ty: item_ty.clone(),
+            array_type_id: array_type_id.clone(),
+        },
+    );
+    let start = push(&mut graph, start_block, OpKind::ConstInt(0));
+    emit_ll_arraycopy_loop(
+        &mut graph,
+        start_block,
+        l1,
+        start,
+        new_list,
+        newlength,
+        item_ty,
+        array_type_id,
+    );
+    graph
+}
+
+/// `ll_arraycopy(l1, l, start, 0, newlength)` as the item loop, because the
+/// rich model has no arraycopy residual.
+fn emit_ll_arraycopy_loop(
+    graph: &mut FunctionGraph,
+    start_block: crate::model::BlockId,
+    l1: Variable,
+    start: Variable,
+    new_list: Variable,
+    newlength: Variable,
+    item_ty: &ValueType,
+    array_type_id: Option<String>,
+) {
+    let zero = push(graph, start_block, OpKind::ConstInt(0));
     let (head, head_args) = graph.create_block_with_arg_vars(5);
     let (body, body_args) = graph.create_block_with_arg_vars(5);
     let (done, done_args) = graph.create_block_with_arg_vars(1);
@@ -279,7 +394,7 @@ pub fn build_ll_listslice_startonly_graph(
         unreachable!("head block was created with five inputargs")
     };
     let in_range = push(
-        &mut graph,
+        graph,
         head,
         OpKind::BinOp {
             op: "lt".into(),
@@ -301,7 +416,7 @@ pub fn build_ll_listslice_startonly_graph(
         unreachable!("body block was created with five inputargs")
     };
     let src_index = push(
-        &mut graph,
+        graph,
         body,
         OpKind::BinOp {
             op: "add".into(),
@@ -311,7 +426,7 @@ pub fn build_ll_listslice_startonly_graph(
         },
     );
     let item = push(
-        &mut graph,
+        graph,
         body,
         OpKind::ArrayRead {
             base: b_l1.clone(),
@@ -334,9 +449,9 @@ pub fn build_ll_listslice_startonly_graph(
         },
         false,
     );
-    let one = push(&mut graph, body, OpKind::ConstInt(1));
+    let one = push(graph, body, OpKind::ConstInt(1));
     let next_i = push(
-        &mut graph,
+        graph,
         body,
         OpKind::BinOp {
             op: "add".into(),
@@ -357,12 +472,10 @@ pub fn build_ll_listslice_startonly_graph(
         ],
     );
 
-    // return l
     let [d_list] = done_args.as_slice() else {
         unreachable!("done block was created with one inputarg")
     };
     graph.set_return(done, Some(d_list.clone()));
-    graph
 }
 
 fn push(graph: &mut FunctionGraph, block: crate::model::BlockId, kind: OpKind) -> Variable {
@@ -380,6 +493,18 @@ pub fn is_getslice_rangefrom(op: &SpaceOperation) -> bool {
             args,
             ..
         } if segments.len() == 1 && segments[0] == "__getslice_rangefrom" && args.len() == 2
+    )
+}
+
+/// The op is the front's `__getslice_minusone(slice)` marker (`l[:-1]`).
+pub fn is_getslice_minusone(op: &SpaceOperation) -> bool {
+    matches!(
+        &op.kind,
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if segments.len() == 1 && segments[0] == "__getslice_minusone" && args.len() == 1
     )
 }
 
@@ -429,6 +554,41 @@ mod tests {
         assert_eq!(body.exits[0].target, crate::model::BlockId(3));
         let done = graph.block(crate::model::BlockId(5));
         assert_eq!(done.exits[0].target, graph.returnblock);
+    }
+
+    #[test]
+    fn minusone_helper_has_one_list_arg_and_the_copy_loop() {
+        let graph = build_ll_listslice_minusone_graph(
+            "ll_listslice_minusone__ref",
+            &ValueType::Ref(None),
+            Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
+        assert_eq!(graph.blocks.len(), 6);
+        let start = graph.block(graph.startblock);
+        assert_eq!(start.inputargs.len(), 1);
+        assert!(
+            start
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayLen { .. }))
+        );
+        assert!(
+            start
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::NewArrayClear { .. }))
+        );
+        let body = graph.block(crate::model::BlockId(4));
+        assert!(
+            body.operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+        );
+        assert!(
+            body.operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayWrite { .. }))
+        );
     }
 
     #[test]
@@ -568,5 +728,37 @@ mod tests {
             },
         };
         assert_eq!(cc.guess_call_kind(&call), CallKind::Regular);
+    }
+
+    #[test]
+    fn minusone_helper_is_minted_once_and_is_a_regular_callee() {
+        use crate::codewriter::call::CallKind;
+        let mut cc = CallControl::new();
+        let first = listslice_minusone_path(&mut cc, &ValueType::Ref(None), Some("objref"));
+        let again = listslice_minusone_path(&mut cc, &ValueType::Ref(None), Some("objref"));
+        assert_eq!(first, again);
+        let startonly = listslice_startonly_path(&mut cc, &ValueType::Ref(None), Some("objref"));
+        assert_ne!(first, startonly);
+        let call = SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![first.last_segment().unwrap().to_string()],
+                },
+                args: crate::model::call_args(vec![Variable::new()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        assert_eq!(cc.guess_call_kind(&call), CallKind::Regular);
+        assert!(is_getslice_minusone(&SpaceOperation {
+            result: Some(Variable::new()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__getslice_minusone".into()],
+                },
+                args: crate::model::call_args(vec![Variable::new()]),
+                result_ty: ValueType::Ref(None),
+            },
+        }));
     }
 }

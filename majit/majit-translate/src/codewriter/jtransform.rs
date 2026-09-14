@@ -4789,6 +4789,33 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_operation(&helper_call, graph_name, graph);
         }
+        // `__getslice_minusone(l)` — the front's deferred `l[:-1]`.
+        // `rtype_getslice` (`rlist.py:906-911`) turns the lifted
+        // `getslice(l, 0, -1)` into `ll_listslice_minusone`; a graph on
+        // this spine never met the rtyper, so mint that helper here the
+        // same way `__getslice_rangefrom` mints `ll_listslice_startonly`.
+        if crate::codewriter::getslice::is_getslice_minusone(op)
+            && let Some((item_ty, array_type_id)) =
+                crate::codewriter::getslice::array_identity_of_base(graph, &args[0])
+            && let Some(cc) = self.callcontrol.as_deref_mut()
+        {
+            let path = crate::codewriter::getslice::listslice_minusone_path(
+                cc,
+                &item_ty,
+                array_type_id.as_deref(),
+            );
+            let helper_call = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: path.segments.clone(),
+                    },
+                    args: crate::model::call_args(args.iter().cloned()),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            return self.rewrite_operation(&helper_call, graph_name, graph);
+        }
         // RPython `jtransform.py rewrite_op_jit_marker`:
         // marker calls never reach `guess_call_kind` — they dispatch straight
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
