@@ -7104,7 +7104,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // (`jit_str_concat`) off the backing-array heap-cache, the same
     // channel as `BINARY_OP ADD` of two exact `str`s.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BuildStringFromArray
-        && try_walker_specialize_build_string(ctx, op.pc, &r_args, dst, dst_bank)?.is_some()
+        && spec_gate(SpecFold::BuildString, || {
+            try_walker_specialize_build_string(ctx, op.pc, &r_args, dst, dst_bank)
+        })?
+        .is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }

@@ -5422,42 +5422,29 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
+    /// `optimizer.py Optimizer.__init__`: every Optimizer the metainterp
+    /// mints — `make_optimizer`, a recycled one, SimpleCompile, and the
+    /// unroll-cancel retry — gets `metainterp_sd.cpu` plus the host
+    /// resolvers `ConstPtrInfo.getstrlen1` / vstring read off that cpu.
+    /// `default_pipeline()` leaves those slots empty.
+    fn pin_optimizer_host_state(&self, opt: &mut Optimizer) {
+        opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
+        opt.cpu = self.cpu.clone();
+        opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
+        opt.set_vrefinfo(self.virtualref_info().clone());
+        opt.constant_fold_alloc = Some(crate::optimizeopt::leak_constant_fold_alloc());
+        opt.string_length_resolver = self.string_length_resolver.clone();
+        opt.string_content_resolver = self.string_content_resolver.clone();
+        opt.string_constant_alloc = self.string_constant_alloc.clone();
+    }
+
     fn make_optimizer(&self) -> Optimizer {
         let mut opt = if let Some(config) = self.current_virtualizable_optimizer_config() {
             Optimizer::default_pipeline_with_virtualizable(config)
         } else {
             Optimizer::default_pipeline()
         };
-        opt.supports_efficient_uint_mul_high = self.backend.supports_efficient_uint_mul_high();
-        // optimizer.py Optimizer.__init__: `self.cpu = metainterp_sd.cpu`.
-        opt.cpu = self.cpu.clone();
-        opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
-        // `virtualize.py:140` `vrefinfo =
-        // self.optimizer.metainterp_sd.virtualref_info` — install the
-        // live `VirtualRefInfo` from `MetaInterp.virtualref_info` so
-        // OptVirtualize emit sites read the same cpu-attached descrs
-        // PyPy's `cpu.fielddescrof(JIT_VIRTUAL_REF, ...)` would.
-        opt.set_vrefinfo(self.virtualref_info().clone());
-        // optimizer.py: constant_fold — allocate immutable objects
-        // at compile time. Uses Box::leak for permanent allocation (immutable
-        // objects are never freed, matching RPython's prebuilt constants).
-        opt.constant_fold_alloc = Some(Box::new(|size_bytes: usize| {
-            let layout = std::alloc::Layout::from_size_align(size_bytes, 8)
-                .unwrap_or(std::alloc::Layout::new::<u8>());
-            let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-            if ptr.is_null() {
-                majit_ir::GcRef::NULL
-            } else {
-                majit_ir::GcRef(ptr as usize)
-            }
-        }));
-        // info.py `ConstPtrInfo.getstrlen1(mode)` — propagate the
-        // host-runtime resolver so constant STRLEN / UNICODELEN operations
-        // can fold to an exact `IntBound::from_constant(len)` during
-        // intbounds postprocessing.
-        opt.string_length_resolver = self.string_length_resolver.clone();
-        opt.string_content_resolver = self.string_content_resolver.clone();
-        opt.string_constant_alloc = self.string_constant_alloc.clone();
+        self.pin_optimizer_host_state(&mut opt);
         opt
     }
 
@@ -5472,16 +5459,7 @@ impl<M: Clone> MetaInterp<M> {
                     return self.make_optimizer();
                 }
                 opt.recycle_for_next_compile();
-                // optimizer.py Optimizer.__init__: `self.cpu = metainterp_sd.cpu`.
-                // Recycle keeps the previous cpu; re-pin to this MetaInterp.
-                opt.cpu = self.cpu.clone();
-                opt.supports_efficient_uint_mul_high =
-                    self.backend.supports_efficient_uint_mul_high();
-                opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
-                opt.set_vrefinfo(self.virtualref_info().clone());
-                opt.string_length_resolver = self.string_length_resolver.clone();
-                opt.string_content_resolver = self.string_content_resolver.clone();
-                opt.string_constant_alloc = self.string_constant_alloc.clone();
+                self.pin_optimizer_host_state(&mut opt);
                 opt
             }
             None => self.make_optimizer(),
@@ -7915,6 +7893,11 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
+        unroll_opt.string_length_resolver = self.string_length_resolver.clone();
+        unroll_opt.string_content_resolver = self.string_content_resolver.clone();
+        unroll_opt.string_constant_alloc = self.string_constant_alloc.clone();
+        unroll_opt.vrefinfo = Some(self.virtualref_info().clone());
+        unroll_opt.pureop_historylength = self.warm_state.pureop_historylength() as usize;
         // Seed the phase optimizers' `input_ops`. Non-cut: `close_loop` only
         // appends, so `preamble_data.base.operations()`'s loop-body `Rc<Op>`
         // are the recorder objects carrying the authoritative Phase-1
@@ -8110,9 +8093,7 @@ impl<M: Clone> MetaInterp<M> {
                         } else {
                             Optimizer::default_pipeline()
                         };
-                        simple_opt.supports_efficient_uint_mul_high =
-                            self.backend.supports_efficient_uint_mul_high();
-                        simple_opt.cpu = self.cpu.clone();
+                        self.pin_optimizer_host_state(&mut simple_opt);
                         // Clone rather than move: only the success arm below hands
                         // the list back, so a retry that aborts would otherwise
                         // leave `unroll_opt.all_descrs` empty, and the
@@ -9838,6 +9819,11 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
         unroll_opt.cpu = self.cpu.clone();
+        unroll_opt.string_length_resolver = self.string_length_resolver.clone();
+        unroll_opt.string_content_resolver = self.string_content_resolver.clone();
+        unroll_opt.string_constant_alloc = self.string_constant_alloc.clone();
+        unroll_opt.vrefinfo = Some(self.virtualref_info().clone());
+        unroll_opt.pureop_historylength = self.warm_state.pureop_historylength() as usize;
         unroll_opt.phase2_input_ops_seed = phase2_input_ops_seed;
         unroll_opt.call_pure_results = call_pure_results.clone();
         // opencoder.py:264-267 `self.inputargs = [rop.inputarg_from_tp(arg.type)
@@ -10865,9 +10851,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.supports_efficient_uint_mul_high =
-            self.backend.supports_efficient_uint_mul_high();
-        optimizer.cpu = self.cpu.clone();
+        self.pin_optimizer_host_state(&mut optimizer);
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py:_make_op parity: every InputArg carries its type
@@ -11380,9 +11364,7 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             Optimizer::default_pipeline()
         };
-        optimizer.supports_efficient_uint_mul_high =
-            self.backend.supports_efficient_uint_mul_high();
-        optimizer.cpu = self.cpu.clone();
+        self.pin_optimizer_host_state(&mut optimizer);
         optimizer.all_descrs = self.staticdata.all_descrs().lock().clone();
         optimizer.call_pure_results = simple_data.call_pure_results.clone();
         // history.py/261/307 — `Const.type` / `InputArg.type` are
