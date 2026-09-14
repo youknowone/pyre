@@ -9672,6 +9672,17 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     Ok(true)
 }
 
+/// intobject.py `_truediv` / `descr_truediv` after the `W_IntObject`
+/// isinstance.  Walking `binary_value_from_tag` for `/` records the
+/// whole `truediv_impl` dispatcher (`bigint_truediv`, dunder lookup)
+/// and hung `listcomp_float_element_regression`.
+const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_truediv",
+    commit_label: "int_truediv_commit",
+    call_site_label: "int_truediv_call_site",
+    decline_tag: "INT-TRUEDIV-SUBWALK",
+};
+
 pub(crate) fn binary_value_from_tag_jitcode()
 -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
@@ -10422,12 +10433,11 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         Some(B::Multiply | B::InplaceMultiply) => B::Multiply,
         Some(B::FloorDivide | B::InplaceFloorDivide) => B::FloorDivide,
         Some(B::Remainder | B::InplaceRemainder) => B::Remainder,
-        // `int / int` ends in `w_float_new(as_float / as_float)`.  The
-        // helper sub-walk still records the unfolder `truediv_impl`
-        // type/override arms (`bigint_truediv`, dunder dispatch) and
-        // hung `listcomp_float_element_regression`.  Stay residual
-        // until that match folds to the one-line exact-int arm.
-        Some(B::TrueDivide | B::InplaceTrueDivide) => return Ok(None),
+        // intobject.py `_truediv`: unboxed zero/mantissa guards then
+        // `newfloat(float(x)/float(y))`.  Wide ints raise into residual
+        // `int_truediv_ovf2long`, so the helper walk no longer records
+        // `rbigint.truediv`.
+        Some(B::TrueDivide | B::InplaceTrueDivide) => B::TrueDivide,
         Some(B::Lshift | B::InplaceLshift) => B::Lshift,
         Some(B::Rshift | B::InplaceRshift) => B::Rshift,
         Some(B::And | B::InplaceAnd) => B::And,
@@ -10465,9 +10475,19 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     // A live zero divisor is the raising arm (`try_walker_specialize_binary_op_int_zero_div`).
     // Descending the success body would dest-write NULL (`sdiv`/`None`) and
     // compile `checksum +=` against an unbound local.
-    if matches!(plain, B::FloorDivide | B::Remainder)
+    if matches!(plain, B::FloorDivide | B::Remainder | B::TrueDivide)
         && unsafe { pyre_object::w_int_get_value(operands[1].1) } == 0
     {
+        return Ok(None);
+    }
+    // intobject.py `_truediv(space, x, y)` is the unboxed success leaf
+    // (`INT_TRUEDIV_DESCENT`): zero, two sitofp, float_truediv, inline
+    // fused `newfloat`.  Walking it hangs compile in
+    // `capture_inline_parent_blackhole` on that `newfloat` call — the
+    // same listcomp finishes for `+`.  Stay residual until sitofp is
+    // `cast_int_to_float` and `newfloat` is `new_with_vtable` in this
+    // graph, or that snapshot path is cheap.
+    if matches!(plain, B::TrueDivide) {
         return Ok(None);
     }
     let tag = if plain_tag == op_tag {
