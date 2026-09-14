@@ -46,6 +46,10 @@ static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Hash
 static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
 
+/// `space.newutf8` / `w_str_from_storage_and_length`, identified by path.
+static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -8597,6 +8601,32 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         original_call_descr.arg_types(),
         None,
     );
+
+    if ctx.is_authoritative_executor && dst_bank == 'r' && i_args.len() == 1 && r_args.len() == 1 {
+        let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        if func_addr != 0 && NEWUTF8_FNADDRS.contains(&func_addr) {
+            if let (Some(majit_ir::Value::Int(len)), Some(storage_obj)) = (
+                ctx.trace_ctx.box_value(i_args[0]),
+                walker_concrete_ref_object(ctx, r_args[0]),
+            ) {
+                if len >= 0 {
+                    let boxed = pyre_object::unicodeobject::w_str_from_storage_and_length(
+                        storage_obj as *mut pyre_object::unicodeobject::UnicodeValueStorage,
+                        len as usize,
+                    );
+                    if let Some(result) =
+                        try_walker_orthodox_newutf8(ctx, op.pc, r_args[0], i_args[0], boxed)?
+                    {
+                        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
+            }
+        }
+    }
 
     // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before
     // any fold or residual applies the opcode. In particular,

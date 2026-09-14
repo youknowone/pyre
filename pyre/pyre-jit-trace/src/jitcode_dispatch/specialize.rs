@@ -16673,24 +16673,112 @@ fn walker_wrap_int_str_payload<Sym: WalkSym>(
         }
     };
 
-    // Fold fallback: residual wrap.  The generated `newutf8` is
-    // look-inside `malloc_typed_managed` so a descent records
-    // NewWithVtable; this emit is only reached when that walk declines.
-    let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
-    let wrapped = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        wrap,
-        &[storage, wrap_len],
-        &[majit_ir::Type::Ref, majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        wrapped,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
+    let wrapped = if let Some(descended) =
+        try_walker_orthodox_newutf8(ctx, op_pc, storage, wrap_len, boxed_result)?
+    {
+        descended
+    } else {
+        // Fold fallback: residual wrap.  The generated `newutf8` is
+        // look-inside `malloc_typed_managed` so a descent records
+        // NewWithVtable; this emit is only reached when that walk declines.
+        let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
+        let wrapped = ctx.trace_ctx.call_typed_with_effect(
+            OpCode::CallR,
+            wrap,
+            &[storage, wrap_len],
+            &[majit_ir::Type::Ref, majit_ir::Type::Int],
+            majit_ir::Type::Ref,
+            majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            wrapped,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+        );
+        wrapped
+    };
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', wrapped)?;
     Ok(())
+}
+
+/// Descend `space.newutf8` / `W_UnicodeObject.__init__` instead of the
+/// residual wrap.  Banks are int then ref: `length`, then `_utf8`.
+pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    storage: OpRef,
+    length: OpRef,
+    boxed_result: pyre_object::PyObjectRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+    let Some(jc_arc) = crate::jitcode_runtime::newutf8_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+    let payload = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
+    let concrete_len = unsafe {
+        (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    ctx.trace_ctx.set_opref_concrete(
+        storage,
+        majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "newutf8_commit",
+        "newutf8_call_site",
+        &[length],
+        &[ConcreteValue::Int(concrete_len)],
+        &[storage],
+        &[ConcreteValue::Ref(payload as pyre_object::PyObjectRef)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] NEWUTF8-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
+    );
+    Ok(Some(result))
 }
 
 /// FORMAT_SIMPLE (`f"{x}"` / empty-spec `format`) on an exact `int` or
@@ -23436,6 +23524,11 @@ fn emit_walker_descr_add<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(total_len, majit_ir::Value::Int(concrete_len));
 
+    if let Some(descended) =
+        try_walker_orthodox_newutf8(ctx, op_pc, concat, total_len, boxed_result)?
+    {
+        return Ok(descended);
+    }
     let wrap = pyre_object::unicodeobject::jit_w_str_from_storage_and_length as *const ();
     let wrapped = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
