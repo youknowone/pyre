@@ -1387,14 +1387,17 @@ impl Optimization for OptPure {
             let result = ctx.materialize_operand_at(op.pos().get());
             ctx.with_intbound_mut(&result, |bound| bound.make_bool());
         }
-        // pure.py DefaultOptimizationResult._callback records a saved pure
-        // op after downstream passes and emission have processed it.
-        if op.opcode.is_always_pure()
-            && let Some(shared) = ctx.producer_in_new_operations(op.pos().get())
-            && shared.opcode.is_always_pure()
-        {
-            self.pure(&shared);
-            self.short_preamble_pure_ops.push(shared);
+        // pure.py DefaultOptimizationResult._callback: `recentops.add(op)`
+        // records the optimized op itself. Looking it up in `new_operations`
+        // missed when emit reminted the result pos, so the ring stayed empty
+        // and identical IntEq never CSEd.
+        if op.opcode.is_always_pure() {
+            self.pure(op);
+            if let Some(shared) = ctx.producer_in_new_operations(op.pos().get())
+                && shared.opcode.is_always_pure()
+            {
+                self.short_preamble_pure_ops.push(shared);
+            }
         }
         if self.pending_call_pure_position
             && (op.opcode.is_real_call() || op.opcode.is_cond_call_value())
@@ -1669,6 +1672,30 @@ mod tests {
     }
 
     #[test]
+    fn two_int_eq_of_the_same_input_and_const_cse() {
+        let result = run_pure(
+            1,
+            &[
+                op_spec(OpCode::IntEq, &[Arg::In(0), Arg::Const(Value::Int(97))]),
+                op_spec(OpCode::IntEq, &[Arg::In(0), Arg::Const(Value::Int(97))]),
+                op_spec(OpCode::IntEq, &[Arg::In(0), Arg::Const(Value::Int(98))]),
+            ],
+            &mut majit_ir::ConstMap::default(),
+            &[],
+            false,
+        );
+        let eqs: Vec<_> = result
+            .iter()
+            .filter(|op| op.opcode == OpCode::IntEq)
+            .collect();
+        assert_eq!(
+            eqs.len(),
+            2,
+            "IntEq(i0, 97) must CSE; IntEq(i0, 98) stays. got {result:?}"
+        );
+    }
+
+    #[test]
     fn pure_history_keeps_the_configured_number_of_distinct_emitted_ops() {
         let limit = crate::jit::PARAMETERS.pureop_historylength as u32;
         let mut specs: Vec<_> = (0..limit)
@@ -1686,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn downstream_removed_pure_op_is_not_reused() {
+    fn downstream_remove_does_not_unrecord_a_pure_op() {
         struct RemoveFirst(bool);
         impl Optimization for RemoveFirst {
             fn name(&self) -> &'static str {
@@ -1722,7 +1749,10 @@ mod tests {
                 types.len(),
             )
             .unwrap();
-        assert_eq!(result.len(), 1);
+        // pure.py `recentops.add(op)` records the optimized op even when a
+        // later pyre pass Removes it (RPython emits from OptPure before later
+        // passes run). The second IntNeg CSEs away, so nothing is emitted.
+        assert_eq!(result.len(), 0);
     }
 
     #[test]
