@@ -5,11 +5,13 @@
 //! when the file is unset.
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
 
-use majit_ir::{InputArg, Op, OpCode};
+use majit_ir::operand::Operand;
+use majit_ir::{InputArg, Op, OpCode, Type, Value};
 
 /// `rjitlog.py` mark table, `start = 0x11`.
 const MARK_BASE: u8 = 0x11;
@@ -21,6 +23,7 @@ pub const MARK_TRACE: u8 = MARK_BASE + 6;
 pub const MARK_TRACE_OPT: u8 = MARK_BASE + 7;
 pub const MARK_START_TRACE: u8 = MARK_BASE + 10;
 pub const MARK_JITLOG_HEADER: u8 = MARK_BASE + 13;
+pub const MARK_MERGE_POINT: u8 = MARK_BASE + 14;
 pub const MARK_ABORT_TRACE: u8 = MARK_BASE + 16;
 
 /// `rjitlog.py JITLOG_VERSION`.
@@ -105,12 +108,12 @@ pub fn start_new_trace(is_bridge: bool, descr_or_entry: u64, jd_name: &str) -> u
 }
 
 /// `rjitlog.py JitLogger.trace_aborted`.
-pub fn trace_aborted() {
+pub fn trace_aborted(tid: u64) {
     let mut state = lock();
     if state.file.is_none() {
         return;
     }
-    let payload = encode_le_addr(state.trace_id);
+    let payload = encode_le_addr(tid);
     write_marked(&mut state, MARK_ABORT_TRACE, &payload);
 }
 
@@ -120,7 +123,11 @@ pub fn trace_id() -> u64 {
 }
 
 /// `rjitlog.py JitLogger.log_trace` + `LogTrace.write`.
-pub fn write_trace<A, O>(tag: u8, inputargs: &[A], ops: &[O])
+///
+/// `tid` is the id `start_new_trace` returned for this compile, not the
+/// process-global latest id (`JitLogger.trace_id` on the logger that
+/// started the write).
+pub fn write_trace<A, O>(tag: u8, tid: u64, inputargs: &[A], ops: &[O])
 where
     A: Borrow<InputArg>,
     O: Borrow<Op>,
@@ -130,24 +137,123 @@ where
     if state.file.is_none() {
         return;
     }
-    let tid = state.trace_id;
     let header = encode_le_addr(tid);
     write_marked(&mut state, tag, &header);
+    let mut memo = VarMemo::default();
     let args: Vec<String> = inputargs
         .iter()
-        .map(|arg| {
-            let arg = arg.borrow();
-            format!("{:?}{}", arg.tp, arg.index)
-        })
+        .map(|arg| memo.inputarg(arg.borrow()))
         .collect();
     write_marked(&mut state, MARK_INPUT_ARGS, &encode_str(&args.join(",")));
     for op in ops {
-        write_resop(&mut state, op.borrow());
+        let op = op.borrow();
+        if op.opcode == OpCode::DebugMergePoint {
+            // rjitlog.py LogTrace.write: DEBUG_MERGE_POINT is not a RESOP.
+            // encode_debug_info returns when get_location is unset; write
+            // MARK_MERGE_POINT with the raw args when we have no locator.
+            let loc = op
+                .getarglist()
+                .iter()
+                .map(|arg| memo.operand(arg))
+                .collect::<Vec<_>>()
+                .join(",");
+            write_marked(&mut state, MARK_MERGE_POINT, &encode_str(&loc));
+            continue;
+        }
+        write_resop(&mut state, &mut memo, op);
+    }
+}
+
+/// `rjitlog.py LogTrace.var_to_str` memo.
+#[derive(Default)]
+struct VarMemo {
+    next: usize,
+    ids: HashMap<(u8, u64), usize>,
+}
+
+impl VarMemo {
+    fn assign(&mut self, kind: u8, key: u64) -> usize {
+        *self.ids.entry((kind, key)).or_insert_with(|| {
+            let id = self.next;
+            self.next += 1;
+            id
+        })
+    }
+
+    fn inputarg(&mut self, arg: &InputArg) -> String {
+        let kind = match arg.tp {
+            Type::Int => b'i',
+            Type::Ref => b'p',
+            Type::Float => b'f',
+            Type::Void => b'?',
+        };
+        let id = self.assign(kind, arg.index as u64);
+        format!("{}{id}", kind as char)
+    }
+
+    fn op_result(&mut self, op: &Op) -> String {
+        if op.type_ == Type::Void {
+            return String::new();
+        }
+        let kind = match op.type_ {
+            Type::Int => b'i',
+            Type::Ref => b'p',
+            Type::Float => b'f',
+            Type::Void => b'v',
+        };
+        let id = self.assign(kind, op.pos().get().raw() as u64);
+        format!("{}{id}", kind as char)
+    }
+
+    /// `rjitlog.py LogTrace.var_to_str`.
+    fn operand(&mut self, arg: &Operand) -> String {
+        if arg.is_none() {
+            return "-".into();
+        }
+        if let Some(value) = arg.const_value() {
+            return match value {
+                Value::Int(v) => v.to_string(),
+                Value::Float(v) => v.to_string(),
+                Value::Ref(r) if r.is_null() => "ConstPtr(null)".into(),
+                Value::Ref(r) => {
+                    let id = self.assign(b'c', r.0 as u64);
+                    format!("ConstPtr(ptr{id})")
+                }
+                Value::Void => "None".into(),
+            };
+        }
+        if arg.is_null_ref() {
+            return "ConstPtr(null)".into();
+        }
+        if arg.is_inputarg() {
+            let opref = arg.to_opref();
+            let tp = arg.type_();
+            let idx = opref.raw() as u64;
+            let kind = match tp {
+                Type::Int => b'i',
+                Type::Ref => b'p',
+                Type::Float => b'f',
+                Type::Void => b'?',
+            };
+            let id = self.assign(kind, idx);
+            return format!("{}{id}", kind as char);
+        }
+        if arg.is_resop() {
+            let kind = match arg.type_() {
+                Type::Int => b'i',
+                Type::Ref => b'p',
+                Type::Float => b'f',
+                Type::Void => b'v',
+            };
+            let id = self.assign(kind, arg.to_opref().raw() as u64);
+            return format!("{}{id}", kind as char);
+        }
+        "?".into()
     }
 }
 
 /// `rjitlog.py LogTrace.encode_op`.
-fn write_resop(state: &mut JitLogState, op: &Op) {
+fn write_resop(state: &mut JitLogState, memo: &mut VarMemo, op: &Op) {
     let descr = op.getdescr();
     let mark = if descr.is_some() {
         MARK_RESOP_DESCR
@@ -155,10 +261,12 @@ fn write_resop(state: &mut JitLogState, op: &Op) {
         MARK_RESOP
     };
     let mut line = encode_le_16bit(op.opcode.as_u16()).to_vec();
-    let mut body = format!("{:?}", op.pos().get());
+    let mut body = memo.op_result(op);
     for arg in op.getarglist() {
-        body.push(',');
-        body.push_str(&format!("{arg:?}"));
+        if !body.is_empty() {
+            body.push(',');
+        }
+        body.push_str(&memo.operand(&arg));
     }
     if let Some(ref d) = descr {
         body.push(',');
@@ -173,7 +281,7 @@ fn write_resop(state: &mut JitLogState, op: &Op) {
     let failargs = match op.getfailargs() {
         Some(args) => args
             .iter()
-            .map(|arg| format!("{arg:?}"))
+            .map(|arg| memo.operand(arg))
             .collect::<Vec<_>>()
             .join(","),
         None => String::new(),
@@ -239,7 +347,17 @@ mod tests {
 
     #[test]
     fn write_trace_is_a_no_op_when_disabled() {
-        write_trace::<InputArg, Op>(MARK_TRACE, &[], &[]);
-        write_trace::<InputArg, Op>(MARK_TRACE_OPT, &[], &[]);
+        write_trace::<InputArg, Op>(MARK_TRACE, 0, &[], &[]);
+        write_trace::<InputArg, Op>(MARK_TRACE_OPT, 0, &[], &[]);
+    }
+
+    #[test]
+    fn var_to_str_names_inputargs_i0_p1() {
+        let mut memo = VarMemo::default();
+        let i = InputArg::new_int(0);
+        let p = InputArg::from_type(Type::Ref, 1);
+        assert_eq!(memo.inputarg(&i), "i0");
+        assert_eq!(memo.inputarg(&p), "p1");
+        assert_eq!(memo.inputarg(&i), "i0");
     }
 }

@@ -412,9 +412,14 @@ impl<'a> CompileData<'a> {
 
     /// compile.py `CompileData.optimize_trace`: `log_trace(MARK_TRACE)`,
     /// run the subclass `optimize()` body, then `forget_optimization_info`.
-    pub fn optimize_trace<T, E>(&self, optimize: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    pub fn optimize_trace<T, E>(
+        &self,
+        tid: u64,
+        optimize: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
         crate::rjitlog::write_trace(
             crate::rjitlog::MARK_TRACE,
+            tid,
             self.inputargs(),
             self.operations(),
         );
@@ -490,9 +495,10 @@ impl<'a> SimpleCompileData<'a> {
     /// compile.py `CompileData.optimize_trace` + `SimpleCompileData.optimize`.
     pub fn optimize_trace<T, E>(
         &self,
+        tid: u64,
         optimize: impl FnOnce(&Self) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.base.optimize_trace(|| optimize(self))
+        self.base.optimize_trace(tid, || optimize(self))
     }
 }
 
@@ -533,9 +539,10 @@ impl<'a> BridgeCompileData<'a> {
     /// compile.py `CompileData.optimize_trace` + `BridgeCompileData.optimize`.
     pub fn optimize_trace<T, E>(
         &self,
+        tid: u64,
         optimize: impl FnOnce(&Self) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.base.optimize_trace(|| optimize(self))
+        self.base.optimize_trace(tid, || optimize(self))
     }
 }
 
