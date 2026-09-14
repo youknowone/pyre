@@ -295,11 +295,36 @@ pub fn elidable_ref_residual() -> Option<&'static ElidableRefResidual> {
     ELIDABLE_REF_RESIDUAL.get()
 }
 
+/// Residual `Ref -> Int` helpers that publish a tracing-only
+/// shadow-stack slot (`frame_anchor_push`). `interp_jit.py` has no
+/// slot; record the frame argument so `live` / blackhole see the red
+/// frame, not a CallR.
+#[derive(Clone, Default)]
+pub struct FrameAnchorPushResidual {
+    pub fnaddrs: Vec<i64>,
+}
+
+impl FrameAnchorPushResidual {
+    pub fn matches(&self, fnaddr: i64) -> bool {
+        self.fnaddrs.contains(&fnaddr)
+    }
+}
+
+static FRAME_ANCHOR_PUSH_RESIDUAL: std::sync::OnceLock<FrameAnchorPushResidual> =
+    std::sync::OnceLock::new();
+
+pub fn register_frame_anchor_push_residual(spec: FrameAnchorPushResidual) {
+    let _ = FRAME_ANCHOR_PUSH_RESIDUAL.set(spec);
+}
+
+pub fn frame_anchor_push_residual() -> Option<&'static FrameAnchorPushResidual> {
+    FRAME_ANCHOR_PUSH_RESIDUAL.get()
+}
+
 /// Residual `Int -> Ref` helpers that return the standard virtualizable
 /// frame (`frame_anchor_live`). `interp_jit.py` has no shadow-stack
 /// slot; the frame is the loop's red input. Reuse that OpRef when the
-/// live concrete equals the vable pointer. `frame_anchor_push` stays a
-/// recorded Call so blackhole resume still has the depth.
+/// live concrete equals the vable pointer.
 #[derive(Clone, Default)]
 pub struct FrameAnchorLiveResidual {
     pub fnaddrs: Vec<i64>,
