@@ -7707,7 +7707,7 @@ impl<'a> Lowering<'a> {
             result: Some(void),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath { segments },
-                args: vec![base],
+                args: crate::model::call_args(vec![base]),
                 result_ty: ValueType::Void,
             },
         });
