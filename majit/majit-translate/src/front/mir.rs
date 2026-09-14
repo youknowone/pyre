@@ -5027,6 +5027,21 @@ impl<'a> Lowering<'a> {
                 // later emit a symmetric `FieldRead __pos_<N>` carrying
                 // the same owner (see `resolve_place`).
                 let positional_owner = self.positional_aggregate_owner(&rvalue, &dest_ty);
+                // `as_bytes()` marks its dest; a later `Copy` / `&*view`
+                // assign must keep the mark so `slice::len` / `Rvalue::Len`
+                // still emit `__strlen` rather than `arraylen_gc`.
+                let dest_local = i as usize;
+                let inherit_byte_view = match &rvalue {
+                    Rvalue::Use(op) => self.operand_is_string_byte_view(op),
+                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => self
+                        .string_byte_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(place, local)),
+                    _ => false,
+                };
+                if inherit_byte_view && !self.string_byte_view_locals.contains(&dest_local) {
+                    self.string_byte_view_locals.push(dest_local);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -8879,6 +8894,12 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Captured before `call.args` is consumed: `slice::len` on
+        // `Copy(*byte_view)` must see the mark `Rvalue::Len` already follows.
+        let first_arg_is_string_byte_view = call
+            .args
+            .first()
+            .is_some_and(|op| self.operand_is_string_byte_view(op));
         // Second argument's MIR-declared type — `bool::then`'s closure env
         // operand.  Captured before the operands are consumed so the
         // `front::bool_then` recording can resolve the closure ADT's
@@ -10851,18 +10872,30 @@ impl<'a> Lowering<'a> {
                 }
                 // `<[T]>::is_empty` is `arraylen_gc(s) == 0`.  Keep both
                 // operations in the graph instead of residualizing the
-                // graph-less std helper.
+                // graph-less std helper.  A string-byte-view (`as_bytes()`)
+                // is `ll_strlen == 0`, not a GcArray header read.
                 if args.len() == 1 && self.is_slice_is_empty(&reg) {
                     let len = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(len.clone()),
-                        kind: OpKind::ArrayLen {
+                    let len_kind = if first_arg_is_string_byte_view {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        }
+                    } else {
+                        OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
                             nolength: false,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(len.clone()),
+                        kind: len_kind,
                     });
                     let zero = self
                         .graph
@@ -10894,17 +10927,32 @@ impl<'a> Lowering<'a> {
                 // as `Rvalue::Len(place)` eventually does, so a gateway
                 // wrapper's red `&[PyObjectRef]` argument never detours
                 // through an unregistered host residual.
+                //
+                // A string-byte-view (`as_bytes()`) is the same place
+                // `Rvalue::Len` rewrites to `__strlen`: the view is the
+                // `W_UnicodeObject`, not a GcArray header.
                 if args.len() == 1 && self.is_slice_len(&reg) {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayLen {
+                    let kind = if first_arg_is_string_byte_view {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        }
+                    } else {
+                        OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
                             nolength: false,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind,
                     });
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
@@ -14508,6 +14556,20 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::len")
+    }
+
+    /// `as_bytes()` aliases the dest to the `W_UnicodeObject` and marks
+    /// that local; a later `slice::len` / `slice::is_empty` often
+    /// receives `Copy(*local)` rather than the local itself, so the
+    /// mark must follow the projection the same way `Rvalue::Len` does.
+    fn operand_is_string_byte_view(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self
+                .string_byte_view_locals
+                .iter()
+                .any(|&local| place_references_local(place, local)),
+            Operand::Const(_) => false,
+        }
     }
 
     fn is_slice_len(&self, reg: &RegularCall) -> bool {

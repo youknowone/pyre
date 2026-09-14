@@ -775,3 +775,95 @@ pub(crate) fn guard_class_record<Sym: WalkSym>(
     }
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
+
+/// How `strgetitem` encodes its index operand.
+///
+/// `ri>i` reads an i-bank register; `rc>i` is the `USE_C_FORM` sibling
+/// (`assembler.py`) whose index is one inline signed byte.
+pub(crate) enum StrGetitemIndex {
+    Reg,
+    Const,
+}
+
+/// `pyjitpl.py opimpl_strlen` — `return self.execute(rop.STRLEN, strbox)`.
+///
+/// Operand layout `r>i`: 1B r-reg(string) + 1B i-reg(dst).  The live
+/// length is `cpu.bh_strlen` (`llmodel.py` / `pyre_cpu`), stamped so a
+/// later `goto_if_not` can take the observed branch.
+pub(crate) fn opimpl_strlen<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let string = read_ref_reg(code, op, 0, ctx)?;
+    let cpu = crate::pyre_cpu::shared();
+    let resvalue = concrete_ref_operand_ptr(code, op, 0, string, ctx)
+        .and_then(|ptr| cpu.bh_strlen(majit_ir::GcRef(ptr as usize)))
+        .map(majit_ir::Value::Int);
+    let result = ctx.trace_ctx.execute_and_record(
+        Some(cpu.as_ref()),
+        OpCode::Strlen,
+        None,
+        &[string],
+        resvalue,
+        0,
+    );
+    let dst = code[op.pc + 2] as usize;
+    let concrete = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `pyjitpl.py opimpl_strgetitem` —
+/// `return self.execute(rop.STRGETITEM, strbox, indexbox)`.
+///
+/// Operand layout `ri>i`: 1B r-reg(string) + 1B i-reg(index) + 1B i-dst.
+/// `rc>i` replaces the index register with one signed immediate byte.
+pub(crate) fn opimpl_strgetitem<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    index_kind: StrGetitemIndex,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let string = read_ref_reg(code, op, 0, ctx)?;
+    let index = match index_kind {
+        StrGetitemIndex::Reg => read_int_reg(code, op, 1, ctx)?,
+        StrGetitemIndex::Const => OpRef::ConstInt(code[op.pc + 2] as i8 as i64),
+    };
+    let cpu = crate::pyre_cpu::shared();
+    let index_value = match index.inline_const_to_value() {
+        Some(majit_ir::Value::Int(n)) => Some(n),
+        _ => ctx
+            .trace_ctx
+            .box_value(index)
+            .and_then(|value| match value {
+                majit_ir::Value::Int(n) => Some(n),
+                _ => None,
+            }),
+    }
+    .or_else(|| match index_kind {
+        StrGetitemIndex::Reg => match read_int_reg_concrete(code, op, 1, ctx) {
+            ConcreteValue::Int(n) => Some(n),
+            _ => None,
+        },
+        StrGetitemIndex::Const => Some(code[op.pc + 2] as i8 as i64),
+    });
+    let resvalue = concrete_ref_operand_ptr(code, op, 0, string, ctx)
+        .zip(index_value)
+        .and_then(|(ptr, index_value)| {
+            cpu.bh_strgetitem(majit_ir::GcRef(ptr as usize), index_value)
+        })
+        .map(majit_ir::Value::Int);
+    let result = ctx.trace_ctx.execute_and_record(
+        Some(cpu.as_ref()),
+        OpCode::Strgetitem,
+        None,
+        &[string, index],
+        resvalue,
+        0,
+    );
+    let dst = code[op.pc + 3] as usize;
+    let concrete = concrete_from_recorded_opref(ctx, result);
+    write_int_reg(ctx, op.pc, dst, result, concrete)?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
