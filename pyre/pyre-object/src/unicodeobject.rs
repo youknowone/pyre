@@ -99,7 +99,8 @@ pub const UNICODE_INDEX_STORAGE_OFFSET: usize =
 
 /// GC type id assigned to `W_UnicodeObject` at JitDriver init time.
 pub const W_UNICODE_GC_TYPE_ID: u32 = 34;
-pub static W_UNICODE_USER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+/// User-subclass str layout (`typedef.py` `_getusercls`). Unconditional id 186.
+pub const W_UNICODE_USER_GC_TYPE_ID: u32 = 186;
 
 /// GC-managed WTF-8 value buffer of a *mortal* (subclass) `str` instance.
 ///
@@ -156,7 +157,7 @@ impl crate::lltype::GcType for W_UnicodeObject {
 
 impl crate::lltype::GcType for W_UnicodeObjectUser {
     fn type_id() -> u32 {
-        W_UNICODE_USER_GC_TYPE_ID.get()
+        W_UNICODE_USER_GC_TYPE_ID
     }
     const SIZE: usize = W_UNICODE_USER_OBJECT_SIZE;
 }
@@ -574,7 +575,7 @@ pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjec
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-        W_UNICODE_USER_GC_TYPE_ID.get(),
+        W_UNICODE_USER_GC_TYPE_ID,
         W_UNICODE_USER_OBJECT_SIZE,
     );
     let mut unicode = W_UnicodeObjectUser {

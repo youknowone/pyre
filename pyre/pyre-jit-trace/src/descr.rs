@@ -4518,7 +4518,7 @@ fn build_native_user_mapdict_group(
 static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_native_user_mapdict_group(
         pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
-        pyre_object::intobject::W_INT_USER_GC_TYPE_ID.get(),
+        pyre_object::intobject::W_INT_USER_GC_TYPE_ID,
         &INT_TYPE as *const _ as usize,
         std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
         std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, storage),
@@ -4531,7 +4531,7 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_native_user_mapdict_group(
         pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
-        pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID.get(),
+        pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID,
         &pyre_object::pyobject::STR_TYPE as *const _ as usize,
         std::mem::offset_of!(pyre_object::unicodeobject::W_UnicodeObjectUser, map),
         std::mem::offset_of!(pyre_object::unicodeobject::W_UnicodeObjectUser, storage),
@@ -4544,7 +4544,7 @@ static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::ne
 static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_native_user_mapdict_group(
         pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
-        pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.get(),
+        pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID,
         &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
         std::mem::offset_of!(pyre_object::tupleobject::W_TupleObjectUser, map),
         std::mem::offset_of!(pyre_object::tupleobject::W_TupleObjectUser, storage),

@@ -37,10 +37,10 @@ pub const INT_INTVAL_OFFSET: usize = std::mem::offset_of!(W_IntObject, intval);
 /// mismatch panics on startup instead of silently misclassifying the
 /// type at collection time.
 pub const W_INT_GC_TYPE_ID: u32 = 1;
-/// User-subclass int layout (`typedef.py` translated instance class).
-/// Register-order tid is platform-dependent (darwin 221, windows 224);
-/// the driver writes it at JitDriver init.
-pub static W_INT_USER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+/// User-subclass int layout (`typedef.py` `_getusercls`). Unconditional,
+/// so its tid sits with the other closed ids (185) ahead of the
+/// target-gated tail.
+pub const W_INT_USER_GC_TYPE_ID: u32 = 185;
 pub const W_INT_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObjectUser>();
 
 // ── Prebuilt-int cache ───────────────────────────────────────────────
@@ -70,7 +70,7 @@ impl crate::lltype::GcType for W_IntObject {
 
 impl crate::lltype::GcType for W_IntObjectUser {
     fn type_id() -> u32 {
-        W_INT_USER_GC_TYPE_ID.get()
+        W_INT_USER_GC_TYPE_ID
     }
     const SIZE: usize = W_INT_USER_OBJECT_SIZE;
 }
@@ -276,7 +276,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         storage: std::ptr::null_mut(),
     };
     let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-        W_INT_USER_GC_TYPE_ID.get(),
+        W_INT_USER_GC_TYPE_ID,
         std::mem::size_of::<W_IntObjectUser>(),
     );
     if raw.is_null() {
@@ -459,6 +459,7 @@ mod tests {
         // `W_IntObject` and the id that `pyre-jit/src/eval.rs`
         // asserts at JitDriver init. See `descr.rs` re-export.
         assert_eq!(W_INT_GC_TYPE_ID, 1);
+        assert_eq!(W_INT_USER_GC_TYPE_ID, 185);
     }
 
     /// `intobject.py _bit_count` parity — verifies the popcount

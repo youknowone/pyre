@@ -97,12 +97,13 @@ pub struct W_TupleObjectUser {
 /// call sites.
 pub const W_TUPLE_GC_TYPE_ID: u32 = 8;
 pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
-pub static W_TUPLE_USER_GC_TYPE_ID: crate::lltype::TypeIdCell = crate::lltype::TypeIdCell::auto();
+/// User-subclass tuple layout (`typedef.py` `_getusercls`). Unconditional id 187.
+pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 187;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
 impl crate::lltype::GcType for W_TupleObjectUser {
     fn type_id() -> u32 {
-        W_TUPLE_USER_GC_TYPE_ID.get()
+        W_TUPLE_USER_GC_TYPE_ID
     }
     const SIZE: usize = W_TUPLE_USER_OBJECT_SIZE;
 }
@@ -335,7 +336,7 @@ fn w_tuple_new_array_backed_impl(
         w_class: crate::gc_roots::shadow_stack_get(class_slot),
     };
     let (type_id, object_size) = if user_layout {
-        (W_TUPLE_USER_GC_TYPE_ID.get(), W_TUPLE_USER_OBJECT_SIZE)
+        (W_TUPLE_USER_GC_TYPE_ID, W_TUPLE_USER_OBJECT_SIZE)
     } else {
         (W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
     };

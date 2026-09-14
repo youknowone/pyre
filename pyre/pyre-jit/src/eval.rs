@@ -4263,6 +4263,42 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
+    // `typedef.py` `_getusercls` builds one translated instance class per
+    // acceptable builtin (`W_IntObjectUser`, …). Those layouts exist on
+    // every target, so they close the ungated block with the range
+    // iterators (185-187) instead of sitting in the target-gated tail
+    // whose ids move (windows +3 vs darwin).
+    let int_user_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
+            int_object_custom_trace,
+        )
+        .object_layout_without_subclass_range(),
+    );
+    debug_assert_eq!(int_user_tid, pyre_object::intobject::W_INT_USER_GC_TYPE_ID);
+    let unicode_user_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
+            unicode_user_object_custom_trace,
+        )
+        .object_layout_without_subclass_range(),
+    );
+    debug_assert_eq!(
+        unicode_user_tid,
+        pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID
+    );
+    let tuple_user_tid = gc.register_type(
+        TypeInfo::with_custom_trace(
+            pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
+            tuple_user_object_custom_trace,
+        )
+        .object_layout_without_subclass_range(),
+    );
+    debug_assert_eq!(
+        tuple_user_tid,
+        pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID
+    );
+
     // Register `posix.DirEntry`'s four inline GC edges and
     // `posix.ScandirIterator`'s entries-list edge. The entries in
     // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are
@@ -4667,36 +4703,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         vec![],
     ));
     majit_metainterp::virtualref::set_tracing_rescall_dummy_gc_type_id(tracing_rescall_dummy_tid);
-    // `typedef.py:174-227` builds a distinct translated instance class for a
-    // user subclass of a builtin. These private header ids describe those
-    // wider payloads. They remain app-level rclass.OBJECT instances: the
-    // collector's object/referent inspection and T_IS_RPYTHON_INSTANCE bit
-    // must treat them exactly like the builtin payloads they extend. Class
-    // identity remains in `PyObject.w_class`.
-    let int_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
-            int_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
-    );
-    pyre_object::intobject::W_INT_USER_GC_TYPE_ID.set(int_user_tid);
-    let unicode_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::unicodeobject::W_UNICODE_USER_OBJECT_SIZE,
-            unicode_user_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
-    );
-    pyre_object::unicodeobject::W_UNICODE_USER_GC_TYPE_ID.set(unicode_user_tid);
-    let tuple_user_tid = gc.register_type(
-        TypeInfo::with_custom_trace(
-            pyre_object::tupleobject::W_TUPLE_USER_OBJECT_SIZE,
-            tuple_user_object_custom_trace,
-        )
-        .object_layout_without_subclass_range(),
-    );
-    pyre_object::tupleobject::W_TUPLE_USER_GC_TYPE_ID.set(tuple_user_tid);
     // `interp__weakref.py WeakrefLifeline(W_Root)` has no typedef and
     // therefore no app-level rclass vtable/subclass range.  Its three managed
     // fields still need an ordinary translated GcStruct layout. Append this
