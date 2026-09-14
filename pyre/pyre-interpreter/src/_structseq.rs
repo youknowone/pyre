@@ -25,7 +25,6 @@
 //! * `lib_pypy/_structseq.py:156-163 structseq_repr` — `"name(f0=v0,
 //!   f1=v1, ...)"` rendering.
 
-use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::sync::OnceLock;
 
@@ -37,6 +36,7 @@ use crate::PyError;
 /// metadata.  Pyre stores the name + positional field list keyed by the
 /// subclass W_TypeObject pointer so the generic field getter resolves
 /// indices without a per-field closure.
+#[derive(Clone)]
 struct StructSeqDescr {
     name: String,
     /// Field names in positional order.  Names starting with `_` are
@@ -53,13 +53,25 @@ struct StructSeqDescr {
     extra_fields: Vec<String>,
 }
 
-/// `class_ptr → StructSeqDescr`.  Pyre keys by the subclass type
-/// pointer because the GetSetProperty descriptor only carries a
-/// `name` slot (`pyre-object`'s `GetSetProperty`), not the owning class.
-static STRUCTSEQ_REGISTRY: OnceLock<Mutex<IndexMap<usize, StructSeqDescr>>> = OnceLock::new();
+/// Live type → descr. The type pointer sits in a MiniMark root so a
+/// nursery heap type can move; lookup compares the forwarded slot.
+struct StructSeqRegEntry {
+    cls_slot: Box<usize>,
+    descr: StructSeqDescr,
+}
 
-fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {
-    STRUCTSEQ_REGISTRY.get_or_init(|| Mutex::new(IndexMap::new()))
+static STRUCTSEQ_REGISTRY: OnceLock<Mutex<Vec<StructSeqRegEntry>>> = OnceLock::new();
+
+fn structseq_registry() -> &'static Mutex<Vec<StructSeqRegEntry>> {
+    STRUCTSEQ_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn structseq_lookup(cls: PyObjectRef) -> Option<StructSeqDescr> {
+    structseq_registry()
+        .lock()
+        .iter()
+        .find(|e| *e.cls_slot == cls as usize)
+        .map(|e| e.descr.clone())
 }
 
 /// Whether `obj` is one of the heap types created by `structseqtype`.
@@ -68,7 +80,7 @@ fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {
 /// keywords.  The restriction belongs to `structseqtype`, not to tuple's
 /// shared TypeDef.
 pub(crate) fn is_structseq_type(obj: PyObjectRef) -> bool {
-    structseq_registry().lock().contains_key(&(obj as usize))
+    structseq_lookup(obj).is_some()
 }
 
 /// `lib_pypy/_structseq.py:31-37 structseqfield.__get__` —
@@ -106,8 +118,7 @@ fn structseq_field_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // `_structseq.py:31-37` — an extra (dict-backed) field shadows a
     // same-named positional slot, so resolve those first.
     let resolved = {
-        let map = structseq_registry().lock();
-        let Some(entry) = map.get(&(cls as usize)) else {
+        let Some(entry) = structseq_lookup(cls) else {
             return Err(PyError::attribute_error(format!(
                 "structseq object has no field {name}"
             )));
@@ -150,12 +161,9 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         return Err(PyError::type_error("structseq __repr__ missing self"));
     }
     let cls = unsafe { (*inst).w_class };
-    let (name, fields) = {
-        let map = structseq_registry().lock();
-        map.get(&(cls as usize))
-            .map(|d| (d.name.clone(), d.fields.clone()))
-            .unwrap_or_default()
-    };
+    let (name, fields) = structseq_lookup(cls)
+        .map(|d| (d.name, d.fields))
+        .unwrap_or_default();
     let n = unsafe { pyre_object::w_tuple_len(inst) };
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     out.push_str(&name);
@@ -246,17 +254,12 @@ fn structseq_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let cls = unsafe { (*inst).w_class };
     let (name, fields, extra_fields) = {
-        let map = structseq_registry().lock();
-        let Some(descr) = map.get(&(cls as usize)) else {
+        let Some(descr) = structseq_lookup(cls) else {
             return Err(PyError::type_error(
                 "__replace__() requires a structseq instance",
             ));
         };
-        (
-            descr.name.clone(),
-            descr.fields.clone(),
-            descr.extra_fields.clone(),
-        )
+        (descr.name, descr.fields, descr.extra_fields)
     };
     if fields.iter().any(|field| field.starts_with('_')) {
         return Err(PyError::type_error(format!(
@@ -373,12 +376,9 @@ pub(crate) fn structseq_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, P
     crate::call::check_type_instantiable(cls)?;
     let n_seq = read_class_int(cls, "n_sequence_fields").unwrap_or(0) as usize;
     let n_fields = read_class_int(cls, "n_fields").unwrap_or(n_seq as i64) as usize;
-    let (name, extra_names) = {
-        let map = structseq_registry().lock();
-        map.get(&(cls as usize))
-            .map(|d| (d.name.clone(), d.extra_fields.clone()))
-            .unwrap_or_else(|| ("structseq".to_string(), Vec::new()))
-    };
+    let (name, extra_names) = structseq_lookup(cls)
+        .map(|d| (d.name, d.extra_fields))
+        .unwrap_or_else(|| ("structseq".to_string(), Vec::new()));
 
     // `_structseq.py:95-101` — the optional second arg is a dict supplying
     // values for the named-only extra fields.
@@ -770,14 +770,18 @@ fn make_struct_seq_impl(
     }
 
     {
-        structseq_registry().lock().insert(
-            cls as usize,
-            StructSeqDescr {
+        let mut cls_slot = Box::new(cls as usize);
+        unsafe {
+            pyre_object::gc_hook::try_gc_add_root((&mut *cls_slot) as *mut usize as *mut *mut u8);
+        }
+        structseq_registry().lock().push(StructSeqRegEntry {
+            cls_slot,
+            descr: StructSeqDescr {
                 name: name.to_string(),
                 fields: owned_names,
                 extra_fields: owned_extra,
             },
-        );
+        });
     }
     root_structseq_type(cls);
 
