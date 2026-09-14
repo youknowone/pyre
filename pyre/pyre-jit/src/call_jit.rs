@@ -803,12 +803,34 @@ pub(crate) extern "C" fn record_caught_blackhole_traceback(
     if frame_ptr.is_null() || exc_value == 0 {
         return;
     }
-    // A forwarding raise keeps the chain it arrived with only when this frame
-    // attached the head. When the raise came out of an inlined callee, the
-    // head names the callee and this frame still owes one node. The ownership
-    // check preserves `pyopcode.py handle_operation_error` as the
-    // one-node-per-frame-per-delivery authority.
+    // An explicit reraise preserves even a cleared or shortened traceback.
+    // An iterator exception can instead arrive from an inlined callee whose
+    // traceback does not yet contain this frame.
     if forwards_existing {
+        let py_pc = pyre_jit_trace::py_coord::exact_py_pc_for_jitcode_pc_public(
+            jitcode_index,
+            opcode_position,
+        )
+        .or_else(|| {
+            pyre_jit_trace::py_coord::containing_py_pc_for_jitcode_pc_public(
+                jitcode_index,
+                opcode_position,
+            )
+        });
+        let explicit_reraise = pyre_jit_trace::state::raw_code_for_jitcode_index(jitcode_index)
+            .zip(py_pc)
+            .and_then(|(code, pc)| unsafe {
+                pyre_interpreter::decode_instruction_at(&*code, pc as usize)
+            })
+            .is_some_and(|(instruction, _)| {
+                matches!(
+                    instruction,
+                    Instruction::RaiseVarargs { .. } | Instruction::Reraise { .. }
+                )
+            });
+        if explicit_reraise {
+            return;
+        }
         let (owns_head, head_lasti) = unsafe {
             let head =
                 pyre_object::interp_exceptions::w_exception_get_traceback(exc_value as PyObjectRef);
