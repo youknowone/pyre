@@ -62,6 +62,37 @@ def become_subreaper():
         raise OSError(error, os.strerror(error))
 
 
+def adopted_child_pids():
+    # `/proc/self/task/<pid>/children` needs CONFIG_CHECKPOINT_RESTORE.
+    # Without that file, scan `/proc` for processes whose ppid is us.
+    children_path = Path(f"/proc/self/task/{os.getpid()}/children")
+    try:
+        return [int(pid) for pid in children_path.read_text().split()]
+    except FileNotFoundError:
+        me = os.getpid()
+        try:
+            entries = list(Path("/proc").iterdir())
+        except OSError:
+            return []
+        found = []
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = Path(f"/proc/{entry.name}/stat").read_text()
+            except OSError:
+                continue
+            # `pid (comm) state ppid ...`; comm may contain spaces and ')'.
+            try:
+                after = stat.rsplit(")", 1)[1].split()
+                ppid = int(after[1])
+            except (IndexError, ValueError):
+                continue
+            if ppid == me:
+                found.append(int(entry.name))
+        return found
+
+
 def stop_tree(root):
     # The root has not been reaped yet: its process-group ID cannot be reused.
     for sig in (signal.SIGSTOP, signal.SIGKILL):
@@ -84,14 +115,13 @@ def cleanup(proc):
     # Detached descendants are now our children. Signal only these unreaped
     # children, never historical PID numbers. Their PIDs cannot be recycled
     # until waitpid below; repeat to collect descendants adopted as they die.
-    children_path = Path(f"/proc/self/task/{os.getpid()}/children")
-    while children := children_path.read_text().split():
-        for pid in map(int, children):
+    while children := adopted_child_pids():
+        for pid in children:
             try:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pass
-        for pid in map(int, children):
+        for pid in children:
             try:
                 os.waitpid(pid, 0)
             except ChildProcessError:

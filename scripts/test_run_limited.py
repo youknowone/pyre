@@ -15,6 +15,16 @@ SUPPORTED_KERNEL = (sys.platform.startswith("linux") and
                     tuple(map(int, re.match(r"(\d+)\.(\d+)", os.uname().release).groups())) >= (4, 7))
 
 
+class AdoptedChildren(unittest.TestCase):
+    def test_missing_children_file_does_not_raise(self):
+        spec = importlib.util.spec_from_file_location("limited_runner", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch.object(Path, "read_text", side_effect=FileNotFoundError):
+            found = module.adopted_child_pids()
+        self.assertEqual(found, [])
+
+
 @unittest.skipUnless(SUPPORTED_KERNEL, "requires Linux >= 4.7 in a RAM-capped VM")
 class Limits(unittest.TestCase):
     def run_guard(self, code, *limits):
