@@ -5990,6 +5990,15 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok((None, logical_len.clone()));
                 }
+                let len_leaf = if self
+                    .string_byte_view_locals
+                    .iter()
+                    .any(|local| place_references_local(&place, *local))
+                {
+                    "__strlen"
+                } else {
+                    "__len"
+                };
                 let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
@@ -5997,7 +6006,7 @@ impl<'a> Lowering<'a> {
                 Ok((
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
-                            segments: vec!["__len".to_string()],
+                            segments: vec![len_leaf.to_string()],
                         },
                         args: crate::model::call_args(vec![base]),
                         result_ty: ValueType::Int,
@@ -9283,6 +9292,23 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `w_str_get_wtf8(obj)` is `_utf8`.  pyre_cpu's `bh_str*`
+                // family reads the `W_UnicodeObject` itself (byte_len +
+                // the `value` indirection), so the field is identity on
+                // the object — the same model `as_bytes` uses one step
+                // down.  Alias and mark the dest as a byte view so
+                // `as_bytes()[i]` / `len` become `strgetitem` / `strlen`
+                // on the object, not on a fat `&Wtf8`.
+                if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `String|str|Wtf8|Wtf8Buf::as_bytes` — the UTF-8 / WTF-8
                 // byte view of a string.  A string IS its byte sequence in
                 // the lifted value model (the immutable `rpy_string`), so
@@ -9434,6 +9460,23 @@ impl<'a> Lowering<'a> {
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
+                }
+                // `as_bytes()[start..end]` is still the same string.  Mark
+                // the subslice dest so a later `slice::cmp::eq` sees both
+                // sides as the frontend string identity.  The range call
+                // itself stays for `front::slice_index` to rewrite to
+                // `__getslice_*`.
+                if args.len() == 2
+                    && arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                    && !self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                    && matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if self.llbc.fn_by_id(*id).is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("index")))
+                    && !self.string_byte_view_locals.contains(&dest_local)
+                {
+                    self.string_byte_view_locals.push(dest_local);
                 }
                 // `ArrayRead` addresses its element as `base + index *
                 // itemsize`.  A scalar host element carries its spelling as
@@ -11315,6 +11358,60 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `as_bytes()[a..b] == as_bytes()[c..d]` is `s[a:b] == t[c:d]`.
+                // Rust types the byte view as `[u8]`, so `==` resolves to
+                // `core::slice::cmp::<Impl>::eq` rather than `<str as
+                // PartialEq>::eq`.  Both operands are the frontend's string
+                // identity (`string_byte_view_locals`); emit the same
+                // `BinOp("eq")` that becomes `ll_streq`.
+                if args.len() == 2
+                    && fmt_path_ends_with(&segments, &["slice", "cmp", "<Impl>", "eq"])
+                    && !self.string_byte_view_locals.is_empty()
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Wtf8::len` is `len(s)` / `ll_strlen`.  After `as_bytes()`
+                // the same length is `Rvalue::Len`; this arm covers the
+                // inherent method on the Wtf8 receiver itself.
+                if args.len() == 1
+                    && (fmt_path_ends_with(&segments, &["Wtf8", "len"])
+                        || fmt_path_ends_with(&segments, &["rustpython_wtf8", "Wtf8", "len"]))
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `&a == &b` / `&a != &b` on two string-family references
                 // (`&Wtf8`, `&str`, `&String`) resolves to the blanket
                 // `impl PartialEq<&B> for &A` (`core::cmp::impls`), whose body
@@ -11337,9 +11434,12 @@ impl<'a> Lowering<'a> {
                     && owner_b == "impls"
                     && owner_c == "<Impl>"
                     && matches!(leaf.as_str(), "eq" | "ne")
-                    && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
+                    && ([first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                         .iter()
                         .all(|t| t.is_some_and(|t| tyref_is_string_value(t, self.llbc)))
+                        || arg_locals.iter().all(|local| {
+                            local.is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                        }))
                 {
                     let res = self
                         .graph
@@ -14049,6 +14149,18 @@ impl<'a> Lowering<'a> {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
+    }
+
+    /// `w_str_get_wtf8(obj)` — `_utf8`.  pyre_cpu treats the
+    /// `W_UnicodeObject` as the STR, so the field is identity.
+    fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
     }
 
     /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /

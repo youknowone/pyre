@@ -1084,20 +1084,6 @@ pub unsafe fn w_str_byte_len(obj: PyObjectRef) -> usize {
     unsafe { (*(obj as *const W_UnicodeObject)).byte_len }
 }
 
-/// `s.chars` (`rstr.py` STR `Array(Char)`).  The WTF-8 buffer is the
-/// same byte array `W_UnicodeObject._utf8` holds.
-///
-/// # Safety
-/// `obj` must point to a valid `W_UnicodeObject` whose `value` is live.
-#[inline]
-pub unsafe fn w_str_chars(obj: PyObjectRef) -> *const u8 {
-    unsafe {
-        (*(*(obj as *const W_UnicodeObject)).value)
-            .as_bytes()
-            .as_ptr()
-    }
-}
-
 /// `unicodeobject.py W_UnicodeObject.is_ascii` — `self._length ==
 /// len(self._utf8)`.  One byte per code point means a code point index is
 /// already a byte offset.
@@ -1329,58 +1315,111 @@ fn rstring_normalize_start_end(length: i64, mut start: i64, mut end: i64) -> (i6
     (start, end)
 }
 
-/// `rstring.py startswith` / `rstr.py LLHelpers.ll_startswith`.
+/// `rstring.py startswith` over two `_utf8` views.
 ///
-/// Elidable byte walk over `s.chars`.  A later look-inside of this
-/// loop is what unrolls a constant prefix the way
-/// `rtype_method_startswith` does; today the generated wrapper
-/// residualizes [`jit_str_startswith`] so the descent does not die
-/// on this body as an un-lowered helper.
+/// `#[inline(always)]` so [`startswith`]'s LLBC contains the walk; a
+/// standalone `&Wtf8` callee is a fat pointer and is not CodeWritten.
+#[inline(always)]
+pub fn rstring_startswith(u_self: &Wtf8, prefix: &Wtf8, start: i64, end: i64) -> bool {
+    let length = u_self.len() as i64;
+    let (start, end) = rstring_normalize_start_end(length, start, end);
+    let prefix_len = prefix.len() as i64;
+    let stop = start + prefix_len;
+    if stop > end {
+        return false;
+    }
+    let u_self = u_self.as_bytes();
+    let prefix = prefix.as_bytes();
+    let mut i = 0i64;
+    while i < prefix_len {
+        if u_self[(start + i) as usize] != prefix[i as usize] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `rstring.py endswith`.  See [`rstring_startswith`].
+#[inline(always)]
+pub fn rstring_endswith(u_self: &Wtf8, suffix: &Wtf8, start: i64, end: i64) -> bool {
+    let length = u_self.len() as i64;
+    let (start, end) = rstring_normalize_start_end(length, start, end);
+    let suffix_len = suffix.len() as i64;
+    let begin = end - suffix_len;
+    if begin < start {
+        return false;
+    }
+    let u_self = u_self.as_bytes();
+    let suffix = suffix.as_bytes();
+    let mut i = 0i64;
+    while i < suffix_len {
+        if u_self[(begin + i) as usize] != suffix[i as usize] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `unicodeobject.py _startswith` / `rstring.py startswith`.
+///
+/// Reads `_utf8` (`w_str_get_wtf8`) and walks `as_bytes()[i]`, the
+/// frontend's `ord(s[i])` spelling of `u_self[start+i] != prefix[i]`.
+/// The walk lives here — not in a `&Wtf8` callee — so CodeWriter sees
+/// only `PyObjectRef` arguments.
 ///
 /// # Safety
 /// Both arguments must be live `W_UnicodeObject`s.
 #[majit_macros::elidable]
 pub unsafe fn startswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -> bool {
-    let length = unsafe { w_str_byte_len(s1) } as i64;
+    // Walk is spelled here (not delegated to the `&Wtf8` helper) so
+    // Charon's body for this Ptr-shaped function contains the
+    // `as_bytes()[i]` getitem, even when rustc has not inlined yet.
+    let u_self = unsafe { w_str_get_wtf8(s1) };
+    let prefix = unsafe { w_str_get_wtf8(s2) };
+    let length = u_self.len() as i64;
     let (start, end) = rstring_normalize_start_end(length, start, end);
-    let prefix_len = unsafe { w_str_byte_len(s2) } as i64;
+    let prefix_len = prefix.len() as i64;
     let stop = start + prefix_len;
     if stop > end {
         return false;
     }
-    let chars1 = unsafe { w_str_chars(s1) };
-    let chars2 = unsafe { w_str_chars(s2) };
-    let mut j = 0i64;
-    while j < prefix_len {
-        if unsafe { *chars1.add((start + j) as usize) != *chars2.add(j as usize) } {
+    let u_self = u_self.as_bytes();
+    let prefix = prefix.as_bytes();
+    let mut i = 0i64;
+    while i < prefix_len {
+        if u_self[(start + i) as usize] != prefix[i as usize] {
             return false;
         }
-        j += 1;
+        i += 1;
     }
     true
 }
 
-/// `rstring.py endswith` / `rstr.py LLHelpers.ll_endswith`.
+/// `unicodeobject.py _endswith` / `rstring.py endswith`.
 ///
 /// # Safety
 /// Both arguments must be live `W_UnicodeObject`s.
 #[majit_macros::elidable]
 pub unsafe fn endswith(s1: PyObjectRef, s2: PyObjectRef, start: i64, end: i64) -> bool {
-    let length = unsafe { w_str_byte_len(s1) } as i64;
+    let u_self = unsafe { w_str_get_wtf8(s1) };
+    let suffix = unsafe { w_str_get_wtf8(s2) };
+    let length = u_self.len() as i64;
     let (start, end) = rstring_normalize_start_end(length, start, end);
-    let suffix_len = unsafe { w_str_byte_len(s2) } as i64;
+    let suffix_len = suffix.len() as i64;
     let begin = end - suffix_len;
     if begin < start {
         return false;
     }
-    let chars1 = unsafe { w_str_chars(s1) };
-    let chars2 = unsafe { w_str_chars(s2) };
-    let mut j = 0i64;
-    while j < suffix_len {
-        if unsafe { *chars1.add((begin + j) as usize) != *chars2.add(j as usize) } {
+    let u_self = u_self.as_bytes();
+    let suffix = suffix.as_bytes();
+    let mut i = 0i64;
+    while i < suffix_len {
+        if u_self[(begin + i) as usize] != suffix[i as usize] {
             return false;
         }
-        j += 1;
+        i += 1;
     }
     true
 }
@@ -1688,6 +1727,25 @@ mod tests {
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
         }
+    }
+
+    #[test]
+    fn test_rstring_startswith_endswith_match_rstring_py() {
+        let alpha = Wtf8::new("alpha");
+        let a = Wtf8::new("a");
+        let b = Wtf8::new("b");
+        let empty = Wtf8::new("");
+        let al = Wtf8::new("al");
+        assert!(rstring_startswith(alpha, a, 0, i64::MAX));
+        assert!(!rstring_startswith(alpha, b, 0, i64::MAX));
+        assert!(rstring_startswith(alpha, empty, 0, i64::MAX));
+        assert!(rstring_startswith(alpha, al, 0, i64::MAX));
+        assert!(!rstring_startswith(alpha, a, 1, i64::MAX));
+        assert!(rstring_startswith(alpha, Wtf8::new("l"), 1, i64::MAX));
+        assert!(rstring_endswith(alpha, a, 0, i64::MAX));
+        assert!(rstring_endswith(Wtf8::new("beta"), a, 0, i64::MAX));
+        assert!(rstring_startswith(empty, empty, 0, i64::MAX));
+        assert!(!rstring_startswith(empty, a, 0, i64::MAX));
     }
 
     #[test]

@@ -5109,6 +5109,38 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_operation(&helper_call, graph_name, graph);
         }
+        // `as_bytes()[i]` on a string-byte-view is `ord(s[i])`.  The
+        // rtyper path expands `__string_byte_getitem` to `getitem`+`ord`;
+        // a Skip-spine graph keeps the marker.  `pyre_cpu.bh_strgetitem`
+        // reads the `W_UnicodeObject` (`rstring.py` `u_self[i]`).
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.as_slice() == ["__string_byte_getitem"]
+            && args.len() == 2
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: "strgetitem".into(),
+                    args: vec![args[0].clone(), args[1].clone()],
+                },
+            }]);
+        }
+        // `len(s)` / `Wtf8::len` / `as_bytes().len()` on a string-byte-view
+        // is `ll_strlen`.  The rtyper path routes `__len` through
+        // `StringRepr.rtype_len`; `__strlen` is the Skip-spine marker
+        // the frontend plants when the place is a byte view.
+        if let CallTarget::FunctionPath { segments } = target
+            && segments.as_slice() == ["__strlen"]
+            && args.len() == 1
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: "strlen".into(),
+                    args: vec![args[0].clone()],
+                },
+            }]);
+        }
         // RPython `jtransform.py rewrite_op_jit_marker`:
         // marker calls never reach `guess_call_kind` — they dispatch straight
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
