@@ -78,8 +78,9 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
 /// `floatobject.py` `__init__`). Own graph so `fuse_boxing_alloc` rewrites
 /// the `malloc_typed` cluster to `new_with_vtable` + payload `setfield`.
 /// Looked inside: `@dont_look_inside` would residualise the constructor
-/// PyPy traces. Cross-crate, so `_truediv` still `inline_call`s this
-/// fused body rather than containing the New.
+/// PyPy traces. `_truediv` carries the same constructor body so its
+/// own graph has the New; other callers still `inline_call` this fused
+/// helper.
 #[inline(never)]
 pub fn newfloat(value: f64) -> PyObjectRef {
     crate::lltype::malloc_typed(W_FloatObject {

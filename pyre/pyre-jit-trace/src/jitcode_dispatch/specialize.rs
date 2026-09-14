@@ -9676,7 +9676,6 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
 /// isinstance.  Walking `binary_value_from_tag` for `/` records the
 /// whole `truediv_impl` dispatcher (`bigint_truediv`, dunder lookup)
 /// and hung `listcomp_float_element_regression`.
-#[allow(dead_code)] // intended `_truediv` walk; gated off until snapshot is cheap
 const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_truediv",
     commit_label: "int_truediv_commit",
@@ -10481,15 +10480,35 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    // intobject.py `_truediv(space, x, y)` is the unboxed success leaf
-    // (`INT_TRUEDIV_DESCENT`): zero, two sitofp, float_truediv, inline
-    // fused `newfloat`.  Walking it hangs compile in
-    // `capture_inline_parent_blackhole` on that `newfloat` call — the
-    // same listcomp finishes for `+`.  Stay residual until sitofp is
-    // `cast_int_to_float` and `newfloat` is `new_with_vtable` in this
-    // graph, or that snapshot path is cheap.
+    // intobject.py `_truediv(space, x, y)` is the unboxed success leaf:
+    // zero, two `cast_int_to_float`, float_truediv, in-graph
+    // `new_with_vtable`.  Wide ints raise into residual
+    // `int_truediv_ovf2long` (`_make_ovf2long`).
     if matches!(plain, B::TrueDivide) {
-        return Ok(None);
+        const MANTISSA_LIM: i64 = 1 << 53;
+        let x = unsafe { pyre_object::w_int_get_value(operands[0].1) };
+        let y = unsafe { pyre_object::w_int_get_value(operands[1].1) };
+        if x <= -MANTISSA_LIM || x >= MANTISSA_LIM || y <= -MANTISSA_LIM || y >= MANTISSA_LIM {
+            return Ok(None);
+        }
+        let type_addr = |obj| {
+            if unsafe { pyre_object::is_bool(obj) } {
+                &pyre_object::pyobject::BOOL_TYPE as *const _ as i64
+            } else {
+                &pyre_object::pyobject::INT_TYPE as *const _ as i64
+            }
+        };
+        let xa = walker_unbox_int(ctx, op_pc, operands[0].0, type_addr(operands[0].1))?;
+        let ya = walker_unbox_int(ctx, op_pc, operands[1].0, type_addr(operands[1].1))?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[(xa, x), (ya, y)],
+            &[],
+            dst,
+            dst_bank,
+            &INT_TRUEDIV_DESCENT,
+        );
     }
     let tag = if plain_tag == op_tag {
         tag

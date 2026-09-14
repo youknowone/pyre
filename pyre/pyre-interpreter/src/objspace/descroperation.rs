@@ -900,17 +900,29 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 /// intobject.py `_truediv(space, x, y)` success body: zero, then
-/// `space.newfloat(float(x)/float(y))`.  The mantissa overflow
-/// (`r_uint(abs(n)) >> DBL_MANT_DIG`) is the `OverflowError` that
-/// `_make_descr_binop` catches in [`int_truediv`] / [`int_truediv_ovf2long`],
-/// so this graph has no ovf diamond (a backward `goto` into that block
-/// hung the helper walk).
+/// `space.newfloat(float(x)/float(y))`.  `space.newfloat` is
+/// `W_FloatObject(floatval)` (`objspace.py newfloat`); Charon cannot
+/// inline the cross-crate helper, so the constructor body lives here
+/// and `fuse_boxing_alloc` rewrites it to `new_with_vtable` in this
+/// graph.  The mantissa overflow (`r_uint(abs(n)) >> DBL_MANT_DIG`) is
+/// the `OverflowError` that `_make_descr_binop` catches in
+/// [`int_truediv`] / [`int_truediv_ovf2long`], so this graph has no
+/// ovf diamond (a backward `goto` into that block hung the helper walk).
 #[inline(never)]
 pub(crate) fn _truediv(x: i64, y: i64) -> PyResult {
     if y == 0 {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    Ok(pyre_object::newfloat((x as f64) / (y as f64)))
+    let value = (x as f64) / (y as f64);
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: value,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
 }
 
 /// `descr_truediv`: unbox, then `_truediv`, catching the mantissa
