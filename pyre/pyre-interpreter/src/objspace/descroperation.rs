@@ -2418,6 +2418,24 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
     }
 }
 
+/// `rstr.py` `AbstractStringRepr.ll_strcmp`. Bytewise prefix, then
+/// length. Indexing is `ll_getitem_nonneg` (`as_ptr().add`), not
+/// `slice::cmp` / `Vec::index`.
+fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> i32 {
+    let cmplen = left.len().min(right.len());
+    let left_p = left.as_ptr();
+    let right_p = right.as_ptr();
+    let mut i = 0usize;
+    while i < cmplen {
+        let diff = unsafe { *left_p.add(i) as i32 - *right_p.add(i) as i32 };
+        if diff != 0 {
+            return diff;
+        }
+        i += 1;
+    }
+    left.len() as i32 - right.len() as i32
+}
+
 /// Read a total-order result under `op` — the shape every `_memcmp`-based
 /// comparison ends in, where the common prefix and then the lengths have
 /// already been folded into one `Ordering`.
@@ -5918,7 +5936,15 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         {
             let da = pyre_object::bytesobject::bytes_like_data(a);
             let db = pyre_object::bytesobject::bytes_like_data(b);
-            return Ok(w_bool_from(ordering_satisfies(da.cmp(db), op)));
+            let diff = ll_bytes_strcmp(da, db);
+            return Ok(w_bool_from(match op {
+                CompareOp::Lt => diff < 0,
+                CompareOp::Le => diff <= 0,
+                CompareOp::Gt => diff > 0,
+                CompareOp::Ge => diff >= 0,
+                CompareOp::Eq => diff == 0,
+                CompareOp::Ne => diff != 0,
+            }));
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
         if is_tuple(a) && is_tuple(b) {
