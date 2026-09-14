@@ -5868,8 +5868,14 @@ fn assemble_peeled_trace_with_jump_args(
         std::collections::HashMap::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
-        let mut original_args: Vec<OpRef> =
-            op.getarglist_copy().iter().map(|a| a.to_opref()).collect();
+        // compile.py never snapshots every body's arglist. Only the Label
+        // arm extends this vec; a Vec per p2 op was a 32 B malloc on
+        // every getfield/setfield (regex and/or 0.15 class).
+        let mut original_args: Vec<OpRef> = if op.opcode == OpCode::Label {
+            op.getarglist().iter().map(|a| a.to_opref()).collect()
+        } else {
+            Vec::new()
+        };
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos().get()) {
             new_op.pos().set(mapped_pos);
         }
@@ -6062,7 +6068,7 @@ fn assemble_peeled_trace_with_jump_args(
                 (Some(jump_idx), Some(label_idx)) if jump_idx == label_idx
             );
             let target_base_len = if current_inner_label_index.is_some() {
-                original_args.len()
+                op.num_args()
             } else {
                 label_args.len()
             };
@@ -8677,6 +8683,59 @@ mod tests {
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].same_as_source.to_opref(), OpRef::int_op(14));
         assert_eq!(aliases[0].same_as_opcode, OpCode::SameAsI);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_does_not_snapshot_every_body_arglist() {
+        // compile.py never builds a Vec of every body's args. Nine
+        // setfields + a JUMP (regex-shaped) must still assemble.
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
+                ],
+            );
+            op.pos().set(OpRef::int_op(3));
+            op
+        }];
+        let mut p2_ops: Vec<Op> = (0..9)
+            .map(|i| {
+                let mut op = Op::new(
+                    OpCode::SetfieldGc,
+                    &[
+                        rooted_resop_operand(Type::Ref, 10),
+                        rooted_resop_operand(Type::Int, 3 + i),
+                    ],
+                );
+                op.pos().set(OpRef::void_op(20 + i as u32));
+                op
+            })
+            .collect();
+        p2_ops.push(Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 3)]));
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef::int_op(3)],
+            &[OpRef::int_op(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            None,
+        );
+        let setfields = combined
+            .iter()
+            .filter(|op| op.opcode == OpCode::SetfieldGc)
+            .count();
+        assert_eq!(setfields, 9, "all body setfields must survive assembly");
+        assert!(
+            combined.iter().any(|op| op.opcode == OpCode::Jump),
+            "the closing JUMP must survive without a per-op arglist Vec"
+        );
     }
 
     #[test]

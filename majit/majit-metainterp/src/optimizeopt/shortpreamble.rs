@@ -1102,7 +1102,7 @@ impl ShortBoxes {
         // (registered on first materialization), so the insert key here and
         // the lookup keys in `materialize_one`/`produce_arg` are ptr_eq.
         let key = ctx.materialize_operand_at(result);
-        let pop = PotentialShortOp::Preamble(PreambleOp {
+        let pop = PreambleOp {
             source_op: None,
             res: key.clone(),
             op: OpRc::new(op),
@@ -1110,11 +1110,11 @@ impl ShortBoxes {
             label_arg_idx,
             invented_name: false,
             same_as_source: None,
-        });
+        };
         // shortpreamble.py add_potential_op: `CompoundOp(op, pop, prev_op)`
-        // stores the previous dict value. OrderedDict assignment keeps the
-        // key's position; do not clone `prev` (a PreambleOp / CompoundOp
-        // clone is a 64 B box).
+        // stores the new leaf and a reference to the previous dict value.
+        // `pop` is always a PreambleOp; boxing it was a 64 B alloc per
+        // collision on the regex and/or compile path.
         if let Some(idx) = self.potential_ops.get_index_of(&key) {
             let (old_key, prev) = self
                 .potential_ops
@@ -1125,12 +1125,12 @@ impl ShortBoxes {
                 old_key,
                 PotentialShortOp::Compound(CompoundOp {
                     res: result,
-                    one: Box::new(pop),
+                    one: pop,
                     two: Box::new(prev),
                 }),
             );
         } else {
-            self.add_op(key, pop);
+            self.add_op(key, PotentialShortOp::Preamble(pop));
         }
     }
 }
@@ -1310,9 +1310,9 @@ impl Default for CollectedExtendedShortPreambleBuilder {
 pub struct CompoundOp {
     /// The result OpRef of the compound operation.
     pub res: OpRef,
-    /// First sub-operation.
-    one: Box<PotentialShortOp>,
-    /// Second sub-operation (depends on the result of `one`).
+    /// shortpreamble.py `pop` — always a leaf (`PureOp` / `HeapOp` / …).
+    one: PreambleOp,
+    /// shortpreamble.py `prev_op` — the previous dict value.
     two: Box<PotentialShortOp>,
 }
 
@@ -1327,15 +1327,8 @@ impl CompoundOp {
         ctx: &mut crate::optimizeopt::OptContext,
         mut produced: Vec<ProducedShortOp>,
     ) -> Vec<ProducedShortOp> {
-        match self.one.as_ref() {
-            PotentialShortOp::Compound(compound) => {
-                produced = compound.flatten(sb, ctx, produced);
-            }
-            PotentialShortOp::Preamble(op) => {
-                if let Some(pop) = op.add_op_to_short(sb, ctx) {
-                    produced.push(pop);
-                }
-            }
+        if let Some(pop) = self.one.add_op_to_short(sb, ctx) {
+            produced.push(pop);
         }
         match self.two.as_ref() {
             PotentialShortOp::Compound(compound) => compound.flatten(sb, ctx, produced),
@@ -4216,9 +4209,9 @@ mod tests {
             PotentialShortOp::Preamble(p) if p.kind == PreambleOpKind::Heap => {
                 Some(OpRc::strong_count(&p.op))
             }
-            PotentialShortOp::Compound(c) => {
-                heap_oprc_strong_count(&c.one).or_else(|| heap_oprc_strong_count(&c.two))
-            }
+            PotentialShortOp::Compound(c) => (c.one.kind == PreambleOpKind::Heap)
+                .then(|| OpRc::strong_count(&c.one.op))
+                .or_else(|| heap_oprc_strong_count(&c.two)),
             _ => None,
         }
     }

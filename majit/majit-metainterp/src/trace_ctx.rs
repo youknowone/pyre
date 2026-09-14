@@ -180,6 +180,21 @@ impl GreenBox {
     pub fn new(opref: OpRef, ty: Type) -> Self {
         Self { opref, ty }
     }
+
+    /// One GreenBox per recorder inputarg, in header order.
+    ///
+    /// `TraceCtx::new` / `with_green_key` used to collect `inputarg_types()`,
+    /// clone that Vec, then collect a parallel `Vec<OpRef>` and zip them.
+    /// GreenBox exists so those two lists are never materialized
+    /// (`pyjitpl.py` live_arg_boxes already carry type on the box).
+    fn from_recorder_inputargs(recorder: &Trace) -> Vec<Self> {
+        recorder
+            .inputargs()
+            .iter()
+            .enumerate()
+            .map(|(i, arg)| Self::new(OpRef::input_arg_typed(i as u32, arg.tp), arg.tp))
+            .collect()
+    }
 }
 
 /// pyjitpl.py:2989 — a visited loop header with its trace position.
@@ -1836,12 +1851,7 @@ impl TraceCtx {
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
         let initial_position = recorder.get_position();
-        let initial_types: Vec<Type> = recorder.inputarg_types().to_vec();
-        let initial_boxes: Vec<OpRef> = initial_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
-            .collect();
+        let green_boxes = GreenBox::from_recorder_inputargs(&recorder);
         TraceCtx {
             recorder,
             metainterp_sd,
@@ -1870,11 +1880,7 @@ impl TraceCtx {
                 // greens, so there is no key to carry.
                 green_key_typed: None,
                 position: initial_position,
-                green_boxes: initial_boxes
-                    .iter()
-                    .zip(initial_types.iter())
-                    .map(|(&opref, &ty)| GreenBox::new(opref, ty))
-                    .collect(),
+                green_boxes,
                 header_pc: 0,
                 vable_ptr: 0,
             }],
@@ -1936,12 +1942,7 @@ impl TraceCtx {
         let header_green_key = green_key_values.clone();
         // RPython pyjitpl.py:2878: initial merge point types come from
         // live_arg_boxes which carry actual types (INT/REF/FLOAT).
-        let initial_input_types = recorder.inputarg_types();
-        let initial_boxes: Vec<OpRef> = initial_input_types
-            .iter()
-            .enumerate()
-            .map(|(i, &tp)| OpRef::input_arg_typed(i as u32, tp))
-            .collect();
+        let green_boxes = GreenBox::from_recorder_inputargs(&recorder);
         TraceCtx {
             recorder,
             metainterp_sd,
@@ -1971,11 +1972,7 @@ impl TraceCtx {
                 // greens `green_key` was hashed from.
                 green_key_typed: Some(header_green_key),
                 position: initial_position,
-                green_boxes: initial_boxes
-                    .iter()
-                    .zip(initial_input_types.iter())
-                    .map(|(&opref, &ty)| GreenBox::new(opref, ty))
-                    .collect(),
+                green_boxes,
                 header_pc: 0,
                 vable_ptr: 0,
             }],
@@ -2799,13 +2796,19 @@ impl TraceCtx {
     /// so each slot's own `OpRef` is the only type source and the only one
     /// upstream uses (`record_same_as` reads `box.type`).
     pub fn remove_consts_and_duplicates_untyped(&mut self, boxes: &mut [OpRef]) {
-        let mut typed: Vec<(OpRef, Type)> = boxes
-            .iter()
-            .map(|&opref| (opref, opref.ty().unwrap_or(Type::Int)))
-            .collect();
-        self.remove_consts_and_duplicates(&mut typed);
-        for (slot, (opref, _)) in boxes.iter_mut().zip(typed) {
-            *slot = opref;
+        // pyjitpl.py `remove_consts_and_duplicates` rewrites `boxes[i]`
+        // in place. A side `Vec<(OpRef, Type)>` was a 128 B class on the
+        // regex and/or bridge close (`start_bridge_tracing`).
+        let mut duplicates: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
+        for slot in boxes.iter_mut() {
+            let opref = *slot;
+            if !opref.is_constant() && duplicates.insert(opref) {
+                continue;
+            }
+            let Some(tp) = opref.ty() else {
+                continue;
+            };
+            *slot = self.record_same_as(opref, tp);
         }
     }
 
@@ -6659,6 +6662,46 @@ mod tests {
         ctx.remove_consts_and_duplicates(&mut again);
         assert_eq!(again, boxes, "a normalized list is unchanged");
         assert_eq!(ctx.num_ops(), ops_after, "and records nothing");
+    }
+
+    #[test]
+    fn new_seeds_green_boxes_from_inputargs_without_a_type_vec() {
+        // GreenBox folds the parallel type list. Rebuilding
+        // `inputarg_types().to_vec()` + `Vec<OpRef>` in `TraceCtx::new`
+        // was two 128 B allocs on every `start_bridge_tracing`.
+        let mut recorder = Trace::new();
+        let _i = recorder.record_input_arg(Type::Int);
+        let _r = recorder.record_input_arg(Type::Ref);
+        let ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let boxes = &ctx.current_merge_points[0].green_boxes;
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0].ty, Type::Int);
+        assert_eq!(boxes[1].ty, Type::Ref);
+        assert_eq!(boxes[0].opref, OpRef::input_arg_typed(0, Type::Int));
+        assert_eq!(boxes[1].opref, OpRef::input_arg_typed(1, Type::Ref));
+    }
+
+    #[test]
+    fn remove_consts_and_duplicates_untyped_rewrites_in_place() {
+        let mut recorder = Trace::new();
+        let b1 = recorder.record_input_arg(Type::Int);
+        let b2 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let c3 = ctx.const_int(3);
+        let mut boxes = [b1, b2, b1, c3];
+        ctx.remove_consts_and_duplicates_untyped(&mut boxes);
+        assert_eq!(boxes[0], b1);
+        assert_eq!(boxes[1], b2);
+        assert_ne!(boxes[2], b1);
+        assert_ne!(boxes[3], c3);
     }
 
     /// history.py `record_same_as` carries the source box's value on

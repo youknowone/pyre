@@ -674,15 +674,16 @@ fn resume_layout_from_rebuilt_frames(
         .map(|frame| {
             let slot_layouts: Vec<ResumeValueLayoutSummary> =
                 frame.values.iter().map(rebuilt_value_layout).collect();
-            let slot_sources: Vec<ResumeValueKind> =
-                slot_layouts.iter().map(|slot| slot.kind).collect();
             ResumeFrameLayoutSummary {
                 trace_id: None,
                 header_pc: None,
                 source_guard: None,
                 jitcode_index: frame.jitcode_index,
                 pc: frame.pc as u64,
-                slot_sources,
+                // resume.py walks `rd_numb`; these kind/pc/count projections
+                // are unused. A 1-item Vec each was the 8 B / 16 B class on
+                // the regex and/or compile path.
+                slot_sources: Vec::new(),
                 slot_layouts,
                 slot_types: None,
             }
@@ -690,11 +691,8 @@ fn resume_layout_from_rebuilt_frames(
         .collect();
     ResumeLayoutSummary {
         num_frames: frame_layouts.len(),
-        frame_pcs: frame_layouts.iter().map(|frame| frame.pc).collect(),
-        frame_slot_counts: frame_layouts
-            .iter()
-            .map(|frame| frame.slot_layouts.len())
-            .collect(),
+        frame_pcs: Vec::new(),
+        frame_slot_counts: Vec::new(),
         frame_layouts,
         num_virtuals: 0,
         virtual_kinds: Vec::new(),
@@ -716,21 +714,20 @@ fn resume_layout_identity_frame(pc: u64, num_slots: usize) -> ResumeLayoutSummar
             virtual_index: None,
         })
         .collect();
-    let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|slot| slot.kind).collect();
     let frame = ResumeFrameLayoutSummary {
         trace_id: None,
         header_pc: None,
         source_guard: None,
         jitcode_index: 0,
         pc,
-        slot_sources,
+        slot_sources: Vec::new(),
         slot_layouts,
         slot_types: None,
     };
     ResumeLayoutSummary {
         num_frames: 1,
-        frame_pcs: vec![pc],
-        frame_slot_counts: vec![num_slots],
+        frame_pcs: Vec::new(),
+        frame_slot_counts: Vec::new(),
         frame_layouts: vec![frame],
         num_virtuals: 0,
         virtual_kinds: Vec::new(),
@@ -739,6 +736,62 @@ fn resume_layout_identity_frame(pc: u64, num_slots: usize) -> ResumeLayoutSummar
         pending_field_layouts: Vec::new(),
         const_pool_size: 0,
     }
+}
+
+/// history.py Box.type is on the box. Prefer the descr's `fail_arg_types`
+/// slice in place — a `to_vec()` per guard was an 8 B / 16 B class on
+/// the regex and/or timed row (`build_guard_metadata`).
+fn exit_types_for_guard_or_finish(op: &Op, is_finish: bool, inputargs: &[InputArg]) -> ExitTypes {
+    let mut out = ExitTypes::new();
+    let want = if is_finish {
+        Some(op.num_args())
+    } else {
+        op.guard_fail_args().map(|fa| fa.len())
+    };
+    if op.with_fail_descr(|fd| {
+        let types = fd.fail_arg_types();
+        if want.is_none_or(|n| types.len() == n) {
+            out.extend_from_slice(types);
+            true
+        } else {
+            false
+        }
+    }) == Some(true)
+    {
+        return out;
+    }
+    let finish_arg_type = |b: &Operand| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
+    if is_finish {
+        out.extend(op.getarglist().iter().map(finish_arg_type));
+        return out;
+    }
+    if let Some(fail_args) = op.guard_fail_args() {
+        // Copy types first: `guard_fail_args` and the extra type slice
+        // cannot be borrowed together (both extras).
+        let mut fa_types = ExitTypes::new();
+        let had_types = op
+            .with_fail_arg_types(|types| {
+                fa_types.extend_from_slice(types);
+            })
+            .is_some();
+        out.extend(fail_args.iter().enumerate().map(|(i, opref)| {
+            if had_types && let Some(&tp) = fa_types.get(i) {
+                return tp;
+            }
+            fail_arg_type(&opref.to_opref())
+        }));
+        return out;
+    }
+    if op
+        .with_fail_arg_types(|types| {
+            out.extend_from_slice(types);
+        })
+        .is_some()
+    {
+        return out;
+    }
+    out.extend(inputargs.iter().map(|arg| arg.tp));
+    out
 }
 
 /// Build guard metadata for a compiled trace.
@@ -760,7 +813,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
     indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
     crate::FxIndexMap<u32, StoredExitLayout>,
 ) {
-    let mut result: indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary> =
+    let result: indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary> =
         indexmap::IndexMap::new();
     let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
     let mut fail_index = 0u32;
@@ -796,92 +849,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         // post-numbering type vector, so descr-first priority no longer
         // exposes stale tracer types. Fall back to `op.fail_arg_types`
         // and finally the failarg's own variant tag (`opref.ty()`).
-        let descr_types = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec());
-        let exit_types: Vec<Type> = if is_finish {
-            // FINISH ops are always emitted with one of the
-            // `_DoneWithThisFrameDescr` family (compile.py) or
-            // `ExitFrameWithExceptionDescrRef`, all of which carry a
-            // fixed `fail_arg_types` (Void → empty, Int → [Int],
-            // Ref → [Ref], Float → [Float]). Prefer the descr's
-            // typing — it matches RPython where `handle_fail` reads
-            // `cpu.get_*_value(deadframe, 0)` keyed by the descr
-            // class, not by per-arg inference.
-            // history.py:220/261/307 — type is intrinsic on the Box; read it
-            // off the OpRef variant tag (`ty()`).
-            let finish_arg_type = |b: &Operand| -> Type { b.to_opref().ty().unwrap_or(Type::Int) };
-            if let Some(types) = descr_types {
-                if types.len() == op.num_args() {
-                    types.to_vec()
-                } else {
-                    // Arity mismatch (synthetic test ops without a
-                    // type-shaped descr): reconstruct per-arg from the
-                    // failarg variant tag (`opref.ty()`). Production FINISH
-                    // always matches the descr arity.
-                    op.getarglist().iter().map(finish_arg_type).collect()
-                }
-            } else {
-                // No descr — synthetic test FINISH only.
-                op.getarglist().iter().map(finish_arg_type).collect()
-            }
-        } else if let Some(fail_args) = op.guard_fail_args() {
-            // `store_final_boxes_in_guard` (resume.py:397) writes the
-            // reduced liveboxes' types authoritatively. Prefer the descr's
-            // fail_arg_types (single source of truth, matches RPython
-            // `ResumeGuardDescr.fail_arg_types`); fall back to op-level
-            // `fail_arg_types` on sharing-path (no descr); fall back to
-            // per-arg reconstruction via the failarg variant tag
-            // (`opref.ty()`) when arity mismatches.
-            let fa_types = op.get_fail_arg_types();
-            if let Some(types) = descr_types {
-                if types.len() == fail_args.len() {
-                    types.to_vec()
-                } else {
-                    // history.py:220/261/307 — `fail_arg_type` reads the type
-                    // off the failarg's own variant tag (`opref.ty()`).
-                    fail_args
-                        .iter()
-                        .enumerate()
-                        .map(|(i, opref)| {
-                            if let Some(&tp) = types.get(i) {
-                                return tp;
-                            }
-                            if let Some(fa) = fa_types.as_ref()
-                                && let Some(&tp) = fa.get(i)
-                            {
-                                return tp;
-                            }
-                            fail_arg_type(&opref.to_opref())
-                        })
-                        .collect()
-                }
-            } else if let Some(types) = fa_types {
-                if types.len() == fail_args.len() {
-                    types.clone()
-                } else {
-                    fail_args
-                        .iter()
-                        .enumerate()
-                        .map(|(i, opref)| {
-                            if let Some(&tp) = types.get(i) {
-                                return tp;
-                            }
-                            fail_arg_type(&opref.to_opref())
-                        })
-                        .collect()
-                }
-            } else {
-                fail_args
-                    .iter()
-                    .map(|b| fail_arg_type(&b.to_opref()))
-                    .collect()
-            }
-        } else if let Some(dt) = descr_types {
-            dt.to_vec()
-        } else if let Some(types) = op.get_fail_arg_types() {
-            types.to_vec()
-        } else {
-            inputargs.iter().map(|arg| arg.tp).collect()
-        };
+        let exit_types = exit_types_for_guard_or_finish(op, is_finish, inputargs);
         // Both resume-layout consumers below decode the same guard-owned
         // `rd_numb`. RPython keeps one numbering stream on the descr and its
         // consumers walk that shared data; decoding it twice here duplicated
@@ -932,7 +900,10 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     .unwrap_or(exit_types.len());
                 resume_layout_identity_frame(pc, num_slots)
             };
-            resume_layout = Some(layout.clone());
+            // One Arc; `enrich_guard_resume_layouts_for_trace` make_muts
+            // it. Cloning the summary here minted a second frame_pcs /
+            // slot_sources / slot_layouts heap per guard.
+            resume_layout = Some(std::sync::Arc::new(layout));
             // compile.py `ResumeGuardDescr` storage — build the shared
             // Arc once from the guard op's `rd_*` fields so every reader
             // (StoredExitLayout, bridge retrace, blackhole resume, GC
@@ -950,7 +921,6 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     op.resolved_rd_pendingfields(),
                 )
             });
-            result.insert(fail_index, layout);
             storage_for_guard
         } else {
             resume_layout = None;
@@ -1307,7 +1277,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
                     pc,
                     jitcode_index: 0,
                     slots,
-                    slot_types: Some(exit_types.clone()),
+                    slot_types: Some(exit_types.to_vec()),
                 }],
                 virtual_layouts: vec![],
                 pending_field_layouts: vec![],
@@ -1319,7 +1289,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             StoredExitLayout {
                 source_op_index: Some(op_idx),
                 recovery_layout: recovery_layout.map(std::sync::Arc::new),
-                resume_layout: resume_layout.map(std::sync::Arc::new),
+                resume_layout,
                 storage,
                 descr: op.getdescr(),
                 op_arg_types_for_jump: None,
@@ -1544,19 +1514,13 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
             new_frames.append(&mut resume_layout.frame_layouts);
             resume_layout.frame_layouts = new_frames;
             resume_layout.num_frames = resume_layout.frame_layouts.len();
-            resume_layout.frame_pcs = resume_layout.frame_layouts.iter().map(|f| f.pc).collect();
-            resume_layout.frame_slot_counts = resume_layout
-                .frame_layouts
-                .iter()
-                .map(|f| f.slot_layouts.len())
-                .collect();
         }
     } else {
         // No existing resume layout; create one from the frame_stack.
         entry.resume_layout = Some(std::sync::Arc::new(ResumeLayoutSummary {
             num_frames: frame_layouts.len(),
-            frame_pcs: frame_layouts.iter().map(|f| f.pc).collect(),
-            frame_slot_counts: frame_layouts.iter().map(|f| f.slot_layouts.len()).collect(),
+            frame_pcs: Vec::new(),
+            frame_slot_counts: Vec::new(),
             frame_layouts,
             num_virtuals: 0,
             virtual_kinds: Vec::new(),
@@ -1624,18 +1588,12 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
             new_frames.append(&mut layout.frame_layouts);
             layout.frame_layouts = new_frames;
             layout.num_frames = layout.frame_layouts.len();
-            layout.frame_pcs = layout.frame_layouts.iter().map(|f| f.pc).collect();
-            layout.frame_slot_counts = layout
-                .frame_layouts
-                .iter()
-                .map(|f| f.slot_layouts.len())
-                .collect();
         }
     } else {
         *resume_layout = Some(ResumeLayoutSummary {
             num_frames: frame_layouts.len(),
-            frame_pcs: frame_layouts.iter().map(|f| f.pc).collect(),
-            frame_slot_counts: frame_layouts.iter().map(|f| f.slot_layouts.len()).collect(),
+            frame_pcs: Vec::new(),
+            frame_slot_counts: Vec::new(),
             frame_layouts,
             num_virtuals: 0,
             virtual_kinds: Vec::new(),
@@ -2464,26 +2422,28 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
-    resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
+    _resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
     exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
 ) {
-    for (fail_index, layout) in resume_layouts.iter_mut() {
-        let recovery_layout = exit_layouts
-            .get(fail_index)
-            .and_then(|exit_layout| exit_layout.recovery_layout.clone());
+    // resume.py keeps one numbering stream on the descr. The previous
+    // clone into a fresh Arc copied every frame_pcs / slot_sources /
+    // slot_layouts Vec per guard. `make_mut` is free while this Arc is
+    // unique (build_guard_metadata no longer clones the summary).
+    for exit_layout in exit_layouts.values_mut() {
+        let recovery_layout = exit_layout.recovery_layout.clone();
+        let Some(layout_arc) = exit_layout.resume_layout.as_mut() else {
+            continue;
+        };
         enrich_resume_layout_with_trace_metadata(
-            layout,
+            std::sync::Arc::make_mut(layout_arc),
             trace_id,
             inputargs,
             trace_info,
             recovery_layout.as_deref(),
         );
-        if let Some(exit_layout) = exit_layouts.get_mut(fail_index) {
-            exit_layout.resume_layout = Some(std::sync::Arc::new(layout.clone()));
-        }
     }
 }
 
@@ -2497,6 +2457,13 @@ pub(crate) fn patch_guard_recovery_layouts_for_trace(
     // `StoredExitLayout` populated with the resume_layout-derived
     // recovery so consumers see the patched virtuals/pending_fields.
     for (_, exit_layout) in exit_layouts.iter_mut() {
+        // resume.py walks `storage.rd_numb`. `build_guard_metadata` already
+        // projected that stream into `recovery_layout`. Rebuilding it from
+        // `resume_layout` cloned every frame's slots (32 B / 128 B) per
+        // guard on the regex and/or compile path.
+        if exit_layout.recovery_layout.is_some() {
+            continue;
+        }
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
             continue;
         };
@@ -3036,6 +3003,131 @@ mod tests {
         assert_eq!(
             exit.resolve_exit_types(),
             &[Type::Ref, Type::Ref, Type::Int, Type::Int][..]
+        );
+    }
+
+    #[test]
+    fn test_exit_types_for_guard_reads_descr_slice() {
+        // history.py Box.type lives on the box / descr. A heap `to_vec`
+        // per guard was an 8 B / 16 B class on the regex and/or row.
+        let value = rooted_inputarg_operand(Type::Int, 0);
+        let descr = make_fail_descr_typed(vec![Type::Int, Type::Ref]);
+        let mut guard = Op::with_descr(OpCode::GuardTrue, std::slice::from_ref(&value), descr);
+        guard.setfailargs(smallvec::smallvec![
+            rooted_inputarg_operand(Type::Int, 0),
+            rooted_inputarg_operand(Type::Ref, 1),
+        ]);
+        let types = exit_types_for_guard_or_finish(&guard, false, &[]);
+        assert_eq!(&types[..], &[Type::Int, Type::Ref]);
+    }
+
+    #[test]
+    fn test_build_guard_metadata_does_not_mint_derived_frame_vecs() {
+        // resume.py walks `rd_numb`. Parallel frame_pcs / frame_slot_counts
+        // / slot_sources Vecs are unused projections; a 1-item heap each
+        // was the 8 B / 16 B class on the regex and/or compile path.
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+        env.types.insert(0, Type::Int);
+        let snapshot = Snapshot {
+            vable_array: vec![],
+            vref_array: vec![],
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 4,
+                py_pc: 4,
+                boxes: vec![OpRef::input_arg_int(0).into()],
+            }],
+        };
+        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        numb_state.writer.patch(1, numb_state.num_boxes);
+        let rd_numb = numb_state.create_numbering();
+        let rd_consts = memo.consts().to_vec();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        if let Some(fd) = descr.as_fail_descr() {
+            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_consts(Some(rd_consts));
+        }
+        guard.setdescr(descr);
+        guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
+        guard.set_fail_arg_types(vec![Type::Int]);
+
+        let (_resume_data, exit_layouts) = build_guard_metadata(&inputargs, &[guard], 4, None);
+        let exit = exit_layouts.get(&0).expect("guard exit layout");
+        let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
+        assert!(
+            resume_layout.frame_pcs.is_empty(),
+            "frame_pcs is derived from frame_layouts; do not heap a 1-item Vec"
+        );
+        assert!(
+            resume_layout.frame_slot_counts.is_empty(),
+            "frame_slot_counts is derived from frame_layouts; do not heap a 1-item Vec"
+        );
+        assert!(
+            resume_layout
+                .frame_layouts
+                .iter()
+                .all(|frame| frame.slot_sources.is_empty()),
+            "slot_sources is derived from slot_layouts; do not heap a kind Vec"
+        );
+        assert_eq!(resume_layout.frame_layouts.len(), 1);
+        assert_eq!(resume_layout.frame_layouts[0].slot_layouts.len(), 1);
+    }
+
+    #[test]
+    fn test_patch_keeps_rd_numb_recovery_without_reprojecting() {
+        // resume.py walks storage.rd_numb. A second
+        // `to_exit_recovery_layout` per guard was 32 B / 128 B on the
+        // regex and/or compile path (`patch_guard_recovery_layouts_for_trace`).
+        let mut memo = ResumeDataLoopMemo::new();
+        let mut env = SimpleBoxEnv::new();
+        env.types.insert(0, Type::Int);
+        let snapshot = Snapshot {
+            vable_array: vec![],
+            vref_array: vec![],
+            framestack: vec![SnapshotFrame {
+                jitcode_index: 0,
+                pc: 4,
+                py_pc: 4,
+                boxes: vec![OpRef::input_arg_int(0).into()],
+            }],
+        };
+        let mut numb_state = memo.number(&snapshot, &env, -1).unwrap();
+        numb_state.writer.patch(1, numb_state.num_boxes);
+        let rd_numb = numb_state.create_numbering();
+        let rd_consts = memo.consts().to_vec();
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let mut guard = Op::new(OpCode::GuardTrue, &[rooted_inputarg_operand(Type::Int, 0)]);
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
+        if let Some(fd) = descr.as_fail_descr() {
+            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_consts(Some(rd_consts));
+        }
+        guard.setdescr(descr);
+        guard.setfailargs(smallvec::smallvec![rooted_inputarg_operand(Type::Int, 0)]);
+        guard.set_fail_arg_types(vec![Type::Int]);
+
+        let (_resume_data, mut exit_layouts) = build_guard_metadata(&inputargs, &[guard], 4, None);
+        let before = std::sync::Arc::as_ptr(
+            exit_layouts
+                .get(&0)
+                .and_then(|e| e.recovery_layout.as_ref())
+                .expect("rd_numb recovery"),
+        );
+        patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
+        let after = std::sync::Arc::as_ptr(
+            exit_layouts
+                .get(&0)
+                .and_then(|e| e.recovery_layout.as_ref())
+                .expect("rd_numb recovery after patch"),
+        );
+        assert_eq!(
+            before, after,
+            "patch must keep the rd_numb recovery; do not mint a second layout"
         );
     }
 

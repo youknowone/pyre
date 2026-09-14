@@ -968,6 +968,11 @@ mod tests {
         setfield_gc: 93,
         int_eq: 2,
         // RPython has one extra guard and two `debug_merge_point`s.
+        // The extra guard is the first and/or after the two Char
+        // `int_eq`s: RPython (header tick, s[3]) emits guard_false;
+        // our back-edge tick at threshold 3 traces s[4] and emits
+        // guard_true. `back_edge_threshold_selects_the_specialized_character`
+        // recovers RPython's 27 / guard_false at threshold 2.
         branching_total: 150,
         branching_guards: 26,
         // masking: one guard -- the loop-exit `IntLt` -- and the 18 ops the
@@ -1089,6 +1094,119 @@ mod tests {
             after_first,
             "a second call rebuilt the regex's JitDriver cell instead of reusing it",
         );
+    }
+
+    /// The back-edge `can_enter_jit` ticks after `shift`/`pos += 1`, so
+    /// threshold N traces character `N+1`. RPython's synthesized header
+    /// tick (warmspot `rewrite_can_enter_jit`) traces character N. The
+    /// first and/or guard after the two `int_eq`s is the witness: RPython
+    /// at threshold 3 emits `guard_false` there (27 guards); our
+    /// threshold 3 emits `guard_true` (26). Threshold 2 should recover
+    /// RPython's polarity by specializing `s[3]`.
+    #[test]
+    fn back_edge_threshold_selects_the_specialized_character() {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let input = nonmatching(4096, 20, 42);
+        let mut rows = [(2u32, 0usize, OpCode::Label), (3, 0, OpCode::Label)];
+        GUARD_FAILURE_PROBE.store(true, Ordering::Relaxed);
+        for row in &mut rows {
+            let root = lower(&bench_regex(20));
+            LAST_BODY.lock().unwrap().clear();
+            COMPILES.store(0, Ordering::Relaxed);
+            BRIDGES.store(0, Ordering::Relaxed);
+            GUARD_FAILURES.store(0, Ordering::Relaxed);
+            assert!(!Matcher::new(root, row.0).matches(&input));
+            let body = last_peeled_body();
+            row.1 = guards(&body);
+            // First guard after the two Char int_eq / setfield pairs.
+            if let Some(op) = body
+                .iter()
+                .skip_while(|op| **op != OpCode::IntEq)
+                .skip(1)
+                .skip_while(|op| **op != OpCode::IntEq)
+                .skip(1)
+                .find(|op| **op == OpCode::GuardTrue || **op == OpCode::GuardFalse)
+            {
+                row.2 = *op;
+            }
+            println!(
+                "[threshold] {} -> {} guards, first post-inteq guard {:?}, \
+                 {} deopt(s), {} bridge(s)",
+                row.0,
+                row.1,
+                row.2,
+                GUARD_FAILURES.load(Ordering::Relaxed),
+                BRIDGES.load(Ordering::Relaxed),
+            );
+        }
+        GUARD_FAILURE_PROBE.store(false, Ordering::Relaxed);
+        assert_eq!(
+            rows[1].2,
+            OpCode::GuardTrue,
+            "threshold 3 is supposed to be the recorded 26-guard polarity"
+        );
+        assert_eq!(
+            rows[0].2,
+            OpCode::GuardFalse,
+            "threshold 2 should specialize s[3] like RPython threshold 3 \
+             and emit the missing guard_false; got {:?} with {} guards",
+            rows[0].2,
+            rows[0].1,
+        );
+        assert_eq!(
+            rows[0].1, 27,
+            "RPython's 27-guard body should appear at the matching character"
+        );
+    }
+
+    /// Same Matcher, same input, several passes: the bridge counter after each
+    /// one. `bridge_was_compiled` already refuses a (trace_id, fail_index)
+    /// that has a bridge; later passes compile *new* fail sites at the
+    /// `trace_eagerness` rate (a bridge's own guards), not the same site
+    /// again. The count therefore keeps growing at about `n / 200` per pass.
+    #[test]
+    fn matcher_bridge_count_across_repeated_passes() {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        COMPILES.store(0, Ordering::Relaxed);
+        BRIDGES.store(0, Ordering::Relaxed);
+        let root = lower(&bench_regex(20));
+        let input = nonmatching(4096, 20, 42);
+        let mut matcher = Matcher::new(root, 3);
+        let mut after = [0usize; 6];
+        for slot in &mut after {
+            assert!(!matcher.matches(&input));
+            *slot = BRIDGES.load(Ordering::Relaxed);
+        }
+        let deltas: [usize; 6] = std::array::from_fn(|i| {
+            if i == 0 {
+                after[0]
+            } else {
+                after[i] - after[i - 1]
+            }
+        });
+        println!(
+            "[bridges-per-pass] 4096 chars: cumulative {after:?} deltas {deltas:?} loops {}",
+            COMPILES.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            COMPILES.load(Ordering::Relaxed),
+            1,
+            "repeated passes compiled more than the one loop",
+        );
+        assert!(
+            after[0] > 0,
+            "the first pass compiled no bridges; the later deltas are unreadable",
+        );
+        assert!(
+            after[5] > after[0],
+            "later passes compiled no new bridges ({after:?}); the eagerness \
+             cascade on this body is supposed to keep trailing the mark pattern",
+        );
+        // A full reset of the compile decision would grow ~`after[0]` every
+        // pass *and* retrace the same (trace_id, fail_index). The cascade
+        // grows at a similar rate from *new* sites; the unique-source check
+        // lives in the dynasm `source=` diag, not in this total.
+        let _ = deltas;
     }
 
     #[test]

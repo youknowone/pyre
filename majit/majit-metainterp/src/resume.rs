@@ -1075,7 +1075,6 @@ pub fn resume_frame_layout_from_exit_frame_layout(
         .iter()
         .map(majit_backend::resume_value_layout_summary_from_exit_value_source)
         .collect();
-    let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
 
     ResumeFrameLayoutSummary {
         trace_id: exit_frame.trace_id,
@@ -1083,7 +1082,7 @@ pub fn resume_frame_layout_from_exit_frame_layout(
         source_guard: exit_frame.source_guard,
         jitcode_index: exit_frame.jitcode_index,
         pc: exit_frame.pc,
-        slot_sources,
+        slot_sources: Vec::new(),
         slot_layouts,
         slot_types: exit_frame.slot_types.clone(),
     }
@@ -2537,12 +2536,8 @@ impl EncodedResumeData {
         let layout = self.decode_layout();
         ResumeLayoutSummary {
             num_frames: layout.frames.len(),
-            frame_pcs: layout.frames.iter().map(|frame| frame.pc).collect(),
-            frame_slot_counts: layout
-                .frames
-                .iter()
-                .map(|frame| frame.slot_map.len())
-                .collect(),
+            frame_pcs: Vec::new(),
+            frame_slot_counts: Vec::new(),
             frame_layouts: layout
                 .frames
                 .iter()
@@ -2552,7 +2547,7 @@ impl EncodedResumeData {
                     source_guard: None,
                     jitcode_index: frame.jitcode_index,
                     pc: frame.pc,
-                    slot_sources: frame.slot_map.iter().map(ResumeValueSource::kind).collect(),
+                    slot_sources: Vec::new(),
                     slot_layouts: frame
                         .slot_map
                         .iter()
