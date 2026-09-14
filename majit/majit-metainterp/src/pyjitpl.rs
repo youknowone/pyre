@@ -15050,11 +15050,11 @@ impl<M: Clone> MetaInterp<M> {
         let inline_short_preamble = !fail_descr.is_resume_at_position();
         // A Grain inner-`for` exhaust JUMP onto the outer loop is the
         // orthodox close (`compile.py` compile_trace JUMP). The dest
-        // LABEL's virtual state is the outer range; the recorded JUMP
-        // still carries the inner leftovers, so both the specialized
-        // short-preamble match and `jump_to_preamble` publish a close
-        // that marks the next primes composite. Decline until the
-        // JUMP args are the dest inputargs (`unroll.py:196-200`).
+        // LABEL is the rotated outer *body* (pc=63). The walk that
+        // reaches it has not run the outer `IterNext` (pc=152), so `p`
+        // is still the exhausted prime and a published close re-sieves
+        // with a stale iterator. Decline until that walk stores the
+        // next `p` before the JUMP (`unroll.py:196-200`).
         if cell_token_key != green_key && self.second_portal_red_is_grain_vm() {
             if crate::majit_log_enabled() {
                 eprintln!(
