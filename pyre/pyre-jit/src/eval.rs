@@ -7658,13 +7658,15 @@ fn unpack_merge_point_jit(
     if !jd1_experiment_enabled() {
         return;
     }
-    // blackhole.py `bhimpl_jit_merge_point`: a merge point reached from
-    // blackhole does not start a new trace.  The hook is the interpreter
-    // portal, so a STORE_ATTR deopt that unpacks a list would otherwise
-    // nest `force_start_tracing` under `BlackholeInterpreter::run`.
-    if majit_metainterp::blackhole::blackhole_is_running() {
-        return;
-    }
+    // Untranslated body of the `can_enter_jit` that `rewrite_can_enter_jits`
+    // inserts at the portal startblock (`warmspot.py`, reds='auto' has none).
+    // `jit_merge_point` itself is only a translator marker; blackhole hits
+    // `bhimpl_jit_merge_point` (ContinueRunningNormally / recursive portal
+    // runner) and never this hook. A residual that reaches the interpreted
+    // portal goes through `ll_portal_runner` / this insert, which may start
+    // a trace — the same as PyPy. Same-green reentry is `JC_TRACING` /
+    // `meta.is_tracing()` inside `drive_unpack_iterable_trace`, not a
+    // blackhole-running flag (none exists upstream).
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
     }
@@ -11889,7 +11891,6 @@ fn compile_and_run_once(
     }
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
-    let had_compiled = driver.has_compiled_loop(green_key);
     match start {
         CompileOnceStart::BackEdge => {
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
@@ -11962,7 +11963,11 @@ fn compile_and_run_once(
             .meta_interp_mut()
             .warm_state_mut()
             .clear_tracing_flag(starting_tracing_key);
-        if !had_compiled && driver.has_compiled_loop(compiled_key) {
+        // compile.py record_loop_or_bridge: register every compiled
+        // loop/bridge's quasi_immutable_deps against its token. The
+        // `!had_compiled` extra gate dropped deps on a replace compile,
+        // so a later mutated() never saw the new token.
+        if driver.has_compiled_loop(compiled_key) {
             register_quasi_immutable_deps(compiled_key);
         } else {
             // `register_quasi_immutable_deps` is the only drain of
