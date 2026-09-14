@@ -10805,6 +10805,17 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_cmp_binop(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    first_arg_ty.as_ref(),
+                    second_arg_ty.as_ref(),
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_word_rotate(
                     mir_bb, &reg.kind, &segments, &args, dest_local, target,
                 )? {
@@ -11515,6 +11526,44 @@ impl<'a> Lowering<'a> {
         {
             OpKind::BinOp {
                 op: binop.to_string(),
+                lhs: args[0].clone().into_variable(),
+                rhs: args[1].clone().into_variable(),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            op_kind
+        };
+
+        // Scalar `PartialEq` / `PartialOrd` on the rich spine: the same
+        // `core::cmp::{eq..ge}` FunctionPath the adapter rewrites, or a
+        // `Method` whose receiver is already in a scalar bank.  Twin of
+        // the fieldless-enum fold above; strings stay on the dedicated
+        // arm so they keep `ll_streq`.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && let Some(leaf) = match target {
+                CallTarget::FunctionPath { segments } => {
+                    crate::codewriter::minmax::cmp_binop_leaf(segments)
+                }
+                CallTarget::Method { name, .. } => match name.as_str() {
+                    "eq" | "ne" | "lt" | "le" | "gt" | "ge" => Some(name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            }
+            && crate::codewriter::minmax::scalar_cmp_banks_compatible(
+                first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.scalar_cmp_bank(ty))
+                    .as_ref(),
+                second_arg_ty
+                    .as_ref()
+                    .and_then(|ty| self.scalar_cmp_bank(ty))
+                    .as_ref(),
+                leaf,
+            ) {
+            OpKind::BinOp {
+                op: leaf.to_string(),
                 lhs: args[0].clone().into_variable(),
                 rhs: args[1].clone().into_variable(),
                 result_ty: ValueType::Int,
@@ -16447,6 +16496,71 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// Opaque `core::cmp::{eq,ne,lt,le,gt,ge}` on a scalar pair is the
+    /// like-named flowspace `BinOp` (`nonraising_core_bridge_opname`).
+    /// The string-family arm above already takes `&Wtf8` / `&str`; this
+    /// one is the integer and float impls that share `impls::<Impl>`
+    /// and were left residual so they would not steal that fold.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_cmp_binop(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 {
+            return Ok(false);
+        }
+        let Some(leaf) = crate::codewriter::minmax::cmp_binop_leaf(segments) else {
+            return Ok(false);
+        };
+        let lhs = first_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
+        let rhs = second_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
+        if !crate::codewriter::minmax::scalar_cmp_banks_compatible(lhs.as_ref(), rhs.as_ref(), leaf)
+        {
+            return Ok(false);
+        }
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: leaf.to_string(),
+                lhs: args[0].clone(),
+                rhs: args[1].clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Signed / unsigned / float / bool bank of `ty`, peeling one
+    /// reference so `&i64` compares as `Int`.  Strings and ADTs stay
+    /// `None` and keep their own folds.
+    fn scalar_cmp_bank(&self, ty: &TyRef) -> Option<ValueType> {
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        match tyref_to_value_type(ty, self.llbc) {
+            ty @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
+                Some(ty)
+            }
+            _ => None,
+        }
     }
 
     fn try_lower_wrapping_binop(

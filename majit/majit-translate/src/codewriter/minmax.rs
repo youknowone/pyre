@@ -58,6 +58,62 @@ pub fn is_cmp_minmax(op: &SpaceOperation) -> Option<bool> {
     }
 }
 
+/// The comparison leaf a `core::cmp::{eq,ne,lt,le,gt,ge}` FunctionPath
+/// (free function or `impls::<Impl>` method) lowers to.  The adapter's
+/// `nonraising_core_bridge_opname` uses the same `core` + `cmp` + leaf
+/// test; the rich spine emits the like-named `BinOp` instead of leaving
+/// the Opaque call residual.
+pub fn cmp_binop_leaf(segments: &[String]) -> Option<&'static str> {
+    if segments.len() < 3 || segments[0] != "core" || segments[1] != "cmp" {
+        return None;
+    }
+    match segments.last().map(String::as_str) {
+        Some("eq") => Some("eq"),
+        Some("ne") => Some("ne"),
+        Some("lt") => Some("lt"),
+        Some("le") => Some("le"),
+        Some("gt") => Some("gt"),
+        Some("ge") => Some("ge"),
+        _ => None,
+    }
+}
+
+/// Whether two scalar banks may share a `BinOp` of `leaf`.  `eq`/`ne`
+/// treat Signed and Unsigned as one machine word (`getkind` is `'int'`
+/// for both); ordered compares keep the banks apart so `uint_lt` is
+/// not answered by `int_lt`.  Float never mixes.  A missing bank is a
+/// const operand — it follows the other side.
+pub fn scalar_cmp_banks_compatible(
+    lhs: Option<&ValueType>,
+    rhs: Option<&ValueType>,
+    leaf: &str,
+) -> bool {
+    let ordered = matches!(leaf, "lt" | "le" | "gt" | "ge");
+    match (lhs, rhs) {
+        (Some(a), Some(b)) => banks_agree(a, b, ordered),
+        (Some(a), None) | (None, Some(a)) => is_scalar_cmp_bank(a),
+        (None, None) => false,
+    }
+}
+
+fn is_scalar_cmp_bank(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool
+    )
+}
+
+fn banks_agree(lhs: &ValueType, rhs: &ValueType, ordered: bool) -> bool {
+    match (lhs, rhs) {
+        (ValueType::Float, ValueType::Float) => true,
+        (ValueType::Float, _) | (_, ValueType::Float) => false,
+        (ValueType::Unsigned, ValueType::Unsigned) => true,
+        (ValueType::Unsigned, _) | (_, ValueType::Unsigned) => !ordered,
+        (ValueType::Int | ValueType::Bool, ValueType::Int | ValueType::Bool) => true,
+        _ => false,
+    }
+}
+
 /// The value bank `ll_min` / `ll_max` can compare.  Refs have no
 /// ordering helper; mixed banks stay residual.
 pub fn minmax_value_ty(result_ty: &ValueType) -> Option<ValueType> {
@@ -166,6 +222,64 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         }
+    }
+
+    #[test]
+    fn recognises_cmp_binop_leaves() {
+        assert_eq!(
+            cmp_binop_leaf(&["core".into(), "cmp".into(), "eq".into()]),
+            Some("eq")
+        );
+        assert_eq!(
+            cmp_binop_leaf(&[
+                "core".into(),
+                "cmp".into(),
+                "impls".into(),
+                "<Impl>".into(),
+                "lt".into()
+            ]),
+            Some("lt")
+        );
+        assert_eq!(
+            cmp_binop_leaf(&["core".into(), "cmp".into(), "min".into()]),
+            None
+        );
+        assert_eq!(cmp_binop_leaf(&["foo".into(), "eq".into()]), None);
+    }
+
+    #[test]
+    fn scalar_cmp_banks_keep_ordered_unsigned_apart() {
+        assert!(scalar_cmp_banks_compatible(
+            Some(&ValueType::Int),
+            Some(&ValueType::Int),
+            "eq"
+        ));
+        assert!(scalar_cmp_banks_compatible(
+            Some(&ValueType::Int),
+            Some(&ValueType::Unsigned),
+            "eq"
+        ));
+        assert!(!scalar_cmp_banks_compatible(
+            Some(&ValueType::Int),
+            Some(&ValueType::Unsigned),
+            "lt"
+        ));
+        assert!(scalar_cmp_banks_compatible(
+            Some(&ValueType::Unsigned),
+            Some(&ValueType::Unsigned),
+            "lt"
+        ));
+        assert!(!scalar_cmp_banks_compatible(
+            Some(&ValueType::Float),
+            Some(&ValueType::Int),
+            "eq"
+        ));
+        assert!(scalar_cmp_banks_compatible(
+            Some(&ValueType::Int),
+            None,
+            "lt"
+        ));
+        assert!(!scalar_cmp_banks_compatible(None, None, "eq"));
     }
 
     #[test]
