@@ -5574,7 +5574,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
                             || name.ends_with("::ncells")
                             || name.contains("ll_issubclass")
                             || name.contains("raise_kind_arg")
-                            || name.contains("label_arg_to_usize"))
+                            || name.contains("label_arg_to_usize")
+                            || name.contains("exception_match")
+                            || name.contains("is_valid_check_exc_match_class"))
                         .then_some(addr)
                     })
                     .collect();
@@ -5582,6 +5584,10 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 addrs.push(pyre_object::ll_issubclass as *const () as i64);
                 addrs.push(
                     pyre_object::pyobject::__majit_call_target_ll_issubclass as *const () as i64,
+                );
+                addrs.push(pyre_interpreter::baseobjspace::exception_match as *const () as i64);
+                addrs.push(
+                    pyre_interpreter::eval::is_valid_check_exc_match_class as *const () as i64,
                 );
                 addrs
             },
@@ -5630,7 +5636,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 .filter_map(|(name, addr)| {
                     (name.contains("frame_anchor_release")
                         || name.contains("frame_anchor_drop")
-                        || name.contains("stack_check"))
+                        || name.contains("stack_check")
+                        || name.contains("set_in_flight_exception"))
                     .then_some(addr)
                 })
                 .collect(),
@@ -5644,6 +5651,89 @@ fn build_jit_driver_pair() -> JitDriverPair {
             intval_descr: pyre_jit_trace::descr::int_intval_descr(),
             int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
         });
+        majit_metainterp::register_exception_trace_residual(
+            majit_metainterp::ExceptionTraceResidual {
+                callable_index: pyre_jit_trace::helpers::portal_callfn_callable_index,
+                can_new: pyre_jit_trace::helpers::portal_can_record_exception_new,
+                emit_new: pyre_jit_trace::helpers::portal_emit_exception_new,
+                can_raise: pyre_jit_trace::helpers::portal_can_record_raise_builtin,
+                emit_raise: pyre_jit_trace::helpers::portal_emit_raise_builtin,
+                raise_prepared_fnaddrs: {
+                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                        .into_iter()
+                        .filter_map(|(name, addr)| {
+                            name.contains("raise_prepared_exc").then_some(addr)
+                        })
+                        .collect();
+                    addrs.push(pyre_interpreter::eval::raise_prepared_exc as *const () as i64);
+                    addrs
+                },
+                attach_raise_cause: pyre_jit_trace::helpers::portal_attach_raise_cause,
+                emit_virtual_traceback: pyre_jit_trace::helpers::portal_emit_virtual_traceback,
+                to_exc_object_fnaddrs: {
+                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                        .into_iter()
+                        .filter_map(|(name, addr)| {
+                            name.contains("pyerror_to_exc_object").then_some(addr)
+                        })
+                        .collect();
+                    addrs.push(pyre_interpreter::error::pyerror_to_exc_object as *const () as i64);
+                    addrs
+                },
+                exc_object_of_pyerror: pyre_jit_trace::helpers::portal_pyerror_exc_object,
+                dispatch_handler_fnaddrs: {
+                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                        .into_iter()
+                        .filter_map(|(name, addr)| {
+                            name.contains("dispatch_exception_handler").then_some(addr)
+                        })
+                        .collect();
+                    addrs.push(
+                        pyre_interpreter::eval::dispatch_exception_handler as *const () as i64,
+                    );
+                    addrs
+                },
+                load_global_fnaddrs: {
+                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                        .into_iter()
+                        .filter_map(|(name, addr)| {
+                            name.contains("load_global_nameindex_w").then_some(addr)
+                        })
+                        .collect();
+                    addrs.push(pyre_interpreter::eval::load_global_nameindex_w as *const () as i64);
+                    addrs
+                },
+                emit_load_global_exc:
+                    pyre_jit_trace::helpers::portal_try_fold_load_global_exc_class,
+                get_current_exception_fnaddrs: {
+                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                        .into_iter()
+                        .filter_map(|(name, addr)| {
+                            name.contains("get_current_exception").then_some(addr)
+                        })
+                        .collect();
+                    addrs.push(pyre_interpreter::eval::get_current_exception as *const () as i64);
+                    addrs.push(crate::call_jit::bh_get_current_exception as *const () as i64);
+                    addrs
+                },
+                set_current_exception_fnaddrs: {
+                    let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
+                        .into_iter()
+                        .filter_map(|(name, addr)| {
+                            name.contains("set_current_exception").then_some(addr)
+                        })
+                        .collect();
+                    addrs.push(pyre_interpreter::eval::set_current_exception as *const () as i64);
+                    addrs.push(crate::call_jit::bh_set_current_exception as *const () as i64);
+                    addrs
+                },
+                emit_get_current_exception:
+                    pyre_jit_trace::helpers::portal_emit_get_current_exception,
+                emit_set_current_exception:
+                    pyre_jit_trace::helpers::portal_emit_set_current_exception,
+                current_ec_ptr: || pyre_interpreter::call::getexecutioncontext() as i64,
+            },
+        );
         majit_metainterp::register_compare_op_residual(majit_metainterp::CompareOpResidual {
             fnaddrs: {
                 let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
