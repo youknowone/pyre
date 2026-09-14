@@ -197,6 +197,13 @@ impl ListStrategy {
 /// `strategy`, `int_items`, `float_items`, `bytes_items`, `ascii_items`
 /// implement PyPy's list
 /// strategy split (`pypy/objspace/std/listobject.py`). Only the Object strategy
+/// Host constructor for the 3.14t length cell. Upstream `l.length`
+/// (`rlist.py`) is a plain int; minting the atomic word is residual.
+#[majit_macros::dont_look_inside]
+fn list_length_cell(n: usize) -> AtomicUsize {
+    AtomicUsize::new(n)
+}
+
 /// reads/writes `length` + `items`; Integer/IntOrFloat/Float/Bytes strategies
 /// operate on their own typed arrays and keep `length = 0`, `items = null`.
 #[repr(C)]
@@ -2137,7 +2144,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
         let boxed = Box::new(W_ListObject {
             ob_header: header,
             allocated: items.len() as isize,
-            length: AtomicUsize::new(length),
+            length: list_length_cell(length),
             items: items_block,
             strategy,
             int_items,
@@ -2154,7 +2161,7 @@ pub fn w_list_new_with_strategy(items: Vec<PyObjectRef>, strategy: ListStrategy)
             W_ListObject {
                 ob_header: header,
                 allocated: items.len() as isize,
-                length: AtomicUsize::new(length),
+                length: list_length_cell(length),
                 items: items_block,
                 strategy,
                 int_items,
