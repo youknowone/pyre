@@ -329,6 +329,22 @@ impl ValueLocals {
                 alias_source[dst] = Some(src);
             }
         }
+        // Loop-closing defs that do not interfere with their LABEL slot
+        // share that slot's local (x86 colors the same way). SAME_AS
+        // above refuses LABEL ids; this edge is the one JUMP rewrite.
+        for (jid, lid) in jump_phi_coalesce_pairs(ops) {
+            let dst = jid as usize;
+            let src = lid as usize;
+            if dst < alias_source.len()
+                && src < by_id.len()
+                && by_id[src].is_some()
+                && by_id[dst].is_some()
+                && alias_source[dst].is_none()
+                && id_types[dst] == id_types[src]
+            {
+                alias_source[dst] = Some(src);
+            }
+        }
 
         let mut types = Vec::new();
         let mut root_locals = vec![None; num_vars as usize];
@@ -1389,6 +1405,35 @@ impl RefHomes {
                 Self::assign(&mut by_id, &mut next, r.raw());
             }
         }
+        // Same JUMP→LABEL coloring as ValueLocals: one home for the
+        // coalesced pair so store-on-def of the def already updates
+        // the slot the next iteration reloads.
+        for (jid, lid) in jump_phi_coalesce_pairs(ops) {
+            let j = jid as usize;
+            let l = lid as usize;
+            let jh = by_id.get(j).copied().unwrap_or(Self::NONE);
+            let lh = by_id.get(l).copied().unwrap_or(Self::NONE);
+            match (jh != Self::NONE, lh != Self::NONE) {
+                (true, true) => {
+                    if j < by_id.len() {
+                        by_id[j] = lh;
+                    }
+                }
+                (false, true) => {
+                    if j >= by_id.len() {
+                        by_id.resize(j + 1, Self::NONE);
+                    }
+                    by_id[j] = lh;
+                }
+                (true, false) => {
+                    if l >= by_id.len() {
+                        by_id.resize(l + 1, Self::NONE);
+                    }
+                    by_id[l] = jh;
+                }
+                (false, false) => {}
+            }
+        }
         RefHomes {
             by_id,
             len: next as usize,
@@ -2446,6 +2491,10 @@ impl HomeLiveness {
     /// nothing reads it. `regalloc.py` spells this `Lifetime.last_usage`.
     fn last_use(&self, raw: u32) -> i32 {
         self.last_use.get(raw as usize).copied().unwrap_or(-1)
+    }
+
+    fn defined_at(&self, raw: u32) -> i32 {
+        self.def_pos.get(raw as usize).copied().unwrap_or(i32::MAX)
     }
 }
 
@@ -6585,7 +6634,15 @@ fn build_function(
                 let moved: Vec<usize> = (0..n)
                     .filter(|&i| {
                         let jarg = jump_args[i].to_opref();
-                        jarg.is_constant() || jarg.raw() != label_args[i].raw()
+                        if jarg.is_constant() {
+                            return true;
+                        }
+                        let larg = label_args[i];
+                        if larg.is_constant() {
+                            return true;
+                        }
+                        jarg.raw() != larg.raw()
+                            && value_types.local(jarg.raw()) != value_types.local(larg.raw())
                     })
                     .collect();
                 debug_assert!(
@@ -6629,7 +6686,10 @@ fn build_function(
                         // A constant jump arg is never a self-move, and OpRef::raw() must
                         // not be called on an inline constant, so guard the comparison.
                         let jarg = jump_args[i].to_opref();
-                        if !jarg.is_constant() && jarg.raw() == la.raw() {
+                        if !jarg.is_constant()
+                            && (jarg.raw() == la.raw()
+                                || value_types.local(jarg.raw()) == value_types.local(la.raw()))
+                        {
                             continue;
                         }
                         sink.local_get(0);
@@ -10812,6 +10872,57 @@ fn jump_label_ordinal(ops: &[Op], jump: &Op) -> Option<usize> {
     )
 }
 
+/// JUMP args that can occupy their LABEL-arg wasm local and Ref home.
+///
+/// x86 `RegisterManager` colors a loop-closing def into the LABEL
+/// register; wasm otherwise mints a fresh local, then parallel-moves
+/// and re-homes at every back-edge. When the def and the LABEL slot
+/// do not interfere (`HomeLiveness::live_across`), share the location
+/// so the JUMP is an identity self-move.
+fn jump_phi_coalesce_pairs(ops: &[Op]) -> Vec<(u32, u32)> {
+    let liveness = HomeLiveness::collect_with_regions(&[], ops, &[]);
+    let mut pairs = Vec::new();
+    let mut taken_j = Vec::new();
+    let mut taken_l = Vec::new();
+    for jump in ops.iter().filter(|op| op.opcode == OpCode::Jump) {
+        if find_jump_target_label_index(ops, jump).is_none() {
+            continue;
+        }
+        let label_args = find_label_args(ops, jump);
+        let jump_args = jump.getarglist();
+        let n = jump_args.len().min(label_args.len());
+        for i in 0..n {
+            let jarg = jump_args[i].to_opref();
+            let larg = label_args[i];
+            if jarg.is_constant()
+                || larg.is_constant()
+                || jarg == OpRef::NONE
+                || larg == OpRef::NONE
+                || jarg.raw() == larg.raw()
+                || jarg.ty() != larg.ty()
+            {
+                continue;
+            }
+            let jid = jarg.raw();
+            let lid = larg.raw();
+            if taken_j.contains(&jid) || taken_l.contains(&lid) {
+                continue;
+            }
+            let def_j = liveness.defined_at(jid);
+            if def_j == i32::MAX || def_j < 0 {
+                continue;
+            }
+            if liveness.live_across(lid, def_j as usize) {
+                continue;
+            }
+            pairs.push((jid, lid));
+            taken_j.push(jid);
+            taken_l.push(lid);
+        }
+    }
+    pairs
+}
+
 fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
     // A multi-label trace's JUMP does not necessarily target its last label.
     // LABEL and JUMP share the loop-target descr, so resolve the target by Arc
@@ -12956,6 +13067,51 @@ mod tests {
     fn aligned_varsize_frame_bump_rejects_u32_overflow() {
         assert_eq!(aligned_varsize_frame_bump(20), Some(24));
         assert_eq!(aligned_varsize_frame_bump(0xffff_fffc), None);
+    }
+
+    #[test]
+    fn jump_phi_coalesces_new_onto_dead_label_slot() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let label = Op::new(OpCode::Label, &[rb(p0)]);
+        label.setdescr(descr.clone());
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::ref_op(10))]);
+        jump.setdescr(descr);
+        let ops = vec![label, new, jump];
+        assert_eq!(jump_phi_coalesce_pairs(&ops), vec![(10, 0)]);
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+        let locals = ValueLocals::collect(&inputargs, &ops, 16, 1);
+        assert_eq!(
+            locals.local(10),
+            locals.local(0),
+            "New that only closes the JUMP must share the LABEL local"
+        );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_when_label_slot_is_still_live() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let label = Op::new(OpCode::Label, &[rb(p0)]);
+        label.setdescr(descr.clone());
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let keep = Op::new(OpCode::GuardNonnull, &[rb(p0)]);
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::ref_op(10))]);
+        jump.setdescr(descr);
+        let ops = vec![label, new, keep, jump];
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "LABEL slot still read after the New must keep its own local"
+        );
     }
 
     #[test]
