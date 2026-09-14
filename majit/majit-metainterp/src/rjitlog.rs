@@ -32,11 +32,15 @@ const JITLOG_VERSION: u16 = 4;
 struct JitLogState {
     file: Option<File>,
     trace_id: u64,
+    /// Snapshot of `metainterp_sd` addr2name at `start_new_trace`.
+    /// `rjitlog.py JitLogger.start_new_trace` stores `self.metainterp_sd`.
+    addr2name: Vec<(u64, String)>,
 }
 
 static JITLOG: Mutex<JitLogState> = Mutex::new(JitLogState {
     file: None,
     trace_id: 0,
+    addr2name: Vec::new(),
 });
 
 fn lock() -> std::sync::MutexGuard<'static, JitLogState> {
@@ -107,6 +111,12 @@ pub fn start_new_trace(is_bridge: bool, descr_or_entry: u64, jd_name: &str) -> u
     tid
 }
 
+/// `rjitlog.py JitLogger.start_new_trace`: `self.metainterp_sd = metainterp_sd`.
+/// Snapshot `addr2name` so later `var_to_str` can emit `ConstClass(name)`.
+pub fn set_addr2name(names: impl IntoIterator<Item = (u64, String)>) {
+    lock().addr2name = names.into_iter().collect();
+}
+
 /// `rjitlog.py JitLogger.trace_aborted`.
 pub fn trace_aborted(tid: u64) {
     let mut state = lock();
@@ -139,7 +149,10 @@ where
     }
     let header = encode_le_addr(tid);
     write_marked(&mut state, tag, &header);
-    let mut memo = VarMemo::default();
+    let mut memo = VarMemo {
+        addr2name: state.addr2name.iter().cloned().collect(),
+        ..VarMemo::default()
+    };
     let args: Vec<String> = inputargs
         .iter()
         .map(|arg| memo.inputarg(arg.borrow()))
@@ -162,6 +175,7 @@ where
 struct VarMemo {
     next: usize,
     ids: HashMap<(u8, u64), usize>,
+    addr2name: HashMap<u64, String>,
 }
 
 impl VarMemo {
@@ -212,6 +226,14 @@ impl VarMemo {
             return match value {
                 Value::Int(v) => {
                     let _ = self.assign(b'I', v as u64);
+                    // rjitlog.py var_to_str: ConstClass(name) when the
+                    // int could be an address and addr2name hits.
+                    if int_could_be_an_address(v)
+                        && let Some(name) = self.addr2name.get(&(v as u64))
+                        && !name.is_empty()
+                    {
+                        return format!("ConstClass({name})");
+                    }
                     v.to_string()
                 }
                 Value::Float(v) => {
@@ -323,6 +345,11 @@ pub fn encode_le_addr(val: u64) -> [u8; 8] {
     val.to_le_bytes()
 }
 
+/// `rjitlog.py int_could_be_an_address` after translation.
+fn int_could_be_an_address(x: i64) -> bool {
+    !(-32768..=32767).contains(&x)
+}
+
 /// `rjitlog.py encode_str`.
 pub fn encode_str(string: &str) -> Vec<u8> {
     let len = string.len() as u32;
@@ -401,5 +428,16 @@ mod tests {
         );
         let i = InputArg::new_int(0);
         assert_eq!(memo.inputarg(&i), "i2");
+    }
+
+    #[test]
+    fn const_class_uses_addr2name() {
+        let mut memo = VarMemo::default();
+        memo.addr2name.insert(0x10000, "alpha".into());
+        assert_eq!(
+            memo.operand(&Operand::const_from_value(Value::Int(0x10000))),
+            "ConstClass(alpha)"
+        );
+        assert_eq!(memo.operand(&Operand::const_from_value(Value::Int(5))), "5");
     }
 }

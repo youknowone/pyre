@@ -3402,6 +3402,19 @@ impl<M: Clone> MetaInterp<M> {
     /// leave it empty.
     fn jitlog_start_new_trace(&mut self, is_bridge: bool, descr_or_entry: u64, jd_name: &str) {
         self.jitlog_trace_id = crate::rjitlog::start_new_trace(is_bridge, descr_or_entry, jd_name);
+        crate::rjitlog::set_addr2name(self.jitlog_addr2name_pairs());
+    }
+
+    /// `rjitlog.py JitLogger.start_new_trace`: snapshot metainterp_sd
+    /// addr2name so `var_to_str` can emit `ConstClass(name)`.
+    fn jitlog_addr2name_pairs(&self) -> Vec<(u64, String)> {
+        self.staticdata
+            ._addr2name_keys
+            .iter()
+            .copied()
+            .map(|k| k as u64)
+            .zip(self.staticdata._addr2name_values.iter().cloned())
+            .collect()
     }
 
     /// `compile.py compile_trace`: `jd_name=jitdriver_sd.jitdriver.name`.
@@ -9110,6 +9123,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_trace: jd_name=jitdriver_sd.jitdriver.name.
         // Capture before `ctx` so the later field write stays disjoint.
         let jd_name = self.jitlog_jd_name();
+        let addr2name = self.jitlog_addr2name_pairs();
         let ctx = self.tracing.as_mut().unwrap();
 
         // pyjitpl.py:3187: save position before recording JUMP/FINISH
@@ -9153,6 +9167,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_trace: start_new_trace after tracing_done.
         // Field write so it does not fight the live `ctx` borrow.
         self.jitlog_trace_id = crate::rjitlog::start_new_trace(true, descr_id, &jd_name);
+        crate::rjitlog::set_addr2name(addr2name);
 
         // Keep the recorded operations (including JUMP) alive while the
         // recorder is cut below. `compile.py compile_trace` hands the live
