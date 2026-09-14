@@ -139,6 +139,88 @@ extern "C" fn bh_w_type_issubtype(w_type: i64, cls: i64) -> i64 {
     }
 }
 
+// `descr.py CallDescr.create_call_stub` constructs FuncType(ARGS, RESULT),
+// calls that typed function and only then casts its result to Signed. These
+// source-registry entries need the same stub: the override probes return bool,
+// whose upper return-register bits are unspecified on x86. All parameters are
+// words as well, so the stub has the declared call_indirect type on wasm32.
+// The macro attribute cannot generate these stubs from syntax alone because
+// their fieldless enum parameters are defined outside the function signature.
+macro_rules! override_enum_arg {
+    ($name:ident, $ty:ty, $($variant:ident),+ $(,)?) => {
+        fn $name(word: i64) -> $ty {
+            match word {
+                $(value if value == <$ty>::$variant as i64 => <$ty>::$variant,)+
+                _ => panic!("invalid {} residual argument: {word}", stringify!($ty)),
+            }
+        }
+    };
+}
+
+override_enum_arg!(
+    binop_dunder_arg,
+    crate::objspace::descroperation::BinopDunder,
+    Add,
+    Sub,
+    Mul,
+    FloorDiv,
+    Mod,
+    TrueDiv,
+    Pow,
+    DivMod,
+    LShift,
+    RShift,
+    And,
+    Or,
+    Xor
+);
+override_enum_arg!(
+    unary_dunder_arg,
+    crate::objspace::descroperation::UnaryDunder,
+    Pos,
+    Neg,
+    Invert
+);
+override_enum_arg!(
+    seq_base_arg,
+    crate::objspace::descroperation::SeqBase,
+    Str,
+    List,
+    Tuple
+);
+override_enum_arg!(
+    repeat_dunder_arg,
+    crate::objspace::descroperation::RepeatDunder,
+    MulPair,
+    IMul
+);
+
+macro_rules! override_call_stub {
+    ($stub:ident, $helper:ident, $($arg:ident => $value:expr),+ $(,)?) => {
+        extern "C" fn $stub($($arg: i64),+) -> i64 {
+            unsafe { crate::objspace::descroperation::$helper($($value),+) as i64 }
+        }
+    };
+}
+
+override_call_stub!(needs_numeric_binop_dispatch_call_stub, needs_numeric_binop_dispatch,
+    a => a as pyre_object::PyObjectRef, b => b as pyre_object::PyObjectRef,
+    op => binop_dunder_arg(op));
+override_call_stub!(needs_bytes_binop_dispatch_call_stub, needs_bytes_binop_dispatch,
+    a => a as pyre_object::PyObjectRef, b => b as pyre_object::PyObjectRef,
+    op => binop_dunder_arg(op));
+override_call_stub!(needs_seq_binop_dispatch_call_stub, needs_seq_binop_dispatch,
+    a => a as pyre_object::PyObjectRef, b => b as pyre_object::PyObjectRef,
+    base => seq_base_arg(base), op => binop_dunder_arg(op));
+override_call_stub!(needs_set_binop_dispatch_call_stub, needs_set_binop_dispatch,
+    a => a as pyre_object::PyObjectRef, b => b as pyre_object::PyObjectRef);
+override_call_stub!(needs_numeric_unaryop_dispatch_call_stub, needs_numeric_unaryop_dispatch,
+    a => a as pyre_object::PyObjectRef, op => unary_dunder_arg(op));
+override_call_stub!(sequence_numeric_slot_is_null_call_stub, sequence_numeric_slot_is_null,
+    a => a as pyre_object::PyObjectRef, op => binop_dunder_arg(op));
+override_call_stub!(seq_repeat_override_call_stub, seq_repeat_override,
+    a => a as pyre_object::PyObjectRef, op => repeat_dunder_arg(op));
+
 /// Publication helpers that check the signature instead of erasing it.
 ///
 /// Taking `*const ()` means every caller casts, and a cast accepts any
@@ -393,6 +475,15 @@ fn up4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
     f: unsafe fn(A1, A2, A3, A4) -> R,
+) {
+    push_raw_fnaddr(entries, full_path, f as *const ());
+}
+
+#[inline]
+fn cp4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    full_path: &'static str,
+    f: extern "C" fn(A1, A2, A3, A4) -> R,
 ) {
     push_raw_fnaddr(entries, full_path, f as *const ());
 }
@@ -2403,43 +2494,43 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `dont_look_inside` so the type-static and typeobject-registry loads stay
     // out of the traced arithmetic graph, which makes every one of them a
     // residual call the walk has to bind.
-    up3(
+    cp3(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::needs_numeric_binop_dispatch",
-        crate::objspace::descroperation::needs_numeric_binop_dispatch,
+        needs_numeric_binop_dispatch_call_stub,
     );
-    up3(
+    cp3(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::needs_bytes_binop_dispatch",
-        crate::objspace::descroperation::needs_bytes_binop_dispatch,
+        needs_bytes_binop_dispatch_call_stub,
     );
-    up4(
+    cp4(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::needs_seq_binop_dispatch",
-        crate::objspace::descroperation::needs_seq_binop_dispatch,
+        needs_seq_binop_dispatch_call_stub,
     );
-    up2(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::needs_set_binop_dispatch",
-        crate::objspace::descroperation::needs_set_binop_dispatch,
+        needs_set_binop_dispatch_call_stub,
     );
-    up2(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::needs_numeric_unaryop_dispatch",
-        crate::objspace::descroperation::needs_numeric_unaryop_dispatch,
+        needs_numeric_unaryop_dispatch_call_stub,
     );
     // The two gates `binop_impl`'s sequence branches reach past the ones
     // above.  Each also carried its dunder names as text and so had no row
     // until it took a discriminant.
-    up2(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::sequence_numeric_slot_is_null",
-        crate::objspace::descroperation::sequence_numeric_slot_is_null,
+        sequence_numeric_slot_is_null_call_stub,
     );
-    up2(
+    cp2(
         &mut entries,
         "pyre_interpreter::objspace::descroperation::seq_repeat_override",
-        crate::objspace::descroperation::seq_repeat_override,
+        seq_repeat_override_call_stub,
     );
     // Truncated `_divrem` projections used by Rust operator shims.
     cp2(
