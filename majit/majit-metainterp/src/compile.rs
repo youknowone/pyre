@@ -2562,6 +2562,11 @@ pub fn compile_tmp_callback(
     // `compile.py` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`
     // is set inside `make_jitcell_token`.
     let jitcell_token = make_jitcell_token(token_number, jitdriver_sd.index);
+    // compile.py: `jl.tmp_callback(jitcell_token)` after make_jitcell_token.
+    crate::rjitlog::tmp_callback(
+        std::sync::Arc::as_ptr(&jitcell_token) as *const () as u64,
+        token_number,
+    );
     // `green_key` / `virtualizable_arg_index` are interior-mutable (`Cell`),
     // so they are written through the shared `Arc` directly.
     jitcell_token.green_key.set(green_key);
@@ -2573,10 +2578,6 @@ pub fn compile_tmp_callback(
     jitcell_token
         .virtualizable_arg_index
         .set(jitdriver_sd.red_arg_virtualizable_index());
-    //
-    // `compile.py` `jl.tmp_callback(jitcell_token)` — JIT logger
-    // marker.  TODO: `rpython/rlib/jit.py`'s `jl`
-    // module is not ported; skip.
     //
     // `compile.py` `nb_red_args = jitdriver_sd.num_red_args`.
     let nb_red_args = jitdriver_sd.num_red_args();

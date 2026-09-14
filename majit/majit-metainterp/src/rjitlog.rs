@@ -27,6 +27,7 @@ pub const MARK_JITLOG_HEADER: u8 = MARK_BASE + 13;
 pub const MARK_MERGE_POINT: u8 = MARK_BASE + 14;
 pub const MARK_COMMON_PREFIX: u8 = MARK_BASE + 15;
 pub const MARK_ABORT_TRACE: u8 = MARK_BASE + 16;
+pub const MARK_TMP_CALLBACK: u8 = MARK_BASE + 19;
 
 /// `rjitlog.py` MP_* semantic types.
 pub const MP_STR: u8 = 0x0;
@@ -150,6 +151,18 @@ pub fn register_get_location(types: &[(u8, u8)], get_location: GetLocation) {
     let mut state = lock();
     state.location_types = types.to_vec();
     state.get_location = Some(get_location);
+}
+
+/// `rjitlog.py tmp_callback`.
+pub fn tmp_callback(token_id: u64, token_number: u64) {
+    jitlog_try_init_using_env();
+    let mut state = lock();
+    if state.file.is_none() {
+        return;
+    }
+    let mut payload = encode_le_addr(token_id).to_vec();
+    payload.extend_from_slice(&encode_le_addr(token_number));
+    write_marked(&mut state, MARK_TMP_CALLBACK, &payload);
 }
 
 /// `rjitlog.py JitLogger.trace_aborted`.
@@ -566,6 +579,7 @@ mod tests {
         assert_eq!(MARK_MERGE_POINT, 0x1f);
         assert_eq!(MARK_COMMON_PREFIX, 0x20);
         assert_eq!(MARK_ABORT_TRACE, 0x21);
+        assert_eq!(MARK_TMP_CALLBACK, 0x24);
     }
 
     #[test]
