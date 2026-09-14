@@ -10322,6 +10322,30 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `f64::to_bits(x)` is `longlong2float.float2longlong(x)`.
+                if args.len() == 1 && self.is_f64_to_bits(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "longlong2float".to_string(),
+                                    "float2longlong".to_string(),
+                                ],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `f64::is_sign_negative(x)` is `float2longlong(x) < 0` — reinterpret
                 // the f64 bits as i64 (sign bit = MSB) instead of an unresolved call.
                 if args.len() == 1 && self.is_f64_is_sign_negative(&reg) {
@@ -14441,6 +14465,16 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::from_bits")
+    }
+
+    /// `f64::to_bits(self)` — the reverse of [`is_f64_from_bits`].
+    fn is_f64_to_bits(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::to_bits")
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the
