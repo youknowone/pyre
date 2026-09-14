@@ -3972,22 +3972,33 @@ pub fn walk<Sym: WalkSym>(
                     // too; a traceback reader forces it through the armed
                     // deadframe only if redirected fields are observed.
                     fbw_store_token_in_vable(ctx, recording_opcode_position)?;
-                    // The runtime half of the node, emitted here rather than
-                    // beside the recording half above: it is the only consumer
-                    // of the frame on this arm, and reading the frame before
-                    // the store-back moves the escape ahead of it, which costs
-                    // the trace bridges and guard failures for no gain.  The
-                    // publish above has already settled `last_instr`, which the
-                    // recorder falls back to.
+                    // Runtime node after the vable token, same order as
+                    // `compile_exit_frame_with_exception` (`pyjitpl.py`) plus
+                    // `record_application_traceback` (`pytraceback.py`):
+                    // store_token, then attach.  Prefer the IR-virtual
+                    // `NewWithVtable` node (`record_prepend_application_traceback`)
+                    // so a function-entry raise (`thrower` / `raise KeyError(i)`)
+                    // keeps the exception and frame virtual through
+                    // `Finish(ExitFrameWithExceptionDescrRef)`.  The opaque
+                    // hook is `EffectInfo::MOST_GENERAL` and forces both.
+                    // Same fallback the in-frame catch arm above already uses.
                     if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
-                        record_top_level_application_traceback(
+                        let emit_runtime = !record_prepend_application_traceback(
                             ctx,
                             exc,
                             exc_concrete,
                             recording_opcode_position,
-                            false,
-                            true,
-                        );
+                        )?;
+                        if emit_runtime {
+                            record_top_level_application_traceback(
+                                ctx,
+                                exc,
+                                exc_concrete,
+                                recording_opcode_position,
+                                false,
+                                true,
+                            );
+                        }
                     }
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
