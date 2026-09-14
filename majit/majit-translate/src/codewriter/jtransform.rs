@@ -1843,9 +1843,17 @@ impl<'a> Transformer<'a> {
     /// field instead of one at the end.  The GC and the JIT want the same
     /// shape here; they simply want it for different reasons.
     fn is_fresh_virtualizable(&self, base: &crate::flowspace::model::Variable) -> bool {
+        // `flags = self.vable_flags[op.args[0]]` — KeyError if the hook
+        // did not file this access. Missing is not "empty flags".
         self.vable_flags
             .get(base)
-            .is_some_and(|flags| flags.fresh_virtualizable)
+            .unwrap_or_else(|| {
+                panic!(
+                    "vable_flags missing for virtualizable getset \
+                     (jtransform.py is_virtualizable_getset)"
+                )
+            })
+            .fresh_virtualizable
     }
 
     /// `jtransform.py is_virtualizable_getset`.
@@ -1888,9 +1896,6 @@ impl<'a> Transformer<'a> {
         if field.suppresses_virtualizable() || field.base_is_local_aggregate() {
             return VirtualizableGetset::No;
         }
-        // `if res: flags = self.vable_flags[op.args[0]]`. hook_access_field
-        // files the key for every redirected access; missing key after that
-        // is empty flags (still lower), not a translator crash.
         if self.is_fresh_virtualizable(base) {
             return VirtualizableGetset::No;
         }

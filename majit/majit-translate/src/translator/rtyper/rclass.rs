@@ -3407,9 +3407,10 @@ impl InstanceRepr {
                 })?;
             let vfields = classdesc.borrow().get_param("_virtualizable_", None, false);
             let names = const_value_field_names(&vfields);
-            let mut hints = HashMap::new();
-            hints.insert("virtualizable_accessor".to_string(), ConstValue::Bool(true));
-            let ranking = self._parse_field_list(&names, &mut vable.accessor, &hints)?;
+            // `_parse_field_list` only consults `hints['immutable']`.
+            // The accessor object itself is stamped on the struct type
+            // as `virtualizable_accessor` — see `virtualizable_accessor_hint`.
+            let ranking = self._parse_field_list(&names, &mut vable.accessor, &HashMap::new())?;
             vable.my_redirected_fields = ranking.into_keys().map(|name| (name, true)).collect();
         } else if let Some(base) = self.rbase.borrow().as_ref()
             && let Some(base_vable) = base.virtualizable.borrow().clone()
@@ -3418,6 +3419,42 @@ impl InstanceRepr {
         }
         *self.virtualizable.borrow_mut() = Some(vable);
         Ok(())
+    }
+
+    /// First step of `VirtualizableInstanceRepr._setup_repr`:
+    /// `hints = {'virtualizable_accessor': self.accessor}` passed to
+    /// `MkStruct`. `Struct._hints` is `frozendict<ConstValue>`, so the
+    /// live `FieldListAccessor` cannot sit here yet. Stamp the ranking
+    /// dict (`inst_name → immutable` / `immutable_array`) that
+    /// `VirtualizableInfo.__init__` reads off `accessor.fields`.
+    fn virtualizable_accessor_hint(&self) -> Result<Vec<(String, ConstValue)>, TyperError> {
+        let Some(vable) = self.virtualizable.borrow().clone() else {
+            return Ok(vec![]);
+        };
+        if !vable.top_of_virtualizable_hierarchy {
+            return Ok(vec![]);
+        }
+        let classdesc = self
+            .classdef
+            .as_ref()
+            .map(|cd| cd.borrow().classdesc.clone())
+            .ok_or_else(|| {
+                TyperError::message(
+                    "VirtualizableInstanceRepr._setup_repr needs a classdesc".to_string(),
+                )
+            })?;
+        let vfields = classdesc.borrow().get_param("_virtualizable_", None, false);
+        let names = const_value_field_names(&vfields);
+        let mut accessor = FieldListAccessor::default();
+        let ranking = self._parse_field_list(&names, &mut accessor, &HashMap::new())?;
+        let mut fields = HashMap::new();
+        for (name, rank) in ranking {
+            fields.insert(ConstValue::byte_str(name), ConstValue::byte_str(rank.name));
+        }
+        Ok(vec![(
+            "virtualizable_accessor".to_string(),
+            ConstValue::Dict(fields),
+        )])
     }
 }
 
@@ -4313,13 +4350,18 @@ impl Repr for InstanceRepr {
         {
             myllfields.insert(0, ("vable_token".into(), lltype::GCREF.clone()));
         }
+        // `_parse_field_list` reads `self.fields`. Store them before
+        // `MkStruct` so the `virtualizable_accessor` hint can name the
+        // redirected fields the way `accessor.fields` does after setup.
+        *self.fields.borrow_mut() = fields.clone();
+        let struct_hints = self.virtualizable_accessor_hint()?;
         let name = classdef_rc.borrow().name.clone();
         let mut struct_fields = Vec::with_capacity(1 + myllfields.len());
         struct_fields.push(("super".into(), rbase.object_type().clone()));
         struct_fields.extend(myllfields);
         let body = match self.gcflavor {
-            Flavor::Gc => Struct::gc_rtti(&name, struct_fields),
-            Flavor::Raw => Struct::with_hints(&name, struct_fields, vec![]),
+            Flavor::Gc => Struct::gc_rtti_with_hints(&name, struct_fields, struct_hints),
+            Flavor::Raw => Struct::with_hints(&name, struct_fields, struct_hints),
         };
         let LowLevelType::ForwardReference(fwd) = &self.object_type else {
             return Err(TyperError::message(
@@ -4760,10 +4802,11 @@ pub fn buildinstancerepr(
                     host_is_unboxed_value_subclass(&subdef.borrow().classdesc.borrow().pyobj)
                 })
                 .collect();
-            let virtualizable = const_truthy(&classdesc_get_param(
-                classdef_rc,
+            // rclass.py `buildinstancerepr`:
+            // `virtualizable = classdef.classdesc.get_param('_virtualizable_', False)`
+            let virtualizable = const_truthy(&classdef_rc.borrow().classdesc.borrow().get_param(
                 "_virtualizable_",
-                ConstValue::Bool(false),
+                Some(ConstValue::Bool(false)),
                 true,
             ));
             (unboxed, virtualizable)
@@ -6595,6 +6638,77 @@ mod tests {
                 .borrow()
                 .as_ref()
                 .is_some_and(|vable| vable.top_of_virtualizable_hierarchy)
+        );
+    }
+
+    #[test]
+    fn virtualizable_setup_stamps_accessor_ranking_on_struct_hints() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::model::{ConstValue, HostObject};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let mut members = indexmap::IndexMap::new();
+        members.insert(
+            "_virtualizable_".into(),
+            ConstValue::List(vec![ConstValue::byte_str("x")]),
+        );
+        let pyobj = HostObject::new_class_with_members("V", vec![], members);
+        let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        let classdesc =
+            crate::annotator::classdesc::ClassDesc::new(&bk, pyobj, Some("V".into()), None, None)
+                .expect("ClassDesc");
+        let classdef = crate::annotator::classdesc::ClassDef::new(&bk, &classdesc);
+        attach_attr(
+            &classdef,
+            "x",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            false,
+        );
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("vable repr");
+        Repr::setup(repr.as_ref()).expect("VirtualizableInstanceRepr._setup_repr");
+
+        let LowLevelType::ForwardReference(fwd) = repr.object_type() else {
+            panic!("object_type must be ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("object_type resolved");
+        let LowLevelType::Struct(body) = resolved else {
+            panic!("object_type must resolve to Struct");
+        };
+        assert!(
+            body._flds.get("vable_token").is_some(),
+            "vable_token precedes instance attrs"
+        );
+        let hint = body
+            ._hints
+            .get("virtualizable_accessor")
+            .expect("VTYPE._hints['virtualizable_accessor']");
+        let ConstValue::Dict(fields) = hint else {
+            panic!("virtualizable_accessor hint must be a ranking dict, got {hint:?}");
+        };
+        assert_eq!(
+            fields.get(&ConstValue::byte_str("inst_x")),
+            Some(&ConstValue::byte_str("immutable")),
+            "accessor.fields maps inst_x to IR_IMMUTABLE"
+        );
+
+        let child = ClassDef::new_standalone("W", Some(&classdef));
+        let child_repr = getinstancerepr(&rtyper, Some(&child), Flavor::Gc).expect("child");
+        Repr::setup(child_repr.as_ref()).expect("subclass setup");
+        let LowLevelType::ForwardReference(child_fwd) = child_repr.object_type() else {
+            panic!("child object_type");
+        };
+        let child_resolved = child_fwd.resolved().expect("child resolved");
+        let LowLevelType::Struct(child_body) = child_resolved else {
+            panic!("child struct");
+        };
+        assert!(
+            child_body._hints.get("virtualizable_accessor").is_none(),
+            "test_rvirtualizable.py: subclass TYPE has no virtualizable_accessor"
         );
     }
 
