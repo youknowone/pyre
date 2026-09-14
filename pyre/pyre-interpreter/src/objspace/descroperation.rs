@@ -6563,7 +6563,7 @@ pub fn pos_inner(a: PyObjectRef) -> PyResult {
             ));
         }
         if is_float(a) {
-            return Ok(w_float_new(w_float_get_value(a)));
+            return _float_pos(w_float_get_value(a));
         }
         if is_complex(a) {
             let (ar, ai) = complex_val(a).unwrap();
@@ -6607,6 +6607,20 @@ pub(crate) fn _int_neg(x: i64) -> PyResult {
         // `0 - x`, not `wrapping_neg`: Charon leaves the rustc intrinsic
         // as `residual_call_ir_i`, while subtraction is `int_sub`.
         intval: 0i64.wrapping_sub(x),
+    }) as PyObjectRef)
+}
+
+/// floatobject.py `descr_pos`: `W_FloatObject(self.floatval)`.
+#[inline(never)]
+pub(crate) fn _float_pos(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
     }) as PyObjectRef)
 }
 
@@ -6741,10 +6755,22 @@ pub fn invert(a: PyObjectRef) -> PyResult {
 /// alone.  Every other caller reaches this through [`invert`] and is
 /// unaffected, except `int.__invert__`, which names this body directly
 /// because an unbound slot must not dispatch.
+/// intobject.py `descr_invert`: `wrapint(~self.intval)`.
+#[inline(never)]
+pub(crate) fn _int_invert(x: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: !x,
+    }) as PyObjectRef)
+}
+
 pub fn invert_inner(a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) {
-            return Ok(w_int_new(!int_value(a)));
+            return _int_invert(int_value(a));
         }
         if is_long(a) {
             return Ok(w_long_new(bigint_invert(w_long_get_value(a))));

@@ -9773,6 +9773,22 @@ const FLOAT_NEG_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-NEG-SUBWALK",
 };
 
+/// floatobject.py `descr_pos`.
+const FLOAT_POS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_pos",
+    commit_label: "float_pos_commit",
+    call_site_label: "float_pos_call_site",
+    decline_tag: "FLOAT-POS-SUBWALK",
+};
+
+/// intobject.py `descr_invert`.
+const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_invert",
+    commit_label: "int_invert_commit",
+    call_site_label: "int_invert_call_site",
+    decline_tag: "INT-INVERT-SUBWALK",
+};
+
 pub(crate) fn binary_value_from_tag_jitcode()
 -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
@@ -10085,6 +10101,88 @@ pub(crate) fn try_walker_orthodox_unary_neg<Sym: WalkSym>(
         dst_bank,
         &INT_NEG_DESCENT,
     )
+}
+
+/// Exact builtin `int` `UNARY_INVERT`: walk `_int_invert`.  Bool stays
+/// on `invert`'s deprecation-warning slot.
+pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let admitted = unsafe {
+        pyre_object::is_exact_builtin_instance(obj)
+            && pyre_object::is_int(obj)
+            && !pyre_object::is_bool(obj)
+    };
+    if !admitted {
+        return Ok(None);
+    }
+    let x = unsafe { pyre_object::w_int_get_value(obj) };
+    let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let xa = walker_unbox_int(ctx, op_pc, r_args[0], type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[(xa, x)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &INT_INVERT_DESCENT,
+    )
+}
+
+/// Exact builtin `float` `UNARY_POSITIVE`: walk `_float_pos`.  Exact
+/// `int` is identity (`_self_unaryop('pos')` → `self`) and writes the
+/// operand through.
+pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::is_float(obj) } {
+        let x = unsafe { pyre_object::w_float_get_value(obj) };
+        let xa = walker_coerce_dispatching_operand_to_float(
+            ctx, op_pc, r_args[0], obj, false, x, false,
+        )?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[],
+            &[(xa, x)],
+            dst,
+            dst_bank,
+            &FLOAT_POS_DESCENT,
+        );
+    }
+    if unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) } {
+        walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, r_args[0])?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+    Ok(None)
 }
 
 /// `space.neg` on a concrete exact int or bool: unbox through the operand's
