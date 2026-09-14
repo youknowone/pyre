@@ -24889,20 +24889,28 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // clinic wrapper uses `PyLong_AsInt`.  The latter is observable before
     // the body even for an empty receiver, so narrow through the shared
     // index-protocol C-int converter here.
-    let tabsize = i64::from(
-        match pos
-            .get(1)
-            .copied()
-            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-        {
-            Some(t) if !t.is_null() => crate::baseobjspace::index_c_int_w(t)?,
-            _ => 8,
-        },
-    );
+    let w_tabsize = pos
+        .get(1)
+        .copied()
+        .filter(|t| !t.is_null())
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = if let Some(t) = w_tabsize {
+        pyre_object::gc_roots::pin_roots(&[pos[0], t])
+    } else {
+        pyre_object::gc_roots::pin_roots(&[pos[0]])
+    };
+    let tabsize = i64::from(match w_tabsize {
+        Some(_) => crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
+            recv_slot + 1,
+        ))?,
+        None => 8,
+    });
     // `unwrap_spec(tabsize=int)` converts before `descr_expandtabs` calls
     // `_val`; a re-entrant `__index__` can therefore resize a bytearray and
     // the method must read the resulting value.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(recv()) }.to_vec();
     // `StringMethods.descr_expandtabs`: split at tabs, append the first
     // token, then compute each following indentation from the previous token
     // (back to its last CR/LF).  RPython's builder turns an unsatisfiable
@@ -24954,7 +24962,7 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         out.extend_from_slice(tokens[index]);
         index += 1;
     }
-    Ok(new_bytes_like(pos[0], &out))
+    Ok(new_bytes_like(recv(), &out))
 }
 
 /// `bytesobject.py:descr_maketrans` — build a 256-byte translation table

@@ -2153,13 +2153,12 @@ pub(crate) unsafe fn bytes_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 pub(crate) unsafe fn bytes_repeat(s: PyObjectRef, n: PyObjectRef) -> PyResult {
-    // `repeat_count` runs `__index__`, so pin the receiver first and copy
-    // its payload after that conversion.
+    // `repeat_count` runs `__index__`, so pin the receiver and count
+    // together and copy the payload after that conversion.
     let _roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(s);
-    let s = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
-    let count = repeat_count(n)?;
+    let base = pyre_object::gc_roots::pin_roots(&[s, n]);
+    let s = || pyre_object::gc_roots::shadow_stack_get(base);
+    let count = repeat_count(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let data = pyre_object::bytesobject::bytes_like_data(s()).to_vec();
     // A count of 1 on exact `bytes` (immutable) returns the receiver unchanged;
     // a subclass yields a fresh base `bytes`, and mutable `bytearray` copies.

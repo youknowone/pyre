@@ -1599,10 +1599,18 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             arg_type_name(pos[2])
         )));
     }
-    // `__index__` on `count` can collect, so pin the three strings and copy
-    // their payloads off the objects first.
+    // `__index__` on `count` can collect, so pin the three strings and the
+    // optional count together and copy their payloads off the objects first.
+    let w_count = pos
+        .get(3)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"));
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]]);
+    let base = if let Some(c) = w_count {
+        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2], c])
+    } else {
+        pyre_object::gc_roots::pin_roots(&[pos[0], pos[1], pos[2]])
+    };
     let recv = || pyre_object::gc_roots::shadow_stack_get(base);
     let s = unsafe { pyre_object::w_str_get_wtf8(recv()) }.to_wtf8_buf();
     let old =
@@ -1613,12 +1621,10 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             .to_wtf8_buf();
     // Optional `count`: a negative count means "no limit"; 0 leaves the
     // string untouched. Resolved through `__index__`.
-    let maxcount = match pos
-        .get(3)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "count"))
-    {
-        Some(w_count) => crate::builtins::space_index_w(w_count)?,
+    let maxcount = match w_count {
+        Some(_) => {
+            crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 3))?
+        }
         None => -1,
     };
     let (out, replacements) = wtf8_replace(&s, &old, &new, maxcount);
@@ -5970,19 +5976,22 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // and therefore calls `PyLong_AsInt` before inspecting even an empty
     // receiver.  Keep PyPy's method body below, but narrow this observable
     // argument boundary to a C int.
+    let w_tabsize = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"));
     let _roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pos[0]);
-    let tabsize = i64::from(
-        match pos
-            .get(1)
-            .copied()
-            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-        {
-            Some(t) => crate::baseobjspace::index_c_int_w(t)?,
-            None => 8,
-        },
-    );
+    let recv_slot = if let Some(t) = w_tabsize {
+        pyre_object::gc_roots::pin_roots(&[pos[0], t])
+    } else {
+        pyre_object::gc_roots::pin_roots(&[pos[0]])
+    };
+    let tabsize = i64::from(match w_tabsize {
+        Some(_) => crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
+            recv_slot + 1,
+        ))?,
+        None => 8,
+    });
     let s =
         unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(recv_slot)) }.to_wtf8_buf();
     // Tabs advance to the next multiple of `tabsize` measured from the
