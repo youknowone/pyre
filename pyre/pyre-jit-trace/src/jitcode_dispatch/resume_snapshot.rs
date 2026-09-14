@@ -2827,18 +2827,10 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
             None,
         )
     };
-    let call_stack_overrides = if caller_code.is_some() {
-        Vec::new()
-    } else {
-        let caller_sym_ptr = ctx.fbw_mode.snapshot_sym;
-        // SAFETY: same non-null snapshot_sym as the box collection above.
-        let caller_sym = unsafe { &*caller_sym_ptr };
-        collect_call_stack_overrides(caller_sym, ctx, call_jit_pc).unwrap_or_default()
-    };
     Ok(InlineParentFrame {
         jitcode_index,
-        call_jitcode_pc: Some(call_jit_pc),
-        call_stack_overrides,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
         blackhole: capture_inline_parent_blackhole(ctx, jitcode_index, call_jit_pc),
         resume_coord: ParentResumeCoord::Backxlat(resume_marker_jit_pc),
         resume_marker_jit_pc: Some(resume_marker_jit_pc),
