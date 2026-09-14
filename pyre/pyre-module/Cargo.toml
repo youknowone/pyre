@@ -16,6 +16,7 @@ cranelift = ["pyre-interpreter/cranelift", "majit-metainterp/cranelift"]
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+ctor = { workspace = true }
 libc = { workspace = true }
 linkme = { workspace = true }
 majit-ir = { workspace = true }
@@ -27,6 +28,16 @@ num-complex = { workspace = true }
 paste = { workspace = true }
 pymath = { workspace = true }
 rustpython-common = { workspace = true }
+rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
 rustpython-host_env = { workspace = true, optional = true }
 rustpython-wtf8 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# `faulthandler`'s vectored exception handler returns
+# `EXCEPTION_CONTINUE_SEARCH`. Same 0.61 line as pyre-interpreter so
+# HANDLE types stay one package instance.
+windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] }
+# `_overlapped.CreateEvent` builds the `WideCString` name
+# `rustpython_host_env::winapi::create_event_w` takes.
+widestring = "1.2"

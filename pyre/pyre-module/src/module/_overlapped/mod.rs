@@ -49,7 +49,7 @@ unsafe impl Send for NativeOverlapped {}
 
 // CPython 3.14 Modules/overlapped.c creates overlapped_type_spec through
 // PyType_FromModuleAndSpec; its spec is immutable.
-#[crate::pyre_class("_overlapped.Overlapped", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_overlapped.Overlapped", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Overlapped {
     backend: *mut Mutex<NativeOverlapped>,
@@ -62,23 +62,30 @@ pub struct W_Overlapped {
     w_result: PyObjectRef,
 }
 
-fn this(obj: PyObjectRef) -> Result<&'static mut W_Overlapped, crate::PyError> {
-    W_Overlapped::from_obj(obj)
-        .ok_or_else(|| crate::PyError::type_error("expected _overlapped.Overlapped object"))
+fn this(obj: PyObjectRef) -> Result<&'static mut W_Overlapped, pyre_interpreter::PyError> {
+    W_Overlapped::from_obj(obj).ok_or_else(|| {
+        pyre_interpreter::PyError::type_error("expected _overlapped.Overlapped object")
+    })
 }
 
-fn native(obj: PyObjectRef) -> Result<&'static Mutex<NativeOverlapped>, crate::PyError> {
+fn native(obj: PyObjectRef) -> Result<&'static Mutex<NativeOverlapped>, pyre_interpreter::PyError> {
     let this = this(obj)?;
     if this.backend.is_null() {
-        return Err(crate::PyError::value_error("invalid overlapped object"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "invalid overlapped object",
+        ));
     }
     Ok(unsafe { &*this.backend })
 }
 
-fn arg(args: &[PyObjectRef], index: usize, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    args.get(index)
-        .copied()
-        .ok_or_else(|| crate::PyError::type_error(format!("{name}() missing required argument")))
+fn arg(
+    args: &[PyObjectRef],
+    index: usize,
+    name: &str,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    args.get(index).copied().ok_or_else(|| {
+        pyre_interpreter::PyError::type_error(format!("{name}() missing required argument"))
+    })
 }
 
 fn method_arity(
@@ -86,17 +93,17 @@ fn method_arity(
     name: &str,
     min: usize,
     max: usize,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     if (min..=max).contains(&args.len()) {
         Ok(())
     } else if min == max {
-        Err(crate::PyError::type_error(format!(
+        Err(pyre_interpreter::PyError::type_error(format!(
             "{name}() takes exactly {} argument{}",
             min - 1,
             if min == 2 { "" } else { "s" }
         )))
     } else {
-        Err(crate::PyError::type_error(format!(
+        Err(pyre_interpreter::PyError::type_error(format!(
             "{name}() takes from {} to {} arguments",
             min - 1,
             max - 1
@@ -107,11 +114,13 @@ fn method_arity(
 /// The `TypeError` `PyLong_AsVoidPtr` raises for something that is not an
 /// integer at all, checked before the conversion so that whatever an
 /// `__index__` of its own raises still comes through unchanged.
-fn require_int(obj: PyObjectRef) -> Result<(), crate::PyError> {
+fn require_int(obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     if !unsafe { pyre_object::pyobject::is_int_or_long(obj) }
-        && unsafe { crate::baseobjspace::lookup(obj, "__index__") }.is_none()
+        && unsafe { pyre_interpreter::baseobjspace::lookup(obj, "__index__") }.is_none()
     {
-        return Err(crate::PyError::type_error("an integer is required"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "an integer is required",
+        ));
     }
     Ok(())
 }
@@ -119,9 +128,9 @@ fn require_int(obj: PyObjectRef) -> Result<(), crate::PyError> {
 /// A handle argument (`_Py_PARSE_UINTPTR`): the value modulo the pointer
 /// width, so a handle may be written as the negative it is or as the unsigned
 /// value it prints as.
-fn handle_w(obj: PyObjectRef) -> Result<host_overlapped::Handle, crate::PyError> {
+fn handle_w(obj: PyObjectRef) -> Result<host_overlapped::Handle, pyre_interpreter::PyError> {
     require_int(obj)?;
-    Ok(crate::baseobjspace::truncatedint_w(obj)? as isize as host_overlapped::Handle)
+    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as isize as host_overlapped::Handle)
 }
 
 /// The integer a pointer-sized value comes back as (`PyLong_FromVoidPtr`):
@@ -136,25 +145,25 @@ fn w_uintptr(value: usize) -> PyObjectRef {
     }
 }
 
-fn isize_w(obj: PyObjectRef) -> Result<isize, crate::PyError> {
+fn isize_w(obj: PyObjectRef) -> Result<isize, pyre_interpreter::PyError> {
     require_int(obj)?;
-    Ok(crate::baseobjspace::truncatedint_w(obj)? as isize)
+    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as isize)
 }
 
-fn usize_w(obj: PyObjectRef) -> Result<usize, crate::PyError> {
+fn usize_w(obj: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
     require_int(obj)?;
-    Ok(crate::baseobjspace::truncatedint_w(obj)? as usize)
+    Ok(pyre_interpreter::baseobjspace::truncatedint_w(obj)? as usize)
 }
 
-fn u32_w(obj: PyObjectRef) -> Result<u32, crate::PyError> {
-    crate::baseobjspace::c_uint_w(obj)
+fn u32_w(obj: PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::c_uint_w(obj)
 }
 
-fn win32_err_code(code: u32) -> crate::PyError {
-    crate::PyError::os_error_win32_syscall2(code as i32, PY_NULL, PY_NULL)
+fn win32_err_code(code: u32) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::os_error_win32_syscall2(code as i32, PY_NULL, PY_NULL)
 }
 
-fn win32_err(err: std::io::Error) -> crate::PyError {
+fn win32_err(err: std::io::Error) -> pyre_interpreter::PyError {
     win32_err_code(err.raw_os_error().unwrap_or(0) as u32)
 }
 
@@ -163,7 +172,7 @@ fn set_object_refs(
     w_buffer: PyObjectRef,
     w_owner: PyObjectRef,
     w_result: PyObjectRef,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let this = this(obj)?;
     this.w_buffer = w_buffer;
     this.w_buffer_owner = w_owner;
@@ -175,7 +184,9 @@ fn set_object_refs(
 /// PyPy `ffi.from_buffer(bufobj)` / CPython `PyBUF_WRITABLE`: resolve the
 /// contiguous writable window and the concrete exporter whose resize lock is
 /// held until the Overlapped object is swept.
-fn writable_buffer(obj: PyObjectRef) -> Result<(&'static mut [u8], PyObjectRef), crate::PyError> {
+fn writable_buffer(
+    obj: PyObjectRef,
+) -> Result<(&'static mut [u8], PyObjectRef), pyre_interpreter::PyError> {
     if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
         return Ok((
             unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(obj) },
@@ -189,19 +200,19 @@ fn writable_buffer(obj: PyObjectRef) -> Result<(&'static mut [u8], PyObjectRef),
         ));
     }
     if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        unsafe { crate::builtins::memoryview_check_released(obj) }?;
+        unsafe { pyre_interpreter::builtins::memoryview_check_released(obj) }?;
         if unsafe { pyre_object::memoryview::w_memoryview_readonly(obj) }
-            || !unsafe { crate::builtins::memoryview_contiguity(obj).0 }
+            || !unsafe { pyre_interpreter::builtins::memoryview_contiguity(obj).0 }
         {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::BufferError,
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::BufferError,
                 "buffer is not contiguous and writable",
             ));
         }
         let view = unsafe { pyre_object::memoryview::w_memoryview_view(obj) };
         let Some(full) = (unsafe { view.backing().as_bytes_mut() }) else {
-            return Err(crate::PyError::new(
-                crate::PyErrorKind::BufferError,
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::BufferError,
                 "buffer is not writable",
             ));
         };
@@ -211,13 +222,13 @@ fn writable_buffer(obj: PyObjectRef) -> Result<(&'static mut [u8], PyObjectRef),
             .checked_add(length)
             .is_none_or(|end| end > full.len())
         {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "memoryview buffer is no longer valid",
             ));
         }
         return Ok((&mut full[offset..offset + length], obj));
     }
-    Err(crate::PyError::type_error(
+    Err(pyre_interpreter::PyError::type_error(
         "a writable bytes-like object is required",
     ))
 }
@@ -225,7 +236,7 @@ fn writable_buffer(obj: PyObjectRef) -> Result<(&'static mut [u8], PyObjectRef),
 fn retain_writable_buffer(
     obj: PyObjectRef,
     w_buffer: PyObjectRef,
-) -> Result<usize, crate::PyError> {
+) -> Result<usize, pyre_interpreter::PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     pyre_object::gc_roots::pin_roots(&[obj, w_buffer]);
     let base = pyre_object::gc_roots::shadow_stack_len() - 2;
@@ -235,7 +246,9 @@ fn retain_writable_buffer(
     let _ = pyre_object::gc_roots::pin_root(owner);
     let owner_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let held = unsafe {
-        crate::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(owner_slot))
+        pyre_interpreter::builtins::buffer_export_incref(pyre_object::gc_roots::shadow_stack_get(
+            owner_slot,
+        ))
     };
     let r_obj = pyre_object::gc_roots::shadow_stack_get(base);
     let r_buffer = pyre_object::gc_roots::shadow_stack_get(base + 1);
@@ -247,20 +260,20 @@ fn retain_writable_buffer(
     Ok(length)
 }
 
-fn release_writable_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
+fn release_writable_buffer(obj: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     let owner = this(obj)?.w_buffer_owner;
     let mut state = native(obj)?.lock();
     if state.buffer_export_held && !owner.is_null() {
-        unsafe { crate::builtins::buffer_export_decref(owner) };
+        unsafe { pyre_interpreter::builtins::buffer_export_decref(owner) };
         state.buffer_export_held = false;
     }
     drop(state);
     set_object_refs(obj, PY_NULL, PY_NULL, PY_NULL)
 }
 
-fn copied_read_buffer(obj: PyObjectRef, name: &str) -> Result<Vec<u8>, crate::PyError> {
-    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(obj)? else {
-        return Err(crate::PyError::type_error(format!(
+fn copied_read_buffer(obj: PyObjectRef, name: &str) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(obj)? else {
+        return Err(pyre_interpreter::PyError::type_error(format!(
             "{name}() argument must be a bytes-like object"
         )));
     };
@@ -269,25 +282,25 @@ fn copied_read_buffer(obj: PyObjectRef, name: &str) -> Result<Vec<u8>, crate::Py
     Ok(bytes)
 }
 
-fn parse_address(obj: PyObjectRef) -> Result<(Vec<u8>, i32), crate::PyError> {
-    let items = crate::baseobjspace::unpackiterable(obj, -1)?;
+fn parse_address(obj: PyObjectRef) -> Result<(Vec<u8>, i32), pyre_interpreter::PyError> {
+    let items = pyre_interpreter::baseobjspace::unpackiterable(obj, -1)?;
     match items.as_slice() {
         [host, port] => {
-            let host = crate::baseobjspace::text_w(*host)?;
+            let host = pyre_interpreter::baseobjspace::text_w(*host)?;
             let port = u32_w(*port)?;
             let port = u16::try_from(port)
-                .map_err(|_| crate::PyError::overflow_error("port must be 0-65535"))?;
+                .map_err(|_| pyre_interpreter::PyError::overflow_error("port must be 0-65535"))?;
             host_overlapped::parse_address_v4(host, port).map_err(win32_err)
         }
         [host, port, flowinfo, scope_id] => {
-            let host = crate::baseobjspace::text_w(*host)?;
+            let host = pyre_interpreter::baseobjspace::text_w(*host)?;
             let port = u32_w(*port)?;
             let port = u16::try_from(port)
-                .map_err(|_| crate::PyError::overflow_error("port must be 0-65535"))?;
+                .map_err(|_| pyre_interpreter::PyError::overflow_error("port must be 0-65535"))?;
             host_overlapped::parse_address_v6(host, port, u32_w(*flowinfo)?, u32_w(*scope_id)?)
                 .map_err(win32_err)
         }
-        _ => Err(crate::PyError::value_error(
+        _ => Err(pyre_interpreter::PyError::value_error(
             "expected tuple of length 2 or 4",
         )),
     }
@@ -296,13 +309,14 @@ fn parse_address(obj: PyObjectRef) -> Result<(Vec<u8>, i32), crate::PyError> {
 fn unparse_address(
     address: &host_overlapped::SocketAddrV6,
     length: i32,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     match host_overlapped::unparse_address(
         address as *const _ as *const host_overlapped::SocketAddrRaw,
         length,
     )
-    .map_err(|_| crate::PyError::value_error("recvfrom returned unsupported address family"))?
-    {
+    .map_err(|_| {
+        pyre_interpreter::PyError::value_error("recvfrom returned unsupported address family")
+    })? {
         host_overlapped::SocketAddress::V4 { host, port } => {
             let mut fields = pyre_object::gc_roots::RootedItems::new();
             fields.push(pyre_object::w_str_new_managed(&host));
@@ -325,9 +339,11 @@ fn unparse_address(
     }
 }
 
-fn operation_already_attempted(state: &NativeOverlapped) -> Result<(), crate::PyError> {
+fn operation_already_attempted(state: &NativeOverlapped) -> Result<(), pyre_interpreter::PyError> {
     if state.kind != OverlappedType::None {
-        Err(crate::PyError::value_error("operation already attempted"))
+        Err(pyre_interpreter::PyError::value_error(
+            "operation already attempted",
+        ))
     } else {
         Ok(())
     }
@@ -336,7 +352,7 @@ fn operation_already_attempted(state: &NativeOverlapped) -> Result<(), crate::Py
 fn accept_read_start_error(
     state: &mut NativeOverlapped,
     error: u32,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     use host_winapi::{ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_SUCCESS};
     state.error = error;
     match error {
@@ -355,7 +371,7 @@ fn accept_read_start_error(
 fn accept_write_start_error(
     state: &mut NativeOverlapped,
     error: u32,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     state.error = error;
     match error {
         host_winapi::ERROR_SUCCESS | host_winapi::ERROR_IO_PENDING => Ok(pyre_object::w_none()),
@@ -366,10 +382,10 @@ fn accept_write_start_error(
     }
 }
 
-fn overlapped_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn overlapped_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let cls = args.first().copied().unwrap_or_else(overlapped_type);
     if args.len() > 2 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "Overlapped() takes at most one argument",
         ));
     }
@@ -405,12 +421,13 @@ fn overlapped_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         w_buffer_owner: PY_NULL,
         w_result: PY_NULL,
     });
-    Ok(crate::typedef::tag_subclass_instance(obj, unsafe {
-        pyre_object::gc_roots::shadow_stack_get(cls_slot)
-    }))
+    Ok(pyre_interpreter::typedef::tag_subclass_instance(
+        obj,
+        unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+    ))
 }
 
-fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_cancel(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "cancel", 1, 1)?;
     let obj = arg(args, 0, "cancel")?;
     let state = native(obj)?.lock();
@@ -423,21 +440,25 @@ fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn overlapped_getresult(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_getresult(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     use host_winapi::{ERROR_BROKEN_PIPE, ERROR_MORE_DATA, ERROR_SUCCESS};
     method_arity(args, "getresult", 1, 2)?;
     let obj = arg(args, 0, "getresult")?;
     let wait = match args.get(1).copied() {
-        Some(w) => crate::baseobjspace::is_true(w)?,
+        Some(w) => pyre_interpreter::baseobjspace::is_true(w)?,
         None => false,
     };
     let mut state = native(obj)?.lock();
     match state.kind {
         OverlappedType::None => {
-            return Err(crate::PyError::value_error("operation not yet attempted"));
+            return Err(pyre_interpreter::PyError::value_error(
+                "operation not yet attempted",
+            ));
         }
         OverlappedType::NotStarted => {
-            return Err(crate::PyError::value_error("operation failed to start"));
+            return Err(pyre_interpreter::PyError::value_error(
+                "operation failed to start",
+            ));
         }
         _ => {}
     }
@@ -499,7 +520,7 @@ fn overlapped_getresult(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
-fn overlapped_read_file(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_read_file(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "ReadFile", 3, 3)?;
     let obj = arg(args, 0, "ReadFile")?;
     let handle = handle_w(arg(args, 1, "ReadFile")?)?;
@@ -518,7 +539,7 @@ fn overlapped_read_file(args: &[PyObjectRef]) -> crate::PyResult {
     accept_read_start_error(&mut state, error)
 }
 
-fn overlapped_read_file_into(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_read_file_into(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "ReadFileInto", 3, 3)?;
     let obj = arg(args, 0, "ReadFileInto")?;
     let handle = handle_w(arg(args, 1, "ReadFileInto")?)?;
@@ -528,8 +549,8 @@ fn overlapped_read_file_into(args: &[PyObjectRef]) -> crate::PyResult {
         operation_already_attempted(&state)?;
     }
     let length = retain_writable_buffer(obj, w_buffer)?;
-    let size =
-        u32::try_from(length).map_err(|_| crate::PyError::value_error("buffer too large"))?;
+    let size = u32::try_from(length)
+        .map_err(|_| pyre_interpreter::PyError::value_error("buffer too large"))?;
     let mut state = native(obj)?.lock();
     state.handle = handle;
     state.kind = OverlappedType::ReadInto;
@@ -543,13 +564,13 @@ fn overlapped_read_file_into(args: &[PyObjectRef]) -> crate::PyResult {
     accept_read_start_error(&mut state, error)
 }
 
-fn overlapped_write_file(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_write_file(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WriteFile", 3, 3)?;
     let obj = arg(args, 0, "WriteFile")?;
     let handle = handle_w(arg(args, 1, "WriteFile")?)?;
     let buffer = copied_read_buffer(arg(args, 2, "WriteFile")?, "WriteFile")?;
-    let size =
-        u32::try_from(buffer.len()).map_err(|_| crate::PyError::value_error("buffer too large"))?;
+    let size = u32::try_from(buffer.len())
+        .map_err(|_| pyre_interpreter::PyError::value_error("buffer too large"))?;
     let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle;
@@ -564,7 +585,7 @@ fn overlapped_write_file(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn overlapped_wsa_recv(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_wsa_recv(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WSARecv", 3, 4)?;
     let obj = arg(args, 0, "WSARecv")?;
     let handle = isize_w(arg(args, 1, "WSARecv")?)?;
@@ -588,7 +609,7 @@ fn overlapped_wsa_recv(args: &[PyObjectRef]) -> crate::PyResult {
     accept_read_start_error(&mut state, error)
 }
 
-fn overlapped_wsa_recv_into(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_wsa_recv_into(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WSARecvInto", 4, 4)?;
     let obj = arg(args, 0, "WSARecvInto")?;
     let handle = isize_w(arg(args, 1, "WSARecvInto")?)?;
@@ -599,8 +620,8 @@ fn overlapped_wsa_recv_into(args: &[PyObjectRef]) -> crate::PyResult {
         operation_already_attempted(&state)?;
     }
     let length = retain_writable_buffer(obj, w_buffer)?;
-    let size =
-        u32::try_from(length).map_err(|_| crate::PyError::value_error("buffer too large"))?;
+    let size = u32::try_from(length)
+        .map_err(|_| pyre_interpreter::PyError::value_error("buffer too large"))?;
     let mut state = native(obj)?.lock();
     state.handle = handle as host_overlapped::Handle;
     state.kind = OverlappedType::ReadInto;
@@ -615,14 +636,14 @@ fn overlapped_wsa_recv_into(args: &[PyObjectRef]) -> crate::PyResult {
     accept_read_start_error(&mut state, error)
 }
 
-fn overlapped_wsa_send(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_wsa_send(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WSASend", 4, 4)?;
     let obj = arg(args, 0, "WSASend")?;
     let handle = isize_w(arg(args, 1, "WSASend")?)?;
     let buffer = copied_read_buffer(arg(args, 2, "WSASend")?, "WSASend")?;
     let flags = u32_w(arg(args, 3, "WSASend")?)?;
-    let size =
-        u32::try_from(buffer.len()).map_err(|_| crate::PyError::value_error("buffer too large"))?;
+    let size = u32::try_from(buffer.len())
+        .map_err(|_| pyre_interpreter::PyError::value_error("buffer too large"))?;
     let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
@@ -638,7 +659,7 @@ fn overlapped_wsa_send(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn overlapped_accept_ex(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_accept_ex(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "AcceptEx", 3, 3)?;
     let obj = arg(args, 0, "AcceptEx")?;
     let listen = isize_w(arg(args, 1, "AcceptEx")?)?;
@@ -659,7 +680,7 @@ fn overlapped_accept_ex(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn overlapped_connect_ex(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_connect_ex(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "ConnectEx", 3, 3)?;
     let obj = arg(args, 0, "ConnectEx")?;
     let socket = isize_w(arg(args, 1, "ConnectEx")?)?;
@@ -678,7 +699,7 @@ fn overlapped_connect_ex(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn overlapped_disconnect_ex(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_disconnect_ex(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "DisconnectEx", 3, 3)?;
     let obj = arg(args, 0, "DisconnectEx")?;
     let socket = isize_w(arg(args, 1, "DisconnectEx")?)?;
@@ -691,7 +712,7 @@ fn overlapped_disconnect_ex(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn overlapped_transmit_file(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_transmit_file(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "TransmitFile", 8, 8)?;
     let obj = arg(args, 0, "TransmitFile")?;
     let socket = isize_w(arg(args, 1, "TransmitFile")?)?;
@@ -718,7 +739,7 @@ fn overlapped_transmit_file(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn overlapped_connect_named_pipe(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_connect_named_pipe(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "ConnectNamedPipe", 2, 2)?;
     let obj = arg(args, 0, "ConnectNamedPipe")?;
     let pipe = handle_w(arg(args, 1, "ConnectNamedPipe")?)?;
@@ -749,7 +770,7 @@ fn start_recv_from(
     size: u32,
     mut flags: u32,
     kind: OverlappedType,
-) -> crate::PyResult {
+) -> pyre_interpreter::PyResult {
     let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
@@ -772,7 +793,7 @@ fn start_recv_from(
     accept_read_start_error(&mut state, error)
 }
 
-fn overlapped_wsa_recv_from(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_wsa_recv_from(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WSARecvFrom", 3, 4)?;
     let obj = arg(args, 0, "WSARecvFrom")?;
     let handle = isize_w(arg(args, 1, "WSARecvFrom")?)?;
@@ -784,7 +805,7 @@ fn overlapped_wsa_recv_from(args: &[PyObjectRef]) -> crate::PyResult {
     start_recv_from(obj, handle, size, flags, OverlappedType::ReadFrom)
 }
 
-fn overlapped_wsa_recv_from_into(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_wsa_recv_from_into(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WSARecvFromInto", 4, 5)?;
     let obj = arg(args, 0, "WSARecvFromInto")?;
     let handle = isize_w(arg(args, 1, "WSARecvFromInto")?)?;
@@ -801,20 +822,20 @@ fn overlapped_wsa_recv_from_into(args: &[PyObjectRef]) -> crate::PyResult {
     let length = retain_writable_buffer(obj, w_buffer)?;
     if requested as usize > length {
         release_writable_buffer(obj)?;
-        return Err(crate::PyError::value_error("buffer too small"));
+        return Err(pyre_interpreter::PyError::value_error("buffer too small"));
     }
     start_recv_from(obj, handle, requested, flags, OverlappedType::ReadFromInto)
 }
 
-fn overlapped_wsa_send_to(args: &[PyObjectRef]) -> crate::PyResult {
+fn overlapped_wsa_send_to(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     method_arity(args, "WSASendTo", 5, 5)?;
     let obj = arg(args, 0, "WSASendTo")?;
     let handle = isize_w(arg(args, 1, "WSASendTo")?)?;
     let buffer = copied_read_buffer(arg(args, 2, "WSASendTo")?, "WSASendTo")?;
     let flags = u32_w(arg(args, 3, "WSASendTo")?)?;
     let (address, address_length) = parse_address(arg(args, 4, "WSASendTo")?)?;
-    let size =
-        u32::try_from(buffer.len()).map_err(|_| crate::PyError::value_error("buffer too large"))?;
+    let size = u32::try_from(buffer.len())
+        .map_err(|_| pyre_interpreter::PyError::value_error("buffer too large"))?;
     let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
@@ -833,13 +854,13 @@ fn overlapped_wsa_send_to(args: &[PyObjectRef]) -> crate::PyResult {
     accept_write_start_error(&mut state, error)
 }
 
-fn property(ns: PyObjectRef, name: &'static str, getter: crate::BuiltinCodeFn) {
+fn property(ns: PyObjectRef, name: &'static str, getter: pyre_interpreter::BuiltinCodeFn) {
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             name,
-            crate::typedef::make_getset_descriptor_named(
-                crate::make_builtin_function_with_arity(name, getter, 2),
+            pyre_interpreter::typedef::make_getset_descriptor_named(
+                pyre_interpreter::make_builtin_function_with_arity(name, getter, 2),
                 name,
             ),
         )
@@ -851,11 +872,14 @@ fn init_overlapped_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            crate::typedef::make_new_descr(overlapped_new),
+            pyre_interpreter::typedef::make_new_descr(overlapped_new),
         )
     };
     for (name, function) in [
-        ("cancel", overlapped_cancel as crate::BuiltinCodeFn),
+        (
+            "cancel",
+            overlapped_cancel as pyre_interpreter::BuiltinCodeFn,
+        ),
         ("getresult", overlapped_getresult),
         ("ReadFile", overlapped_read_file),
         ("ReadFileInto", overlapped_read_file_into),
@@ -876,7 +900,7 @@ fn init_overlapped_type(ns: PyObjectRef) {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                crate::make_builtin_function(name, function),
+                pyre_interpreter::make_builtin_function(name, function),
             )
         };
     }
@@ -907,13 +931,13 @@ static OVERLAPPED_RUNTIME_TYPE: OnceLock<usize> = OnceLock::new();
 
 pub fn overlapped_type() -> PyObjectRef {
     *OVERLAPPED_RUNTIME_TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_layout(
+        let tp = pyre_interpreter::typedef::make_builtin_type_with_layout(
             "_overlapped.Overlapped",
             init_overlapped_type,
-            crate::typedef::w_object(),
+            pyre_interpreter::typedef::w_object(),
             <W_Overlapped as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
         );
-        crate::typedef::mark_cpython_heap_type(tp, true);
+        pyre_interpreter::typedef::mark_cpython_heap_type(tp, true);
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_Overlapped as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
@@ -946,20 +970,20 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
         state.overlapped.hEvent = std::ptr::null_mut();
     }
     if state.buffer_export_held && !this.w_buffer_owner.is_null() {
-        unsafe { crate::builtins::buffer_export_decref(this.w_buffer_owner) };
+        unsafe { pyre_interpreter::builtins::buffer_export_decref(this.w_buffer_owner) };
         state.buffer_export_held = false;
     }
     host_windows::set_last_error(old_error);
 }
 
-fn connect_pipe(args: &[PyObjectRef]) -> crate::PyResult {
-    let address = crate::baseobjspace::text_w(arg(args, 0, "ConnectPipe")?)?;
+fn connect_pipe(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
+    let address = pyre_interpreter::baseobjspace::text_w(arg(args, 0, "ConnectPipe")?)?;
     host_overlapped::connect_pipe(address)
         .map(|handle| w_uintptr(handle as usize))
         .map_err(win32_err)
 }
 
-fn create_iocp(args: &[PyObjectRef]) -> crate::PyResult {
+fn create_iocp(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_overlapped::create_io_completion_port(
         isize_w(arg(args, 0, "CreateIoCompletionPort")?)?,
         isize_w(arg(args, 1, "CreateIoCompletionPort")?)?,
@@ -970,7 +994,7 @@ fn create_iocp(args: &[PyObjectRef]) -> crate::PyResult {
     .map_err(win32_err)
 }
 
-fn get_queued_completion_status(args: &[PyObjectRef]) -> crate::PyResult {
+fn get_queued_completion_status(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     match host_overlapped::get_queued_completion_status(
         isize_w(arg(args, 0, "GetQueuedCompletionStatus")?)?,
         u32_w(arg(args, 1, "GetQueuedCompletionStatus")?)?,
@@ -989,7 +1013,7 @@ fn get_queued_completion_status(args: &[PyObjectRef]) -> crate::PyResult {
     }
 }
 
-fn post_queued_completion_status(args: &[PyObjectRef]) -> crate::PyResult {
+fn post_queued_completion_status(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_overlapped::post_queued_completion_status(
         isize_w(arg(args, 0, "PostQueuedCompletionStatus")?)?,
         u32_w(arg(args, 1, "PostQueuedCompletionStatus")?)?,
@@ -1000,7 +1024,7 @@ fn post_queued_completion_status(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn register_wait_with_queue(args: &[PyObjectRef]) -> crate::PyResult {
+fn register_wait_with_queue(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_overlapped::register_wait_with_queue(
         isize_w(arg(args, 0, "RegisterWaitWithQueue")?)?,
         isize_w(arg(args, 1, "RegisterWaitWithQueue")?)?,
@@ -1011,13 +1035,13 @@ fn register_wait_with_queue(args: &[PyObjectRef]) -> crate::PyResult {
     .map_err(win32_err)
 }
 
-fn unregister_wait(args: &[PyObjectRef]) -> crate::PyResult {
+fn unregister_wait(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_overlapped::unregister_wait(isize_w(arg(args, 0, "UnregisterWait")?)?)
         .map_err(win32_err)?;
     Ok(pyre_object::w_none())
 }
 
-fn unregister_wait_ex(args: &[PyObjectRef]) -> crate::PyResult {
+fn unregister_wait_ex(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_overlapped::unregister_wait_ex(
         isize_w(arg(args, 0, "UnregisterWaitEx")?)?,
         isize_w(arg(args, 1, "UnregisterWaitEx")?)?,
@@ -1026,11 +1050,11 @@ fn unregister_wait_ex(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn bind_local(args: &[PyObjectRef]) -> crate::PyResult {
+fn bind_local(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let socket = isize_w(arg(args, 0, "BindLocal")?)?;
-    let family = crate::baseobjspace::c_int_w(arg(args, 1, "BindLocal")?)?;
+    let family = pyre_interpreter::baseobjspace::c_int_w(arg(args, 1, "BindLocal")?)?;
     if family != host_overlapped::AF_INET_FAMILY && family != host_overlapped::AF_INET6_FAMILY {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "expected tuple of length 2 or 4",
         ));
     }
@@ -1038,13 +1062,13 @@ fn bind_local(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn format_message(args: &[PyObjectRef]) -> crate::PyResult {
+fn format_message(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     Ok(pyre_object::w_str_new_managed(
         &host_overlapped::format_message(u32_w(arg(args, 0, "FormatMessage")?)?),
     ))
 }
 
-fn wsa_connect(args: &[PyObjectRef]) -> crate::PyResult {
+fn wsa_connect(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let socket = isize_w(arg(args, 0, "WSAConnect")?)?;
     let (address, length) = parse_address(arg(args, 1, "WSAConnect")?)?;
     host_overlapped::wsa_connect(
@@ -1056,20 +1080,22 @@ fn wsa_connect(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn create_event(args: &[PyObjectRef]) -> crate::PyResult {
+fn create_event(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let attributes = arg(args, 0, "CreateEvent")?;
     if !unsafe { pyre_object::is_none(attributes) } {
-        return Err(crate::PyError::value_error("EventAttributes must be None"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "EventAttributes must be None",
+        ));
     }
-    let manual_reset = crate::baseobjspace::is_true(arg(args, 1, "CreateEvent")?)?;
-    let initial_state = crate::baseobjspace::is_true(arg(args, 2, "CreateEvent")?)?;
+    let manual_reset = pyre_interpreter::baseobjspace::is_true(arg(args, 1, "CreateEvent")?)?;
+    let initial_state = pyre_interpreter::baseobjspace::is_true(arg(args, 2, "CreateEvent")?)?;
     let w_name = arg(args, 3, "CreateEvent")?;
     let name = if unsafe { pyre_object::is_none(w_name) } {
         None
     } else {
         Some(
-            widestring::WideCString::from_str(crate::baseobjspace::text_w(w_name)?)
-                .map_err(|_| crate::PyError::value_error("embedded null character"))?,
+            widestring::WideCString::from_str(pyre_interpreter::baseobjspace::text_w(w_name)?)
+                .map_err(|_| pyre_interpreter::PyError::value_error("embedded null character"))?,
         )
     };
     host_winapi::create_event_w(manual_reset, initial_state, name.as_deref())
@@ -1077,17 +1103,17 @@ fn create_event(args: &[PyObjectRef]) -> crate::PyResult {
         .map_err(win32_err)
 }
 
-fn set_event(args: &[PyObjectRef]) -> crate::PyResult {
+fn set_event(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_winapi::set_event(handle_w(arg(args, 0, "SetEvent")?)?).map_err(win32_err)?;
     Ok(pyre_object::w_none())
 }
 
-fn reset_event(args: &[PyObjectRef]) -> crate::PyResult {
+fn reset_event(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     host_winapi::reset_event(handle_w(arg(args, 0, "ResetEvent")?)?).map_err(win32_err)?;
     Ok(pyre_object::w_none())
 }
 
-pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
+pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
     // PyPy imports `_socket` before resolving the extension-function GUIDs.
     // The host layer exposes the same process-global WSAStartup owner, so the
     // builtin can establish that prerequisite without creating a second
@@ -1130,17 +1156,21 @@ pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ("INFINITE", host_winapi::INFINITE_TIMEOUT as i64),
         ("NULL", 0),
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(value));
+        pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(value));
     }
     // The handle sentinel is `(HANDLE)-1`, which prints as the unsigned value.
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "INVALID_HANDLE_VALUE",
         w_uintptr(host_overlapped::INVALID_HANDLE_VALUE_ISIZE as usize),
     );
-    crate::module_ns_store(ns, "Overlapped", overlapped_type());
+    pyre_interpreter::module_ns_store(ns, "Overlapped", overlapped_type());
     for (name, arity, function) in [
-        ("ConnectPipe", 1, connect_pipe as crate::BuiltinCodeFn),
+        (
+            "ConnectPipe",
+            1,
+            connect_pipe as pyre_interpreter::BuiltinCodeFn,
+        ),
         ("CreateIoCompletionPort", 4, create_iocp),
         ("GetQueuedCompletionStatus", 2, get_queued_completion_status),
         (
@@ -1158,12 +1188,12 @@ pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ("SetEvent", 1, set_event),
         ("ResetEvent", 1, reset_event),
     ] {
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             name,
-            crate::gateway::with_module(
+            pyre_interpreter::gateway::with_module(
                 "_overlapped",
-                crate::make_module_builtin_function_with_arity(name, function, arity),
+                pyre_interpreter::make_module_builtin_function_with_arity(name, function, arity),
             ),
         );
     }

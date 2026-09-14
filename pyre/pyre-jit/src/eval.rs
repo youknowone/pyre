@@ -809,7 +809,7 @@ unsafe fn array_object_destructor(obj_addr: usize) {
 /// through the generic no-destructor path.
 unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
     let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_interpreter::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
+    unsafe { pyre_module::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
 }
 
 unsafe fn hashlib_hash_state_destructor(obj_addr: usize) {
@@ -879,17 +879,13 @@ unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
 
 unsafe fn bz2_compressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_bz2::w_bz2compressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_bz2::w_bz2compressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_bz2::w_bz2decompressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_bz2::w_bz2decompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -968,9 +964,7 @@ unsafe fn cffi_lib_destructor(obj_addr: usize) {
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_overlapped::w_overlapped_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_overlapped::w_overlapped_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -1864,6 +1858,10 @@ fn register_traced_storage_box<T: 'static>(
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<MiniMarkGC> {
+    // Optional-module rclass aliases must be in the census before the
+    // vtable assertion below.  Launchers also call `register`; this is
+    // the backstop for unit tests and late `driver_pair` entry.
+    pyre_module::register();
     // translationoption.py `taggedpointers` — kept in lockstep with the
     // pyre-object representation switch so the collector-core immediate
     // guards (`is_tagged_immediate`) go live exactly when small ints start
@@ -3767,7 +3765,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let tokenizer_iter_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_tokenize::W_TokenizerIter
+        <pyre_module::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_TokenizerIter owns Rust heap (source string, token / error vectors, the
@@ -4022,7 +4020,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_json::W_Scanner
+        <pyre_module::module::_json::W_Scanner
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `_json.Encoder` keeps the `make_encoder` arguments in traced payload
@@ -4030,7 +4028,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_json::W_Encoder
+        <pyre_module::module::_json::W_Encoder
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // CPython's EVPobject and HMACobject own their native contexts.  Pyre's
@@ -4128,12 +4126,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // with the zlib owners so their ids agree on wasm/native.
     for (descr, destructor) in [
         (
-            <pyre_interpreter::module::_bz2::W_BZ2Compressor
+            <pyre_module::module::_bz2::W_BZ2Compressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             bz2_compressor_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::_bz2::W_BZ2Decompressor
+            <pyre_module::module::_bz2::W_BZ2Decompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),
@@ -4449,7 +4447,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // performs PyPy's cancel/wait-before-free ordering and closes hEvent.
     #[cfg(all(windows, not(feature = "sandbox")))]
     {
-        let descr = <pyre_interpreter::module::_overlapped::W_Overlapped
+        let descr = <pyre_module::module::_overlapped::W_Overlapped
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
         gc.types.set_destructor(tid, overlapped_destructor);
@@ -5393,6 +5391,11 @@ fn install_pyre_object_hooks() {
 /// `gc_sync::is_initialized()` + `gc_sync::store_singleton()` ensures
 /// exactly one GC is created even under cargo test's parallel threads.
 fn build_gc_global() {
+    // `build_gc` always registers the optional-module types this crate
+    // names.  Their rclass aliases live behind `pyre_module::register`;
+    // install them before the census assertion, including on paths that
+    // reach the collector without going through a launcher.
+    pyre_module::register();
     // `is_initialized()` is a plain check-then-act, so on a fresh process
     // every thread that reaches here before the first `store_singleton`
     // observes the flag unset and would each run `build_gc()`.  `build_gc`

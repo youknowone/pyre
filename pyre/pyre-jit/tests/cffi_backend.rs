@@ -28,11 +28,11 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn run_harness(program: &str, name: &str) -> Result<(), String> {
     pyre_interpreter::stack_check::set_recursion_limit(5000)
         .map_err(|_| "set_recursion_limit failed".to_string())?;
+    pyre_module::register();
     init_jit_hooks();
     reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    pyre_module::register();
     importing::init_sys_path(&cwd, cwd.as_os_str());
     importing::add_sys_path_0();
     importing::set_sys_argv(&[std::ffi::OsString::from(name)]);

@@ -11,8 +11,6 @@ pub mod _abc;
 #[allow(non_snake_case)]
 pub mod _ast;
 #[allow(non_snake_case)]
-pub mod _bz2;
-#[allow(non_snake_case)]
 #[cfg(all(
     feature = "host_env",
     not(feature = "sandbox"),
@@ -34,16 +32,11 @@ pub mod _functools;
 pub mod _hashlib;
 pub mod _io;
 #[allow(non_snake_case)]
-pub mod _json;
-#[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
 pub mod _lsprof;
 #[allow(non_snake_case)]
 pub mod _lzma;
-#[allow(non_snake_case)]
-#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub mod _overlapped;
 #[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
@@ -63,7 +56,6 @@ pub mod _ssl;
 pub mod _stat;
 #[allow(non_snake_case)]
 pub mod _symtable;
-pub mod _tokenize;
 #[allow(non_snake_case)]
 pub mod _types;
 #[allow(non_snake_case)]

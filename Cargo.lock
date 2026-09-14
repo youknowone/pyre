@@ -2847,6 +2847,7 @@ dependencies = [
 name = "pyre-module"
 version = "0.0.2"
 dependencies = [
+ "ctor",
  "libc",
  "linkme",
  "majit-ir",
@@ -2860,9 +2861,12 @@ dependencies = [
  "pyre-interpreter",
  "pyre-object",
  "rustpython-common",
+ "rustpython-compiler",
  "rustpython-compiler-core",
  "rustpython-host_env",
  "rustpython-wtf8",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -100,7 +100,7 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
 /// pyre's generic `Py_buffer` carrier is shared by every consumer, keeping the
 /// boolean beside the owning object field preserves the same single-owner
 /// shape without an address-keyed side table.
-pub(crate) unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
+pub unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             pyre_object::bytearrayobject::w_bytearray_exports_incref(obj);
@@ -128,7 +128,7 @@ pub(crate) unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must still be the exporter paired with a successful (`true`)
 /// acquisition, and the pair must be released exactly once.
-pub(crate) unsafe fn buffer_export_decref(obj: PyObjectRef) {
+pub unsafe fn buffer_export_decref(obj: PyObjectRef) {
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             pyre_object::bytearrayobject::w_bytearray_exports_decref(obj);
@@ -864,7 +864,7 @@ fn w_memoryview_new_with_flags_impl(
 
 /// `_check_released` — every accessing method rejects a released view with
 /// `ValueError` before touching the (logically dropped) backing.
-pub(crate) unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), crate::PyError> {
+pub unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::memoryview::w_memoryview_released(mv) } {
         return Err(crate::PyError::value_error(
             "operation forbidden on released memoryview object",
@@ -2735,7 +2735,7 @@ fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, len
 
 /// `(c_contiguous, f_contiguous)` for a view, from `_init_flags` /
 /// `PyBuffer_isContiguous`.  A 0-dim (scalar) view is both.
-pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
+pub unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
     use pyre_object::memoryview::*;
     unsafe {
         let ndim = w_memoryview_ndim(mv);
@@ -12147,7 +12147,7 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(w_tuple_new(collect_iterable(obj)?))
 }
 
-pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `list.__new__` is positional-only, so any keyword is a TypeError
     // (an empty `**{}` is not a keyword and is allowed).
     let (args, kwargs) = split_builtin_kwargs(args);
@@ -18944,7 +18944,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// `listobject.py descr_sort` — the shared body of `list.sort` and
 /// `sorted`.  `list_slot` is a shadow-stack slot holding the list, because a
 /// key call or a comparison dunder can collect and move it.
-pub(crate) fn sort_list_in_place(
+pub fn sort_list_in_place(
     list_slot: usize,
     key_fn: Option<PyObjectRef>,
     reverse: bool,

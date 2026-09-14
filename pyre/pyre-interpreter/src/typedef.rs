@@ -3560,7 +3560,7 @@ pub(crate) fn make_new_descr_with_signature(
 /// [`make_new_descr`] optionally carrying a `Signature`: `Some` binds keyword
 /// arguments by name before the constructor runs; `None` (a variadic
 /// whole-args `__new__`) keeps the positional-only carrier.
-pub(crate) fn make_new_descr_maybe_sig(
+pub fn make_new_descr_maybe_sig(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     signature: Option<crate::gateway::Signature>,
 ) -> PyObjectRef {
@@ -4805,7 +4805,7 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `hasuserdel`, so tagging must precede registration. Registering an
 /// instance whose type has no `__del__` is a no-op, the hook gates on
 /// `hasuserdel` exactly as upstream does.
-pub(crate) fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
+pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
     unsafe { store_subclass_tag(obj, sub) };
     pyre_object::gc_hook::maybe_register_finalizer(obj);
     obj
@@ -25471,7 +25471,7 @@ pub fn unicode_decode_error(
 /// `pyparse.py recode_to_utf8` takes this same encode, and it is strict:
 /// a lone surrogate has no UTF-8 spelling, so the text is reported rather than
 /// silently rewritten with U+FFFD.
-pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
+pub fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
     if let Ok(s) = text.as_str() {
         return Ok(s.to_owned());
     }
@@ -26041,7 +26041,7 @@ fn unicode_check_encoding_errors(encoding: &str, errors: &str) -> Result<(), cra
 
 /// Decode `data` under `encoding`/`errors` into a WTF-8 string, dispatching on
 /// the codec name the same way `bytes.decode` does.
-pub(crate) fn decode_bytes_to_wtf8(
+pub fn decode_bytes_to_wtf8(
     data: &[u8],
     encoding: &str,
     errors: &str,

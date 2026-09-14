@@ -1126,6 +1126,18 @@ pub fn all_immortal_w_class_only_descriptors()
 /// `pyre-object::pyobject::all_subclass_range_aliases` supplies the object
 /// layer; `init_typeobjects` passes both slices to the common numbering
 /// writer.
+static OPTIONAL_SUBCLASS_RANGE_ALIASES: std::sync::OnceLock<
+    fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
+> = std::sync::OnceLock::new();
+
+/// Extra rclass aliases for types that live in `pyre-module`. Installed
+/// from `pyre_module::register` before the first `init_subclass_ranges`.
+pub fn set_optional_subclass_range_aliases(
+    extra: fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
+) {
+    let _ = OPTIONAL_SUBCLASS_RANGE_ALIASES.set(extra);
+}
+
 pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
     use pyre_object::lltype::PyreClassPyTypeOf;
     use pyre_object::pyobject::subclass_range_alias;
@@ -1140,7 +1152,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         unsafe { &*T::PYTYPE }
     }
 
-    vec![
+    let mut aliases = vec![
         subclass_range_alias(13, &crate::gateway::BUILTIN_CODE_TYPE),
         subclass_range_alias(14, &crate::function::FUNCTION_TYPE),
         subclass_range_alias(14, &crate::function::BUILTIN_FUNCTION_TYPE),
@@ -1169,7 +1181,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         ),
         subclass_range_alias(127, typed::<crate::module::_collections::W_DequeIter>()),
         subclass_range_alias(128, typed::<crate::module::_collections::W_DequeRevIter>()),
-        subclass_range_alias(129, typed::<crate::module::_tokenize::W_TokenizerIter>()),
         subclass_range_alias(
             130,
             typed::<crate::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
@@ -1199,10 +1210,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `_json.Scanner` and `_json.Encoder` extend the append-only managed
-        // payload tail without renumbering an established class.
-        subclass_range_alias(162, typed::<crate::module::_json::W_Scanner>()),
-        subclass_range_alias(163, typed::<crate::module::_json::W_Encoder>()),
         // `_hashlib`'s per-object digest/HMAC contexts follow their Python
         // owners and have sweep-time native-state destructors in build_gc.
         subclass_range_alias(164, typed::<crate::module::_hashlib::W_HashState>()),
@@ -1221,10 +1228,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(169, typed::<crate::module::zlib::W_Compress>()),
         subclass_range_alias(170, typed::<crate::module::zlib::W_Decompress>()),
         subclass_range_alias(171, typed::<crate::module::zlib::W_ZlibDecompressor>()),
-        // `_bz2`'s two stream objects own their libbz2 state and per-object
-        // lock.  Unconditional, so they stay ahead of the target-gated types.
-        subclass_range_alias(172, typed::<crate::module::_bz2::W_BZ2Compressor>()),
-        subclass_range_alias(173, typed::<crate::module::_bz2::W_BZ2Decompressor>()),
         // `_lzma`'s two stream objects own their liblzma coder, unconditional
         // for the same reason.
         subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
@@ -1267,12 +1270,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
-        // Windows asyncio's Overlapped owner follows mmap at the native tail.
-        // It is a non-subclassable builtin in Python, but still participates
-        // in the rclass hierarchy because its managed header and retained
-        // buffer/result fields are traced by the ordinary object marker.
-        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(196, typed::<crate::module::_overlapped::W_Overlapped>()),
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.
@@ -1407,7 +1404,11 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             CFFI_FIRST_TYPE_ID + 12,
             typed::<crate::module::_cffi_backend::wrapper::W_FunctionWrapper>(),
         ),
-    ]
+    ];
+    if let Some(extra) = OPTIONAL_SUBCLASS_RANGE_ALIASES.get() {
+        aliases.extend(extra());
+    }
+    aliases
 }
 
 /// The rclass hierarchy present in this interpreter configuration.

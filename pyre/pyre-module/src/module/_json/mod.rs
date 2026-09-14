@@ -10,7 +10,7 @@ use rustpython_common::json as machinery;
 use pyre_object::{PyObjectRef, gc_roots};
 use rustpython_wtf8::Wtf8;
 
-use crate::error::{PyError, PyResult};
+use pyre_interpreter::error::{PyError, PyResult};
 
 /// Shadow-stack slots holding the three GC references a `PyError` carries.
 /// The precise collector does not scan a Rust `PyError`, so a site that runs
@@ -53,15 +53,15 @@ fn require_string(obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
 }
 
 fn index_i64(obj: PyObjectRef) -> Result<i64, PyError> {
-    let indexed = crate::baseobjspace::space_index(obj)?;
-    crate::baseobjspace::int_w(indexed)
+    let indexed = pyre_interpreter::baseobjspace::space_index(obj)?;
+    pyre_interpreter::baseobjspace::int_w(indexed)
 }
 
 fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
-    let Some(module) = crate::importing::get_sys_module("json.decoder") else {
+    let Some(module) = pyre_interpreter::importing::get_sys_module("json.decoder") else {
         return PyError::value_error(format!("{msg}: line 1 column 1 (char {pos})"));
     };
-    let Ok(class) = crate::baseobjspace::getattr_str(module, "JSONDecodeError") else {
+    let Ok(class) = pyre_interpreter::baseobjspace::getattr_str(module, "JSONDecodeError") else {
         return PyError::value_error(format!("{msg}: line 1 column 1 (char {pos})"));
     };
     let args = [
@@ -69,7 +69,7 @@ fn json_decode_error(msg: String, doc: PyObjectRef, pos: usize) -> PyError {
         doc,
         pyre_object::w_int_new(pos as i64),
     ];
-    match crate::call::call_function_impl_result(class, &args) {
+    match pyre_interpreter::call::call_function_impl_result(class, &args) {
         Ok(exc) => unsafe { PyError::from_exc_object(exc) },
         Err(err) => err,
     }
@@ -91,7 +91,7 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
     if end < 0 || end as usize > unsafe { pyre_object::w_str_len(doc) } {
         return Err(PyError::value_error("end is out of bounds"));
     }
-    let strict = crate::baseobjspace::is_true(strict_obj)?;
+    let strict = pyre_interpreter::baseobjspace::is_true(strict_obj)?;
     let start = end as usize;
     let byte_start = unsafe { pyre_object::w_str_index_to_byte(doc, start) };
     let rest = value.get(byte_start..).ok_or_else(|| {
@@ -114,9 +114,10 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
 }
 
 fn stop_iteration(index: i64) -> PyError {
-    let class = crate::builtins::lookup_exc_class("StopIteration")
+    let class = pyre_interpreter::builtins::lookup_exc_class("StopIteration")
         .expect("StopIteration installed before _json");
-    match crate::call::call_function_impl_result(class, &[pyre_object::w_int_new(index)]) {
+    match pyre_interpreter::call::call_function_impl_result(class, &[pyre_object::w_int_new(index)])
+    {
         Ok(exc) => unsafe { PyError::from_exc_object(exc) },
         Err(err) => err,
     }
@@ -177,7 +178,7 @@ fn scanner_scan_once(
             ))
         }
         b'{' => {
-            crate::stack_check::stack_check().map_err(|_| {
+            pyre_interpreter::stack_check::stack_check().map_err(|_| {
                 PyError::recursion_error(
                     "maximum recursion depth exceeded while decoding a JSON object from a string",
                 )
@@ -191,7 +192,7 @@ fn scanner_scan_once(
             )
         }
         b'[' => {
-            crate::stack_check::stack_check().map_err(|_| {
+            pyre_interpreter::stack_check::stack_check().map_err(|_| {
                 PyError::recursion_error(
                     "maximum recursion depth exceeded while decoding a JSON array from a string",
                 )
@@ -271,7 +272,7 @@ fn scan_scalar(
         }
     }
     if end != 0 {
-        let parser = crate::baseobjspace::getattr_str(
+        let parser = pyre_interpreter::baseobjspace::getattr_str(
             self_obj,
             if is_float { "parse_float" } else { "parse_int" },
         )?;
@@ -279,7 +280,7 @@ fn scan_scalar(
         let _token_roots = pyre_object::gc_roots::push_roots();
         let token_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(number));
-        let parsed = crate::call::call_function_impl_result(
+        let parsed = pyre_interpreter::call::call_function_impl_result(
             parser,
             &[pyre_object::gc_roots::shadow_stack_get(token_slot)],
         )?;
@@ -288,11 +289,11 @@ fn scan_scalar(
 
     for (token, len) in [("NaN", 3usize), ("Infinity", 8), ("-Infinity", 9)] {
         if rest.starts_with(token.as_bytes()) {
-            let parser = crate::baseobjspace::getattr_str(self_obj, "parse_constant")?;
+            let parser = pyre_interpreter::baseobjspace::getattr_str(self_obj, "parse_constant")?;
             let _token_roots = pyre_object::gc_roots::push_roots();
             let token_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(token));
-            let parsed = crate::call::call_function_impl_result(
+            let parsed = pyre_interpreter::call::call_function_impl_result(
                 parser,
                 &[pyre_object::gc_roots::shadow_stack_get(token_slot)],
             )?;
@@ -364,18 +365,20 @@ fn scanner_parse_object(
             let candidate = pyre_object::w_str_from_wtf8_managed(decoded);
             let _ = gc_roots::pin_root(candidate);
             let memo = gc_roots::shadow_stack_get(slot + 1);
-            let key =
-                match crate::baseobjspace::finditem(memo, gc_roots::shadow_stack_get(item_slot))? {
-                    Some(key) => key,
-                    None => {
-                        crate::baseobjspace::setitem(
-                            memo,
-                            gc_roots::shadow_stack_get(item_slot),
-                            gc_roots::shadow_stack_get(item_slot),
-                        )?;
-                        gc_roots::shadow_stack_get(item_slot)
-                    }
-                };
+            let key = match pyre_interpreter::baseobjspace::finditem(
+                memo,
+                gc_roots::shadow_stack_get(item_slot),
+            )? {
+                Some(key) => key,
+                None => {
+                    pyre_interpreter::baseobjspace::setitem(
+                        memo,
+                        gc_roots::shadow_stack_get(item_slot),
+                        gc_roots::shadow_stack_get(item_slot),
+                    )?;
+                    gc_roots::shadow_stack_get(item_slot)
+                }
+            };
             let _ = gc_roots::pin_root(key);
 
             (char_index, byte_index) =
@@ -431,7 +434,7 @@ fn scanner_parse_object(
                     );
                 }
             } else {
-                crate::baseobjspace::setitem(
+                pyre_interpreter::baseobjspace::setitem(
                     gc_roots::shadow_stack_get(slot + 3),
                     gc_roots::shadow_stack_get(item_slot + 1),
                     gc_roots::shadow_stack_get(item_slot + 2),
@@ -492,7 +495,7 @@ fn scanner_parse_object(
     if unsafe { pyre_object::is_none(hook) } {
         Ok((result, char_index, byte_index))
     } else {
-        let hooked = crate::call::call_function_impl_result(hook, &[result])?;
+        let hooked = pyre_interpreter::call::call_function_impl_result(hook, &[result])?;
         Ok((hooked, char_index, byte_index))
     }
 }
@@ -634,7 +637,7 @@ fn scanner_call_impl(self_obj: PyObjectRef, doc: PyObjectRef, index: i64) -> PyR
 
 // CPython 3.14 Modules/_json.c:PyInit__json uses PyType_FromSpec;
 // PyScannerType_spec is mutable.
-#[crate::pyre_class("_json.Scanner", cpython_mutable)]
+#[pyre_interpreter::pyre_class("_json.Scanner", cpython_mutable)]
 pub struct W_Scanner {
     strict: bool,
     parse_float: PyObjectRef,
@@ -647,7 +650,7 @@ pub struct W_Scanner {
 mod scanner_class {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_Scanner {
         fn __call__(&mut self, doc: PyObjectRef, index: i64) -> Result<PyObjectRef, PyError> {
             scanner_call_impl(self as *mut Self as PyObjectRef, doc, index)
@@ -681,7 +684,7 @@ mod scanner_class {
 }
 
 // CPython 3.14 Modules/_json.c:PyInit__json creates the mutable encoder spec.
-#[crate::pyre_class("_json.Encoder", cpython_mutable)]
+#[pyre_interpreter::pyre_class("_json.Encoder", cpython_mutable)]
 pub struct W_Encoder {
     markers: PyObjectRef,
     default: PyObjectRef,
@@ -699,7 +702,7 @@ pub struct W_Encoder {
 mod encoder_class {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_Encoder {
         fn __call__(
             &mut self,
@@ -750,11 +753,16 @@ mod encoder_class {
 }
 
 fn is_instance(obj: PyObjectRef, ty: &pyre_object::PyType) -> bool {
-    unsafe { crate::baseobjspace::isinstance_w(obj, crate::typedef::gettypeobject(ty)) }
+    unsafe {
+        pyre_interpreter::baseobjspace::isinstance_w(
+            obj,
+            pyre_interpreter::typedef::gettypeobject(ty),
+        )
+    }
 }
 
 fn encoder_attr(self_obj: PyObjectRef, name: &str) -> PyResult {
-    crate::baseobjspace::getattr_str(self_obj, name)
+    pyre_interpreter::baseobjspace::getattr_str(self_obj, name)
 }
 
 fn append_python_string(out: &mut rustpython_wtf8::Wtf8Buf, obj: PyObjectRef) -> PyResult {
@@ -776,14 +784,14 @@ fn encode_string_field(
         return Ok(pyre_object::w_none());
     }
     let encoder = encoder_attr(self_obj, "encoder")?;
-    let encoded = crate::call::call_function_impl_result(encoder, &[obj])?;
+    let encoded = pyre_interpreter::call::call_function_impl_result(encoder, &[obj])?;
     append_python_string(out, encoded)
 }
 
 fn base_repr(obj: PyObjectRef, ty: &pyre_object::PyType) -> PyResult {
-    let w_type = crate::typedef::gettypeobject(ty);
-    let repr = crate::baseobjspace::getattr_str(w_type, "__repr__")?;
-    crate::call::call_function_impl_result(repr, &[obj])
+    let w_type = pyre_interpreter::typedef::gettypeobject(ty);
+    let repr = pyre_interpreter::baseobjspace::getattr_str(w_type, "__repr__")?;
+    pyre_interpreter::call::call_function_impl_result(repr, &[obj])
 }
 
 fn encode_float(
@@ -802,9 +810,9 @@ fn encode_float(
     } else {
         "-Infinity"
     };
-    if !crate::baseobjspace::is_true(encoder_attr(self_obj, "allow_nan")?)? {
+    if !pyre_interpreter::baseobjspace::is_true(encoder_attr(self_obj, "allow_nan")?)? {
         let repr = base_repr(obj, &pyre_object::FLOAT_TYPE)?;
-        let repr = crate::baseobjspace::text_w(repr)?.to_owned();
+        let repr = pyre_interpreter::baseobjspace::text_w(repr)?.to_owned();
         return Err(PyError::value_error(format!(
             "Out of range float values are not JSON compliant: {repr}"
         )));
@@ -834,10 +842,11 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
     let note = pyre_object::w_str_from_wtf8_managed(note.into());
     let note_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(note);
-    if let Ok(add_note) =
-        crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(exc_slot), "add_note")
-    {
-        let _ = crate::call::call_function_impl_result(
+    if let Ok(add_note) = pyre_interpreter::baseobjspace::getattr_str(
+        gc_roots::shadow_stack_get(exc_slot),
+        "add_note",
+    ) {
+        let _ = pyre_interpreter::call::call_function_impl_result(
             add_note,
             &[gc_roots::shadow_stack_get(note_slot)],
         );
@@ -846,7 +855,7 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
 }
 
 fn short_type_name(obj: PyObjectRef) -> String {
-    crate::baseobjspace::object_functionstr_type_name(obj)
+    pyre_interpreter::baseobjspace::object_functionstr_type_name(obj)
 }
 
 fn encode_child(
@@ -857,10 +866,10 @@ fn encode_child(
     // RPython inserts a stack check on this recursive `_encode` edge;
     // `encoder_listencode_obj` brackets the equivalent recursion with
     // `Py_EnterRecursiveCall`.
-    crate::stack_check::stack_check()?;
+    pyre_interpreter::stack_check::stack_check()?;
     let encoder = W_Encoder::from_obj(self_obj).expect("Encoder payload");
     let depth = encoder.depth;
-    if depth >= crate::stack_check::get_recursion_limit() as i64 {
+    if depth >= pyre_interpreter::stack_check::get_recursion_limit() as i64 {
         return Err(PyError::recursion_error(
             "maximum recursion depth exceeded while encoding a JSON object",
         ));
@@ -874,7 +883,7 @@ fn encode_child(
 }
 
 fn marker_key(obj: PyObjectRef) -> PyObjectRef {
-    crate::function::immutable_unique_id(obj)
+    pyre_interpreter::function::immutable_unique_id(obj)
         .unwrap_or_else(|| pyre_object::w_int_new(obj as usize as i64))
 }
 
@@ -903,13 +912,13 @@ where
     let key = marker_key(gc_roots::shadow_stack_get(obj_slot));
     let key_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(key);
-    if crate::baseobjspace::contains(
+    if pyre_interpreter::baseobjspace::contains(
         gc_roots::shadow_stack_get(markers_slot),
         gc_roots::shadow_stack_get(key_slot),
     )? {
         return Err(PyError::value_error("Circular reference detected"));
     }
-    crate::baseobjspace::setitem(
+    pyre_interpreter::baseobjspace::setitem(
         gc_roots::shadow_stack_get(markers_slot),
         gc_roots::shadow_stack_get(key_slot),
         gc_roots::shadow_stack_get(obj_slot),
@@ -918,7 +927,7 @@ where
         gc_roots::shadow_stack_get(self_slot),
         gc_roots::shadow_stack_get(obj_slot),
     );
-    let delete = crate::baseobjspace::delitem(
+    let delete = pyre_interpreter::baseobjspace::delitem(
         gc_roots::shadow_stack_get(markers_slot),
         gc_roots::shadow_stack_get(key_slot),
     );
@@ -965,7 +974,7 @@ fn encode_value(
                 let default = encoder_attr(self_obj, "default")?;
                 // `_default` exceptions propagate bare; errors while
                 // encoding its returned object gain context for the source.
-                let converted = crate::call::call_function_impl_result(default, &[obj])?;
+                let converted = pyre_interpreter::call::call_function_impl_result(default, &[obj])?;
                 encode_child(self_obj, converted, level).map_err(|err| {
                     add_json_note(
                         err,
@@ -1006,7 +1015,7 @@ fn encode_sequence(
     // address and report the type of whatever now occupies that cell.
     let obj_slot = gc_roots::shadow_stack_len();
     let obj = gc_roots::pin_root(obj);
-    let iter = crate::baseobjspace::iter(obj)?;
+    let iter = pyre_interpreter::baseobjspace::iter(obj)?;
     let iter_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(iter);
     let separator_obj = encoder_attr(self_obj, "item_separator")?;
@@ -1018,7 +1027,8 @@ fn encode_sequence(
     let mut first = true;
     let mut item_index = 0usize;
     loop {
-        let item = match crate::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot)) {
+        let item = match pyre_interpreter::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot))
+        {
             Ok(item) => item,
             Err(err) if err.matches_stop_iteration() => break,
             Err(err) => return Err(err),
@@ -1079,12 +1089,12 @@ fn coerce_key(self_obj: PyObjectRef, key: PyObjectRef) -> Result<Option<PyObject
             return Ok(Some(pyre_object::w_str_from_wtf8_managed(out)));
         }
     }
-    if crate::baseobjspace::is_true(encoder_attr(self_obj, "skipkeys")?)? {
+    if pyre_interpreter::baseobjspace::is_true(encoder_attr(self_obj, "skipkeys")?)? {
         Ok(None)
     } else {
         Err(PyError::type_error(format!(
             "keys must be str, int, float, bool or None, not {}",
-            crate::baseobjspace::object_functionstr_type_name(key)
+            pyre_interpreter::baseobjspace::object_functionstr_type_name(key)
         )))
     }
 }
@@ -1105,25 +1115,27 @@ fn encode_dict(
     let _roots = gc_roots::push_roots();
     let obj_slot = gc_roots::shadow_stack_len();
     let obj = gc_roots::pin_root(obj);
-    let items = crate::call::call_function_impl_result(
-        crate::baseobjspace::getattr_str(obj, "items")?,
+    let items = pyre_interpreter::call::call_function_impl_result(
+        pyre_interpreter::baseobjspace::getattr_str(obj, "items")?,
         &[],
     )?;
     let mut items_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(items);
-    if crate::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
+    if pyre_interpreter::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
         // `encoder_listencode_dict` builds the list itself and sorts it in
         // place with `PyList_Sort`.  Naming `builtins.sorted` instead resolves
         // through the running `sys.modules`, which a program is entitled to
         // block -- and then a plain `json.dumps(d, sort_keys=True)` fails on a
         // module it never asked for.
         let items_list =
-            crate::builtins::builtin_list_ctor(&[gc_roots::shadow_stack_get(items_slot)])?;
+            pyre_interpreter::builtins::builtin_list_ctor(&[gc_roots::shadow_stack_get(
+                items_slot,
+            )])?;
         items_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(items_list);
-        crate::builtins::sort_list_in_place(items_slot, None, false)?;
+        pyre_interpreter::builtins::sort_list_in_place(items_slot, None, false)?;
     }
-    let iter = crate::baseobjspace::iter(gc_roots::shadow_stack_get(items_slot))?;
+    let iter = pyre_interpreter::baseobjspace::iter(gc_roots::shadow_stack_get(items_slot))?;
     let iter_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(iter);
     let item_separator = require_string(encoder_attr(self_obj, "item_separator")?)?.to_wtf8_buf();
@@ -1134,12 +1146,13 @@ fn encode_dict(
     out.push_char('{');
     let mut first = true;
     loop {
-        let pair = match crate::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot)) {
+        let pair = match pyre_interpreter::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot))
+        {
             Ok(pair) => pair,
             Err(err) if err.matches_stop_iteration() => break,
             Err(err) => return Err(err),
         };
-        let pair_items = crate::builtins::collect_iterable(pair)?;
+        let pair_items = pyre_interpreter::builtins::collect_iterable(pair)?;
         if pair_items.len() != 2 {
             return Err(PyError::value_error(
                 "dictionary update sequence element has length other than 2",
@@ -1180,12 +1193,13 @@ fn encode_dict(
             child_level,
         )
         .map_err(|err| {
-            let key_repr =
-                unsafe { crate::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2)) }
-                    .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
+            let key_repr = unsafe {
+                pyre_interpreter::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2))
+            }
+            .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
             add_json_note(
                 err,
-                crate::display::wtf8_format!(
+                pyre_interpreter::wtf8_format!(
                     format!(
                         "when serializing {} item ",
                         short_type_name(gc_roots::shadow_stack_get(obj_slot))
@@ -1228,7 +1242,7 @@ fn make_encoder_impl(
     if !unsafe { pyre_object::is_none(markers) } && !is_instance(markers, &pyre_object::DICT_TYPE) {
         return Err(PyError::type_error(format!(
             "make_encoder() argument 1 must be dict or None, not {}",
-            crate::baseobjspace::object_functionstr_type_name(markers)
+            pyre_interpreter::baseobjspace::object_functionstr_type_name(markers)
         )));
     }
     require_string(key_separator)?;
@@ -1236,9 +1250,9 @@ fn make_encoder_impl(
     if !unsafe { pyre_object::is_none(indent) } {
         require_string(indent)?;
     }
-    let sort_keys = pyre_object::w_bool_from(crate::baseobjspace::is_true(sort_keys)?);
-    let skipkeys = pyre_object::w_bool_from(crate::baseobjspace::is_true(skipkeys)?);
-    let allow_nan = pyre_object::w_bool_from(crate::baseobjspace::is_true(allow_nan)?);
+    let sort_keys = pyre_object::w_bool_from(pyre_interpreter::baseobjspace::is_true(sort_keys)?);
+    let skipkeys = pyre_object::w_bool_from(pyre_interpreter::baseobjspace::is_true(skipkeys)?);
+    let allow_nan = pyre_object::w_bool_from(pyre_interpreter::baseobjspace::is_true(allow_nan)?);
 
     let fast_mode = fast_encode_mode(encoder);
 
@@ -1286,12 +1300,13 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
         "object_hook",
         "object_pairs_hook",
     ] {
-        let value = crate::baseobjspace::getattr_str(gc_roots::shadow_stack_get(slot), name)?;
+        let value =
+            pyre_interpreter::baseobjspace::getattr_str(gc_roots::shadow_stack_get(slot), name)?;
         let _ = gc_roots::pin_root(value);
     }
     // Match the C accelerator: strict is converted during construction, so
     // an overriding `__bool__` raises before the first token is scanned.
-    let strict = crate::baseobjspace::is_true(gc_roots::shadow_stack_get(slot + 1))?;
+    let strict = pyre_interpreter::baseobjspace::is_true(gc_roots::shadow_stack_get(slot + 1))?;
     let _ = scanner_class::type_object();
     Ok(W_Scanner::allocate_stable(W_Scanner {
         ob: pyre_object::PyObject::default(),
@@ -1324,7 +1339,9 @@ static FAST_ENCODE_FNS: [std::sync::atomic::AtomicUsize; 2] = [
 /// non-ASCII one, `2` for anything else, which is called as an ordinary
 /// callable.
 fn fast_encode_mode(encoder: PyObjectRef) -> i64 {
-    let Some(code_fn) = (unsafe { crate::jit_builtin_folds::builtin_code_fn_of(encoder) }) else {
+    let Some(code_fn) =
+        (unsafe { pyre_interpreter::jit_builtin_folds::builtin_code_fn_of(encoder) })
+    else {
         return 2;
     };
     let found = code_fn as usize;
@@ -1349,13 +1366,15 @@ fn publish_fast_encode_fns(ns: PyObjectRef) {
         else {
             continue;
         };
-        if let Some(code_fn) = unsafe { crate::jit_builtin_folds::builtin_code_fn_of(func) } {
+        if let Some(code_fn) =
+            unsafe { pyre_interpreter::jit_builtin_folds::builtin_code_fn_of(func) }
+        {
             cell.store(code_fn as usize, std::sync::atomic::Ordering::Release);
         }
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_json",
     inline_functions: {
         fn make_scanner(context: PyObjectRef) -> Result<PyObjectRef, PyError> {

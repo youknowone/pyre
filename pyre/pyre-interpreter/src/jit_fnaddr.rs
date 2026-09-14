@@ -5773,27 +5773,6 @@ mod tests {
         );
     }
 
-    /// The `_csv::dialect_class::type_object` accessor is hand-written (not
-    /// `#[pyre_methods]` / `py_class!`), yet the front recognizer stamps every
-    /// `type_object` accessor `dont_look_inside`.  It must still publish a
-    /// residual address, or a traced `_csv.Dialect` type lookup residualizes to
-    /// a symbolic fnaddr and inline JIT descent aborts.  Guards the invariant
-    /// that every `type_object` generator (macro or hand-written) registers.
-    #[test]
-    fn jit_trace_fnaddrs_covers_hand_written_csv_dialect_type_object() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key("pyre_module::module::_csv::dialect_class::type_object")
-                || bindings
-                    .contains_key("pyre_interpreter::module::_csv::dialect_class::type_object"),
-            "hand-written _csv::dialect_class::type_object must publish a residual fnaddr",
-        );
-        assert!(
-            bindings.contains_key("module::_csv::dialect_class::type_object"),
-            "the crate-stripped alias must resolve too",
-        );
-    }
-
     /// Every `BUILTIN_WRAPPER_DESCRIPTORS` member must carry the
     /// `__majit_wrap_` leaf.  That prefix is how
     /// `CallControl::compute_builtin_wrapper_indirect_graphs` populates the

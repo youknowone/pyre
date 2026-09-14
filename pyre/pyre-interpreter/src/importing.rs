@@ -687,11 +687,6 @@ pub fn install_builtin_modules() {
     // COM and is therefore present only on an unsandboxed Windows host.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(_wmi);
-    // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
-    // OVERLAPPED record per operation and reaches the Win32/WinSock calls
-    // through this Windows-only builtin.
-    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    pyre_install_module!(_overlapped);
     // `importlib._bootstrap_external` eagerly `import winreg`s on win32; the
     // module must exist for the import machinery (and `import site`) to start.
     #[cfg(windows)]
@@ -802,7 +797,6 @@ pub fn install_builtin_modules() {
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
     pyre_install_module!(zlib);
-    pyre_install_module!(_bz2);
     pyre_install_module!(_lsprof);
     pyre_install_module!(_lzma);
     pyre_install_module!(_typing);
@@ -824,8 +818,6 @@ pub fn install_builtin_modules() {
     );
     register_builtin_module("_queue", crate::module::_queue::init);
     register_builtin_module("_types", crate::module::_types::init);
-    register_builtin_module("_json", crate::module::_json::init);
-    register_builtin_module("_tokenize", crate::module::_tokenize::init);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);

@@ -5,6 +5,8 @@ pub mod _bisect;
 #[allow(non_snake_case)]
 pub mod _blake2;
 #[allow(non_snake_case)]
+pub mod _bz2;
+#[allow(non_snake_case)]
 pub mod _codecs_cn;
 #[allow(non_snake_case)]
 pub mod _codecs_hk;
@@ -23,12 +25,17 @@ pub mod _heapq;
 #[allow(non_snake_case)]
 pub mod _immutables_map;
 #[allow(non_snake_case)]
+pub mod _json;
+#[allow(non_snake_case)]
 pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
 pub mod _multiprocessing;
 #[allow(non_snake_case)]
 pub mod _opcode;
+#[allow(non_snake_case)]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+pub mod _overlapped;
 #[allow(non_snake_case)]
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixshmem;
@@ -44,6 +51,8 @@ pub mod _statistics;
 pub mod _suggestions;
 #[allow(non_snake_case)]
 pub mod _template;
+#[allow(non_snake_case)]
+pub mod _tokenize;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _uuid;
