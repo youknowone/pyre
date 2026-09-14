@@ -5039,8 +5039,16 @@ impl<'a> Lowering<'a> {
                         .any(|&local| place_references_local(place, local)),
                     _ => false,
                 };
-                if inherit_byte_view && !self.string_byte_view_locals.contains(&dest_local) {
-                    self.string_byte_view_locals.push(dest_local);
+                if inherit_byte_view {
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                } else {
+                    // Last-write-wins, same as `positional_aggregate_locals`
+                    // below: a later assign of an ordinary `&[u8]` must not
+                    // keep `strlen`/`strgetitem` on a `W_UnicodeObject`.
+                    self.string_byte_view_locals
+                        .retain(|&local| local != dest_local);
                 }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
