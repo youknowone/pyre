@@ -10265,9 +10265,13 @@ fn exception_group_subgroup_inner(
     w_self: PyObjectRef,
     condition: &ExceptionGroupCondition,
 ) -> Result<PyObjectRef, crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let w_self = pyre_object::gc_roots::pin_root(w_self);
     if condition.matches(w_self)? {
-        return Ok(w_self);
+        return Ok(pyre_object::gc_roots::shadow_stack_get(self_slot));
     }
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let (_, exceptions) = exception_group_fields(w_self)?;
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     // A selected child can be a freshly derived subgroup and the next child
@@ -10295,11 +10299,14 @@ fn exception_group_subgroup_inner(
         }
     }
     if !modified {
-        Ok(w_self)
+        Ok(pyre_object::gc_roots::shadow_stack_get(self_slot))
     } else if selected.is_empty() {
         Ok(pyre_object::w_none())
     } else {
-        exception_group_derive_and_copy(w_self, selected.take())
+        exception_group_derive_and_copy(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            selected.take(),
+        )
     }
 }
 
@@ -10307,9 +10314,16 @@ fn exception_group_split_inner(
     w_self: PyObjectRef,
     condition: &ExceptionGroupCondition,
 ) -> Result<(PyObjectRef, PyObjectRef), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let w_self = pyre_object::gc_roots::pin_root(w_self);
     if condition.matches(w_self)? {
-        return Ok((w_self, pyre_object::w_none()));
+        return Ok((
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            pyre_object::w_none(),
+        ));
     }
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let (_, exceptions) = exception_group_fields(w_self)?;
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     // Either side can hold a freshly derived subgroup while a later child is
@@ -10348,6 +10362,7 @@ fn exception_group_split_inner(
     let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept_items[i]).collect() };
     // Deriving one side allocates, so the group derived for the other side is
     // pinned across it.
+    let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let mut derived = pyre_object::gc_roots::RootedItems::new();
     let yes = if matching_at.is_empty() {
         pyre_object::w_none()
@@ -10358,7 +10373,10 @@ fn exception_group_split_inner(
     let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self, side(&nonmatching_at))?
+        exception_group_derive_and_copy(
+            pyre_object::gc_roots::shadow_stack_get(self_slot),
+            side(&nonmatching_at),
+        )?
     };
     derived.push(no);
     let sides = derived.take();
