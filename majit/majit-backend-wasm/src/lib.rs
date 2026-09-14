@@ -3360,6 +3360,7 @@ impl WasmBackend {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
+                    fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: inputs.frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -4001,6 +4002,15 @@ fn exit_slot_count(fail_descr: &failguard::WasmFailDescr) -> usize {
         .map_or(fail_args, |slot| fail_args.max(slot + 1))
 }
 
+/// Decode through the locations saved on the descriptor, as
+/// BaseAssembler.rebuild_faillocs_from_descr does. The frontend still sees
+/// its logical resume numbering; a hole neither reads nor reserves memory.
+fn exit_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
+    fail_descr.frame_slot(index).map_or(0, |slot| unsafe {
+        *((frame_ptr + codegen::FRAME_SLOT_BASE as usize + slot * 8) as *const i64)
+    })
+}
+
 /// Reconstruct a [`DeadFrame`] from a callee frame an in-guest `call_indirect`
 /// already ran to a guard/finish exit (the self-recursive CALL_ASSEMBLER fast
 /// path, `PYRE_WASM_CA`). This is the post-`glue::execute` tail of
@@ -4025,7 +4035,7 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
         global_fail_descr(fail_index).expect("invalid fail_index from in-guest CA callee frame");
     let num_outputs = exit_slot_count(&fail_descr);
     let raw_values: Vec<i64> = (0..num_outputs)
-        .map(|i| unsafe { *frame.add(1 + i) })
+        .map(|i| exit_arg_word(frame_ptr, &fail_descr, i))
         .collect();
     DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
 }
@@ -4047,7 +4057,10 @@ fn forced_frame_items_base(force_token: GcRef) -> usize {
 }
 
 fn force_arg_word(frame_ptr: usize, fail_descr: &WasmFailDescr, index: usize) -> i64 {
-    let offset = fail_descr.force_args_offset as usize + index * std::mem::size_of::<i64>();
+    let Some(slot) = fail_descr.frame_slot(index) else {
+        return 0;
+    };
+    let offset = fail_descr.force_args_offset as usize + slot * std::mem::size_of::<i64>();
     unsafe { *((frame_ptr + offset) as *const i64) }
 }
 
@@ -4502,6 +4515,7 @@ impl majit_backend::Backend for WasmBackend {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
+                    fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -4934,16 +4948,9 @@ impl majit_backend::Backend for WasmBackend {
             }
             Some(inputargs.len())
         } else {
-            // A frame entry reads bridge input `k` out of the positional exit
-            // slot `k`, while `emit_guard_fail_args_spill` writes each fail
-            // argument into the slot named by its own resume position, holes
-            // included. `initialize_state_from_guard_failure` drops those
-            // holes, so input `k` is the k-th LIVE position and the two orders
-            // coincide only while every hole trails the last live one.
-            // `rebuild_faillocs_from_descr` is where a live position's own
-            // location is recovered instead; this entry has no table to do it
-            // with, so decline the shape rather than hand the bridge a
-            // neighbouring fail argument's slot.
+            // BaseAssembler.rebuild_faillocs_from_descr binds only live
+            // positions. The source guard spills them in that same compact
+            // order, so frame entry input k reads physical slot k.
             if !codegen::frame_entry_reads_live_positions(fail_descr, inputargs.len()) {
                 diag_bump(46);
                 return Err(BackendError::Unsupported(
@@ -4975,12 +4982,14 @@ impl majit_backend::Backend for WasmBackend {
             || bridge_ref_homes > source_frame.ordinary_home_slots()
         {
             diag_bump(4);
-            return Err(BackendError::Unsupported(format!(
+            let error = BackendError::Unsupported(format!(
                 "wasm backend: bridge frame needs values={bridge_value_slots}, homes={bridge_ref_homes}; \
                  source frozen layout has values={}, homes={}",
                 source_frame.value_slots,
                 source_frame.ordinary_home_slots(),
-            )));
+            ));
+            record_inline_trial_error(&error);
+            return Err(error);
         }
 
         // A loop-closing bridge (terminal JUMP, no local LABEL) re-enters the
@@ -5535,6 +5544,7 @@ impl majit_backend::Backend for WasmBackend {
                     fail_index: g.fail_index,
                     trace_id,
                     fail_arg_types: g.fail_arg_types.clone(),
+                    fail_locs: g.fail_locs.clone(),
                     is_finish: g.is_finish,
                     force_args_offset: source_frame.force_slot_base as u32,
                     force_gcmap_ptr: leak_gcmap_for_indices(&g.force_ref_home_indices),
@@ -5979,7 +5989,7 @@ impl majit_backend::Backend for WasmBackend {
                     global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
                 let num_outputs = exit_slot_count(&fail_descr);
                 let raw_values: Vec<i64> = (0..num_outputs)
-                    .map(|i| unsafe { *((items_base + fsb + i * 8) as *const i64) })
+                    .map(|i| exit_arg_word(items_base, &fail_descr, i))
                     .collect();
 
                 // `assembler.py::_finish_gcmap`: after FINISH, retain only the
@@ -6060,7 +6070,7 @@ impl majit_backend::Backend for WasmBackend {
                 global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
             let num_outputs = exit_slot_count(&fail_descr);
             let raw_values: Vec<i64> = (0..num_outputs)
-                .map(|i| unsafe { *items.add(1 + i) })
+                .map(|i| exit_arg_word(items as usize, &fail_descr, i))
                 .collect();
             drop(backing);
             DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))

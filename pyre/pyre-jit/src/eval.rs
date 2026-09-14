@@ -5816,6 +5816,11 @@ fn build_jit_driver_pair() -> JitDriverPair {
             crate::call_jit::bh_load_global_fn as *const () as usize as i64,
             crate::call_jit::bh_reraise_varargs_zero as *const () as usize as i64,
             crate::call_jit::bh_get_current_exception as *const () as usize as i64,
+            // These call_jit stubs already implement CallDescr.create_call_stub's
+            // word ABI. Keep truth tests and exception-context reads in the
+            // guest instead of reflecting through the host on every iteration.
+            crate::call_jit::bh_truth_fn as *const () as usize as i64,
+            crate::call_jit::resolve_exception_context as *const () as usize as i64,
             pyre_interpreter::jit_load_name_from_namespace as *const () as usize as i64,
             pyre_interpreter::jit_store_name_to_namespace as *const () as usize as i64,
             pyre_interpreter::jit_binary_value_from_tag as *const () as usize as i64,

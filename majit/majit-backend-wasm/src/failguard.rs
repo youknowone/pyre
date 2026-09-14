@@ -13,6 +13,11 @@ pub struct WasmFailDescr {
     pub fail_index: u32,
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
+    /// BaseAssembler.store_info_on_descr's fail locations: one physical
+    /// i64 slot for each live logical resume position, None for a hole.
+    /// An empty list is the identity layout used by reserved FINISH descrs
+    /// and backend-only synthetic descriptors.
+    pub fail_locs: Vec<Option<usize>>,
     pub is_finish: bool,
     /// Byte offset of GUARD_NOT_FORCED(_2)'s force-only spill area. Native
     /// backends carry these coordinates in their fail locations; keeping a
@@ -31,6 +36,15 @@ pub struct WasmFailDescr {
     /// for synthetic backend-only descrs (`compile_bridge` placeholders,
     /// test scaffolds).
     pub meta_descr: Option<DescrRef>,
+}
+
+impl WasmFailDescr {
+    pub fn frame_slot(&self, index: usize) -> Option<usize> {
+        if self.fail_locs.is_empty() {
+            return (index < self.fail_arg_types.len()).then_some(index);
+        }
+        self.fail_locs.get(index).copied().flatten()
+    }
 }
 
 impl Descr for WasmFailDescr {
@@ -229,6 +243,7 @@ mod tests {
             fail_index: 0,
             trace_id: 0,
             fail_arg_types,
+            fail_locs: Vec::new(),
             is_finish: false,
             force_args_offset: 8,
             force_gcmap_ptr: 0,
@@ -286,6 +301,7 @@ mod tests {
                     fail_index: base + i,
                     trace_id: 0,
                     fail_arg_types: vec![Type::Ref],
+                    fail_locs: Vec::new(),
                     is_finish: false,
                     force_args_offset: 8,
                     force_gcmap_ptr: 0,
@@ -320,6 +336,7 @@ mod tests {
                                 fail_index: base + index as u32,
                                 trace_id: trace_id as u64,
                                 fail_arg_types: vec![Type::Int],
+                                fail_locs: Vec::new(),
                                 is_finish: false,
                                 force_args_offset: 8,
                                 force_gcmap_ptr: 0,
@@ -583,6 +600,7 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
         fail_index: exit_index,
         trace_id: 0,
         fail_arg_types: reserved_fail_arg_types(exit_index),
+        fail_locs: Vec::new(),
         is_finish: true,
         force_args_offset: 0,
         force_gcmap_ptr: 0,
