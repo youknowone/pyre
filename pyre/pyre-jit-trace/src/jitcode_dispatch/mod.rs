@@ -5652,18 +5652,6 @@ fn funcptr_concrete_int<Sym: WalkSym>(
     }
 }
 
-/// Returns `true` when the body being walked has a Python `try`/`except`
-/// handler.  Used by the residual-call fast paths that conservatively decline
-/// a handler-bearing body to the generic walk (which resumes a
-/// `GUARD_NO_EXCEPTION` deopt into the handler correctly) rather than to their
-/// concrete fold.
-///
-/// The question is about the source function, so it reads `co_exceptiontable`.
-/// Scanning the jitcode for `catch_exception` ops answers a different one: the
-/// codewriter also emits that op for can-raise sites it routes itself — the
-/// FOR_ITER exception-match arm emits one at every `for` loop — and those have
-/// no Python handler for a deopt to resume into.  Falls back to the scan when
-/// the walk's jitcode index resolves to no `CodeObject`.
 fn walk_body_has_exception_handler<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -7023,7 +7011,7 @@ thread_local! {
     /// heap.  Cells are immovable (`malloc_typed`; the fold's `can_move`
     /// gate) and stay reachable from their module dict slot, so entries need
     /// no GC-root forwarding.
-    static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>> =
+    static FBW_CELL_STORE_JOURNAL: std::cell::RefCell<Vec<FbwCellStore>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
     /// Undo log for the walked region's eagerly executed namespace bindings.
@@ -7358,6 +7346,22 @@ pub(crate) struct EntryFallback {
     pub entry_executed_effects: usize,
 }
 
+/// Eager in-place cell write the StoreName/StoreGlobal fold applied.
+/// `write_cell` mutates `IntMutableCell.intvalue` or
+/// `ObjectMutableCell.w_value` without bumping `version?`; the walk
+/// must restore the prior payload if it does not commit.
+#[derive(Clone, Copy)]
+enum FbwCellStore {
+    Int {
+        cell: pyre_object::PyObjectRef,
+        before: i64,
+    },
+    Obj {
+        cell: pyre_object::PyObjectRef,
+        before: pyre_object::PyObjectRef,
+    },
+}
+
 /// One [`FBW_NAMESPACE_STORE_JOURNAL`] entry: the namespace dict a `*_NAME` /
 /// `*_GLOBAL` residual wrote, the name it bound, and the value that name held
 /// before the write — null when the name was unbound, which the rollback undoes
@@ -7376,7 +7380,7 @@ struct FbwStoreJournalRootArea {
     list_effects: *const std::cell::RefCell<Vec<FbwListEffect>>,
     append_promote: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     abort_overrides: *const std::cell::RefCell<Vec<(usize, pyre_object::PyObjectRef)>>,
-    cell_stores: *const std::cell::RefCell<Vec<(pyre_object::PyObjectRef, i64)>>,
+    cell_stores: *const std::cell::RefCell<Vec<FbwCellStore>>,
     namespace_stores: *const std::cell::RefCell<Vec<FbwNamespaceStore>>,
     sys_exc: *const std::cell::RefCell<Vec<pyre_object::PyObjectRef>>,
     traceback_store:
@@ -7720,8 +7724,18 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // only reference — rooting it keeps the rollback's `intvalue` restore
     // from writing into a freed block.
     let cell_stores = unsafe { &mut *(*area.cell_stores).as_ptr() };
-    for (cell, _intvalue) in cell_stores.iter_mut() {
-        visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
+    for entry in cell_stores.iter_mut() {
+        match entry {
+            FbwCellStore::Int { cell, .. } => {
+                visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
+            }
+            FbwCellStore::Obj { cell, before } => {
+                visitor(unsafe { &mut *(cell as *mut pyre_object::PyObjectRef).cast() });
+                if !before.is_null() {
+                    visitor(unsafe { &mut *(before as *mut pyre_object::PyObjectRef).cast() });
+                }
+            }
+        }
     }
     // Namespace-store journal: the store replaced the displaced binding in its
     // dict slot, so the entry can be that value's only remaining owner, and the
@@ -10776,6 +10790,7 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     dst_bank: char,
     w_globals: pyre_object::PyObjectRef,
     name: &str,
+    pin_version: bool,
 ) -> Result<bool, DispatchError> {
     // Cell fast path applies only to a module dict still in strategy mode
     // whose slot holds a raw value, an `ObjectMutableCell`, or an
@@ -10790,7 +10805,15 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
                 // cell lookup can fold; the namespace version guard below
                 // still revokes the constant when the slot is rebound.
                 return emit_namespace_cell_fold(
-                    ctx, op_pc, dst, dst_bank, w_globals, slot, stored, true,
+                    ctx,
+                    op_pc,
+                    dst,
+                    dst_bank,
+                    w_globals,
+                    slot,
+                    stored,
+                    true,
+                    pin_version,
                 );
             }
         }
@@ -10821,24 +10844,27 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     slot: usize,
     stored: pyre_object::PyObjectRef,
     guard_frame_globals: bool,
+    pin_version: bool,
 ) -> Result<bool, DispatchError> {
     if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
         return Ok(false);
     }
-    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
-        return Ok(false);
+    // In-place `write_cell` / `unwrap_cell` do not call `mutated()`.
+    // Pinning the dict `version?` on those loads made every `except as`
+    // (`DELETE_NAME` → `delitem` always `mutated()`) kill the module
+    // while-loop — 116 qmut aborts on jitstress.  LoadGlobal of a
+    // rebindable name still pins.
+    if pin_version {
+        if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+            return Ok(false);
+        }
+        if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
+            return Ok(false);
+        }
     }
-    // The caller read `stored` before the marker above was installed, so a
-    // store from another thread in that window moved the entry while nothing
-    // was watching the version it bumped, and the constant baked below would
-    // be the cell from before it -- for the rest of the loop's life, since no
-    // invalidation is owed for a bump that predates its watcher.  Re-read now
-    // that the watcher stands and decline when the two disagree; single
-    // threaded there is no interval and this always agrees.
-    if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
+    let Some((result_opref, _)) = emit_namespace_cell_value(ctx, op_pc, stored)? else {
         return Ok(false);
-    }
-    let (result_opref, _) = emit_namespace_cell_value(ctx, op_pc, stored)?;
+    };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result_opref)?;
     // `pyjitpl.py _opimpl_residual_call*` finishes its no-raise
     // tail with `metainterp.clear_exception()`.  The fold replaces a
@@ -10867,144 +10893,10 @@ fn emit_namespace_cell_value<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     stored: pyre_object::PyObjectRef,
-) -> Result<(OpRef, pyre_object::PyObjectRef), DispatchError> {
-    let is_obj_cell = unsafe { pyre_object::celldict::is_object_mutable_cell(stored) };
-    let is_int_cell = unsafe { pyre_object::celldict::is_int_mutable_cell(stored) };
-    let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
-    // Bake the stored value/cell as a `ConstPtr` (pypy `ConstPtr(cell)`). The
-    // `QuasiimmutField(strategy, version)` guard the caller took invalidates the loop on a
-    // rebind / strategy-version bump (`_setitem_str_cell_known` calls
-    // `mutated()` before every write that replaces the stored pointer), and the
-    // registered `ConstPtr` walkers keep the address current across a moving
-    // collection — the optimizer already folds the equivalent elidable
-    // `jit_namespace_cell_lookup` down to this same const ptr.  A genuine
-    // constant (not the elidable call's `RefOp` result, which is not
-    // `is_constant()`) is what lets the trace-time heapcache's
-    // `_unique_const_heuristic` canonicalise the LOAD's `getfield_gc_i` and
-    // the STORE fold's `setfield_gc_i` onto one cache slot; without it a hot
-    // int global's cached field goes stale.
-    let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
-    // An `ObjectMutableCell` needs `cell.w_value` read LIVE so a same-key
-    // reassign (in-place `write_cell`, no version bump) is observed each
-    // iteration; an `IntMutableCell` reads `cell.intvalue` LIVE for the same
-    // reason (`write_cell` mutates `intvalue` in place for an int->int
-    // reassign) then re-boxes the raw int; a raw stored value is its own
-    // result.
-    let default_concrete = majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize));
-    let (result_opref, result_concrete) = if is_obj_cell {
-        (
-            crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                cell_opref,
-                crate::descr::object_mutable_cell_value_descr(),
-            ),
-            default_concrete,
-        )
-    } else if is_int_cell {
-        let raw_int = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            cell_opref,
-            crate::descr::int_mutable_cell_value_descr(),
-        );
-        let intval = unsafe { pyre_object::w_int_get_value(result_obj) };
-        (
-            walker_box_int(ctx, op_pc, raw_int, intval)?,
-            box_int_concrete(intval, result_obj as i64),
-        )
-    } else {
-        (cell_opref, default_concrete)
-    };
-    // Seed the dst's concrete with the unwrapped LOAD result so chained
-    // walker handlers see the resolved value instead of `Null`.
-    ctx.trace_ctx
-        .set_opref_concrete(result_opref, result_concrete);
-    Ok((result_opref, result_obj))
-}
-
-/// STORE dual of [`emit_namespace_cell_fold`]: `QUASIIMMUT_FIELD(ns, slot)` +
-/// elidable `jit_namespace_cell_lookup` (const-fold the cell ptr) +
-/// `setfield_gc_i(cell, raw_int)` writing `IntMutableCell.intvalue` in place.
-/// Mirrors pypy's inlined `write_cell` int arm (`typeobject.py`, the
-/// `isinstance(w_cell, IntMutableCell) and is_plain_int1(w_value)` branch):
-/// `setfield_gc(ConstPtr(cell), i_new, IntMutableCell.inst_intvalue)`.  No
-/// runtime guard on `raw_int` — the caller recovered it from a
-/// provably-plain-int JIT box (heapcache), so `is_plain_int1` folds away as it
-/// does in the optimized pypy trace.  The version watcher (the
-/// `QUASIIMMUT_FIELD` guard) still protects cell IDENTITY: reassigning the
-/// global to a non-int replaces the cell + bumps the strategy version,
-/// invalidating this loop.
-fn emit_namespace_cell_store_fold<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    ns: pyre_object::PyObjectRef,
-    slot: usize,
-    stored: pyre_object::PyObjectRef,
-    raw_int: OpRef,
-    new_int: i64,
-) -> Result<bool, DispatchError> {
-    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
-        return Ok(false);
-    }
-    // Bake the immovable cell as a `ConstPtr`, identical to the LOAD fold
-    // (`emit_namespace_cell_fold`), so this `setfield_gc_i` and the LOAD's
-    // `getfield_gc_i` canonicalise onto one trace-heapcache slot via
-    // `_unique_const_heuristic` (both `ConstPtr(cell)`, matched by
-    // `same_constant`).  An elidable-call `RefOp` cell would not be
-    // `is_constant()`, leaving the store's cache write unreachable from the
-    // load — the hot int global's cached field would go stale.
-    let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
-    // `setfield_gc(cell, raw_int, IntMutableCell.intvalue)` with the same
-    // heapcache-redundancy skip + write-through as `setfield_gc_via_heapcache`
-    // (`pyjitpl.py _opimpl_setfield_gc_any`).
-    let descr = crate::descr::int_mutable_cell_value_descr();
-    let descr_index = descr.index();
-    let is_redundant = ctx
-        .trace_ctx
-        .heapcache_getfield_cached(cell_opref, descr_index)
-        == Some(raw_int);
-    if is_redundant {
-        ctx.trace_ctx.profiler().count_ops(
-            majit_ir::OpCode::SetfieldGc,
-            majit_metainterp::counters::HEAPCACHED_OPS,
-        );
-    } else {
-        // pyjitpl.py `_opimpl_setfield_gc_any` record leg.
-        ctx.trace_ctx.profiler().count_ops(
-            majit_ir::OpCode::SetfieldGc,
-            majit_metainterp::counters::OPS,
-        );
-        ctx.trace_ctx.profiler().count_ops(
-            majit_ir::OpCode::SetfieldGc,
-            majit_metainterp::counters::RECORDED_OPS,
-        );
-        ctx.trace_ctx.record_op_with_descr(
-            majit_ir::OpCode::SetfieldGc,
-            &[cell_opref, raw_int],
-            descr,
-        );
-        ctx.trace_ctx
-            .heapcache_setfield_cached(cell_opref, descr_index, raw_int);
-        // Authoritative-executor eager store: the elided residual would have
-        // run `write_cell` concretely (`try_execute_residual_call_via_executor`),
-        // so apply the in-place `cell.intvalue` write now and journal the
-        // displaced value for the non-commit rollback
-        // ([`FBW_CELL_STORE_JOURNAL`]).  Without it the live cell keeps its
-        // pre-store value while the trace heapcache carries the new box —
-        // the next LOAD fold's cache-hit sanity check (pyjitpl.py)
-        // trips on the divergence, and the walk's remaining concrete
-        // execution reads the stale global.  The redundant arm above skips
-        // the write: `cached == raw_int` means the cell already holds this
-        // box's value (the cache is seeded from — and kept in step with —
-        // the live cell).
-        let cell = stored as *mut pyre_object::celldict::IntMutableCell;
-        fbw_cell_store_journal_push(stored, unsafe { (*cell).intvalue });
-        unsafe { (*cell).intvalue = new_int };
-    }
-    // `store_name_fn` is `CallFlavor::Plain` (can-raise); the fold replaces a
-    // SUCCESSFUL non-raising store, so mirror the residual success arm's
-    // exception clear exactly as [`emit_namespace_cell_fold`] does.
-    ctx.clear_last_exc_value();
-    Ok(true)
+) -> Result<Option<(OpRef, pyre_object::PyObjectRef)>, DispatchError> {
+    // The value half is `typeobject.py unwrap_cell`, generated.  A
+    // hand-written getfield/box here was the fold this descent replaces.
+    specialize::try_walker_orthodox_unwrap_cell(ctx, op_pc, stored)
 }
 
 /// #67 shape fix: append virtualizable data boxes so the walker merge-point

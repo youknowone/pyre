@@ -3928,7 +3928,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                         // `guard_frame_globals=false`: the receiver pin above
                         // (not a frame-globals-identity guard) proves the dict.
                         if !emit_namespace_cell_fold(
-                            ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false,
+                            ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false, true,
                         )? {
                             // Nothing was written to `dst`, so the residual
                             // still owes the load.
@@ -3976,7 +3976,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
                 ctx.trace_ctx.heap_cache_mut().replace_box(obj, expected);
             }
-            if !emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false)? {
+            if !emit_namespace_cell_fold(
+                ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false, true,
+            )? {
                 return Ok(None);
             }
             Ok(Some(()))
@@ -9468,6 +9470,186 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     call_site_label: "binary_op_call_site",
     decline_tag: "BINARY-OP-SUBWALK",
 };
+
+const WRITE_CELL_DESCENT: HelperDescent = HelperDescent {
+    path: "write_cell",
+    commit_label: "write_cell_commit",
+    call_site_label: "write_cell_call_site",
+    decline_tag: "WRITE-CELL-SUBWALK",
+};
+
+const UNWRAP_CELL_DESCENT: HelperDescent = HelperDescent {
+    path: "unwrap_cell",
+    commit_label: "unwrap_cell_commit",
+    call_site_label: "unwrap_cell_call_site",
+    decline_tag: "UNWRAP-CELL-SUBWALK",
+};
+
+/// Descend a generated cell helper (`write_cell` / `unwrap_cell`) the way
+/// [`try_walker_orthodox_descent`] enters `binary_value_from_tag`.  The
+/// IR comes from the helper's jitcode, not a hand-written getfield/setfield.
+fn descend_named_cell_helper<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    jc_index: usize,
+    ref_args: &[(OpRef, pyre_object::PyObjectRef)],
+    descent: &HelperDescent,
+) -> Result<Option<OpRef>, DispatchError> {
+    let decline = |why: &str| {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[decline-why] {}-{why} pc={op_pc}", descent.decline_tag);
+        }
+        Ok(None)
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_index) else {
+        return decline("NO-SUB-BODY");
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return decline("NO-SYM");
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return decline("SYM-NO-JITCODE");
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return decline("NESTED-ENTRY");
+    };
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    for &(operand, operand_obj) in ref_args {
+        ctx.trace_ctx.set_opref_concrete(
+            operand,
+            majit_ir::Value::Ref(majit_ir::GcRef(operand_obj as usize)),
+        );
+    }
+    let ref_oprefs: Vec<OpRef> = ref_args.iter().map(|&(opref, _)| opref).collect();
+    let ref_concretes: Vec<ConcreteValue> = ref_args
+        .iter()
+        .map(|&(_, obj)| ConcreteValue::Ref(obj))
+        .collect();
+    let exc_before_subwalk = ctx.last_exc_value();
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        descent.commit_label,
+        descent.call_site_label,
+        &[],
+        &[],
+        &ref_oprefs,
+        &ref_concretes,
+        &[],
+    );
+    let (walk_outcome, _walk_start) = match walk {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] {} pc={pc}", descent.decline_tag);
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Ok(pair) => pair,
+        Err(error) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[decline-why] {}-ERR pc={op_pc} error={}",
+                    descent.decline_tag,
+                    error.variant_name()
+                );
+            }
+            return Err(error);
+        }
+    };
+    let result =
+        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk) {
+            DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+                .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+            raised @ DispatchOutcome::SubRaise { .. } => {
+                let _ = raised;
+                return Ok(None);
+            }
+            _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+        };
+    Ok(Some(result))
+}
+
+/// Walk `unwrap_cell` and return the unwrapped value's operand.
+pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    stored: pyre_object::PyObjectRef,
+) -> Result<Option<(OpRef, pyre_object::PyObjectRef)>, DispatchError> {
+    if stored.is_null() {
+        return Ok(None);
+    }
+    let Some(jc) = crate::jitcode_runtime::unwrap_cell_jitcode() else {
+        return Ok(None);
+    };
+    let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
+    let Some(result) = descend_named_cell_helper(
+        ctx,
+        op_pc,
+        jc.index(),
+        &[(cell_opref, stored)],
+        &UNWRAP_CELL_DESCENT,
+    )?
+    else {
+        return Ok(None);
+    };
+    let result_obj = unsafe { pyre_object::celldict::unwrap_cell(stored) };
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+    );
+    Ok(Some((result, result_obj)))
+}
+
+/// Walk `write_cell` for an in-place cell store.  Applies the helper
+/// afterwards so the walk's remaining concrete reads see the write and
+/// `mark_prebuilt_roots_dirty` runs (`celldict::write_cell`).
+pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    _ns: pyre_object::PyObjectRef,
+    stored: pyre_object::PyObjectRef,
+    value_opref: OpRef,
+    new_value: pyre_object::PyObjectRef,
+) -> Result<bool, DispatchError> {
+    if stored.is_null() || new_value.is_null() {
+        return Ok(false);
+    }
+    let Some(jc) = crate::jitcode_runtime::write_cell_jitcode() else {
+        return Ok(false);
+    };
+    let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
+    if descend_named_cell_helper(
+        ctx,
+        op_pc,
+        jc.index(),
+        &[(cell_opref, stored), (value_opref, new_value)],
+        &WRITE_CELL_DESCENT,
+    )?
+    .is_none()
+    {
+        return Ok(false);
+    }
+    if unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+        let cell = stored as *const pyre_object::celldict::IntMutableCell;
+        fbw_cell_store_journal_push(stored, unsafe { (*cell).intvalue });
+    } else if unsafe { pyre_object::celldict::is_object_mutable_cell(stored) } {
+        let cell = stored as *const pyre_object::celldict::ObjectMutableCell;
+        fbw_obj_cell_store_journal_push(stored, unsafe { (*cell).w_value });
+    }
+    let replaced = unsafe { pyre_object::celldict::write_cell(Some(stored), new_value) };
+    if replaced.is_some() {
+        return Ok(false);
+    }
+    ctx.clear_last_exc_value();
+    Ok(true)
+}
 
 pub(crate) fn binary_value_from_tag_jitcode()
 -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
@@ -22106,7 +22288,7 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
             None => return Ok(false),
         }
     };
-    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name)? {
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name, true)? {
         return Ok(true);
     }
 
@@ -22234,7 +22416,9 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
         } else if ctx.trace_ctx.const_value(live_builtin) != Some(w_builtin as i64) {
             return Ok(false);
         }
-        return emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false);
+        return emit_namespace_cell_fold(
+            ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false, true,
+        );
     }
 
     if !matches!(
@@ -22438,6 +22622,7 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
         b_slot,
         b_stored,
         false,
+        true,
     )? {
         return Ok(false);
     }
@@ -22490,7 +22675,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name)? {
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name, true)? {
         return Ok(true);
     }
     emit_builtins_cell_fold(
@@ -22504,16 +22689,9 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     )
 }
 
-/// StoreName/StoreGlobal cell fold — module-scope store dual of
-/// [`try_walker_load_name_cell_fold`].  Folds `i = <int>` on a hot module
-/// global whose slot has stabilised to an `IntMutableCell` (the in-place
-/// shape `write_cell` reaches after the 2nd int store) to a single
-/// `setfield_gc_i(cell, intvalue)`, eliding the value boxing + residual dict
-/// setitem.  Declines (→ residual `bh_store_name_fn`, which runs the full
-/// `write_cell`) when the frame is non-module, the slot is not an immovable
-/// `IntMutableCell`, or the value is not a provably-plain-int box (bool /
-/// int-subclass / long / object all fall through — `write_cell` REPLACES the
-/// cell + bumps the version for those, which the setfield fast path must not).
+/// StoreName/StoreGlobal: descend `typeobject.py write_cell` for an
+/// in-place cell.  A replacing write (new cell, version bump) stays on
+/// the residual so `mutated()` still runs.
 pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -22531,12 +22709,8 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // STORE_NAME writes `get_or_create_w_locals`, so only a module frame —
-    // where `w_locals` aliases `w_globals` — targets the dict this folds.  An
-    // ABSENT `w_locals` does NOT stand in for globals on the write path (unlike
-    // the LOAD fold): the store would land in a fresh locals mapping while the
-    // fold set the module cell.  STORE_GLOBAL names globals outright, and its
-    // frame is a function frame whose `w_locals` is legitimately null, so the
-    // gate must not apply to it.
+    // where `w_locals` aliases `w_globals` — targets this dict.  STORE_GLOBAL
+    // names globals outright; its frame may have a null `w_locals`.
     if helper == majit_ir::RuntimeHelperKind::StoreName {
         let w_locals = frame.get_w_locals();
         if !std::ptr::eq(w_locals, w_globals) {
@@ -22546,76 +22720,36 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    // Slot must hold an immovable `IntMutableCell`.  `can_move` gates the same
-    // baked-address relocation hazard as the LOAD fold; mutable cells are
-    // `malloc_typed` (never nursery) so a stabilised int global folds.
     let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) else {
         return Ok(false);
     };
     let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) else {
         return Ok(false);
     };
-    if stored.is_null() || !unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
+    if stored.is_null() {
         return Ok(false);
     }
     if majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
         return Ok(false);
     }
-    // The stored value must be a provably-plain-int box. `is_plain_int1` accepts
-    // a fits-int `W_LongObject`, whose `write_cell` REPLACES the cell rather than
-    // mutating `intvalue`, so exclude `long` explicitly; the remaining int box's
-    // raw `intvalue` (populated only by JIT int boxes, `emit_box_int_inline`) is
-    // recovered by the heapcache lookup, so the setfield needs no runtime class
-    // guard — exactly as pypy's optimized trace folds the `is_plain_int1` check
-    // away for an `int_add` result. (bool / int-subclass are already excluded by
-    // `is_plain_int1`.)
-    let is_plain_int = matches!(
-        ctx.trace_ctx.box_value(value_opref),
-        Some(majit_ir::Value::Ref(majit_ir::GcRef(p)))
-            if p != 0
-                && unsafe { pyre_object::listobject::is_plain_int1(p as pyre_object::PyObjectRef) }
-                && !unsafe { pyre_object::is_long(p as pyre_object::PyObjectRef) }
-    );
-    if !is_plain_int {
+    let Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) = ctx.trace_ctx.box_value(value_opref)
+    else {
+        return Ok(false);
+    };
+    if p == 0 {
         return Ok(false);
     }
-    // A bridge walk resets the heapcache, or leaves a getfield whose
-    // raw int has no `box_value`.  The boxed int is still a concrete
-    // exact int (`is_plain_int` above); stamp the raw from that box
-    // instead of residualizing `bh_store_name`
-    // (`inline_multiframe_branchy_carrier` odd arm).
-    let cached = ctx
-        .trace_ctx
-        .heapcache_getfield_cached(value_opref, crate::descr::int_intval_descr().index());
-    let raw_int = match cached {
-        Some(raw) if matches!(ctx.trace_ctx.box_value(raw), Some(majit_ir::Value::Int(_))) => raw,
-        cached => {
-            let raw = match cached {
-                Some(raw) => raw,
-                None => {
-                    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                    walker_unbox_int(ctx, op_pc, value_opref, int_type_addr)?
-                }
-            };
-            if !matches!(ctx.trace_ctx.box_value(raw), Some(majit_ir::Value::Int(_))) {
-                if let Some(majit_ir::Value::Ref(majit_ir::GcRef(p))) =
-                    ctx.trace_ctx.box_value(value_opref)
-                {
-                    if p != 0 {
-                        let v =
-                            unsafe { pyre_object::w_int_get_value(p as pyre_object::PyObjectRef) };
-                        ctx.trace_ctx
-                            .set_opref_concrete(raw, majit_ir::Value::Int(v));
-                    }
-                }
-            }
-            raw
-        }
+    let new_value = p as pyre_object::PyObjectRef;
+    // In-place arms only.  An `IntMutableCell` plus a non-plain-int
+    // replaces the cell and must bump `version?` (`write_cell`).
+    let in_place = unsafe {
+        pyre_object::celldict::is_object_mutable_cell(stored)
+            || (pyre_object::celldict::is_int_mutable_cell(stored)
+                && pyre_object::listobject::is_plain_int1(new_value)
+                && !pyre_object::is_long(new_value))
     };
-    // The eager concrete write needs the raw int the store applies; a
-    // raw-int box with no concrete shadow declines to the residual.
-    let Some(majit_ir::Value::Int(new_int)) = ctx.trace_ctx.box_value(raw_int) else {
+    if !in_place {
         return Ok(false);
-    };
-    emit_namespace_cell_store_fold(ctx, op_pc, w_globals, slot, stored, raw_int, new_int)
+    }
+    try_walker_orthodox_write_cell(ctx, op_pc, w_globals, stored, value_opref, new_value)
 }

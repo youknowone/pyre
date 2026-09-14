@@ -1414,12 +1414,7 @@ pub fn jitcode_pc_raise_keeps_existing_traceback(jitcode_index: i32, offset: i32
 }
 
 /// Whether the source function behind `jitcode_index` carries a Python
-/// `try`/`except` handler, read from `co_exceptiontable` (`pycode.py:145`) —
-/// the same table the codewriter's `decode_exception_catch_sites` builds its
-/// `catch_for_pc` map from.
-///
-/// `None` when the index resolves to no `CodeObject`: a native drain portal
-/// carries a null `code_ptr`.
+/// `try`/`except` handler, read from `co_exceptiontable`.
 pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> {
     let raw_code = raw_code_for_jitcode_index(jitcode_index)?;
     Some(!unsafe { &*raw_code }.exceptiontable.is_empty())

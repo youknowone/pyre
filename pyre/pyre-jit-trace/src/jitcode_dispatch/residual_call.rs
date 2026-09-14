@@ -7192,12 +7192,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Err(e);
     }
 
-    // StoreName/StoreGlobal IntMutableCell in-place store fold: module-scope
-    // dual of the LoadName/LoadGlobal cell fold.  Fires when the target slot
-    // holds a stabilised immovable `IntMutableCell` and the store value is a
-    // provably-plain-int box; emits `QUASIIMMUT_FIELD` + `setfield_gc_i(cell,
-    // intvalue)`, eliding the boxing + residual dict setitem.  Carries the
-    // LoadName fold's handler-free gate, for the reason recorded there.
+    // StoreName/StoreGlobal: descend `typeobject.py write_cell` for an
+    // in-place cell.  A replacing write still forces `version?` below.
     //
     // Two staleness bugs were fixed before enabling this unconditionally:
     // (1) the fold now eagerly applies the concrete
@@ -8918,35 +8914,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
 
-    // The handler-free gate is NOT the raise argument the LoadGlobal fold above
-    // rebuts.  That argument transfers cleanly: both folds lower through
-    // `emit_namespace_cell_fold`, which fires only on a name already PRESENT in
-    // the module dict and watches that slot with `QUASIIMMUT_FIELD` +
-    // `GUARD_NOT_INVALIDATED`, so a rebind or a delete fails the loop instead of
-    // reaching a NameError, and a successful fold provably cannot raise.
-    //
-    // The gate stands on compile behaviour, not on correctness.  The fold
-    // INSTALLS the module dict's `version?` watcher, and that watcher is what
-    // makes a later bumping write in the same program abandon the walk with
-    // `ForceQuasiImmutable` — so lifting the gate multiplies those aborts in
-    // handler-bearing module bodies.  The three wrong-code shapes that used to
-    // ride on that (a dropped FOR_ITER iteration in
-    // `pickle_terminal_raise_resume`, and the two double-applies in
-    // `iter57/real_exception` and `exception_reentry_guard_finally_residual`)
-    // are closed: the first no longer reproduces, and the other two were the
-    // stale `abort_in_subwalk` this file now stamps at its own qmut raise plus
-    // the live-NULL mirror slot `reseed_vstack_from_shadow` now accepts.  With
-    // the gate lifted the whole `bench/synth` corpus is output-correct; what
-    // still fails is `exception_reraise_tb_depth_jitstress` at 13.0x against
-    // its 4x pypy gate, and four benches' jit-stats move (most visibly
-    // `exception_reraise_tb_depth_hot`, `loops_aborted 0 -> 63`).
-    //
-    // The gate is whole-body, so one `try` anywhere in a module also charges
-    // every name access in it a live dict lookup (~83ns each, linear in the
-    // count).  Measured on a 200k-iteration
-    // `bench/synth/exc_info_module_loop_hot`, folding it is worth 1.87us ->
-    // 1.32us per iteration; at the fixture's own 3000 iterations the difference
-    // sits under this box's noise floor.
+    // LoadName: descend `typeobject.py unwrap_cell` for a name already
+    // in the module dict.  A later `DELETE_NAME` (`except as`) still
+    // forces `version?` (`opimpl_jit_force_quasi_immutable` →
+    // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
         && !walk_body_has_exception_handler(ctx, code)

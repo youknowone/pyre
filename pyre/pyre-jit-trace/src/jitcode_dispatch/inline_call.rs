@@ -7044,7 +7044,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             {
                 return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
             }
-            let (value_op, _) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)?;
+            let Some((value_op, _)) = emit_namespace_cell_value(ctx, op.pc, kwonly.stored)? else {
+                return Err(DispatchError::KwonlyDefaultsMappingRacedRecord { pc: op.pc });
+            };
             callee_args[nparams + offset] = value_op;
         }
     }

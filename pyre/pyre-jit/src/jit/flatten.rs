@@ -4420,9 +4420,8 @@ where
         frame_operand,
         name_operand,
         CallFlavor::Plain,
-        // Tag so the full-body walker can try the module-scope cell fold
-        // (`try_walker_load_name_cell_fold`); the fold falls through to this
-        // residual for non-module frames (`w_locals` set).
+        // Tag so the full-body walker can descend `unwrap_cell`
+        // (`try_walker_load_name_cell_fold`); non-module frames stay residual.
         majit_ir::RuntimeHelperKind::LoadName,
         dst_reg,
     ))
@@ -4463,10 +4462,8 @@ where
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
         true,
-        // Tag so the full-body walker can try the module-scope IntMutableCell
-        // in-place store fold (`try_walker_store_name_cell_fold`); the fold
-        // falls through to this residual for non-module frames / non-int
-        // values / non-cell slots.
+        // Tag so the full-body walker can descend `write_cell`
+        // (`try_walker_store_name_cell_fold`); replacing writes stay residual.
         majit_ir::RuntimeHelperKind::StoreName,
     ))
 }
