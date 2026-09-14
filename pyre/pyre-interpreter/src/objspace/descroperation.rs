@@ -1617,12 +1617,71 @@ unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
     a_num && b_num && (is_float(a) || is_float(b))
 }
 
+/// floatobject.py `descr_add` / `descr_sub` / `descr_mul` / `descr_div`
+/// after `_to_float`: `W_FloatObject(self.floatval ? w_rhs.floatval)`.
+/// Charon cannot inline the cross-crate `newfloat`, so the constructor
+/// body lives in each leaf the way it lives in [`_truediv`].
+#[inline(never)]
+pub(crate) fn _float_add(x: f64, y: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x + y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+#[inline(never)]
+pub(crate) fn _float_sub(x: f64, y: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x - y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+#[inline(never)]
+pub(crate) fn _float_mul(x: f64, y: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x * y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+#[inline(never)]
+pub(crate) fn _float_truediv(x: f64, y: f64) -> PyResult {
+    if y == 0.0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x / y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
 unsafe fn float_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = as_float(a);
     reject_float_coercion_overflow(a, va)?;
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    Ok(w_float_new(va + vb))
+    _float_add(va, vb)
 }
 
 unsafe fn float_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1630,7 +1689,7 @@ unsafe fn float_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     reject_float_coercion_overflow(a, va)?;
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    Ok(w_float_new(va - vb))
+    _float_sub(va, vb)
 }
 
 unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1638,18 +1697,15 @@ unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     reject_float_coercion_overflow(a, va)?;
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    Ok(w_float_new(va * vb))
+    _float_mul(va, vb)
 }
 
 unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    if vb == 0.0 {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
     let va = as_float(a);
     reject_float_coercion_overflow(a, va)?;
-    Ok(w_float_new(va / vb))
+    _float_truediv(va, vb)
 }
 
 /// floatobject.py: descr_floordiv → _divmod_w()[0].
@@ -2631,6 +2687,38 @@ fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
         CompareOp::Ge => b1.ge(b2),
         CompareOp::Eq | CompareOp::Ne => unreachable!("handled above"),
     }
+}
+
+/// floatobject.py `_compare` after `_to_float` for two floats:
+/// `space.newbool(self.floatval ? w_other.floatval)`.
+#[inline(never)]
+pub(crate) fn _float_lt(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x < y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_le(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x <= y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_gt(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x > y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_ge(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x >= y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_eq(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x == y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_ne(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x != y))
 }
 
 /// floatobject.py `_compare` — the float side of a numeric
@@ -5862,8 +5950,12 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // The machine-int arm stands alone so that this function has no loop:
     // the codewriter looks inside a loop-free graph only
     // (`policy.py look_inside_graph`), and a traced `int < int` must reach
-    // `int_lt` through here.  Every other layout's comparison, several of
-    // which iterate, lives in [`compare_slot_rest`], a residual on the trace.
+    // `int_lt` through here.  Exact float/float is the same shape
+    // (`_float_lt` after `_to_float`) and must live here too, or the
+    // leaf is only reachable from [`compare_slot_rest`] and never
+    // becomes a jitcode.  Every other layout's comparison, several of
+    // which iterate, lives in [`compare_slot_rest`], a residual on the
+    // trace.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -5873,6 +5965,18 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ge => int_ge(a, b),
                 CompareOp::Eq => int_eq(a, b),
                 CompareOp::Ne => int_ne(a, b),
+            };
+        }
+        if is_float(a) && is_float(b) {
+            let x = w_float_get_value(a);
+            let y = w_float_get_value(b);
+            return match op {
+                CompareOp::Lt => _float_lt(x, y),
+                CompareOp::Le => _float_le(x, y),
+                CompareOp::Gt => _float_gt(x, y),
+                CompareOp::Ge => _float_ge(x, y),
+                CompareOp::Eq => _float_eq(x, y),
+                CompareOp::Ne => _float_ne(x, y),
             };
         }
     }
@@ -5938,6 +6042,9 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             }));
         }
         if is_float_pair(a, b) {
+            // Exact float/float already returned from [`compare_slot`].
+            // Mixed int/long keeps `float_compare` for the mantissa / bigint
+            // arm (`int_between(-1, i2 >> 48, 1)`).
             // `_compare` is a method on the float operand; the int-left order
             // reaches it through the reflected comparison, with the relation
             // reversed.
@@ -6487,6 +6594,36 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
     PyError::type_error(format!("bad operand type for {descr}: '{type_name}'"))
 }
 
+/// intobject.py `descr_neg` after `ovfcheck(-a)`: `wrapint(-a)`.
+/// `INT_MIN` stays in [`neg_inner`]'s ovf2long arm so this graph has
+/// no overflow diamond.
+#[inline(never)]
+pub(crate) fn _int_neg(x: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        // `0 - x`, not `wrapping_neg`: Charon leaves the rustc intrinsic
+        // as `residual_call_ir_i`, while subtraction is `int_sub`.
+        intval: 0i64.wrapping_sub(x),
+    }) as PyObjectRef)
+}
+
+/// floatobject.py `descr_neg`: `W_FloatObject(-self.floatval)`.
+#[inline(never)]
+pub(crate) fn _float_neg(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: -x,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
 /// Unary negation.
 ///
 /// `inline(never)` is load-bearing: rustc otherwise folds this body into its
@@ -6522,7 +6659,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
             return match v.checked_neg() {
-                Some(r) => Ok(w_int_new(r)),
+                Some(_) => _int_neg(v),
                 None => Ok(pyre_object::longobject::w_long_new_fresh_rbigint_handle(
                     bigint_neg(&BigInt::from(v)),
                 )),
@@ -6534,7 +6671,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
             ));
         }
         if is_float(a) {
-            return Ok(w_float_new(-w_float_get_value(a)));
+            return _float_neg(w_float_get_value(a));
         }
         if is_complex(a) {
             return complex_neg(a);

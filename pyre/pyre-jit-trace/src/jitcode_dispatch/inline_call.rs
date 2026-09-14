@@ -14157,6 +14157,11 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(outcome) = spec_gate(SpecFold::UnaryNeg, || {
+            super::specialize::try_walker_orthodox_unary_neg(ctx, op.pc, &args, dst, dst_bank)
+        })? {
+            return Ok((outcome, op.next_pc));
+        }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::UnaryNeg, || {
