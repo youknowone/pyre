@@ -1025,7 +1025,19 @@ impl RegisterManager {
             !longevity.contains(v) || longevity.get(v).unwrap().last_usage <= self.position;
         if should_free {
             if let Some(reg) = self.reg_bindings_get(v, longevity) {
-                self.free_regs.push(reg);
+                // Duplicate rd_locs can leave two liveboxes on one physical
+                // register. Free the register only when no other still-live
+                // box still names it; otherwise loc() of the alias would
+                // read a later occupant.
+                let idx = self._register_index(reg) as i32;
+                let shared_still_live = longevity.lifetimes_iter().any(|(other, lt)| {
+                    *other != v
+                        && lt.current_register_index == idx
+                        && lt.last_usage > self.position
+                });
+                if !shared_still_live {
+                    self.free_regs.push(reg);
+                }
                 self.reg_bindings_del(v, longevity);
             }
             if self.box_currently_in_frame_reg == Some(v) {
