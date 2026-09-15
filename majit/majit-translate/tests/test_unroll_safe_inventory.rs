@@ -254,10 +254,7 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `exception_reraise_tb_depth_jitstress` at N=200 stayed under its
     // 4x pypy gate on dynasm/cranelift/wasm, and the three-backend
     // snapshot was re-recorded.
-    (
-        "dropvaluesuntil",
-        "pyframe.py dropvaluesuntil",
-    ),
+    ("dropvaluesuntil", "pyframe.py dropvaluesuntil"),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`
