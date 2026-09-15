@@ -16795,10 +16795,14 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
                 (cb.drain_backend_jit_exc)();
             }
             walker_record_guard_exception(ctx, op.pc);
-            Ok(Some(DispatchOutcome::SubRaise {
-                exc: raised,
-                exc_concrete: ConcreteValue::Ref(exc),
-            }))
+            // `handle_possible_exception` / residual_call: the live
+            // `GuardException` result replaces the pre-guard constant when
+            // `class_of_last_exc_is_const` was false.
+            let exc = ctx
+                .last_exc_value()
+                .expect("walker_record_guard_exception seeds last_exc_value");
+            let exc_concrete = ctx.last_exc_value_concrete();
+            Ok(Some(DispatchOutcome::SubRaise { exc, exc_concrete }))
         }
         Ok(None) => Ok(None),
     }
