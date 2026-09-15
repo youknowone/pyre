@@ -260,15 +260,23 @@ pub extern "C" fn jit_ll_arraycopy(
         ) as usize
     };
     let dest_address = follow(dest_slot);
+    let source_address = follow(source_slot);
     let fallback = majit_gc::GcVarSizeLayout {
         base_size: ITEMS_BLOCK_TOKEN.base_size,
         item_size: ITEMS_BLOCK_TOKEN.item_size,
         items_have_gc_ptrs: true,
     };
     let dest_layout = majit_gc::gc_varsize_layout(dest_address).unwrap_or(fallback);
+    let source_layout = majit_gc::gc_varsize_layout(source_address).unwrap_or(fallback);
+    // rgc.py `ll_arraycopy`: `assert TP == typeOf(dest).TO`.
+    assert!(
+        source_layout.item_size == dest_layout.item_size
+            && source_layout.items_have_gc_ptrs == dest_layout.items_have_gc_ptrs,
+        "ll_arraycopy source and dest must have the same item layout"
+    );
     let source_offset = (source_start as usize)
-        .checked_mul(dest_layout.item_size)
-        .and_then(|offset| dest_layout.base_size.checked_add(offset))
+        .checked_mul(source_layout.item_size)
+        .and_then(|offset| source_layout.base_size.checked_add(offset))
         .expect("ll_arraycopy source address overflow");
     let dest_offset = (dest_start as usize)
         .checked_mul(dest_layout.item_size)
