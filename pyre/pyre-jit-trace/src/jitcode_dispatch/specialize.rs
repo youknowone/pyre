@@ -16590,10 +16590,11 @@ extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
 /// and `GuardValue`s the module observed at record time.  A replaced or
 /// deleted entry side-exits to the original `IMPORT_NAME`.
 ///
-/// A non-empty fromlist is accepted only when the cached module is not a
-/// package (`__path__` missing), matching `interp___import__`.  Relative
-/// imports, a non-zero level, a rebound `__import__`, or a cache miss decline
-/// (SAFE).
+/// A non-empty fromlist is declined: `interp___import__` rechecks
+/// `__path__` on every call and may run `_handle_fromlist`.  Baking the
+/// trace-time "not a package" answer would miss a later `__path__`.
+/// Relative imports, a non-zero level, a rebound `__import__`, or a
+/// cache miss also decline (SAFE).
 pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -16664,19 +16665,14 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     let fromlist_empty = w_fromlist.is_null()
         || unsafe { pyre_object::is_none(w_fromlist) }
         || unsafe { pyre_object::w_tuple_len(w_fromlist) == 0 };
+    if !fromlist_empty {
+        return Ok(None);
+    }
     let w_mod = jit_import_cached(w_name as i64, i64::from(fromlist_empty));
     if w_mod == 0 {
         return Ok(None);
     }
     let w_mod = w_mod as pyre_object::PyObjectRef;
-    if !fromlist_empty {
-        // Package fromlist goes through `_handle_fromlist`.  A non-package
-        // answers the module itself (`interp___import__`).
-        match pyre_interpreter::baseobjspace::findattr_result(w_mod, "__path__") {
-            Ok(None) => {}
-            _ => return Ok(None),
-        }
-    }
 
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
