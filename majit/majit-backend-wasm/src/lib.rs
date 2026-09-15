@@ -2627,21 +2627,28 @@ impl PendingInline {
 #[cfg(target_arch = "wasm32")]
 impl PendingInline {
     fn set_dispatch_withdrawn(&self, withdrawn: bool) {
+<<<<<<< HEAD
+        // The trip helper runs in the guest. Do not expect/index: a
+        // missing owner or out-of-range fail index must leave
+        // must_compile alone rather than abort the loop.
         let Some(owner) = self.owner() else {
             return;
         };
-        let source = compiled_wasm_loop(&owner).expect("pending inline owner must be compiled");
+        let Some(source) = compiled_wasm_loop(&owner) else {
+            return;
+        };
         let guards = source.fail_descrs.borrow();
-        let guard = &guards[self.region.source_fail_index as usize];
+        let Some(guard) = guards.get(self.region.source_fail_index as usize) else {
+            return;
+        };
         // get_latest_descr_arc returns the canonical metainterp descriptor,
         // not this backend wrapper. Backend-only synthetic guards have no
         // metainterp hotness state to suppress.
         if let Some(meta) = &guard.meta_descr
             && (meta.is_resume_guard() || meta.is_resume_guard_copied())
+            && let Some(fail) = meta.as_fail_descr()
         {
-            meta.as_fail_descr()
-                .expect("resume guard")
-                .set_wasm_dispatch_withdrawn(withdrawn);
+            fail.set_wasm_dispatch_withdrawn(withdrawn);
         }
     }
 }
