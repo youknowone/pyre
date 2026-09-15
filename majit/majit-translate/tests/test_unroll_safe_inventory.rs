@@ -255,6 +255,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // 4x pypy gate on dynasm/cranelift/wasm, and the three-backend
     // snapshot was re-recorded.
     ("dropvaluesuntil", "pyframe.py dropvaluesuntil"),
+    // `executioncontext.py run_trace_func` is `@jit.unroll_safe`.
+    // Loop-free, so `look_inside_graph` already admits it; the hint is
+    // the upstream decorator, not a descent-scope change.
+    ("run_trace_func", "executioncontext.py run_trace_func"),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`
