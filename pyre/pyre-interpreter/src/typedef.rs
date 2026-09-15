@@ -10650,9 +10650,7 @@ fn slice_method_indices(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let roots = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(self_);
-    let _ = pyre_object::gc_roots::pin_root(args[1]);
+    let roots = pyre_object::gc_roots::pin_roots(&[self_, args[1]]);
     // sliceobject.py app-level `indices`: unlike the machine-word
     // `indices3()` used by concrete sequence operations, this rarely-used
     // public method deliberately keeps start/stop/step/length unbounded.
@@ -25976,7 +25974,7 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             "argument for decode() given by name ('encoding') and position (1)",
         ));
     }
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) }.to_vec();
     let w_encoding = pos
         .get(1)
         .copied()
@@ -26004,17 +26002,22 @@ pub(crate) fn bytes_method_decode(args: &[PyObjectRef]) -> Result<PyObjectRef, c
             "decode() argument 'errors' must be str, not {tn}",
         )));
     }
-    // `str_utf8_w` hands back the string object's own buffer, and both
-    // objects stay rooted for the call, so neither name needs a copy.
+    // Copy encoding/errors and the payload off the objects before the
+    // decoder allocates. Do not pin here: leftover-17's pin set on this
+    // path broke JIT startpoints.
     let encoding = match w_encoding {
-        Some(e) if unsafe { pyre_object::is_str(e) } => crate::baseobjspace::str_utf8_w(e)?,
-        _ => "utf-8",
+        Some(e) if unsafe { pyre_object::is_str(e) } => {
+            crate::baseobjspace::str_utf8_w(e)?.to_string()
+        }
+        _ => "utf-8".to_string(),
     };
     let errors = match w_errors {
-        Some(e) if unsafe { pyre_object::is_str(e) } => crate::baseobjspace::str_utf8_w(e)?,
-        _ => "strict",
+        Some(e) if unsafe { pyre_object::is_str(e) } => {
+            crate::baseobjspace::str_utf8_w(e)?.to_string()
+        }
+        _ => "strict".to_string(),
     };
-    let s = decode_bytes_to_wtf8(data, encoding, errors)?;
+    let s = decode_bytes_to_wtf8(&data, &encoding, &errors)?;
     Ok(pyre_object::w_str_from_wtf8_managed(s))
 }
 
@@ -28547,14 +28550,16 @@ pub(crate) fn set_method_difference(
         return Ok(pyre_object::w_set_new());
     }
     // The copy has no referrer yet and the update below drains each operand
-    // through Python, so it needs the same lifetime pin the intersection
-    // accumulator takes.  A set never moves, so one pin is the whole fix and
-    // the word stays usable as it stands.
+    // through Python. Publish the receiver and every operand first so the
+    // copy cannot move a tail argument.
     let _roots = pyre_object::gc_roots::push_roots();
-    let result = set_copy_real(args[0]);
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let result = set_copy_real(pyre_object::gc_roots::shadow_stack_get(base));
     let result = pyre_object::gc_roots::pin_root(result);
     let mut update_args: Vec<pyre_object::PyObjectRef> = vec![result];
-    update_args.extend_from_slice(&args[1..]);
+    for i in 1..args.len() {
+        update_args.push(pyre_object::gc_roots::shadow_stack_get(base + i));
+    }
     set_method_difference_update(&update_args)?;
     Ok(result)
 }
@@ -28592,7 +28597,7 @@ pub(crate) fn set_method_symmetric_difference(
     )?;
     let w_new = pyre_object::gc_roots::pin_root(w_new);
     unsafe {
-        if pyre_object::is_frozenset(args[0]) {
+        if pyre_object::is_frozenset(pyre_object::gc_roots::shadow_stack_get(receiver_slot)) {
             let w_frozenset = pyre_object::w_frozenset_new();
             let w_frozenset = pyre_object::gc_roots::pin_root(w_frozenset);
             pyre_object::w_set_copy_storage_from(w_frozenset, w_new);

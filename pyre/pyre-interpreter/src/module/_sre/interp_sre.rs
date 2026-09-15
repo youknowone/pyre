@@ -1924,18 +1924,26 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_receiver(args)?;
     let n = unsafe { (*m).spans_len };
-    let mut regs = pyre_object::gc_roots::RootedItems::new();
+    // Each pair tuple is a nursery object and the next mint can collect,
+    // so every field and pair sits on one bracket. Pin the ints one at a
+    // time: `pin_roots(&[w_int_new(a), w_int_new(b)])` evaluates both
+    // constructors before any slot is published.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut pair_slots = Vec::with_capacity(n);
     for gi in 0..n {
         let (start, end) = unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
-        let pair = {
-            let mut fields = pyre_object::gc_roots::RootedItems::new();
-            fields.push(w_int_new(start));
-            fields.push(w_int_new(end));
-            w_tuple_new(fields.take())
-        };
-        regs.push(pair);
+        let start_obj = pyre_object::gc_roots::pin_root(w_int_new(start));
+        let end_obj = pyre_object::gc_roots::pin_root(w_int_new(end));
+        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![start_obj, end_obj]));
+        pair_slots.push(pair_slot);
     }
-    Ok(w_tuple_new(regs.take()))
+    Ok(w_tuple_new(
+        pair_slots
+            .into_iter()
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .collect(),
+    ))
 }
 
 /// `start_w` (interp_sre.py).

@@ -857,17 +857,20 @@ pub fn list_method_sort(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // to be pinned before the call and reloaded after, as `tuple_method_index`
     // does around `eq_w`.  `w_none` stands in when no key was given, keeping the
     // two roots adjacent so one base covers both.
+    let key_obj = crate::builtins::kwarg_get(kwargs, "key").unwrap_or_else(w_none);
+    let reverse_obj = crate::builtins::kwarg_get(kwargs, "reverse");
     let _roots = pyre_object::gc_roots::push_roots();
-    let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let _ = pyre_object::gc_roots::pin_root(
-        crate::builtins::kwarg_get(kwargs, "key").unwrap_or_else(w_none),
-    );
+    let list_slot = if let Some(reverse_obj) = reverse_obj {
+        pyre_object::gc_roots::pin_roots(&[args[0], key_obj, reverse_obj])
+    } else {
+        pyre_object::gc_roots::pin_roots(&[args[0], key_obj])
+    };
 
-    let reverse = crate::builtins::kwarg_get(kwargs, "reverse")
-        .map(crate::baseobjspace::is_true)
-        .transpose()?
-        .unwrap_or(false);
+    let reverse = if reverse_obj.is_some() {
+        crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(list_slot + 2))?
+    } else {
+        false
+    };
 
     let key_arg = pyre_object::gc_roots::shadow_stack_get(list_slot + 1);
     let key_fn = unsafe { !pyre_object::is_none(key_arg) }.then_some(key_arg);
@@ -887,26 +890,28 @@ pub fn list_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // first, and that call is what folds the negative bounds; the two halves
     // are called separately below so the length can be read after the
     // coercion instead.
-    let w_start = if args.len() >= 3 {
+    // An `__index__` on start/stop allocates and may move the list, the
+    // search value, or the other bound. Publish the four words first so
+    // no constructor runs before the live operands are visible.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::publish_roots(&[list, value]);
+    let start_obj = if args.len() >= 3 {
         args[2]
     } else {
         w_int_new(0)
     };
-    let w_stop = if args.len() >= 4 {
+    let _ = pyre_object::gc_roots::publish_roots(&[start_obj]);
+    let stop_obj = if args.len() >= 4 {
         args[3]
     } else {
         w_int_new(i64::MAX)
     };
-    // An `__index__` on start/stop allocates and may move the list or the
-    // search value across a minor collection.  `w_list_find_or_count` pins
-    // both for its own `eq_w` loop, but it pins whatever address it is
-    // handed, so that scope cannot cover this window — root them here and
-    // reload after the coercion.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(list);
-    let _ = pyre_object::gc_roots::pin_root(value);
-    let (raw_start, raw_stop) = crate::sliceobject::index_bounds_not_none(w_start, w_stop)?;
+    let _ = pyre_object::gc_roots::publish_roots(&[stop_obj]);
+    pyre_object::gc_roots::normalize_roots(sp, 4);
+    let (raw_start, raw_stop) = crate::sliceobject::index_bounds_not_none(
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
+        pyre_object::gc_roots::shadow_stack_get(sp + 3),
+    )?;
     let list = pyre_object::gc_roots::shadow_stack_get(sp);
     let value = pyre_object::gc_roots::shadow_stack_get(sp + 1);
     // The length that folds a negative bound is read after the bounds have
@@ -1338,9 +1343,7 @@ pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `__getitem__`.
 pub fn str_method_format_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "format_map", 1)?;
-    let fmt = args[0];
-    let mapping = args[1];
-    str_method_format_core(fmt, &[], None, Some(mapping))
+    str_method_format_core(args[0], &[], None, Some(args[1]))
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject._strip` —
@@ -1390,37 +1393,42 @@ fn extract_strip_chars(arg: PyObjectRef, fn_name: &str) -> Result<Option<Wtf8Buf
     )))
 }
 
-pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "strip")?;
-    arity_at_most(args, "strip", 1)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let chars = match args.get(1) {
-        Some(&a) => extract_strip_chars(a, "strip")?,
-        None => None,
+fn str_strip_impl(
+    args: &[PyObjectRef],
+    method: &str,
+    left: bool,
+    right: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    require_receiver(args, method)?;
+    arity_at_most(args, method, 1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::pin_roots(args);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let chars = if args.len() > 1 {
+        extract_strip_chars(
+            pyre_object::gc_roots::shadow_stack_get(recv_slot + 1),
+            method,
+        )?
+    } else {
+        None
     };
-    Ok(unsafe { pyre_object::w_str_cut(args[0], strip_chars(s, chars.as_deref(), true, true)) })
+    // Copy the receiver payload before `strip_chars` allocates its
+    // code-point set. `w_str_cut` then reads the owned cut (same
+    // shape as `str.split`).
+    let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    Ok(unsafe { pyre_object::w_str_cut(recv(), strip_chars(&s, chars.as_deref(), left, right)) })
+}
+
+pub fn str_method_strip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    str_strip_impl(args, "strip", true, true)
 }
 
 pub fn str_method_lstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "lstrip")?;
-    arity_at_most(args, "lstrip", 1)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let chars = match args.get(1) {
-        Some(&a) => extract_strip_chars(a, "lstrip")?,
-        None => None,
-    };
-    Ok(unsafe { pyre_object::w_str_cut(args[0], strip_chars(s, chars.as_deref(), true, false)) })
+    str_strip_impl(args, "lstrip", true, false)
 }
 
 pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    require_receiver(args, "rstrip")?;
-    arity_at_most(args, "rstrip", 1)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let chars = match args.get(1) {
-        Some(&a) => extract_strip_chars(a, "rstrip")?,
-        None => None,
-    };
-    Ok(unsafe { pyre_object::w_str_cut(args[0], strip_chars(s, chars.as_deref(), false, true)) })
+    str_strip_impl(args, "rstrip", false, true)
 }
 
 /// `unicodeobject.py descr_startswith` — accepts either a single str
@@ -1681,18 +1689,18 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "upper")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
     Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(
-        s,
+        &s,
         str::to_uppercase,
     )))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "lower")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
+    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
     Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(
-        s,
+        &s,
         str::to_lowercase,
     )))
 }
@@ -1722,17 +1730,48 @@ fn str_method_format_core(
     kwargs_dict: Option<PyObjectRef>,
     mapping: Option<PyObjectRef>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // Read the template as WTF-8 so a lone surrogate in a literal run (or a
-    // surrogate arg spliced in) survives instead of panicking.
-    let fmt = unsafe { pyre_object::w_str_get_wtf8(fmt_obj) };
+    // Copy the template off the object before field lookup / rendering
+    // allocate. Publish the template and every operand first so the copy
+    // cannot move them out from under the words handed to `format_render`.
+    // A lone surrogate in a literal run (or a surrogate arg spliced in)
+    // still survives instead of panicking.
+    let (fmt, positional, kwargs_dict, mapping) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let fmt_base = pyre_object::gc_roots::publish_roots(&[fmt_obj]);
+        let pos_base = pyre_object::gc_roots::publish_roots(positional);
+        let kw_base = pyre_object::gc_roots::publish_roots(&[
+            kwargs_dict.unwrap_or(pyre_object::PY_NULL),
+            mapping.unwrap_or(pyre_object::PY_NULL),
+        ]);
+        pyre_object::gc_roots::normalize_roots(fmt_base, 1 + positional.len() + 2);
+        let fmt = unsafe {
+            pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(fmt_base))
+        }
+        .to_wtf8_buf();
+        let positional: Vec<_> = (0..positional.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+            .collect();
+        let kwargs = pyre_object::gc_roots::shadow_stack_get(kw_base);
+        let mapping = pyre_object::gc_roots::shadow_stack_get(kw_base + 1);
+        (
+            fmt,
+            positional,
+            if kwargs.is_null() { None } else { Some(kwargs) },
+            if mapping.is_null() {
+                None
+            } else {
+                Some(mapping)
+            },
+        )
+    };
     let mut auto_idx = 0usize;
     // `newformat.py` auto_numbering_state — `None` = ANS_INIT, `Some(true)`
     // = ANS_AUTO (empty `{}` fields), `Some(false)` = ANS_MANUAL (numbered
     // `{0}` fields).  Mixing the two raises ValueError.
     let mut numbering: Option<bool> = None;
     match format_render(
-        fmt,
-        positional,
+        &fmt,
+        &positional,
         kwargs_dict,
         mapping,
         &mut auto_idx,
@@ -1798,11 +1837,12 @@ fn format_render(
     // back at its use; the absent source takes a slot too, so the two indices
     // stay fixed whichever spelling the caller used.
     let _roots = pyre_object::gc_roots::push_roots();
-    let positional_base = pyre_object::gc_roots::pin_roots(positional);
-    let kwargs_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(kwargs_dict.unwrap_or(pyre_object::PY_NULL));
-    let mapping_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(mapping.unwrap_or(pyre_object::PY_NULL));
+    let positional_base = pyre_object::gc_roots::publish_roots(positional);
+    let kwargs_slot =
+        pyre_object::gc_roots::publish_roots(&[kwargs_dict.unwrap_or(pyre_object::PY_NULL)]);
+    let mapping_slot =
+        pyre_object::gc_roots::publish_roots(&[mapping.unwrap_or(pyre_object::PY_NULL)]);
+    pyre_object::gc_roots::normalize_roots(positional_base, positional.len() + 2);
     let lookup_kwarg = |name: &str| -> Result<Option<PyObjectRef>, crate::PyError> {
         if mapping.is_some() {
             // `newformat.format_method(... w_mapping, True)` resolves
@@ -4687,11 +4727,16 @@ fn is_identifier(s: &str) -> bool {
 /// fill between it and the digits (`'-42'.zfill(5) == '-0042'`).
 pub fn str_method_zfill(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "zfill", 1)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
-    let len = unsafe { pyre_object::w_str_len(args[0]) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let width =
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
+            .max(0) as usize;
+    let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    let len = unsafe { pyre_object::w_str_len(recv()) };
     if len >= width {
-        return Ok(str_result_unchanged(args[0]));
+        return Ok(str_result_unchanged(recv()));
     }
     let need = width - len;
     let zero = CodePoint::from_char('0');
@@ -5398,22 +5443,22 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// PyPy: unicodeobject.py descr_title
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "title")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8_managed(case::title_wtf8(s)))
+    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
+    Ok(w_str_from_wtf8_managed(case::title_wtf8(&s)))
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "capitalize")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8_managed(case::capitalize_wtf8(s)))
+    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
+    Ok(w_str_from_wtf8_managed(case::capitalize_wtf8(&s)))
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "swapcase")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8_managed(case::swapcase_wtf8(s)))
+    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
+    Ok(w_str_from_wtf8_managed(case::swapcase_wtf8(&s)))
 }
 
 /// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to `' '`
@@ -5521,12 +5566,20 @@ pub(crate) fn str_result_unchanged(obj: PyObjectRef) -> PyObjectRef {
 pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "center", 1)?;
     arity_at_most(args, "center", 2)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
-    let fillchar = pad_fillchar(args, "center")?;
-    let s_len = unsafe { pyre_object::w_str_len(args[0]) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::pin_roots(args);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
+    let width =
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
+            .max(0) as usize;
+    let fillchar = pad_fillchar(&reloaded, "center")?;
+    let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    let s_len = unsafe { pyre_object::w_str_len(recv()) };
     if s_len >= width {
-        return Ok(str_result_unchanged(args[0]));
+        return Ok(str_result_unchanged(recv()));
     }
     // unicodeobject.py:1098 d = (width - len) ; lpad = d//2 + (d & width & 1)
     let d = width - s_len;
@@ -5534,7 +5587,7 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let right = d - left;
     let mut out = crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), d, fillchar))?;
     push_cp_repeated(&mut out, fillchar, left)?;
-    out.push_wtf8(s);
+    out.push_wtf8(&s);
     push_cp_repeated(&mut out, fillchar, right)?;
     Ok(w_str_from_wtf8_managed(out))
 }
@@ -5543,16 +5596,24 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "ljust", 1)?;
     arity_at_most(args, "ljust", 2)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
-    let fillchar = pad_fillchar(args, "ljust")?;
-    let s_len = unsafe { pyre_object::w_str_len(args[0]) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::pin_roots(args);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
+    let width =
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
+            .max(0) as usize;
+    let fillchar = pad_fillchar(&reloaded, "ljust")?;
+    let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    let s_len = unsafe { pyre_object::w_str_len(recv()) };
     if s_len >= width {
-        return Ok(str_result_unchanged(args[0]));
+        return Ok(str_result_unchanged(recv()));
     }
     let mut out =
         crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), width - s_len, fillchar))?;
-    out.push_wtf8(s);
+    out.push_wtf8(&s);
     push_cp_repeated(&mut out, fillchar, width - s_len)?;
     Ok(w_str_from_wtf8_managed(out))
 }
@@ -5561,17 +5622,25 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
 pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "rjust", 1)?;
     arity_at_most(args, "rjust", 2)?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    let width = crate::builtins::space_index_w(args[1])?.max(0) as usize;
-    let fillchar = pad_fillchar(args, "rjust")?;
-    let s_len = unsafe { pyre_object::w_str_len(args[0]) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = pyre_object::gc_roots::pin_roots(args);
+    let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
+    let width =
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
+            .max(0) as usize;
+    let fillchar = pad_fillchar(&reloaded, "rjust")?;
+    let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
+    let s_len = unsafe { pyre_object::w_str_len(recv()) };
     if s_len >= width {
-        return Ok(str_result_unchanged(args[0]));
+        return Ok(str_result_unchanged(recv()));
     }
     let mut out =
         crate::builtins::try_wtf8_with_capacity(padded_byte_len(s.len(), width - s_len, fillchar))?;
     push_cp_repeated(&mut out, fillchar, width - s_len)?;
-    out.push_wtf8(s);
+    out.push_wtf8(&s);
     Ok(w_str_from_wtf8_managed(out))
 }
 
@@ -5920,11 +5989,16 @@ pub fn str_method_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             arg_type_name(pos[1])
         )));
     }
-    let s = unsafe { w_str_get_wtf8(pos[0]) };
-    let prefix = unsafe { w_str_get_wtf8(pos[1]) };
-    match s.strip_prefix(prefix) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[pos[0], pos[1]]);
+    let s = unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }.to_wtf8_buf();
+    let prefix =
+        unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }.to_wtf8_buf();
+    match s.strip_prefix(prefix.as_ref()) {
         Some(rest) => Ok(w_str_from_wtf8_managed(rest.to_wtf8_buf())),
-        None => Ok(str_result_unchanged(pos[0])),
+        None => Ok(str_result_unchanged(
+            pyre_object::gc_roots::shadow_stack_get(base),
+        )),
     }
 }
 
@@ -5943,8 +6017,11 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
             arg_type_name(pos[1])
         )));
     }
-    let s = unsafe { w_str_get_wtf8(pos[0]) };
-    let suffix = unsafe { w_str_get_wtf8(pos[1]) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[pos[0], pos[1]]);
+    let s = unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }.to_wtf8_buf();
+    let suffix =
+        unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base + 1)) }.to_wtf8_buf();
     // `descr_removesuffix` (unicodeobject.py) guards the slice arm
     // with `if suffix and ...`, so an empty suffix falls through to the arm
     // that rewraps the receiver's own storage — `s.removesuffix("") is s` for
@@ -5952,11 +6029,13 @@ pub fn str_method_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // through `ll_stringslice_startonly` (rstr.py), which has no
     // whole-span shortcut, so an empty prefix still builds a fresh object.
     if !suffix.is_empty()
-        && let Some(rest) = s.strip_suffix(suffix)
+        && let Some(rest) = s.strip_suffix(suffix.as_ref())
     {
         return Ok(w_str_from_wtf8_managed(rest.to_wtf8_buf()));
     }
-    Ok(str_result_unchanged(pos[0]))
+    Ok(str_result_unchanged(
+        pyre_object::gc_roots::shadow_stack_get(base),
+    ))
 }
 
 /// PyPy: unicodeobject.py descr_expandtabs
@@ -7062,22 +7141,29 @@ pub fn tuple_method_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // descr_index defaults: w_start=0, w_stop=maxint; unwrap_start_stop does
     // negative normalization and __index__ coercion.
     let size = unsafe { w_tuple_len(tup) } as i64;
-    let w_start = if args.len() >= 3 {
-        args[2]
-    } else {
-        w_int_new(0)
-    };
-    let w_stop = if args.len() >= 4 {
-        args[3]
-    } else {
-        w_int_new(i64::MAX)
-    };
     // A user __eq__ (or an __index__ on start/stop) may allocate and move the
-    // tuple / search value across a minor collection; root both and reload.
+    // tuple, search value, or the other bound. Publish all four first.
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::pin_roots(&[tup, value]);
-        let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(size, w_start, w_stop)?;
+        let sp = pyre_object::gc_roots::publish_roots(&[tup, value]);
+        let start_obj = if args.len() >= 3 {
+            args[2]
+        } else {
+            w_int_new(0)
+        };
+        let _ = pyre_object::gc_roots::publish_roots(&[start_obj]);
+        let stop_obj = if args.len() >= 4 {
+            args[3]
+        } else {
+            w_int_new(i64::MAX)
+        };
+        let _ = pyre_object::gc_roots::publish_roots(&[stop_obj]);
+        pyre_object::gc_roots::normalize_roots(sp, 4);
+        let (start, stop) = crate::sliceobject::unwrap_start_stop_not_none(
+            size,
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            pyre_object::gc_roots::shadow_stack_get(sp + 3),
+        )?;
         let mut i = start.max(0);
         while i < stop {
             let tup = pyre_object::gc_roots::shadow_stack_get(sp);

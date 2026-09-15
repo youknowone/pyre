@@ -115,19 +115,29 @@ fn get_intrinsic2_descs(_: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpret
 }
 
 fn get_nb_ops(_: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    // Each name string and each pair tuple is freshly allocated, so both levels
-    // pin as they arrive; the inner bracket closes before its tuple is pinned.
-    let mut rows = pyre_object::gc_roots::RootedItems::new();
+    // Each name string and each pair tuple is a nursery object, so they
+    // all sit on one bracket. Reload the pair inputs from their slots
+    // before `w_tuple_new` so a later mint cannot hand a stale local.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut row_slots = Vec::new();
     for value in oparg::BinaryOperator::iter() {
-        let row = {
-            let mut names = pyre_object::gc_roots::RootedItems::new();
-            names.push(w_str_new_managed(value.desc()));
-            names.push(w_str_new_managed(&value.to_string()));
-            w_tuple_new(names.take())
-        };
-        rows.push(row);
+        let desc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(value.desc()));
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&value.to_string()));
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(desc_slot),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        ]));
+        row_slots.push(slot);
     }
-    Ok(w_list_new(rows.take()))
+    Ok(w_list_new(
+        row_slots
+            .into_iter()
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .collect(),
+    ))
 }
 
 fn special_method_names_impl() -> PyObjectRef {
