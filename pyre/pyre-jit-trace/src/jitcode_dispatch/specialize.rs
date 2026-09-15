@@ -9789,6 +9789,22 @@ const FLOAT_SQRT_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-SQRT-SUBWALK",
 };
 
+/// ll_math.py `ll_math_sin` after the finite pin.
+const FLOAT_SIN_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_sin",
+    commit_label: "float_sin_commit",
+    call_site_label: "float_sin_call_site",
+    decline_tag: "FLOAT-SIN-SUBWALK",
+};
+
+/// ll_math.py `ll_math_cos` after the finite pin.
+const FLOAT_COS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_cos",
+    commit_label: "float_cos_commit",
+    call_site_label: "float_cos_call_site",
+    decline_tag: "FLOAT-COS-SUBWALK",
+};
+
 /// floatobject.py `descr_abs` / `ll_math_fabs`.
 const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_abs",
@@ -15173,6 +15189,25 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if r_args.len() >= 3 {
+            use pyre_interpreter::module::math::interp_math;
+            let walked = if interp_math::is_math_sin_function(callable) {
+                try_walker_orthodox_float_sin(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            } else if interp_math::is_math_cos_function(callable) {
+                try_walker_orthodox_float_cos(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            } else {
+                None
+            };
+            if let Some(DispatchOutcome::SubReturn {
+                result: Some(boxed),
+            }) = walked
+            {
+                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         use pyre_interpreter::module::math::interp_math;
         if interp_math::is_math_log_function(callable) {
@@ -15744,6 +15779,60 @@ pub(crate) fn try_walker_orthodox_float_sqrt<Sym: WalkSym>(
         dst_bank,
         &FLOAT_SQRT_DESCENT,
     )
+}
+
+/// Exact finite `math.sin`: walk `_float_sin`.
+pub(crate) fn try_walker_orthodox_float_sin<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_SIN_DESCENT)
+}
+
+/// Exact finite `math.cos`: walk `_float_cos`.
+pub(crate) fn try_walker_orthodox_float_cos<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_COS_DESCENT)
+}
+
+fn try_walker_orthodox_float_trig<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
+        (false, unsafe { pyre_object::w_float_get_value(obj) })
+    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
+    } else {
+        return Ok(None);
+    };
+    if !x.is_finite() {
+        return Ok(None);
+    }
+    let xa =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    try_walker_orthodox_descent(ctx, op_pc, &[], &[], &[(xa, x)], dst, dst_bank, descent)
 }
 
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
