@@ -1792,14 +1792,7 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
 /// where its collector could not see it. Returns `GcRef(0)` when no GC is
 /// bound, leaving the caller on its own path.
 fn wasm_alloc_nursery_headerless_no_collect(size: usize) -> GcRef {
-    let obj = with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size))
-        .unwrap_or(GcRef(0));
-    if !obj.is_null() && size != 0 {
-        unsafe {
-            core::ptr::write_bytes(obj.0 as *mut u8, 0, size);
-        }
-    }
-    obj
+    with_wasm_active_gc_mut(|gc| gc.alloc_nursery_headerless_no_collect(size)).unwrap_or(GcRef(0))
 }
 
 /// Placement-reporting companion of [`wasm_alloc_nursery_typed`].
@@ -1984,11 +1977,9 @@ pub extern "C" fn wasm_jit_alloc_headerless(size: i64) -> i64 {
         0
     })
     .unwrap_or(0);
-    if obj != 0 && size != 0 {
-        unsafe {
-            core::ptr::write_bytes(obj as *mut u8, 0, size);
-        }
-    }
+    // IncrementalMiniMark `malloc_zero_filled = False`. rewrite.py
+    // does not fill a headerless bump; leftover GC-pointer fields are
+    // the delayed-zero stores, not this helper.
     oom_signal_if_zero(obj)
 }
 
@@ -2176,7 +2167,7 @@ fn wasm_write_barrier_helpers() -> codegen::WriteBarrierHelpers {
 /// own geometry — no shared coarse single-stride scan that mis-reads a larger
 /// frame's interior as a smaller frame's slots.
 pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, _gcmap_ptr: i64) -> i64 {
-    use majit_backend::jitframe::JitFrame;
+    use majit_backend::jitframe::{JITFRAME_FIXED_SIZE, JitFrame};
     assert!(frame_bytes >= 0);
     assert_eq!(frame_bytes as usize % std::mem::size_of::<isize>(), 0);
     let depth = frame_bytes as usize / std::mem::size_of::<isize>();
@@ -2196,14 +2187,12 @@ pub extern "C" fn wasm_jit_ca_alloc_frame(frame_bytes: i64, _gcmap_ptr: i64) -> 
     }
     let jf = jf_ref.0 as *mut JitFrame;
     unsafe {
-        // `JitFrame::init` requires a zeroed fixed header. Native execute
-        // uses calloc; wasm used to get the same from nursery reset. Reset
-        // now leaves recycled bytes dirty (`malloc_zero_filled = False`),
-        // and wasm skips rewrite's `emit_setfield` zeros of jf_descr /
-        // jf_force_descr / jf_savedata / jf_guard_exc / jf_forward. A
-        // leftover word in those slots is traced as a young object or
-        // decoded as a fail-index by `install_post_finish_force_gcmap`.
-        std::ptr::write_bytes(jf as *mut u8, 0, alloc_size);
+        // rewrite.py `gen_malloc_frame`: NULL the GC-pointer header
+        // fields (`jf_savedata` / `jf_force_descr` / `jf_descr` /
+        // `jf_guard_exc` / `jf_forward`). IncrementalMiniMark does not
+        // zero the `jf_frame` slots; `JitFrame::init` only needs the
+        // fixed header clean.
+        std::ptr::write_bytes(jf as *mut u8, 0, JITFRAME_FIXED_SIZE);
         JitFrame::init(jf, std::ptr::null(), depth);
         // assembler.py publishes `jf_gcmap` at safepoints once homes are
         // live. The callee entry stores `home_gcmap_ptr` after its
