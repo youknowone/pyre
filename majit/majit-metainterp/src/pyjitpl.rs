@@ -29323,7 +29323,6 @@ mod closing_jump_fixes_label_slots_tests {
             &[boxed(1), boxed(2)]
         )]));
     }
-
 }
 
 #[cfg(test)]
