@@ -16556,6 +16556,9 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
 /// on a miss, then swallow the error as null and let the result guard
 /// retry the same import.
 ///
+/// A non-`AttributeError` from `__spec__` / `_initializing` is published
+/// for the trailing `GuardNoException`, matching `_gcd_import`'s re-raise.
+///
 /// `fromlist_empty != 0` is `import a.b` (no fromlist): `__import__`
 /// answers the top-level package, so a dotted name returns the initialized
 /// `sys.modules["a"]` after the leaf is confirmed present.
@@ -16567,17 +16570,24 @@ extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return 0;
     };
-    let Some(leaf) = pyre_interpreter::importing::sys_module_if_initialized(s) else {
-        return 0;
-    };
-    if fromlist_empty != 0
-        && let Some(dot) = s.find('.')
-    {
-        return pyre_interpreter::importing::sys_module_if_initialized(&s[..dot])
-            .map(|head| head as i64)
-            .unwrap_or(0);
+    match import_cached_lookup(s, fromlist_empty != 0) {
+        Ok(Some(module)) => module as i64,
+        Ok(None) => 0,
+        Err(mut err) => crate::helpers::publish_leaf_exception(&mut err),
     }
-    leaf as i64
+}
+
+fn import_cached_lookup(
+    name: &str,
+    fromlist_empty: bool,
+) -> Result<Option<pyre_object::PyObjectRef>, pyre_interpreter::PyError> {
+    let Some(leaf) = pyre_interpreter::importing::sys_module_if_initialized(name)? else {
+        return Ok(None);
+    };
+    if fromlist_empty && let Some(dot) = name.find('.') {
+        return pyre_interpreter::importing::sys_module_if_initialized(&name[..dot]);
+    }
+    Ok(Some(leaf))
 }
 
 /// Cached absolute `import name` / `from name import ...` on a module already
@@ -16669,11 +16679,15 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     if !fromlist_empty {
         return Ok(None);
     }
-    let w_mod = jit_import_cached(w_name as i64, i64::from(fromlist_empty));
-    if w_mod == 0 {
+    // Record-time probe: decline on FastPathGiveUp *or* a raising accessor.
+    // The compiled residual publishes the latter; publishing here would
+    // leave a pending JIT exception on a fold we are about to refuse.
+    let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return Ok(None);
-    }
-    let w_mod = w_mod as pyre_object::PyObjectRef;
+    };
+    let Ok(Some(w_mod)) = import_cached_lookup(s, fromlist_empty) else {
+        return Ok(None);
+    };
 
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
@@ -16728,8 +16742,11 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
 
     let helper = jit_import_cached as *const ();
     // Impure `CallR`: `sys.modules` is mutable, so an elidable / `CallPureR`
-    // rewrite would fold the entry observed while tracing.  The helper
-    // only reads the dict and cannot raise.
+    // rewrite would fold the entry observed while tracing.  `_gcd_import`
+    // re-raises a non-`AttributeError` from `__spec__` / `_initializing`,
+    // so this is `EF_CAN_RAISE` plus `GuardNoException` (`pyjitpl.py`
+    // `handle_possible_exception`).  FastPathGiveUp stays a null result
+    // and fails the identity `GuardValue` instead.
     let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
@@ -16737,12 +16754,13 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
         &[name_op, fromlist_empty_op],
         &[majit_ir::Type::Ref, majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        majit_metainterp::cannot_raise_effect_info(),
+        majit_metainterp::can_raise_effect_info(),
     );
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
     );
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
     let expected = ctx.trace_ctx.const_ref(w_mod as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
     ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
