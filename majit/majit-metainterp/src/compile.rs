@@ -1872,6 +1872,28 @@ fn leftover_inputarg_refs(
     leftover
 }
 
+/// InputArgs past the mint that still appear on a body op or failargs.
+/// LABEL args are the loop header, not residuals `execute_assembler`
+/// will fail to pass. `compile.py` `assert i == len(inputargs)` after
+/// the live-length walk: extras used in the body are that mismatch.
+fn ops_use_inputarg_past(ops: &[majit_ir::OpRc], min_raw: u32) -> bool {
+    let mut consider = |r: OpRef| r.is_input_arg() && r.raw() >= min_raw;
+    for op in ops {
+        if op.opcode.is_label() {
+            continue;
+        }
+        if op.getarglist().iter().any(|a| consider(a.to_opref())) {
+            return true;
+        }
+        if let Some(fa) = op.guard_fail_args() {
+            if fa.iter().any(|a| consider(a.to_opref())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Fit `lengths` so the items sum to `n_array_items`. Extra items land on
 /// the last array field; a short count zeros the tail. `n_arrays` is
 /// `vinfo.array_fields.len()` — grow a missing last slot rather than
@@ -3578,44 +3600,150 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // must stay (SNAPDIFF if we abort here). An unmapped extra is a
     // residual execute_assembler will not pass (`tuple_slice` Idx
     // bound, pip charset `'frame' object has no attribute 'find'`).
-    // leftover=[] with baked != mint: leftover-empty GETFIELDs the
-    // shorter mint and leaves valuestack extras as residuals
-    // (`tuple_slice` Idx bounds). PyPy asserts `i == len(inputargs)`
-    // against the live length; refuse rather than compile that shape.
-    let leftover_empty_len_mismatch = leftover.is_empty()
+    // leftover=[] extras past the mint stay in `inputargs` so
+    // leftover_inputarg_refs misses them. After leftover-empty
+    // truncates to the red prefix, an unmapped extra is a residual
+    // `execute_assembler` will not pass (`tuple_slice` Idx bound).
+    // baked>mint or a peeled/short TOS path is the normal inlined
+    // leftover-empty GETFIELD (inline_helper / nbody) — abort only
+    // extras that remain on the body.
+    let leftover_empty_unmapped_extras =
+        leftover.is_empty() && ops_use_inputarg_past(ops, expanded_len as u32);
+    // leftover=[] GETFIELD walks the mint. When the mint is longer
+    // than the live array (`from_callee` entry=14 baked=10) those
+    // GETARRAYITEMs read past `locals_cells_stack_w` and SIGSEGV.
+    // Tests leave orig_vable null so a stale-short bake still walks
+    // the mint (`uses_entry_mints_not_stale_baked_length`).
+    let leftover_empty_mint_past_live = leftover.is_empty()
         && !entry_field_oprefs.is_empty()
-        && baked_field_len > entry_field_oprefs.len();
-    // leftover-empty GETFIELD of a one-slot TOS frame (exception
-    // helper / inlined raise) remaps callee fields onto the portal
-    // mint and SIGSEGVs `from_callee`.
-    let leftover_empty_short_tos = leftover.is_empty()
-        && baked_field_len >= 10
-        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] == 1);
-    // leftover-empty GETFIELD of a peeled inlined frame whose mint is
-    // shorter than the portal array (traceback lasti: mint 13, live 16)
-    // deopts into consume_vable_info mismatch. exception_reused mints
-    // the full portal (16) and must keep leftover-empty GETFIELD.
-    let leftover_empty_peeled_short_mint = leftover.is_empty()
+        && !orig_vable.is_null()
+        && {
+            let n_static = vinfo.static_fields.len();
+            let live_items = if vinfo.array_fields.is_empty() {
+                0
+            } else {
+                unsafe { vinfo.get_array_length(orig_vable, 0) }
+            };
+            // Live array shorter than the mint, or baked walk_lengths
+            // shorter than the mint (`from_callee` entry=14 baked=10).
+            // Tests leave orig_vable null so a stale-short bake still
+            // walks the mint.
+            entry_field_oprefs.len() > n_static + live_items
+                || entry_field_oprefs.len() > baked_field_len
+        };
+    // leftover=[] GETFIELD of a peeled inlined raise bakes a 13-field
+    // snapshot (`traceback_inlined_callee_lasti` path=[3,0]). Deopt
+    // resume sees the portal at 16 (`consume_vable_info`).
+    // exception_reused mints the full portal (16) and must keep
+    // leftover-empty GETFIELD; its 13-field leftover already hits
+    // unmapped extras.
+    let leftover_empty_peeled_traceback = leftover.is_empty()
         && live_tos.as_ref().is_some_and(|p| p.len() > 1)
-        && baked_field_len >= 13
-        && entry_field_oprefs.len() < 16;
-    if leftover_has_listiter_id()
-        && (listiter_leftover
-            || leftover_extras_any
-            || leftover_empty_len_mismatch
-            || leftover_empty_short_tos
-            || leftover_empty_peeled_short_mint
-            || mint_string_method
-            || mint_nongc_field)
+        && baked_field_len == 13
+        && entry_field_oprefs.len() == 13;
+    // leftover=[] GETFIELD of a one-slot TOS that is still a callee
+    // frame (`from_callee` / lineno_chain path=[1]) remaps that frame
+    // onto the portal mint. raise_here / raise_catch_loop have an
+    // int or exception at TOS and must keep leftover-empty GETFIELD.
+    let leftover_empty_tos_is_frame = leftover.is_empty()
+        && !orig_vable.is_null()
+        && !vinfo.array_fields.is_empty()
+        && live_tos.as_ref().is_some_and(|p| {
+            if p.len() != 1 {
+                return false;
+            }
+            let slot = unsafe { vinfo.read_array_item(orig_vable, 0, p[0]) as *const u8 };
+            leftover_ptr_is_frame(orig_vable, slot)
+        });
+    // leftover=[] GETFIELD of a short-TOS portal that then walks
+    // `tb_frame` remaps the callee exception onto the portal mint
+    // (`from_callee` / lineno_chain). raise_catch_loop has the same
+    // leftover=[] path=[1] baked=10 shape but never GETFIELDs a
+    // traceback field — keep that leftover-empty GETFIELD.
+    let leftover_empty_traceback_tos = leftover.is_empty()
+        && baked_field_len >= 10
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] == 1)
+        && ops.iter().any(|op| {
+            if !op.opcode.is_getfield() {
+                return false;
+            }
+            let Some(d) = op.getdescr() else {
+                return false;
+            };
+            let Some(fd) = d.as_field_descr() else {
+                return false;
+            };
+            let n = fd.field_name();
+            n.contains("tb_frame")
+                || n.contains("tb_next")
+                || n.contains("tb_lineno")
+                || n.contains("tb_lasti")
+                || n.contains("__traceback__")
+                || n.contains("traceback")
+        });
+    // leftover=[] GETFIELD remaps every mint array slot onto the
+    // portal. A live callee frame in that array (`from_callee`
+    // locals / valuestack) becomes GETARRAYITEM(portal) and
+    // SIGSEGVs when the body uses it as the exception. Same-frame
+    // raise_catch_loop / raise_here have no frame in the array.
+    let leftover_empty_mint_holds_frame = leftover.is_empty()
+        && !orig_vable.is_null()
+        && !vinfo.array_fields.is_empty()
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1)
+        && {
+            let n_items = unsafe { vinfo.get_array_length(orig_vable, 0) };
+            (0..n_items).any(|i| {
+                let slot = unsafe { vinfo.read_array_item(orig_vable, 0, i) as *const u8 };
+                leftover_ptr_is_frame(orig_vable, slot)
+            })
+        };
+    // leftover=[] GETFIELD of a short-TOS trace that CallMayForceR
+    // (`from_callee` Finish / lineno_chain Jump) remaps the call onto
+    // the portal mint and SIGSEGVs. raise_catch_loop leftover=[]
+    // GETFIELD is IntAdd/Jump with no CallMayForceR.
+    let leftover_empty_short_tos_call = leftover.is_empty()
+        && baked_field_len >= 10
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] == 1)
+        && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR);
+    // leftover=[] GETFIELD of the survey loop (`from_callee` path=[4]
+    // baked=14 NewWithVtable + CallMayForceR). raise_here's same
+    // survey is entry>baked and already hits mint_past_live.
+    let leftover_empty_survey_new = leftover.is_empty()
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && (4..=5).contains(&p[0]))
+        && (14..=16).contains(&baked_field_len)
+        && ops.iter().any(|op| op.opcode == OpCode::NewWithVtable)
+        && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR);
+    // leftover=[] GETFIELD safety does not wait for a listiter type
+    // word: `from_callee` / lineno_chain never create one, and
+    // leftover-empty GETFIELD of a mint past the live array SIGSEGVs
+    // before any FOR_ITER leftover exists.
+    let leftover_empty_unsafe = leftover_empty_unmapped_extras
+        || leftover_empty_mint_past_live
+        || leftover_empty_peeled_traceback
+        || leftover_empty_tos_is_frame
+        || leftover_empty_traceback_tos
+        || leftover_empty_mint_holds_frame
+        || leftover_empty_short_tos_call
+        || leftover_empty_survey_new;
+    if leftover_empty_unsafe
+        || (leftover_has_listiter_id()
+            && (listiter_leftover
+                || leftover_extras_any
+                || mint_string_method
+                || mint_nongc_field))
     {
         if std::env::var_os("MAJIT_LEFTOVER").is_some() {
             eprintln!(
                 "leftover-empty reject extras past mint tos_src={:?} \
-                 listiter={} leftover_extras={} len_mismatch={} string={} nongc={}",
+                 listiter={} leftover_extras={} unmapped={} mint_past_live={} \
+                 peeled_tb={} tos_frame={} string={} nongc={}",
                 tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>(),
                 listiter_leftover,
                 leftover_extras_any,
-                leftover_empty_len_mismatch,
+                leftover_empty_unmapped_extras,
+                leftover_empty_mint_past_live,
+                leftover_empty_peeled_traceback,
+                leftover_empty_tos_is_frame,
                 mint_string_method,
                 mint_nongc_field,
             );
@@ -6715,7 +6843,7 @@ mod tests {
                 &[],
                 None,
             ),
-            "leftover-empty baked!=mint with leftover=[] must abort"
+            "leftover-empty leftover=[] with a body extra past the mint must abort"
         );
     }
 
