@@ -2409,18 +2409,46 @@ fn framestate_enabled() -> bool {
     )
 }
 
+/// Per-LLBC maps the whole-program loop computes once. Standalone
+/// `lower_fun_decl` used to re-derive them on every call, so a census
+/// that lowers hundreds of bodies paid `derive_program_metadata` +
+/// `dont_look_inside_set_of` once per body (642s on ubuntu debug for
+/// `nearly_every_dropped_bracket_closes`). Keyed by `Llbc` identity;
+/// the test process keeps each artefact in a `OnceLock`.
+struct StandaloneLowerMaps {
+    struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: std::collections::HashSet<String>,
+}
+
+fn standalone_lower_maps(llbc: &Llbc) -> std::sync::Arc<StandaloneLowerMaps> {
+    static CACHE: std::sync::Mutex<Option<(usize, std::sync::Arc<StandaloneLowerMaps>)>> =
+        std::sync::Mutex::new(None);
+    let key = llbc as *const Llbc as usize;
+    let mut slot = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, maps)) = slot.as_ref()
+        && *cached == key
+    {
+        return std::sync::Arc::clone(maps);
+    }
+    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+    let maps = std::sync::Arc::new(StandaloneLowerMaps {
+        struct_field_attrs,
+        dont_look_inside: dont_look_inside_set_of(llbc),
+    });
+    *slot = Some((key, std::sync::Arc::clone(&maps)));
+    maps
+}
+
 pub fn lower_fun_decl_with_static_addrs(
     llbc: &Llbc,
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
-        // Derive the struct field-layout map the boxing-alloc fusion reads
-        // (`fuse_boxing_alloc`).  The whole-program build lowers each function
-        // through the `_with_attrs` variant with a single precomputed map; this
-        // stand-alone entry (used by the reader / tests) derives it per call from
-        // the same source of truth so the fusion fires identically.
-        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+        // Same maps the whole-program loop lowers with. Cached per LLBC
+        // so a stand-alone census is O(bodies) lowers, not O(bodies)
+        // full-artefact harvests.
+        let maps = standalone_lower_maps(llbc);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
         lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
@@ -2428,7 +2456,8 @@ pub fn lower_fun_decl_with_static_addrs(
             fd,
             static_addrs,
             &jitdriver_receiver_roots,
-            &struct_field_attrs,
+            &maps.struct_field_attrs,
+            &maps.dont_look_inside,
         )
     })
 }
@@ -2508,12 +2537,14 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
 ) -> Result<FunctionGraph, LowerError> {
     let jitdriver_receiver_roots =
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    let dont_look_inside = dont_look_inside_set_of(llbc);
     lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         llbc,
         fd,
         static_addrs,
         &jitdriver_receiver_roots,
         struct_field_attrs,
+        &dont_look_inside,
     )
 }
 
@@ -2523,6 +2554,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -2530,13 +2562,6 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
-    // Standalone entry (the reader / tests / on-demand `GraphBodyProvider`):
-    // harvest the residual marker set from this LLBC so the call-target
-    // builder makes the SAME Method-hint decline the whole-program loop makes.
-    // The hot whole-program path passes its precomputed set directly to
-    // `lower_unstructured_with_static_addrs_and_attrs`, so this per-call
-    // harvest is only paid on the standalone paths.
-    let dont_look_inside = dont_look_inside_set_of(llbc);
     let builder_mode = graph_has_builder_accumulator(llbc, &u);
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
