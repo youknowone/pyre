@@ -193,6 +193,16 @@ pub fn raw_write_f64(p: usize, v: f64) {
     unsafe { (p as *mut f64).write_unaligned(v as f64) }
 }
 
+/// `misc.py read_raw_long_data`.
+///
+/// # Safety
+/// `target` must point at `size` readable bytes, and `size` must not
+/// exceed `sizeof(Signed)`.
+pub unsafe fn read_raw_long_data(target: usize, size: i64) -> Result<i64, PyError> {
+    debug_assert!(size <= std::mem::size_of::<i64>() as i64);
+    unsafe { read_raw_signed_data(target, size) }
+}
+
 /// `misc.py read_raw_signed_data`.
 ///
 /// # Safety
