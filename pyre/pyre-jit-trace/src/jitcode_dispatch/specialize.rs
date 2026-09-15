@@ -10132,6 +10132,9 @@ pub(crate) fn try_walker_orthodox_unary_neg<Sym: WalkSym>(
     let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(obj);
     let xa = walker_unbox_int_typed(ctx, op_pc, r_args[0], type_addr, descr)?;
     walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+    // `_int_neg` is `0.wrapping_sub`; a later `i64::MIN` must deopt to
+    // the ovf2long residual instead of wrapping.
+    walker_guard_int_ne(ctx, op_pc, xa, x, i64::MIN)?;
     try_walker_orthodox_descent(
         ctx,
         op_pc,
@@ -10533,6 +10536,47 @@ const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
 /// `ref_args` pairs each operand box with its concrete object; `int_args`
 /// carries constant-bank operands (an operator tag) the same way.  A body
 /// that raises declines (see the `SubRaise` arm).
+fn walker_guard_int_ne<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw: OpRef,
+    concrete: i64,
+    banned: i64,
+) -> Result<(), DispatchError> {
+    let banned_box = ctx.trace_ctx.const_int(banned);
+    let is_banned = ctx.trace_ctx.record_op(OpCode::IntEq, &[raw, banned_box]);
+    ctx.trace_ctx.set_opref_concrete(
+        is_banned,
+        majit_ir::Value::Int(i64::from(concrete == banned)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_banned])
+}
+
+/// Pin `lo < raw < hi` so a later out-of-range value deopts.
+fn walker_guard_int_open_range<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw: OpRef,
+    concrete: i64,
+    lo_exclusive: i64,
+    hi_exclusive: i64,
+) -> Result<(), DispatchError> {
+    let lo = ctx.trace_ctx.const_int(lo_exclusive);
+    let hi = ctx.trace_ctx.const_int(hi_exclusive);
+    let gt_lo = ctx.trace_ctx.record_op(OpCode::IntLt, &[lo, raw]);
+    ctx.trace_ctx.set_opref_concrete(
+        gt_lo,
+        majit_ir::Value::Int(i64::from(lo_exclusive < concrete)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt_lo])?;
+    let lt_hi = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw, hi]);
+    ctx.trace_ctx.set_opref_concrete(
+        lt_hi,
+        majit_ir::Value::Int(i64::from(concrete < hi_exclusive)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[lt_hi])
+}
+
 fn try_walker_orthodox_descent<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10854,7 +10898,23 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
             }
         };
         let xa = walker_unbox_int(ctx, op_pc, operands[0].0, type_addr(operands[0].1))?;
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            operands[0].0,
+            walker_numeric_builtin_class(operands[0].1),
+        )?;
         let ya = walker_unbox_int(ctx, op_pc, operands[1].0, type_addr(operands[1].1))?;
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            operands[1].0,
+            walker_numeric_builtin_class(operands[1].1),
+        )?;
+        // Host-side mantissa check only admits the recording operands.
+        // Later values must deopt into `int_truediv_ovf2long`.
+        walker_guard_int_open_range(ctx, op_pc, xa, x, -MANTISSA_LIM, MANTISSA_LIM)?;
+        walker_guard_int_open_range(ctx, op_pc, ya, y, -MANTISSA_LIM, MANTISSA_LIM)?;
         return try_walker_orthodox_descent(
             ctx,
             op_pc,
@@ -15162,11 +15222,9 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
         if pyre_interpreter::module::math::interp_math::is_math_sqrt_function(callable)
             && r_args.len() >= 3
         {
-            if let Some(DispatchOutcome::SubReturn {
-                result: Some(boxed),
-            }) = try_walker_orthodox_float_sqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            if try_walker_orthodox_float_sqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                .is_some()
             {
-                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
                 return Ok(Some(()));
             }
         }
@@ -15199,11 +15257,7 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
             } else {
                 None
             };
-            if let Some(DispatchOutcome::SubReturn {
-                result: Some(boxed),
-            }) = walked
-            {
-                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+            if walked.is_some() {
                 return Ok(Some(()));
             }
         }
@@ -15854,11 +15908,9 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
         if pyre_interpreter::module::math::interp_math::is_math_fabs_function(callable)
             && r_args.len() >= 3
         {
-            if let Some(DispatchOutcome::SubReturn {
-                result: Some(boxed),
-            }) = try_walker_orthodox_float_abs(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            if try_walker_orthodox_float_abs(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                .is_some()
             {
-                write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
                 return Ok(Some(()));
             }
         }

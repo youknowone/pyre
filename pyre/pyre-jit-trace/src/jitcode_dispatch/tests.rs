@@ -4353,7 +4353,7 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
     for (path, arith) in [
         (
             "pyre_interpreter::objspace::descroperation::_int_neg",
-            "int_neg",
+            "int_sub",
         ),
         (
             "pyre_interpreter::objspace::descroperation::_float_neg",
@@ -4364,7 +4364,10 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "pyre_interpreter::objspace::descroperation::_int_invert",
             "int_invert",
         ),
-        ("pyre_interpreter::objspace::descroperation::_float_abs", ""),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_abs",
+            "float_abs",
+        ),
         (
             "pyre_interpreter::objspace::descroperation::_float_sqrt",
             "",
@@ -4383,11 +4386,8 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             .collect();
         if !arith.is_empty() {
             assert!(
-                ops.iter().any(|op| *op == arith
-                    || *op == "int_sub"
-                    || *op == "int_sub_ovf"
-                    || *op == "int_add"),
-                "{path} must record {arith} (or int_sub/int_add); ops={ops:?}"
+                ops.iter().any(|op| *op == arith),
+                "{path} must record {arith}; ops={ops:?}"
             );
         }
         assert!(
