@@ -7314,8 +7314,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             Some(majit_ir::Value::Int(n)) => n,
             _ => 0,
         };
-        let is_space_getattr = foldable_runtime_helper
-            == majit_ir::RuntimeHelperKind::LoadAttr
+        let is_space_getattr = foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr
             || (func_addr != 0 && GETATTR_FNADDRS.contains(&func_addr));
         if is_space_getattr
             && let Some(concrete_name) = walker_concrete_ref_object(ctx, r_args[1])
@@ -7338,9 +7337,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                         .replace_box(r_args[1], name_const);
                 }
                 if spec_gate(SpecFold::LoadAttr, || {
-                    try_walker_specialize_load_attr(
-                        ctx, op.pc, r_args[0], name, dst, dst_bank,
-                    )
+                    try_walker_specialize_load_attr(ctx, op.pc, r_args[0], name, dst, dst_bank)
                 })?
                 .is_some()
                 {
@@ -9103,9 +9100,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         .replace_box(r_args[1], name_const);
                 }
                 if spec_gate(SpecFold::LoadAttr, || {
-                    try_walker_specialize_load_attr(
-                        ctx, op.pc, r_args[0], name, dst, dst_bank,
-                    )
+                    try_walker_specialize_load_attr(ctx, op.pc, r_args[0], name, dst, dst_bank)
                 })?
                 .is_some()
                 {

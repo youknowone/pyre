@@ -9519,9 +9519,9 @@ pub(crate) fn jitcode_is_pathed(
     path: &str,
 ) -> bool {
     let leaf = path.rsplit("::").next().unwrap_or(path);
-    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
-        jc.name == path || jc.name == leaf || jc.name.ends_with(path)
-    }) {
+    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| jc.name == path || jc.name == leaf || jc.name.ends_with(path))
+    {
         return true;
     }
     crate::jitcode_runtime::pathed_jitcode_cached(path).is_some_and(|jc| {
@@ -9569,17 +9569,16 @@ pub(crate) fn name_is_getattr_family(name: &str) -> bool {
         || name_leaf_is(name, "load_attr")
 }
 
-pub(crate) fn jitcode_is_space_getattr(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_pathed(sub_index, sub_body, "pyre_interpreter::baseobjspace::getattr")
-        || jitcode_is_pathed(
-            sub_index,
-            sub_body,
-            "pyre_interpreter::baseobjspace::getattr_str",
-        )
-        || jitcode_leaf_is(sub_index, "getattr")
+pub(crate) fn jitcode_is_space_getattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::getattr",
+    ) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::getattr_str",
+    ) || jitcode_leaf_is(sub_index, "getattr")
         || jitcode_leaf_is(sub_index, "getattr_str")
 }
 
@@ -9607,22 +9606,20 @@ pub(crate) fn name_is_space_is_true(name: &str) -> bool {
 }
 
 /// `space.is_true` and the two layout/lookup helpers it dispatches to.
-pub(crate) fn jitcode_is_space_is_true(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_pathed(sub_index, sub_body, "pyre_interpreter::baseobjspace::is_true")
-        || jitcode_is_pathed(
-            sub_index,
-            sub_body,
-            "pyre_interpreter::baseobjspace::is_true_slot",
-        )
-        || jitcode_is_pathed(
-            sub_index,
-            sub_body,
-            "pyre_interpreter::baseobjspace::is_true_lookup",
-        )
-        || jitcode_leaf_is(sub_index, "is_true")
+pub(crate) fn jitcode_is_space_is_true(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::is_true",
+    ) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::is_true_slot",
+    ) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::is_true_lookup",
+    ) || jitcode_leaf_is(sub_index, "is_true")
         || jitcode_leaf_is(sub_index, "is_true_slot")
         || jitcode_leaf_is(sub_index, "is_true_lookup")
 }
@@ -9691,9 +9688,7 @@ pub(crate) fn try_fold_inline_getattr<Sym: WalkSym>(
     try_fold_inline_getattr_named(ctx, op_pc, obj, name, dst, dst_bank)
 }
 
-pub(crate) fn resolved_attr_name_from_str_slice(
-    int_concretes: &[ConcreteValue],
-) -> Option<String> {
+pub(crate) fn resolved_attr_name_from_str_slice(int_concretes: &[ConcreteValue]) -> Option<String> {
     let (ptr, len) = match int_concretes {
         [ConcreteValue::Int(ptr), ConcreteValue::Int(len), ..] if *len >= 0 && *len < 4096 => {
             (*ptr as *const u8, *len as usize)
