@@ -102,7 +102,7 @@ bitflags::bitflags! {
     "ctitem",
     "ctptr",
     "length",
-    "fargs",
+    "fargs[*]",
     "abi",
     "cif_descr"
 )]
@@ -138,8 +138,8 @@ pub struct W_CType {
     pub length: i64,
     /// Packed [`CTypeFlags`].
     pub flags: i64,
-    /// `W_CTypeFunc.fargs` — the argument ctypes, as a tuple.  `PY_NULL` on
-    /// every other kind.
+    /// `W_CTypeFunc.fargs` — the argument ctypes, as a list
+    /// (`_immutable_fields_ = ['fargs[*]']`).  `PY_NULL` on every other kind.
     pub fargs: PyObjectRef,
     /// `W_CTypeFunc.abi`, the `FFI_*` calling convention.
     pub abi: i64,
@@ -881,7 +881,7 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
             pyre_object::tupleobject::w_tuple_new(Vec::new())
         } else {
             pyre_object::tupleobject::w_tuple_new(unsafe {
-                pyre_object::tupleobject::w_tuple_items_copy_as_vec(ct.fargs)
+                pyre_object::w_list_items_copy_as_vec(ct.fargs)
             })
         }),
         'r' if ct.kind == KIND_FUNC => Ok(ct.ctitem),
