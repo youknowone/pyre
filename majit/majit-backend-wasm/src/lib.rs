@@ -5426,6 +5426,7 @@ impl majit_backend::Backend for WasmBackend {
                 // Without the callback the probe would `call_indirect` slot
                 // 0, so this stays a permanent out-of-line decline.
                 if inline_trip_helper_slot() != 0
+                    && bridge_is_loop_closing
                     && (resumes_at_loop_header || inline_nonheader_enabled())
                     && let Some(owner) = original_token
                         .compiled_loop_token()
