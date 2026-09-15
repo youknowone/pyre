@@ -10531,11 +10531,12 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `f64::hypot(x, y)` is the C `hypot` llexternal
-                // (`ll_math.py math_hypot`).  The raising wrapper
-                // `ll_math_hypot` stays around it; this leaf is the
-                // IEEE call, the same way `abs` is `float_abs`.
-                if args.len() == 2 && self.is_f64_hypot(&reg) {
+                // Opaque `f64::{hypot,atan2,copysign,floor,ceil}` are the
+                // C llexternals in `ll_math.py` (`math_hypot`, …).  The
+                // raising wrappers (`ll_math_hypot`, …) stay around them.
+                if let Some((arity, leaf)) = self.f64_ll_math_leaf(&reg)
+                    && args.len() == arity
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -10543,9 +10544,9 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["ll_math".to_string(), "math_hypot".to_string()],
+                                segments: vec!["ll_math".to_string(), leaf.to_string()],
                             },
-                            args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
+                            args: crate::model::call_args(args.iter().cloned()),
                             result_ty: ValueType::Float,
                         },
                     });
@@ -14780,16 +14781,23 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
     }
 
-    /// `f64::hypot(self, other)` — `core` has no graph body (Opaque).
-    /// `ll_math.py math_hypot` is the C `hypot` llexternal; the raising
-    /// `ll_math_hypot` wrapper stays around it.
-    fn is_f64_hypot(&self, reg: &RegularCall) -> bool {
+    /// Opaque `f64` math leaves that `ll_math.py` registers as C
+    /// llexternals.  Returns `(arity, math_* leaf)`.
+    fn f64_ll_math_leaf(&self, reg: &RegularCall) -> Option<(usize, &'static str)> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
+            return None;
         };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::hypot" || path == "std::f64::<Impl>::hypot"
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        let leaf = path
+            .strip_prefix("core::f64::<Impl>::")
+            .or_else(|| path.strip_prefix("std::f64::<Impl>::"))?;
+        Some(match leaf {
+            "hypot" => (2, "math_hypot"),
+            "atan2" => (2, "math_atan2"),
+            "copysign" => (2, "math_copysign"),
+            "floor" => (1, "math_floor"),
+            "ceil" => (1, "math_ceil"),
+            _ => return None,
         })
     }
 
