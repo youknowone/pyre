@@ -359,11 +359,22 @@ pub(crate) fn dual_gate_check_with_registry(
     let followed_legacy = call_registry.session_if_started().map(|(annotator, _)| {
         annotator_followed_legacy_vars(&annotator, &graph, &real_value_to_var)
     });
+    if followed_legacy
+        .as_ref()
+        .is_some_and(|followed| followed.is_empty())
+    {
+        return Ok(DualGateOutcome::Skip(
+            "dual-gate compared set empty".to_string(),
+        ));
+    }
+    let excluded_legacy = call_registry.session_if_started().map(|(annotator, _)| {
+        annotator_unfollowed_legacy_vars(&annotator, &graph, &real_value_to_var)
+    });
     if let Some(divergence) = compare_real_against_legacy(
         &real_value_to_var,
         &real_constants,
         legacy_graph,
-        followed_legacy.as_ref(),
+        excluded_legacy.as_ref(),
     ) {
         return Ok(DualGateOutcome::Skip(format!(
             "dual-gate divergence: {divergence}"
@@ -1269,22 +1280,23 @@ fn collect_divergences(
     collect_divergences_on(real_state, legacy_graph, None)
 }
 
-/// Same as [`collect_divergences`], optionally restricted to variables the
-/// real annotator actually followed.
+/// Same as [`collect_divergences`], optionally skipping variables the
+/// real annotator never followed.
 ///
-/// `followed_legacy` is the inverse of `value_to_var` over blocks in
-/// `annotator.annotated` for the subject graph — the blocks
-/// `follow_link` / `follow_raise_link` reached
-/// (`annrpython.py` `links_followed`). A structurally reachable
-/// unfollowed arm (the `Result::Ok.__pos_0` extract on an always-`Err`
-/// `__majit_wrap___new__`) is not in this set; comparing it reads
-/// `real=Unknown` because the rtyper never saw the block. Restricting
-/// the compared set is not an Unknown-acceptance widening: a followed
-/// variable that the real path left untyped still diverges.
+/// `excluded_legacy` is the complement of
+/// [`annotator_followed_legacy_vars`]: `value_to_var` keys whose typed
+/// twin sits only on a block `follow_link` / `follow_raise_link` never
+/// recorded (`annrpython.py` `links_followed`). A structurally
+/// reachable unfollowed arm (the `Result::Ok.__pos_0` extract on an
+/// always-`Err` `__majit_wrap___new__`) is in this set. A legacy
+/// variable with no typed twin is not: `value_to_var` omits Abort
+/// results (`flowspace_adapter` `build_value_to_variable_map`), and
+/// those must still compare as `real=Unknown`. An empty exclusion
+/// compares every reachable variable.
 fn collect_divergences_on(
     real_state: &HashMap<Variable, ConcreteType>,
     legacy_graph: &LegacyGraph,
-    followed_legacy: Option<&HashSet<Variable>>,
+    excluded_legacy: Option<&HashSet<Variable>>,
 ) -> Vec<String> {
     let reachable_vars = reachable_defined_vars(legacy_graph);
     let colored_operands = colored_operand_vars(legacy_graph);
@@ -1303,8 +1315,8 @@ fn collect_divergences_on(
         if !reachable_vars.contains(var) {
             continue;
         }
-        if let Some(followed) = followed_legacy
-            && !followed.contains(var)
+        if let Some(excluded) = excluded_legacy
+            && excluded.contains(var)
         {
             continue;
         }
@@ -1467,10 +1479,10 @@ fn compare_real_against_legacy(
     value_to_var: &LegacyToTyped,
     constants: &HashMap<Variable, LowLevelType>,
     legacy_graph: &LegacyGraph,
-    followed_legacy: Option<&HashSet<Variable>>,
+    excluded_legacy: Option<&HashSet<Variable>>,
 ) -> Option<String> {
     let real_state = project_value_to_var(value_to_var, constants);
-    collect_divergences_on(&real_state, legacy_graph, followed_legacy)
+    collect_divergences_on(&real_state, legacy_graph, excluded_legacy)
         .into_iter()
         .next()
 }
@@ -1521,6 +1533,26 @@ fn annotator_followed_legacy_vars(
         .iter()
         .filter(|(_, typed)| typed_live.contains(*typed))
         .map(|(legacy, _)| legacy.clone())
+        .collect()
+}
+
+/// `value_to_var` keys whose typed twin is not on an annotated block
+/// of `graph`. The compared set is every other reachable legacy
+/// variable, including those `value_to_var` never paired.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn annotator_unfollowed_legacy_vars(
+    annotator: &crate::annotator::annrpython::RPythonAnnotator,
+    graph: &crate::flowspace::model::GraphRef,
+    value_to_var: &LegacyToTyped,
+) -> HashSet<Variable> {
+    let followed = annotator_followed_legacy_vars(annotator, graph, value_to_var);
+    value_to_var
+        .keys()
+        .filter(|legacy| !followed.contains(*legacy))
+        .cloned()
         .collect()
 }
 
@@ -4601,8 +4633,19 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let followed_legacy = call_registry
         .session_if_started()
         .map(|(annotator, _)| annotator_followed_legacy_vars(&annotator, &graph, &value_to_var));
+    if followed_legacy
+        .as_ref()
+        .is_some_and(|followed| followed.is_empty())
+    {
+        return Ok(DualGateOutcome::Skip(
+            "two-phase compared set empty".to_string(),
+        ));
+    }
+    let excluded_legacy = call_registry
+        .session_if_started()
+        .map(|(annotator, _)| annotator_unfollowed_legacy_vars(&annotator, &graph, &value_to_var));
     if let Some(divergence) =
-        compare_real_against_legacy(&value_to_var, &constants, legacy, followed_legacy.as_ref())
+        compare_real_against_legacy(&value_to_var, &constants, legacy, excluded_legacy.as_ref())
     {
         return Ok(DualGateOutcome::Skip(format!(
             "two-phase divergence: {divergence}"
@@ -6315,22 +6358,19 @@ mod tests {
             "unfiltered compared set must still see the untyped Ok payload: {unfiltered:?}"
         );
 
-        let mut followed = HashSet::new();
-        followed.insert(vars[0].clone());
-        followed.insert(vars[1].clone());
-        followed.insert(vars[2].clone());
+        let mut excluded = HashSet::new();
+        excluded.insert(v_ok.clone());
         assert!(
-            collect_divergences_on(&HashMap::new(), &graph, Some(&followed)).is_empty(),
+            collect_divergences_on(&HashMap::new(), &graph, Some(&excluded)).is_empty(),
             "an unfollowed Ok payload is outside links_followed, not a kind mismatch"
         );
 
-        followed.insert(v_ok);
-        let followed_hit = collect_divergences_on(&HashMap::new(), &graph, Some(&followed));
+        let unpaired_hit = collect_divergences_on(&HashMap::new(), &graph, Some(&HashSet::new()));
         assert!(
-            followed_hit
+            unpaired_hit
                 .iter()
                 .any(|d| d.contains("legacy=GcRef, real=Unknown")),
-            "a followed untyped var must still diverge: {followed_hit:?}"
+            "a legacy var with no typed twin must still diverge: {unpaired_hit:?}"
         );
     }
 

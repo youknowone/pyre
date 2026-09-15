@@ -5045,6 +5045,10 @@ pub fn copygraph(
             return existing.clone();
         }
         let v2 = v.copy();
+        // copygraph copyvar (`model.py`): `Variable(v)` then
+        // `concretetype` only. `Variable.copy` also clones
+        // `annotation`; a lifted clone must not inherit it.
+        *v2.annotation.borrow_mut() = None;
         varmap.insert(v.clone(), v2.clone());
         v2
     };

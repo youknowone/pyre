@@ -2485,7 +2485,12 @@ impl PendingInlineGuard {
 impl Drop for PendingInlineGuard {
     fn drop(&mut self) {
         if let Some(pending_id) = self.0 {
-            PENDING_INLINES.with(|pending| pending.borrow_mut().remove(&pending_id));
+            PENDING_INLINES.with(|pending| {
+                if let Some(_item) = pending.borrow_mut().remove(&pending_id) {
+                    #[cfg(target_arch = "wasm32")]
+                    _item.set_dispatch_withdrawn(false);
+                }
+            });
         }
     }
 }

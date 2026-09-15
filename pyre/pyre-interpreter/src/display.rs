@@ -317,7 +317,10 @@ fn repr_active() -> Option<&'static std::cell::RefCell<Vec<PyObjectRef>>> {
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
     let Some(active) = repr_active() else {
-        return true;
+        // `objspace.py get_objects_in_repr` / `Py_ReprEnter` read the
+        // set off the live EC. No EC means no set, so this cannot
+        // claim a fresh enter.
+        return false;
     };
     let mut active = active.borrow_mut();
     if active.contains(&obj) {
@@ -358,23 +361,19 @@ fn repr_leave_at(index: usize) {
 /// RAII cycle guard.  `enter` returns `None` when `obj` is already being
 /// repr'd on this thread — the caller emits the `...` placeholder — and
 /// otherwise records `obj`, removing it again when the guard drops.
-pub(crate) struct ReprGuard(usize);
+pub(crate) struct ReprGuard(Option<usize>);
 
 impl ReprGuard {
     pub(crate) fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
-        repr_enter(obj).then(|| {
-            ReprGuard(
-                repr_active()
-                    .map(|active| active.borrow().len() - 1)
-                    .unwrap_or(0),
-            )
-        })
+        repr_enter(obj).then(|| ReprGuard(repr_active().map(|active| active.borrow().len() - 1)))
     }
 }
 
 impl Drop for ReprGuard {
     fn drop(&mut self) {
-        repr_leave_at(self.0);
+        if let Some(index) = self.0 {
+            repr_leave_at(index);
+        }
     }
 }
 

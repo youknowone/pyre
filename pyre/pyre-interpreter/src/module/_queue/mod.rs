@@ -58,8 +58,11 @@ fn queue_lock<'a>(
 }
 
 #[majit_macros::dont_look_inside]
-fn queue_push_back(mutex: &Mutex<VecDeque<PyObjectRef>>, item: PyObjectRef) {
-    queue_lock(mutex).push_back(item);
+fn queue_push_back(mutex: &Mutex<VecDeque<PyObjectRef>>, base: usize) {
+    // Read the pinned slot after `queue_lock` returns: argument
+    // evaluation would snapshot the pointer before the residual
+    // acquire, and `before_external_block` can collect.
+    queue_lock(mutex).push_back(pyre_object::gc_roots::shadow_stack_get(base));
 }
 
 #[majit_macros::dont_look_inside]
@@ -142,7 +145,7 @@ fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(item);
-    queue_push_back(&queue.queue, pyre_object::gc_roots::shadow_stack_get(base));
+    queue_push_back(&queue.queue, base);
     queue.not_empty.notify_one();
     w_none()
 }

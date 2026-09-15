@@ -579,20 +579,13 @@ mod gateway_cache_tests {
         use crate::baseobjspace::{ObjSpace, SpaceCacheClass, SpaceCacheInstance};
         let space = ObjSpace::new();
         let weak = std::sync::Arc::downgrade(&space);
-        let SpaceCacheInstance::GatewayCache(cache) =
-            space.fromcache(SpaceCacheClass::GatewayCache)
+        let SpaceCacheInstance::ClassDictStrategy(cache) =
+            space.fromcache(SpaceCacheClass::ClassDictStrategy)
         else {
             unreachable!()
         };
         drop(space);
         assert!(weak.upgrade().is_some());
-        let gateway = interp2app(builtin_code_new("answer", answer));
-        let function = cache.getorbuild(gateway);
-        let mut found = false;
-        crate::baseobjspace::walk_object_space_cache_roots(&mut |slot| {
-            found |= *slot == function;
-        });
-        assert!(found, "non-global space caches are GC roots too");
         drop(cache);
         assert!(
             weak.upgrade().is_none(),
@@ -872,8 +865,9 @@ bitflags::bitflags! {
     }
 }
 
-/// eval.py:22 `HOPELESS = 0x400` — module-level integer so `immutablevalue`
-/// reads a prebuilt Constant; the `bitflags!` associated const has an Opaque
+/// eval.py `Code.HOPELESS = 0x400` — class attribute on `Code`, not a
+/// module-level name. A standalone integer so `immutablevalue` reads a
+/// prebuilt Constant; the `bitflags!` associated const has an Opaque
 /// initializer and becomes an unregistered nullary Call.
 pub const HOPELESS: u16 = 0x400;
 

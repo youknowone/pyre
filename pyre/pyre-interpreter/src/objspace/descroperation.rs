@@ -2421,19 +2421,19 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
 /// `rstr.py` `AbstractStringRepr.ll_strcmp`. Bytewise prefix, then
 /// length. Indexing is `ll_getitem_nonneg` (`as_ptr().add`), not
 /// `slice::cmp` / `Vec::index`.
-fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> i32 {
+fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
     let cmplen = left.len().min(right.len());
     let left_p = left.as_ptr();
     let right_p = right.as_ptr();
     let mut i = 0usize;
     while i < cmplen {
-        let diff = unsafe { *left_p.add(i) as i32 - *right_p.add(i) as i32 };
+        let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
         if diff != 0 {
             return diff;
         }
         i += 1;
     }
-    left.len() as i32 - right.len() as i32
+    left.len() as isize - right.len() as isize
 }
 
 /// Read a total-order result under `op` — the shape every `_memcmp`-based

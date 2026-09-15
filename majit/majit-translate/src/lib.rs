@@ -236,7 +236,8 @@ fn build_semantic_program_via_active_frontend(
             // the merged SemanticProgram is what blew a 12GB container.
             let mut discovered = Vec::new();
             let mut crate_names = Vec::new();
-            let mut hints = std::collections::HashMap::new();
+            let mut hints: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
@@ -249,25 +250,13 @@ fn build_semantic_program_via_active_frontend(
                 for (k, v) in
                     front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc))
                 {
-                    hints.entry(k).or_insert(v);
+                    hints.entry(k).or_default().extend(v);
                 }
                 for (k, v) in front::llbc_hints::harvest_immutable_fields_from_llbcs(
                     std::slice::from_ref(&llbc),
                 ) {
                     immutable_fields.entry(k).or_insert(v);
                 }
-                unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
-                    &llbc,
-                    static_addrs.error_carrier,
-                ));
-                unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
-                    &llbc,
-                    static_addrs.error_carrier,
-                ));
-                unsafe_fn_stubs
-                    .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
-                foreign_opaque_method_externals
-                    .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
             }
             discovered.sort_by(|a, b| a.0.cmp(&b.0));
             discovered.dedup();
@@ -281,6 +270,18 @@ fn build_semantic_program_via_active_frontend(
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
                 llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
+                unsafe_fn_stubs.extend(front::mir::collect_unsafe_fn_stubs_from_llbc(
+                    &llbc,
+                    static_addrs.error_carrier,
+                ));
+                unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
+                    &llbc,
+                    static_addrs.error_carrier,
+                ));
+                unsafe_fn_stubs
+                    .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
+                foreign_opaque_method_externals
+                    .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
                 let prog = front::mir::build_semantic_program_from_prelinked_llbc(
                     &llbc,
                     static_addrs,

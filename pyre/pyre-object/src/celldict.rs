@@ -669,6 +669,7 @@ impl GlobalCache {
 
 /// `celldict.py` `self.caches.get(key)`. The registry mutex is the 3.14t
 /// wrapper; the lookup itself is the dict get upstream performs under the GIL.
+#[allow(dead_code)]
 #[majit_macros::dont_look_inside]
 fn caches_get(
     caches: &parking_lot::Mutex<Option<GlobalCacheRegistry>>,
@@ -685,6 +686,25 @@ fn cache_set_cell(
     cell: Option<PyObjectRef>,
 ) {
     cache.lock().cell = cell;
+}
+
+/// `caches_get` plus `cache.cell =` under the registry lock so a
+/// concurrent `delitem` cannot drop the entry and then have this
+/// store resurrect it.
+#[majit_macros::dont_look_inside]
+fn caches_set_cell(
+    caches: &parking_lot::Mutex<Option<GlobalCacheRegistry>>,
+    key: &str,
+    cell: Option<PyObjectRef>,
+) {
+    let guard = caches.lock();
+    if let Some(cache) = guard
+        .as_ref()
+        .and_then(|registry| registry.get(key))
+        .cloned()
+    {
+        cache_set_cell(&cache, cell);
+    }
 }
 
 /// GC root walk over a single `GlobalCache` and its chained
@@ -1056,9 +1076,7 @@ impl ModuleDictStrategy {
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
         // round-trip.
-        if let Some(cache) = caches_get(&self.caches, key) {
-            cache_set_cell(&cache, Some(w_to_store));
-        }
+        caches_set_cell(&self.caches, key, Some(w_to_store));
     }
 
     /// `celldict.py length`:
@@ -1095,12 +1113,10 @@ impl ModuleDictStrategy {
         let removed = unsafe {
             crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).remove(key)?
         };
-        if let Some(cache) = caches_get(&self.caches, key) {
-            // `celldict.py:117-121`: zero out the per-key cache
-            // so LOAD_GLOBAL falls through to the builtins
-            // fallback (or NameError) on the next read.
-            cache_set_cell(&cache, None);
-        }
+        // `celldict.py:117-121`: zero out the per-key cache
+        // so LOAD_GLOBAL falls through to the builtins
+        // fallback (or NameError) on the next read.
+        caches_set_cell(&self.caches, key, None);
         self.mutated();
         Some(removed)
     }

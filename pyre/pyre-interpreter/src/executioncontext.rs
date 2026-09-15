@@ -3457,14 +3457,13 @@ mod tests {
         use super::{FORCE_VREF_HOOK, force_vref, register_force_vref_hook};
         use majit_metainterp::virtualref::{ObjectHeader, VirtualRefInfo};
 
-        struct RestoreUnset;
-        impl Drop for RestoreUnset {
+        struct RestorePrev(*mut ());
+        impl Drop for RestorePrev {
             fn drop(&mut self) {
-                FORCE_VREF_HOOK.store(std::ptr::null_mut(), Ordering::Release);
+                FORCE_VREF_HOOK.store(self.0, Ordering::Release);
             }
         }
-        let _restore = RestoreUnset;
-        FORCE_VREF_HOOK.store(std::ptr::null_mut(), Ordering::Release);
+        let _restore = RestorePrev(FORCE_VREF_HOOK.swap(std::ptr::null_mut(), Ordering::AcqRel));
 
         static SEEN_VREF: AtomicPtr<PyFrame> = AtomicPtr::new(std::ptr::null_mut());
         unsafe extern "C" fn record_vref(frame: *mut PyFrame) -> *mut PyFrame {

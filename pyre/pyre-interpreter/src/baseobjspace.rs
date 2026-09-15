@@ -466,8 +466,6 @@ impl AppExecCache {
 /// Extend alongside each real SpaceCache subclass, not a parallel registry.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpaceCacheClass {
-    GatewayCache,
-    TypeCache,
     ClassDictStrategy,
     SysState,
 }
@@ -520,8 +518,6 @@ impl<T> std::ops::Deref for RetainedSpaceCache<T> {
 
 #[derive(Clone)]
 pub enum SpaceCacheInstance {
-    GatewayCache(RetainedSpaceCache<crate::gateway::GatewayCache>),
-    TypeCache(RetainedSpaceCache<crate::objspace::std::typeobject::TypeCache>),
     ClassDictStrategy(RetainedSpaceCache<crate::objspace::std::classdict::ClassDictStrategy>),
     SysState(RetainedSpaceCache<crate::module::sys::state::SysState>),
 }
@@ -531,8 +527,6 @@ impl SpaceCacheInstance {
     /// its isolated space alive. The stored clone is left untouched.
     fn retain_owner(self) -> Self {
         match self {
-            Self::GatewayCache(cache) => Self::GatewayCache(cache.retain_owner()),
-            Self::TypeCache(cache) => Self::TypeCache(cache.retain_owner()),
             Self::ClassDictStrategy(cache) => Self::ClassDictStrategy(cache.retain_owner()),
             Self::SysState(cache) => Self::SysState(cache.retain_owner()),
         }
@@ -606,16 +600,6 @@ impl SpaceCallable<SpaceHandle> for SpaceCacheClass {
         // Store Isolated(Weak). IsolatedStrong is attached only to the
         // clone `fromcache` returns (`SpaceCacheInstance::retain_owner`).
         Ok(match self {
-            Self::TypeCache => SpaceCacheInstance::TypeCache(RetainedSpaceCache::stored(
-                space.clone(),
-                std::sync::Arc::new(crate::objspace::std::typeobject::TypeCache::new(
-                    space.clone(),
-                )),
-            )),
-            Self::GatewayCache => SpaceCacheInstance::GatewayCache(RetainedSpaceCache::stored(
-                space.clone(),
-                std::sync::Arc::new(crate::gateway::GatewayCache::new(space.clone())),
-            )),
             Self::ClassDictStrategy => {
                 SpaceCacheInstance::ClassDictStrategy(RetainedSpaceCache::stored(
                     space.clone(),
@@ -702,8 +686,6 @@ impl ObjSpace {
         self.gateway_cache.walk_roots(forward);
         self.type_cache.walk_roots(forward);
         self.fromcache.visit_values_mut(|cache| match cache {
-            SpaceCacheInstance::GatewayCache(cache) => cache.walk_roots(forward),
-            SpaceCacheInstance::TypeCache(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::ClassDictStrategy(cache) => cache.walk_roots(forward),
             SpaceCacheInstance::SysState(cache) => cache.walk_roots(forward),
         });
