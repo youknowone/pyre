@@ -16612,7 +16612,7 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     op: &DecodedOp,
     r_args: &[OpRef],
     dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // `simple_call(__import__, NULL, name, globals, locals, fromlist, level)`
     if r_args.len() != 7 {
         return Ok(None);
@@ -16679,14 +16679,27 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     if !fromlist_empty {
         return Ok(None);
     }
-    // Record-time probe: decline on FastPathGiveUp *or* a raising accessor.
-    // The compiled residual publishes the latter; publishing here would
-    // leave a pending JIT exception on a fold we are about to refuse.
+    // Record-time `_gcd_import` probe.  FastPathGiveUp declines so the
+    // generic importer runs once.  A non-`AttributeError` is this CALL's
+    // result (`_gcd_import` re-raises); returning `None` would let
+    // `residual_call` invoke `__import__` again and run the accessor twice.
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return Ok(None);
     };
-    let Ok(Some(w_mod)) = import_cached_lookup(s, fromlist_empty) else {
-        return Ok(None);
+    let w_mod = match import_cached_lookup(s, fromlist_empty) {
+        Ok(Some(w_mod)) => w_mod,
+        Ok(None) => return Ok(None),
+        Err(mut err) => {
+            let exc = err.to_exc_object();
+            let raised = ctx.trace_ctx.const_ref(exc as i64);
+            ctx.set_last_exc_value(raised, ConcreteValue::Ref(exc));
+            ctx.fbw_mode.class_of_last_exc_is_const = true;
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
+            return Ok(Some(DispatchOutcome::SubRaise {
+                exc: raised,
+                exc_concrete: ConcreteValue::Ref(exc),
+            }));
+        }
     };
 
     let callable_op = r_args[0];
@@ -16765,7 +16778,7 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
     ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-    Ok(Some(()))
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
