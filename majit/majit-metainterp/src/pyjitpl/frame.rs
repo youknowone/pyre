@@ -1262,23 +1262,10 @@ impl MIFrame {
         if registers.is_empty() {
             return;
         }
-        // pyjitpl.py `replace_active_box_in_frame` writes the new box
-        // into the register; snapshot then reads `registers_r[i]`.
-        // `portal_red_refs` is the flat-OpRef stand-in for that identity,
-        // so a Ref replace must retire the entry or the next snapshot
-        // still names the portal InputArg.
-        let mut replaced_ref_regs = Vec::new();
-        for (i, slot) in registers.iter_mut().enumerate() {
+        for slot in registers.iter_mut() {
             if *slot == Some(oldbox) {
                 *slot = Some(newbox);
-                if oldbox_type == Type::Ref {
-                    replaced_ref_regs.push(i);
-                }
             }
-        }
-        drop(registers);
-        for i in replaced_ref_regs {
-            self.retire_portal_red_ref(i);
         }
     }
 
@@ -1935,23 +1922,6 @@ mod tests {
         // Ref / float banks untouched — bank dispatch is by oldbox.type.
         assert_eq!(frame.ref_regs[0], Some(OpRef::ref_op(7)));
         assert_eq!(frame.float_regs[0], Some(OpRef::float_op(7)));
-    }
-
-    #[test]
-    fn replace_active_box_in_frame_retires_portal_red_ref() {
-        let jitcode = make_jitcode_with_regs(0, 2, 0);
-        let mut frame = MIFrame::new(jitcode, 0);
-        let old = OpRef::ref_op(7);
-        let new = OpRef::ref_op(42);
-        frame.ref_regs[0] = Some(old);
-        frame.ref_regs[1] = Some(OpRef::ref_op(8));
-        frame.portal_red_refs.push((0, old));
-        frame.portal_red_refs.push((1, OpRef::ref_op(8)));
-
-        frame.replace_active_box_in_frame(old, new, Type::Ref);
-
-        assert_eq!(frame.ref_regs[0], Some(new));
-        assert_eq!(frame.portal_red_refs, vec![(1, OpRef::ref_op(8))]);
     }
 
     /// Empty bank short-circuit: pyjitpl.py:248 `if not count: return`.
