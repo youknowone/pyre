@@ -3923,6 +3923,12 @@ impl AllVirtuals {
         }
         let obj = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<AllVirtuals>());
         assert!(!obj.is_null(), "AllVirtuals old-gen allocation failed");
+        // Upstream the instance is born young, so storing `cache` needs no
+        // barrier. This one is born old and `ptrs` can name nursery objects
+        // (`bh_newstr` allocates through `alloc_varsize_typed`), so remember it
+        // before the store; a minor collection then traces it through
+        // `custom_trace`.
+        majit_gc::gc_write_barrier_managed(obj);
         unsafe { std::ptr::write(obj.0 as *mut AllVirtuals, value) };
         let slot = Box::into_raw(Box::new(obj));
         unsafe {
@@ -6299,7 +6305,7 @@ mod fail_descr_tests {
         assert_eq!(forced_inner.fail_arg_types(), &[Type::Int]);
 
         let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref]);
-        let exc_inner = resume_guard_descr(&exc).expect("Exc as_any is the wrapper, not the base");
+        let exc_inner = resume_guard_descr(&exc).expect("Exc as_any is the inner base descr");
         assert_eq!(exc_inner.fail_arg_types(), &[Type::Ref]);
 
         let plain = make_resume_guard_descr_typed(vec![Type::Float]);
