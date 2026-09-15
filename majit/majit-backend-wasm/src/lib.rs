@@ -2440,6 +2440,10 @@ struct PendingInline {
     /// parent is in the owner's merged stream. `None` is the ordinary
     /// owner-stream index already stored on `region`.
     remap: Option<(u64, u32)>,
+    /// Set when a one-shot trip leftover is waiting on a sibling peel
+    /// (`uninitialized_label`). Ordinary deferred entries stay false so a
+    /// hot sibling cannot pull them in before their own threshold.
+    retry_on_sibling: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2588,6 +2592,7 @@ fn register_pending_inline(
                 owner,
                 region,
                 remap,
+                retry_on_sibling: false,
             },
         )
     });
@@ -3114,7 +3119,10 @@ impl WasmBackend {
             pending
                 .borrow()
                 .iter()
-                .filter(|(_, item)| Arc::ptr_eq(&item.owner, &owner))
+                .filter(|(_, item)| {
+                    Arc::ptr_eq(&item.owner, &owner)
+                        && (item.remap.is_some() || item.retry_on_sibling)
+                })
                 .map(|(&id, _)| id)
                 .collect()
         });
@@ -3202,6 +3210,7 @@ impl WasmBackend {
                         owner: owner.clone(),
                         region,
                         remap,
+                        retry_on_sibling: remap.is_none(),
                     },
                 )
             });
