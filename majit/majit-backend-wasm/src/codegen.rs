@@ -1613,7 +1613,17 @@ impl LabelResumeData {
 
             let mut missing = Vec::new();
             let mut bad = false;
-            for op in &ops[label_pos + 1..] {
+            // An appended region is not a predecessor of this label's
+            // resume. Its body reads would only reserve frozen slots
+            // the resume loader never reloads — the guard-fail branch
+            // is the region's sole predecessor.
+            let scan_end = regions
+                .iter()
+                .filter(|region| region.ops_start > label_pos)
+                .map(|region| region.ops_start)
+                .min()
+                .unwrap_or(ops.len());
+            for op in &ops[label_pos + 1..scan_end] {
                 let mut reads: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
                 if let Some(failargs) = op.getfailargs() {
                     reads.extend(failargs.iter().map(|a| a.to_opref()));
