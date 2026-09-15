@@ -6151,12 +6151,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // drain builds once a guard inside the compiled chain fails.  The drain
     // walks the paused middle frames between the raising leaf and the root, so
     // one intermediate frame may sit between the loop and the raise; a middle
-    // that CATCHES is still declined.  Two live copies of the same `w_code`
-    // stay at depth two because a third copy storms
-    // `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).  A
-    // distinct `shape → mid → leaf` chain is admitted at three so it follows
-    // `perform_call`.  A value-returning chain (no raise) inlines to the full
-    // depth either way.
+    // that CATCHES is still declined.  Raising depth stays at two for every
+    // shape: a third distinct `shape → mid → leaf` frame abort_trace's
+    // `exception_try_call_inlined_callee_raise` (3/1/0 → 2/0/3, `b3efabbc8ed`),
+    // and a third copy of the same `w_code` storms
+    // `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).
+    // `perform_call` has no such cap; see `fbw_effective_multiframe_depth`
+    // for the convergence condition.  A value-returning chain (no raise)
+    // inlines to the full depth either way.
     // Value-returning recursion still keys only on this callee's own
     // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
     // only a raising-chain safety valve: it must not promote an unrelated

@@ -113,8 +113,9 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
 
 /// True when two live frames share a `w_code`.  Inlining a raising leaf
 /// through two suspended copies of the same intermediate is the
-/// `selfrec_tail_exception_unwind` storm; a `shape → mid → leaf` chain of
-/// distinct codes is not.
+/// `selfrec_tail_exception_unwind` storm.  A distinct `shape → mid → leaf`
+/// chain is a different failure (`exception_try_call_inlined_callee_raise`
+/// abort_trace) that currently shares the same depth-2 bound.
 pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
     let mut seen = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -140,11 +141,19 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 /// frame is present.
 ///
 /// Raising chains keep a shallower local bound because the carrier unwind
-/// crosses suspended frames.  Admitting a third inlined raising frame
-/// (`shape → mid → leaf`) abort_trace's the exception-edge bridges on
-/// `exception_try_call_inlined_callee_raise`.  The second flag is "this
-/// callee is already on the stack, or two live frames already share a
-/// `w_code`" — that is the `selfrec_tail_exception_unwind` storm.
+/// crosses suspended frames.  `perform_call` (`pyjitpl.py`) has no such cap:
+/// it always pushes a new `MIFrame`.  A third inlined raising frame is still
+/// blocked here — `b3efabbc8ed` measured `exception_try_call_inlined_callee_raise`
+/// going 3/1/0 → 2/0/3 (three exception-edge bridges abort_trace), and a
+/// third copy of the same `w_code` storms `selfrec_tail_exception_unwind`
+/// (`guard_failures` 937 → 7408).  The second flag is therefore ignored on
+/// the raising path: both the distinct `shape → mid → leaf` chain and the
+/// selfrec storm fail at depth 3.
+///
+/// Convergence: exception-edge bridges for a three-frame raising chain must
+/// compile the way `perform_call` + `finishframe_exception` do.  Until
+/// `exception_try_call_inlined_callee_raise` stays at 3/1/0 (or better) with
+/// this function returning 3, the local bound stays.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
     recursive_or_duplicate: bool,
