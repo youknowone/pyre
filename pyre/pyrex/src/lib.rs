@@ -673,6 +673,10 @@ pub fn main_entry(binary_name: &'static str) {
         } else {
             granted.min(mapped)
         };
+        // Capture the inherited mask before either path so `real_main`'s
+        // unblock restores signals the caller had blocked, instead of
+        // opening SIGINT/SIGALRM unconditionally.
+        pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
         if usable >= pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE {
             pyre_interpreter::stack_check::configure_current_thread_stack_size(
                 pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
@@ -683,7 +687,6 @@ pub fn main_entry(binary_name: &'static str) {
             // The soft limit went up but the mapping did not. Same situation
             // as darwin: reserve a thread whose stack is actually that large,
             // and route process-directed signals onto that thread.
-            pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
             std::thread::Builder::new()
                 .stack_size(INTERPRETER_THREAD_STACK_SIZE)
                 .spawn(move || {
