@@ -17359,11 +17359,13 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
         return Ok(None);
     }
     // `interp___import__` uses `space.is_true(w_fromlist)`.  Only None
-    // and tuples are classified here: an empty list is falsey, and a
-    // list can change emptiness after GuardValue on the pointer.
+    // and an exact tuple are classified here: a list can change
+    // emptiness after GuardValue on the pointer, and a tuple subclass
+    // can override `__bool__`.  Exact-tuple emptiness is `len == 0`,
+    // the same answer `is_true` gives without a hook.
     if !w_fromlist.is_null()
         && !unsafe { pyre_object::is_none(w_fromlist) }
-        && !unsafe { pyre_object::is_tuple(w_fromlist) }
+        && !unsafe { pyre_object::is_exact_tuple(w_fromlist) }
     {
         return Ok(None);
     }
