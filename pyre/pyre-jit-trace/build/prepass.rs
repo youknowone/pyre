@@ -5,6 +5,7 @@
 //! Analyzes all source files from:
 //! - pyre-object (Python object types: W_IntObject, W_FloatObject, etc.)
 //! - pyre-interpreter (object space, bytecode dispatch, eval loop)
+//! - pyre-module (optional builtin modules: math, _csv, …)
 
 #[path = "../src/call_spec.rs"]
 mod call_spec;
@@ -941,6 +942,11 @@ fn real_main() {
     let source_dirs = [
         format!("{pyre_base}/pyre-object/src"),
         format!("{pyre_base}/pyre-interpreter/src"),
+        // Optional builtins live in this crate; `should_lower_module`
+        // admits `module::*` only when a matching source path is in
+        // this census. Interpreter `module/mod.rs` currently contributes
+        // the `module` root as well, but the moved graphs belong here.
+        format!("{pyre_base}/pyre-module/src"),
     ];
 
     let mut source_paths = Vec::new();
@@ -1136,7 +1142,27 @@ fn real_main() {
             &analyze_config.pipeline.transform,
         )
     };
+    // Link the optional-module crate into this process so its
+    // `#[pyre_methods]` wrappers join `BUILTIN_WRAPPER_DESCRIPTORS`.
+    // `jit_trace_fnaddrs` reads that slice; without the crate the
+    // moved builtins publish no address and
+    // `compute_builtin_wrapper_indirect_graphs` records
+    // `no jitcode for address`. `register` is idempotent with the
+    // crate's ctor.
+    pyre_module::register();
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
+    // Host-only: `BUILTIN_WRAPPER_DESCRIPTORS` is empty on wasm32.
+    // A missing row here means the build-dep was dropped and every
+    // moved builtin will residualise at `no jitcode for address`.
+    if !fnaddr_bindings
+        .iter()
+        .any(|(path, _)| path.contains("pyre_module::module::") && path.contains("__majit_wrap_"))
+    {
+        panic!(
+            "prepass fnaddr table has no pyre-module #[pyre_methods] wrappers; \
+             pyre-module must be linked into this build script"
+        );
+    }
     // Prebuilt object-space singleton addresses (static `PyType` pointers
     // and dict-strategy refs).  `majit-translate` is the translation
     // layer and must not import `pyre-object`; the driver supplies these

@@ -168,4 +168,20 @@ mod tests {
             "the crate-stripped alias must resolve too",
         );
     }
+
+    /// `#[pyre_methods]` wrappers in this crate must appear in the
+    /// process-global fnaddr table. The prepass reads the same table
+    /// from a host copy of this crate; a missing row here is the same
+    /// defect as a build script that forgot to link `pyre-module`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_bz2_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_bz2::compressor_methods::__majit_wrap___new__"
+            ),
+            "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
 }
