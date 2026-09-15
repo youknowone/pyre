@@ -10985,6 +10985,18 @@ pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     registry.get(name).copied().map(|cls| cls as PyObjectRef)
 }
 
+/// Word-sized residual for [`lookup_exc_class`]: a `&str` is a fat
+/// pointer and cannot be a residual argument. LOAD_GLOBAL's builtin
+/// fallback uses this when the frame has no picked Module / EC.
+#[majit_macros::dont_look_inside]
+pub fn lookup_exc_class_obj(w_name: PyObjectRef) -> PyObjectRef {
+    if w_name.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let name = unsafe { pyre_object::unicodeobject::w_str_get_value(w_name) };
+    lookup_exc_class(name).unwrap_or(pyre_object::PY_NULL)
+}
+
 /// The `PythonFinalizationError` for an operation refused at interpreter
 /// shutdown, carrying `message` as its argument when one is given.
 ///
@@ -24333,7 +24345,7 @@ mod tests {
         let err = parse_int_from_str(source, &text, 10).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::ValueError);
         assert!(
-            err.message
+            err.message_text()
                 .starts_with("invalid literal for int() with base 10:")
         );
     }

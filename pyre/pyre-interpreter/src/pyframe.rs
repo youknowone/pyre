@@ -1867,7 +1867,9 @@ pub struct FrameLocalsRoot {
 }
 
 impl FrameLocalsRoot {
-    #[majit_macros::dont_look_inside]
+    /// Look-inside: the 2-word `{frame, registered}` return cannot be a
+    /// residual. The interior slot address stays inside
+    /// [`register_frame_locals_slot`].
     pub fn new(frame_ptr: *mut PyFrame) -> Self {
         let registered = unsafe { register_frame_locals_slot(frame_ptr) };
         Self {
@@ -3989,8 +3991,13 @@ impl PyFrame {
     /// no locals bound yet (a function before its first `fast2locals`).
     #[inline]
     pub fn get_w_locals(&self) -> PyObjectRef {
-        self.getdebug_data()
-            .map_or(pyre_object::PY_NULL, |data| data.w_locals)
+        // `pyframe.py get_w_locals`: plain None-check, no closure.
+        // `map_or` lowers to a synthetic-transparent-ctor residual the
+        // walker cannot bind (`get_w_locals::closure`).
+        match self.getdebug_data() {
+            None => pyre_object::PY_NULL,
+            Some(data) => data.w_locals,
+        }
     }
 
     /// CPython 3.14 `PyFrameObject.f_extra_locals`, allocated by
@@ -4404,10 +4411,23 @@ impl PyFrame {
         // Both writes below — the stack slot and the depth — have to land on
         // the live frame, so reload once and use it for both.
         let frame = self.live_mut();
-        frame.assert_stack_index(frame.valuestackdepth);
-        let idx = frame.valuestackdepth;
-        frame.set_locals_w(idx, value);
-        frame.valuestackdepth = idx + 1;
+        frame.push_on_self(value);
+    }
+
+    /// `pyframe.py pushvalue` — write the slot and the depth on `self`.
+    ///
+    /// [`push`] reloads through [`Self::live_mut`] first because it is the
+    /// post-allocation write and the caller's `&mut self` may name a
+    /// forwarded corpse. Callers that already hold the live frame —
+    /// [`crate::eval::FrameAnchor::live`] — write here so the tracer sees
+    /// the virtualizable stores instead of a `try_gc_current_object_address`
+    /// residual on the walk-local frame.
+    #[inline]
+    pub fn push_on_self(&mut self, value: PyObjectRef) {
+        self.assert_stack_index(self.valuestackdepth);
+        let idx = self.valuestackdepth;
+        self.set_locals_w(idx, value);
+        self.valuestackdepth = idx + 1;
     }
 
     /// Reads and writes through the caller's `&mut self`, without the
@@ -5327,13 +5347,23 @@ impl PyFrame {
     /// pyframe.py get_f_trace_lines
     #[inline]
     pub fn get_f_trace_lines(&self) -> bool {
-        self.getdebug_data().is_none_or(|d| d.f_trace_lines)
+        // `pyframe.py get_f_trace_lines`: None → True. Avoid `is_none_or`
+        // so the walker does not residual a synthetic closure ctor.
+        match self.getdebug_data() {
+            None => true,
+            Some(d) => d.f_trace_lines,
+        }
     }
 
     /// pyframe.py get_f_trace_opcodes
     #[inline]
     pub fn get_f_trace_opcodes(&self) -> bool {
-        self.getdebug_data().is_some_and(|d| d.f_trace_opcodes)
+        // `pyframe.py get_f_trace_opcodes`: None → False. Avoid `is_some_and`
+        // so the walker does not residual a synthetic closure ctor.
+        match self.getdebug_data() {
+            None => false,
+            Some(d) => d.f_trace_opcodes,
+        }
     }
 
     /// pyframe.py fget_f_trace_lines

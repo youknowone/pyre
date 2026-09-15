@@ -1244,6 +1244,12 @@ fn refuse_walk_local_ref_args(
     if !small_ref && !bridge_store && !pointer_index {
         return None;
     }
+    // `FrameAnchor::live` residualizes `&self` as the depth word in a Ref
+    // register (`frame_anchor_live_method_jit_abi`). A live slot index is
+    // also `<= 0x1000`; running the helper is what the residual exists for.
+    if crate::allow_small_ref_residual(func) {
+        return None;
+    }
     ctx.symbolic_residual_abort = true;
     if crate::is_bridge_walking() || ctx.is_bridge_trace {
         ctx.deterministic_bridge_abort = true;
@@ -1506,6 +1512,15 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
+    /// Compare-folded `newbool` CallR. Replaced after `IntIsTrue` of
+    /// the live compare so JUMP_IF does not list it as a failarg.
+    pending_newbool: Option<(OpRef, i64, OpRef)>,
+    /// Inline-built exception from a folded `CallFn` constructor.
+    /// The following `RaiseVarargs` consumes it (`FBW_BUILT_EXC`).
+    pending_built_exc: Option<(OpRef, i64)>,
+    /// Built exception waiting for `BC_RAISE` to emit a virtual
+    /// traceback instead of the forcing recording hook.
+    fresh_virtual_exc: Option<(OpRef, i64)>,
     marker: PhantomData<(S, R)>,
 }
 
@@ -1580,6 +1595,194 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
+    /// Fold `bool_singleton` inside a descended `w_bool_from` body.
+    /// `baseobjspace.py newbool` returns the prebuilt `w_True`/`w_False`
+    /// after the `if b:` guard; the OnceLock helper is not in the
+    /// fnaddr table, so the residual must not run.
+    fn try_record_newbool_singleton(
+        &mut self,
+        ctx: &mut TraceCtx,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let name = self.frames.current_mut().jitcode.name();
+        if name != "w_bool_from" && name != "bool_value_from_truth" {
+            return None;
+        }
+        let spec = crate::box_trace::compare_op_residual()?;
+        let observed = self
+            .frames
+            .current_mut()
+            .int_values
+            .first()
+            .copied()
+            .flatten()?;
+        let ptr = if observed != 0 {
+            spec.w_true
+        } else {
+            spec.w_false
+        };
+        let boxed = ctx.const_ref(ptr);
+        self.set_ref_reg(dst, Some(boxed), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// Specialise residual `compare_slot_jit_abi` of two ints to unbox +
+    /// `int_OP` + `newbool`, before `ForceToken` escapes the boxes.
+    /// A mid-helper `GuardTrue` fail-resumes with a desynced snapshot
+    /// (hang). Cache `intval` on the elidable `newbool` box instead:
+    /// JUMP_IF's `is_true` hits the cache and records `GuardTrue` at
+    /// its own live marker, then the unused `CallR` DCEs.
+    fn try_record_int_compare(
+        &mut self,
+        ctx: &mut TraceCtx,
+        _sym: &mut S,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        args: &[OpRef],
+        arg_types: &[majit_ir::Type],
+        raw_i: &[i64],
+        raw_r: &[i64],
+        arg_classes: &str,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::compare_op_residual()?;
+        if !spec.matches(concrete_ptr) && !spec.matches(trace_ptr) {
+            return None;
+        }
+        if arg_types
+            != [
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+            ]
+        {
+            return None;
+        }
+        if args.len() < 3 || raw_r.len() < 2 {
+            return None;
+        }
+        if !(spec.is_exact_int)(raw_r[0]) || !(spec.is_exact_int)(raw_r[1]) {
+            return None;
+        }
+        let tag = if let Some(majit_ir::Value::Int(t)) = ctx.box_value(args[2]) {
+            t
+        } else {
+            *raw_i.last().unwrap_or(&i64::MIN)
+        };
+        let opcode = crate::box_trace::int_compare_op_kind(tag)?;
+        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
+        {
+            return None;
+        }
+        self.clear_exception();
+        let boxed_ptr = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                arg_classes,
+                Some(raw_i),
+                Some(raw_r),
+                Some(&[]),
+            )
+        };
+        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 || boxed_ptr == 0 {
+            return None;
+        }
+        if boxed_ptr != spec.w_true && boxed_ptr != spec.w_false {
+            return None;
+        }
+        let truth = crate::box_trace::trace_int_compare(
+            ctx,
+            args[0],
+            args[1],
+            opcode,
+            spec.int_type_addr,
+            spec.intval_descr.clone(),
+        );
+        // `baseobjspace.py newbool` is look-inside. The residual CallR
+        // is only a heapcache key so JUMP_IF can read `IntLt`; it is
+        // replaced after `IntIsTrue` and dropped by OptSimplify when
+        // unused (`CALL_PURE` would otherwise become a residual CALL).
+        let boxed = ctx.call_typed_with_effect_pure(
+            OpCode::CallR,
+            spec.newbool_fnaddr as *const (),
+            &[truth],
+            &[majit_ir::Type::Int],
+            majit_ir::Type::Ref,
+            crate::ELIDABLE_CANNOT_RAISE_EFFECT_INFO,
+            &[
+                majit_ir::Value::Int(spec.newbool_fnaddr),
+                majit_ir::Value::Int(if boxed_ptr == spec.w_true { 1 } else { 0 }),
+            ],
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
+        );
+        ctx.heap_cache_mut()
+            .class_now_known(boxed, spec.bool_type_addr);
+        ctx.heapcache_setfield_cached(boxed, spec.bool_intval_descr.index(), truth);
+        let w_class_null = ctx.const_ref(0);
+        ctx.heapcache_setfield_cached(boxed, spec.w_class_descr.index(), w_class_null);
+        let ob_type = ctx.const_ref(spec.bool_type_addr);
+        ctx.heapcache_setfield_cached(boxed, spec.ob_type_descr.index(), ob_type);
+        ctx.set_opref_concrete(
+            boxed,
+            majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr as usize)),
+        );
+        self.set_ref_reg(dst, Some(boxed), Some(boxed_ptr));
+        self.pending_newbool = Some((boxed, boxed_ptr, truth));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `try_walker_specialize_truth_bool`: `is_true` of a bool is
+    /// `intval` then `int_is_true`. The compare fold caches `intval` on
+    /// the newbool box so this Getfield hits and JUMP_IF guards the
+    /// live compare at its own snapshot.
+    fn try_record_truth_bool(
+        &mut self,
+        ctx: &mut TraceCtx,
+        _sym: &mut S,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        args: &[OpRef],
+        raw_r: &[i64],
+        arg_classes: &str,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::compare_op_residual()?;
+        if !spec.truth_fnaddrs.contains(&concrete_ptr) && !spec.truth_fnaddrs.contains(&trace_ptr) {
+            return None;
+        }
+        if args.len() != 1 || raw_r.is_empty() {
+            return None;
+        }
+        if !(spec.is_bool)(raw_r[0]) {
+            return None;
+        }
+        if concrete_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr)
+        {
+            return None;
+        }
+        self.clear_exception();
+        let concrete = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                arg_classes,
+                Some(&[]),
+                Some(raw_r),
+                Some(&[]),
+            )
+        };
+        if crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) != 0 {
+            return None;
+        }
+        // Cached `intval` only — `trace_unbox_int` would `GuardClass`
+        // the boxed CallR and pin it in that snapshot.
+        let raw = ctx.heapcache_getfield_cached(args[0], spec.bool_intval_descr.index())?;
+        let is_true = ctx.record_op(OpCode::IntIsTrue, &[raw]);
+        ctx.set_opref_concrete(is_true, majit_ir::Value::Int(concrete));
+        self.set_int_reg(dst, Some(is_true), Some(concrete));
+        self.replace_pending_newbool_if_truth(ctx, raw);
+        Some(TraceAction::Continue)
+    }
+
     fn active_standard_virtualizable(&self, ctx: &TraceCtx) -> Option<ActiveStandardVirtualizable> {
         let vable_opref = ctx.standard_virtualizable_box()?;
         let info = ctx.virtualizable_info()?.clone();
@@ -1717,7 +1920,21 @@ where
                 /* after_residual_call */ true,
             );
             if materialized {
-                ctx.reload_tokenless_virtualizable_after_residual_call();
+                if let (Some(info), Some(ptr)) = (
+                    ctx.virtualizable_info().cloned(),
+                    ctx.standard_virtualizable_ptr(),
+                ) && ctx.vable_heap_static_diverged(&info, ptr as *const u8)
+                {
+                    // Residual wrote vsd/stack without forcing the token
+                    // (`dispatch_exception_handler`). Sync only those
+                    // slots — `load_fields_from_virtualizable` would
+                    // replace resume Virtuals with heap ConstPtrs and
+                    // fold immutable `intval` to the recording-time
+                    // counter (exception-bridge hang).
+                    ctx.reload_vable_stack_if_heap_moved();
+                } else {
+                    ctx.reload_tokenless_virtualizable_after_residual_call();
+                }
             }
             TraceAction::Continue
         }
@@ -2251,6 +2468,283 @@ where
         }
     }
 
+    /// Second portal red is the ExecutionContext (`reds = ['frame', 'ec']`).
+    ///
+    /// `state.rs recover_bridge_execution_context`: a bridge resume
+    /// does not restamp `portal_red_refs`, so recover the live EC box
+    /// from registers / concrete match, and only then `const_ref`.
+    /// A residual `getexecutioncontext` would leave a Call after opt.
+    fn portal_ec_box(&self, ctx: &mut TraceCtx) -> Option<OpRef> {
+        if let Some(ec) = self
+            .frames
+            .frames
+            .iter()
+            .find(|frame| frame.portal_entered)
+            .or_else(|| {
+                self.frames
+                    .frames
+                    .iter()
+                    .find(|frame| frame.portal_red_refs.len() >= 2)
+            })
+            .and_then(|frame| frame.portal_red_refs.get(1).map(|(_, opref)| *opref))
+        {
+            return Some(ec);
+        }
+        let spec = crate::box_trace::exception_trace_residual()?;
+        let ec_ptr = (spec.current_ec_ptr)();
+        if ec_ptr == 0 {
+            return None;
+        }
+        for frame in &self.frames.frames {
+            for (i, slot) in frame.ref_regs.iter().enumerate() {
+                let Some(op) = *slot else {
+                    continue;
+                };
+                if frame.ref_values.get(i).and_then(|v| *v) == Some(ec_ptr) {
+                    return Some(op);
+                }
+                if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
+                    && r.0 as i64 == ec_ptr
+                {
+                    return Some(op);
+                }
+            }
+        }
+        Some(ctx.const_ref(ec_ptr))
+    }
+
+    /// FBW `try_walker_trace_exception_new`: `CallFn` of a canonical
+    /// exception class becomes `NewWithVtable` + `SetfieldGc` before
+    /// `ForceToken`.
+    fn try_record_exception_new(
+        &mut self,
+        ctx: &mut TraceCtx,
+        _sym: &mut S,
+        args: &[OpRef],
+        raw_r: &[i64],
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if !(spec.can_new)(raw_r) {
+            return None;
+        }
+        // Builtin exception classes are immortal. A mid-bridge
+        // `GuardValue` snapshot reads the residual's liveness bitmap
+        // and panics (`constants_f` empty). Use the const class as
+        // `w_class` and rewrite the live box without a new guard.
+        let mut args = args.to_vec();
+        if let Some(callable_idx) = (spec.callable_index)(raw_r)
+            && callable_idx < args.len()
+            && !args[callable_idx].is_constant()
+        {
+            let expected = ctx.const_ref(raw_r[callable_idx]);
+            self.replace_box(ctx, args[callable_idx], expected, Type::Ref);
+            args[callable_idx] = expected;
+        }
+        let (boxed, ptr) = (spec.emit_new)(ctx, &args, raw_r)?;
+        ctx.set_opref_concrete(boxed, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+        self.set_ref_reg(dst, Some(boxed), Some(ptr));
+        self.pending_built_exc = Some((boxed, ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `try_walker_trace_raise_builtin`: skip the residual publish
+    /// for a freshly-built exception with no `from` cause.
+    fn try_record_raise_builtin(
+        &mut self,
+        ctx: &mut TraceCtx,
+        args: &[OpRef],
+        raw_r: &[i64],
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        let (exc, ptr) = self.pending_built_exc?;
+        if !(spec.can_raise)(raw_r) {
+            return None;
+        }
+        let ec = self.portal_ec_box(ctx);
+        let boxed = (spec.emit_raise)(ctx, args, raw_r, exc, ptr, ec)?;
+        self.set_ref_reg(dst, Some(boxed), Some(ptr));
+        self.fresh_virtual_exc = Some((boxed, ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// `eval.rs raise_prepared_exc`: `RAISE_VARARGS 1` of a just-built
+    /// instance is identity + `attach_raise_cause`. `pyopcode.py
+    /// RAISE_VARARGS` looks inside; the helper is `dont_look_inside`.
+    fn try_record_raise_prepared(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        args: &[OpRef],
+        raw_r: &[i64],
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if !spec.matches_raise_prepared(concrete_ptr) && !spec.matches_raise_prepared(trace_ptr) {
+            return None;
+        }
+        if args.len() != 1 || raw_r.is_empty() {
+            return None;
+        }
+        let (exc, ptr) = self.pending_built_exc?;
+        if raw_r[0] != ptr && args[0] != exc {
+            return None;
+        }
+        self.pending_built_exc = None;
+        (spec.attach_raise_cause)(ptr);
+        self.set_ref_reg(dst, Some(exc), Some(ptr));
+        self.fresh_virtual_exc = Some((exc, ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// `error.py OperationError.get_w_value`: already-built instance
+    /// is identity. `pyerror_to_exc_object` is residual; fold it back
+    /// onto the virtual exception so traceback SETFIELD and later
+    /// Getfield kind hit the NewWithVtable, not the CallR result.
+    fn try_record_to_exc_object(
+        &mut self,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        args: &[OpRef],
+        raw_r: &[i64],
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if !spec.matches_to_exc_object(concrete_ptr) && !spec.matches_to_exc_object(trace_ptr) {
+            return None;
+        }
+        if args.len() != 1 || raw_r.is_empty() {
+            return None;
+        }
+        let exc_ptr = (spec.exc_object_of_pyerror)(raw_r[0])?;
+        let (exc, ptr) = self.fresh_virtual_exc?;
+        if exc_ptr != ptr {
+            return None;
+        }
+        self.set_ref_reg(dst, Some(exc), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// `pyopcode.py handle_operation_error` looks inside the exception
+    /// table lookup. The helper is `dont_look_inside_cannot_raise`;
+    /// execute it for the live frame and keep the handler pc, so the
+    /// virtual exception is not a CallI argument.
+    fn try_record_dispatch_exception_handler(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        raw_i: &[i64],
+        raw_r: &[i64],
+        raw_f: &[i64],
+        arg_classes: &str,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if !spec.matches_dispatch_handler(concrete_ptr) && !spec.matches_dispatch_handler(trace_ptr)
+        {
+            return None;
+        }
+        if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr) {
+            return None;
+        }
+        let concrete = unsafe {
+            majit_backend::call_stub::bh_call_i_by_classes(
+                concrete_ptr as usize,
+                arg_classes,
+                Some(raw_i),
+                Some(raw_r),
+                Some(raw_f),
+            )
+        };
+        ctx.reload_vable_stack_if_heap_moved();
+        let boxed = ctx.const_int(concrete);
+        self.set_int_reg(dst, Some(boxed), Some(concrete));
+        Some(TraceAction::Continue)
+    }
+
+    /// `pyopcode.py LOAD_GLOBAL` of a builtin exception class: pin the
+    /// module-dict version and keep the immortal type as `ConstPtr`.
+    fn try_record_load_global_exc_class(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        raw_i: &[i64],
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if !spec.matches_load_global(concrete_ptr) && !spec.matches_load_global(trace_ptr) {
+            return None;
+        }
+        let (boxed, ptr) = (spec.emit_load_global_exc)(ctx, raw_i)?;
+        self.set_ref_reg(dst, Some(boxed), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `GetCurrentException`: `GETFIELD_GC_R(ec, sys_exc_value)`.
+    fn try_record_get_current_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        runtime_helper: majit_ir::RuntimeHelperKind,
+        dst: usize,
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if runtime_helper != majit_ir::RuntimeHelperKind::GetCurrentException
+            && !spec.matches_get_current_exception(concrete_ptr)
+            && !spec.matches_get_current_exception(trace_ptr)
+        {
+            return None;
+        }
+        let ec = self.portal_ec_box(ctx)?;
+        let (boxed, ptr) = (spec.emit_get_current_exception)(ctx, ec);
+        self.set_ref_reg(dst, Some(boxed), Some(ptr));
+        Some(TraceAction::Continue)
+    }
+
+    /// FBW `SetCurrentException`: `SETFIELD_GC(ec, exc, sys_exc_value)`.
+    fn try_record_set_current_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        concrete_ptr: i64,
+        trace_ptr: i64,
+        runtime_helper: majit_ir::RuntimeHelperKind,
+        args: &[OpRef],
+        raw_r: &[i64],
+    ) -> Option<TraceAction> {
+        let spec = crate::box_trace::exception_trace_residual()?;
+        if runtime_helper != majit_ir::RuntimeHelperKind::SetCurrentException
+            && !spec.matches_set_current_exception(concrete_ptr)
+            && !spec.matches_set_current_exception(trace_ptr)
+        {
+            return None;
+        }
+        if args.is_empty() || raw_r.is_empty() {
+            return None;
+        }
+        let ec = self.portal_ec_box(ctx)?;
+        (spec.emit_set_current_exception)(ctx, ec, args[0], raw_r[0]);
+        Some(TraceAction::Continue)
+    }
+
+    /// `space.newbool` after `if b:` is the immortal singleton.
+    /// Replace once `is_true` has read the cached compare.
+    fn replace_pending_newbool_if_truth(&mut self, ctx: &mut TraceCtx, src: OpRef) {
+        let Some((old, ptr, truth)) = self.pending_newbool else {
+            return;
+        };
+        if src != truth {
+            return;
+        }
+        self.pending_newbool = None;
+        let singleton = ctx.const_ref(ptr);
+        self.replace_box(ctx, old, singleton, Type::Ref);
+    }
+
     /// pyjitpl.py `MIFrame._create_segmented_trace_and_blackhole`,
     /// recording half.
     ///
@@ -2735,6 +3229,9 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
+            pending_newbool: None,
+            pending_built_exc: None,
+            fresh_virtual_exc: None,
             marker: PhantomData,
         }
     }
@@ -3169,6 +3666,7 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        crate::jitdriver::mark_interpret_shadow_base();
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local
@@ -3266,11 +3764,8 @@ where
                         } else {
                             "<non-string panic payload>"
                         };
-                        eprintln!(
-                            "[jit] trace_jitcode panic while tracing pc={}: {}",
-                            self.frames.current_mut().pc,
-                            message
-                        );
+                        let pc = self.frames.frames.last().map(|f| f.pc).unwrap_or(0);
+                        eprintln!("[jit] trace_jitcode panic while tracing pc={pc}: {message}");
                     }
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.
@@ -3280,13 +3775,26 @@ where
                 }
             };
             if !matches!(action, TraceAction::Continue) {
-                if crate::tldbg_enabled() {
+                if crate::majit_log_enabled() || crate::tldbg_enabled() {
+                    let (cursor, last_op, name) = self
+                        .frames
+                        .frames
+                        .last()
+                        .map(|fr| {
+                            (
+                                fr.code_cursor,
+                                fr.jitcode
+                                    .code
+                                    .get(fr.last_opcode_position)
+                                    .copied()
+                                    .unwrap_or(0xff),
+                                fr.jitcode.name(),
+                            )
+                        })
+                        .unwrap_or((0, 0xff, "<empty>"));
                     eprintln!(
-                        "@@@TLDBG run_to_end end action={:?} step_count={} num_recorded_ops={} trace_limit={}",
-                        action,
-                        step_count,
+                        "[interpret] run_to_end action={action:?} steps={step_count} ops={} cursor={cursor} last_op=0x{last_op:02x} jitcode={name}",
                         ctx.num_recorded_ops(),
-                        ctx.trace_limit()
                     );
                 }
                 match action {
@@ -3488,19 +3996,15 @@ where
             let mut portal_frame = self.frames.take_frame(portal, green_pc, None, Some(ctx));
             portal_frame.code_cursor = green_pc;
             ctx.push_inline_frame((jd_index, green_pc), u32::MAX);
-            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id)
-            // for an inlined portal (greenkey present). `unique_id` has no
-            // warmstate source here; use `green_pc` as a stable per-entry id.
-            // Pairs with the deferred LEAVE_PORTAL_FRAME recorded by the
-            // recursive-portal merge-point cut (opimpl_jit_merge_point
-            // else-branch).
+            // pyjitpl.py newframe -> enter_portal_frame(jd_no, unique_id).
+            // rvmprof.get_unique_id is 0 when the code class is unregistered.
             let jd_box = ctx.const_int(jd_index as i64);
-            let uid_box = ctx.const_int(green_pc as i64);
+            let uid_box = ctx.const_int(0);
             ctx.record_op(OpCode::EnterPortalFrame, &[jd_box, uid_box]);
             // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME and the
             // `portal_trace_positions` append sit on adjacent lines.
-            // The machine cannot reach MetaInterp, so the log half
-            // lives on TraceCtx and `find_biggest_function` reads both.
+            // The machine forwards the log half through
+            // `portal_trace_push_fn` into MetaInterp.
             if runtime.is_main_portal(jd_index) {
                 ctx.push_portal_trace_event(
                     jd_index,
@@ -3964,6 +4468,13 @@ where
             jitcode::insns::BC_LIVE => {
                 let _liveness_offset = self.frames.current_mut().next_u16();
             }
+            // pyjitpl.py opimpl_unreachable: raise AssertionError("unreachable").
+            // A landing here is a wrong-path generation/dispatch defect; abort
+            // the attempt so the interpreter can resume instead of panicking
+            // mid-opcode (which left a stack underflow on the Python frame).
+            jitcode::insns::BC_UNREACHABLE => {
+                return TraceAction::Abort;
+            }
             // -- State field access (register/tape machines) --
             // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
             // `i` = u8 register index (`assembler.py:165-167`).
@@ -4384,6 +4895,16 @@ where
                     {
                         majit_gc::gc_write_barrier(majit_ir::GcRef(struct_ptr as usize));
                     }
+                    let shadow = match bytecode {
+                        jitcode::insns::BC_SETFIELD_GC_R => {
+                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize))
+                        }
+                        jitcode::insns::BC_SETFIELD_GC_F => {
+                            majit_ir::Value::Float(f64::from_bits(concrete as u64))
+                        }
+                        _ => majit_ir::Value::Int(concrete),
+                    };
+                    ctx.sync_shadow_if_vable_heap_store(struct_ptr, offset, value_opref, shadow);
                 }
             }
             jitcode::insns::BC_RAW_STORE_I => {
@@ -4615,7 +5136,8 @@ where
                 // which carries the field's byte width; a sub-word integer field
                 // (`Char`/`Bool`/`INT` narrower than a word) must be read at that
                 // width, not as a full word — otherwise adjacent bytes leak into
-                // the value. Ref fields are always word-sized pointers.
+                // the value. Ref fields are always word-sized pointers
+                // (`llmodel.py bh_getfield_gc_r` / `read_ref_at_mem`).
                 let loaded = if struct_ptr == 0 {
                     0
                 } else if is_ref {
@@ -4734,15 +5256,36 @@ where
                     // an entry seeded without a live concrete and skips
                     // the check.  A null struct fabricated `loaded` rather
                     // than reading, so it has nothing to compare either.
+                    //
+                    // RPython runs `executor.execute(cpu, metainterp,
+                    // opnum, fielddescr, box)` for this compare
+                    // (`_opimpl_getfield_gc_any_pureornot`). That is
+                    // `bh_getfield_gc_{i,r}`, a word-sized ref load —
+                    // not a raw i64 read that on a 32-bit target
+                    // swallows the next field.
                     let expected = match ctx.box_value(cached) {
                         Some(Value::Int(n)) => Some(n),
                         Some(Value::Ref(r)) => Some(r.0 as i64),
                         _ => None,
                     };
+                    let executed = if is_ref {
+                        ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Ref)
+                            .and_then(|v| match v {
+                                Value::Ref(r) => Some(r.0 as i64),
+                                _ => None,
+                            })
+                    } else {
+                        ctx.field_sanity_load(struct_ptr, &fielddescr, Type::Int)
+                            .and_then(|v| match v {
+                                Value::Int(n) => Some(n),
+                                _ => None,
+                            })
+                    };
+                    let compare = executed.unwrap_or(loaded);
                     assert!(
-                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != loaded),
+                        struct_ptr == 0 || !matches!(expected, Some(exp) if exp != compare),
                         "_opimpl_getfield_gc_any_pureornot sanity check ({}): \
-                             loaded {loaded} != cached {expected:?} \
+                             loaded {compare} != cached {expected:?} \
                              (field_key={field_key:?}, struct_ptr={struct_ptr:#x})",
                         if is_ref { "ref" } else { "int" },
                     );
@@ -5906,6 +6449,7 @@ where
                     Some(majit_ir::Value::Int(cond_value)),
                     self.last_exception_value,
                 );
+                self.replace_pending_newbool_if_truth(ctx, src);
                 self.goto_if_not(ctx, sym, opcode_pc, cond, cond_value, target, false);
             }
             // pyjitpl.py opimpl_goto_if_not_int_is_zero(box, target):
@@ -7881,6 +8425,17 @@ where
                     let is_loopinvariant =
                         effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
+                    if let Some(action) = self.try_record_set_current_exception(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        effectinfo.runtime_helper,
+                        &args,
+                        &raw_r,
+                    ) {
+                        return action;
+                    }
+
                     // pyjitpl.py execute_varargs parity (plain
                     // CALL_N / LOOPINVARIANT_N branch) and pyjitpl.py:2005
                     // (MAY_FORCE_N branch).  Both branches share the same
@@ -7979,6 +8534,30 @@ where
                     // vrefs.
                     if is_forces {
                         ctx.vrefs_after_residual_call();
+                    }
+                    // `frame_anchor_release` is the drop of a tracing-only
+                    // shadow-stack slot. `interp_jit.py` `dispatch` has no
+                    // counterpart; skip the `CallN` when the helper ran.
+                    // `stack_check` is the same: compiled loops poll the
+                    // breaker on the back-edge (`rstack.py`). Skip only
+                    // when the helper did not publish an exception.
+                    if let Some(spec) = crate::box_trace::void_skip_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()) == 0
+                    {
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
                     }
                     // 3. record IR (`history.record` →
                     //    `_record_helper_varargs`). pyjitpl.py
@@ -8263,6 +8842,33 @@ where
                         return TraceAction::Continue;
                     }
 
+                    // `is_true` of a compare-folded bool: unbox `intval`
+                    // (heapcache hit) before `ForceToken`.
+                    if let Some(action) = self.try_record_truth_bool(
+                        ctx,
+                        sym,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &args,
+                        &raw_r,
+                        &calldescr.arg_classes,
+                        dst,
+                    ) {
+                        return action;
+                    }
+                    if let Some(action) = self.try_record_dispatch_exception_handler(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &raw_i,
+                        &raw_r,
+                        &raw_f,
+                        &calldescr.arg_classes,
+                        dst,
+                    ) {
+                        return action;
+                    }
+
                     // pyjitpl.py:2005-2010 MAY_FORCE_I branch parity:
                     //     clear_exception  ← FIRST
                     //     vable_and_vrefs_before_residual_call
@@ -8304,12 +8910,114 @@ where
                     ) {
                         return action;
                     }
+                    // `dont_look_inside_cannot_raise` residuals skip the
+                    // may_force finalize. `dispatch_exception_handler`
+                    // still `frame.push`es the caught exception, so the
+                    // heap vsd moves while the vable shadow does not.
+                    // Reload vsd/stack only — a full static reload
+                    // clobbers last_instr (shadow newer than heap).
+                    ctx.reload_vable_stack_if_heap_moved();
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
                     // `is_forces` because the before-hook only stamps
                     // TOKEN_TRACING_RESCALL in that branch).
                     if is_forces {
                         ctx.vrefs_after_residual_call();
+                    }
+                    // `gc_interp::enabled` is `@elidable` (`rlib/jit.py`):
+                    // the env read is cached. Record the traced constant
+                    // instead of `CallI` so compiled loops do not keep the
+                    // residual the frozen jitcode still emits.
+                    // `ll_issubclass` is `@elidable_cannot_raise`
+                    // (`rclass.py`); same fold.
+                    if let Some(spec) = crate::box_trace::elidable_int_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                    {
+                        let folded = ctx.const_int(concrete);
+                        self.set_int_reg(dst, Some(folded), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
+                    // `descroperation.py _call_binop_impl` looks inside;
+                    // exact builtin ints never override, so the gate is
+                    // the constant 0.
+                    if let Some(spec) = crate::box_trace::exact_int_false_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && concrete == 0
+                        && raw_r.len() >= 2
+                        && (spec.is_exact_int)(raw_r[0])
+                        && (spec.is_exact_int)(raw_r[1])
+                    {
+                        let folded = ctx.const_int(0);
+                        self.set_int_reg(dst, Some(folded), Some(0));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
+                    // `rint.py ll_int_py_mod` residual: record `OS_INT_PY_MOD`
+                    // (FBW `walker_emit_int_py_div_or_mod`). Look-inside of
+                    // `int_mod` still emits `_ll_2_int_mod` plus the
+                    // sign-correction; rewriting that C rem to Python rem
+                    // makes the correction a no-op (`(r ^ y) < 0` is false
+                    // for a same-sign remainder) so `optimize_call_int_py_mod`
+                    // can fold the call. Emitting `IntMod` instead would keep
+                    // C rem and leave `GuardTrue(rem != 0)` as a live bake.
+                    if let Some(spec) = crate::box_trace::int_py_mod_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && args.len() == 2
+                        && raw_i.len() >= 2
+                    {
+                        let func_ptr = crate::blackhole::ll_int_py_mod as *const ();
+                        let traced = ctx.call_typed_with_effect_pure(
+                            majit_ir::OpCode::CallI,
+                            func_ptr,
+                            &args,
+                            &arg_types,
+                            majit_ir::Type::Int,
+                            crate::INT_PY_MOD_EFFECT_INFO,
+                            &[
+                                majit_ir::Value::Int(func_ptr as usize as i64),
+                                majit_ir::Value::Int(raw_i[0]),
+                                majit_ir::Value::Int(raw_i[1]),
+                            ],
+                            majit_ir::Value::Int(concrete),
+                        );
+                        ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
+                        self.set_int_reg(dst, Some(traced), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
                     }
                     // pyjitpl.py do_residual_call plain branch:
                     //     pure = effectinfo.check_is_elidable()
@@ -8405,13 +9113,31 @@ where
                     // results this way (`jitcode_dispatch/residual_call.rs`).
                     ctx.set_opref_concrete(traced, majit_ir::Value::Int(concrete));
                     self.set_int_reg(dst, Some(traced), Some(concrete));
-                    if is_forces
-                        && matches!(
+                    if is_forces {
+                        if crate::majit_log_enabled() {
+                            let frame = self.frames.current_mut();
+                            eprintln!(
+                                "[interpret] residual may_force jitcode={} last_op={} cursor={} \
+                                 extraeffect={:?} can_raise={} next={:?} fnaddr={:#x} classes={:?} \
+                                 ret={} last_exc={:#x}",
+                                frame.jitcode.name(),
+                                frame.last_opcode_position,
+                                frame.code_cursor,
+                                effectinfo.extraeffect,
+                                effectinfo.check_can_raise(false),
+                                frame.jitcode.code.get(frame.code_cursor),
+                                concrete_ptr as usize,
+                                calldescr.arg_classes,
+                                concrete,
+                                crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
+                            );
+                        }
+                        if matches!(
                             self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
                             TraceAction::Abort
-                        )
-                    {
-                        return TraceAction::Abort;
+                        ) {
+                            return TraceAction::Abort;
+                        }
                     }
                     // pyjitpl.py `exc = exc and not isinstance(op, Const)`:
                     // a pure call that const-folded clears `exc`, so
@@ -8608,6 +9334,87 @@ where
                         return TraceAction::Continue;
                     }
 
+                    // Int COMPARE_OP (`jit_compare_value_from_tag`):
+                    // specialise before `ForceToken`. FBW
+                    // `try_walker_specialize_compare_op_int` emits unbox +
+                    // int_OP + newbool so the call does not escape virtual
+                    // int boxes. Matching wrapint (an int `NewWithVtable`)
+                    // here made the following `GUARD_ISNULL(w_class)` an
+                    // InvalidLoop — bools have a null `w_class`.
+                    // `w_bool_from` look-inside: `bool_singleton` is
+                    // `dont_look_inside` so its residual is a symbolic
+                    // hash. The `goto_if_not` guard is already recorded;
+                    // fold the residual to the immortal singleton.
+                    if let Some(action) = self.try_record_newbool_singleton(ctx, dst) {
+                        return action;
+                    }
+
+                    if let Some(action) = self.try_record_int_compare(
+                        ctx,
+                        sym,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &args,
+                        &arg_types,
+                        &raw_i,
+                        &raw_r,
+                        &calldescr.arg_classes,
+                        dst,
+                    ) {
+                        return action;
+                    }
+
+                    // FBW `try_walker_trace_exception_new` /
+                    // `try_walker_trace_raise_builtin`: fold before
+                    // `ForceToken` so a locally-caught exception stays
+                    // virtual. Portal `CallFn` is `[frame, callable,
+                    // args...]` and may arrive without a helper tag.
+                    if let Some(action) =
+                        self.try_record_exception_new(ctx, sym, &args, &raw_r, dst)
+                    {
+                        return action;
+                    }
+                    if let Some(action) = self.try_record_raise_builtin(ctx, &args, &raw_r, dst) {
+                        return action;
+                    }
+                    if let Some(action) = self.try_record_raise_prepared(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &args,
+                        &raw_r,
+                        dst,
+                    ) {
+                        return action;
+                    }
+                    if let Some(action) = self.try_record_to_exc_object(
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &args,
+                        &raw_r,
+                        dst,
+                    ) {
+                        return action;
+                    }
+                    if let Some(action) = self.try_record_load_global_exc_class(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        &raw_i,
+                        dst,
+                    ) {
+                        return action;
+                    }
+                    if let Some(action) = self.try_record_get_current_exception(
+                        ctx,
+                        concrete_ptr as i64,
+                        trace_ptr as i64,
+                        effectinfo.runtime_helper,
+                        dst,
+                    ) {
+                        return action;
+                    }
+
                     // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:
                     // clear_exception precedes vable_and_vrefs_before_residual_call
                     // (vrefs walk + vinfo stamp; see void arm for full citation).
@@ -8645,6 +9452,13 @@ where
                     ) {
                         return action;
                     }
+                    // `dont_look_inside_cannot_raise` residuals skip the
+                    // may_force finalize. `dispatch_exception_handler`
+                    // still `frame.push`es the caught exception, so the
+                    // heap vsd moves while the vable shadow does not.
+                    // Reload vsd/stack only — a full static reload
+                    // clobbers last_instr (shadow newer than heap).
+                    ctx.reload_vable_stack_if_heap_moved();
                     // pyjitpl.py — vrefs_after_residual_call
                     // (see void arm for the explanation; gated on
                     // `is_forces` because the before-hook only stamps
@@ -8652,90 +9466,223 @@ where
                     if is_forces {
                         ctx.vrefs_after_residual_call();
                     }
-                    // pyjitpl.py do_residual_call plain branch —
-                    // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
-                    let plain_branch = !is_forces && !is_loopinvariant;
-                    let pure = plain_branch && effectinfo.check_is_elidable();
-                    let patch_pos = if pure {
-                        Some(ctx.get_trace_position())
-                    } else {
-                        None
-                    };
-                    let traced = if is_forces {
-                        ctx.call_may_force_ref_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                        )
-                    } else if is_loopinvariant {
-                        ctx.call_loopinvariant_ref_typed_with_effect(
-                            trace_ptr,
-                            &args,
-                            &arg_types,
-                            effectinfo.clone(),
-                            concrete,
-                        )
-                    } else {
-                        ctx.record_call_with_descr(
-                            majit_ir::OpCode::CallR,
-                            trace_ptr,
-                            &args,
-                            trace_descr.clone(),
-                        )
-                    };
-                    // pyjitpl.py:1946 gate (see int sibling for full cite).
-                    let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
-                    let traced = match patch_pos {
-                        Some(patch_pos) if last_exc_value == 0 => {
-                            let func_ref = ctx.const_int(trace_ptr as usize as i64);
-                            let mut call_args = vec![func_ref];
-                            call_args.extend_from_slice(&args);
-                            let concrete_values =
-                                build_concrete_values(trace_ptr, &concrete_args, &arg_types);
-                            ctx.record_result_of_call_pure(
-                                traced,
-                                &call_args,
-                                &concrete_values,
-                                trace_descr,
-                                patch_pos,
-                                majit_ir::OpCode::CallR,
-                                majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                            )
-                        }
-                        _ => traced,
-                    };
-                    // `pyjitpl.py execute_and_record_varargs` runs the call
-                    // through `executor.execute_varargs` and hands the result
-                    // to `history.record_nospec`, so the recorded op carries
-                    // the executed value on its own frontend slot -- every
-                    // later `getvalue()` of that box answers it.  Writing the
-                    // value into the destination register alone leaves
-                    // `concrete_of_opref` answering `None` for the box, and
-                    // the two readers then disagree: `_nonstandard_virtualizable`
-                    // asks the box, so a residual that returns the standard
-                    // virtualizable (the portal's `reload_top_root`) loses its
-                    // PTR_EQ against `virtualizable_boxes[-1]` and every later
-                    // vable access on that register takes the nonstandard leg.
-                    // The full-body walker already stamps its own residual
-                    // results this way (`jitcode_dispatch/residual_call.rs`).
-                    ctx.set_opref_concrete(
-                        traced,
-                        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                    );
-                    self.set_ref_reg(dst, Some(traced), Some(concrete));
-                    if is_forces
-                        && matches!(
-                            self.finalize_standard_virtualizable_may_force(ctx, sym, active_vable),
-                            TraceAction::Abort
-                        )
+                    // interp_jit.py `PyFrame.dispatch` has no per-opcode
+                    // `reload_top_root`. When the live result equals the
+                    // argument, no collection moved it — record the
+                    // identity instead of `CallR`.
+                    if let Some(spec) = crate::box_trace::identity_ref_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && let Some(&raw_op) = args.first()
                     {
-                        return TraceAction::Abort;
+                        let arg_bits = raw_r.first().copied().unwrap_or(0);
+                        if concrete == arg_bits {
+                            self.set_ref_reg(dst, Some(raw_op), Some(concrete));
+                            if is_forces
+                                && matches!(
+                                    self.finalize_standard_virtualizable_may_force(
+                                        ctx,
+                                        sym,
+                                        active_vable
+                                    ),
+                                    TraceAction::Abort
+                                )
+                            {
+                                return TraceAction::Abort;
+                            }
+                            return TraceAction::Continue;
+                        }
                     }
-                    if !(pure && traced.is_constant()) {
-                        match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
-                            TraceAction::Continue => {}
-                            action => return action,
+                    // `frame_anchor_push` publishes a tracing-only slot.
+                    // `interp_jit.py` has none; record the frame argument.
+                    if let Some(spec) = crate::box_trace::frame_anchor_push_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && let Some(&frame_op) = args.first()
+                    {
+                        let frame_bits = raw_r.first().copied().unwrap_or(concrete);
+                        self.set_ref_reg(dst, Some(frame_op), Some(frame_bits));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
+                    // `pyopcode.py LOAD_CONST` reads the green
+                    // `co_consts_w` slot. Record the traced ConstPtr.
+                    if let Some(spec) = crate::box_trace::elidable_ref_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && concrete != 0
+                    {
+                        let folded = ctx.const_ref(concrete);
+                        self.set_ref_reg(dst, Some(folded), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
+                    // `frame_anchor_live` rereads the red frame. Reuse
+                    // the standard virtualizable OpRef when the concrete
+                    // equals that frame. Push stays recorded so
+                    // blackhole resume still has the depth.
+                    if let Some(spec) = crate::box_trace::frame_anchor_live_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && let Some(vable) = ctx.standard_virtualizable_box()
+                        && let Some(ptr) = ctx.standard_virtualizable_ptr()
+                        && concrete == ptr as i64
+                    {
+                        self.set_ref_reg(dst, Some(vable), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        return TraceAction::Continue;
+                    }
+                    // Residual wrapint (`w_int_gc_alloc`): execute already
+                    // ran; record `new_with_vtable` + `setfield_gc`
+                    // (`intobject.py wrapint`) instead of `CallR`.
+                    if let Some(spec) = crate::box_trace::wrapint_residual()
+                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
+                        && concrete != 0
+                        && let Some(&raw_op) = args.first()
+                    {
+                        let boxed = crate::box_trace::trace_box_int(
+                            ctx,
+                            raw_op,
+                            spec.size_descr.clone(),
+                            spec.intval_descr.clone(),
+                            spec.int_type_addr,
+                        );
+                        ctx.set_opref_concrete(
+                            boxed,
+                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        );
+                        self.set_ref_reg(dst, Some(boxed), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                    } else {
+                        // pyjitpl.py do_residual_call plain branch —
+                        // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
+                        let plain_branch = !is_forces && !is_loopinvariant;
+                        let pure = plain_branch && effectinfo.check_is_elidable();
+                        let patch_pos = if pure {
+                            Some(ctx.get_trace_position())
+                        } else {
+                            None
+                        };
+                        let traced = if is_forces {
+                            ctx.call_may_force_ref_typed_with_effect(
+                                trace_ptr,
+                                &args,
+                                &arg_types,
+                                effectinfo.clone(),
+                            )
+                        } else if is_loopinvariant {
+                            ctx.call_loopinvariant_ref_typed_with_effect(
+                                trace_ptr,
+                                &args,
+                                &arg_types,
+                                effectinfo.clone(),
+                                concrete,
+                            )
+                        } else {
+                            ctx.record_call_with_descr(
+                                majit_ir::OpCode::CallR,
+                                trace_ptr,
+                                &args,
+                                trace_descr.clone(),
+                            )
+                        };
+                        // pyjitpl.py:1946 gate (see int sibling for full cite).
+                        let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
+                        let traced = match patch_pos {
+                            Some(patch_pos) if last_exc_value == 0 => {
+                                let func_ref = ctx.const_int(trace_ptr as usize as i64);
+                                let mut call_args = vec![func_ref];
+                                call_args.extend_from_slice(&args);
+                                let concrete_values =
+                                    build_concrete_values(trace_ptr, &concrete_args, &arg_types);
+                                ctx.record_result_of_call_pure(
+                                    traced,
+                                    &call_args,
+                                    &concrete_values,
+                                    trace_descr,
+                                    patch_pos,
+                                    majit_ir::OpCode::CallR,
+                                    majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                                )
+                            }
+                            _ => traced,
+                        };
+                        // `pyjitpl.py execute_and_record_varargs` runs the call
+                        // through `executor.execute_varargs` and hands the result
+                        // to `history.record_nospec`, so the recorded op carries
+                        // the executed value on its own frontend slot -- every
+                        // later `getvalue()` of that box answers it.  Writing the
+                        // value into the destination register alone leaves
+                        // `concrete_of_opref` answering `None` for the box, and
+                        // the two readers then disagree: `_nonstandard_virtualizable`
+                        // asks the box, so a residual that returns the standard
+                        // virtualizable (the portal's `reload_top_root`) loses its
+                        // PTR_EQ against `virtualizable_boxes[-1]` and every later
+                        // vable access on that register takes the nonstandard leg.
+                        // The full-body walker already stamps its own residual
+                        // results this way (`jitcode_dispatch/residual_call.rs`).
+                        ctx.set_opref_concrete(
+                            traced,
+                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+                        );
+                        self.set_ref_reg(dst, Some(traced), Some(concrete));
+                        if is_forces
+                            && matches!(
+                                self.finalize_standard_virtualizable_may_force(
+                                    ctx,
+                                    sym,
+                                    active_vable
+                                ),
+                                TraceAction::Abort
+                            )
+                        {
+                            return TraceAction::Abort;
+                        }
+                        if !(pure && traced.is_constant()) {
+                            match self.finish_residual_call_exception_path(ctx, sym, effectinfo) {
+                                TraceAction::Continue => {}
+                                action => return action,
+                            }
                         }
                     }
                 }
@@ -10615,7 +11562,18 @@ where
                 self.last_exception_box = Some(opref);
                 self.last_exception_value = concrete;
                 self.class_of_last_exc_is_const = true;
-                {
+                let virtual_tb = self.fresh_virtual_exc.take().and_then(|(exc, ptr)| {
+                    if ptr != concrete {
+                        self.fresh_virtual_exc = Some((exc, ptr));
+                        return None;
+                    }
+                    let spec = crate::box_trace::exception_trace_residual()?;
+                    let frame_box = ctx.standard_virtualizable_box()?;
+                    let frame_ptr = ctx.virtualizable_heap_ptr()? as usize as i64;
+                    (spec.emit_virtual_traceback)(ctx, opref, concrete, frame_box, frame_ptr)
+                        .then_some(())
+                });
+                if virtual_tb.is_none() {
                     let frame = self.frames.current_mut();
                     // pyopcode.py raise_varargs: RAISE_VARARGS with an
                     // explicit value records at the raising instruction.
@@ -10991,6 +11949,12 @@ where
         let Some(sub_jitcode) = sub_jitcode else {
             // The callee is in neither pool; abort the trace instead of
             // crashing the process.
+            if crate::majit_log_enabled() {
+                eprintln!(
+                    "[interpret] inline_call descrs[{sub_idx}] missing (pool={})",
+                    crate::jitcode::global_build_descr_pool().is_some(),
+                );
+            }
             return TraceAction::Abort;
         };
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
@@ -11067,8 +12031,20 @@ where
     fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
         let frame = self.frames.current_mut();
         (
-            frame.ref_regs[reg].expect("jitcode ref register was uninitialized"),
-            frame.ref_values[reg].expect("jitcode concrete ref register was uninitialized"),
+            frame.ref_regs[reg].unwrap_or_else(|| {
+                panic!(
+                    "jitcode ref register {reg} was uninitialized (pc={} jitcode={})",
+                    frame.pc,
+                    frame.jitcode.name()
+                )
+            }),
+            frame.ref_values[reg].unwrap_or_else(|| {
+                panic!(
+                    "jitcode concrete ref register {reg} was uninitialized (pc={} jitcode={})",
+                    frame.pc,
+                    frame.jitcode.name()
+                )
+            }),
         )
     }
 
@@ -11386,6 +12362,9 @@ where
             Some(majit_ir::Value::Int(value)),
             self.last_exception_value,
         );
+        if opcode == OpCode::IntIsTrue {
+            self.replace_pending_newbool_if_truth(ctx, src);
+        }
         self.set_int_reg(dst, Some(opref), Some(value));
     }
 
@@ -11917,6 +12896,39 @@ where
     {
         return TraceAction::Abort;
     }
+    run_resume_framestack(ctx, sym, frames, outer_program_pc, runtime)
+}
+
+/// Same walk as [`trace_jitcode_at_resume_framestack`], without the
+/// whole-body symbolic-residual gate. The portal JitCode can reach
+/// unbound helpers (`fill_user_function_args`, …) that the loop
+/// interpret already residual-calls; the gate would refuse every
+/// portal guard resume before the walk starts.
+pub fn trace_jitcode_at_resume_framestack_allowing_residuals<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    frames: &[crate::jit_state::GuardResumeFrame],
+    outer_program_pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
+    run_resume_framestack(ctx, sym, frames, outer_program_pc, runtime)
+}
+
+fn run_resume_framestack<S, R>(
+    ctx: &mut TraceCtx,
+    sym: &mut S,
+    frames: &[crate::jit_state::GuardResumeFrame],
+    outer_program_pc: usize,
+    runtime: &R,
+) -> TraceAction
+where
+    S: JitCodeSym,
+    R: JitCodeRuntime,
+{
     let mut standalone = StandaloneFrameStack::new();
     for (depth, resume_frame) in frames.iter().enumerate() {
         let mut frame = standalone.frames.take_frame(
@@ -11941,6 +12953,23 @@ where
             }
             bank_regs[index] = Some(reg.opref);
             bank_values[index] = Some(reg.value);
+        }
+        // A register the guard did not keep live is absent from resume
+        // data. The first opcode after the guard can still read it as an
+        // INLINE_CALL arg (from_exc_object's completed body is one such
+        // site). Seed a null/zero so interpret does not panic; a later
+        // use of a truly-live missing box is a liveness bug to fix.
+        for r in 0..frame.ref_regs.len() {
+            if frame.ref_regs[r].is_none() {
+                frame.ref_regs[r] = Some(ctx.const_ref(0));
+                frame.ref_values[r] = Some(0);
+            }
+        }
+        for r in 0..frame.int_regs.len() {
+            if frame.int_regs[r].is_none() {
+                frame.int_regs[r] = Some(ctx.const_int(0));
+                frame.int_values[r] = Some(0);
+            }
         }
         // The walker reads from `code_cursor`; `pc` is what a snapshot taken
         // inside this frame reports. `setup_resume_at_op` is both.

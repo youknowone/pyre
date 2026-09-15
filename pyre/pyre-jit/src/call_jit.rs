@@ -1900,6 +1900,32 @@ fn materialize_str_call_for_cranelift(
     result.0 as i64
 }
 
+/// Blackhole-only rewrite of the `bool_singleton` symbolic hash.
+///
+/// The path stays off `jit_trace_fnaddrs` so interpret still folds the
+/// OnceLock helper (`try_record_newbool_singleton`). Resume of
+/// `w_bool_from` has no fold and must call the residual.
+fn resolve_bh_symbolic_residual(fnaddr: i64) -> i64 {
+    use majit_translate::codewriter::call::symbolic_fnaddr_for_segments;
+    use std::sync::OnceLock;
+    static MAP: OnceLock<Vec<(i64, i64)>> = OnceLock::new();
+    let abi = pyre_object::boolobject::bool_singleton_jit_abi as *const () as i64;
+    let map = MAP.get_or_init(|| {
+        [
+            ["boolobject", "bool_singleton"].as_slice(),
+            ["pyre_object", "boolobject", "bool_singleton"].as_slice(),
+            ["pyre_object", "bool_singleton"].as_slice(),
+        ]
+        .into_iter()
+        .map(|segs| (symbolic_fnaddr_for_segments(segs.iter().copied()), abi))
+        .collect()
+    });
+    map.iter()
+        .find(|(hash, _)| *hash == fnaddr)
+        .map(|(_, addr)| *addr)
+        .unwrap_or(0)
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -1966,6 +1992,20 @@ pub fn install_jit_call_bridge() {
             pyre_interpreter::stack_check::stack_almost_full()
         }
         majit_metainterp::register_stack_almost_full_hook(stack_almost_full_adapter);
+        majit_metainterp::register_allow_small_ref_residual(
+            pyre_interpreter::is_frame_anchor_word_residual,
+        );
+        // `bool_singleton` stays off `jit_trace_fnaddrs` so the walker
+        // still folds the symbolic hash (`try_record_newbool_singleton`).
+        // Blackhole resume of COMPARE_OP interprets `w_bool_from` and
+        // must call the residual instead of bailing to an empty stack.
+        majit_metainterp::register_symbolic_residual_fnaddr(resolve_bh_symbolic_residual);
+        // `FrameAnchorLiveResidual` reuses the red vable during the walk.
+        // Resume still has the tracing-time slot; the blackhole rewrites
+        // that word to this portal frame (`interp_jit.py` has no slot).
+        majit_metainterp::register_bh_portal_frame(|| {
+            pyre_interpreter::eval::current_frame() as i64
+        });
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
@@ -3859,6 +3899,36 @@ pub fn trace_and_compile_from_bridge(
     if bridge_bail_stage() == 3 {
         return BridgeResolution::ResumeBlackhole;
     }
+    // pyjitpl.py handle_guard_failure: rebuild_from_resumedata + interpret()
+    // from the guard PC. The FBW walk below is the fallback when the resume
+    // cannot be seeded. A Finish from this walk is the compiled
+    // "return from main" shape — do not attach it.
+    {
+        let (driver, _) = crate::eval::driver_pair();
+        if let Some(pc) = driver.bridge_from_guard_resume_position(
+            descr_arc,
+            &mut jit_state,
+            &env,
+            raw_values,
+            resume_pc,
+            false,
+        ) {
+            let compiled = driver
+                .meta_interp()
+                .bridge_was_compiled(green_key, trace_id, fail_index);
+            if majit_metainterp::majit_log_enabled() {
+                eprintln!(
+                    "[jit][bridge-trace] interpret-from-resume key={} trace={} fail={} \
+                     resume_pc={} walk_pc={} compiled={}",
+                    green_key, trace_id, fail_index, resume_pc, pc, compiled
+                );
+            }
+            if compiled {
+                return BridgeResolution::CompiledContinue;
+            }
+            return BridgeResolution::ResumeBlackhole;
+        }
+    }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
@@ -3883,6 +3953,20 @@ pub fn trace_and_compile_from_bridge(
             );
         }
         return BridgeResolution::ResumeBlackhole;
+    }
+    // resume.py rebuild_from_resumedata: one newframe(jitcode) per
+    // encoded section, no greenkey. The portal jitcode is the Python
+    // driver's mainjitcode for every inlined user function.
+    if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
+        let (driver, _) = crate::eval::driver_pair();
+        let nframes = driver
+            .resume_data_result
+            .as_ref()
+            .map(|r| r.frames.len())
+            .unwrap_or(1);
+        driver
+            .meta_interp_mut()
+            .rebuild_portal_framestack_from_resume(portal, nframes);
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception

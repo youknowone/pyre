@@ -2271,6 +2271,7 @@ impl UnrollOptimizer {
                 seen.insert(op.pos().get().raw())
             });
         }
+        crate::optimizeopt::optimizer::strip_unused_call_pure(&mut combined);
         crate::optimizeopt::optimizer::sanitize_backend_constants_for_ops(
             combined.iter().map(|op| &**op),
             &mut consts_p2,

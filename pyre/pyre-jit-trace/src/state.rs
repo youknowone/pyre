@@ -1820,67 +1820,119 @@ fn sub_descr_pool_for_payload(pjc: &crate::PyJitCode) -> SubDescrPool {
 /// at trace time.
 pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     ensure_finish_setup();
+    // Interpret snapshots stamp the helper's build-time `JitCode::index`.
+    // The matching runtime slot is reserved as a skeleton until a portal
+    // or `ensure_build_time_jitcode_at` installs the frozen body
+    // (`reserve_build_time_index_space`). Compile then looks the index
+    // up in `METAINTERP_SD.jitcodes` — a still-empty skeleton has no
+    // `-live-` bytes, so materialize the body first.
+    if let Ok(idx) = usize::try_from(jitcode_index) {
+        let skeleton = METAINTERP_SD.with(|r| {
+            r.borrow()
+                .jitcodes
+                .get(idx)
+                .is_some_and(|jc| jc.payload.is_skeleton())
+        });
+        if skeleton {
+            let _ = ensure_build_time_jitcode_at(idx);
+        }
+    }
     METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
         let idx = jitcode_index as usize;
-        let jc = match sd.jitcodes.get(idx) {
-            Some(jc) => jc,
-            // `record_guard_with_snapshot` (`history.rs`) mints the
-            // interpreter-side vable promotes' resume frame with no
-            // coordinate of its own, marked
-            // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
-            // it with the real position
-            // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
-            // here still carrying the mark means that re-stamp was missed and
-            // the guard was compiled against a resume coordinate that names
-            // no frame. The frame holds no boxes, so `0` is the arithmetically
-            // right answer and the decode would survive it — but the guard it
-            // belongs to cannot resume, so say so instead of continuing.
-            None if jitcode_index == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 => {
-                panic!(
-                    "frame_value_count_at: guard resume frame is still \
-                     unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
-                     pc={pc}) — the `record_guard_with_snapshot` placeholder \
-                     reached the decoder without the walker's real position"
-                )
+        let runtime = {
+            let sd = r.borrow();
+            match sd.jitcodes.get(idx) {
+                Some(jc) => {
+                    // Snapshot publication stores only a decodable JitCode `-live-`
+                    // coordinate. An unrepresentable coordinate must have declined
+                    // during capture, before it could reach this frame-boundary
+                    // decoder.
+                    let count = decode_live_var_count(
+                        &jc.payload.jitcode,
+                        pc,
+                        sd.op_live,
+                        &sd.liveness_info,
+                    );
+                    Some((
+                        count,
+                        jc.payload.metadata.n_py_instrs as usize,
+                        sd.liveness_info.len(),
+                    ))
+                }
+                // `record_guard_with_snapshot` (`history.rs`) mints the
+                // interpreter-side vable promotes' resume frame with no
+                // coordinate of its own, marked
+                // `recorder::UNSTAMPED_JITCODE_INDEX`, and the walker re-stamps
+                // it with the real position
+                // (`walker_capture_inline_nonstandard_vable_guard`). Arriving
+                // here still carrying the mark means that re-stamp was missed
+                // and the guard was compiled against a resume coordinate that
+                // names no frame. The frame holds no boxes, so `0` is the
+                // arithmetically right answer and the decode would survive it
+                // — but the guard it belongs to cannot resume, so say so
+                // instead of continuing.
+                None if jitcode_index
+                    == majit_metainterp::recorder::UNSTAMPED_JITCODE_INDEX as i32 =>
+                {
+                    panic!(
+                        "frame_value_count_at: guard resume frame is still \
+                         unstamped (jitcode_index=UNSTAMPED_JITCODE_INDEX, \
+                         pc={pc}) — the `record_guard_with_snapshot` placeholder \
+                         reached the decoder without the walker's real position"
+                    )
+                }
+                None => None,
             }
-            None => return 0,
         };
-        let payload = &jc.payload;
-        // Snapshot publication stores only a decodable JitCode `-live-`
-        // coordinate. An unrepresentable coordinate must have declined during
-        // capture, before it could reach this frame-boundary decoder.
-        let resolved_jit_pc: Option<usize> = if pc >= 0
-            && payload
-                .jitcode
-                .can_decode_live_vars(pc as usize, sd.op_live)
-        {
-            Some(pc as usize)
-        } else {
-            None
+        let Some((count, n_py_instrs, live_len)) = runtime else {
+            return 0;
         };
-        if let Some(jit_pc) = resolved_jit_pc {
-            let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
-            let all_liveness: &[u8] = &sd.liveness_info;
-            if off + 2 < all_liveness.len() {
-                let length_i = all_liveness[off] as usize;
-                let length_r = all_liveness[off + 1] as usize;
-                let length_f = all_liveness[off + 2] as usize;
-                return length_i + length_r + length_f;
-            }
+        if let Some(count) = count {
+            return count;
+        }
+        // `MetaInterp::interpret` inlines extracted helper JitCodes whose
+        // `JitCode::index` is the build-time `all_jitcodes` slot. The
+        // runtime store at that number can be a different body; try the
+        // table the helper was assembled into.
+        if let Some(count) = decode_build_time_live_var_count(jitcode_index, pc) {
+            return count;
         }
         // A published non-decodable coordinate violates the capture contract.
         // This remains a fail-loud internal invariant, not a fallback path.
         panic!(
             "frame_value_count_at: fallback hit for jitcode_index={} pc={} \
-             (n_py_instrs={}, all_liveness.len={}). Phase X-0/X-1 removed \
-             all known triggers — further hits are bugs.",
-            jitcode_index,
-            pc,
-            payload.metadata.n_py_instrs as usize,
-            sd.liveness_info.len(),
+             (n_py_instrs={n_py_instrs}, all_liveness.len={live_len}). Phase \
+             X-0/X-1 removed all known triggers — further hits are bugs.",
+            jitcode_index, pc,
         );
     })
+}
+
+fn decode_live_var_count(
+    jitcode: &majit_translate::jitcode::JitCode,
+    pc: i32,
+    op_live: u8,
+    all_liveness: &[u8],
+) -> Option<usize> {
+    if pc < 0 || !jitcode.can_decode_live_vars(pc as usize, op_live) {
+        return None;
+    }
+    let off = jitcode.get_live_vars_info(pc as usize, op_live);
+    if off + 2 >= all_liveness.len() {
+        return None;
+    }
+    let length_i = all_liveness[off] as usize;
+    let length_r = all_liveness[off + 1] as usize;
+    let length_f = all_liveness[off + 2] as usize;
+    Some(length_i + length_r + length_f)
+}
+
+fn decode_build_time_live_var_count(jitcode_index: i32, pc: i32) -> Option<usize> {
+    let op_live = crate::jitcode_runtime::insns_opname_to_byte()
+        .get("live/")
+        .copied()?;
+    let jitcode = crate::jitcode_runtime::get_jitcode_by_index(jitcode_index as usize)?;
+    decode_live_var_count(&jitcode, pc, op_live, &liveness_info_snapshot())
 }
 
 /// [`frame_value_count_at`] for a driver whose frames are numbered in the
@@ -2685,6 +2737,51 @@ pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, 
 /// frame/ec colors from the current MIFrame's own red inputs. Root bridge
 /// setup keeps `ec` in its second root inputarg, outside the resumed
 /// MIFrame's semantic register bank.
+/// Recover the portal `ec` red for a bridge.
+///
+/// The translated portal jitcode is installed with degenerate
+/// `portal_ec_reg = u16::MAX` (`from_core_degenerate`), so the color
+/// lookup below is usually empty. The peel still carries `ec` as a
+/// loop-carried red; when the failing guard snapshotted that box it
+/// sits in `fail_values` and must be rebound as the matching bridge
+/// inputarg. A residual `getexecutioncontext` would leave a Call after
+/// opt; a missing box becomes `OpRef::NONE` and `close_bridge` panics
+/// in `arg_to_box`.
+fn recover_bridge_execution_context(
+    ctx: &mut majit_metainterp::TraceCtx,
+    portal_ec_reg: u16,
+    bridge_registers_r: &[OpRef],
+    fail_values: &[i64],
+    fail_types: &[Type],
+) -> OpRef {
+    if portal_ec_reg != u16::MAX
+        && let Some(&op) = bridge_registers_r.get(portal_ec_reg as usize)
+        && !op.is_none()
+    {
+        return op;
+    }
+    let ec_ptr = pyre_interpreter::call::getexecutioncontext() as i64;
+    if ec_ptr == 0 {
+        return OpRef::NONE;
+    }
+    for (i, (&val, &ty)) in fail_values.iter().zip(fail_types.iter()).enumerate() {
+        if ty == Type::Ref && val == ec_ptr {
+            return OpRef::input_arg_typed(i as u32, Type::Ref);
+        }
+    }
+    for &op in bridge_registers_r {
+        if op.is_none() {
+            continue;
+        }
+        if let Some(majit_ir::Value::Ref(r)) = ctx.concrete_of_opref(op)
+            && r.0 as i64 == ec_ptr
+        {
+            return op;
+        }
+    }
+    ctx.const_ref(ec_ptr)
+}
+
 pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
@@ -4083,52 +4180,34 @@ pub(crate) fn note_root_trace_too_long(
 /// including an abort that retires the log before the close.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
-    pos: majit_metainterp::recorder::TracePosition,
+    _pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
-    // Every Python callee re-enters the Python driver's declared portal.
-    // eval.rs registers that driver in slot 0; portal_jitcode resolves its
-    // actual mainjitcode from CompiledJitDriver, including a split portal.
-    // Read that JitCode's owner as pyjitpl.py `MetaInterp.newframe` does,
-    // rather than choosing the first recursive driver in the process.
-    let jitcode = crate::jitcode_runtime::portal_jitcode()?;
+    let canonical = crate::jitcode_runtime::portal_jitcode()?;
     let meta = driver.meta_interp_mut();
-    if !meta.is_main_jitcode(&jitcode) {
+    if !meta.is_main_jitcode(&canonical) {
         return None;
     }
-    let jd_no = jitcode.jitdriver_sd()?;
-    // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME sits on the same greenkey
-    // path as the log append. The walker never builds an MIFrame, so this
-    // is the counterpart of that record.
-    let unique_id = meta.unique_id_for_greenkey(jd_no, &green_key);
-    meta.enter_portal_frame(jd_no, unique_id);
-    meta.push_portal_trace_position(jd_no, Some(green_key), pos);
-    // Counted HERE, not where the entry is appended: an abort retires the log
-    // mid-sub-walk, so counting appends would read `push` far above `pop` for a
-    // reason that says nothing about the pairing.  Counting the decisions makes
-    // `ptp_push != ptp_pop` mean exactly one thing — a sub-walk exit that
-    // skipped its close.
+    let jd_no = canonical.jitdriver_sd()?;
+    // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
+    // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
+    let jitcode = crate::jitcode_runtime::portal_metainterp_jitcode()?;
+    meta.newframe(jitcode, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
 }
 
 /// pyjitpl.py:2470-2472 — close the entry [`note_inline_subwalk_start`] opened.
 pub(crate) fn note_inline_subwalk_end(
-    jd_no: usize,
-    pos: majit_metainterp::recorder::TracePosition,
+    _jd_no: usize,
+    _pos: majit_metainterp::recorder::TracePosition,
 ) {
-    // Like note_inline_subwalk_start, count the activation decision even
-    // when the abort has retired the log. These are not append counters.
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
     majit_metainterp::mc_diag_bump(59);
-    let meta = driver.meta_interp_mut();
-    // pyjitpl.py `popframe(leave_portal_frame=True)`: the walker close is
-    // a normal return, so LEAVE is recorded even when the abort has
-    // already retired the log.
-    meta.leave_portal_frame(jd_no);
-    meta.push_portal_trace_position(jd_no, None, pos);
+    // pyjitpl.py `popframe(leave_portal_frame=True)`.
+    driver.meta_interp_mut().popframe(true);
 }
 
 /// Stage `reason` as the abort the walker is returning, so the single
@@ -7745,7 +7824,14 @@ impl PyreJitState {
     }
 
     fn frame_ptr(&self) -> Option<*mut u8> {
-        (self.frame != 0).then_some(self.frame as *mut u8)
+        // An abort writeback can leave a leftover integer in `frame`
+        // (0, or a small/unaligned word). Those are not PyFrame
+        // pointers; refuse them so last_instr restore cannot fault.
+        let p = self.frame;
+        if p < 0x1000 || p % std::mem::align_of::<PyFrame>() != 0 {
+            return None;
+        }
+        Some(p as *mut u8)
     }
 
     fn frame_array(&self, offset: usize) -> Option<&pyre_object::FixedObjectArray> {
@@ -7910,32 +7996,32 @@ impl PyreJitState {
     // directly to the heap.  These accessors do the same via frame_ptr.
 
     pub fn last_instr_as_usize(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe { (*(frame_ptr as *const PyFrame)).last_instr as usize }
     }
 
     pub fn set_last_instr(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (*(frame_ptr as *mut PyFrame)).last_instr = value as isize;
         }
     }
 
     pub fn next_instr(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe { (&*(frame_ptr as *const PyFrame)).next_instr() }
     }
 
     pub fn set_next_instr(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (&mut *(frame_ptr as *mut PyFrame)).set_last_instr_from_next_instr(value);
         }
@@ -7943,14 +8029,11 @@ impl PyreJitState {
 
     pub fn valuestackdepth(&self) -> usize {
         self.read_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+            .unwrap_or(0)
     }
 
     pub fn set_valuestackdepth(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let _ = self.write_frame_usize(PYFRAME_VALUESTACKDEPTH_OFFSET, value);
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the
@@ -7965,8 +8048,7 @@ impl PyreJitState {
 
     /// Read the code pointer (pycode) from the heap frame.
     pub fn pycode_as_usize(&self) -> usize {
-        self.read_frame_usize(PYFRAME_PYCODE_OFFSET)
-            .expect("PyreJitState.frame must point to a valid PyFrame")
+        self.read_frame_usize(PYFRAME_PYCODE_OFFSET).unwrap_or(0)
     }
 
     /// Read the execution context red independently of the virtualizable frame.
@@ -7990,9 +8072,9 @@ impl PyreJitState {
 
     /// Read the namespace pointer from the heap frame.
     pub fn namespace_as_usize(&self) -> usize {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
         unsafe {
             (&*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame)).get_w_globals() as usize
         }
@@ -8001,10 +8083,7 @@ impl PyreJitState {
     /// Write the pycode pointer to the heap frame.
     /// virtualizable.py write_boxes: ALL static fields written.
     pub fn set_pycode(&mut self, value: usize) {
-        assert!(
-            self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value),
-            "PyreJitState.frame must point to a valid PyFrame"
-        );
+        let _ = self.write_frame_usize(PYFRAME_PYCODE_OFFSET, value);
     }
 
     /// Compatibility wrapper for older callers that still speak in
@@ -8014,9 +8093,9 @@ impl PyreJitState {
     }
 
     pub fn set_namespace(&mut self, value: usize) {
-        let frame_ptr = self
-            .frame_ptr()
-            .expect("PyreJitState.frame must point to a valid PyFrame");
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return;
+        };
         unsafe {
             (&mut *(frame_ptr as *mut pyre_interpreter::pyframe::PyFrame))
                 .set_w_globals(value as pyre_object::PyObjectRef);
@@ -10458,26 +10537,41 @@ impl JitState for PyreJitState {
             values.push(value);
         }
 
+        // Portal interpret (`pypyjit_create_sym`) never fills
+        // `concrete_locals`. Inventing `PY_NULL` for those slots makes
+        // `restore_values` wipe function locals (`i`, `total`) after
+        // CloseLoop — the next interpreter step then raises
+        // UnboundLocalError. Residuals already mutated the live PyFrame,
+        // so read it when the shadow is empty. Omit the slots if there is
+        // no frame either: restore only writes `values.get(idx)`, so the
+        // live locals stay.
         let array_slots = live_arg_boxes.len().saturating_sub(num_scalars);
-        for slot in 0..array_slots {
-            let concrete = if slot < sym.nlocals {
-                sym.concrete_locals
-                    .get(slot)
-                    .copied()
-                    .unwrap_or(ConcreteValue::Ref(PY_NULL))
-            } else {
-                let stack_idx = slot - sym.nlocals;
-                let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
-                if stack_idx < live_stack {
-                    sym.concrete_stack
-                        .get(stack_idx)
+        if !sym.concrete_locals.is_empty() {
+            for slot in 0..array_slots {
+                let concrete = if slot < sym.nlocals {
+                    sym.concrete_locals
+                        .get(slot)
                         .copied()
                         .unwrap_or(ConcreteValue::Ref(PY_NULL))
                 } else {
-                    ConcreteValue::Ref(PY_NULL)
-                }
-            };
-            values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+                    let stack_idx = slot - sym.nlocals;
+                    let live_stack = sym.valuestackdepth.saturating_sub(sym.nlocals);
+                    if stack_idx < live_stack {
+                        sym.concrete_stack
+                            .get(stack_idx)
+                            .copied()
+                            .unwrap_or(ConcreteValue::Ref(PY_NULL))
+                    } else {
+                        ConcreteValue::Ref(PY_NULL)
+                    }
+                };
+                values.push(Value::Ref(majit_ir::GcRef(concrete.to_pyobj() as usize)));
+            }
+        } else if frame_addr != 0 {
+            for slot in 0..array_slots {
+                let obj = concrete_stack_value(frame_addr, slot).unwrap_or(PY_NULL);
+                values.push(Value::Ref(majit_ir::GcRef(obj as usize)));
+            }
         }
 
         Some(values)
@@ -10967,14 +11061,13 @@ impl JitState for PyreJitState {
         // `MIFrame::ensure_execution_context`, which reads the thread's own
         // context instead.
         let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
-        let bridge_execution_context = (portal_ec_reg != u16::MAX)
-            .then(|| {
-                bridge_registers_r
-                    .get(portal_ec_reg as usize)
-                    .copied()
-                    .unwrap_or(OpRef::NONE)
-            })
-            .unwrap_or(OpRef::NONE);
+        let bridge_execution_context = recover_bridge_execution_context(
+            ctx,
+            portal_ec_reg,
+            &bridge_registers_r,
+            fail_values,
+            fail_types,
+        );
         // Reconstruct the slot-indexed semantic register file
         // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
         // The decode just filled `bridge_registers_r` by abstract-register
@@ -11829,6 +11922,68 @@ impl JitState for PyreJitState {
             // carries history.py:220 `box.type`).
             fail_arg_types: fail_arg_types.to_vec(),
         })
+    }
+
+    fn jitcode_at_resume_index(
+        index: i32,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        if index < 0 {
+            return None;
+        }
+        let index = index as usize;
+        if let Some(portal) = crate::jitcode_runtime::portal_metainterp_jitcode()
+            && portal.try_index() == Some(index)
+        {
+            return Some(portal);
+        }
+        crate::jitcode_runtime::get_jitcode_by_index(index).map(|canonical| {
+            std::sync::Arc::new(majit_metainterp::jitcode::JitCode::from_canonical(
+                (*canonical).clone(),
+            ))
+        })
+    }
+
+    /// pyjitpl.py `handle_guard_failure` → `interpret()` from the rebuilt
+    /// resume framestack. Generated `#[jit_interp]` states already forward
+    /// this to `trace_jitcode_at_resume_framestack`; the portal frontend
+    /// was still on the trait default (`None`), so every guard fell
+    /// through to FBW.
+    fn trace_from_guard_resume_position<R: majit_metainterp::JitCodeRuntime>(
+        ctx: &mut TraceCtx,
+        _sym: &mut Self::Sym,
+        frames: &[majit_metainterp::GuardResumeFrame],
+        outer_program_pc: usize,
+        runtime: &R,
+    ) -> Option<TraceAction> {
+        struct PortalResumeSym {
+            header_pc: usize,
+        }
+        impl majit_metainterp::JitCodeSym for PortalResumeSym {
+            fn total_slots(&self) -> usize {
+                0
+            }
+            fn loop_header_pc(&self) -> usize {
+                self.header_pc
+            }
+        }
+        let mut portal_sym = PortalResumeSym {
+            header_pc: outer_program_pc,
+        };
+        let action = majit_metainterp::trace_jitcode_at_resume_framestack_allowing_residuals(
+            ctx,
+            &mut portal_sym,
+            frames,
+            outer_program_pc,
+            runtime,
+        );
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] portal resume walk action={action:?} frames={} header_pc={}",
+                frames.len(),
+                outer_program_pc
+            );
+        }
+        Some(action)
     }
 
     /// pyjitpl.py get_procedure_token: compute green key for a PC.
