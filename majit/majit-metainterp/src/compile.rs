@@ -3584,13 +3584,13 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // against the live length; refuse rather than compile that shape.
     let leftover_empty_len_mismatch = leftover.is_empty()
         && !entry_field_oprefs.is_empty()
-        && baked_field_len != entry_field_oprefs.len();
+        && baked_field_len > entry_field_oprefs.len();
     // leftover-empty GETFIELD of a one-slot TOS frame (exception
     // helper / inlined raise) remaps callee fields onto the portal
     // mint and SIGSEGVs `from_callee`.
     let leftover_empty_short_tos = leftover.is_empty()
         && baked_field_len >= 10
-        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] <= 1);
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] == 1);
     // leftover-empty GETFIELD of a peeled inlined frame whose mint is
     // shorter than the portal array (traceback lasti: mint 13, live 16)
     // deopts into consume_vable_info mismatch. exception_reused mints
