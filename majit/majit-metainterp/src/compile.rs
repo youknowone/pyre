@@ -3540,13 +3540,14 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         });
     // leftover-empty GETFIELD of a leftover Ref whose mint slot is an
     // untagged non-GC word later SETFIELDs that word into a holder
-    // (pip hermetic-guard `type_id` garbage, child `-42`). Call leftovers
-    // stay: aborting those dropped leftover-empty GETFIELD of frame
-    // `f_locals`. Scanning every leftover InputArg did the same.
+    // (pip hermetic-guard `type_id` garbage, child `-42`). GETFIELD
+    // leftovers stay: aborting those SNAPDIFF'd `defaults_reassigned`
+    // and ctor-inline loop-census fixtures. Call leftovers stay so
+    // exception_reused still GETFIELDs `f_locals`.
     let mint_nongc_field = leftover_has_listiter_id()
         && !orig_vable.is_null()
         && ops.iter().any(|op| {
-            if !(op.opcode.is_getfield() || op.opcode.is_setfield()) {
+            if !op.opcode.is_setfield() {
                 return false;
             }
             op.getarglist().iter().any(|a| {
@@ -6373,10 +6374,10 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_rejects_leftover_empty_nongc_getfield() {
-        // leftover-empty GETFIELD of a leftover Ref whose mint slot is
+        // leftover-empty SETFIELD of a leftover Ref whose mint slot is
         // an untagged non-GC word later walks that word as an object.
-        // Abort only that GETFIELD/SETFIELD leftover; a Call leftover
-        // with the same slot must stay (exception_reused f_locals).
+        // Abort only that SETFIELD leftover; a Call leftover with the
+        // same slot must stay (exception_reused f_locals).
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
         #[repr(C)]
         struct Frame {
@@ -6420,11 +6421,14 @@ mod tests {
                 rooted_inputarg_operand(Type::Ref, 3),
             ],
         );
-        let get = Op::new(
-            OpCode::GetfieldGcR,
-            &[rooted_inputarg_operand(Type::Ref, 3)],
+        let set = Op::new(
+            OpCode::SetfieldGc,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 3),
+            ],
         );
-        let mut ops: Vec<majit_ir::OpRc> = vec![label, get].into_iter().map(OpRc::new).collect();
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, set].into_iter().map(OpRc::new).collect();
         let mut inputargs = vec![
             InputArg::new_ref(0),
             InputArg::new_ref(1),
@@ -6455,7 +6459,7 @@ mod tests {
                 &mut portal as *mut Frame as *const u8,
                 None,
             ),
-            "leftover-empty GETFIELD of an untagged non-GC mint slot must abort"
+            "leftover-empty SETFIELD of an untagged non-GC mint leftover must abort"
         );
 
         let _ = take_leftover_empty_reject();
