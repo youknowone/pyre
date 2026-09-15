@@ -373,7 +373,7 @@ pub mod rbuilder_runtime {
     }
 
     /// `rbuilder.py _ll_append`.
-    pub fn ll_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
+    pub fn _ll_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
         // STR-only — see [`ll_new`].
         assert_eq!(
             item_size, 1,
@@ -490,8 +490,19 @@ pub mod rbuilder_runtime {
         }
     }
 
+    /// `rbuilder.py ll_build`: `@jit.look_inside_iff(isvirtual(ll_builder))`.
+    /// Without StringBuilder virtualization the builder is never virtual, so
+    /// the generated JIT residualizes this body.
+    fn ll_build_iff(builder: i64, _item_size: usize) -> bool {
+        if builder == 0 {
+            return false;
+        }
+        unsafe { majit_rlib::jit::isvirtual(&*(builder as *const StringBuilderBox)) }
+    }
+
     /// `rbuilder.py ll_build`: consolidate to a single buffer and return the
     /// builder's GC reference. The builder intentionally keeps the same reference.
+    #[majit_macros::look_inside_iff(ll_build_iff)]
     pub fn ll_build(builder: i64, item_size: usize) -> i64 {
         // STR-only — see [`ll_new`].
         assert_eq!(
@@ -510,20 +521,42 @@ pub mod rbuilder_runtime {
         unsafe { (*(builder as *const StringBuilderBox)).current_buf }
     }
 
+    /// `rbuilder.py ll_append(ll_builder, ll_str)` — `@always_inline`.
+    /// Jitted: residual `ll_append_res0` (`ll_jit_append` fallback).
+    /// Interpreter: inline `_ll_append(..., 0, len(ll_str.chars))`.
+    #[inline]
+    pub fn ll_append(builder: i64, ll_str: i64) {
+        if majit_rlib::jit::we_are_jitted() {
+            ll_jit_append(builder, ll_str);
+        } else {
+            let size = bh_lowlevel_string_len(ll_str) as i64;
+            _ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
+        }
+    }
+
+    /// `rbuilder.py ll_jit_append` — `@dont_inline`. Small-length
+    /// `ll_jit_try_append_slice` is not ported; the residual fallback is
+    /// the required path.
+    fn ll_jit_append(builder: i64, ll_str: i64) {
+        jit_ll_append_res0(builder, ll_str);
+    }
+
     /// `ll_append_res0(ll_builder, ll_str)` = `_ll_append(ll_builder, ll_str, 0,
     /// len(ll_str.chars))` (`rbuilder.py`). The `dont_look_inside` residual
     /// target the codewriter binds when an append cannot be inlined; mutates the
     /// builder in place and returns void.
+    #[majit_macros::dont_look_inside]
     pub extern "C" fn jit_ll_append_res0(builder: i64, ll_str: i64) {
         let size = bh_lowlevel_string_len(ll_str) as i64;
-        ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
+        _ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
     }
 
     /// `ll_append_res_slice(ll_builder, ll_str, start, end)` =
     /// `_ll_append(ll_builder, ll_str, start, end - start)` (`rbuilder.py`). The
     /// slice helper takes `end`; `_ll_append` takes the count, so convert here.
+    #[majit_macros::dont_look_inside]
     pub extern "C" fn jit_ll_append_res_slice(builder: i64, ll_str: i64, start: i64, end: i64) {
-        ll_append(builder, ll_str, start, end - start, STR_ITEM_SIZE);
+        _ll_append(builder, ll_str, start, end - start, STR_ITEM_SIZE);
     }
 
     #[cfg(test)]
@@ -558,7 +591,7 @@ pub mod rbuilder_runtime {
             let item = STR_ITEM_SIZE;
             let builder = ll_new(100, item);
             let hello = make_str(b"hello");
-            ll_append(builder, hello, 0, 5, item);
+            _ll_append(builder, hello, 0, 5, item);
             assert_eq!(ll_getlength(builder), 5);
             // current_pos (5) != total_size (100) ⇒ ll_shrink_final.
             let result = ll_build(builder, item);
@@ -572,7 +605,7 @@ pub mod rbuilder_runtime {
             // init 4 forces a grow when appending 10 chars.
             let builder = ll_new(4, item);
             let s = make_str(b"abcdefghij");
-            ll_append(builder, s, 0, 10, item);
+            _ll_append(builder, s, 0, 10, item);
             // Must have chained a piece.
             let extra = {
                 let b = unsafe { &*(builder as *const StringBuilderBox) };
@@ -596,8 +629,8 @@ pub mod rbuilder_runtime {
             let builder = ll_new(2, item);
             let bytes: Vec<u8> = (0..70u8).map(|i| b'A' + (i % 26)).collect();
             let s = make_str(&bytes);
-            ll_append(builder, s, 0, 10, item);
-            ll_append(builder, s, 10, 60, item);
+            _ll_append(builder, s, 0, 10, item);
+            _ll_append(builder, s, 10, 60, item);
             // Two grows ⇒ a two-node chain: the head node's prev_piece is another
             // node, not the chain-end sentinel.
             let head = {

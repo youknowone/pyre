@@ -495,14 +495,7 @@ impl Utf8StringBuilder {
         utf8: *mut crate::unicodeobject::UnicodeValueStorage,
         length: i64,
     ) {
-        let size = crate::lowlevel_string::bh_lowlevel_string_len(utf8 as i64) as i64;
-        crate::rbuilder::rbuilder_runtime::ll_append(
-            self._s,
-            utf8 as i64,
-            0,
-            size,
-            crate::rbuilder::rbuilder_runtime::STR_ITEM_SIZE,
-        );
+        crate::rbuilder::rbuilder_runtime::ll_append(self._s, utf8 as i64);
         self._lgt += length;
     }
 
