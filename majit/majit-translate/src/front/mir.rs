@@ -10531,9 +10531,10 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // Opaque `f64::{hypot,atan2,copysign,floor,ceil}` are the
-                // C llexternals in `ll_math.py` (`math_hypot`, …).  The
-                // raising wrappers (`ll_math_hypot`, …) stay around them.
+                // Opaque `f64::{hypot,atan2,copysign,floor,ceil,powf,ln,
+                // exp,sin,cos}` are the C llexternals in `ll_math.py`
+                // (`math_hypot`, …).  The raising wrappers
+                // (`ll_math_hypot`, …) stay around them.
                 if let Some((arity, leaf)) = self.f64_ll_math_leaf(&reg)
                     && args.len() == arity
                 {
@@ -14795,8 +14796,13 @@ impl<'a> Lowering<'a> {
             "hypot" => (2, "math_hypot"),
             "atan2" => (2, "math_atan2"),
             "copysign" => (2, "math_copysign"),
+            "powf" => (2, "math_pow"),
             "floor" => (1, "math_floor"),
             "ceil" => (1, "math_ceil"),
+            "ln" => (1, "math_log"),
+            "exp" => (1, "math_exp"),
+            "sin" => (1, "math_sin"),
+            "cos" => (1, "math_cos"),
             _ => return None,
         })
     }

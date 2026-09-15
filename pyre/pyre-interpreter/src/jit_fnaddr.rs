@@ -3269,6 +3269,36 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "math_ceil",
         crate::module::math::interp_math::jit_math_ceil_raw,
     );
+    cpa1(
+        &mut entries,
+        "ll_math::math_log",
+        "math_log",
+        crate::module::math::interp_math::jit_math_log_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_exp",
+        "math_exp",
+        crate::module::math::interp_math::jit_math_exp_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_sin",
+        "math_sin",
+        crate::module::math::interp_math::jit_math_sin_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_cos",
+        "math_cos",
+        crate::module::math::interp_math::jit_math_cos_raw,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_pow",
+        "math_pow",
+        crate::module::math::interp_math::jit_math_pow_raw,
+    );
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
     // `ll_append_res_slice` once its native fnaddr is bound. Unlike shrink, these

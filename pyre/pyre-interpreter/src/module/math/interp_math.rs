@@ -508,6 +508,28 @@ pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
     x.hypot(y)
 }
 
+/// `ll_math.py` C llexternals for Opaque `f64::{ln,exp,sin,cos,powf}`.
+/// IEEE, no raise — the `ll_math_*` wrappers stay around them.
+pub extern "C" fn jit_math_log_raw(x: f64) -> f64 {
+    x.ln()
+}
+
+pub extern "C" fn jit_math_exp_raw(x: f64) -> f64 {
+    x.exp()
+}
+
+pub extern "C" fn jit_math_sin_raw(x: f64) -> f64 {
+    x.sin()
+}
+
+pub extern "C" fn jit_math_cos_raw(x: f64) -> f64 {
+    x.cos()
+}
+
+pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {
+    x.powf(y)
+}
+
 /// Raw `math.isclose(a, b)` with both keyword tolerances left at their
 /// defaults, `rel_tol=1e-09` and `abs_tol=0.0`.
 ///
@@ -588,7 +610,6 @@ math_fold_table!(
     "copysign" => jit_math_copysign,
     "remainder" => jit_math_remainder,
     "atan2" => jit_math_atan2,
-    "hypot" => jit_math_hypot,
 );
 
 /// The wrapper pointer `py_module!` installed for `math.<name>`, or `None`

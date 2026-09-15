@@ -132,6 +132,7 @@ impl ExceptionNormalization {
     /// fast path is now reachable — `w_exception_set_traceback` is
     /// invoked when `w_value` is an exception instance, falling back
     /// to the generic setattr for anything else.
+    #[majit_macros::unroll_safe]
     pub fn normalize_exception(&mut self, space: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let mut w_type = self.w_type;
         let mut w_value = self.get_w_value(space);
@@ -1728,6 +1729,10 @@ impl PyError {
         exc
     }
 
+    /// `error.py OperationError.normalize_exception` is `@jit.unroll_safe`.
+    /// This body has no loop, so `look_inside_graph` already admits it;
+    /// the hint matches the upstream decorator.
+    #[majit_macros::unroll_safe]
     pub fn normalize_exception(&mut self, _space: PyObjectRef) -> Result<PyObjectRef, PyError> {
         let w_value = self.to_exc_object();
         if w_value.is_null() || !unsafe { pyre_object::is_exception(w_value) } {
