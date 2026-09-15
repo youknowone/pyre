@@ -27,7 +27,7 @@ use majit_ir::forwarding::bound_operand_from_opref as rb;
 /// so the two exits are distinguishable by value alone: 42 means the guard was
 /// taken, 43 means it was not.
 fn compile_guarded_add(backend: &mut DynasmBackend, token: &JitCellToken) -> majit_ir::DescrRef {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
 
     let guard_descr = make_resume_guard_descr_typed(vec![Type::Int]);
@@ -115,7 +115,7 @@ fn every_recorded_position_in_a_trace_is_written() {
     backend.attach_default_test_descrs();
     let token = JitCellToken::new(3);
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let i0 = inputargs[0].opref();
 
     let first = Op::new(OpCode::GuardNotInvalidated, &[]);

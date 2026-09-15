@@ -100,7 +100,7 @@ impl crate::Backend for SyntheticCpu {
     /// must never be reached.
     fn compile_loop(
         &mut self,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _token: &crate::JitCellToken,
     ) -> Result<crate::AsmInfo, crate::BackendError> {
@@ -110,7 +110,7 @@ impl crate::Backend for SyntheticCpu {
     fn compile_bridge(
         &mut self,
         _fail_descr: &dyn majit_ir::FailDescr,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _original_token: &crate::JitCellToken,
         _previous_tokens: &[std::sync::Arc<crate::JitCellToken>],

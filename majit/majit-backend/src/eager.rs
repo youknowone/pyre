@@ -42,7 +42,7 @@
 //!         make_finish_descr(0, vec![Type::Int])));
 //!     // SAFETY: well-formed integer-only IR, configured CPU and fresh token.
 //!     let mut compiled = unsafe {
-//!         CompiledIr::compile(cpu, fresh_token, &[x.fresh_value_copy()],
+//!         CompiledIr::compile(cpu, fresh_token, &[x],
 //!             &[add, finish], ConstMap::default())
 //!     }.expect("backend supports integer addition");
 //!     // SAFETY: no pointers, allocation, or runtime calls in this IR.
@@ -54,7 +54,7 @@
 
 use std::sync::Arc;
 
-use majit_ir::{Const, ConstMap, InputArg, OpRc, Type, Value};
+use majit_ir::{Const, ConstMap, InputArgRc, OpRc, Type, Value};
 
 use crate::{AsmInfo, Backend, BackendError, JitCellToken, RawExecResult};
 
@@ -104,7 +104,7 @@ impl<'backend> CompiledIr<'backend> {
     pub unsafe fn compile(
         backend: &'backend mut dyn Backend,
         token: Arc<JitCellToken>,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         operations: &[OpRc],
         constants: ConstMap<Const>,
     ) -> Result<Self, BackendError> {

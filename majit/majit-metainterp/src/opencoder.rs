@@ -296,11 +296,13 @@ where
         start: usize,
         end: usize,
         force_inputargs: Option<&[OpRef]>,
-        inputargs: &[InputArg],
+        inputargs: &[impl AsRef<InputArg>],
         start_fresh: u32,
     ) -> Self {
-        let inputarg_types: Vec<majit_ir::Type> = inputargs.iter().map(|arg| arg.tp).collect();
-        let inputarg_positions: Vec<OpRef> = inputargs.iter().map(InputArg::opref).collect();
+        let inputarg_types: Vec<majit_ir::Type> =
+            inputargs.iter().map(|arg| arg.as_ref().tp).collect();
+        let inputarg_positions: Vec<OpRef> =
+            inputargs.iter().map(|arg| arg.as_ref().opref()).collect();
         Self::new_with_input_layout(
             trace,
             start,

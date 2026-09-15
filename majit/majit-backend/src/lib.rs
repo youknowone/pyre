@@ -11,7 +11,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
+use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Type, Value};
 
 thread_local! {
     static NULL_MEM_ACCESS: Cell<bool> = const { Cell::new(false) };
@@ -2804,7 +2804,7 @@ pub trait Backend: Send {
     /// interior-mutable so they can be written through the shared reference.
     fn compile_loop(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
@@ -2897,7 +2897,7 @@ pub trait Backend: Send {
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
@@ -4558,17 +4558,20 @@ mod tests {
         let mut info = LoopVersionInfo::new();
         assert!(info.versions.is_empty());
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![Op::new(majit_ir::OpCode::Finish, &[])];
         info.add_version(
             10,
-            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            vec![InputArg::new_int(0), InputArg::new_int(1)],
             ops.clone(),
         );
         assert_eq!(info.versions.len(), 1);
         assert_eq!(info.versions[0].0, 10);
 
-        info.add_version(20, inputargs, ops);
+        info.add_version(
+            20,
+            vec![InputArg::new_int(0), InputArg::new_int(1)],
+            ops,
+        );
         assert_eq!(info.versions.len(), 2);
         assert_eq!(info.versions[1].0, 20);
     }

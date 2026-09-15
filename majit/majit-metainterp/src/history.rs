@@ -524,11 +524,8 @@ impl TreeLoop {
         !opref.is_none() && !opref.is_constant()
     }
 
-    pub fn inputargs_cloned(&self) -> Vec<InputArg> {
-        self.inputargs
-            .iter()
-            .map(|rc| (**rc).fresh_value_copy())
-            .collect()
+    pub fn inputargs_cloned(&self) -> Vec<InputArgRc> {
+        self.inputargs.clone()
     }
 
     /// Create a new trace from input arguments and operations.
@@ -1480,10 +1477,8 @@ mod tests {
     #[test]
     fn test_trace_loop_vs_finish_exclusive() {
         // A trace cannot be both a loop and finished.
-        let inputargs = vec![InputArg::new_int(0)];
-
         let loop_trace = TreeLoop::new(
-            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            vec![InputArg::new_int(0)],
             vec![
                 Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
                 Op::new(OpCode::Jump, &[iop_box(1)]),
@@ -1493,7 +1488,7 @@ mod tests {
         assert!(!loop_trace.is_finished());
 
         let finish_trace = TreeLoop::new(
-            inputargs,
+            vec![InputArg::new_int(0)],
             vec![
                 Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
                 Op::new(OpCode::Finish, &[iop_box(1)]),

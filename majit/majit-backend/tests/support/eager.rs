@@ -57,7 +57,7 @@ fn compiles_before_first_execution_and_reuses_code_for_new_inputs() {
         add.clone(),
         finish(&[Operand::from_bound_op(&add)], vec![Type::Int]),
     ];
-    let inputs = vec![x.fresh_value_copy(), y.fresh_value_copy()];
+    let inputs = vec![x.clone(), y.clone()];
     let token = token();
     let mut code = unsafe {
         CompiledIr::compile(
@@ -141,7 +141,7 @@ fn guard_failure_is_returned_without_fallback_or_recompilation() {
         CompiledIr::compile(
             &mut *backend,
             compiled_token.clone(),
-            &[x.fresh_value_copy()],
+            &[x.clone()],
             &operations,
             ConstMap::default(),
         )
@@ -175,9 +175,9 @@ fn mixed_types_and_void_results_preserve_the_backend_contract() {
     let float = InputArg::from_type_rc(Type::Float, 1);
     let reference = InputArg::from_type_rc(Type::Ref, 2);
     let inputs = vec![
-        int.fresh_value_copy(),
-        float.fresh_value_copy(),
-        reference.fresh_value_copy(),
+        int.clone(),
+        float.clone(),
+        reference.clone(),
     ];
     let args = [&int, &float, &reference].map(Operand::from_bound_inputarg);
     let values = [
@@ -274,7 +274,7 @@ fn host_function_runs_only_on_explicit_execution() {
         CompiledIr::compile(
             &mut *backend,
             token(),
-            &[x.fresh_value_copy()],
+            &[x.clone()],
             &operations,
             ConstMap::default(),
         )

@@ -20,7 +20,7 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_ir::descr::SizeDescr;
 use majit_ir::forwarding::Forwarded;
 use majit_ir::operand::Operand;
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{InputArg, InputArgRc, Op, OpCode, OpRef, Type, Value};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, EntityType, ExportKind, ExportSection, Function,
     FunctionSection, GlobalSection, GlobalType, ImportSection, InstructionSink, MemArg, MemoryType,
@@ -36,7 +36,7 @@ use wasm_encoder::{
 /// locals start at zero, so a later deopt writes a null local back as
 /// bytecode state. Clone an existing array load in this trace — same
 /// descr, same array pointer — and store into the missing LABEL id.
-pub fn materialize_unbound_label_args(inputargs: &[InputArg], ops: &mut Vec<Op>) {
+pub fn materialize_unbound_label_args(inputargs: &[InputArgRc], ops: &mut Vec<Op>) {
     let produced: std::collections::HashSet<u32> = ops
         .iter()
         .filter_map(|op| {
@@ -208,7 +208,7 @@ impl ValueLocals {
         has_authoritative_type[i] |= authoritative;
     }
 
-    fn collect(inputargs: &[InputArg], ops: &[Op], num_vars: u32, first_local: u32) -> Self {
+    fn collect(inputargs: &[InputArgRc], ops: &[Op], num_vars: u32, first_local: u32) -> Self {
         let mut by_id = vec![None; num_vars as usize];
         let mut id_types = vec![ValType::I64; num_vars as usize];
         let mut has_authoritative_type = vec![false; num_vars as usize];
@@ -1284,7 +1284,7 @@ impl RefValues {
         by_id[i] = true;
     }
 
-    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+    fn collect(inputargs: &[InputArgRc], ops: &[Op]) -> Self {
         let mut by_id = Vec::new();
         for ia in inputargs {
             if ia.tp == Type::Ref {
@@ -1340,7 +1340,7 @@ impl RefHomes {
     }
 
     fn collect(
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[Op],
         include_ca_collects: bool,
         forced_refs: &[OpRef],
@@ -1525,12 +1525,12 @@ impl InlinedRegionSpan {
 }
 
 impl LabelResumeData {
-    fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
+    fn collect(inputargs: &[InputArgRc], ops: &[Op]) -> Self {
         Self::collect_with_regions(inputargs, ops, &[], inputargs.len())
     }
 
     fn collect_with_regions(
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[Op],
         regions: &[InlinedRegionSpan],
         entry_arity: usize,
@@ -1788,7 +1788,7 @@ impl LabelResumeData {
 /// matching the `num_ref_homes` [`build_wasm_module`] returns. Lets a CA-arena
 /// caller size the callee frame and the GC walker for a (wider) bridge's home
 /// region before codegen runs.
-pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
+pub fn count_ref_homes(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     // This pre-sizing query is used for CA bridges before `CaParams` exists, so
     // count CALL_ASSEMBLER as a collecting position to match CA codegen.
     let resume = LabelResumeData::collect(inputargs, ops);
@@ -1796,7 +1796,7 @@ pub fn count_ref_homes(inputargs: &[InputArg], ops: &[Op]) -> usize {
 }
 
 /// Number of high GC-rooted homes reserved exclusively for LABEL live-ins.
-pub fn label_ref_capture_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+pub fn label_ref_capture_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     LabelResumeData::collect(inputargs, ops).ref_slots
 }
 
@@ -1843,7 +1843,7 @@ pub(crate) fn build_home_gcmap(
 /// numbering the optimizer produced stays untouched. Same id set
 /// `collect_guards_and_vars` sizes `num_vars` from, so the loads land inside
 /// the locals the function declares.
-pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
+pub fn next_value_pos(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
     collect_guards_and_vars(inputargs, ops).1
 }
 
@@ -1862,11 +1862,15 @@ pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 /// one. Upstream never faces the question: `regalloc.py prepare_op_guard_value`
 /// names a slot in the register save area `_push_all_regs_to_frame` writes at
 /// every exit, so a slot always exists and no frame is ever sized for it.
-fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+fn normal_frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots_for(inputargs, ops, inputargs.len())
 }
 
-fn normal_frame_value_slots_for(inputargs: &[InputArg], ops: &[Op], entry_arity: usize) -> usize {
+fn normal_frame_value_slots_for(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+    entry_arity: usize,
+) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
@@ -1881,7 +1885,7 @@ fn normal_frame_value_slots_for(inputargs: &[InputArg], ops: &[Op], entry_arity:
 ///
 /// The first slot past the value area every exit writes into, so it is free in
 /// every exit's layout, and `normal_frame_value_slots` reserves it.
-fn counter_slot(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
+fn counter_slot(inputargs: &[InputArgRc], ops: &[Op]) -> Option<usize> {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     if guards.iter().all(|g| g.counter_value_spill.is_none()) {
         return None;
@@ -1894,7 +1898,7 @@ fn counter_slot(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
     Some(max_fail_args.max(inputargs.len()))
 }
 
-pub fn frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+pub fn frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots(inputargs, ops) + LabelResumeData::collect(inputargs, ops).scalar_slots
 }
 
@@ -2424,7 +2428,7 @@ struct HomeLiveness {
 
 impl HomeLiveness {
     fn collect_with_regions(
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[Op],
         regions: &[InlinedRegionSpan],
     ) -> Self {
@@ -3763,7 +3767,7 @@ fn direct_helper_i64_arity(
 /// non-uniform CALLs, an unvouched callee, and string allocation retain the
 /// trampoline.
 fn has_trampoline_calls(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     emit_ca: bool,
@@ -3794,7 +3798,7 @@ fn has_trampoline_calls(
     })
 }
 
-fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit>, u32) {
+fn collect_guards_and_vars(inputargs: &[InputArgRc], ops: &[Op]) -> (Vec<GuardExit>, u32) {
     let mut guards = Vec::new();
     let mut max_var: u32 = 0;
 
@@ -3961,13 +3965,13 @@ fn park_guard_value_counters(guards: &mut [GuardExit], entry_arity: usize) {
 
 /// Number of guard/finish exits a module will need bridge-dispatch cells for.
 /// Cell ownership belongs to the compiled trace, outside module generation.
-pub fn guard_exit_count(inputargs: &[InputArg], ops: &[Op]) -> usize {
+pub fn guard_exit_count(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     collect_guards_and_vars(inputargs, ops).0.len()
 }
 
 /// Dense wasm-local assignment and type lookup for each addressed SSA value.
 fn collect_value_types(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     num_vars: u32,
     first_local: u32,
@@ -4544,7 +4548,7 @@ pub struct InlineTripProbe {
 /// first build so it can emit the same trace again without revisiting mutable
 /// backend state such as the constants pool or GC-reference interning pass.
 pub struct ModuleBuildInputs {
-    pub inputargs: Vec<InputArg>,
+    pub inputargs: Vec<InputArgRc>,
     /// These are the post-intern operations.  Re-interning them would lose the
     /// already allocated GC-table base encoded by `gc_table_base`.
     pub ops: Vec<Op>,
@@ -4625,7 +4629,7 @@ pub struct InlinedBridge {
     /// own sub-bridges' dispatch cells are keyed by.
     pub outside_loop: bool,
     pub trace_id: u64,
-    pub inputargs: Vec<InputArg>,
+    pub inputargs: Vec<InputArgRc>,
     pub ops: Vec<Op>,
     /// Base of this already-interned region's GC table. Each region retains
     /// its own roots; codegen selects it by the LoadFromGcTable producer.
@@ -4715,7 +4719,7 @@ impl Clone for InlinedBridge {
             inputargs: self
                 .inputargs
                 .iter()
-                .map(InputArg::fresh_value_copy)
+                .cloned()
                 .collect(),
             ops: self.ops.clone(),
             gc_table_base: self.gc_table_base,
@@ -4730,7 +4734,7 @@ impl Clone for ModuleBuildInputs {
             inputargs: self
                 .inputargs
                 .iter()
-                .map(InputArg::fresh_value_copy)
+                .cloned()
                 .collect(),
             ops: self.ops.clone(),
             inlined_bridges: self.inlined_bridges.clone(),
@@ -4761,7 +4765,7 @@ impl Clone for ModuleBuildInputs {
 /// One past the highest value id `inputargs`/`ops` define or read. Mirrors the
 /// `max_var` half of `collect_guards_and_vars` without its guard collection,
 /// which stamps per-value counters onto guard descrs and must run once only.
-fn value_id_end(inputargs: &[InputArg], ops: &[Op]) -> u32 {
+fn value_id_end(inputargs: &[InputArgRc], ops: &[Op]) -> u32 {
     let mut end: u32 = 0;
     let widen = |r: OpRef, end: &mut u32| {
         if r != OpRef::NONE && !r.is_constant() && r.raw() + 1 > *end {
@@ -4830,10 +4834,10 @@ fn rebase_region_value_ids(
              (offset {offset}, width {width})"
         )));
     }
-    let inputargs: Vec<InputArg> = bridge
+    let inputargs: Vec<InputArgRc> = bridge
         .inputargs
         .iter()
-        .map(|ia| InputArg::from_type(ia.tp, ia.index + offset))
+        .map(|ia| InputArgRc::new(InputArg::from_type(ia.tp, ia.index + offset)))
         .collect();
     // `Op::clone` gives the copy its own arg/failarg slots, but the operands in
     // them keep pointing at the region's original producers, whose `pos` this
@@ -4931,10 +4935,10 @@ pub fn build_wasm_module(
     let mut gc_table_bases = HashMap::new();
     let mut rebased_bridges: Vec<InlinedBridge> = Vec::new();
     let mut rebased_constants = indexmap::IndexMap::new();
-    let (analysis_inputargs, analysis_ops): (&[InputArg], &[Op]) = if inlined_bridges.is_empty() {
+    let (analysis_inputargs, analysis_ops): (&[InputArgRc], &[Op]) = if inlined_bridges.is_empty() {
         (inputargs, ops)
     } else {
-        merged_inputargs.extend(inputargs.iter().map(InputArg::fresh_value_copy));
+        merged_inputargs.extend(inputargs.iter().cloned());
         merged_ops.extend(ops.iter().cloned());
         // The merged stream has one local namespace, so every region has to be
         // moved off the ids the owner and the earlier regions already use.
@@ -4960,7 +4964,7 @@ pub fn build_wasm_module(
                 }
             }
             next_value_id += width;
-            merged_inputargs.extend(bridge.inputargs.iter().map(InputArg::fresh_value_copy));
+            merged_inputargs.extend(bridge.inputargs.iter().cloned());
             for op in &bridge.ops {
                 if op.opcode == OpCode::LoadFromGcTable {
                     gc_table_bases.insert(op.pos().get().raw(), bridge.gc_table_base);
@@ -5710,8 +5714,8 @@ fn build_spill_helper(arity: usize) -> Function {
 
 #[allow(clippy::too_many_arguments)]
 fn build_function(
-    entry_inputargs: &[InputArg],
-    inputargs: &[InputArg],
+    entry_inputargs: &[InputArgRc],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     inlined_bridges: &[InlinedBridge],
     constants: &indexmap::IndexMap<u32, i64>,
@@ -10818,7 +10822,7 @@ pub fn label_arg_counts(ops: &[Op]) -> Vec<usize> {
 }
 
 pub fn has_label_param_entry(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     frame: FrameGeometry,
     bridge_entry_arity: Option<usize>,
@@ -10846,7 +10850,7 @@ pub fn has_label_param_entry(
 /// loop populated it; a sibling specialization may share the same geometry
 /// but not those values, so bridge chaining must then stay on the owner.
 pub fn label_resume_info(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     frame: FrameGeometry,
 ) -> Vec<(bool, bool)> {
@@ -11271,7 +11275,7 @@ fn jump_targets_local_label(ops: &[Op], jump: &Op) -> bool {
 }
 
 fn unbound_pool_const_seeds(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     num_vars: u32,
@@ -11670,7 +11674,7 @@ fn unpack_interior_field(op: &Op) -> InteriorFieldLayout {
 #[derive(Clone, Copy)]
 struct InlineGuard<'a> {
     guard_idx: u32,
-    inputargs: &'a [InputArg],
+    inputargs: &'a [InputArgRc],
     /// Ordinal within this region's family, region 0 attached first. NOT a
     /// branch depth on its own: a family's blocks close one per region as the
     /// walk reaches each region's ops, so the depth of region N's block is this
@@ -12065,7 +12069,7 @@ fn emit_guard_inline_bridge_move(
     ref_homes: &RefHomes,
     frame: FrameGeometry,
     op: &Op,
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     gc_table_slots: &HashMap<u32, (u32, i64)>,
 ) {
     let fail_args: Vec<OpRef> = live_fail_args_of(op);
@@ -13243,7 +13247,7 @@ mod tests {
     #[test]
     fn label_arg_that_is_also_a_later_read_is_still_seeded() {
         use majit_ir::forwarding::bound_operand_from_opref as rb;
-        let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         let mut constants = indexmap::IndexMap::new();
         constants.insert(50, 42);
         let add = Op::new(
@@ -13270,8 +13274,8 @@ mod tests {
     fn label_arg_import_hole_is_not_an_unbound_read() {
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![
-            InputArg::from_type(Type::Int, 0),
-            InputArg::from_type(Type::Int, 1),
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Int, 1),
         ];
         let constants = indexmap::IndexMap::new();
         let ops = vec![
@@ -13292,8 +13296,8 @@ mod tests {
     fn debug_merge_point_import_hole_is_not_an_unbound_read() {
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![
-            InputArg::from_type(Type::Int, 0),
-            InputArg::from_type(Type::Int, 1),
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Int, 1),
         ];
         let constants = indexmap::IndexMap::new();
         let ops = vec![
@@ -13315,8 +13319,8 @@ mod tests {
     fn guard_failarg_import_hole_is_not_an_unbound_read() {
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![
-            InputArg::from_type(Type::Int, 0),
-            InputArg::from_type(Type::Int, 1),
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Int, 1),
         ];
         let constants = indexmap::IndexMap::new();
         let guard = Op::new(OpCode::GuardNotInvalidated, &[]);
