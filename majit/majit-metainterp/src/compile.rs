@@ -2178,9 +2178,14 @@ fn leftover_mint_slot_is_nongc_ref(
     if slot.is_null() || (slot as usize) & 1 != 0 {
         return false;
     }
-    // Check ownership before leftover_ptr_is_frame / leftover_ptr_is_listiter:
-    // those read type words. A raw `-42` mint slot is not an object.
-    !majit_gc::gc_owns_object(slot as usize)
+    // Raw leftover integers (`-42`, a type_id) are not word-aligned
+    // object refs, or sit in the first page. `gc_owns_object` is the
+    // managed-heap query: it is false for immortal types too
+    // (`ValueError` as an except target), and aborting those
+    // leftover-empty SETFIELDs drops check_exc. Do not deref: `-42`
+    // is not an object header.
+    let addr = slot as usize;
+    !addr.is_multiple_of(std::mem::size_of::<usize>()) || addr < 4096
 }
 
 /// TOS slots from the portal frame down through inlined callee
@@ -3517,13 +3522,20 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             if is_foriter {
                 return false;
             }
-            op.getarglist().iter().any(|a| {
+            // Receiver only: a Call that *passes* a string (`raise
+            // ValueError("x")`) is not `charmap.find`. The first Ref
+            // InputArg after ConstInt fn-ptr / descr args is the
+            // method object.
+            let receiver = op.getarglist().iter().find_map(|a| {
                 let src = a.to_opref();
-                if !src.is_input_arg()
-                    || src.ty() != Some(Type::Ref)
-                    || src.raw() < entry_prefix_len as u32
-                    || (src.raw() as usize) >= expanded_len
-                {
+                if src.is_input_arg() && src.ty() == Some(Type::Ref) {
+                    Some(src)
+                } else {
+                    None
+                }
+            });
+            receiver.is_some_and(|src| {
+                if src.raw() < entry_prefix_len as u32 || (src.raw() as usize) >= expanded_len {
                     return false;
                 }
                 let idx = src.raw() as usize - entry_prefix_len;
@@ -3560,34 +3572,24 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 )
             })
         });
-    // Extras still sitting on the entry list (`inputargs[expanded_len..]`)
-    // are not leftover yet — they are present, so the scan above misses
-    // them. leftover-empty already truncated `inputargs` to the red
-    // prefix (`compile.py` `inputargs[:num_red_args]`), so the length
-    // check would never fire here. A Call/Getfield that still names a
-    // dropped extra is `'frame' object has no attribute 'find'` on
-    // pip's charset walk, or `tuple_slice` TypeError when the extra
-    // is an Idx bound remapped off the valuestack.
-    let extras_on_entry_used = ops.iter().any(|op| {
-        if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
-            return false;
-        }
-        op.getarglist().iter().any(|a| {
-            let src = a.to_opref();
-            src.is_input_arg() && (src.raw() as usize) >= expanded_len
-        })
-    });
+    // Present extras (`inputargs[expanded_len..]`) are not leftover —
+    // leftover_inputarg_refs misses them. Scan the rewritten body
+    // after emit: a mint-sharing extra is remapped to GETFIELD and
+    // must stay (SNAPDIFF if we abort here). An unmapped extra is a
+    // residual execute_assembler will not pass (`tuple_slice` Idx
+    // bound, pip charset `'frame' object has no attribute 'find'`).
     if leftover_has_listiter_id()
-        && (listiter_leftover
-            || leftover_extras_any
-            || extras_on_entry_used
-            || mint_string_method
-            || mint_nongc_field)
+        && (listiter_leftover || leftover_extras_any || mint_string_method || mint_nongc_field)
     {
         if std::env::var_os("MAJIT_LEFTOVER").is_some() {
             eprintln!(
-                "leftover-empty reject extras past mint tos_src={:?}",
-                tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>()
+                "leftover-empty reject extras past mint tos_src={:?} \
+                 listiter={} leftover_extras={} string={} nongc={}",
+                tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>(),
+                listiter_leftover,
+                leftover_extras_any,
+                mint_string_method,
+                mint_nongc_field,
             );
         }
         tos_sources.clear();
@@ -3689,6 +3691,25 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     }
     if peel_emitted {
         attach_peel_guard_resume(&extra_ops);
+    }
+    if leftover_has_listiter_id()
+        && extra_ops.iter().any(|op| {
+            if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
+                return false;
+            }
+            op.getarglist().iter().any(|a| {
+                let src = a.to_opref();
+                src.is_input_arg() && (src.raw() as usize) >= expanded_len
+            })
+        })
+    {
+        if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+            eprintln!(
+                "leftover-empty reject unmapped extra past mint tos_src={:?}",
+                tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>()
+            );
+        }
+        note_leftover_empty_reject();
     }
     *ops = extra_ops;
     take_leftover_empty_reject()
@@ -6518,11 +6539,101 @@ mod tests {
     }
 
     #[test]
+    fn test_patch_new_loop_keeps_leftover_empty_aligned_object_setfield() {
+        // An aligned mint Ref is an object (GC or immortal), not a raw
+        // `-42`. leftover-empty SETFIELD of ValueError as an except
+        // target must stay (check_exc).
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            last_instr: usize,
+            pycode: usize,
+            vsd: usize,
+            debugdata: usize,
+        }
+        const FRAME_TY: usize = 0xF1;
+        let prev = LISTITER_TYPE_WORD.swap(0x1A13, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+                let _ = take_leftover_empty_reject();
+            }
+        }
+        let _restore = Restore(prev);
+        let _ = take_leftover_empty_reject();
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_TY,
+            last_instr: 0,
+            pycode: 0x10000,
+            vsd: 0,
+            debugdata: 0,
+        };
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 16);
+        vinfo.add_field("pycode", Type::Ref, 24);
+        vinfo.add_field("valuestackdepth", Type::Int, 32);
+        vinfo.add_field("debugdata", Type::Ref, 40);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 3),
+            ],
+        );
+        let set = Op::new(
+            OpCode::SetfieldGc,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 3),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, set].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+        ];
+        assert!(
+            !patch_new_loop_to_load_virtualizable_fields_with_vable(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &[],
+                None,
+                &mut portal as *mut Frame as *const u8,
+                None,
+            ),
+            "leftover-empty SETFIELD of an aligned object mint slot must not abort"
+        );
+    }
+
+    #[test]
     fn test_patch_new_loop_rejects_leftover_empty_present_extra() {
         // leftover=[] because the extra is still on the entry list.
-        // leftover-empty truncates that list to the red prefix before
-        // the extras scan; a body Call of the dropped extra must still
-        // abort (tuple_slice Idx bound on the valuestack).
+        // leftover-empty remaps mint fields, not this extra; after
+        // emit the body Call still names it and must abort
+        // (tuple_slice Idx bound on the valuestack).
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
         let prev = LISTITER_TYPE_WORD.swap(0x1A13, std::sync::atomic::Ordering::Relaxed);
         struct Restore(usize);
