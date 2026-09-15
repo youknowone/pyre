@@ -209,45 +209,64 @@ macro_rules! pm1_plain {
 /// `math.sin` after `_get_double`: domain pin, then [`_float_sin`].
 pub fn sin(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "sin() takes exactly one argument",
         ));
     }
     let val = try_get_double(args[0])?;
     match pymath::math::sin(val) {
-        Ok(_) => crate::objspace::descroperation::_float_math1(
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
             val,
-            crate::objspace::descroperation::FLOAT_MATH1_SIN,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_SIN,
         ),
-        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
             "expected a finite input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
     }
 }
 
 /// `math.cos` after `_get_double`: domain pin, then [`_float_cos`].
 pub fn cos(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "cos() takes exactly one argument",
         ));
     }
     let val = try_get_double(args[0])?;
     match pymath::math::cos(val) {
-        Ok(_) => crate::objspace::descroperation::_float_math1(
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
             val,
-            crate::objspace::descroperation::FLOAT_MATH1_COS,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_COS,
         ),
-        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
             "expected a finite input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
     }
 }
-pm1_edom!(tan, "expected a finite input");
+/// `math.tan` after `_get_double`: domain pin, then [`_float_tan`].
+pub fn tan(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tan() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::tan(val) {
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
+            val,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_TAN,
+        ),
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
+            "expected a finite input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
+    }
+}
 pm1_edom!(asin, "expected a number in range from -1 up to 1");
 pm1_edom!(acos, "expected a number in range from -1 up to 1");
 pm1!(atan);
@@ -262,21 +281,21 @@ pm1_edom!(atanh, "expected a number between -1 and 1");
 /// `math.sqrt` after `_get_double`: domain pin, then [`_float_sqrt`].
 pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "sqrt() takes exactly one argument",
         ));
     }
     let val = try_get_double(args[0])?;
     match pymath::math::sqrt(val) {
-        Ok(_) => crate::objspace::descroperation::_float_math1(
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
             val,
-            crate::objspace::descroperation::FLOAT_MATH1_SQRT,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_SQRT,
         ),
-        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
             "expected a nonnegative input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
     }
 }
 
@@ -290,6 +309,7 @@ struct MathBuiltinWrappers {
     log: usize,
     cos: usize,
     sin: usize,
+    tan: usize,
     frexp: usize,
     ldexp: usize,
     isqrt: usize,
@@ -323,6 +343,7 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         log: math_wrapper_addr(ns, "log"),
         cos: math_wrapper_addr(ns, "cos"),
         sin: math_wrapper_addr(ns, "sin"),
+        tan: math_wrapper_addr(ns, "tan"),
         frexp: math_wrapper_addr(ns, "frexp"),
         ldexp: math_wrapper_addr(ns, "ldexp"),
         isqrt: math_wrapper_addr(ns, "isqrt"),
@@ -381,6 +402,10 @@ pub fn is_math_cos_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.sin)
+}
+
+pub fn is_math_tan_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.tan)
 }
 
 /// Callable-identity probes used by the meta-trace walker.  As with
@@ -539,7 +564,6 @@ macro_rules! jit_raw2 {
     };
 }
 
-jit_raw1!(jit_math_tan, tan);
 jit_raw1!(jit_math_asin, asin);
 jit_raw1!(jit_math_acos, acos);
 jit_raw1!(jit_math_atan, atan);
@@ -648,12 +672,11 @@ macro_rules! math_fold_table {
     };
 }
 
-/// `sqrt`, `log`, `cos`, `sin` and `fabs` are absent: each has a dedicated
-/// specialization that lowers to a tighter shape (a domain-guarded call with
-/// no result guard, or a single `FloatAbs`).
+/// `sqrt`, `log`, `cos`, `sin`, `tan` and `fabs` are absent: each has a
+/// dedicated specialization that lowers to a tighter shape (a domain-guarded
+/// call with no result guard, or a single `FloatAbs`).
 math_fold_table!(
     MATH_FLOAT1_FOLDS: MathFloat1Fold,
-    "tan" => jit_math_tan,
     "asin" => jit_math_asin,
     "acos" => jit_math_acos,
     "atan" => jit_math_atan,
@@ -752,11 +775,11 @@ pm1_edom!(lgamma, "expected a noninteger or positive integer");
 /// `math.fabs` after `_get_double`: the unboxed `_float_abs` leaf.
 pub fn fabs(args: &[PyObjectRef]) -> PyResult {
     if args.len() != 1 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "fabs() takes exactly one argument",
         ));
     }
-    crate::objspace::descroperation::_float_abs(try_get_double(args[0])?)
+    pyre_interpreter::objspace::descroperation::_float_abs(try_get_double(args[0])?)
 }
 pm1_plain!(ulp);
 
