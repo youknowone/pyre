@@ -2621,6 +2621,8 @@ impl Backend for DynasmBackend {
         // rawstart + functionpos`. pyre stores the single entry point
         // so `_ll_function_addr` = compiled-code base.
         token.set_ll_function_addr(code_addr);
+        // `x86/assembler.py assemble_loop` `looptoken._ll_raw_start = rawstart`.
+        token.set_ll_raw_start(rawstart);
         token.set_compiled(Box::new(compiled));
 
         Ok(AsmInfo {
@@ -3431,7 +3433,7 @@ impl Backend for DynasmBackend {
         }
         let old_addr = old_compiled.entry_ptr();
         let new_addr = new_compiled.entry_ptr();
-        Asm::redirect_call_assembler(old_addr, new_addr);
+        Asm::redirect_call_assembler(old, new, old_addr, new_addr);
         Self::redirect_call_assembler_target(old.number, new_addr as usize);
         Ok(())
     }

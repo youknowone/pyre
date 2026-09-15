@@ -6031,7 +6031,12 @@ impl<'a> Assembler386<'a> {
 
     /// assembler.py:1138 redirect_call_assembler: patch old loop entry
     /// to JMP to new loop after retrace.
-    pub fn redirect_call_assembler(old_addr: *const u8, new_addr: *const u8) {
+    pub fn redirect_call_assembler(
+        old: &majit_backend::JitCellToken,
+        new: &majit_backend::JitCellToken,
+        old_addr: *const u8,
+        new_addr: *const u8,
+    ) {
         codebuf::with_writable(old_addr as *mut u8, 16, || {
             let old_ptr = old_addr as *mut u8;
             let offset = new_addr as isize - (old_addr as isize + 5);
@@ -6051,6 +6056,11 @@ impl<'a> Assembler386<'a> {
                 }
             }
         });
+        // `x86/assembler.py redirect_call_assembler`:
+        // `asm_adr = newlooptoken._ll_raw_start`.
+        let raw = new.ll_raw_start();
+        let asm_adr = if raw != 0 { raw as u64 } else { new.number };
+        majit_backend::redirect_assembler(old, new, asm_adr);
     }
 
     // genop_* — integer arithmetic

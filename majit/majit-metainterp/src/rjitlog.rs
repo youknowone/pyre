@@ -155,8 +155,18 @@ pub fn register_get_location(types: &[(u8, u8)], get_location: GetLocation) {
     state.get_location = Some(get_location);
 }
 
+/// `rpython.rlib.rjitlog.redirect_assembler` — assemblers call
+/// `majit_backend::redirect_assembler`; this is the writer they install.
+pub fn install_backend_hooks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        majit_backend::register_redirect_assembler_log(redirect_assembler);
+    });
+}
+
 /// `rjitlog.py redirect_assembler`.
 pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
+    install_backend_hooks();
     jitlog_try_init_using_env();
     let mut state = lock();
     if state.file.is_none() {
@@ -613,20 +623,19 @@ fn python_float_str(v: f64) -> String {
     }
 }
 
+/// `str(float)` scientific form. rustc's `{:e}` is the correctly-rounded
+/// shortest mantissa; Python only differs in the exponent's sign and
+/// minimum width (`e+16`, `e-05`). Reconstructing `mant * 10**exp` in
+/// `f64` underflows (`5e-324` → `infe-323`) and changes trailing digits.
 fn python_scientific_str(v: f64) -> String {
-    let sign = if v.is_sign_negative() { "-" } else { "" };
-    let abs = v.abs();
-    let mut exp = abs.log10().floor() as i32;
-    let mut mant = abs / 10f64.powi(exp);
-    if mant >= 10.0 {
-        mant /= 10.0;
-        exp += 1;
-    } else if mant < 1.0 {
-        mant *= 10.0;
-        exp -= 1;
-    }
-    let mant_s = mant.to_string();
-    format!("{sign}{mant_s}e{exp:+03}")
+    let s = format!("{v:e}");
+    let Some((mant, exp)) = s.split_once('e') else {
+        return s;
+    };
+    let Ok(exp) = exp.parse::<i32>() else {
+        return s;
+    };
+    format!("{mant}e{exp:+03}")
 }
 
 /// `rjitlog.py encode_str`.
@@ -739,6 +748,14 @@ mod tests {
         assert_eq!(python_float_str(1e-4), "0.0001");
         assert_eq!(python_float_str(1e-5), "1e-05");
         assert_eq!(python_float_str(1e20), "1e+20");
+        assert_eq!(python_float_str(5e-324), "5e-324");
+        assert_eq!(python_float_str(-5e-324), "-5e-324");
+        assert_eq!(python_float_str(f64::MAX), "1.7976931348623157e+308");
+        assert_eq!(python_float_str(f64::MIN), "-1.7976931348623157e+308");
+        assert_eq!(
+            python_float_str(2.2250738585072014e-308),
+            "2.2250738585072014e-308"
+        );
         assert_eq!(python_float_str(f64::INFINITY), "inf");
         assert_eq!(python_float_str(f64::NEG_INFINITY), "-inf");
         assert_eq!(python_float_str(f64::NAN), "nan");

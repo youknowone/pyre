@@ -6277,6 +6277,8 @@ impl majit_backend::Backend for WasmBackend {
         transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
         publish_call_assembler_target(old.number, new_target);
+        // Non-x86 assemblers log `newlooptoken.number`.
+        majit_backend::redirect_assembler(old, new, new.number);
         Ok(())
     }
 
