@@ -462,7 +462,7 @@ mod imp {
         // `CALL_RELEASE_GIL` (`pyjitpl.py direct_libffi_call`); the
         // interpreter path has to do the swap here, or `_call` would need
         // the two residuals PyPy's `_call` does not have.
-        super::cerrno::errno_before();
+        super::super::cerrno::errno_before();
         unsafe {
             libffi::low::call_return_into(
                 &raw mut descr.cif,
@@ -471,7 +471,7 @@ mod imp {
                 resultdata,
             );
         }
-        super::cerrno::errno_after();
+        super::super::cerrno::errno_after();
     }
 }
 
