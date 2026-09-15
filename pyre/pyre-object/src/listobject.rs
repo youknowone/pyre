@@ -2512,13 +2512,23 @@ pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: usize, o
 ///
 /// `cond = len(l.items) < newsize`; a constant pair inlines the realloc,
 /// otherwise `jit.conditional_call` keeps the fast path bridge-free.
+///
+/// `_ll_list_resize_hint_really` may `malloc` (`rlist.py`). RPython's
+/// gctransform keeps `l` a live root across that call and reloads it
+/// before `l.length = newsize`. A Rust `PyObjectRef` is a raw word, so
+/// the grow-taken path reloads through `current_gc_ref` (the same
+/// residual the append body already uses after this function). The
+/// spare-capacity path (`cond == false`) does not allocate and keeps
+/// the original pointer, so the fast path stays residual-free.
 pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
+    let mut obj = obj;
     let list = &*(obj as *const W_ListObject);
     let allocated = ll_list_obj_capacity(list);
     let cond = allocated < newsize;
     if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
         if cond {
             ll_list_obj_resize_hint_really(obj, newsize, true);
+            obj = current_gc_ref(obj);
         }
     } else {
         majit_rlib::jit::conditional_call3(
@@ -2528,6 +2538,9 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
+        if cond {
+            obj = current_gc_ref(obj);
+        }
     }
     let list = &mut *(obj as *mut W_ListObject);
     ll_list_obj_set_len(list, newsize);
