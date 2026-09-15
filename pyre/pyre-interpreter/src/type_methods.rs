@@ -1179,11 +1179,16 @@ pub fn str_method_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // allocate.  Keep the receiver below the result-set bracket and read its
     // rewritten slot for each identity-preserving `w_str_cut`.  The text is an
     // owned snapshot so no `&Wtf8` points into a receiver that may move.
+    // Sep and maxsplit sit on the same set: the payload copy can collect
+    // before `resolve_split_args` rereads them.
     let recv_roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = recv_roots.publish(&[args[0]]);
-    recv_roots.normalize(recv_slot, 1);
+    let recv_slot = recv_roots.publish(args);
+    recv_roots.normalize(recv_slot, args.len());
     let s = unsafe { w_str_get_wtf8(recv_roots.get(recv_slot)) }.to_wtf8_buf();
-    let (sep_arg, maxsplit_arg) = resolve_split_args(args, "split")?;
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
+    let (sep_arg, maxsplit_arg) = resolve_split_args(&reloaded, "split")?;
     let sep = parse_split_sep(sep_arg)?;
     // `unicodeobject.py @unwrap_spec(maxsplit=int) descr_split` —
     // `space.int_w(w_maxsplit)` routes through `__index__`, so any
@@ -1271,10 +1276,13 @@ fn parse_split_maxsplit(value: PyObjectRef) -> Result<i64, crate::PyError> {
 pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_receiver(args, "rsplit")?;
     let recv_roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = recv_roots.publish(&[args[0]]);
-    recv_roots.normalize(recv_slot, 1);
+    let recv_slot = recv_roots.publish(args);
+    recv_roots.normalize(recv_slot, args.len());
     let s = unsafe { w_str_get_wtf8(recv_roots.get(recv_slot)) }.to_wtf8_buf();
-    let (sep_arg, maxsplit_arg) = resolve_split_args(args, "rsplit")?;
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
+    let (sep_arg, maxsplit_arg) = resolve_split_args(&reloaded, "rsplit")?;
     let sep = parse_split_sep(sep_arg)?;
     let maxsplit = parse_split_maxsplit(maxsplit_arg)?;
     // As in `str_method_split`: the cuts are pinned as they are produced.
@@ -1437,19 +1445,53 @@ pub fn str_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 pub fn str_method_startswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "startswith", 1)?;
     arity_at_most(args, "startswith", 3)?;
-    let Some(slice) = str_slice_args(args[0], args)? else {
-        return validate_prefix_arg(args[1], "startswith").map(|()| w_bool_from(false));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let Some(slice) = str_slice_window(
+        base,
+        (args.len() >= 3).then_some(base + 2),
+        (args.len() >= 4).then_some(base + 3),
+    )?
+    else {
+        return validate_prefix_arg(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            "startswith",
+        )
+        .map(|()| w_bool_from(false));
     };
-    str_prefix_match(slice, args[1], "startswith", true).map(w_bool_from)
+    str_prefix_match(
+        &slice,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        "startswith",
+        true,
+    )
+    .map(w_bool_from)
 }
 
 pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_at_least(args, "endswith", 1)?;
     arity_at_most(args, "endswith", 3)?;
-    let Some(slice) = str_slice_args(args[0], args)? else {
-        return validate_prefix_arg(args[1], "endswith").map(|()| w_bool_from(false));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let Some(slice) = str_slice_window(
+        base,
+        (args.len() >= 3).then_some(base + 2),
+        (args.len() >= 4).then_some(base + 3),
+    )?
+    else {
+        return validate_prefix_arg(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            "endswith",
+        )
+        .map(|()| w_bool_from(false));
     };
-    str_prefix_match(slice, args[1], "endswith", false).map(w_bool_from)
+    str_prefix_match(
+        &slice,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        "endswith",
+        false,
+    )
+    .map(w_bool_from)
 }
 
 /// Apply `startswith`/`endswith`'s optional `start`/`end` bounds to `s`,
@@ -1464,42 +1506,69 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// it is short of the end. `None` signals the resulting window is inverted,
 /// for which the match is always `False` — even for an empty needle, which is
 /// why `'abc'.startswith('', 5, 10)` and `''.endswith('', 1, 0)` are `False`.
-fn str_slice_args(
-    obj: pyre_object::PyObjectRef,
-    args: &[pyre_object::PyObjectRef],
-) -> Result<Option<&'static Wtf8>, crate::PyError> {
-    let s = unsafe { pyre_object::w_str_get_wtf8(obj) };
+fn wtf8_cp_to_byte(s: &Wtf8, cp_index: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut n = 0usize;
+    for cp in s.code_points() {
+        if n == cp_index {
+            break;
+        }
+        bytes += cp.len_wtf8();
+        n += 1;
+    }
+    bytes
+}
+
+fn str_slice_window(
+    recv_slot: usize,
+    start_slot: Option<usize>,
+    end_slot: Option<usize>,
+) -> Result<Option<Wtf8Buf>, crate::PyError> {
+    let obj = pyre_object::gc_roots::shadow_stack_get(recv_slot);
+    // Copy before `__index__`. The window is then taken from the owned
+    // snapshot, not a slice into a receiver that may have moved.
+    let s = unsafe { pyre_object::w_str_get_wtf8(obj) }.to_wtf8_buf();
     let char_len = unsafe { pyre_object::w_str_len(obj) } as i64;
     // `None` bounds mean "not provided" (start -> 0, end -> len).
-    let start = if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
-        crate::sliceobject::adapt_lower_bound(char_len, args[2])?
+    let start = if let Some(slot) = start_slot {
+        let bound = pyre_object::gc_roots::shadow_stack_get(slot);
+        if !unsafe { pyre_object::is_none(bound) } {
+            crate::sliceobject::adapt_lower_bound(char_len, bound)?
+        } else {
+            0
+        }
     } else {
         0
     };
-    let end = if args.len() >= 4 && !unsafe { pyre_object::is_none(args[3]) } {
-        crate::sliceobject::adapt_lower_bound(char_len, args[3])?
+    let end = if let Some(slot) = end_slot {
+        let bound = pyre_object::gc_roots::shadow_stack_get(slot);
+        if !unsafe { pyre_object::is_none(bound) } {
+            crate::sliceobject::adapt_lower_bound(char_len, bound)?
+        } else {
+            char_len
+        }
     } else {
         char_len
     };
     let bytes = s.as_bytes();
     let mut end_index = bytes.len();
     if end < char_len {
-        end_index = unsafe { pyre_object::w_str_index_to_byte(obj, end as usize) };
+        end_index = wtf8_cp_to_byte(&s, end as usize);
     }
     let mut start_index = 0usize;
     if start > 0 {
         start_index = if start > char_len {
             end_index + 1
         } else {
-            unsafe { pyre_object::w_str_index_to_byte(obj, start as usize) }
+            wtf8_cp_to_byte(&s, start as usize)
         };
     }
     if start_index > end_index {
         return Ok(None);
     }
-    Ok(Some(unsafe {
-        Wtf8::from_bytes_unchecked(&bytes[start_index..end_index])
-    }))
+    Ok(Some(
+        unsafe { Wtf8::from_bytes_unchecked(&bytes[start_index..end_index]) }.to_wtf8_buf(),
+    ))
 }
 
 fn str_prefix_match(
@@ -5935,18 +6004,28 @@ pub fn str_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         "keepends",
         pos.get(1).is_some(),
     )?;
+    let keepends_obj =
+        crate::builtins::kwarg_get(kwargs, "keepends").or_else(|| pos.get(1).copied());
     let recv_roots = pyre_object::gc_roots::push_roots();
-    let recv_slot = recv_roots.publish(&[pos[0]]);
-    recv_roots.normalize(recv_slot, 1);
+    let recv_slot = if let Some(keepends_obj) = keepends_obj {
+        let recv_slot = recv_roots.publish(&[pos[0], keepends_obj]);
+        recv_roots.normalize(recv_slot, 2);
+        recv_slot
+    } else {
+        let recv_slot = recv_roots.publish(&[pos[0]]);
+        recv_roots.normalize(recv_slot, 1);
+        recv_slot
+    };
+    // keepends is positional-or-keyword. Resolve it before copying the
+    // receiver: `__bool__` can collect.
+    let keepends = if keepends_obj.is_some() {
+        crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
+    } else {
+        false
+    };
     let cps: Vec<CodePoint> = unsafe { w_str_get_wtf8(recv_roots.get(recv_slot)) }
         .code_points()
         .collect();
-    // keepends is positional-or-keyword.
-    let keepends = crate::builtins::kwarg_get(kwargs, "keepends")
-        .or_else(|| pos.get(1).copied())
-        .map(crate::baseobjspace::is_true)
-        .transpose()?
-        .unwrap_or(false);
     // Each `cps_to_str_cut` allocates over the pieces already cut.
     let mut parts = pyre_object::gc_roots::RootedItems::new();
     let mut start = 0usize;

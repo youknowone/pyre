@@ -6222,7 +6222,7 @@ fn handle_fromlist(
         // `__all__` is expanded once; a name inside it that is itself `*` is an
         // ordinary name, not a second expansion.
         let star_slot = shadow_stack_len();
-        let _ = pin_root(pyre_object::w_str_new("*"));
+        let _ = pin_root(pyre_object::unicodeobject::intern_str_value("*"));
         if crate::baseobjspace::eq_w(shadow_stack_get(x_slot), shadow_stack_get(star_slot))? {
             if !recursive
                 && let Some(w_all) =

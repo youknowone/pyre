@@ -1334,10 +1334,20 @@ fn pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "pack_into() missing format, buffer or offset argument",
         ));
     }
-    let fmt = format_to_string(args[0])?;
-    let offset = unsafe { crate::builtins::space_index_w(args[2])? };
-    let values = unsafe { w_tuple_items_copy_as_vec(args[3]) };
-    do_pack_into(&fmt, args[1], offset, &values)
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2], args[3]]);
+    let fmt = format_to_string(pyre_object::gc_roots::shadow_stack_get(base))?;
+    let offset = unsafe {
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 2))?
+    };
+    let values =
+        unsafe { w_tuple_items_copy_as_vec(pyre_object::gc_roots::shadow_stack_get(base + 3)) };
+    do_pack_into(
+        &fmt,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        offset,
+        &values,
+    )
 }
 
 /// `interp_struct.py descr_pack_into(self, w_buffer, offset, args_w)` —
@@ -1356,11 +1366,21 @@ fn struct_pack_into(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         ));
     }
     this.ensure_ready()?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2], args[3]]);
     let format = majit_metainterp::jit::promote_string(this.format);
-    let fmt = unsafe { w_str_get_value(format) };
-    let offset = unsafe { crate::builtins::space_index_w(args[2])? };
-    let values = unsafe { w_tuple_items_copy_as_vec(args[3]) };
-    do_pack_into(fmt, args[1], offset, &values)
+    let fmt = unsafe { w_str_get_value(format) }.to_owned();
+    let offset = unsafe {
+        crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 2))?
+    };
+    let values =
+        unsafe { w_tuple_items_copy_as_vec(pyre_object::gc_roots::shadow_stack_get(base + 3)) };
+    do_pack_into(
+        &fmt,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        offset,
+        &values,
+    )
 }
 
 // ── W_UnpackIter ─────────────────────────────────────────────────────

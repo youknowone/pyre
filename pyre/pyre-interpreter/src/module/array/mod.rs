@@ -1464,8 +1464,16 @@ fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
 fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "tofile", true)?;
     check_arity(args, 2, "array.tofile")?;
-    let w_bytes = array_tobytes_method(&args[..1])?;
-    call_method(args[1], "write", &[w_bytes])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let w_bytes = array_tobytes_method(&[pyre_object::gc_roots::shadow_stack_get(base)])?;
+    let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_bytes);
+    call_method(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        "write",
+        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+    )?;
     Ok(pyre_object::w_none())
 }
 

@@ -4280,7 +4280,7 @@ pub fn system_exit_code(err: &PyError) -> i32 {
     if exc.is_null() {
         return 0;
     }
-    let code = match crate::getattr(exc, pyre_object::w_str_new("code")) {
+    let code = match crate::getattr(exc, pyre_object::unicodeobject::intern_str_value("code")) {
         Ok(c) => c,
         Err(_) => return 1,
     };

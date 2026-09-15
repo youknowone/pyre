@@ -362,9 +362,8 @@ fn get_attr(
 
 fn lib_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
-    let lib_slot = roots.base();
-    let _ = roots.pin_root(args[0]);
-    let value = get_attr(roots.get(lib_slot), args[1], true)?;
+    let lib_slot = roots.pin_roots(&[args[0], args[1]]);
+    let value = get_attr(roots.get(lib_slot), roots.get(lib_slot + 1), true)?;
     if cglob::W_GlobSupport::from_obj(value).is_some() {
         cglob::read_global_var(value)
     } else {
