@@ -60,7 +60,7 @@ impl BytesArray {
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),
-            len: AtomicUsize::new(0),
+            len: crate::object_array::length_cell(0),
         }
     }
 
@@ -72,7 +72,7 @@ impl BytesArray {
         let len = refs.len();
         Self {
             block: unsafe { alloc_list_items_block_gc(&refs) },
-            len: AtomicUsize::new(len),
+            len: crate::object_array::length_cell(len),
         }
     }
 
@@ -85,7 +85,7 @@ impl BytesArray {
             block: unsafe {
                 crate::object_array::grow_list_items_block_gc(std::ptr::null_mut(), capacity, 0)
             },
-            len: AtomicUsize::new(0),
+            len: crate::object_array::length_cell(0),
         }
     }
 
