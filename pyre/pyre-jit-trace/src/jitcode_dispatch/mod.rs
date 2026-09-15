@@ -10741,21 +10741,15 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
         return Ok(());
     }
-    // A ConstPtr interned / co_consts box already is the exact builtin.
-    // Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every iteration is
-    // the leftover the `guard_value` comment below exists to kill;
-    // for a compile-time constant the proof is the object itself.
-    if obj.is_constant()
-        && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
-        && !concrete.is_null()
-        && !(pyre_object::tagged_int::CAN_BE_TAGGED
-            && pyre_object::tagged_int::is_tagged_int(concrete))
-        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
-    {
-        // Exact class implies the layout vtable; a later unbox / GuardClass
-        // of this ConstPtr already has its own `already_this_class` fold.
-        return Ok(());
-    }
+    // Do not skip the pin for a ConstPtr whose live `w_class` already
+    // matches. Interned ints and `co_consts` boxes are exact builtins,
+    // but `inline_call` also hands a descriptor ConstPtr through here.
+    // That instance can have `__class__` reassigned; without
+    // `walker_pin_instance_w_class` no `QuasiimmutField` watcher is
+    // installed, so `notify_w_class_mutated_then` cannot invalidate
+    // the compiled loop. The pin records the watcher; OptHeap then
+    // folds the ConstPtr getfield the way `optimize_GETFIELD` does
+    // after `QUASIIMMUT_FIELD`.
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
     // second spelling of "exact builtin", while the guard below reads the slot and
