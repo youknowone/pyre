@@ -18022,6 +18022,7 @@ impl majit_backend::Backend for CraneliftBackend {
                         }
                     }
                 }
+                majit_backend::hold_forced_savedata(savedata);
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
@@ -18114,6 +18115,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
                 let fail_descr_ref: DescrRef = fail_descr.to_arc();
                 let trace_id = fail_descr_fd.trace_id();
+                majit_backend::hold_forced_savedata(savedata);
                 return majit_backend::RawExecResult {
                     outputs,
                     typed_outputs,
@@ -18175,6 +18177,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
             let fail_descr_ref: DescrRef = fail_descr.to_arc();
             let trace_id = fail_descr_fd.trace_id();
+            majit_backend::hold_forced_savedata(savedata);
             return majit_backend::RawExecResult {
                 outputs,
                 typed_outputs,

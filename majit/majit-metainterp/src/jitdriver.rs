@@ -6536,17 +6536,22 @@ impl<S: JitState> JitDriver<S> {
             // the no-exception continuation.
             let guard_exc = result.exception.exc_value;
             let savedata = result.savedata;
-            // Keep `result` (and its deadframe) until this arm returns so
-            // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
-            // `compile.py handle_fail(self, deadframe, ...)`.
-            // The reconstruction below allocates through the blackhole allocator,
-            // so hold the exception where the frontend's root walker can reach
-            // it until `prepare_resume_from_failure` hands it to the blackhole.
-            let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
+            // Park AllVirtuals before `result` drops. The backend hold
+            // (dynasm raw / default execute_token_raw) covers the gap
+            // between deadframe release and this root; clear it after
+            // the handoff so the last cache is not retained until
+            // thread exit.
             let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
             let _savedata_root = unsafe {
                 crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
             };
+            majit_backend::release_forced_savedata();
+            drop(result);
+            // The reconstruction below allocates through the blackhole
+            // allocator, so hold the exception where the frontend's root
+            // walker can reach it until `prepare_resume_from_failure`
+            // hands it to the blackhole.
+            let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
 
             // must_compile tick for bridge threshold counting.
             if crate::majit_log_enabled() {

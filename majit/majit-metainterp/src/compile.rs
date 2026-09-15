@@ -2134,6 +2134,55 @@ fn leftover_ptr_is_str(p: *const u8) -> bool {
     unsafe { f(p) != 0 }
 }
 
+fn leftover_read_mint_slot(
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    orig_vable: *const u8,
+    src: OpRef,
+    entry_prefix_len: usize,
+    expanded_len: usize,
+) -> *const u8 {
+    if !src.is_input_arg()
+        || src.raw() < entry_prefix_len as u32
+        || (src.raw() as usize) >= expanded_len
+    {
+        return std::ptr::null();
+    }
+    let idx = src.raw() as usize - entry_prefix_len;
+    let n_static = vinfo.static_fields.len();
+    if idx < n_static {
+        unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
+    } else if !vinfo.array_fields.is_empty() {
+        unsafe { vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8 }
+    } else {
+        std::ptr::null()
+    }
+}
+
+/// leftover-empty GETFIELD of a leftover Ref whose mint slot is an
+/// untagged non-GC word later walks that word as an object (`type_id`
+/// garbage, child `-42`). Tagged small-int leftovers stay: aborting
+/// those dropped leftover-empty GETFIELD of frame `f_locals`
+/// (`exception_reused` stack underflow). Frame and listiter leftovers
+/// stay on GETFIELD.
+fn leftover_mint_slot_is_nongc_ref(
+    vinfo: &crate::virtualizable::VirtualizableInfo,
+    orig_vable: *const u8,
+    src: OpRef,
+    entry_prefix_len: usize,
+    expanded_len: usize,
+) -> bool {
+    if src.ty() != Some(Type::Ref) {
+        return false;
+    }
+    let slot = leftover_read_mint_slot(vinfo, orig_vable, src, entry_prefix_len, expanded_len);
+    if slot.is_null() || (slot as usize) & 1 != 0 {
+        return false;
+    }
+    // Check ownership before leftover_ptr_is_frame / leftover_ptr_is_listiter:
+    // those read type words. A raw `-42` mint slot is not an object.
+    !majit_gc::gc_owns_object(slot as usize)
+}
+
 /// TOS slots from the portal frame down through inlined callee
 /// frames. Recursive `_compile` can stack several frames on one
 /// portal; leftover-empty must peel until TOS is not a frame.
@@ -3280,8 +3329,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                     // is leftover-empty FOR_ITER on a frame
                     // (`re/_compiler.py` `'frame' object is not an iterator`).
                     let past_mint = src.raw() >= expanded_len as u32;
-                    if (src.raw() >= entry_prefix_len as u32
-                        && (below_portal || at_peeled_frame)
+                    if (src.raw() >= entry_prefix_len as u32 && (below_portal || at_peeled_frame)
                         || past_mint)
                         && !tos_sources.contains(&src)
                     {
@@ -3463,8 +3511,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             }
             let is_foriter = op.getdescr().is_some_and(|d| {
                 d.as_call_descr().is_some_and(|cd| {
-                    cd.get_extra_info().runtime_helper
-                        == majit_ir::RuntimeHelperKind::ForIterNext
+                    cd.get_extra_info().runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
                 })
             });
             if is_foriter {
@@ -3491,46 +3538,25 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 leftover_ptr_is_str(slot)
             })
         });
-    // leftover-empty GETFIELD of a Call leftover whose mint slot is not
-    // a GC object hands the collector a non-object (`type_id=4294967254`
-    // on pip download). Frame leftovers stay on GETFIELD
-    // (exception_reused `f.f_locals`).
-    let mint_nongc_call = leftover_has_listiter_id()
+    // leftover-empty GETFIELD of a leftover Ref whose mint slot is an
+    // untagged non-GC word later SETFIELDs that word into a holder
+    // (pip hermetic-guard `type_id` garbage, child `-42`). Call leftovers
+    // stay: aborting those dropped leftover-empty GETFIELD of frame
+    // `f_locals`. Scanning every leftover InputArg did the same.
+    let mint_nongc_field = leftover_has_listiter_id()
         && !orig_vable.is_null()
         && ops.iter().any(|op| {
-            if !op.opcode.is_call() {
-                return false;
-            }
-            let is_foriter = op.getdescr().is_some_and(|d| {
-                d.as_call_descr().is_some_and(|cd| {
-                    cd.get_extra_info().runtime_helper
-                        == majit_ir::RuntimeHelperKind::ForIterNext
-                })
-            });
-            if is_foriter {
+            if !(op.opcode.is_getfield() || op.opcode.is_setfield()) {
                 return false;
             }
             op.getarglist().iter().any(|a| {
-                let src = a.to_opref();
-                if !src.is_input_arg()
-                    || src.ty() != Some(Type::Ref)
-                    || src.raw() < entry_prefix_len as u32
-                    || (src.raw() as usize) >= expanded_len
-                {
-                    return false;
-                }
-                let idx = src.raw() as usize - entry_prefix_len;
-                let n_static = vinfo.static_fields.len();
-                let slot = if idx < n_static {
-                    unsafe { vinfo.read_field(orig_vable, idx) as *const u8 }
-                } else if !vinfo.array_fields.is_empty() {
-                    unsafe { vinfo.read_array_item(orig_vable, 0, idx - n_static) as *const u8 }
-                } else {
-                    std::ptr::null()
-                };
-                !slot.is_null()
-                    && (slot as usize) & 1 == 0
-                    && !majit_gc::gc_owns_object(slot as usize)
+                leftover_mint_slot_is_nongc_ref(
+                    vinfo,
+                    orig_vable,
+                    a.to_opref(),
+                    entry_prefix_len,
+                    expanded_len,
+                )
             })
         });
     // Extras still sitting on the entry list (`inputargs[expanded_len..]`)
@@ -3553,7 +3579,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             || leftover_extras_any
             || extras_on_entry_used
             || mint_string_method
-            || mint_nongc_call)
+            || mint_nongc_field)
     {
         if std::env::var_os("MAJIT_LEFTOVER").is_some() {
             eprintln!(
@@ -6342,6 +6368,141 @@ mod tests {
         assert!(
             ops.iter().all(|op| op.opcode != OpCode::GetfieldGcR),
             "a type-mismatched leftover-empty tail must not GETFIELD"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rejects_leftover_empty_nongc_getfield() {
+        // leftover-empty GETFIELD of a leftover Ref whose mint slot is
+        // an untagged non-GC word later walks that word as an object.
+        // Abort only that GETFIELD/SETFIELD leftover; a Call leftover
+        // with the same slot must stay (exception_reused f_locals).
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        #[repr(C)]
+        struct Frame {
+            ty: usize,
+            class: usize,
+            last_instr: usize,
+            pycode: usize,
+            vsd: usize,
+            debugdata: usize,
+        }
+        const FRAME_TY: usize = 0xF1;
+        let prev = LISTITER_TYPE_WORD.swap(0x1A13, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+                let _ = take_leftover_empty_reject();
+            }
+        }
+        let _restore = Restore(prev);
+        let _ = take_leftover_empty_reject();
+        let mut portal = Frame {
+            ty: FRAME_TY,
+            class: FRAME_TY,
+            last_instr: 0,
+            pycode: (-42i64) as usize,
+            vsd: 0,
+            debugdata: 0,
+        };
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 16);
+        vinfo.add_field("pycode", Type::Ref, 24);
+        vinfo.add_field("valuestackdepth", Type::Int, 32);
+        vinfo.add_field("debugdata", Type::Ref, 40);
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(48));
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 3),
+            ],
+        );
+        let get = Op::new(
+            OpCode::GetfieldGcR,
+            &[rooted_inputarg_operand(Type::Ref, 3)],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, get].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+        ];
+        assert!(
+            patch_new_loop_to_load_virtualizable_fields_with_vable(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &[],
+                None,
+                &mut portal as *mut Frame as *const u8,
+                None,
+            ),
+            "leftover-empty GETFIELD of an untagged non-GC mint slot must abort"
+        );
+
+        let _ = take_leftover_empty_reject();
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 3)]);
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::None;
+        call.setdescr(majit_ir::descr::make_call_descr(
+            vec![Type::Ref],
+            Type::Ref,
+            effect,
+        ));
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 3),
+            ],
+        );
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+        ];
+        assert!(
+            !patch_new_loop_to_load_virtualizable_fields_with_vable(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &[],
+                None,
+                &mut portal as *mut Frame as *const u8,
+                None,
+            ),
+            "Call leftover of an untagged non-GC mint slot must not abort leftover-empty"
         );
     }
 

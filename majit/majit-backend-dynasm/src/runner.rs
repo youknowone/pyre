@@ -321,29 +321,6 @@ type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard;
 /// ordinary portal shape; larger signatures pay one temporary host allocation.
 /// Returns whether the frame is a collector object, which decides the
 /// deadframe that later owns it.
-thread_local! {
-    static RAW_SAVEDATA_SLOT: std::cell::UnsafeCell<i64> = const { std::cell::UnsafeCell::new(0) };
-    static RAW_SAVEDATA_ROOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Keep AllVirtuals reachable after `execute_token_ints_raw` drops the
-/// collector frame. `handle_fail` parks the same pointer in
-/// `DeadFrameRefRoots` immediately after this returns.
-fn hold_raw_savedata(savedata: GcRef) {
-    RAW_SAVEDATA_SLOT.with(|slot| {
-        unsafe { *slot.get() = savedata.0 as i64 };
-        if !RAW_SAVEDATA_ROOTED.get() {
-            RAW_SAVEDATA_ROOTED.set(true);
-            unsafe {
-                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
-                    slot.get(),
-                    1,
-                ));
-            }
-        }
-    });
-}
-
 fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bool, EntryArgRoots) {
     with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
@@ -3282,7 +3259,7 @@ impl Backend for DynasmBackend {
         // unreachable here; a host frame's chain is freed. Hold
         // AllVirtuals on a thread-local root until handle_fail parks it.
         if gc_object && !savedata.is_null() {
-            hold_raw_savedata(savedata);
+            majit_backend::hold_forced_savedata(Some(savedata));
         }
         if !gc_object {
             unsafe { majit_backend::libc_deadframe::free_jitframe_chain(jf_ptr) };
