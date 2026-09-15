@@ -125,6 +125,16 @@ def install():
         # abi3 wheels ship a bare '.pyd' there, which _imp.extension_suffixes()
         # does not (yet) include
         return
+    # PyPy's default build always has cpyext, so install() never asks.  pyre
+    # keeps the loader behind the `cpyext` cargo feature (docs/cpyext.md);
+    # advertising cp3XY-abi3 tags without a loader would make pip prefer an
+    # unloadable binary wheel over a working py3-none one.
+    try:
+        import _imp
+        if '.abi3.so' not in _imp.extension_suffixes():
+            return
+    except Exception:
+        return
     if not any(isinstance(finder, _Abi3TagsFinder) for finder in sys.meta_path):
         sys.meta_path.insert(0, _Abi3TagsFinder())
     for name, module in list(sys.modules.items()):

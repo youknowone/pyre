@@ -72,8 +72,17 @@ impl Fixtures {
 
     /// Compile `tests/fixtures/<name>.c` into an importable extension.
     pub fn compile(&self, name: &str) -> PathBuf {
+        self.compile_with_suffix(name, extension_suffix())
+    }
+
+    /// Compile `tests/fixtures/<name>.c` under a chosen import suffix.
+    ///
+    /// PyPy #5578 advertises `.abi3.so` from `_imp.extension_suffixes` so
+    /// importlib will find a limited-API wheel.  The native suffix is still
+    /// the default `compile` output.
+    pub fn compile_with_suffix(&self, name: &str, suffix: &str) -> PathBuf {
         let root = repo_root();
-        let extension = self.join(&format!("{name}{}", extension_suffix()));
+        let extension = self.join(&format!("{name}{suffix}"));
         let source = root.join(format!("pyre/pyrex/tests/fixtures/{name}.c"));
         let include = root.join("include/pyre3.14t");
         let mut cc = Command::new(std::env::var_os("CC").unwrap_or_else(|| "cc".into()));

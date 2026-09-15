@@ -46,33 +46,54 @@ def fake_packaging(tmp_path, monkeypatch):
     return vendor + '.packaging.tags'
 
 
+def _has_abi3_loader():
+    try:
+        import _imp
+        return '.abi3.so' in _imp.extension_suffixes()
+    except Exception:
+        return False
+
+
 def _import(name):
     __import__(name)
-    return sys.modules[name]
+    module = sys.modules[name]
+    # pyre's default build has no cpyext loader, so install() leaves the
+    # finder off meta_path.  The tag tests still exercise the patch.
+    if not getattr(module, abi3_tags._PATCHED_ATTR, False):
+        abi3_tags.patch_tags_module(module)
+    return module
 
 
 def test_finder_installed():
+    if not _has_abi3_loader():
+        pytest.skip('no abi3 loader in this build')
     assert any(isinstance(f, abi3_tags._Abi3TagsFinder)
                for f in sys.meta_path)
 
 
 def test_patched_on_import(fake_packaging):
-    tags = _import(fake_packaging)
+    if not _has_abi3_loader():
+        pytest.skip('no abi3 loader in this build')
+    __import__(fake_packaging)
+    tags = sys.modules[fake_packaging]
     assert getattr(tags, abi3_tags._PATCHED_ATTR)
     assert tags.compatible_tags.__wrapped__ is not tags.compatible_tags
 
 
 def test_abi3_tags_for_running_interpreter(fake_packaging):
     tags = _import(fake_packaging)
-    result = list(tags.compatible_tags(interpreter='pp%d%d' % sys.version_info[:2],
+    major, minor = sys.version_info[:2]
+    result = list(tags.compatible_tags(interpreter='pp%d%d' % (major, minor),
                                        platforms=['p1', 'p2']))
     abi3 = [t for t in result if t.abi == 'abi3']
-    assert abi3 == [tags.Tag(VERSION, 'abi3', 'p1'),
-                    tags.Tag(VERSION, 'abi3', 'p2')]
-    assert result[:2] == abi3
-    assert result[2:] == [tags.Tag('py3', 'none', 'p1'),
-                          tags.Tag('py3', 'none', 'p2'),
-                          tags.Tag('pp%d%d' % sys.version_info[:2], 'none', 'any')]
+    expected = [tags.Tag('cp%d%d' % (major, m), 'abi3', platform)
+                for m in range(minor, 11, -1)
+                for platform in ('p1', 'p2')]
+    assert abi3 == expected
+    assert result[:len(abi3)] == abi3
+    assert result[len(abi3):] == [tags.Tag('py3', 'none', 'p1'),
+                                  tags.Tag('py3', 'none', 'p2'),
+                                  tags.Tag('pp%d%d' % (major, minor), 'none', 'any')]
 
 
 def test_floor_is_312(fake_packaging):
@@ -143,5 +164,7 @@ def test_from_import_sees_patched_function(fake_packaging):
                     reason='CPython still lists a bare .so')
 def test_extension_suffix():
     import importlib.machinery
+    if not _has_abi3_loader():
+        pytest.skip('no abi3 loader in this build')
     assert '.abi3.so' in importlib.machinery.EXTENSION_SUFFIXES
     assert '.so' not in importlib.machinery.EXTENSION_SUFFIXES

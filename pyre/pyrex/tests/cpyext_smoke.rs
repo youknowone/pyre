@@ -78,3 +78,20 @@ print('cpyext-smoke-ok')
         "cpyext-smoke-ok",
     );
 }
+
+#[test]
+fn imports_abi3_suffix_module() {
+    let fixtures = Fixtures::new("cpyext-abi3");
+    fixtures.compile_with_suffix("cpyext_smoke", ".abi3.so");
+
+    let code = r#"
+import _imp
+import cpyext_smoke
+assert '.abi3.so' in _imp.extension_suffixes()
+assert cpyext_smoke.__name__ == 'cpyext_smoke'
+assert cpyext_smoke.__file__.endswith('.abi3.so'), cpyext_smoke.__file__
+print('cpyext-abi3-ok')
+"#;
+
+    fixtures.expect_ok(&code, &[], "cpyext-abi3-ok");
+}
