@@ -1496,25 +1496,12 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
         // host is the producer Op / InputArg, so two reaches of one logical box
         // return the same producer Rc (ptr_eq) — the #160 livebox dedup key.
-        // `get_box_replacement_operand_opt` carries the debug-build tripwire that
-        // the native Operand walk agrees with the legacy forwarding form on presence and
-        // identity, so the resume-numbering path validates the forwarding→Operand
-        // equivalence across the corpus. The fallback PANICS on a producerless
-        // position (the position-only Operand variant was dropped), the armed
-        // hazard-5 tripwire: a non-Const numbering key with no findable producer
-        // would otherwise mint a fresh, non-ptr_eq box and corrupt the livebox
-        // dedup. #157 drained these fires to zero across the corpus.
+        // OptContext::get_box_replacement_operand resolves the chain terminal
+        // back through the position's canonical producer.
         if opref.is_none() {
             return Operand::None;
         }
-        if self.ctx.is_vm_red_name(opref) {
-            // `resolve_to_operand` follows `_forwarded` onto a Scope.
-            // Numbering must key the LiveboxMap by the assembled Vm name.
-            return Operand::bound_from_opref(opref);
-        }
-        self.ctx
-            .get_box_replacement_operand_opt(opref)
-            .unwrap_or_else(|| Operand::from_opref(self.ctx.get_replacement_opref(opref)))
+        self.ctx.get_box_replacement_operand(opref)
     }
 
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
@@ -5355,7 +5342,10 @@ impl OptContext {
             return Operand::None;
         }
         if let Some(start) = self.resolve_to_operand(opref) {
-            return start.get_box_replacement(false);
+            let terminal = start.get_box_replacement(false);
+            return self
+                .resolve_to_operand(terminal.to_opref())
+                .unwrap_or(terminal);
         }
         self.s9_probe_fire(opref);
         Operand::bound_from_opref(opref)
@@ -9860,6 +9850,20 @@ mod boxref_forwarding_tests {
                 .expect("walked terminal carries bound InputArg"),
             &ia_holder[1],
         ));
+    }
+
+    #[test]
+    fn replacement_operand_rebinds_chain_terminal_to_canonical_producer() {
+        let (ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
+        let foreign = InputArgRc::new(majit_ir::InputArg::from_type(Type::Int, 1));
+        b0.set_forwarded_inputarg(&foreign);
+
+        let resolved = ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int));
+        let resolved_inputarg = resolved
+            .bound_inputarg()
+            .expect("replacement must remain an InputArg");
+        assert!(InputArgRc::ptr_eq(&resolved_inputarg, &ia_holder[1]));
+        assert!(!InputArgRc::ptr_eq(&resolved_inputarg, &foreign));
     }
 
     /// Forward-reference dup-materialization regression: a
