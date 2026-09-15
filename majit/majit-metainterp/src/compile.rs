@@ -3633,10 +3633,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         };
     // leftover=[] GETFIELD of a peeled inlined raise bakes a 13-field
     // snapshot (`traceback_inlined_callee_lasti` path=[3,0]). Deopt
-    // resume sees the portal at 16 (`consume_vable_info`).
-    // exception_reused mints the full portal (16) and must keep
-    // leftover-empty GETFIELD; its 13-field leftover already hits
-    // unmapped extras.
+    // resume sees the portal at 16 (`consume_vable_info`). Compiling
+    // that leftover=[] GETFIELD remaps the exception onto the portal
+    // mint (`'int' object has no attribute 'tb_frame'`).
     let leftover_empty_peeled_traceback = leftover.is_empty()
         && live_tos.as_ref().is_some_and(|p| p.len() > 1)
         && baked_field_len == 13

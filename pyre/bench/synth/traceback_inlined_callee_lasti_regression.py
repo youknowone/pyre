@@ -1,5 +1,11 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=a_bridge_two_classes,chain
+# leftover=[] GETFIELD of `chain` is a peeled 13-field snapshot
+# whose TAGBOX is still the portal (16). Compiling that remaps
+# `except ... as e` onto a portal mint slot (`'int' object has no
+# attribute 'tb_frame'`). `a_bridge_two_classes` is the loop the
+# assertion actually reads; `chain` stays interpreted until leftover=[]
+# GETFIELD loads the inlined callee, not the portal.
+# pyre-check: selfcheck-compiles=a_bridge_two_classes
 # Self-checking regression guard for the coordinate an UNWOUND frame reports
 # after an exception passed through it.  Sibling of
 # `frame_lineno_mid_replay_regression`, which guards the same coordinate for a
