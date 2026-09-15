@@ -498,6 +498,8 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "vec.Vec.with_capacity", foreign_container_ctor);
     analyzer_for(&mut reg, "indexmap.IndexMap.new", foreign_container_ctor);
     analyzer_for(&mut reg, "Box.new", foreign_container_ctor);
+    // `Box::new_uninit` is the no-arg heap-box twin of `lltype.malloc`.
+    analyzer_for(&mut reg, "boxed.Box.new_uninit", foreign_container_ctor);
     // `<[T]>::into_vec` producer — returns a fresh `Vec<T>`, the same
     // opaque container shell as `Vec::new`.
     analyzer_for(
