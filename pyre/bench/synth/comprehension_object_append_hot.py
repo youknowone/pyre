@@ -1,14 +1,6 @@
 # pyre-check: max-pypy-ratio=102
-# pyre-check: max-wasm-ratio=5.3
-# The pypy ceiling is twice the slowest ratio observed (51.0x on the windows
-# runner), rounded up.
-# fstring_comp is `f"{i}"` — FORMAT_VALUE + BUILD_STRING through
-# Utf8StringBuilder.  rbuilder.py `ll_append` residuals when
-# `we_are_jitted()`; `ll_build` is `look_inside_iff(isvirtual)`.  Until
-# optimizeopt virtualizes StringBuilder the generated path is that residual
-# copy, and wasm reads 4.2–4.6x vs dynasm here (ubuntu CI 4.1x).  5.3x is
-# the highest observation plus WASM_RATIO_FIT_HEADROOM (15%).  Recovery is
-# the rbuilder virtualization, not a new fold.
+# The ceiling is twice the slowest ratio observed (51.0x on the windows runner),
+# rounded up.
 # An inlined list comprehension whose LIST_APPEND element lands in a list
 # Object-strategy (tuple / None / str / dict / f-string) folds through the #171
 # orthodox append. Its Object arm stores a GC ref and runs list_write_barrier,

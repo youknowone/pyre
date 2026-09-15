@@ -326,9 +326,8 @@ pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
 ///
 /// Residual wrap: the walker descends this body (`NewWithVtable` + field
 /// stores) when the generated graph is not looked inside.  Looking inside
-/// the constructor currently feeds `stroruni.*` a non-`rpy_string` first
-/// argument (`jtransform.py` asserts STR/UNICODE).  Unseal once `Utf8Str`
-/// types as `Ptr(STR)` through that oopspec.
+/// the constructor currently speeds dynasm more than wasm on `str_fstring`
+/// (4.3x wasm/dynasm).  Unseal once Utf8Str virtualizes through `newutf8`.
 #[majit_macros::dont_look_inside]
 pub fn w_str_from_storage_and_length(
     value: *mut UnicodeValueStorage,
