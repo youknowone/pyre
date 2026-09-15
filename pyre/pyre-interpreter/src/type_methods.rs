@@ -4124,11 +4124,11 @@ fn pad_wtf8(
 /// str being encoded so a strict failure can build a structured
 /// UnicodeEncodeError carrying it.
 pub(crate) fn encode_utf8_with_errors(
+    s: &Wtf8,
     w_object: PyObjectRef,
     err_mode: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let s = unsafe { w_str_get_wtf8(w_object) }.to_wtf8_buf();
-    crate::codec_engine::encode_utf8(&s, w_object, err_mode)
+    crate::codec_engine::encode_utf8(s, w_object, err_mode)
 }
 
 /// PyPy: unicodeobject.py descr_encode → encode_object.
@@ -4169,6 +4169,10 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         0,
     )?;
     crate::builtins::kwarg_reject_unknown(kwargs, &["encoding", "errors"], "encode")?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let arg_base = pyre_object::gc_roots::pin_roots(args);
+    let reload = |i: usize| pyre_object::gc_roots::shadow_stack_get(arg_base + i);
+    let kwargs = kwargs.map(|_| reload(args.len() - 1));
     let dual =
         |name: &str, p: Option<PyObjectRef>| -> Result<Option<PyObjectRef>, crate::PyError> {
             let kw = crate::builtins::kwarg_get(kwargs, name);
@@ -4179,10 +4183,12 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
             Ok(p.or(kw))
         };
-    let encoding = str_arg(dual("encoding", pos.get(1).copied())?, "utf-8")?;
-    let errors = str_arg(dual("errors", pos.get(2).copied())?, "strict")?;
+    let encoding = str_arg(dual("encoding", pos.get(1).map(|_| reload(1)))?, "utf-8")?;
+    let errors = str_arg(dual("errors", pos.get(2).map(|_| reload(2)))?, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
-        args[0], &encoding, &errors,
+        reload(0),
+        &encoding,
+        &errors,
     )?))
 }
 
@@ -4224,7 +4230,7 @@ pub fn encode_object(
         crate::module::_codecs::validate_error_handler(errors)?;
     }
     if matches!(enc_lower.as_str(), "utf-8" | "utf8" | "u8") {
-        return encode_utf8_with_errors(w_object, errors);
+        return encode_utf8_with_errors(&s, w_object, errors);
     }
     match enc_lower.as_str() {
         "ascii" | "us-ascii" | "646" => crate::codec_engine::encode_ascii(&s, w_object, errors),
@@ -5917,11 +5923,17 @@ pub fn str_method_partition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                 pyre_object::gc_roots::shadow_stack_get(right_slot),
             ]))
         }
-        None => Ok(w_tuple_new(vec![
-            pyre_object::gc_roots::shadow_stack_get(base),
-            w_str_new(""),
-            w_str_new(""),
-        ])),
+        None => {
+            let empty_a = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new(""));
+            let empty_b = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new(""));
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(empty_a),
+                pyre_object::gc_roots::shadow_stack_get(empty_b),
+            ]))
+        }
     }
 }
 
@@ -5958,11 +5970,17 @@ pub fn str_method_rpartition(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
                 pyre_object::gc_roots::shadow_stack_get(right_slot),
             ]))
         }
-        None => Ok(w_tuple_new(vec![
-            w_str_new(""),
-            w_str_new(""),
-            pyre_object::gc_roots::shadow_stack_get(base),
-        ])),
+        None => {
+            let empty_a = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new(""));
+            let empty_b = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_str_new(""));
+            Ok(w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(empty_a),
+                pyre_object::gc_roots::shadow_stack_get(empty_b),
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ]))
+        }
     }
 }
 
@@ -7078,15 +7096,29 @@ pub fn dict_method_setdefault(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     arity_at_least(args, "setdefault", 1)?;
     arity_at_most(args, "setdefault", 2)?;
     let dict = resolve_dict_backing(args[0]);
-    let key = args[1];
-    let default = args.get(2).copied().unwrap_or_else(w_none);
-    if !dict.is_null() {
-        unsafe {
-            return pyre_object::dictmultiobject::w_dict_setdefault_checked(dict, key, default)
-                .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key));
-        }
+    if dict.is_null() {
+        return Ok(args.get(2).copied().unwrap_or_else(w_none));
     }
-    Ok(default)
+    // Hashing the key can collect; pin the backing, key, and default first
+    // the way `dict.get` publishes `args` before the lookup.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let live: Vec<PyObjectRef> = if args.len() >= 3 {
+        vec![dict, args[1], args[2]]
+    } else {
+        vec![dict, args[1]]
+    };
+    let base = pyre_object::gc_roots::pin_roots(&live);
+    let dict = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let default = if args.len() >= 3 {
+        pyre_object::gc_roots::shadow_stack_get(base + 2)
+    } else {
+        w_none()
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setdefault_checked(dict, key, default)
+            .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key))
+    }
 }
 
 #[cfg(test)]
