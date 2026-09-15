@@ -45,6 +45,9 @@ ENABLED: list[tuple[str, str | None]] = [
     # module owns those names on Windows and there is no implementation behind
     # them), so `test_spawnv`'s `ret == 42` is not a Windows expectation.
     ("test_os.py", "posix"),
+    # PyPy #5578.  CPython skips the file (`importorskip('_pypy_abi3_tags')`);
+    # pyre runs the tag tests and skips the loader-only ones when cpyext is off.
+    ("test_abi3_tags.py", None),
 ]
 
 

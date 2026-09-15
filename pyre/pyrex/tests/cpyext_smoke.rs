@@ -12,6 +12,8 @@
 
 mod cpyext_fixture;
 
+use std::path::Path;
+
 use cpyext_fixture::{Fixtures, extension_suffix};
 
 #[test]
@@ -94,4 +96,28 @@ print('cpyext-abi3-ok')
 "#;
 
     fixtures.expect_ok(&code, &[], "cpyext-abi3-ok");
+}
+
+#[test]
+fn abi3_tags_finder_installs_when_loader_exists() {
+    let fixtures = Fixtures::new("cpyext-abi3-tags");
+    let lib_pypy = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("pyrex manifest sits two levels below the repo root")
+        .join("lib_pypy");
+    let code = format!(
+        r#"
+import sys
+sys.path.insert(0, {lib_pypy})
+import _imp
+import _pypy_abi3_tags
+assert '.abi3.so' in _imp.extension_suffixes(), _imp.extension_suffixes()
+assert any(isinstance(f, _pypy_abi3_tags._Abi3TagsFinder) for f in sys.meta_path)
+print('cpyext-abi3-finder-ok')
+"#,
+        lib_pypy = format!("{:?}", lib_pypy.to_string_lossy())
+    );
+
+    fixtures.expect_ok(&code, &[], "cpyext-abi3-finder-ok");
 }
