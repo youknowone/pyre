@@ -2072,6 +2072,29 @@ fn rewrite_pending_zero_flush(op: &Op) -> bool {
         || op.opcode.can_malloc()
 }
 
+/// rewrite.py `could_merge_with_next_guard`: a comparison whose next
+/// op is GUARD_TRUE / GUARD_FALSE / COND_CALL on that result, or any
+/// ovf op, flushes pending zeros before the comparison.
+fn could_merge_with_next_guard(op: &Op, i: usize, operations: &[Op]) -> bool {
+    if !op.opcode.is_comparison() {
+        return op.opcode.is_ovf();
+    }
+    let Some(next_op) = operations.get(i + 1) else {
+        return false;
+    };
+    if !matches!(
+        next_op.opcode,
+        OpCode::GuardTrue
+            | OpCode::GuardFalse
+            | OpCode::CondCallN
+            | OpCode::CondCallValueI
+            | OpCode::CondCallValueR
+    ) {
+        return false;
+    }
+    next_op.arg(0).to_opref() == op.pos().get()
+}
+
 /// `rewrite.py emit_pending_zeros` / `handle_clear_array_contents`.
 ///
 /// IncrementalMiniMark is `malloc_zero_filled=false`, so native rewrite
@@ -2111,8 +2134,8 @@ fn newarray_clear_fully_written(
     constants: &indexmap::IndexMap<u32, i64>,
 ) -> bool {
     let mut written = vec![false; length];
-    for later in ops.iter().skip(op_idx + 1) {
-        if rewrite_pending_zero_flush(later) {
+    for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
+        if rewrite_pending_zero_flush(later) || could_merge_with_next_guard(later, j, ops) {
             break;
         }
         if later.opcode != OpCode::SetarrayitemGc {
@@ -2163,8 +2186,8 @@ fn pending_new_zero_offsets(
     if pending.is_empty() {
         return pending;
     }
-    for later in ops.iter().skip(op_idx + 1) {
-        if rewrite_pending_zero_flush(later) {
+    for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
+        if rewrite_pending_zero_flush(later) || could_merge_with_next_guard(later, j, ops) {
             break;
         }
         if later.opcode != OpCode::SetfieldGc {
