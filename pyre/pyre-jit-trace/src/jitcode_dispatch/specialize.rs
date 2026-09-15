@@ -15222,6 +15222,7 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
         if pyre_interpreter::module::math::interp_math::is_math_sqrt_function(callable)
             && r_args.len() >= 3
         {
+            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_float_sqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
                 .is_some()
             {
@@ -15251,8 +15252,10 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
         if r_args.len() >= 3 {
             use pyre_interpreter::module::math::interp_math;
             let walked = if interp_math::is_math_sin_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 try_walker_orthodox_float_sin(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
             } else if interp_math::is_math_cos_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 try_walker_orthodox_float_cos(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
             } else {
                 None
@@ -15823,6 +15826,7 @@ pub(crate) fn try_walker_orthodox_float_sqrt<Sym: WalkSym>(
     }
     let xa =
         walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    MathFloatDomain::NonNegativeFinite.emit_operand_guards(ctx, op_pc, xa)?;
     try_walker_orthodox_descent(
         ctx,
         op_pc,
@@ -15886,6 +15890,7 @@ fn try_walker_orthodox_float_trig<Sym: WalkSym>(
     }
     let xa =
         walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    MathFloatDomain::Finite.emit_operand_guards(ctx, op_pc, xa)?;
     try_walker_orthodox_descent(ctx, op_pc, &[], &[], &[(xa, x)], dst, dst_bank, descent)
 }
 
@@ -15910,6 +15915,7 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
         if pyre_interpreter::module::math::interp_math::is_math_fabs_function(callable)
             && r_args.len() >= 3
         {
+            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
             if try_walker_orthodox_float_abs(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
                 .is_some()
             {
