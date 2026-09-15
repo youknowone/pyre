@@ -3062,7 +3062,18 @@ pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
     if result.is_infinite() && ar.is_finite() && ai.is_finite() {
         return Err(PyError::overflow_error("absolute value too large"));
     }
-    _float_abs(result)
+    // Loop-free looked-inside caller of both unboxed float leaves. `_float_sqrt`
+    // is otherwise only reached from `interp_math::sqrt` under opaque
+    // `crate::module`, the same class as `_float_lt` before [`compare_slot`].
+    _float_abs_or_sqrt(result, false)
+}
+
+/// Hub so `_float_sqrt` is a jitcode (`_float_lt` / [`compare_slot`]).
+/// `inline(never)` keeps both arms in the graph when the abs caller
+/// passes a constant `false`.
+#[inline(never)]
+pub(crate) fn _float_abs_or_sqrt(x: f64, sqrt: bool) -> PyResult {
+    if sqrt { _float_sqrt(x) } else { _float_abs(x) }
 }
 
 /// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
@@ -6619,6 +6630,20 @@ pub(crate) fn _float_pos(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `sqrt_nonneg` after the domain pin: `W_FloatObject(sqrt(x))`.
+#[inline(never)]
+pub(crate) fn _float_sqrt(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.sqrt(),
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)

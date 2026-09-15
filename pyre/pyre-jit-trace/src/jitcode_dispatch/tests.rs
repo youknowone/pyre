@@ -4341,6 +4341,10 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
         ),
         ("pyre_interpreter::objspace::descroperation::_float_abs", ""),
         (
+            "pyre_interpreter::objspace::descroperation::_float_sqrt",
+            "",
+        ),
+        (
             "pyre_interpreter::objspace::descroperation::_int_abs",
             "int_sub",
         ),
