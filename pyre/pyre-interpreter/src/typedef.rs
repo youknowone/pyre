@@ -22176,8 +22176,15 @@ fn init_object_type(ns: PyObjectRef) {
                         ));
                     }
                     crate::type_methods::arity_exact(args, "__reduce_ex__", 1)?;
-                    let proto = crate::builtins::space_index_w(args[1])?;
-                    crate::reduce_protocol::descr_reduce_ex(args[0], proto)
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+                    let proto = crate::builtins::space_index_w(
+                        pyre_object::gc_roots::shadow_stack_get(base + 1),
+                    )?;
+                    crate::reduce_protocol::descr_reduce_ex(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                        proto,
+                    )
                 },
                 2,
                 "($self, protocol, /)",
@@ -24000,36 +24007,55 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
     crate::builtins::kwarg_reject_unknown(kwargs, &["sep", "maxsplit"], fn_name)?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "sep", pos.get(1).is_some())?;
     crate::builtins::kwarg_reject_duplicate(kwargs, fn_name, "maxsplit", pos.get(2).is_some())?;
-    // Argument clinic converts maxsplit before bytearray_split_impl acquires
-    // the receiver export; a re-entrant __index__ may therefore resize it.
-    let maxsplit = match pos
+    let sep_arg = pos
+        .get(1)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
+    let maxsplit_arg = pos
         .get(2)
         .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"))
-    {
-        Some(m) if !m.is_null() => crate::builtins::space_index_w(m)?,
-        _ => -1,
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "maxsplit"));
+    // Argument clinic converts maxsplit before bytearray_split_impl acquires
+    // the receiver export; a re-entrant __index__ may therefore resize it.
+    // Publish recv/sep/maxsplit first so that conversion cannot move them.
+    let _split_roots = pyre_object::gc_roots::push_roots();
+    let mut live = vec![pos[0]];
+    let sep_idx = sep_arg.map(|s| {
+        live.push(s);
+        live.len() - 1
+    });
+    let max_idx = maxsplit_arg.filter(|m| !m.is_null()).map(|m| {
+        live.push(m);
+        live.len() - 1
+    });
+    let recv_slot = pyre_object::gc_roots::pin_roots(&live);
+    let maxsplit = match max_idx {
+        Some(i) => {
+            crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + i))?
+        }
+        None => -1,
     };
     // CPython 3.14 bytearray split keeps the receiver export across separator
     // buffer acquisition (gh-142560).
-    let receiver = crate::baseobjspace::simple_buffer_bytes(pos[0])?
-        .expect("bytes/bytearray receiver always exports a buffer");
+    let receiver = crate::baseobjspace::simple_buffer_bytes(
+        pyre_object::gc_roots::shadow_stack_get(recv_slot),
+    )?
+    .expect("bytes/bytearray receiver always exports a buffer");
     let mut sep_buffer = None;
     let result = (|| {
-        let sep_arg = pos
-            .get(1)
-            .copied()
-            .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
-        if let Some(o) = sep_arg.filter(|o| !o.is_null() && unsafe { !pyre_object::is_none(*o) }) {
-            sep_buffer = match crate::baseobjspace::simple_buffer_bytes(o)? {
-                Some(buffer) => Some(buffer),
-                None => {
-                    return Err(crate::PyError::type_error(format!(
-                        "a bytes-like object is required, not '{}'",
-                        type_name_of(o)
-                    )));
-                }
-            };
+        if let Some(i) = sep_idx {
+            let o = pyre_object::gc_roots::shadow_stack_get(recv_slot + i);
+            if !o.is_null() && unsafe { !pyre_object::is_none(o) } {
+                sep_buffer = match crate::baseobjspace::simple_buffer_bytes(o)? {
+                    Some(buffer) => Some(buffer),
+                    None => {
+                        return Err(crate::PyError::type_error(format!(
+                            "a bytes-like object is required, not '{}'",
+                            type_name_of(o)
+                        )));
+                    }
+                };
+            }
         }
         let data = receiver.as_bytes();
         let parts = match sep_buffer.as_ref() {
@@ -24052,16 +24078,23 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
                 }
             }
         };
-        // `cut_bytes_like` allocates per piece, over the pieces already cut,
-        // and a plain `Vec` is not a root area (`build_list_storage`).
-        let recv_roots = pyre_object::gc_roots::push_roots();
-        let recv_slot = recv_roots.publish(&[pos[0]]);
-        recv_roots.normalize(recv_slot, 1);
-        let mut items = pyre_object::gc_roots::RootedItems::new();
+        // `cut_bytes_like` allocates per piece, over the pieces already cut.
+        // Pin each cut onto the same set that holds the receiver.
+        let mut item_slots = Vec::with_capacity(parts.len());
         for p in parts.iter() {
-            items.push(cut_bytes_like(recv_roots.get(recv_slot), p));
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cut_bytes_like(
+                pyre_object::gc_roots::shadow_stack_get(recv_slot),
+                p,
+            ));
+            item_slots.push(slot);
         }
-        Ok(pyre_object::w_list_new(items.take()))
+        Ok(pyre_object::w_list_new(
+            item_slots
+                .into_iter()
+                .map(pyre_object::gc_roots::shadow_stack_get)
+                .collect(),
+        ))
     })();
     if let Some(buffer) = sep_buffer {
         buffer.release();
@@ -25261,18 +25294,31 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         .get(1)
         .copied()
         .or_else(|| crate::builtins::kwarg_get(kwargs, "sep"));
+    let group_arg = pos
+        .get(2)
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, "bytes_per_sep"));
     // CPython 3.14 Argument Clinic converts `bytes_per_sep` before
     // `bytearray_hex_impl` acquires the receiver export. Its `__index__` may
     // therefore resize the receiver, and the live payload must be read only
-    // after this conversion.
-    let raw_group: i64 = match pos
-        .get(2)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "bytes_per_sep"))
-    {
+    // after this conversion. Publish recv/sep/group first.
+    let _hex_roots = pyre_object::gc_roots::push_roots();
+    let mut live = vec![pos[0]];
+    let sep_idx = sep_arg.map(|s| {
+        live.push(s);
+        live.len() - 1
+    });
+    let group_idx = group_arg.map(|g| {
+        live.push(g);
+        live.len() - 1
+    });
+    let recv_slot = pyre_object::gc_roots::pin_roots(&live);
+    let raw_group: i64 = match group_idx {
         // `_Py_strhex_impl`'s clinic `int bytes_per_sep` converter reads
         // `__index__`, so a non-index argument is named in the error.
-        Some(o) => crate::builtins::space_index_w(o)?,
+        Some(i) => {
+            crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + i))?
+        }
         None => 1,
     };
 
@@ -25281,11 +25327,14 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // `_Py_strhex_with_sep` calls `len(sep)`, so this export makes a
     // re-entrant resize raise BufferError instead of invalidating the
     // receiver pointer/length pair (gh-143195).
-    let receiver = crate::baseobjspace::simple_buffer_bytes(pos[0])?
-        .expect("bytes/bytearray receiver always exports a buffer");
+    let receiver = crate::baseobjspace::simple_buffer_bytes(
+        pyre_object::gc_roots::shadow_stack_get(recv_slot),
+    )?
+    .expect("bytes/bytearray receiver always exports a buffer");
     let result = (|| {
         let data = receiver.as_bytes();
-        let Some(sep_obj) = sep_arg else {
+        let Some(sep_obj) = sep_idx.map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        else {
             let mut out = String::with_capacity(data.len() * 2);
             for &byte in data {
                 out.push_str(&format!("{byte:02x}"));
@@ -25306,16 +25355,20 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if crate::baseobjspace::len_w(sep_obj)? != 1 {
             return Err(sep_length_error());
         }
-        let sep_bytes: &[u8] = if unsafe { pyre_object::is_str(sep_obj) } {
+        // `__len__` can collect; copy the separator off the object after it.
+        let sep_owned: Vec<u8> = if unsafe { pyre_object::is_str(sep_obj) } {
             // A lone surrogate is a length-1 separator with no UTF-8
             // spelling, so the ASCII test reads the WTF-8 payload; demanding
             // a `str` of it raises nothing, it aborts.
-            unsafe { pyre_object::w_str_get_wtf8(sep_obj) }.as_bytes()
+            unsafe { pyre_object::w_str_get_wtf8(sep_obj) }
+                .as_bytes()
+                .to_vec()
         } else if unsafe { pyre_object::is_bytes(sep_obj) } {
-            unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) }
+            unsafe { pyre_object::bytesobject::bytes_like_data(sep_obj) }.to_vec()
         } else {
             return Err(crate::PyError::type_error("sep must be str or bytes."));
         };
+        let sep_bytes: &[u8] = &sep_owned;
         if !sep_bytes.is_ascii() {
             return Err(sep_ascii_error());
         }
@@ -26445,16 +26498,25 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// clamping out-of-range indices (negative counts from the end).
 fn bytearray_method_insert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_exact_unpack(args, "insert", 2)?;
-    unsafe { crate::builtins::bytearray_check_exports(args[0])? };
-    let index = crate::builtins::space_index_w(args[1])?;
-    let b = bytearray_byte_arg(args[2])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1], args[2]]);
     unsafe {
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        crate::builtins::bytearray_check_exports(pyre_object::gc_roots::shadow_stack_get(base))?
+    };
+    let index = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let b = bytearray_byte_arg(pyre_object::gc_roots::shadow_stack_get(base + 2))?;
+    unsafe {
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(
+            pyre_object::gc_roots::shadow_stack_get(base),
+        );
         let old_size = vec.len();
         let len = vec.len() as i64;
         let i = if index < 0 { index + len } else { index };
         vec.insert(i.clamp(0, len) as usize, b);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], old_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            old_size,
+        );
     }
     Ok(pyre_object::w_none())
 }

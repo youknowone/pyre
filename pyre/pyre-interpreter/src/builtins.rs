@@ -16709,7 +16709,7 @@ pub(crate) fn exec_or_eval(
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
-        let key = pyre_object::w_str_new("__builtins__");
+        let key = pyre_object::unicodeobject::intern_str_value("__builtins__");
         if !crate::baseobjspace::contains(w_globals, key)? {
             crate::baseobjspace::setitem(w_globals, key, w_builtin)?;
         }
@@ -16741,7 +16741,7 @@ pub(crate) fn exec_or_eval(
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
-        let key = pyre_object::w_str_new("__builtins__");
+        let key = pyre_object::unicodeobject::intern_str_value("__builtins__");
         let setdefault = crate::baseobjspace::getattr_str(w_globals, "setdefault")?;
         crate::call_and_check(setdefault, &[key, w_builtin])?;
         Ok(())

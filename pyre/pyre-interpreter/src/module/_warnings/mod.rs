@@ -373,7 +373,8 @@ fn already_warned(
             pyre_object::gc_roots::shadow_stack_get(clear_slot),
             &[],
         )?;
-        let version_key_slot = pin_root_slot(w_str_new("version"));
+        let version_key_slot =
+            pin_root_slot(pyre_object::unicodeobject::intern_str_value("version"));
         crate::baseobjspace::setitem(
             pyre_object::gc_roots::shadow_stack_get(registry_slot),
             pyre_object::gc_roots::shadow_stack_get(version_key_slot),
