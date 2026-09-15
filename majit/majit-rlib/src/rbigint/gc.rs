@@ -32,8 +32,11 @@ pub struct RBigIntGcRoot {
     registered: bool,
 }
 
-/// Shadow-stack analogue for a borrowed handle that remains live across
-/// a collecting `Digits::new`. Clone shares the immutable digit array.
+/// Root a *borrowed* handle whose owner already keeps the original local
+/// live. Clone shares the digit array; the clone's `_digits` slot is what
+/// the collector updates. An *owned* local that is read after the next
+/// collecting call must move into [`RBigIntGcRoot::new`] instead — a clone
+/// here leaves the caller's pointer at the pre-move address.
 pub fn live_rbigint(value: &RBigInt) -> RBigIntGcRoot {
     RBigIntGcRoot::new(value.clone())
 }

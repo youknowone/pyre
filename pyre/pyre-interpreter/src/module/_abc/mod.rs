@@ -31,18 +31,17 @@ static ROOTED_SLOTS: parking_lot::Mutex<Vec<Box<usize>>> = parking_lot::Mutex::n
 /// module attribute, or dropping the module, lets the sweep reclaim the type
 /// while the stash still names it — the collector traces neither the stash nor
 /// anything that would keep the object on its account.  Registering the address
-/// in a stable slot is what buys survival, the `_structseq.rs`
-/// `root_structseq_type` idiom.
+/// in a stable slot is what buys survival, the same `try_gc_add_root`
+/// registration `_structseq.rs` uses for each registry `cls_slot`.
 ///
 /// Used only where the object must genuinely outlive its last Python
 /// reference: the class itself, and the weak references in
 /// [`SIMPLE_WEAK_SET_CONTAINS`], which retain nothing of what they name.  The
 /// bodies those references identify are deliberately not rooted.
 ///
-/// The stashes stay plain addresses rather than reads of these slots.  Types
-/// and weak references are born outside the nursery, so no walker rewrites a
-/// slot naming one and a read back through the root would return the same bits;
-/// only list and dict headers move.
+/// The stashes stay plain addresses rather than reads of these slots.  A
+/// heap type can now be born in the nursery, so a cache that names one
+/// must be a collector-updated slot (`RootedOnceRef`).
 fn root_forever(obj: PyObjectRef) {
     let mut slot = Box::new(obj as usize);
     let root_slot = (&raw mut *slot) as *mut *mut u8;
@@ -1002,7 +1001,6 @@ crate::py_module! {
         )?;
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
-        root_forever(simple_weak_set);
         SIMPLE_WEAK_SET_TYPE.set(simple_weak_set);
         let installed = simple_weak_set_contains_identity();
         if installed != (0, 0, 0, 0) {

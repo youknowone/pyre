@@ -10512,25 +10512,25 @@ fn exception_group_split_inner(
             kept.push(exc);
         }
     }
-    let kept_items = kept.take();
-    let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept_items[i]).collect() };
-    // Deriving one side allocates, so the group derived for the other side is
-    // pinned across it.
+    // `app_group.py` `split` walks `self.exceptions` and derives each
+    // side from the live list. Do not `take()` the rooted items: the
+    // first `derive` can collect, and a snapshot Vec would then be stale.
     let mut derived = pyre_object::gc_roots::RootedItems::new();
     let yes = if matching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self(), side(&matching_at))?
+        let items: Vec<PyObjectRef> = matching_at.iter().map(|&i| kept.get(i)).collect();
+        exception_group_derive_and_copy(w_self(), items)?
     };
     derived.push(yes);
     let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self(), side(&nonmatching_at))?
+        let items: Vec<PyObjectRef> = nonmatching_at.iter().map(|&i| kept.get(i)).collect();
+        exception_group_derive_and_copy(w_self(), items)?
     };
     derived.push(no);
-    let sides = derived.take();
-    Ok((sides[0], sides[1]))
+    Ok((derived.get(0), derived.get(1)))
 }
 
 /// `ceval.c _PyEval_ExceptionGroupMatch`, answering `CHECK_EG_MATCH`.
@@ -10642,8 +10642,12 @@ fn exception_group_collect_leaves(
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     if crate::baseobjspace::isinstance(w_exc, base_group)? {
         let (_, exceptions) = exception_group_fields(w_exc)?;
+        let mut children = pyre_object::gc_roots::RootedItems::new();
         for child in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
-            exception_group_collect_leaves(child, leaves)?;
+            children.push(child);
+        }
+        for i in 0..children.len() {
+            exception_group_collect_leaves(children.get(i), leaves)?;
         }
     } else if unsafe { pyre_object::is_exception(w_exc) } {
         if !(0..leaves.len()).any(|i| std::ptr::eq(leaves.get(i), w_exc)) {

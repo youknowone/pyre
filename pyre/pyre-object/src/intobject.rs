@@ -228,6 +228,7 @@ pub fn w_int_gc_alloc(value: i64) -> *mut PyObject {
         (*p).ob_header.w_class = w_class;
         (*p).intval = value;
     }
+    crate::gc_hook::try_gc_write_barrier_managed(raw);
     raw as PyObjectRef
 }
 

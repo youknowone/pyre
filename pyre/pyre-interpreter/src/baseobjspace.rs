@@ -8180,32 +8180,37 @@ unsafe fn type_getattr_hook_or_err(
 /// shape: explicit annotations and the lazy cache belong to this type's own
 /// namespace and are never inherited from a base class.
 pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
+    // `w_dict_new` / `__annotate__` can collect. The type is a nursery
+    // heap object; keep the caller's handle in the shadow stack and
+    // re-read it after those allocations (`framework.py` stack map).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+
     // `type.__annotations__` is the getset descriptor implementing this
     // operation, not annotations owned by the static builtin `type` itself.
     // Static builtin types cannot acquire annotations, so reject them before
     // consulting their namespace.  Heap types below may have an explicit
     // class-body entry with this name.
-    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj()) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotations__'",
-            unsafe { w_type_get_name(obj) },
+            unsafe { w_type_get_name(obj()) },
         )));
     }
 
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations__") {
+    if let Some(value) = crate::type_dict_lookup(obj(), "__annotations__") {
         return Ok(value);
     }
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations_cache__") {
+    if let Some(value) = crate::type_dict_lookup(obj(), "__annotations_cache__") {
         return Ok(value);
     }
 
     // The callable is reached through `getattr(type, '__annotate__')`, so an
     // annotation-free class picks up the `__annotate_func__ = None` entry
     // `type_get_annotate` stamps on the miss.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let annotate_fn = type_get_annotate(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let annotate_fn = type_get_annotate(obj())?;
     let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotate_fn);
     let annotations = if callable_w(pyre_object::gc_roots::shadow_stack_get(annotate_slot)) {
@@ -8225,14 +8230,8 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     } else {
         pyre_object::w_dict_new()
     };
-    crate::type_dict_store(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        "__annotations_cache__",
-        annotations,
-    );
-    pyre_object::gc_hook::try_gc_write_barrier(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut u8
-    );
+    crate::type_dict_store(obj(), "__annotations_cache__", annotations);
+    pyre_object::gc_hook::try_gc_write_barrier(obj() as *mut u8);
     Ok(annotations)
 }
 

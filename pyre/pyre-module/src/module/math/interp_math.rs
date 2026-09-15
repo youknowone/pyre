@@ -1227,26 +1227,28 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
             return result;
         }
         let mid = ((low + high) >> 1) | 1;
-        fac_odd(low, mid, gap).mul(&fac_odd(mid, high, gap))
+        let left = RBigIntGcRoot::new(fac_odd(low, mid, gap));
+        left.mul(&fac_odd(mid, high, gap))
     }
     fn fac1(x: i64, gap: i64) -> (BigInt, BigInt, i64) {
         if x <= 2 {
             return (BigInt::one(), BigInt::one(), x - 1);
         }
         let x2 = x >> 1;
-        let (f, mut g, shift) = fac1(x2, gap);
-        g = g.mul(&fac_odd((x2 + 1) | 1, x + 1, gap));
-        (f.mul(&g), g, shift + x2)
+        let (f, g, shift) = fac1(x2, gap);
+        let f = RBigIntGcRoot::new(f);
+        let g = RBigIntGcRoot::new(g.mul(&fac_odd((x2 + 1) | 1, x + 1, gap)));
+        (f.mul(&g), (*g).clone(), shift + x2)
     }
 
     let result = if n <= 100 {
-        let mut result = BigInt::one();
+        let mut result = RBigIntGcRoot::new(BigInt::one());
         let mut i = 2;
         while i <= n {
-            result = result.int_mul(i);
+            result = RBigIntGcRoot::new(result.int_mul(i));
             i += 1;
         }
-        result
+        (*result).clone()
     } else {
         let gap = 100.max(n >> 7);
         let (result, _, shift) = fac1(n, gap);
@@ -1467,28 +1469,29 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     }
 
     let n_minus_k = &*n_big - &k_big;
-    let k = if n_minus_k.lt(&k_big) {
+    let k = RBigIntGcRoot::new(if n_minus_k.lt(&k_big) {
         n_minus_k
     } else {
         k_big
-    };
+    });
     if k.is_zero() {
         return Ok(w_int_new(1));
     }
 
     // pypy/module/math/app_math.py:comb — preserve its occasional fraction
     // reduction, including a bigint loop index.
-    let mut numerator = n_big.translated_alias();
-    let mut denominator = BigInt::one();
-    let mut i = BigInt::one();
+    let mut numerator = RBigIntGcRoot::new(n_big.translated_alias());
+    let mut denominator = RBigIntGcRoot::new(BigInt::one());
+    let mut i = RBigIntGcRoot::new(BigInt::one());
     while i.lt(&k) {
-        numerator = numerator.mul(&n_big.sub(&i));
-        denominator = denominator.mul(&i.int_add(1));
+        numerator = RBigIntGcRoot::new(numerator.mul(&n_big.sub(&i)));
+        denominator = RBigIntGcRoot::new(denominator.mul(&i.int_add(1)));
         if i.int_and_(15).is_zero() {
-            numerator = numerator.floordiv(&denominator).map_err(map_rbigint_err)?;
-            denominator = BigInt::one();
+            numerator =
+                RBigIntGcRoot::new(numerator.floordiv(&denominator).map_err(map_rbigint_err)?);
+            denominator = RBigIntGcRoot::new(BigInt::one());
         }
-        i = i.int_add(1);
+        i = RBigIntGcRoot::new(i.int_add(1));
     }
     Ok(bigint_to_pyint(
         &numerator.floordiv(&denominator).map_err(map_rbigint_err)?,
@@ -1558,20 +1561,21 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
             return Ok(w_int_new(0));
         }
     }
-    let k = k_big.unwrap_or_else(|| n_big.translated_alias());
+    let k = RBigIntGcRoot::new(k_big.unwrap_or_else(|| n_big.translated_alias()));
 
     fn product_range(low: &BigInt, high: &BigInt, gap: &BigInt) -> Result<BigInt, RBigIntError> {
         if low.add(gap).ge(high) {
-            let mut result = BigInt::one();
-            let mut i = low.translated_alias();
+            let mut result = RBigIntGcRoot::new(BigInt::one());
+            let mut i = RBigIntGcRoot::new(low.translated_alias());
             while i.lt(high) {
-                result = result.mul(&i);
-                i = i.int_add(1);
+                result = RBigIntGcRoot::new(result.mul(&i));
+                i = RBigIntGcRoot::new(i.int_add(1));
             }
-            return Ok(result);
+            return Ok((*result).clone());
         }
-        let mid = low.add(high).rshift(1, false)?;
-        Ok(product_range(low, &mid, gap)?.mul(&product_range(&mid, high, gap)?))
+        let mid = RBigIntGcRoot::new(low.add(high).rshift(1, false)?);
+        let left = RBigIntGcRoot::new(product_range(low, &mid, gap)?);
+        Ok(left.mul(&product_range(&mid, high, gap)?))
     }
 
     let low = n_big.sub(&k).int_add(1);

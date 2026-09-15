@@ -340,6 +340,11 @@ pub unsafe fn w_long_is_zero(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_long_get_value(obj: PyObjectRef) -> &'static BigInt {
     unsafe {
+        // Follow a nursery forwarding stub. The returned reference is only
+        // valid until the next collecting allocation: the payload can move.
+        // A caller that keeps the value across `Digits::new` must
+        // `translated_alias` it into an `RBigIntGcRoot`.
+        let obj = crate::gc_hook::try_gc_current_object_address(obj as *mut u8) as PyObjectRef;
         let long_obj = obj as *const W_LongObject;
         &*(*long_obj).value
     }

@@ -45,20 +45,24 @@ pub(crate) fn bigint_result(value: BigInt) -> PyObjectRef {
 /// Keep the Bézout coefficients as rbigints: the loop is the ordinary
 /// extended Euclidean algorithm and never crosses into an opaque host bigint.
 fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError> {
-    let mut old_r = base
-        .r#mod(modulus)
-        .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))?;
-    let mut r = modulus.translated_alias();
-    let mut old_s = BigInt::one();
-    let mut s = BigInt::zero();
+    let base = RBigIntGcRoot::new(base.translated_alias());
+    let modulus = RBigIntGcRoot::new(modulus.translated_alias());
+    let mut old_r = RBigIntGcRoot::new(
+        base.r#mod(&modulus)
+            .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))?,
+    );
+    let mut r = RBigIntGcRoot::new(modulus.translated_alias());
+    let mut old_s = RBigIntGcRoot::new(BigInt::one());
+    let mut s = RBigIntGcRoot::new(BigInt::zero());
     while !r.is_zero() {
-        let quotient = old_r
-            .floordiv(&r)
-            .map_err(|_| PyError::value_error("base is not invertible for the given modulus"))?;
-        let next_r = old_r.sub(&quotient.mul(&r));
+        let quotient =
+            RBigIntGcRoot::new(old_r.floordiv(&r).map_err(|_| {
+                PyError::value_error("base is not invertible for the given modulus")
+            })?);
+        let next_r = RBigIntGcRoot::new(old_r.sub(&quotient.mul(&r)));
         old_r = r;
         r = next_r;
-        let next_s = old_s.sub(&quotient.mul(&s));
+        let next_s = RBigIntGcRoot::new(old_s.sub(&quotient.mul(&s)));
         old_s = s;
         s = next_s;
     }
@@ -68,7 +72,7 @@ fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError
         ));
     }
     old_s
-        .r#mod(modulus)
+        .r#mod(&modulus)
         .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))
 }
 
@@ -1833,13 +1837,11 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 }
 
 unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    let vb_owned;
-    let vb = if is_long(b) {
-        w_long_get_value(b)
+    let vb = RBigIntGcRoot::new(if is_long(b) {
+        w_long_get_value(b).translated_alias()
     } else {
-        vb_owned = BigInt::from(int_value(b));
-        &vb_owned
-    };
+        BigInt::from(int_value(b))
+    });
     if vb.get_sign() < 0 {
         // longobject.py calls descr_float on both integer operands
         // before float pow.  RBigInt::tofloat raises on an out-of-range value;
@@ -1857,13 +1859,11 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         return Ok(w_long_new(BigInt::from(1)));
     }
     // longobject.py:224-231: rbigint.pow handles arbitrary exponents.
-    let va_owned;
-    let va = if is_long(a) {
-        w_long_get_value(a)
+    let va = RBigIntGcRoot::new(if is_long(a) {
+        w_long_get_value(a).translated_alias()
     } else {
-        va_owned = BigInt::from(int_value(a));
-        &va_owned
-    };
+        BigInt::from(int_value(a))
+    });
     // Both rbigint.int_pow(1) and rbigint.pow(ONERBIGINT) return the base
     // reference after the zero-base check. W_LongObject adds only a wrapper.
     if is_long(a) && va.get_sign() != 0 && vb.int_eq(1) {
@@ -1885,9 +1885,9 @@ unsafe fn long_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // unwrapped (`exp_bigint` stays None) and calls `rbigint.int_pow`; only a
     // long exponent reaches `rbigint.pow`.
     if is_int_like(b) {
-        return Ok(w_long_new(bigint_int_pow_nomod(va, int_value(b))?));
+        return Ok(w_long_new(bigint_int_pow_nomod(&va, int_value(b))?));
     }
-    Ok(w_long_new(bigint_pow_nomod(va, vb)?))
+    Ok(w_long_new(bigint_pow_nomod(&va, &vb)?))
 }
 
 // ── Shift operations ─────────────────────────────────────────────────
@@ -5208,27 +5208,21 @@ pub(crate) fn try_int_long_pow_with_modulo(
         // machine ints, in which case `space.newint` demotes it.
         let all_int_like = is_int_like(base) && is_int_like(exp) && is_int_like(modulus);
 
-        let base_owned;
-        let base = if is_long(base) {
-            w_long_get_value(base)
+        let base = RBigIntGcRoot::new(if is_long(base) {
+            w_long_get_value(base).translated_alias()
         } else {
-            base_owned = BigInt::from(int_value(base));
-            &base_owned
-        };
-        let exp_owned;
-        let exp = if is_long(exp) {
-            w_long_get_value(exp)
+            BigInt::from(int_value(base))
+        });
+        let exp = RBigIntGcRoot::new(if is_long(exp) {
+            w_long_get_value(exp).translated_alias()
         } else {
-            exp_owned = BigInt::from(int_value(exp));
-            &exp_owned
-        };
-        let modulus_owned;
-        let modulus = if is_long(modulus) {
-            w_long_get_value(modulus)
+            BigInt::from(int_value(exp))
+        });
+        let modulus = RBigIntGcRoot::new(if is_long(modulus) {
+            w_long_get_value(modulus).translated_alias()
         } else {
-            modulus_owned = BigInt::from(int_value(modulus));
-            &modulus_owned
-        };
+            BigInt::from(int_value(modulus))
+        });
 
         if modulus.get_sign() == 0 {
             return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
@@ -5239,49 +5233,54 @@ pub(crate) fn try_int_long_pow_with_modulo(
             // long_invmod).  The inverse exists only when `base` is
             // coprime to the modulus.
             let negative_modulus = modulus.get_sign() < 0;
-            let abs_modulus_owned;
             let abs_modulus = if negative_modulus {
-                abs_modulus_owned = modulus.neg();
-                &abs_modulus_owned
+                RBigIntGcRoot::new(modulus.neg())
             } else {
-                modulus
+                RBigIntGcRoot::new(modulus.translated_alias())
             };
-            let inverse = bigint_mod_inverse(base, abs_modulus)?;
-            let pos_exp = exp.neg();
-            let mut result = inverse
-                .pow(&pos_exp, Some(abs_modulus))
-                .map_err(|_| PyError::memory_error("exponent too large"))?;
+            let inverse = RBigIntGcRoot::new(bigint_mod_inverse(&base, &abs_modulus)?);
+            let pos_exp = RBigIntGcRoot::new(exp.neg());
+            let mut result = RBigIntGcRoot::new(
+                inverse
+                    .pow(&pos_exp, Some(&abs_modulus))
+                    .map_err(|_| PyError::memory_error("exponent too large"))?,
+            );
             if negative_modulus && result.get_sign() > 0 {
-                result = result.sub(abs_modulus);
+                result = RBigIntGcRoot::new(result.sub(&abs_modulus));
             }
-            return Ok(Some(pow_mod_result(result, all_int_like)));
+            return Ok(Some(pow_mod_result(
+                result.translated_alias(),
+                all_int_like,
+            )));
         }
         if exp.get_sign() == 0 {
             // `x ** 0 % m` is `1 % m` under floor semantics, so a negative
             // modulus yields a negative residue (`pow(2, 0, -13) == -12`).
             return Ok(Some(pow_mod_result(
                 BigInt::one()
-                    .r#mod(modulus)
+                    .r#mod(&modulus)
                     .expect("modulus was checked nonzero"),
                 all_int_like,
             )));
         }
 
         let negative_modulus = modulus.get_sign() < 0;
-        let abs_modulus_owned;
         let abs_modulus = if negative_modulus {
-            abs_modulus_owned = modulus.neg();
-            &abs_modulus_owned
+            RBigIntGcRoot::new(modulus.neg())
         } else {
-            modulus
+            RBigIntGcRoot::new(modulus.translated_alias())
         };
-        let mut result = base
-            .pow(exp, Some(abs_modulus))
-            .map_err(|_| PyError::memory_error("exponent too large"))?;
+        let mut result = RBigIntGcRoot::new(
+            base.pow(&exp, Some(&abs_modulus))
+                .map_err(|_| PyError::memory_error("exponent too large"))?,
+        );
         if negative_modulus && result.get_sign() > 0 {
-            result = result.sub(abs_modulus);
+            result = RBigIntGcRoot::new(result.sub(&abs_modulus));
         }
-        Ok(Some(pow_mod_result(result, all_int_like)))
+        Ok(Some(pow_mod_result(
+            result.translated_alias(),
+            all_int_like,
+        )))
     }
 }
 

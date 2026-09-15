@@ -4219,7 +4219,7 @@ impl PyFrame {
         let globals_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_globals);
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::intern_str_value("__main__"));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__main__"));
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 pyre_object::gc_roots::shadow_stack_get(globals_slot),

@@ -140,8 +140,9 @@ pub fn w_float_subclass_new(value: f64) -> PyObjectRef {
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_FloatObject, obj);
-            raw as PyObjectRef
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
     }
 }
 

@@ -783,31 +783,8 @@ fn make_struct_seq_impl(
             },
         });
     }
-    root_structseq_type(cls);
 
     cls
-}
-
-/// Slots holding the structseq types, registered as GC roots.
-///
-/// `Box` so each slot keeps one address for the collector's whole lifetime;
-/// the `Vec` only owns them.
-static STRUCTSEQ_TYPE_ROOTS: Mutex<Vec<Box<usize>>> = Mutex::new(Vec::new());
-
-/// Keep a structseq type alive for the life of the process.
-///
-/// `w_type_new` builds a *mortal* GC heap type, and every caller reaches its
-/// type through a `OnceLock<usize>` that caches the raw address once — a cache
-/// the collector neither traces nor rewrites. Nothing else need reference the
-/// type: the module attribute can be rebound or the module dropped, and the
-/// sweep then reclaims it while the cache still hands the address out, so the
-/// next instance is built with a `w_class` naming freed memory. Register the
-/// address in a stable slot, the `intern_str` idiom.
-fn root_structseq_type(cls: PyObjectRef) {
-    let mut slot = Box::new(cls as usize);
-    let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
-    unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
-    STRUCTSEQ_TYPE_ROOTS.lock().push(slot);
 }
 
 /// `lib_pypy/_structseq.py:43-87 structseqtype.__new__` creates an ordinary
@@ -831,7 +808,7 @@ fn make_heap_structseq_type(
         .map_or((None, full_name), |(module, name)| (Some(module), name));
     if let Some(module) = module {
         let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::intern_str_value(module));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(module));
         unsafe {
             pyre_object::w_dict_setitem_str_no_proxy(
                 pyre_object::gc_roots::shadow_stack_get(ns_slot),

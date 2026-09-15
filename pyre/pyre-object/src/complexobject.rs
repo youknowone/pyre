@@ -78,8 +78,9 @@ pub fn w_complex_subclass_new(real: f64, imag: f64) -> PyObjectRef {
     } else {
         unsafe {
             std::ptr::write(raw as *mut W_ComplexObject, obj);
-            raw as PyObjectRef
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
     }
 }
 

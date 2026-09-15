@@ -414,7 +414,7 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // instance is already a nursery object; `instance_walk_boxed_storage`
 // rewrites its `storage` slot. A non-moving block was a shortcut so the
 // instance's `storage` pointer never needed rewriting. That is not
-// `mapdict.py`. The
+// `mapdict.py`. The nursery bump is `malloc_varsize`.
 
 // A stable allocation does not itself start a collection, but it is still a GC
 // operation and can wait behind a collection started by another mutator.
@@ -486,6 +486,9 @@ pub unsafe fn grow_instance_items_block(
         for i in copy..new_cap {
             *new_base.add(i) = PY_NULL;
         }
+        // Copied slots can be young. A nursery-full `fresh` block is
+        // old-gen with TRACK_YOUNG_PTRS still set.
+        crate::gc_hook::try_gc_write_barrier_managed(fresh as *mut u8);
         fresh
     }
 }

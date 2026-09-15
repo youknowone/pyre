@@ -5325,10 +5325,13 @@ impl<'a> RegAlloc<'a> {
         } else {
             self.perform(i, arglocs, result_loc, output);
         }
-        // Residual GCREF results start in call_result_gpr, which the
-        // next collecting call excludes from its gcmap (callbuilder.py).
-        // Publish them to the jitframe so a later collect rewrites the
-        // slot, matching a shadow-stack result local.
+        // Residual GCREF results start in call_result_gpr. Upstream
+        // leaves them in eax until the next call's `before_call`
+        // `SAVE_GCREF_REGS` (`llsupport/regalloc.py`). pyre also has
+        // that arm, but a free-threaded safepoint can collect before
+        // the next call, so this extra frame store is a
+        // PRE-EXISTING-ADAPTATION: publish the result now so a later
+        // collect rewrites the jitframe slot.
         if result_tp == Type::Ref {
             self.force_spill_var(op.pos().get(), Type::Ref);
             self.flush_moves(output);
