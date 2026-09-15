@@ -9627,8 +9627,9 @@ pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
 }
 
 /// Walk `write_cell` for an in-place cell store.  Applies the helper
-/// afterwards so the walk's remaining concrete reads see the write and
-/// `mark_prebuilt_roots_dirty` runs (`celldict::write_cell`).
+/// afterwards so the walk's remaining concrete reads see the write.
+/// A pointer store still marks the prebuilt-root bit inside
+/// `celldict::write_cell`; an int store does not.
 ///
 /// Pin `version?` and re-read the slot before baking `stored`: a later
 /// delete or replacing store mutates the dict and must revoke this

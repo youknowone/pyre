@@ -290,12 +290,14 @@ pub unsafe fn walk_module_value_slot(
 /// must be a valid non-null PyObjectRef.
 pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> Option<PyObjectRef> {
     debug_assert!(!w_value.is_null(), "write_cell: null value");
-    // The cell payload lives in a Box-immortal structure reached only by the
-    // prebuilt-family root walk; record the store so the next minor
-    // collection rescans it (gc_roots.rs prebuilt-root write tracking).
-    crate::gc_roots::mark_prebuilt_roots_dirty();
     match classify_cell_write(w_cell, w_value) {
         CellWrite::InPlaceObject(cell) => {
+            // The cell is Box-immortal and reached only by the prebuilt-family
+            // root walk.  A pointer store is the write barrier for that walk
+            // (`gc_roots.rs` prebuilt-root write tracking).  An in-place int
+            // store writes no `PyObjectRef` and does not need the bit —
+            // `typeobject.py write_cell` has no barrier on `intvalue` either.
+            crate::gc_roots::mark_prebuilt_roots_dirty();
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }

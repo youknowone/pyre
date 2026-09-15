@@ -1,9 +1,4 @@
-# pyre-check: max-pypy-ratio=5.0
-# A MutableCell builtins slot unwraps through generated `unwrap_cell`.
-# Until that helper's `ob_type` compares fold on the baked cell pointer,
-# the compiled loop is a few ns/iter slower than pypy (dynasm 3.4x,
-# cranelift 4.4x on a fast pypy). The recovery is that fold, not a
-# hand-written getfield.
+# pyre-check: max-pypy-ratio=2.5
 # pyre-check: spec-folds=builtin_len_descent
 # pyre-check: skip-cpython
 # A module-scope LOAD_NAME whose name misses the module dict resolves through

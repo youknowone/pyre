@@ -1,7 +1,4 @@
-# pyre-check: max-pypy-ratio=4.5
-# The module-level `s = s + read_global()` store now descends generated
-# `write_cell` for the in-place int cell. Until that helper's classify
-# match folds, cranelift is ~3.7x pypy. The recovery is that fold.
+# pyre-check: max-pypy-ratio=3
 N = 156150700
 
 G = 100
