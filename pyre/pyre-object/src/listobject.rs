@@ -2843,6 +2843,15 @@ pub fn ll_list_obj_getitem_fast(l: &W_ListObject, index: usize) -> PyObjectRef {
     }
 }
 
+/// `ll_getitem_foldable_nonneg` for the Object strategy (rlist.py,
+/// `oopspec = 'list.getitem_foldable(l, index)'`).  `rtype_getitem`
+/// selects this when `not listdef.listitem.mutated` (`rlist.py`);
+/// `fargs[*]` is that list (`rclass.py _parse_field_list`).
+#[majit_macros::oopspec("list.obj_getitem_foldable(l, index)")]
+pub fn ll_list_obj_getitem_foldable(l: &W_ListObject, index: usize) -> PyObjectRef {
+    ll_list_obj_getitem_fast(l, index)
+}
+
 /// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
 /// known-in-bounds index (the spare-capacity append's element write).
 /// The element is a GC pointer, but — unlike the runtime helper that once
@@ -6251,6 +6260,10 @@ mod tests {
         assert_eq!(
             oopspec_ll_list_obj_setitem_fast,
             "list.obj_setitem(l, index, item)"
+        );
+        assert_eq!(
+            oopspec_ll_list_obj_getitem_foldable,
+            "list.obj_getitem_foldable(l, index)"
         );
     }
 

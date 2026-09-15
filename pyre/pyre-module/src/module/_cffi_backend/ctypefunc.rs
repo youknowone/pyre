@@ -137,12 +137,13 @@ fn fargs_len(w_fargs: PyObjectRef) -> usize {
         .unwrap_or(0)
 }
 
-/// `self.fargs[i]` — `ctypefunc.py` `_call`.  `ll_getitem_fast` on the
-/// object-strategy list, so the codewriter sees `list.obj_getitem`.
+/// `self.fargs[i]` — `ctypefunc.py` `_call`.  The list is never mutated
+/// (`fargs[*]`), so this is `ll_getitem_foldable_nonneg` (`rlist.py`)
+/// and the codewriter sees `list.obj_getitem_foldable`.
 fn farg(w_fargs: PyObjectRef, i: usize) -> PyObjectRef {
     match fargs_list(w_fargs) {
         Some(list) if i < pyre_object::ll_list_obj_length(list) => {
-            pyre_object::ll_list_obj_getitem_fast(list, i)
+            pyre_object::ll_list_obj_getitem_foldable(list, i)
         }
         _ => pyre_object::PY_NULL,
     }
