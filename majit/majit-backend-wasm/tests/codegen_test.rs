@@ -6108,7 +6108,7 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
         "an oversized owner waits on the entry-count trip, not an unmeasured merge"
     );
     assert_eq!(
-        majit_backend_wasm::bridge_diag(53),
+        majit_backend_wasm::bridge_diag(32),
         inline_ok_before,
         "an oversized owner is not merged before the trip"
     );

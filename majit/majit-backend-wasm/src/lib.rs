@@ -3174,6 +3174,9 @@ impl WasmBackend {
                 Self::restore_dispatch_cell(&owner, source_fail_index);
             }
         }
+        if owner.is_invalidated() {
+            return;
+        }
         // Remapped children whose parent is not in the owner yet stay
         // pending so a later parent install can pick them up.
         for (region, remap) in leftover {
@@ -3262,6 +3265,7 @@ impl WasmBackend {
             return regions;
         };
         let mut attached = 0usize;
+        let mut attached_pairs = Vec::new();
         let mut leftover = regions;
         // A compile-time `uninitialized_label` may become legal after a
         // sibling peel is attached. Retry leftovers against the growing
@@ -3311,7 +3315,8 @@ impl WasmBackend {
                     }
                     diag_bump(52);
                 }
-                candidate.inlined_bridges.push(region);
+                candidate.inlined_bridges.push(region.clone());
+                attached_pairs.push((region, remap));
                 attached += 1;
                 progressed = true;
             }
@@ -3416,6 +3421,7 @@ impl WasmBackend {
                 }
                 record_inline_trial_error(&error);
                 classify_inline_install_error(&error);
+                leftover.splice(0..0, attached_pairs);
             }
         }
         let _ = source_cells_base;
