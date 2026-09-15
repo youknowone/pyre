@@ -16100,6 +16100,83 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn string_byte_getitem_marker_lowers_to_strgetitem() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("string_byte_getitem");
+        let s = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let i = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["__string_byte_getitem"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![s.clone(), i.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[s.clone(), i.clone()],
+            &result_ty,
+            "string_byte_getitem",
+            &mut graph,
+        ) else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].result, Some(result));
+        match &ops[0].kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                assert_eq!(opname, "strgetitem");
+                assert_eq!(args, &[s, i]);
+            }
+            other => panic!("expected LoweredBlackholeOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strlen_marker_lowers_to_strlen() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("strlen_marker");
+        let s = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["__strlen"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![s.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&s),
+            &result_ty,
+            "strlen_marker",
+            &mut graph,
+        ) else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].result, Some(result));
+        match &ops[0].kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                assert_eq!(opname, "strlen");
+                assert_eq!(args, &[s]);
+            }
+            other => panic!("expected LoweredBlackholeOp, got {other:?}"),
+        }
+    }
+
     /// `jtransform.py:116-118` + `:176-179
     /// _killed_exception_raising_operation`: the exception exits belong to
     /// the block's last operation, so once that operation rewrites to
