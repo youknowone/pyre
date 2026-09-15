@@ -3225,39 +3225,49 @@ impl WasmBackend {
             .filter(|(_, _, remap)| remap.is_none())
             .map(|(id, region, _)| (region.source_fail_index, *id))
             .collect();
-        let trigger_is_core = pending.remap.is_none();
-        let had_remaps = work.iter().any(|(_, _, remap)| remap.is_some());
+        let trigger_id = pending_id;
         let (mut leftover, mut terminal) = self.install_inline_region_batch(
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
         );
-        // Cold remaps must not make a hot parent fail the whole rebuild.
-        if terminal && trigger_is_core && had_remaps && !owner.is_invalidated() {
-            let (remap_left, core_left): (Vec<_>, Vec<_>) =
-                leftover.into_iter().partition(|(_, remap)| remap.is_some());
-            (leftover, terminal) = self.install_inline_region_batch(&owner, core_left);
-            // Remaps are only useful if the parent entered the owner.
-            // A terminal parent-only retry means they can never remap.
-            if !terminal && !owner.is_invalidated() {
-                for (region, remap) in remap_left {
-                    let Some(key) = remap else {
-                        continue;
-                    };
-                    let Some(&id) = remap_pending_ids.get(&key) else {
-                        continue;
-                    };
-                    PENDING_INLINES.with(|pending| {
-                        pending.borrow_mut().insert(
-                            id,
-                            PendingInline {
-                                owner: Arc::downgrade(&owner),
-                                region,
-                                remap,
-                                retry_on_sibling: false,
-                            },
-                        )
+        // Optional remaps / leftover labels must not make the newly
+        // tripped region fail the whole rebuild.
+        if terminal && leftover.len() > 1 && !owner.is_invalidated() {
+            let (trigger_left, optional_left): (Vec<_>, Vec<_>) =
+                leftover
+                    .into_iter()
+                    .partition(|(region, remap)| match remap {
+                        Some(key) => remap_pending_ids.get(&key) == Some(&trigger_id),
+                        None => {
+                            fail_pending_ids.get(&region.source_fail_index) == Some(&trigger_id)
+                        }
                     });
+            if !trigger_left.is_empty() {
+                (leftover, terminal) = self.install_inline_region_batch(&owner, trigger_left);
+                if !terminal && !owner.is_invalidated() {
+                    for (region, remap) in optional_left {
+                        let id = match remap {
+                            Some(key) => remap_pending_ids.get(&key).copied(),
+                            None => fail_pending_ids.get(&region.source_fail_index).copied(),
+                        };
+                        let Some(id) = id else {
+                            continue;
+                        };
+                        PENDING_INLINES.with(|pending| {
+                            pending.borrow_mut().insert(
+                                id,
+                                PendingInline {
+                                    owner: Arc::downgrade(&owner),
+                                    region,
+                                    remap,
+                                    retry_on_sibling: remap.is_none(),
+                                },
+                            )
+                        });
+                    }
                 }
+            } else {
+                leftover = optional_left;
             }
         }
         if leftover.iter().any(|(_, remap)| remap.is_none()) {
