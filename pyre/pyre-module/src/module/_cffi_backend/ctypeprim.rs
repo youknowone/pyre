@@ -89,6 +89,18 @@ unsafe fn convert_to_object_longlong(ct: &W_CType, cdata: usize) -> Result<PyObj
     }))
 }
 
+/// `W_CTypePrimitiveSigned._convert_from_object_longlong`.
+///
+/// In its own function: LONGLONG may make the whole function jit-opaque.
+unsafe fn convert_from_object_longlong(
+    ct: &W_CType,
+    cdata: usize,
+    w_ob: PyObjectRef,
+) -> Result<(), PyError> {
+    let value = misc::as_long_long(w_ob)?;
+    unsafe { misc::write_raw_signed_data(cdata, value, ct.size) }
+}
+
 /// `W_CTypePrimitive.convert_from_object`.
 ///
 /// # Safety
@@ -112,18 +124,23 @@ pub unsafe fn convert_from_object(
             }
             // `W_CTypePrimitiveSigned.convert_from_object`.
             ctypeobj::KIND_PRIM_SIGNED => {
-                // The conversion runs `__index__`, so the object the overflow
-                // message names has to be read back out of its slot.
-                let roots = pyre_object::gc_roots::push_roots();
-                let ob_slot = roots.base();
-                let _ = roots.pin_root(w_ob);
-                let value = misc::as_long(roots.get(ob_slot))?;
-                if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
-                    && value != misc::signext(value, ct.size)
-                {
-                    return Err(overflow(ct, roots.get(ob_slot)));
+                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) {
+                    // The conversion runs `__index__`, so the object the
+                    // overflow message names has to be read back out of
+                    // its slot.
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let ob_slot = roots.base();
+                    let _ = roots.pin_root(w_ob);
+                    let value = misc::as_long(roots.get(ob_slot))?;
+                    if ct.has(ctypeobj::CTypeFlags::VALUE_SMALLER_THAN_LONG)
+                        && value != misc::signext(value, ct.size)
+                    {
+                        return Err(overflow(ct, roots.get(ob_slot)));
+                    }
+                    misc::write_raw_signed_data(cdata, value, ct.size)
+                } else {
+                    convert_from_object_longlong(ct, cdata, w_ob)
                 }
-                misc::write_raw_signed_data(cdata, value, ct.size)
             }
             // `W_CTypePrimitiveBool` and `W_CTypePrimitiveUnsigned` share
             // `convert_from_object`; only the range differs.
