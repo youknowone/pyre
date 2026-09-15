@@ -3235,26 +3235,30 @@ impl WasmBackend {
         if terminal && trigger_is_core && had_remaps && !owner.is_invalidated() {
             let (remap_left, core_left): (Vec<_>, Vec<_>) =
                 leftover.into_iter().partition(|(_, remap)| remap.is_some());
-            for (region, remap) in remap_left {
-                let Some(key) = remap else {
-                    continue;
-                };
-                let Some(&id) = remap_pending_ids.get(&key) else {
-                    continue;
-                };
-                PENDING_INLINES.with(|pending| {
-                    pending.borrow_mut().insert(
-                        id,
-                        PendingInline {
-                            owner: Arc::downgrade(&owner),
-                            region,
-                            remap,
-                            retry_on_sibling: false,
-                        },
-                    )
-                });
-            }
             (leftover, terminal) = self.install_inline_region_batch(&owner, core_left);
+            // Remaps are only useful if the parent entered the owner.
+            // A terminal parent-only retry means they can never remap.
+            if !terminal && !owner.is_invalidated() {
+                for (region, remap) in remap_left {
+                    let Some(key) = remap else {
+                        continue;
+                    };
+                    let Some(&id) = remap_pending_ids.get(&key) else {
+                        continue;
+                    };
+                    PENDING_INLINES.with(|pending| {
+                        pending.borrow_mut().insert(
+                            id,
+                            PendingInline {
+                                owner: Arc::downgrade(&owner),
+                                region,
+                                remap,
+                                retry_on_sibling: false,
+                            },
+                        )
+                    });
+                }
+            }
         }
         if leftover.iter().any(|(_, remap)| remap.is_none()) {
             for source_fail_index in fail_indices {
