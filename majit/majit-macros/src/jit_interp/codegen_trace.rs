@@ -531,14 +531,23 @@ fn first_unsupported_pre_merge_stmt(func_block: &syn::Block) -> Option<&syn::Stm
 }
 
 /// A pre-merge `let` whose initializer mutates (an assignment or
-/// assign-op, including one nested in a block) runs in the interpreter
-/// but is omitted from the compiled back-edge if the lowerer cannot
-/// reproduce it. Reject those so the portal fails at compile time.
+/// assign-op, including one nested in a block) or calls out (a
+/// qualified `crate::tick()` the lowerer emits as a compile-time
+/// constant) runs in the interpreter but is omitted or run once from
+/// the compiled back-edge. Reject those so the portal fails at compile
+/// time. Tracing hints (`promote` / `assert_not_none` /
+/// `record_exact_class`) have no user-visible effect and stay allowed.
 fn local_init_has_side_effect(local: &syn::Local) -> bool {
     let Some(init) = &local.init else {
         return false;
     };
     expr_has_pre_merge_side_effect(&init.expr)
+}
+
+fn expr_is_tracing_hint_call(func: &syn::Expr) -> bool {
+    is_promote_call_path(func)
+        || is_assert_not_none_call_path(func)
+        || is_record_exact_class_call_path(func)
 }
 
 fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
@@ -549,6 +558,16 @@ fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
     impl<'ast> Visit<'ast> for Finder {
         fn visit_expr_assign(&mut self, _: &'ast syn::ExprAssign) {
             self.hit = true;
+        }
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if !expr_is_tracing_hint_call(&node.func) {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            self.hit = true;
+            syn::visit::visit_expr_method_call(self, node);
         }
         fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
             if matches!(
@@ -973,6 +992,18 @@ mod find_dispatch_match_tests {
         let block = fn_block(
             "while pos < len {
                 let ignored = { state.acc += 1; 0 };
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    }
+
+    #[test]
+    fn a_qualified_call_let_before_merge_is_unsupported() {
+        let block = fn_block(
+            "while pos < len {
+                let ignored = crate::tick();
                 jit_merge_point!(driver, program, pc; state);
                 pos = pos + 1;
             }",
