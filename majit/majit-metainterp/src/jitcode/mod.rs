@@ -1286,16 +1286,21 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "singlefloat call arguments require a raw ABI descriptor")]
-    fn unresolved_singlefloat_argument_abi_is_rejected() {
+    fn singlefloat_argument_uses_the_integer_bank() {
         let bh = CanonicalBhCallDescr::from_arg_classes(
             "S".to_owned(),
             'v',
             crate::call_descr::default_effect_info(),
         );
-        RuntimeBhDescr::Descr(Box::new(CanonicalBhDescr::Call { calldescr: bh }))
-            .into_resolved()
-            .as_optimizer_descr();
+        let entry = RuntimeBhDescr::Descr(Box::new(CanonicalBhDescr::Call { calldescr: bh }))
+            .into_resolved();
+        let descr = entry
+            .as_optimizer_descr()
+            .expect("call pool entry must be resolved");
+        assert_eq!(
+            descr.as_call_descr().unwrap().arg_types(),
+            &[majit_ir::Type::Int]
+        );
     }
 
     #[test]

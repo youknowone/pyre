@@ -102,23 +102,18 @@ fn leaf3_prov_enabled() -> bool {
     *ARMED
 }
 
-/// Ordered livebox map: canonical box (`Rc::ptr_eq`) → i16 tag.
+/// Ordered livebox map: replacement box → i16 tag.
 ///
-/// resume.py:137/370: RPython uses `dict` keyed by the actual Box object
-/// (object `is` identity). In Python 3 that dict is insertion-ordered, and
-/// `_number_virtuals` iterates it directly. #160/S11 keys this map by the
-/// canonical [`Operand`](majit_ir::operand::Operand) (`Rc::ptr_eq` on the
-/// producer = PyPy `box is box`), the faithful port of the dict-by-`is` —
-/// `Operand` IS the box object `resume.py liveboxes` stores. The backing is an
-/// insertion-ordered sequence of `(box, tag)` pairs — resume numbering walks it
-/// in that order — looked up by a linear identity scan while the map is small,
-/// which is where IndexMap's separate hash-index allocation was the cost, and
-/// through an identity index above that, which is where the scan would be.
-/// Neither changes dict-assignment semantics.
-/// Two reaches of one logical box
-/// resolve to one producer Rc (via `from_bound_op`/`from_bound_inputarg`) and
-/// collapse to one key; distinct boxes — e.g. an `InputArg` vs a `ResOp`
-/// result — stay distinct, where a raw-position key could have aliased them.
+/// resume.py `_number_boxes` keys `liveboxes[box]` on
+/// `box.get_box_replacement()`. In pyre a non-const, non-none box IS its
+/// [`OpRef`](majit_ir::OpRef): `Operand::Op` carries the op pos with a kind
+/// tag, `Operand::InputArg` carries the inputarg index with a kind tag, so
+/// an InputArg and a ResOp at the same raw position have different
+/// `to_opref()`. Two Operands with equal `to_opref()` are two spellings of
+/// the same upstream box object and share one TAGBOX. The backing is an
+/// insertion-ordered sequence of `(box, tag)` pairs — resume numbering walks
+/// it in that order — looked up by a linear `to_opref` scan while the map is
+/// small, and through an `OpRef` index above that.
 ///
 /// Invariant: keys are never Const boxes. Per `resume.py:204-205`
 /// `_number_boxes`, `isinstance(box, Const)` short-circuits to
@@ -127,28 +122,28 @@ fn leaf3_prov_enabled() -> bool {
 /// non-Const Box) reaches `liveboxes[box] = tagged`. `insert` enforces
 /// this via `debug_assert!` so a const-keyed insertion fails loudly in
 /// debug builds rather than silently producing an out-of-RPython-shape
-/// numbering state.
+/// numbering state. A `none()` opref is never inserted.
 pub struct LiveboxMap {
     /// Insertion-order live set. Eight pairs stay inline so the common
     /// four-or-fewer liveboxes never heap-grow (24 B/pair, Vec 1→2→4 = 96 B).
     entries: SmallVec<[(majit_ir::operand::Operand, i16); 8]>,
-    /// Identity index over `entries`, built once the map outgrows
+    /// `to_opref` index over `entries`, built once the map outgrows
     /// [`Self::LINEAR_MAX`] and maintained from then on.
     ///
     /// `dict` is O(1) at every size, and a guard's live set is not bounded:
     /// `_number_boxes` looks up (and usually inserts) once per live box, so a
     /// scan-only map is quadratic per guard and multiplies bridge-compilation
     /// time on a trace with hundreds of them. The scan is kept for the small
-    /// maps the JIT workloads actually produce — where a few pointer compares
-    /// beat hashing and the index's allocation is the cost being avoided —
-    /// and abandoned as soon as that stops being true.
-    index: Option<std::collections::HashMap<majit_ir::operand::Operand, usize, FxBuildHasher>>,
+    /// maps the JIT workloads actually produce — where a few `to_opref`
+    /// compares beat hashing and the index's allocation is the cost being
+    /// avoided — and abandoned as soon as that stops being true.
+    index: Option<std::collections::HashMap<majit_ir::OpRef, usize, FxBuildHasher>>,
 }
 
 impl LiveboxMap {
-    /// Entries held before the identity index is built. Below this a linear
-    /// identity scan is a handful of pointer compares against one cache line
-    /// or two; above it the scan is what the index exists to replace.
+    /// Entries held before the `to_opref` index is built. Below this a linear
+    /// `to_opref` scan is a handful of compares against one cache line or
+    /// two; above it the scan is what the index exists to replace.
     const LINEAR_MAX: usize = 16;
 
     pub fn new() -> Self {
@@ -169,11 +164,18 @@ impl LiveboxMap {
     }
 
     /// Slot of `b` in `entries`, through the index once there is one.
+    ///
+    /// resume.py `_number_boxes` keys `liveboxes[box]` on
+    /// `box.get_box_replacement()`. The only key is `to_opref()`.
     #[inline(always)]
     fn position(&self, b: &majit_ir::operand::Operand) -> Option<usize> {
+        let opref = b.to_opref();
         match self.index.as_ref() {
-            Some(index) => index.get(b).copied(),
-            None => self.entries.iter().position(|(key, _)| key == b),
+            Some(index) => index.get(&opref).copied(),
+            None => self
+                .entries
+                .iter()
+                .position(|(key, _)| key.to_opref() == opref),
         }
     }
 
@@ -190,22 +192,27 @@ impl LiveboxMap {
              `_number_boxes` invariant — `isinstance(box, Const)` is encoded \
              via `getconst(box)` and never enters numb_state.liveboxes",
         );
+        let opref = b.to_opref();
+        assert!(
+            !opref.is_none(),
+            "LiveboxMap::insert: none() opref is not a livebox key"
+        );
         if let Some(at) = self.position(&b) {
             self.entries[at].1 = value;
             return;
         }
         let at = self.entries.len();
-        self.entries.push((b.clone(), value));
+        self.entries.push((b, value));
         match self.index.as_mut() {
             Some(index) => {
-                index.insert(b, at);
+                index.insert(opref, at);
             }
             None if self.entries.len() > Self::LINEAR_MAX => {
                 self.index = Some(
                     self.entries
                         .iter()
                         .enumerate()
-                        .map(|(at, (key, _))| (key.clone(), at))
+                        .map(|(at, (key, _))| (key.to_opref(), at))
                         .collect(),
                 );
             }
@@ -218,8 +225,7 @@ impl LiveboxMap {
         self.position(b).is_some()
     }
 
-    /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
-    /// order (Rc::ptr_eq identity = PyPy `box is box`).
+    /// Iterate over all (box, tag) pairs in dict insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (majit_ir::operand::Operand, i16)> + '_ {
         self.entries.iter().map(|(op, value)| (op.clone(), *value))
     }
@@ -5266,6 +5272,24 @@ mod tests {
     }
 
     #[test]
+    fn livebox_map_collapses_two_spellings_of_one_inputarg_pos() {
+        let mut liveboxes = LiveboxMap::new();
+        let first = crate::history::test_support::rooted_operand_from_opref(
+            majit_ir::OpRef::input_arg_ref(5),
+        );
+        let later = crate::history::test_support::rooted_operand_from_opref(
+            majit_ir::OpRef::input_arg_ref(5),
+        );
+        assert!(!first.same_box(&later));
+        assert_eq!(first.to_opref(), later.to_opref());
+        liveboxes.insert(first.clone(), tag(0, TAGBOX).unwrap());
+        liveboxes.insert(later.clone(), tag(1, TAGBOX).unwrap());
+        assert_eq!(liveboxes.iter().count(), 1);
+        assert_eq!(liveboxes.get(&first), liveboxes.get(&later));
+        assert_eq!(liveboxes.get(&later), Some(tag(1, TAGBOX).unwrap()));
+    }
+
+    #[test]
     fn test_simple_resume_data() {
         let rd = ResumeData::simple(42, 3);
         let fail_values = vec![10, 20, 30];
@@ -5838,18 +5862,21 @@ mod tests {
         let (rd_numb, rd_consts, _rd_virtuals, liveboxes, _livebox_types) =
             memo.finish(numb_state, &env, &mut [], None).unwrap();
 
-        assert_eq!(liveboxes.len(), 2);
-        assert!(liveboxes[0].same_box(&first));
-        assert!(liveboxes[1].same_box(&second));
+        // resume.py `_number_boxes` liveboxes[box.get_box_replacement()]:
+        // two spellings of one replacement (same to_opref, different Rc)
+        // share one TAGBOX, so locs_for_fail does not write the same
+        // recovery loc onto two failargs.
+        assert_eq!(liveboxes.len(), 1);
+        assert!(liveboxes[0].to_opref() == collapsed);
         let guard = majit_ir::Op::new(majit_ir::OpCode::GuardTrue, &[first.clone()]);
         guard.store_final_boxes(liveboxes);
         let (_, _, _, frames) =
-            rebuild_from_numbering(&rd_numb, &rd_consts, &[majit_ir::Type::Ref; 2], None, 0);
+            rebuild_from_numbering(&rd_numb, &rd_consts, &[majit_ir::Type::Ref; 1], None, 0);
         assert_eq!(
             frames[0].values,
             vec![
                 RebuiltValue::Box(0, majit_ir::Type::Ref),
-                RebuiltValue::Box(1, majit_ir::Type::Ref),
+                RebuiltValue::Box(0, majit_ir::Type::Ref),
                 RebuiltValue::Box(0, majit_ir::Type::Ref),
             ]
         );
@@ -5857,7 +5884,7 @@ mod tests {
         // per TAGBOX number. Repeated frame references must share that object
         // before bridge knowledge and optimization, not be merged by location
         // later in the backend.
-        let mut recorder = crate::recorder::Trace::with_input_types(&[majit_ir::Type::Ref; 2]);
+        let mut recorder = crate::recorder::Trace::with_input_types(&[majit_ir::Type::Ref; 1]);
         let restored: Vec<_> = frames[0]
             .values
             .iter()
@@ -5868,8 +5895,8 @@ mod tests {
                 _ => unreachable!(),
             })
             .collect();
+        assert!(restored[0].same_box(&restored[1]));
         assert!(restored[0].same_box(&restored[2]));
-        assert!(!restored[0].same_box(&restored[1]));
     }
 
     #[test]
