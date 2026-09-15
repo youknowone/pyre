@@ -293,14 +293,17 @@ impl Drop for FrameRoot {
 struct FrameView;
 
 impl FrameView {
-    #[inline]
+    #[inline(always)]
     fn reload(frame: *mut PyFrame) -> *mut PyFrame {
         gc_roots::reload_top_root(frame as pyre_object::PyObjectRef) as *mut PyFrame
     }
 
     /// `reload_top_root` is `dont_look_inside`; the jitted arm has no
     /// interpreter-path collection between opcodes, so skip the residual.
-    #[inline]
+    /// `inline(always)` so debug builds still put `we_are_jitted` in the
+    /// portal body — `#[inline]` alone leaves a residual `CallR` that
+    /// official after-opt must not keep.
+    #[inline(always)]
     fn reload_if_interp(frame: *mut PyFrame) -> *mut PyFrame {
         if majit_rlib::jit::we_are_jitted() {
             frame
