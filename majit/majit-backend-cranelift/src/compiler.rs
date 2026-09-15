@@ -5969,16 +5969,22 @@ fn emit_load_from_addr(
     let heap_flags = MemFlagsData::new();
     match value_type {
         Type::Float => {
-            if size != 8 {
-                return Err(unsupported_semantics(
+            match size {
+                4 => {
+                    let raw = builder.ins().load(cl_types::F32, heap_flags, addr, 0);
+                    Ok(builder.ins().fpromote(cl_types::F64, raw))
+                }
+                8 => {
+                    // Return the natural F64 so a Float-result variable (declared
+                    // F64) receives it without a GPR round-trip; callers feeding a
+                    // boxed I64 slot coerce at their own boundary.
+                    Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
+                }
+                _ => Err(unsupported_semantics(
                     opcode,
-                    "float memory operations currently require 8-byte values",
-                ));
+                    "float memory operations require 4- or 8-byte values",
+                )),
             }
-            // Return the natural F64 so a Float-result variable (declared
-            // F64) receives it without a GPR round-trip; callers feeding a
-            // boxed I64 slot coerce at their own boundary.
-            Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
         }
         Type::Int | Type::Ref => {
             // Adaptation, not parity.  Upstream's reference bank is one word by
@@ -6033,14 +6039,24 @@ fn emit_store_to_addr(
 ) -> Result<(), BackendError> {
     match value_type {
         Type::Float => {
-            if size != 8 {
-                return Err(unsupported_semantics(
-                    opcode,
-                    "float memory operations currently require 8-byte values",
-                ));
-            }
             let fval = coerce_ty(builder, value, cl_types::F64);
-            builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
+            match size {
+                4 => {
+                    let f32val = builder.ins().fdemote(cl_types::F32, fval);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), f32val, addr, 0);
+                }
+                8 => {
+                    builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
+                }
+                _ => {
+                    return Err(unsupported_semantics(
+                        opcode,
+                        "float memory operations require 4- or 8-byte values",
+                    ));
+                }
+            }
         }
         Type::Int | Type::Ref => {
             // Same adaptation as the load path above, and for the same reason.
@@ -18896,11 +18912,10 @@ impl majit_backend::Backend for CraneliftBackend {
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        let offset = fielddescr.as_offset();
-        // Route through `read_float_at_mem` (`compiler.rs` —
-        // `llmodel.py:490-491` parity) for the same `read_unaligned`
-        // safety guarantee as the dynasm sibling.
-        self.read_float_at_mem(struct_ptr, offset as i64)
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        unsafe {
+            majit_backend::llmodel::read_float_at_mem_sized(struct_ptr as usize, offset, size)
+        }
     }
 
     /// llmodel.py bh_setfield_gc_f delegates to write_float_at_mem.
@@ -18912,8 +18927,15 @@ impl majit_backend::Backend for CraneliftBackend {
         value: f64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
-        self.write_float_at_mem(struct_ptr, offset as i64, value);
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem_sized(
+                struct_ptr as usize,
+                offset,
+                size,
+                value,
+            )
+        }
     }
 
     /// llsupport/gc.py GcLLDescr_framework

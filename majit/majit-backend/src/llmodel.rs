@@ -335,7 +335,37 @@ pub unsafe fn write_ref_at_mem(base: usize, ofs: usize, newvalue: usize) {
 /// # Safety
 /// `base + ofs` must be a writable float-width field.
 pub unsafe fn write_float_at_mem(base: usize, ofs: usize, newvalue: f64) {
-    unsafe { (base.wrapping_add(ofs) as *mut f64).write_unaligned(newvalue) }
+    unsafe { write_float_at_mem_sized(base, ofs, 8, newvalue) }
+}
+
+/// Load a JIT float-bank value. Size 8 is `FLOATSTORAGE`
+/// (`llmodel.py read_float_at_mem`). Size 4 is a jit_interp
+/// `float(f32)` field: load f32 and widen, matching
+/// `VirtualizableInfo::read_field`.
+///
+/// # Safety
+/// `base + ofs` must be a readable `size`-byte float field.
+pub unsafe fn read_float_at_mem_sized(base: usize, ofs: usize, size: usize) -> f64 {
+    let addr = base.wrapping_add(ofs);
+    match size {
+        4 => f64::from(unsafe { (addr as *const f32).read_unaligned() }),
+        8 => unsafe { (addr as *const f64).read_unaligned() },
+        _ => panic!("read_float_at_mem: unsupported size {size}"),
+    }
+}
+
+/// Store a JIT float-bank value. Size 8 is `FLOATSTORAGE`. Size 4
+/// demotes to f32, matching `VirtualizableInfo::write_field`.
+///
+/// # Safety
+/// `base + ofs` must be a writable `size`-byte float field.
+pub unsafe fn write_float_at_mem_sized(base: usize, ofs: usize, size: usize, newvalue: f64) {
+    let addr = base.wrapping_add(ofs);
+    match size {
+        4 => unsafe { (addr as *mut f32).write_unaligned(newvalue as f32) },
+        8 => unsafe { (addr as *mut f64).write_unaligned(newvalue) },
+        _ => panic!("write_float_at_mem: unsupported size {size}"),
+    }
 }
 
 /// llmodel.py — get_savedata_ref.
@@ -362,6 +392,26 @@ mod tests {
     use crate::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
     use crate::resume_guard_descr::make_resume_guard_descr_typed;
     use majit_ir::Type;
+
+    #[test]
+    fn sized_float_load_store_does_not_touch_neighbor() {
+        #[repr(C)]
+        struct Pair {
+            value: f32,
+            neighbor: u32,
+        }
+        let mut pair = Pair {
+            value: 1.25,
+            neighbor: 0xa5a5_a5a5,
+        };
+        let base = (&mut pair as *mut Pair) as usize;
+        unsafe {
+            assert_eq!(super::read_float_at_mem_sized(base, 0, 4), 1.25);
+            super::write_float_at_mem_sized(base, 0, 4, -2.5);
+        }
+        assert_eq!(pair.value, -2.5);
+        assert_eq!(pair.neighbor, 0xa5a5_a5a5);
+    }
 
     #[test]
     fn empty_slice_get_does_not_panic() {

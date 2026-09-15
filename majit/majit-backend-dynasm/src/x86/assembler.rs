@@ -6861,7 +6861,14 @@ impl<'a> Assembler386<'a> {
         signed: bool,
     ) {
         if dst.is_xmm {
-            if let Some(r) = ofs_reg {
+            if size == 4 {
+                if let Some(r) = ofs_reg {
+                    dynasm!(self.mc ; .arch x64 ; movss Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; movss Rx(dst.value), [Rq(base.value) + ofs]);
+                }
+                dynasm!(self.mc ; .arch x64 ; cvtss2sd Rx(dst.value), Rx(dst.value));
+            } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
             } else {
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
@@ -7046,7 +7053,15 @@ impl<'a> Assembler386<'a> {
         size: usize,
     ) {
         if val.is_xmm {
-            if let Some(r) = ofs_reg {
+            if size == 4 {
+                dynasm!(self.mc ; .arch x64 ; cvtsd2ss Rx(val.value), Rx(val.value));
+                if let Some(r) = ofs_reg {
+                    dynasm!(self.mc ; .arch x64 ; movss [Rq(base.value) + Rq(r.value)], Rx(val.value));
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; movss [Rq(base.value) + ofs], Rx(val.value));
+                }
+                dynasm!(self.mc ; .arch x64 ; cvtss2sd Rx(val.value), Rx(val.value));
+            } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + Rq(r.value)], Rx(val.value));
             } else {
                 dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(val.value));

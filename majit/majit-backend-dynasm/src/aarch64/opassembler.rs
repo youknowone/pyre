@@ -27,7 +27,15 @@ impl<'a> AssemblerARM64<'a> {
     ) {
         match val_loc {
             Loc::Reg(v) if v.is_xmm => {
-                dynasm!(self.mc ; .arch aarch64 ; str D(v.value), [X(base.value), ofs as u32]);
+                if field_size == 4 {
+                    dynasm!(self.mc ; .arch aarch64
+                        ; fcvt S(v.value), D(v.value)
+                        ; str S(v.value), [X(base.value), ofs as u32]
+                        ; fcvt D(v.value), S(v.value)
+                    );
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; str D(v.value), [X(base.value), ofs as u32]);
+                }
             }
             Loc::Reg(v) => match field_size {
                 1 => {
@@ -97,8 +105,14 @@ impl<'a> AssemblerARM64<'a> {
         signed: bool,
     ) {
         if dst.is_xmm {
-            // Float: always 8-byte
-            if let Some(r) = ofs_reg {
+            if size == 4 {
+                if let Some(r) = ofs_reg {
+                    dynasm!(self.mc ; .arch aarch64 ; ldr S(dst.value), [X(base.value), X(r.value)]);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; ldr S(dst.value), [X(base.value), ofs as u32]);
+                }
+                dynasm!(self.mc ; .arch aarch64 ; fcvt D(dst.value), S(dst.value));
+            } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), X(r.value)]);
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
@@ -242,7 +256,15 @@ impl<'a> AssemblerARM64<'a> {
     fn emit_stur_sized(&mut self, base: &RegLoc, ofs: i32, val: &RegLoc, size: usize) {
         debug_assert!((-256..256).contains(&ofs));
         if val.is_xmm {
-            dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
+            if size == 4 {
+                dynasm!(self.mc ; .arch aarch64
+                    ; fcvt S(val.value), D(val.value)
+                    ; stur S(val.value), [X(base.value), ofs]
+                    ; fcvt D(val.value), S(val.value)
+                );
+            } else {
+                dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
+            }
             return;
         }
         match size {
@@ -262,7 +284,15 @@ impl<'a> AssemblerARM64<'a> {
         size: usize,
     ) {
         if val.is_xmm {
-            if let Some(r) = ofs_reg {
+            if size == 4 {
+                dynasm!(self.mc ; .arch aarch64 ; fcvt S(val.value), D(val.value));
+                if let Some(r) = ofs_reg {
+                    dynasm!(self.mc ; .arch aarch64 ; str S(val.value), [X(base.value), X(r.value)]);
+                } else {
+                    dynasm!(self.mc ; .arch aarch64 ; str S(val.value), [X(base.value), ofs as u32]);
+                }
+                dynasm!(self.mc ; .arch aarch64 ; fcvt D(val.value), S(val.value));
+            } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), X(r.value)]);
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), ofs as u32]);

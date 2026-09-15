@@ -1010,6 +1010,8 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         br(label: u32),
         br_if(label: u32),
         call(function: u32),
+        f32_load(memarg: MemArg),
+        f32_store(memarg: MemArg),
         f64_load(memarg: MemArg),
         f64_store(memarg: MemArg),
         i32_load(memarg: MemArg),
@@ -7717,13 +7719,21 @@ fn build_function(
                     let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 2, 3)?;
                     let (size, signed) = gc_rewrite_access_size(op, constants, 4)?;
                     if op.opcode == OpCode::GcLoadIndexedF {
-                        if size != 8 {
-                            return Err(BackendError::Unsupported(format!(
-                                "wasm codegen: {:?} float load has size {size}",
-                                op.opcode
-                            )));
+                        match size {
+                            4 => {
+                                sink.f32_load(mem64(offset));
+                                sink.f64_promote_f32();
+                            }
+                            8 => {
+                                sink.f64_load(mem64(offset));
+                            }
+                            _ => {
+                                return Err(BackendError::Unsupported(format!(
+                                    "wasm codegen: {:?} float load has size {size}",
+                                    op.opcode
+                                )));
+                            }
                         }
-                        sink.f64_load(mem64(offset));
                     } else {
                         emit_sized_int_load(&mut sink, offset, size, signed);
                     }
@@ -7748,13 +7758,21 @@ fn build_function(
                     );
                     let (size, signed) = gc_rewrite_access_size(op, constants, 2)?;
                     if op.opcode == OpCode::GcLoadF {
-                        if size != 8 {
-                            return Err(BackendError::Unsupported(format!(
-                                "wasm codegen: {:?} float load has size {size}",
-                                op.opcode
-                            )));
+                        match size {
+                            4 => {
+                                sink.f32_load(mem64(offset));
+                                sink.f64_promote_f32();
+                            }
+                            8 => {
+                                sink.f64_load(mem64(offset));
+                            }
+                            _ => {
+                                return Err(BackendError::Unsupported(format!(
+                                    "wasm codegen: {:?} float load has size {size}",
+                                    op.opcode
+                                )));
+                            }
                         }
-                        sink.f64_load(mem64(offset));
                     } else {
                         emit_sized_int_load(&mut sink, offset, size, signed);
                     }
