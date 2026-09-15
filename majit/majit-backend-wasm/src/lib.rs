@@ -3181,7 +3181,7 @@ impl WasmBackend {
             .filter(|(_, _, remap)| remap.is_none())
             .map(|(id, region, _)| (region.source_fail_index, *id))
             .collect();
-        let leftover = self.install_inline_region_batch(
+        let (leftover, terminal) = self.install_inline_region_batch(
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
         );
@@ -3190,7 +3190,7 @@ impl WasmBackend {
                 Self::restore_dispatch_cell(&owner, source_fail_index);
             }
         }
-        if owner.is_invalidated() {
+        if owner.is_invalidated() || terminal {
             return;
         }
         // Leftovers whose parent or sibling is not in the owner yet stay
@@ -3257,6 +3257,7 @@ impl WasmBackend {
         region: codegen::InlinedBridge,
     ) -> bool {
         self.install_inline_region_batch(owner, vec![(region, None)])
+            .0
             .is_empty()
     }
 
@@ -3264,24 +3265,24 @@ impl WasmBackend {
         &mut self,
         owner: &JitCellToken,
         regions: Vec<(codegen::InlinedBridge, Option<(u64, u32)>)>,
-    ) -> Vec<(codegen::InlinedBridge, Option<(u64, u32)>)> {
+    ) -> (Vec<(codegen::InlinedBridge, Option<(u64, u32)>)>, bool) {
         if regions.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         if owner.is_invalidated() {
             diag_bump(50);
-            return regions;
+            return (regions, true);
         }
         let Some(source_loop) = owner
             .compiled
             .get()
             .and_then(|c| c.downcast_ref::<CompiledWasmLoop>())
         else {
-            return regions;
+            return (regions, true);
         };
         let Some(mut candidate) = source_loop.reemit.borrow().as_ref().cloned() else {
             diag_bump(35);
-            return regions;
+            return (regions, true);
         };
         let mut attached = 0usize;
         let mut attached_pairs = Vec::new();
@@ -3352,7 +3353,7 @@ impl WasmBackend {
             }
         }
         if attached == 0 {
-            return leftover;
+            return (leftover, false);
         }
         let mut merged_ops = candidate.ops.clone();
         for region in &candidate.inlined_bridges {
@@ -3428,7 +3429,7 @@ impl WasmBackend {
                 // module, whose LABEL dest the replacement owner does not
                 // recreate.
                 let _ = extra_retire;
-                return leftover;
+                return (leftover, false);
             }
             Err(error) => {
                 source_loop.reemit.replace(old_inputs);
@@ -3451,7 +3452,7 @@ impl WasmBackend {
             }
         }
         let _ = source_cells_base;
-        leftover
+        (leftover, true)
     }
 
     /// Rebuild a loop module and install it into its original shared-table
