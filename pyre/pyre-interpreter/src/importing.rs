@@ -5262,6 +5262,49 @@ pub fn import_name(
 // ── __import__ ───────────────────────────────────────────────────────
 // PyPy equivalent: _frozen_importlib/interp_import.py `interp___import__`
 
+/// `_gcd_import` cache probe: `sys.modules` plus `__spec__._initializing`.
+///
+/// `interp_import.py _gcd_import` raises `FastPathGiveUp` on a miss, a
+/// missing `__spec__`, or a truthy `_initializing`.  A `__spec__` without
+/// `_initializing` counts as initialised (a builtin module).
+enum GcdCache {
+    Miss,
+    Ready(PyObjectRef),
+    Initializing(PyObjectRef),
+}
+
+fn gcd_import_cache_probe(name: &str) -> Result<GcdCache, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
+    // would fall back to the interpreter cache, resurrecting a builtin the
+    // sentinel is meant to block.  Give up so the slow path raises
+    // `import of {name} halted; None in sys.modules`.
+    if sys_modules_blocks(name) {
+        return Ok(GcdCache::Miss);
+    }
+    let Some(w_module) = check_sys_modules(name) else {
+        return Ok(GcdCache::Miss);
+    };
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_module);
+    let Some(w_spec) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
+    else {
+        return Ok(GcdCache::Miss);
+    };
+    let spec_slot = shadow_stack_len();
+    let _ = pin_root(w_spec);
+    if let Some(w_initializing) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
+        && crate::baseobjspace::is_true(w_initializing)?
+    {
+        return Ok(GcdCache::Initializing(shadow_stack_get(mod_slot)));
+    }
+    Ok(GcdCache::Ready(shadow_stack_get(mod_slot)))
+}
+
 /// `_gcd_import` fast path: the already-imported module for `name`, after
 /// waiting for another thread to finish initialising it.
 ///
@@ -5278,38 +5321,30 @@ pub fn import_name(
 /// missing `__spec__`, or an entry removed/replaced while we waited.  A
 /// `__spec__` without `_initializing` counts as initialised (a builtin module).
 fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
-    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+    match gcd_import_cache_probe(name)? {
+        GcdCache::Miss => Ok(None),
+        GcdCache::Ready(w_module) => Ok(Some(w_module)),
+        GcdCache::Initializing(w_module) => {
+            // The wait is a Python call into `_lock_unlock_module`.  Keep it
+            // off the look-inside graph so `test_import.test_import_in_function`
+            // can see only the initialized-module arm (`guard_not_invalidated`).
+            wait_initializing_module(name, w_module)
+        }
+    }
+}
 
-    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
-    // would fall back to the interpreter cache, resurrecting a builtin the
-    // sentinel is meant to block.  Give up so the slow path raises
-    // `import of {name} halted; None in sys.modules`.
-    if sys_modules_blocks(name) {
-        return Ok(None);
+/// JIT residual view of [`gcd_import_cache_probe`]: the initialized
+/// `sys.modules` entry, or `None` on every `FastPathGiveUp` case.
+///
+/// Does not wait and does not raise.  The compiled `jit_import_cached`
+/// residual is `cannot_raise`; a still-initializing module side-exits to
+/// the original `IMPORT_NAME`, which runs `dunder_import` (including the
+/// 3.14 wait).
+pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
+    match gcd_import_cache_probe(name) {
+        Ok(GcdCache::Ready(w_module)) => Some(w_module),
+        _ => None,
     }
-    let Some(w_module) = check_sys_modules(name) else {
-        return Ok(None);
-    };
-    let _roots = push_roots();
-    let mod_slot = shadow_stack_len();
-    let _ = pin_root(w_module);
-    let Some(w_spec) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
-    else {
-        return Ok(None);
-    };
-    let spec_slot = shadow_stack_len();
-    let _ = pin_root(w_spec);
-    if let Some(w_initializing) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
-        && crate::baseobjspace::is_true(w_initializing)?
-    {
-        // The wait is a Python call into `_lock_unlock_module`.  Keep it off
-        // the look-inside graph so `test_import.test_import_in_function` can
-        // see only the initialized-module arm (`guard_not_invalidated`).
-        return wait_initializing_module(name, shadow_stack_get(mod_slot));
-    }
-    Ok(Some(shadow_stack_get(mod_slot)))
 }
 
 /// Concurrent-import tail of `_gcd_import`: wait for `__spec__._initializing`

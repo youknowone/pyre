@@ -16548,15 +16548,16 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
 
 /// Runtime residual for [`try_walker_specialize_import_cached`].
 ///
-/// Reads the current `sys.modules` entry and nothing else.  A miss or a
-/// replaced module returns a different pointer than the record-time
-/// `GuardValue`, so the original `IMPORT_NAME` runs the importer once.
-/// Running `dunder_import` here would execute a finder on a miss, then
-/// swallow the error as null and let the result guard retry the same
-/// import.
+/// Reads the current initialized `sys.modules` entry and nothing else.
+/// A miss, a replaced module, a missing `__spec__`, or a still-initializing
+/// module returns null so the record-time `GuardValue` side-exits to the
+/// original `IMPORT_NAME`.  That is `interp_import.py _gcd_import`'s
+/// `FastPathGiveUp`.  Running `dunder_import` here would execute a finder
+/// on a miss, then swallow the error as null and let the result guard
+/// retry the same import.
 ///
 /// `fromlist_empty != 0` is `import a.b` (no fromlist): `__import__`
-/// answers the top-level package, so a dotted name returns
+/// answers the top-level package, so a dotted name returns the initialized
 /// `sys.modules["a"]` after the leaf is confirmed present.
 extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
     let w_name = name as pyre_object::PyObjectRef;
@@ -16566,13 +16567,13 @@ extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return 0;
     };
-    let Some(leaf) = pyre_interpreter::importing::get_sys_module(s) else {
+    let Some(leaf) = pyre_interpreter::importing::sys_module_if_initialized(s) else {
         return 0;
     };
     if fromlist_empty != 0
         && let Some(dot) = s.find('.')
     {
-        return pyre_interpreter::importing::get_sys_module(&s[..dot])
+        return pyre_interpreter::importing::sys_module_if_initialized(&s[..dot])
             .map(|head| head as i64)
             .unwrap_or(0);
     }
