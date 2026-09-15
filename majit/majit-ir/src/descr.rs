@@ -5662,11 +5662,11 @@ impl Descr for VableStaticFieldDescr {
 }
 
 /// Number of `OnceLock<DescrRef>` slots reserved for
-/// `vable_static_field_descr(idx)` singletons. Matches
-/// `PYFRAME_VABLE_FIELDS` (`last_instr`, `pycode`, `valuestackdepth`,
-/// `debugdata`). `virtualizable.py` `static_field_descrs` is sized to
-/// `len(static_fields)`. Bump this when that table grows.
-const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 4;
+/// `vable_static_field_descr(idx)` singletons. `virtualizable.py`
+/// `static_field_descrs` is sized to `len(static_fields)` per vinfo.
+/// This array is the shared ceiling for every vtype that uses the
+/// singleton (PyFrame has 4; jit_interp machines can need 5).
+const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 5;
 
 /// Singleton accessor for `static_field_descrs[idx]`.
 ///
@@ -5679,6 +5679,7 @@ const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 4;
 /// matching `idx` returns true.
 pub fn vable_static_field_descr(idx: u16) -> DescrRef {
     static SLOTS: [OnceLock<DescrRef>; VABLE_STATIC_FIELD_DESCR_SLOTS] = [
+        OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
