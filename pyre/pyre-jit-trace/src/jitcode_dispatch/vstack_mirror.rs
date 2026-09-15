@@ -630,15 +630,14 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // leave an intentional hole so the capture overlay around
                 // stack_sync omits the slot and resume rematerializes it.
                 let mut top = ctx.frame_state.borrow().vstack_last_ref;
-                // `LOAD_CONST` / `LOAD_SMALL_INT` push a Const the way
-                // `MIFrame.registers_r` holds `getconstant_w` / the
-                // interned small-int box. A residual `box_int_fn`
-                // stamps `vstack_last_ref` through `write_ref_reg`; the
-                // interned ConstPtr path does not, so a stale last_ref
-                // (the previous opcode's result) must not win.
-                let const_top = loadconst_operand_ref(ctx, code, &instr, op_arg);
-                if const_top != OpRef::NONE {
-                    top = const_top;
+                if top == OpRef::NONE {
+                    // A value `LOAD_CONST` (large int / float) routes its
+                    // result through the unboxed int/float bank, so
+                    // `write_ref_reg` never stamps `vstack_last_ref`.
+                    // Residual `box_int_fn` (`LOAD_SMALL_INT`) does stamp
+                    // the fresh wrapint; keep that identity. Only fill a
+                    // NONE hole from `getconstant_w` / `w_small_int_const`.
+                    top = loadconst_operand_ref(ctx, code, &instr, op_arg);
                 }
                 ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
             }
