@@ -133,7 +133,7 @@ fn stat_value(stderr: &str, name: &str) -> u64 {
 
 /// CALL_ASSEMBLER must not refill a frame on the bump path. The inline
 /// bump leaves `jf_gcmap` unset. Expected `memory.fill`s are the entry
-/// home clear of marked slots, `emit_zero_bytes` New* payload zeros,
+/// home clear of marked slots, leftover `NEW_ARRAY_CLEAR` ZERO_ARRAY,
 /// and the CA caller nulling the callee home range (`home_slots * SLOT_SIZE`
 /// from the dispatch snapshot) before publishing that snapshot's gcmap.
 #[track_caller]
@@ -9262,6 +9262,165 @@ fn inline_newarray_clear_fills_when_an_item_is_unwritten() {
     );
 }
 
+/// rewrite.py flushes pending zeros at a guard, so a later SETARRAYITEM
+/// does not cancel ZERO_ARRAY for the unwritten slot.
+#[test]
+fn inline_newarray_clear_fills_when_a_guard_splits_the_stores() {
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array_clear(1, 53, 2),
+            setarrayitem_gc(1, 0, OpRef::const_int(7), 53),
+            guard,
+            setarrayitem_gc(1, 1, OpRef::const_int(8), 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert!(
+        memory_fill_count(&bytes) >= 1,
+        "SETARRAYITEM after a guard must not rewrite ZERO_ARRAY to a no-op"
+    );
+}
+
+fn new_with_gc_field(result: u32, type_id: u32, field_offset: usize) -> Op {
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+    let fd = Arc::new(SimpleFieldDescr::new(0, field_offset, 4, Type::Ref, false));
+    let descr = SimpleSizeDescr::new(0, 16, type_id).with_all_fielddescrs(vec![fd]);
+    descr.set_non_moving(false);
+    let op = make_op(OpCode::New, &[], OpRef::ref_op(result));
+    op.setdescr(Arc::new(descr));
+    op
+}
+
+fn setfield_gc(obj: u32, value: OpRef, offset: usize) -> Op {
+    use majit_ir::descr::SimpleFieldDescr;
+    use std::sync::Arc;
+    let op = make_op(
+        OpCode::SetfieldGc,
+        &[OpRef::ref_op(obj), value],
+        OpRef::NONE,
+    );
+    op.setdescr(Arc::new(SimpleFieldDescr::new(
+        0,
+        offset,
+        4,
+        Type::Ref,
+        false,
+    )));
+    op
+}
+
+fn i32_store_const0_count(bytes: &[u8]) -> usize {
+    let mut prev_const0 = false;
+    let mut stores = 0;
+    count_operators(bytes, |op| match op {
+        wasmparser::Operator::I32Const { value: 0 } => prev_const0 = true,
+        wasmparser::Operator::I32Store { .. } if prev_const0 => {
+            stores += 1;
+            prev_const0 = false;
+        }
+        _ => prev_const0 = false,
+    });
+    stores
+}
+
+/// rewrite.py clear_gc_fields: a New with no GC-pointer fields emits
+/// no ZERO / NULL stores. IncrementalMiniMark does not fill the payload.
+#[test]
+fn inline_new_does_not_memory_fill() {
+    let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        memory_fill_count(&bytes),
+        0,
+        "NEW must not memory.fill; rewrite only NULLs leftover GC fields"
+    );
+}
+
+/// rewrite.py emit_pending_zeros: leftover gc_fielddescrs become
+/// pointer-width NULL stores, not a payload fill.
+#[test]
+fn inline_new_nulls_unwritten_gc_field() {
+    let inputs = nursery_new_inputs(vec![new_with_gc_field(1, 53, 8), finish_int_arg0()], 53);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(memory_fill_count(&bytes), 0, "NEW does not memory.fill");
+    assert!(
+        i32_store_const0_count(&bytes) >= 1,
+        "unwritten GC field still gets the delayed NULL store"
+    );
+}
+
+/// rewrite.py consider_setfield_gc drops a field SETFIELD_GC covers
+/// before the next flush, so emit_pending_zeros is empty.
+#[test]
+fn inline_new_skips_null_when_setfield_covers() {
+    let uncovered = nursery_new_inputs(vec![new_with_gc_field(1, 53, 8), finish_int_arg0()], 53);
+    let covered = nursery_new_inputs(
+        vec![
+            new_with_gc_field(1, 53, 8),
+            setfield_gc(1, OpRef::input_arg_int(0), 8),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (uncovered_bytes, _, _, _) =
+        codegen::build_wasm_module(&uncovered).expect("wasm codegen should succeed");
+    let (covered_bytes, _, _, _) =
+        codegen::build_wasm_module(&covered).expect("wasm codegen should succeed");
+    validate_wasm(&uncovered_bytes);
+    validate_wasm(&covered_bytes);
+    assert_eq!(memory_fill_count(&covered_bytes), 0);
+    assert!(
+        i32_store_const0_count(&covered_bytes) < i32_store_const0_count(&uncovered_bytes),
+        "SETFIELD_GC before the flush cancels the delayed NULL"
+    );
+}
+
+/// rewrite.py emits pending zeros at a guard, so a SETFIELD after the
+/// guard does not cancel the NULL store.
+#[test]
+fn inline_new_nulls_gc_field_when_a_guard_splits_the_store() {
+    let guard = make_guard(
+        OpCode::GuardTrue,
+        &[OpRef::input_arg_int(0)],
+        &[OpRef::input_arg_int(0)],
+    );
+    let uncovered = nursery_new_inputs(vec![new_with_gc_field(1, 53, 8), finish_int_arg0()], 53);
+    let split = nursery_new_inputs(
+        vec![
+            new_with_gc_field(1, 53, 8),
+            guard,
+            setfield_gc(1, OpRef::input_arg_int(0), 8),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (uncovered_bytes, _, _, _) =
+        codegen::build_wasm_module(&uncovered).expect("wasm codegen should succeed");
+    let (split_bytes, _, _, _) =
+        codegen::build_wasm_module(&split).expect("wasm codegen should succeed");
+    validate_wasm(&split_bytes);
+    assert_eq!(memory_fill_count(&split_bytes), 0);
+    assert_eq!(
+        i32_store_const0_count(&split_bytes),
+        i32_store_const0_count(&uncovered_bytes),
+        "SETFIELD_GC after a guard must not cancel the delayed NULL"
+    );
+}
+
 #[test]
 fn consecutive_new_ops_share_one_nursery_bump() {
     let inputs = nursery_new_inputs(
@@ -9487,21 +9646,20 @@ fn call_malloc_nursery_uses_one_inline_bump() {
     assert_eq!(nursery_top_compare_count(&bytes), 1);
 }
 
+/// rewrite.py `clear_gc_fields`: IncrementalMiniMark is
+/// `malloc_zero_filled=false`, so a New with no leftover GC-pointer
+/// fields emits no payload fill. The previous wasm lowering filled every
+/// New; that is the skip this test pins.
 #[test]
-fn inline_nursery_new_zeros_its_payload() {
+fn inline_nursery_new_does_not_fill_payload() {
     let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
-    let mut fills = 0;
-    count_operators(&bytes, |op| {
-        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
-            fills += 1;
-        }
-    });
-    assert!(
-        fills >= 1,
-        "inline New must memory.fill its payload instead of relying on a nursery reset fill"
+    assert_eq!(
+        memory_fill_count(&bytes),
+        0,
+        "inline New must not memory.fill; rewrite only NULLs leftover GC fields"
     );
 }
 
