@@ -2160,6 +2160,16 @@ impl KnownArrayLengths {
     }
 }
 
+/// `rewrite.py` flush points for `emit_pending_zeros`: LABEL, JUMP,
+/// FINISH, any guard, and any collecting op. A store after one of these
+/// does not cancel a delayed NULL / ZERO_ARRAY — the object is visible
+/// at the flush (deopt, next malloc, merge).
+fn rewrite_pending_zero_flush(op: &Op) -> bool {
+    matches!(op.opcode, OpCode::Label | OpCode::Jump | OpCode::Finish)
+        || op.opcode.is_guard()
+        || op.opcode.can_malloc()
+}
+
 /// `rewrite.py emit_pending_zeros` / `handle_clear_array_contents`.
 ///
 /// IncrementalMiniMark is `malloc_zero_filled=false`, so native rewrite
@@ -2200,7 +2210,7 @@ fn newarray_clear_fully_written(
 ) -> bool {
     let mut written = vec![false; length];
     for later in ops.iter().skip(op_idx + 1) {
-        if later.opcode == OpCode::Label || later.opcode.can_malloc() {
+        if rewrite_pending_zero_flush(later) {
             break;
         }
         if later.opcode != OpCode::SetarrayitemGc {
@@ -2219,6 +2229,74 @@ fn newarray_clear_fully_written(
         }
     }
     written.iter().all(|&w| w)
+}
+
+/// `rewrite.py clear_gc_fields` + `consider_setfield_gc` + `emit_pending_zeros`.
+///
+/// IncrementalMiniMark does not zero-fill. Native rewrite only NULLs
+/// unwritten GC-pointer fields (`descr.gc_fielddescrs`) and drops any
+/// offset a later `SETFIELD_GC` writes before the next flush. The class
+/// word is omitted when `handle_new` already stamped `w_class_obj`
+/// (`rewrite.rs clear_gc_fields`); a `NEW_WITH_VTABLE` vtable store is
+/// the same as `emit_setfield` after `handle_new_fixedsize`.
+///
+/// Wasm skips that rewrite and would otherwise `memory.fill` the whole
+/// `New` payload, including scalar fields rewrite never touches.
+fn pending_new_zero_offsets(
+    descr: &dyn majit_ir::descr::SizeDescr,
+    ops: &[Op],
+    op_idx: usize,
+    obj: OpRef,
+    write_vtable_offset: Option<usize>,
+) -> Vec<usize> {
+    let class_word = descr.class_word_field().map(|fd| fd.offset());
+    let skip_class_word = class_word.is_some() && descr.w_class_obj().is_some_and(|w| w != 0);
+    let mut pending: Vec<usize> = descr
+        .gc_fielddescrs()
+        .iter()
+        .map(|fd| fd.offset())
+        .filter(|&ofs| !(skip_class_word && class_word == Some(ofs)))
+        .filter(|&ofs| write_vtable_offset != Some(ofs))
+        .collect();
+    if pending.is_empty() {
+        return pending;
+    }
+    for later in ops.iter().skip(op_idx + 1) {
+        if rewrite_pending_zero_flush(later) {
+            break;
+        }
+        if later.opcode != OpCode::SetfieldGc {
+            continue;
+        }
+        if later.arg(0).to_opref() != obj {
+            continue;
+        }
+        let descr = later.getdescr();
+        let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) else {
+            continue;
+        };
+        let ofs = fd.offset();
+        pending.retain(|&pending_ofs| pending_ofs != ofs);
+        if pending.is_empty() {
+            break;
+        }
+    }
+    pending
+}
+
+/// rewrite.py `emit_pending_zeros` GC_STORE of NULL at each leftover
+/// offset. Pointer-width (`WORD`) like `emit_gc_store_or_indexed(..., WORD)`.
+fn emit_pending_null_fields(sink: &mut PeepSink<'_, '_>, base_local: u32, offsets: &[usize]) {
+    for &ofs in offsets {
+        sink.local_get(base_local);
+        sink.i32_wrap_i64();
+        sink.i32_const(0);
+        sink.i32_store(MemArg {
+            offset: ofs as u64,
+            align: 2,
+            memory_index: 0,
+        });
+    }
 }
 
 /// The element index a card-marking barrier needs, or `None` for a store that
@@ -9890,17 +9968,20 @@ fn build_function(
                             .map(|fd| (fd.offset() as u64, w_class))
                     })
                 });
-                // Same predicate as the store below (`w_class != 0`).
-                // `w_class_obj_for_vtable` already returns None for a
-                // null instantiate; keep the pair aligned if a descr
-                // answers Some(0).
-                let stamps_class_word = op.opcode == OpCode::NewWithVtable
-                    && w_class_init.is_some_and(|(_, w_class)| w_class != 0);
-                // `New` still fills: rewrite may leave gc Refs unstamped.
-                // `NewWithVtable` stamps `w_class` here; skip the fill when
-                // that covers every gc Ref (`malloc_cond` does not zero).
-                let zero_payload = op.opcode != OpCode::NewWithVtable
-                    || sd.is_none_or(|sd| nursery_new_has_unstamped_gc_refs(sd, stamps_class_word));
+                // rewrite.py NEW_WITH_VTABLE `emit_setfield` of the vtable
+                // after `handle_new_fixedsize`; that store cancels the
+                // delayed NULL at the same offset.
+                let write_vtable =
+                    op.opcode == OpCode::NewWithVtable && vtable != 0 && vtable_offset.is_some();
+                let pending_zeros = sd.map_or_else(Vec::new, |sd| {
+                    pending_new_zero_offsets(
+                        sd,
+                        ops,
+                        op_idx,
+                        op.pos().get(),
+                        vtable_offset.filter(|_| write_vtable),
+                    )
+                });
 
                 // `rewrite.rs handle_new`: a `non_moving` descr declines the
                 // nursery outright — both the inline bump and the collecting
@@ -9949,14 +10030,7 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
-                    if zero_payload {
-                        emit_zero_bytes(
-                            &mut sink,
-                            alloc_scratch_local,
-                            0,
-                            total_size.saturating_sub(GcHeader::SIZE) as u32,
-                        );
-                    }
+
                     sink.else_();
                     sink.i64_const(type_id);
                     sink.i64_const(size);
@@ -10055,9 +10129,7 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    if zero_payload {
-                        emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
-                    }
+
                     if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
                         sink.i32_const(1);
                         sink.local_set(alloc_batch_flag_local);
@@ -10133,9 +10205,6 @@ fn build_function(
                     // WORD, vtable). The `ob_type` field is pointer-width: 4
                     // bytes on wasm32 (GuardClass reads it as i32), so store
                     // the low 32 bits to avoid clobbering the next field.
-                    let write_vtable = op.opcode == OpCode::NewWithVtable
-                        && vtable != 0
-                        && vtable_offset.is_some();
                     if write_vtable {
                         let vt_off = vtable_offset.unwrap() as u64;
                         sink.local_get(value_types.local(vi));
@@ -10168,6 +10237,9 @@ fn build_function(
                             memory_index: 0,
                         });
                     }
+                    // rewrite.py emit_pending_zeros: leftover GC-pointer
+                    // fields only. Scalar payload stays dirty.
+                    emit_pending_null_fields(&mut sink, value_types.local(vi), &pending_zeros);
                 }
                 // The collecting allocation may have moved every other live
                 // Ref; reload them from their (forwarded) homes. Skip the fresh
