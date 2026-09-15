@@ -10081,7 +10081,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // `we_are_jitted()` to true so this block is dead in the portal
         // jitcode. The helper returns i64 so a leftover Result use cannot
         // drop the graph.
-        if !majit_rlib::jit::we_are_jitted() {
+        if !majit_metainterp::jit::we_are_jitted() {
             let p = eval_loop_dispatch_poll(f);
             f = WARMUP_TICK_FRAME.with(|c| c.get());
             if p == 1 {
@@ -10177,7 +10177,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // The front folds `we_are_jitted()` to true, so this block is
         // dead in the portal jitcode. The helper returns i64 so a
         // leftover Result use cannot drop the graph.
-        if !majit_rlib::jit::we_are_jitted() {
+        if !majit_metainterp::jit::we_are_jitted() {
             let w = eval_loop_warmup_tick(f, opcode_pc);
             f = WARMUP_TICK_FRAME.with(|c| c.get());
             if w == 1 {
@@ -10214,7 +10214,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
-                if !majit_rlib::jit::we_are_jitted() {
+                if !majit_metainterp::jit::we_are_jitted() {
                     f = FrameView::reload(f);
                 }
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
@@ -10260,7 +10260,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                             last_instr,
                         );
                         if next_instr >= 0 {
-                            if !majit_rlib::jit::we_are_jitted() {
+                            if !majit_metainterp::jit::we_are_jitted() {
                                 f = FrameView::reload(f);
                             }
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
@@ -10284,7 +10284,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // generator keeps its frame alive after leaving the portal,
                 // so force precisely this exit.  Ordinary Return deliberately
                 // remains lazy through FORCE_TOKEN + GUARD_NOT_FORCED_2.
-                if !majit_rlib::jit::we_are_jitted() {
+                if !majit_metainterp::jit::we_are_jitted() {
                     f = FrameView::reload(f);
                 }
                 let _ = majit_metainterp::jit::hint_force_virtualizable(unsafe { &mut *f });
@@ -10293,7 +10293,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
-                if !majit_rlib::jit::we_are_jitted() {
+                if !majit_metainterp::jit::we_are_jitted() {
                     f = FrameView::reload(f);
                 }
                 let last_instr = unsafe { &*f }.last_instr as i64;
@@ -10303,7 +10303,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     last_instr,
                 );
                 if next_instr >= 0 {
-                    if !majit_rlib::jit::we_are_jitted() {
+                    if !majit_metainterp::jit::we_are_jitted() {
                         f = FrameView::reload(f);
                     }
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
