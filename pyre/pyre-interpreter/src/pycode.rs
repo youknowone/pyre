@@ -4335,20 +4335,19 @@ pub fn pack_exceptiontable_lookup(hit: Option<(u32, u32, bool)>) -> i64 {
         None => EXCEPTIONTABLE_LOOKUP_NONE,
         Some((target, depth, lasti)) => {
             debug_assert!(depth < (1u32 << 31));
-            ((target as i64) << 32) | ((depth as i64) << 1) | i64::from(lasti)
+            // Build in `u64` so a target with the high bit set does not
+            // look like the `-1` sentinel after the shift.
+            (((target as u64) << 32) | ((depth as u64) << 1) | u64::from(lasti)) as i64
         }
     }
 }
 
 pub fn unpack_exceptiontable_lookup(packed: i64) -> Option<(u32, u32, bool)> {
-    if packed < 0 {
+    if packed == EXCEPTIONTABLE_LOOKUP_NONE {
         None
     } else {
-        Some((
-            (packed as u64 >> 32) as u32,
-            (packed as u64 >> 1) as u32,
-            packed & 1 != 0,
-        ))
+        let bits = packed as u64;
+        Some(((bits >> 32) as u32, (bits >> 1) as u32, bits & 1 != 0))
     }
 }
 
@@ -4675,6 +4674,11 @@ mod tests {
         assert_eq!(
             unpack_exceptiontable_lookup(pack_exceptiontable_lookup(zero)),
             zero
+        );
+        let high = Some((0x8000_0000, 4, false));
+        assert_eq!(
+            unpack_exceptiontable_lookup(pack_exceptiontable_lookup(high)),
+            high
         );
         assert_eq!(pack_exceptiontable_lookup(None), EXCEPTIONTABLE_LOOKUP_NONE);
     }
