@@ -23,8 +23,8 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at
@@ -2433,8 +2433,10 @@ const DEFAULT_INLINE_EAGER_MAX_BYTES: u32 = 4096;
 /// use blackhole resume without heating an already-attached guard. Invalidation
 /// remains owned by the loop token across module replacement.
 struct PendingInline {
-    /// The loop this region merges into.
-    owner: Arc<JitCellToken>,
+    /// The loop this region merges into. Weak so a leftover retry
+    /// cannot keep an otherwise unreachable owner (and its module)
+    /// alive for the rest of the thread.
+    owner: Weak<JitCellToken>,
     region: codegen::InlinedBridge,
     /// When the source guard lived on a standalone parent bridge, remap
     /// `(parent_trace_id, parent_local_fail_index)` at install once that
@@ -2447,11 +2449,23 @@ struct PendingInline {
     retry_on_sibling: bool,
 }
 
+impl PendingInline {
+    fn owner(&self) -> Option<Arc<JitCellToken>> {
+        self.owner.upgrade()
+    }
+
+    fn same_owner(&self, owner: &Arc<JitCellToken>) -> bool {
+        self.owner().is_some_and(|o| Arc::ptr_eq(&o, owner))
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 impl PendingInline {
     fn set_dispatch_withdrawn(&self, withdrawn: bool) {
-        let source =
-            compiled_wasm_loop(&self.owner).expect("pending inline owner must be compiled");
+        let Some(owner) = self.owner() else {
+            return;
+        };
+        let source = compiled_wasm_loop(&owner).expect("pending inline owner must be compiled");
         let guards = source.fail_descrs.borrow();
         let guard = &guards[self.region.source_fail_index as usize];
         // get_latest_descr_arc returns the canonical metainterp descriptor,
@@ -2556,6 +2570,14 @@ pub fn record_inline_trip(pending_id: i64) {
     TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
 }
 
+fn sweep_dead_pending() {
+    PENDING_INLINES.with(|pending| {
+        pending
+            .borrow_mut()
+            .retain(|_, item| item.owner().is_some_and(|owner| !owner.is_invalidated()));
+    });
+}
+
 /// Take the merges whose bridges have tripped since the last call, for a caller
 /// with no compiled trace left on the stack.
 pub fn take_tripped_inlines() -> Vec<i64> {
@@ -2590,7 +2612,7 @@ fn register_pending_inline(
         pending.borrow_mut().insert(
             pending_id,
             PendingInline {
-                owner,
+                owner: Arc::downgrade(&owner),
                 region,
                 remap,
                 retry_on_sibling: false,
@@ -3097,7 +3119,11 @@ impl WasmBackend {
     /// retried: the bridge is already installed and correct, so the only thing
     /// lost is the merge.
     pub fn install_pending_inline(&mut self, pending_id: i64) {
+        sweep_dead_pending();
         let Some(pending) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&pending_id)) else {
+            return;
+        };
+        let Some(owner) = pending.owner() else {
             return;
         };
         // The driver has already classified the exit, and no compiled frame
@@ -3108,7 +3134,6 @@ impl WasmBackend {
             pending.set_dispatch_withdrawn(false);
         }
         diag_bump(55);
-        let owner = pending.owner.clone();
         let mut work = vec![(pending_id, pending.region, pending.remap)];
         // Other trips for this owner would each re-emit the whole module.
         // Fold them into this rebuild so one Cranelift compile covers them.
@@ -3121,8 +3146,7 @@ impl WasmBackend {
                 .borrow()
                 .iter()
                 .filter(|(_, item)| {
-                    Arc::ptr_eq(&item.owner, &owner)
-                        && (item.remap.is_some() || item.retry_on_sibling)
+                    item.same_owner(&owner) && (item.remap.is_some() || item.retry_on_sibling)
                 })
                 .map(|(&id, _)| id)
                 .collect()
@@ -3142,7 +3166,7 @@ impl WasmBackend {
                     pending
                         .borrow()
                         .get(&id)
-                        .is_some_and(|item| Arc::ptr_eq(&item.owner, &owner))
+                        .is_some_and(|item| item.same_owner(&owner))
                 });
                 if same_owner {
                     extra.push(id);
@@ -3209,7 +3233,7 @@ impl WasmBackend {
                 pending.borrow_mut().insert(
                     id,
                     PendingInline {
-                        owner: owner.clone(),
+                        owner: Arc::downgrade(&owner),
                         region,
                         remap,
                         retry_on_sibling: remap.is_none(),
@@ -5439,8 +5463,7 @@ impl majit_backend::Backend for WasmBackend {
                     // would re-register forever.
                     let parent_pending = PENDING_INLINES.with(|pending| {
                         pending.borrow().values().any(|item| {
-                            Arc::ptr_eq(&item.owner, &owner)
-                                && item.region.trace_id == source_trace_id
+                            item.same_owner(&owner) && item.region.trace_id == source_trace_id
                         })
                     });
                     if parent_pending {
