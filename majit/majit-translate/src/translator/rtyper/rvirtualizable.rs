@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::flowspace::model::{ConstValue, Constant, FunctionGraph, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
+use crate::translator::rtyper::rclass::const_truthy;
 
 /// RPython `class VirtualizableInstanceRepr(InstanceRepr)`.
 ///
@@ -87,14 +88,6 @@ impl VirtualizableInstanceRepr {
             .copied()
             .unwrap_or(false)
     }
-}
-
-fn const_truthy(value: &ConstValue) -> bool {
-    !matches!(value, ConstValue::None | ConstValue::Bool(false))
-        && !matches!(value, ConstValue::List(items) if items.is_empty())
-        && !matches!(value, ConstValue::Tuple(items) if items.is_empty())
-        && !matches!(value, ConstValue::ByteStr(text) if text.is_empty())
-        && !matches!(value, ConstValue::UniStr(text) if text.is_empty())
 }
 
 /// RPython `replace_force_virtualizable_with_call(graphs, VTYPEPTR,

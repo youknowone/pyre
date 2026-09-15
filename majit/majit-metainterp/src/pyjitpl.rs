@@ -5144,7 +5144,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py synchronize_virtualizable parity: TraceCtx needs
         // the live heap pointer to mirror shadow writes. Mirror here — the
-        // MetaInterp `vable_ptr` was cached before `tracing` existed, so
+        // MetaInterp `pending_vable_ptr` was cached before `tracing` existed, so
         // `set_vable_ptr` could not plumb it through.
         ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
         // pyjitpl.py `initialize_virtualizable` closes by asserting the
@@ -7373,7 +7373,7 @@ impl<M: Clone> MetaInterp<M> {
         // compiled and never an ambient one.
         //
         // Prefer it over MetaInterp's ambient pointer: an inlined residual
-        // callee can temporarily update `self.vable_ptr`, while the residual
+        // callee can temporarily update `self.pending_vable_ptr`, while the residual
         // boundary restores the caller's pointer on this TraceCtx. Reading the
         // ambient slot here would combine the caller loop's expanded inputargs
         // with the callee frame's array length, collapsing frame identity.
@@ -7382,7 +7382,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
-        // virtualizable inputarg's ConstPtr.  `vable_ptr` is retained only as
+        // virtualizable inputarg's ConstPtr.  `pending_vable_ptr` is retained only as
         // the legacy/test fallback when neither the rebuilt boxes nor their
         // heap mirror were installed.
         std::ptr::null()

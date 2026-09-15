@@ -435,7 +435,7 @@ fn const_value_field_names(value: &ConstValue) -> Vec<String> {
     }
 }
 
-fn const_truthy(value: &ConstValue) -> bool {
+pub(crate) fn const_truthy(value: &ConstValue) -> bool {
     match value {
         ConstValue::None => false,
         ConstValue::Placeholder => false,

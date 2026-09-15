@@ -3564,8 +3564,9 @@ pub fn make_resume_guard_descr_instance_next_foriter(
 /// The `ResumeGuardDescr` inside a descr that either is one or is one of its
 /// tag-only newtypes (`ResumeGuardForcedDescr` / `ResumeGuardExcDescr`).
 ///
-/// Forced/exc `as_any` returns the wrapper so `is_guard_forced` dispatch
-/// can downcast the subtype. Readers that need the base resume payload
+/// `ResumeGuardForcedDescr::as_any` returns the wrapper so `is_guard_forced`
+/// dispatch can downcast the subtype; `ResumeGuardExcDescr::as_any` returns
+/// the inner descr. Readers that need the base resume payload
 /// (`rd_numb`, `rd_loop_token_clt`) go through this unwrap — including
 /// Cranelift `cranelift_resumedata_deopt`.
 pub fn resume_guard_descr(descr: &DescrRef) -> Option<&ResumeGuardDescr> {

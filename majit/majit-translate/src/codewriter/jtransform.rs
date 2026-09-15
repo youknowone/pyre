@@ -4057,21 +4057,18 @@ impl<'a> Transformer<'a> {
             }
             self.vable_flags.insert(key, flags);
             // jtransform.py: `vinfo = self.get_vinfo(op.args[0]); assert vinfo is not None`.
-            // Tests pass `callcontrol is None`. When a handle is attached,
-            // the unique-handle fallback is the VTYPEPTR stand-in.
-            if self.callcontrol.is_some() {
-                let vinfo = self.get_vinfo(None).or_else(|| {
-                    self.callcontrol
-                        .as_ref()
-                        .and_then(|cc| cc.unique_virtualizable_info())
-                });
+            // Tests pass `callcontrol is None`. When a handle is attached and
+            // the operand's concretetype names no vtype, the unique handle is
+            // the VTYPEPTR stand-in.
+            if let Some(cc) = self.callcontrol.as_ref() {
+                let vinfo = self
+                    .get_vinfo_for_var(base, None)
+                    .or_else(|| cc.unique_virtualizable_info());
                 assert!(
-                    vinfo.is_some()
-                        || self
-                            .callcontrol
-                            .as_ref()
-                            .is_some_and(|cc| cc.unique_virtualizable_info().is_none()),
-                    "rewrite_op_jit_force_virtualizable: vinfo is not None"
+                    vinfo.is_some(),
+                    "{:?} is a class with _virtualizable_, but no jitdriver was found \
+                     with a 'virtualizable' argument naming a variable of that class",
+                    base.concretetype()
                 );
             }
         }
