@@ -6334,19 +6334,59 @@ impl<'a> Transformer<'a> {
         // Descriptor analysis still sees the helper graph through `op`;
         // only the function address is retargeted to the native
         // barrier+memcpy body (`jit_ll_arraycopy`).
+        //
+        // rgc.py `ll_arraycopy` is always five arguments. The rtyper
+        // still mints a specialized three-argument helper
+        // (`source_start == dest_start == 0`) for append/resize;
+        // expand that call to the five-argument ABI rather than
+        // feeding three residuals into `jit_ll_arraycopy`.
         if oopspec_name == "list.ll_arraycopy" {
             let copy_target = CallTarget::function_path(["jit_ll_arraycopy"]);
-            return Some(self._handle_oopspec_call(
+            let (copy_args, prefix) = if args.len() == 3 {
+                let source_start = graph.alloc_value_var_with_type(ConcreteType::Signed);
+                let dest_start = graph.alloc_value_var_with_type(ConcreteType::Signed);
+                let prefix = vec![
+                    SpaceOperation {
+                        result: Some(source_start.clone()),
+                        kind: OpKind::ConstInt(0),
+                    },
+                    SpaceOperation {
+                        result: Some(dest_start.clone()),
+                        kind: OpKind::ConstInt(0),
+                    },
+                ];
+                (
+                    vec![
+                        args[0].clone(),
+                        args[1].clone(),
+                        source_start,
+                        dest_start,
+                        args[2].clone(),
+                    ],
+                    prefix,
+                )
+            } else {
+                (args.to_vec(), Vec::new())
+            };
+            let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
                 &copy_target,
-                args,
+                &copy_args,
                 &ValueType::Void,
                 graph_name,
                 OopSpecIndex::Arraycopy,
                 None,
                 None,
-            ));
+            );
+            return Some(match rewritten {
+                RewriteResult::Replace(ops) if !prefix.is_empty() => {
+                    let mut all = prefix;
+                    all.extend(ops);
+                    RewriteResult::Replace(all)
+                }
+                other => other,
+            });
         }
         // Field owner for the `W_ListObject` storage struct.  The dotted
         // names address the fused offsets the runtime descr group
@@ -17220,6 +17260,79 @@ mod tests {
         let RewriteResult::Replace(ops) = rewritten else {
             panic!("expected Replace");
         };
+        let residual = ops.iter().find_map(|op| match &op.kind {
+            OpKind::CallResidual {
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                ..
+            } => Some((args_i, args_r, args_f, result_kind)),
+            _ => None,
+        });
+        let Some((args_i, args_r, args_f, result_kind)) = residual else {
+            panic!("expected a CallResidual, got {ops:?}");
+        };
+        assert_eq!(args_i.len(), 3);
+        assert_eq!(args_r.len(), 2);
+        assert!(args_f.is_empty());
+        assert_eq!(*result_kind, 'v');
+        let callinfo = &transformer
+            .callcontrol
+            .as_deref()
+            .unwrap()
+            .callinfocollection;
+        assert!(callinfo.has_oopspec(OopSpecIndex::Arraycopy));
+        let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraycopy);
+        assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraycopy"));
+    }
+
+    /// The rtyper's specialized `ll_arraycopy(source, dest, length)` must
+    /// still emit the five-argument `jit_ll_arraycopy` ABI, with the two
+    /// missing starts rewritten as constant zero.
+    #[test]
+    fn list_ll_arraycopy_three_arg_expands_to_five_arg_abi() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let array_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let args = vec![
+            variable_with_lltype("source", array_ty.clone()),
+            variable_with_lltype("dest", array_ty),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let rewritten = transformer
+            ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
+            .expect("list.ll_arraycopy must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        let zeros: Vec<_> = ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::ConstInt(0)))
+            .collect();
+        assert_eq!(
+            zeros.len(),
+            2,
+            "specialized call inserts two start=0 consts"
+        );
         let residual = ops.iter().find_map(|op| match &op.kind {
             OpKind::CallResidual {
                 args_i,
