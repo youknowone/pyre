@@ -9805,6 +9805,14 @@ const FLOAT_COS_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-COS-SUBWALK",
 };
 
+/// ll_math.py `ll_math_tan` after the finite pin.
+const FLOAT_TAN_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_tan",
+    commit_label: "float_tan_commit",
+    call_site_label: "float_tan_call_site",
+    decline_tag: "FLOAT-TAN-SUBWALK",
+};
+
 /// floatobject.py `descr_abs` / `ll_math_fabs`.
 const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_abs",
@@ -15863,6 +15871,18 @@ pub(crate) fn try_walker_orthodox_float_cos<Sym: WalkSym>(
     try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_COS_DESCENT)
 }
 
+/// Exact finite `math.tan`: walk `_float_tan`.
+pub(crate) fn try_walker_orthodox_float_tan<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_TAN_DESCENT)
+}
+
 fn try_walker_orthodox_float_trig<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -16191,6 +16211,18 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if pyre_interpreter::module::math::interp_math::is_math_tan_function(callable)
+            && r_args.len() >= 3
+        {
+            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+            if try_walker_orthodox_float_tan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                .is_some()
+            {
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         pyre_interpreter::module::math::interp_math::math_float1_fold_helper(callable)
             .map(|raw| (MathFloatDomain::ResultFinite, MathFloatEmit::Call1(raw)))
