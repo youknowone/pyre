@@ -1957,7 +1957,9 @@ pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
         gc.alloc_nursery_typed(type_id as u32, size as usize).0 as i64
     })
     .unwrap_or(0);
-    zero_alloc_payload(obj, size as usize);
+    // IncrementalMiniMark `malloc_zero_filled = False`. rewrite.py
+    // `clear_gc_fields` / codegen `pending_new_zero_offsets` NULL leftover
+    // GC-pointer fields; the helper does not fill the payload.
     oom_signal_if_zero(obj)
 }
 
@@ -2010,14 +2012,6 @@ fn try_headerless_nursery_bump(gc: &mut dyn majit_gc::GcAllocator, size: usize) 
     }
 }
 
-fn zero_alloc_payload(obj: i64, payload: usize) {
-    if obj != 0 && payload != 0 {
-        unsafe {
-            core::ptr::write_bytes(obj as *mut u8, 0, payload);
-        }
-    }
-}
-
 /// JIT-trace variable-size allocation trampoline target for `NewArray` /
 /// `NewArrayClear`. Allocates `length` items and writes the length field at
 /// `len_offset`, mirroring [`WasmBackend::bh_new_array`].
@@ -2044,9 +2038,9 @@ pub extern "C" fn wasm_jit_alloc_array(
     })
     .unwrap_or(0);
     if obj != 0 {
-        let payload =
-            (base_size as usize).saturating_add((item_size as usize).saturating_mul(length));
-        zero_alloc_payload(obj, payload);
+        // IncrementalMiniMark does not zero-fill. rewrite.py emits
+        // ZERO_ARRAY only for NEW_ARRAY_CLEAR; wasm codegen does the
+        // same after this helper returns.
         unsafe {
             *((obj as *mut u8).add(len_offset as usize) as *mut usize) = length;
         }

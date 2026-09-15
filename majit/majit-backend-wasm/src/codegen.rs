@@ -2299,6 +2299,58 @@ fn emit_pending_null_fields(sink: &mut PeepSink<'_, '_>, base_local: u32, offset
     }
 }
 
+/// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
+/// length store: items only, starting at `basesize`. IncrementalMiniMark
+/// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
+fn emit_zero_array_items(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    result: u32,
+    base_size: i64,
+    item_size: i64,
+    length: OpRef,
+) {
+    if item_size <= 0 {
+        return;
+    }
+    if let Some(n) = const_operand_value(constants, length) {
+        let Ok(n) = u32::try_from(n) else {
+            return;
+        };
+        let Some(bytes) = (item_size as u32).checked_mul(n) else {
+            return;
+        };
+        if bytes == 0 {
+            return;
+        }
+        sink.local_get(value_types.local(result));
+        sink.i32_wrap_i64();
+        if base_size != 0 {
+            sink.i32_const(base_size as i32);
+            sink.i32_add();
+        }
+        sink.i32_const(0);
+        sink.i32_const(bytes as i32);
+        sink.memory_fill(0);
+        return;
+    }
+    sink.local_get(value_types.local(result));
+    sink.i32_wrap_i64();
+    if base_size != 0 {
+        sink.i32_const(base_size as i32);
+        sink.i32_add();
+    }
+    sink.i32_const(0);
+    emit_resolve(sink, constants, value_types, length);
+    sink.i32_wrap_i64();
+    if item_size != 1 {
+        sink.i32_const(item_size as i32);
+        sink.i32_mul();
+    }
+    sink.memory_fill(0);
+}
+
 /// The element index a card-marking barrier needs, or `None` for a store that
 /// takes the plain barrier.
 ///
@@ -10265,9 +10317,13 @@ fn build_function(
                         frame,
                     );
                 }
-                // `New*` overflow may still return old-gen when the nursery
-                // cannot hold the object. Do not seed `wb_applied` here —
-                // the first store emits the barrier, later stores CSE it.
+                // rewrite.py `gen_malloc_nursery` `remember_write_barrier`:
+                // a nursery-sized New is young on every arm (overflow
+                // collects and retries). Collecting / old-gen New stays
+                // out of the set (`_gen_call_malloc_gc`).
+                if inline_nursery.is_some() {
+                    remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
+                }
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos().get().raw();
@@ -10296,9 +10352,8 @@ fn build_function(
                 // Constant lengths keep the existing compile-time total; a
                 // runtime length uses malloc_cond_varsize's precheck against a
                 // compile-time maxlength before computing the bump size.
-                // The inline bump zeros the payload with `memory.fill`;
-                // `NewArrayClear` items come from that, not from a nursery
-                // reset fill.
+                // rewrite.py ZERO_ARRAY after the length store covers
+                // leftover `NewArrayClear` items; plain `NewArray` does not.
                 let length_const = const_operand_value(constants, op.arg(0).to_opref());
                 let skip_payload_zero =
                     skip_newarray_payload_zero(op, ops, op_idx, constants, length_const);
@@ -10349,7 +10404,7 @@ fn build_function(
                 let batch_role = nursery_batches.get(op_idx).and_then(|role| role.as_ref());
                 if let (
                     Some(base),
-                    Some((length, total)),
+                    Some((length, _total)),
                     Some(NurseryBatchRole::Follower {
                         prev_result,
                         prev_size,
@@ -10369,14 +10424,6 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
-                    if !skip_payload_zero {
-                        emit_zero_bytes(
-                            &mut sink,
-                            alloc_scratch_local,
-                            0,
-                            total.saturating_sub(GcHeader::SIZE) as u32,
-                        );
-                    }
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(length as i32);
                     sink.i32_store(MemArg {
@@ -10487,9 +10534,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    if !skip_payload_zero {
-                        emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
-                    }
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -10627,19 +10671,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    // Payload length = new_free - header - HDR.
-                    if !skip_payload_zero {
-                        sink.local_get(alloc_scratch_local);
-                        sink.i32_const(GcHeader::SIZE as i32);
-                        sink.i32_add();
-                        sink.i32_const(0);
-                        sink.local_get(alloc_size_local);
-                        sink.local_get(alloc_scratch_local);
-                        sink.i32_sub();
-                        sink.i32_const(GcHeader::SIZE as i32);
-                        sink.i32_sub();
-                        sink.memory_fill(0);
-                    }
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -10753,10 +10784,29 @@ fn build_function(
                         frame,
                     );
                 }
-                // GcRewriterAssembler.gen_malloc_nursery_varsize only remembers
-                // a proven nursery allocation. A runtime length can take our
-                // external/old-generation helper arm, so eligibility for the
-                // inline arm is not a generation proof at this join.
+                // rewrite.py `handle_clear_array_contents`: ZERO_ARRAY after
+                // the length store, items only. Plain NEW_ARRAY never emits
+                // it. A fully-written const CLEAR is a no-op.
+                if op.opcode == OpCode::NewArrayClear
+                    && !skip_payload_zero
+                    && !OpRef::raw_is_constant(vi)
+                {
+                    emit_zero_array_items(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        vi,
+                        base_size,
+                        item_size,
+                        op.arg(0).to_opref(),
+                    );
+                }
+                // rewrite.py `gen_malloc_nursery` remembers a const-length
+                // nursery array. `gen_malloc_nursery_varsize` does not —
+                // the array may be large and card-marked.
+                if inline_nursery_total.is_some() {
+                    remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
+                }
             }
 
             // ── Misc ──

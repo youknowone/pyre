@@ -1239,6 +1239,54 @@ fn write_barrier_elision_keeps_one_barrier_per_base() {
     );
 }
 
+/// rewrite.py `gen_malloc_nursery` `remember_write_barrier`: a nursery
+/// New is young, so SETFIELD_GC on it emits no COND_CALL_GC_WB.
+#[test]
+fn nursery_new_seeds_write_barrier_applied() {
+    const WB_TARGET: i64 = 0x4a11;
+    let mut inputs = nursery_new_inputs(
+        vec![
+            new_with_gc_field(1, 53, 8),
+            setfield_gc(1, OpRef::input_arg_int(0), 8),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    inputs.wb = codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
+        0,
+        "gen_malloc_nursery remembers the new object; first SETFIELD_GC is not a barrier"
+    );
+}
+
+/// rewrite.py `gen_malloc_nursery` on a const-length array: SETARRAYITEM
+/// of a Ref does not emit COND_CALL_GC_WB.
+#[test]
+fn nursery_const_newarray_seeds_write_barrier_applied() {
+    const WB_TARGET: i64 = 0x4a11;
+    let mut inputs = nursery_new_inputs(
+        vec![
+            plain_new_array(1, 53, 2),
+            setarrayitem_gc(1, 0, OpRef::input_arg_int(0), 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    inputs.wb = codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
+        0,
+        "const-length nursery NEW_ARRAY remembers write_barrier_applied"
+    );
+}
+
 #[test]
 fn write_barrier_elision_follows_same_as_r_base() {
     use majit_ir::descr::SimpleFieldDescr;
@@ -10045,7 +10093,7 @@ fn newstr_without_a_descr_injects_the_builtin_layout() {
 }
 
 #[test]
-fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
+fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
     use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
     use std::sync::Arc;
 
@@ -10104,13 +10152,17 @@ fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
     validate_wasm(&bytes);
     assert_eq!(
         direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
-        1,
-        "the slow helper may return old-gen, even when an inline arm exists"
+        0,
+        "gen_malloc_nursery remembers the new object on both bump and overflow"
     );
     let mut control = inputs;
     control.nursery = None;
     let (bytes, _, _, _) = codegen::build_wasm_module(&control).unwrap();
-    assert_eq!(direct_write_barrier_call_count(&bytes, WB_TARGET as i32), 1);
+    assert_eq!(
+        direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
+        1,
+        "collecting New is not remembered (`_gen_call_malloc_gc`)"
+    );
 }
 
 /// `emit_force_arm` publishes a guard's fail arguments while the bracketed
