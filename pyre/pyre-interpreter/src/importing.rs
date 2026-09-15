@@ -5354,6 +5354,10 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
         return None;
     }
+    // `getattr` consults a data descriptor before the instance dict.
+    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, "__spec__") } {
+        return None;
+    }
     let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
     if dict.is_null() {
         return None;
@@ -5364,6 +5368,9 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     }
     let spec_type = unsafe { (*w_spec).w_class };
     if unsafe { crate::baseobjspace::getattribute_if_not_from_object(spec_type) }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(spec_type, "_initializing") } {
         return None;
     }
     if !unsafe { crate::objspace::std::mapdict::has_mapdict_storage(w_spec) } {
