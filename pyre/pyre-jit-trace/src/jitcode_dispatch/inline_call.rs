@@ -12926,24 +12926,28 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     // `getattr_str` / `getattr_str_impl` records the whole MRO protocol
     // into the caller trace and the walk does not bound its allocations.
     let callee = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
-    // An orthodox helper descent (`inline_subwalk`) is already bounded
-    // by exact-int operands; residualizing `*_inner` there makes
-    // `compare_op_descent` decline.  The generic walk is the unbounded one.
-    if !ctx.fbw_mode.inline_subwalk
-        && (callee
-            .as_deref()
-            .is_some_and(super::specialize::name_is_unbounded_helper_body)
-            || super::specialize::jitcode_is_space_getattr(sub_index, sub_body)
-            || super::specialize::jitcode_is_frame_load_attr(sub_index)
-            || super::specialize::jitcode_leaf_is(sub_index, "getattr_str_impl")
-            || super::specialize::jitcode_is_pathed(
-                sub_index,
-                sub_body,
-                "pyre_interpreter::baseobjspace::getattr_str_impl",
-            )
-            || super::specialize::jitcode_leaf_is(sub_index, "compare_value_from_tag_inner")
-            || super::specialize::jitcode_leaf_is(sub_index, "binary_value_from_tag_inner"))
-    {
+    // getattr/setattr/setitem/iter protocol bodies are unbounded even
+    // when the caller is already an inline_subwalk (an inlined Python
+    // function).  Only the exact-int `*_inner` helpers stay walkable
+    // there; residualizing those makes `compare_op_descent` decline.
+    let is_bounded_inner = super::specialize::jitcode_leaf_is(sub_index, "compare_value_from_tag_inner")
+        || super::specialize::jitcode_leaf_is(sub_index, "binary_value_from_tag_inner")
+        || callee.as_deref().is_some_and(|n| {
+            super::specialize::name_leaf_is(n, "compare_value_from_tag_inner")
+                || super::specialize::name_leaf_is(n, "binary_value_from_tag_inner")
+        });
+    let is_unbounded = callee
+        .as_deref()
+        .is_some_and(super::specialize::name_is_unbounded_helper_body)
+        || super::specialize::jitcode_is_space_getattr(sub_index, sub_body)
+        || super::specialize::jitcode_is_frame_load_attr(sub_index)
+        || super::specialize::jitcode_leaf_is(sub_index, "getattr_str_impl")
+        || super::specialize::jitcode_is_pathed(
+            sub_index,
+            sub_body,
+            "pyre_interpreter::baseobjspace::getattr_str_impl",
+        );
+    if is_unbounded && !(ctx.fbw_mode.inline_subwalk && is_bounded_inner) {
         return residualize_inline_call_via_fnaddr(
             ctx,
             code,
@@ -14514,6 +14518,22 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     false,
                 );
             };
+            let unicode_name = walker_concrete_ref_object(ctx, name_opref).and_then(|n| {
+                unsafe { pyre_object::w_str_get_wtf8(n).as_str().ok() }.map(str::to_string)
+            });
+            if let Some(outcome) =
+                super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
+                    ctx,
+                    op,
+                    obj,
+                    Some(value),
+                    0,
+                    0,
+                    unicode_name.as_deref(),
+                )?
+            {
+                return Ok(outcome);
+            }
             let folded = if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
                 && unsafe {
                     pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
@@ -15259,6 +15279,20 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             let obj = ref_args.first().copied();
             let value = ref_args.get(1).copied();
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
+            if let (Some(obj), Some(value)) = (obj, value)
+                && let Some(outcome) =
+                    super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
+                        ctx,
+                        op,
+                        obj,
+                        Some(value),
+                        0,
+                        0,
+                        str_name.as_deref(),
+                    )?
+            {
+                return Ok(outcome);
+            }
             let folded =
                 if let (Some(obj), Some(value), Some(name)) = (obj, value, str_name.as_deref()) {
                     guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;

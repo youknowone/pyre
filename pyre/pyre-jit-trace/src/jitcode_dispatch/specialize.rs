@@ -20584,7 +20584,30 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     w_code_ptr: usize,
     name_idx: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || w_code_ptr == 0 {
+    try_walker_trace_immutable_type_attr_raise_with_name(
+        ctx,
+        op,
+        obj_op,
+        store_value,
+        w_code_ptr,
+        name_idx,
+        None,
+    )
+}
+
+pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    obj_op: OpRef,
+    store_value: Option<OpRef>,
+    w_code_ptr: usize,
+    name_idx: usize,
+    name_override: Option<&str>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    if name_override.is_none() && w_code_ptr == 0 {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
@@ -20603,15 +20626,19 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         }
         None => None,
     };
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
+    let name = if let Some(name) = name_override {
+        name.to_string()
+    } else {
+        unsafe {
+            let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+            if code_ptr.is_null() {
+                return Ok(None);
+            }
+            let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+            match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
+                Some(n) => n.to_string(),
+                None => return Ok(None),
+            }
         }
     };
     if !pyre_interpreter::baseobjspace::type_immutable_attr_raise_is_stable(
