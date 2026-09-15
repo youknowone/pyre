@@ -537,7 +537,7 @@ fn first_unsupported_pre_merge_stmt(func_block: &syn::Block) -> Option<&syn::Stm
 /// the compiled back-edge. Reject those so the portal fails at compile
 /// time. Tracing hints (`promote` / `assert_not_none` /
 /// `record_exact_class`) have no user-visible effect and stay allowed.
-fn local_init_has_side_effect(local: &syn::Local) -> bool {
+pub(crate) fn local_init_has_side_effect(local: &syn::Local) -> bool {
     let Some(init) = &local.init else {
         return false;
     };

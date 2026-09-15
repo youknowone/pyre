@@ -758,11 +758,19 @@ pub(super) fn bind_pre_merge_point_stmts(
             break;
         }
         if let syn::Stmt::Local(local) = stmt {
-            // A `let` the lowerer cannot reproduce must not stay in the
-            // interpreter-only prefix: the compiled back-edge would omit
-            // it. Fail the body so the portal stays in the interpreter
-            // rather than compiling a loop that drops the binding.
-            lowerer.lower_local(local)?;
+            // A side-effecting `let` the lowerer cannot reproduce must
+            // not stay in the interpreter-only prefix: the compiled
+            // back-edge would omit it. Fail the body so the portal
+            // stays in the interpreter rather than compiling a loop
+            // that drops the mutation. A side-effect-free match
+            // (`jit_interp_dispatch_match_choice` `InLoopState`) is
+            // prefix-only and can be skipped — `jit_merge_point` is
+            // the compiled header.
+            if lowerer.lower_local(local).is_none()
+                && crate::jit_interp::codegen_trace::local_init_has_side_effect(local)
+            {
+                return None;
+            }
         }
     }
     Some(())
