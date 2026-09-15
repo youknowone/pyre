@@ -8,10 +8,12 @@
 # item, so it is not an accumulating body effect and must not refuse-drop the
 # iteration.  A drop loses that iteration's `exc_info_inside` / `exc_info_after`
 # increments (both would read N-k instead of N).
+# Keep N large enough that PyPy's execution-only time is measurable
+# after startup subtraction (`FLOOR_GATE_MIN_BASELINE_S`).
 
 import sys
 
-N = 50000
+N = 500_000
 
 exc_info_inside = 0
 exc_info_after_none = 0
