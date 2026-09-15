@@ -3236,6 +3236,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
     );
+    // `ll_math.py math_hypot` llexternal.  The front retargets Opaque
+    // `f64::hypot` to `["ll_math", "math_hypot"]`; the crate-root alias
+    // leaf strips to that path.
+    cpa2(
+        &mut entries,
+        "ll_math::math_hypot",
+        "math_hypot",
+        crate::module::math::interp_math::jit_math_hypot,
+    );
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
     // `ll_append_res_slice` once its native fnaddr is bound. Unlike shrink, these

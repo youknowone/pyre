@@ -501,6 +501,13 @@ jit_raw2!(jit_math_copysign, copysign);
 jit_raw2!(jit_math_remainder, remainder);
 jit_raw2!(jit_math_atan2, atan2);
 
+/// `ll_math.py math_hypot` — the C `hypot` llexternal, not the raising
+/// `ll_math_hypot` wrapper.  Two finite arguments that overflow return
+/// +inf; the wrapper (and `complex_abs`) turn that into OverflowError.
+pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
+    x.hypot(y)
+}
+
 /// Raw `math.isclose(a, b)` with both keyword tolerances left at their
 /// defaults, `rel_tol=1e-09` and `abs_tol=0.0`.
 ///
@@ -581,6 +588,7 @@ math_fold_table!(
     "copysign" => jit_math_copysign,
     "remainder" => jit_math_remainder,
     "atan2" => jit_math_atan2,
+    "hypot" => jit_math_hypot,
 );
 
 /// The wrapper pointer `py_module!` installed for `math.<name>`, or `None`

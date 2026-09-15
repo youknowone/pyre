@@ -10531,6 +10531,30 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `f64::hypot(x, y)` is the C `hypot` llexternal
+                // (`ll_math.py math_hypot`).  The raising wrapper
+                // `ll_math_hypot` stays around it; this leaf is the
+                // IEEE call, the same way `abs` is `float_abs`.
+                if args.len() == 2 && self.is_f64_hypot(&reg) {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["ll_math".to_string(), "math_hypot".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
+                            result_ty: ValueType::Float,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if args.len() == 1 && self.is_f64_is_nan(&reg) {
                     let res = self
                         .graph
@@ -14754,6 +14778,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
+    }
+
+    /// `f64::hypot(self, other)` — `core` has no graph body (Opaque).
+    /// `ll_math.py math_hypot` is the C `hypot` llexternal; the raising
+    /// `ll_math_hypot` wrapper stays around it.
+    fn is_f64_hypot(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
+            path == "core::f64::<Impl>::hypot" || path == "std::f64::<Impl>::hypot"
+        })
     }
 
     /// `f64::is_finite(self)` — `core` has no graph body (Opaque), so the
