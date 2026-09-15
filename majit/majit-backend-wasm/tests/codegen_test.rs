@@ -6043,9 +6043,9 @@ fn assert_valid_owner_defers_inline_trial(preamble: bool, large_header: bool) {
 
 /// After a peel has already grown the owner past
 /// [`majit_backend_wasm::set_inline_eager_max_bytes`], a later
-/// invalidation-watched region used to decline `eager_too_large` and
-/// never arm the trip. That left `exception_loop_warmup`'s raise path
-/// as a permanent crossing. The size check still refuses the unmeasured
+/// invalidation-watched region used to refuse the eager arm and never
+/// register a trip. That left `exception_loop_warmup`'s raise path as
+/// a permanent crossing. The size check still refuses the unmeasured
 /// re-emission; it now arms the same trip as the no-GNI deferral.
 #[test]
 fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
@@ -6087,7 +6087,7 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
         fail_index: 0,
         arg_types: vec![Type::Int, Type::Int],
     };
-    let too_large_before = majit_backend_wasm::bridge_diag(65);
+    let deferred_before = majit_backend_wasm::bridge_diag(54);
     let inline_ok_before = majit_backend_wasm::bridge_diag(32);
     let pending_before = majit_backend_wasm::pending_inline_count();
     majit_backend_wasm::set_inline_trip_helper_slot(1);
@@ -6104,8 +6104,8 @@ fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
     majit_backend_wasm::set_inline_trip_helper_slot(0);
 
     assert!(
-        majit_backend_wasm::bridge_diag(65) > too_large_before,
-        "the size check still refuses the unmeasured eager re-emission"
+        majit_backend_wasm::bridge_diag(54) > deferred_before,
+        "an oversized owner waits on the entry-count trip, not an unmeasured merge"
     );
     assert_eq!(
         majit_backend_wasm::bridge_diag(53),
