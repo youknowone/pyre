@@ -5276,18 +5276,56 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     }
 }
 
-/// JIT residual view of [`gcd_import_cache_probe`]: the initialized
-/// `sys.modules` entry, `Ok(None)` on every `FastPathGiveUp` case, or
-/// `Err` when `_gcd_import` would re-raise (`interp_import.py` keeps
-/// non-`AttributeError` from `__spec__` / `_initializing`).
+/// JIT residual view of `_gcd_import`: initialized `sys.modules` entry,
+/// or `None` on every `FastPathGiveUp` case *and* on any shape whose
+/// `__spec__` / `_initializing` read would run Python.
 ///
-/// Does not wait.  A still-initializing module is `Ok(None)` so the
-/// compiled residual's `GuardValue` side-exits to `IMPORT_NAME`, which
-/// runs `dunder_import` (including the 3.14 wait).
-pub fn sys_module_if_initialized(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
-    match gcd_import_cache_probe(name)? {
-        GcdCache::Ready(w_module) => Ok(Some(w_module)),
-        _ => Ok(None),
+/// The residual is a non-forcing `CallR` so
+/// `test_import.test_import_in_function` stays `guard_not_invalidated`
+/// only.  A custom `__getattribute__`, a data descriptor, or a
+/// non-bool `_initializing` declines; the original `IMPORT_NAME` then
+/// runs `dunder_import` (including hooks and the 3.14 wait).
+pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
+    if sys_modules_blocks(name) {
+        return None;
+    }
+    let w_module = check_sys_modules(name)?;
+    if !unsafe { pyre_object::is_module(w_module) } {
+        return None;
+    }
+    let w_type = unsafe { (*w_module).w_class };
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+        return None;
+    }
+    let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
+    if dict.is_null() {
+        return None;
+    }
+    let w_spec = unsafe { pyre_object::w_dict_getitem_str(dict, "__spec__") }?;
+    if w_spec.is_null() || unsafe { pyre_object::is_none(w_spec) } {
+        return None;
+    }
+    let spec_type = unsafe { (*w_spec).w_class };
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(spec_type) }.is_some() {
+        return None;
+    }
+    if !unsafe { crate::objspace::std::mapdict::has_mapdict_storage(w_spec) } {
+        return None;
+    }
+    let spec_dict = crate::objspace::std::mapdict::_obj_getdict(w_spec);
+    if spec_dict.is_null() {
+        return None;
+    }
+    match unsafe { pyre_object::w_dict_getitem_str(spec_dict, "_initializing") } {
+        None => Some(w_module),
+        Some(flag) if unsafe { pyre_object::is_bool(flag) } => {
+            if unsafe { pyre_object::w_bool_get_value(flag) } {
+                None
+            } else {
+                Some(w_module)
+            }
+        }
+        Some(_) => None,
     }
 }
 

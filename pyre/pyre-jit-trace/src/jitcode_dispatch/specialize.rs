@@ -17265,23 +17265,17 @@ extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
         return 0;
     };
     match import_cached_lookup(s, fromlist_empty != 0) {
-        Ok(Some(module)) => module as i64,
-        Ok(None) => 0,
-        Err(mut err) => crate::helpers::publish_leaf_exception(&mut err),
+        Some(module) => module as i64,
+        None => 0,
     }
 }
 
-fn import_cached_lookup(
-    name: &str,
-    fromlist_empty: bool,
-) -> Result<Option<pyre_object::PyObjectRef>, pyre_interpreter::PyError> {
-    let Some(leaf) = pyre_interpreter::importing::sys_module_if_initialized(name)? else {
-        return Ok(None);
-    };
+fn import_cached_lookup(name: &str, fromlist_empty: bool) -> Option<pyre_object::PyObjectRef> {
+    let leaf = pyre_interpreter::importing::sys_module_if_initialized(name)?;
     if fromlist_empty && let Some(dot) = name.find('.') {
         return pyre_interpreter::importing::sys_module_if_initialized(&name[..dot]);
     }
-    Ok(Some(leaf))
+    Some(leaf)
 }
 
 /// Cached absolute `import name` / `from name import ...` on a module already
@@ -17375,16 +17369,14 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     if !fromlist_empty {
         return Ok(None);
     }
-    // Record-time `_gcd_import` probe.  FastPathGiveUp declines so the
-    // generic importer runs once.  A non-`AttributeError` is this CALL's
-    // result (`_gcd_import` re-raises); returning `None` would let
-    // `residual_call` invoke `__import__` again and run the accessor twice.
+    // Record-time probe: dict-only, no Python hooks.  FastPathGiveUp and
+    // hook-shaped objects decline so the generic importer (CallMayForce)
+    // runs once.
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return Ok(None);
     };
-    let probe = match import_cached_lookup(s, fromlist_empty) {
-        Ok(None) => return Ok(None),
-        other => other,
+    let Some(w_mod) = import_cached_lookup(s, fromlist_empty) else {
+        return Ok(None);
     };
 
     let callable_op = r_args[0];
@@ -17439,69 +17431,28 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
 
     let helper = jit_import_cached as *const ();
-    // Impure `CallR`.  `__spec__` / `_initializing` can run Python, so this
-    // is `MOST_GENERAL` (`default_effect_info`) plus the same heap-cache
-    // invalidate `residual_call` applies after `execute_varargs`.  An empty
-    // `can_raise_effect_info` write set would keep pre-call field values.
-    // `_gcd_import` re-raises a non-`AttributeError`; `handle_possible_exception`
-    // records `GUARD_EXCEPTION` on that arm and `GUARD_NO_EXCEPTION` on a hit.
+    // Impure `CallR`: `sys.modules` is mutable.  The helper only reads
+    // module/spec dicts on exact `module` objects with no Python
+    // `__getattribute__`, so it cannot raise or force a virtualizable.
+    // Hook-shaped objects declined above; `IMPORT_NAME` keeps CallMayForce.
     let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
-    let ei = majit_metainterp::default_effect_info();
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
         &[name_op, fromlist_empty_op],
         &[majit_ir::Type::Ref, majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        ei,
+        majit_metainterp::cannot_raise_effect_info(),
     );
-    let helper_op = ctx.trace_ctx.const_int(helper as usize as i64);
-    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
-        OpCode::CallR,
-        Some(&majit_metainterp::default_effect_info()),
-        &[helper_op, name_op, fromlist_empty_op],
+    ctx.trace_ctx.set_opref_concrete(
+        result,
+        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
     );
-    match probe {
-        Ok(Some(w_mod)) => {
-            ctx.trace_ctx.set_opref_concrete(
-                result,
-                majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
-            );
-            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-            let expected = ctx.trace_ctx.const_ref(w_mod as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardValue,
-                &[result, expected],
-            )?;
-            ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
-            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-            Ok(Some(DispatchOutcome::Continue))
-        }
-        Err(mut err) => {
-            // `execute_raised(..., constant=False)`: record the residual
-            // plus `GUARD_EXCEPTION` so compiled iterations re-run the
-            // accessor instead of baking this exception as a constant.
-            let exc = err.to_exc_object();
-            let raised = ctx.trace_ctx.const_ref(exc as i64);
-            ctx.set_last_exc_value(raised, ConcreteValue::Ref(exc));
-            ctx.fbw_mode.class_of_last_exc_is_const = false;
-            if let Some(cb) = crate::callbacks::try_get() {
-                (cb.drain_backend_jit_exc)();
-            }
-            walker_record_guard_exception(ctx, op.pc);
-            // `handle_possible_exception` / residual_call: the live
-            // `GuardException` result replaces the pre-guard constant when
-            // `class_of_last_exc_is_const` was false.
-            let exc = ctx
-                .last_exc_value()
-                .expect("walker_record_guard_exception seeds last_exc_value");
-            let exc_concrete = ctx.last_exc_value_concrete();
-            Ok(Some(DispatchOutcome::SubRaise { exc, exc_concrete }))
-        }
-        Ok(None) => Ok(None),
-    }
+    let expected = ctx.trace_ctx.const_ref(w_mod as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
