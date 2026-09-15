@@ -8825,11 +8825,6 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
-        // Set when this Call's dest is still a string byte view after
-        // the residual is emitted (`as_bytes()[a..b]`).  Those arms
-        // fall through; `as_bytes` / `w_str_get_wtf8` return above.
-        let mut residual_preserves_byte_view = false;
-
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
         // `base()` and the read-back all leave the jitcode here, before any
         // operand is resolved -- the guard and its borrow bind no Variable,
@@ -9515,25 +9510,14 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `as_bytes()[start..end]` is still the same string.  Mark
-                // the subslice dest so a later `slice::cmp::eq` sees both
-                // sides as the frontend string identity.  The range call
-                // itself stays for `front::slice_index` to rewrite to
-                // `__getslice_*`.
-                if args.len() == 2
-                    && arg_locals
-                        .first()
-                        .copied()
-                        .flatten()
-                        .is_some_and(|local| self.string_byte_view_locals.contains(&local))
-                    && !self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
-                    && matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if self.llbc.fn_by_id(*id).is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("index")))
-                {
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
-                    residual_preserves_byte_view = true;
-                }
+                // `as_bytes()[a..b]` is rewritten by `front::slice_index` to
+                // `__getslice_*`, a GC-array/list slice — not
+                // `_ll_stringslice` (`rstr.py`), which would allocate a
+                // new string of length `stop-start`.  Do not mark the dest
+                // as a string byte view: `strlen` / string `eq` expect a
+                // `W_UnicodeObject`, and this dest is the slice object.
+                // `ArrayLen` on the getslice result is the length of
+                // `[a..b]`.
                 // `ArrayRead` addresses its element as `base + index *
                 // itemsize`.  A scalar host element carries its spelling as
                 // the array identity so the descr computes the exact width;
@@ -12562,12 +12546,11 @@ impl<'a> Lowering<'a> {
         self.local_var[dest_local] = Some(result_var.clone());
         // Last-write-wins: a residual Call is not `as_bytes` /
         // `w_str_get_wtf8`.  Those arms mark dest and return above.
-        // A recognized `as_bytes()[a..b]` keeps the dest mark and
-        // falls through so `slice_index` can rewrite the call.
-        if !residual_preserves_byte_view {
-            self.string_byte_view_locals
-                .retain(|&local| local != dest_local);
-        }
+        // `as_bytes()[a..b]` falls through as `__getslice_*`, not a
+        // string slice (`_ll_stringslice`), so the dest is not a
+        // string byte view.
+        self.string_byte_view_locals
+            .retain(|&local| local != dest_local);
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
