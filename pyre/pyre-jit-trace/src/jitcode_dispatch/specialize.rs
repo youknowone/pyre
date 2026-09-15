@@ -10732,7 +10732,9 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         // walk no longer hits the synthetic `w_float_new` constructor.
         let admitted = unsafe {
             pyre_object::is_exact_builtin_instance(obj)
-                && (pyre_object::is_int(obj) || pyre_object::is_bool(obj) || pyre_object::is_float(obj))
+                && (pyre_object::is_int(obj)
+                    || pyre_object::is_bool(obj)
+                    || pyre_object::is_float(obj))
         };
         if !admitted {
             return Ok(None);
@@ -15712,9 +15714,8 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
         {
             if let Some(DispatchOutcome::SubReturn {
                 result: Some(boxed),
-            }) = try_walker_orthodox_float_abs(
-                ctx, op.pc, r_args[2], operands[0], dst, 'r',
-            )? {
+            }) = try_walker_orthodox_float_abs(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            {
                 write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
                 return Ok(Some(()));
             }
