@@ -4699,8 +4699,8 @@ fn write_ref_reg<Sym: WalkSym>(
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
-/// `valuestackdepth(2)`, `debugdata(3)`, and `w_globals(4)`
-/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 5`). They are frame
+/// `valuestackdepth(2)` and `debugdata(3)` (`virtualizable_gen.rs`,
+/// `NUM_VABLE_SCALARS = 4`). They are frame
 /// bookkeeping; the Python operand stack lives in the separate
 /// `locals_cells_stack_w` array (`virtualizable_gen.rs`,
 /// `pyre-interpreter/src/pyframe.rs`).  PyPy's `interp_jit.py`
