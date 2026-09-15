@@ -3562,19 +3562,21 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         });
     // Extras still sitting on the entry list (`inputargs[expanded_len..]`)
     // are not leftover yet — they are present, so the scan above misses
-    // them. After leftover-empty truncates to the mint they become
-    // positional residuals. A Call/Getfield that still names one is
-    // `'frame' object has no attribute 'find'` on pip's charset walk.
-    let extras_on_entry_used = inputargs.len() > expanded_len
-        && ops.iter().any(|op| {
-            if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
-                return false;
-            }
-            op.getarglist().iter().any(|a| {
-                let src = a.to_opref();
-                src.is_input_arg() && (src.raw() as usize) >= expanded_len
-            })
-        });
+    // them. leftover-empty already truncated `inputargs` to the red
+    // prefix (`compile.py` `inputargs[:num_red_args]`), so the length
+    // check would never fire here. A Call/Getfield that still names a
+    // dropped extra is `'frame' object has no attribute 'find'` on
+    // pip's charset walk, or `tuple_slice` TypeError when the extra
+    // is an Idx bound remapped off the valuestack.
+    let extras_on_entry_used = ops.iter().any(|op| {
+        if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
+            return false;
+        }
+        op.getarglist().iter().any(|a| {
+            let src = a.to_opref();
+            src.is_input_arg() && (src.raw() as usize) >= expanded_len
+        })
+    });
     if leftover_has_listiter_id()
         && (listiter_leftover
             || leftover_extras_any
@@ -6512,6 +6514,89 @@ mod tests {
                 None,
             ),
             "Call leftover of an untagged non-GC mint slot must not abort leftover-empty"
+        );
+    }
+
+    #[test]
+    fn test_patch_new_loop_rejects_leftover_empty_present_extra() {
+        // leftover=[] because the extra is still on the entry list.
+        // leftover-empty truncates that list to the red prefix before
+        // the extras scan; a body Call of the dropped extra must still
+        // abort (tuple_slice Idx bound on the valuestack).
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
+        let prev = LISTITER_TYPE_WORD.swap(0x1A13, std::sync::atomic::Ordering::Relaxed);
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LISTITER_TYPE_WORD.store(self.0, std::sync::atomic::Ordering::Relaxed);
+                let _ = take_leftover_empty_reject();
+            }
+        }
+        let _restore = Restore(prev);
+        let _ = take_leftover_empty_reject();
+        let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
+        vinfo.add_field("last_instr", Type::Int, 8);
+        vinfo.add_field("pycode", Type::Ref, 16);
+        vinfo.add_field("valuestackdepth", Type::Int, 24);
+        vinfo.add_field("debugdata", Type::Ref, 32);
+        vinfo.add_array_field(
+            "locals_cells_stack_w",
+            Type::Ref,
+            40,
+            0,
+            48,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
+        );
+        vinfo.set_parent_descr(majit_ir::descr::make_size_descr(56));
+        let mut effect = majit_ir::EffectInfo::new(
+            majit_ir::ExtraEffect::CanRaise,
+            majit_ir::OopSpecIndex::None,
+        );
+        effect.runtime_helper = majit_ir::RuntimeHelperKind::None;
+        let descr = majit_ir::descr::make_call_descr(vec![Type::Ref], Type::Ref, effect);
+        let label = Op::new(
+            OpCode::Label,
+            &[
+                rooted_inputarg_operand(Type::Ref, 0),
+                rooted_inputarg_operand(Type::Ref, 1),
+                rooted_inputarg_operand(Type::Ref, 7),
+            ],
+        );
+        let mut call = Op::new(OpCode::CallR, &[rooted_inputarg_operand(Type::Ref, 7)]);
+        call.setdescr(descr);
+        let mut ops: Vec<majit_ir::OpRc> = vec![label, call].into_iter().map(OpRc::new).collect();
+        let mut inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_int(2),
+            InputArg::new_ref(3),
+            InputArg::new_int(4),
+            InputArg::new_ref(5),
+            InputArg::new_ref(6),
+            InputArg::new_ref(7),
+        ];
+        let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
+        let entry_mints = vec![
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_ref(3),
+            OpRef::input_arg_int(4),
+            OpRef::input_arg_ref(5),
+            OpRef::input_arg_ref(6),
+        ];
+        assert!(
+            patch_new_loop_to_load_virtualizable_fields(
+                &mut ops,
+                &mut inputargs,
+                &vinfo,
+                &[1],
+                2,
+                0,
+                &mut constants,
+                &entry_mints,
+                &[],
+                None,
+            ),
+            "leftover-empty Call of a present extra past the mint must abort"
         );
     }
 
