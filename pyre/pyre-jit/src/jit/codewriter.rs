@@ -17343,11 +17343,7 @@ mod tests {
             56,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("setattr op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "setattr");
         assert_eq!(op.offset, 56);
         assert_eq!(op.args, vec![obj.into(), name.into(), value.into()]);
