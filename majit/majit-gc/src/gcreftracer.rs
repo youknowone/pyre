@@ -74,6 +74,9 @@ pub struct GcTable {
     array_length: usize,
     /// The heap-owned array, when the slots do not live in a code block.
     _owned: Option<Box<[Cell<GcRef>]>>,
+    /// Compile-time ConstPtr identities. `trace` updates slots in place;
+    /// leftover failarg ConstPtrs still name these originals.
+    compile_keys: Box<[usize]>,
 }
 
 // SAFETY: slots are written only by `trace`, which runs inside a
@@ -140,6 +143,7 @@ impl GcTable {
             array_base_addr: slots.as_ptr() as usize,
             array_length: slots.len(),
             _owned: Some(slots),
+            compile_keys: gcrefs.iter().map(|g| g.0).collect(),
         };
         Self::register(table)
     }
@@ -166,6 +170,7 @@ impl GcTable {
             array_base_addr,
             array_length: gcrefs.len(),
             _owned: None,
+            compile_keys: gcrefs.iter().map(|g| g.0).collect(),
         })
     }
 
@@ -190,6 +195,14 @@ impl GcTable {
 
     pub fn is_empty(&self) -> bool {
         self.array_length == 0
+    }
+
+    /// Compile-time address of slot `i`, used as the ConstPtr lookup key.
+    ///
+    /// `trace` rewrites [`Self::slot`] to the forwarded address; a leftover
+    /// failarg still names this original.
+    pub fn compile_key(&self, i: usize) -> usize {
+        self.compile_keys[i]
     }
 
     /// Read slot `i`.
@@ -309,6 +322,12 @@ mod tests {
         });
         assert_eq!(table.slot(0), GcRef(0x9000));
         assert_eq!(table.slot(1), GcRef(0x2000));
+        assert_eq!(
+            table.compile_key(0),
+            0x1000,
+            "ConstPtr lookup keys stay at the compile-time address"
+        );
+        assert_eq!(table.compile_key(1), 0x2000);
         assert_eq!(
             table.base_addr(),
             table._owned.as_ref().unwrap().as_ptr() as usize
