@@ -239,6 +239,7 @@ impl crate::lltype::GcType for W_UnicodeObject {
 }
 
 impl crate::lltype::GcType for W_UnicodeObjectUser {
+    #[inline(always)]
     fn type_id() -> u32 {
         W_UNICODE_USER_GC_TYPE_ID
     }
