@@ -220,7 +220,23 @@ pm1_edom!(acosh, "expected argument value not less than 1");
 pm1_edom!(atanh, "expected a number between -1 and 1");
 
 // Exponential / logarithmic
-pm1_edom!(sqrt, "expected a nonnegative input");
+/// `math.sqrt` after `_get_double`: domain pin, then [`_float_sqrt`].
+pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "sqrt() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::sqrt(val) {
+        Ok(_) => crate::objspace::descroperation::_float_abs_or_sqrt(val, true),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a nonnegative input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
 
 /// Checked-arity wrapper pointers installed by `py_module!` for the
 /// builtins the walker probes by identity.  One record, filled once at
