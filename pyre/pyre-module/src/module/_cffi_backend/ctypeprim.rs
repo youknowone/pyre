@@ -29,9 +29,15 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
                 unichr(ct, value)
             }
             // `W_CTypePrimitiveSigned.convert_to_object`.
-            ctypeobj::KIND_PRIM_SIGNED => Ok(pyre_object::w_int_new(misc::read_raw_signed_data(
-                cdata, ct.size,
-            )?)),
+            ctypeobj::KIND_PRIM_SIGNED => {
+                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) {
+                    Ok(pyre_object::w_int_new(misc::read_raw_long_data(
+                        cdata, ct.size,
+                    )?))
+                } else {
+                    convert_to_object_longlong(ct, cdata)
+                }
+            }
             // `W_CTypePrimitiveBool.convert_to_object`.
             ctypeobj::KIND_PRIM_BOOL => Ok(pyre_object::boolobject::w_bool_from(
                 read_bool_0_or_1(cdata as *const u8)? != 0,
@@ -72,6 +78,15 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
             ))),
         }
     }
+}
+
+/// `W_CTypePrimitiveSigned._convert_to_object_longlong`.
+///
+/// In its own function: LONGLONG may make the whole function jit-opaque.
+unsafe fn convert_to_object_longlong(ct: &W_CType, cdata: usize) -> Result<PyObjectRef, PyError> {
+    Ok(pyre_object::w_int_new(unsafe {
+        misc::read_raw_signed_data(cdata, ct.size)?
+    }))
 }
 
 /// `W_CTypePrimitive.convert_from_object`.
