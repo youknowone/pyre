@@ -2095,44 +2095,54 @@ fn could_merge_with_next_guard(op: &Op, i: usize, operations: &[Op]) -> bool {
     next_op.arg(0).to_opref() == op.pos().get()
 }
 
-/// `rewrite.py emit_pending_zeros` / `handle_clear_array_contents`.
-///
+/// rewrite.py `emit_pending_zeros` rewrite of the `ZERO_ARRAY` emitted
+/// by `handle_clear_array_contents`.
+enum ZeroArrayPlan {
+    /// `NEW_ARRAY`, length 0, or every index written (`ConstInt(0)`).
+    Skip,
+    /// Const-length CLEAR: items `[start, start+count)`.
+    Items { start: usize, count: usize },
+    /// Runtime-length CLEAR: items `0..length`.
+    Runtime,
+}
+
 /// IncrementalMiniMark is `malloc_zero_filled=false`, so native rewrite
 /// emits `ZERO_ARRAY` only for `NEW_ARRAY_CLEAR` and then trims any
-/// prefix/suffix that later `SETARRAYITEM_GC` writes before the next
-/// collecting op. A fully-written constant-length clear is a no-op
-/// (`ConstInt(0)`). Plain `NEW_ARRAY` never emits `ZERO_ARRAY`.
-///
-/// Wasm skips `GcRewriterImpl.clear_gc_fields` and would otherwise
-/// `memory.fill` every array payload. Apply the same skip so a length-1
-/// list whose only slot is stored in this window does not fill-then-store.
-fn skip_newarray_payload_zero(
+/// written prefix/suffix (`emit_pending_zeros`). Plain `NEW_ARRAY`
+/// never emits `ZERO_ARRAY`.
+fn newarray_zero_plan(
     op: &Op,
     ops: &[Op],
     op_idx: usize,
     constants: &indexmap::IndexMap<u32, i64>,
     length_const: Option<i64>,
-) -> bool {
+) -> ZeroArrayPlan {
     match op.opcode {
-        OpCode::NewArray => true,
+        OpCode::NewArray => ZeroArrayPlan::Skip,
         OpCode::NewArrayClear => match length_const {
-            Some(0) => true,
-            Some(len) => usize::try_from(len).is_ok_and(|n| {
-                n > 0 && newarray_clear_fully_written(ops, op_idx, op.pos().get(), n, constants)
+            Some(0) => ZeroArrayPlan::Skip,
+            Some(len) => usize::try_from(len).map_or(ZeroArrayPlan::Runtime, |n| {
+                if n == 0 {
+                    ZeroArrayPlan::Skip
+                } else {
+                    trimmed_zero_array(ops, op_idx, op.pos().get(), n, constants)
+                }
             }),
-            None => false,
+            None => ZeroArrayPlan::Runtime,
         },
-        _ => false,
+        _ => ZeroArrayPlan::Skip,
     }
 }
 
-fn newarray_clear_fully_written(
+/// rewrite.py `emit_pending_zeros`: advance `start` while the index was
+/// stored, retreat `stop` the same way. `start >= stop` is a no-op.
+fn trimmed_zero_array(
     ops: &[Op],
     op_idx: usize,
     array: OpRef,
     length: usize,
     constants: &indexmap::IndexMap<u32, i64>,
-) -> bool {
+) -> ZeroArrayPlan {
     let mut written = vec![false; length];
     for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
         if rewrite_pending_zero_flush(later) || could_merge_with_next_guard(later, j, ops) {
@@ -2153,7 +2163,22 @@ fn newarray_clear_fully_written(
             written[i] = true;
         }
     }
-    written.iter().all(|&w| w)
+    let mut start = 0;
+    while start < length && written[start] {
+        start += 1;
+    }
+    let mut stop = length;
+    while stop > start && written[stop - 1] {
+        stop -= 1;
+    }
+    if start >= stop {
+        ZeroArrayPlan::Skip
+    } else {
+        ZeroArrayPlan::Items {
+            start,
+            count: stop - start,
+        }
+    }
 }
 
 /// `rewrite.py clear_gc_fields` + `consider_setfield_gc` + `emit_pending_zeros`.
@@ -2227,7 +2252,31 @@ fn emit_pending_null_fields(sink: &mut PeepSink<'_, '_>, base_local: u32, offset
 /// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
 /// length store: items only, starting at `basesize`. IncrementalMiniMark
 /// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
-fn emit_zero_array_items(
+fn emit_zero_array_item_range(
+    sink: &mut PeepSink<'_, '_>,
+    value_types: &ValueLocals,
+    result: u32,
+    dest_ofs: i64,
+    bytes: u32,
+) {
+    if bytes == 0 {
+        return;
+    }
+    sink.local_get(value_types.local(result));
+    sink.i32_wrap_i64();
+    if dest_ofs != 0 {
+        sink.i32_const(dest_ofs as i32);
+        sink.i32_add();
+    }
+    sink.i32_const(0);
+    sink.i32_const(bytes as i32);
+    sink.memory_fill(0);
+}
+
+/// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
+/// length store: items only, starting at `basesize`. IncrementalMiniMark
+/// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
+fn emit_zero_array_plan(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
@@ -2235,45 +2284,37 @@ fn emit_zero_array_items(
     base_size: i64,
     item_size: i64,
     length: OpRef,
+    plan: &ZeroArrayPlan,
 ) {
     if item_size <= 0 {
         return;
     }
-    if let Some(n) = const_operand_value(constants, length) {
-        let Ok(n) = u32::try_from(n) else {
-            return;
-        };
-        let Some(bytes) = (item_size as u32).checked_mul(n) else {
-            return;
-        };
-        if bytes == 0 {
-            return;
+    match *plan {
+        ZeroArrayPlan::Skip => {}
+        ZeroArrayPlan::Items { start, count } => {
+            let Some(bytes) = (item_size as u32).checked_mul(count as u32) else {
+                return;
+            };
+            let dest = base_size.saturating_add((item_size as i64).saturating_mul(start as i64));
+            emit_zero_array_item_range(sink, value_types, result, dest, bytes);
         }
-        sink.local_get(value_types.local(result));
-        sink.i32_wrap_i64();
-        if base_size != 0 {
-            sink.i32_const(base_size as i32);
-            sink.i32_add();
+        ZeroArrayPlan::Runtime => {
+            sink.local_get(value_types.local(result));
+            sink.i32_wrap_i64();
+            if base_size != 0 {
+                sink.i32_const(base_size as i32);
+                sink.i32_add();
+            }
+            sink.i32_const(0);
+            emit_resolve(sink, constants, value_types, length);
+            sink.i32_wrap_i64();
+            if item_size != 1 {
+                sink.i32_const(item_size as i32);
+                sink.i32_mul();
+            }
+            sink.memory_fill(0);
         }
-        sink.i32_const(0);
-        sink.i32_const(bytes as i32);
-        sink.memory_fill(0);
-        return;
     }
-    sink.local_get(value_types.local(result));
-    sink.i32_wrap_i64();
-    if base_size != 0 {
-        sink.i32_const(base_size as i32);
-        sink.i32_add();
-    }
-    sink.i32_const(0);
-    emit_resolve(sink, constants, value_types, length);
-    sink.i32_wrap_i64();
-    if item_size != 1 {
-        sink.i32_const(item_size as i32);
-        sink.i32_mul();
-    }
-    sink.memory_fill(0);
 }
 
 /// The element index a card-marking barrier needs, or `None` for a store that
@@ -4647,46 +4688,6 @@ fn emit_nursery_ptr_increment(
     sink.i64_extend_i32_u();
 }
 
-/// Zero `len` bytes at `base_local + offset`. `base_local` holds an i32
-/// linear-memory address. Operand-stack-neutral.
-fn emit_zero_bytes(sink: &mut PeepSink<'_, '_>, base_local: u32, offset: u32, len: u32) {
-    if len == 0 {
-        return;
-    }
-    sink.local_get(base_local);
-    if offset != 0 {
-        sink.i32_const(offset as i32);
-        sink.i32_add();
-    }
-    sink.i32_const(0);
-    sink.i32_const(len as i32);
-    sink.memory_fill(0);
-}
-
-/// `malloc_cond` does not zero the payload. Nursery reset is dirty
-/// (`malloc_zero_filled = False`), so a leftover *gc pointer* would be
-/// traced. Skip the fill when this lowering stamps every gc Ref
-/// (`NewWithVtable` writes `w_class`) or the descr has none — fannkuch's
-/// eight `W_IntObject` bumps at JUMP are that case.
-fn nursery_new_has_unstamped_gc_refs(sd: &dyn SizeDescr, stamps_class_word: bool) -> bool {
-    let class_off = stamps_class_word
-        .then(|| sd.class_word_field().map(|fd| fd.offset()))
-        .flatten();
-    sd.gc_fielddescrs()
-        .iter()
-        .any(|fd| fd.field_type() == Type::Ref && Some(fd.offset()) != class_off)
-}
-
-/// Zero the payload of a headered nursery object whose header is in
-/// `header_local` and whose allocated total is `total` bytes.
-fn emit_zero_headered_payload(sink: &mut PeepSink<'_, '_>, header_local: u32, total: usize) {
-    emit_zero_bytes(
-        sink,
-        header_local,
-        GcHeader::SIZE as u32,
-        total.saturating_sub(GcHeader::SIZE) as u32,
-    );
-}
 
 /// `__indirect_function_table` indices of the allocation helpers a compiled
 /// trace calls for `New*` / `NewArray*`.
@@ -8580,6 +8581,19 @@ fn build_function(
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
                 );
+                // rewrite.py `clear_varsize_gc_fields` FLAG_STR / FLAG_UNICODE:
+                // `emit_setfield(result, 0, descr=hash_descr)`. Both layouts
+                // keep `hash` at offset 0 (`rewrite.rs clear_varsize_gc_fields`).
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_get(value_types.local(vi));
+                    sink.i32_wrap_i64();
+                    sink.i32_const(0);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                }
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
                 emit_reload_frame_if_necessary(
                     &mut sink,
@@ -8756,7 +8770,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, bump_size as usize);
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(GcHeader::SIZE as i32);
                     sink.i32_add();
@@ -8870,7 +8883,6 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
-                    emit_zero_bytes(&mut sink, alloc_scratch_local, 0, bump_size);
                     sink.local_get(alloc_scratch_local);
                     sink.i64_extend_i32_u();
                     sink.end();
@@ -9038,7 +9050,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, bump_size as usize);
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(GcHeader::SIZE as i32);
                     sink.i32_add();
@@ -10220,8 +10231,7 @@ fn build_function(
                 // rewrite.py ZERO_ARRAY after the length store covers
                 // leftover `NewArrayClear` items; plain `NewArray` does not.
                 let length_const = const_operand_value(constants, op.arg(0).to_opref());
-                let skip_payload_zero =
-                    skip_newarray_payload_zero(op, ops, op_idx, constants, length_const);
+                let zero_plan = newarray_zero_plan(op, ops, op_idx, constants, length_const);
                 let inline_nursery_total = length_const.and_then(|len| {
                     use majit_gc::header::GcHeader;
                     let len = usize::try_from(len).ok()?;
@@ -10649,14 +10659,9 @@ fn build_function(
                         frame,
                     );
                 }
-                // rewrite.py `handle_clear_array_contents`: ZERO_ARRAY after
-                // the length store, items only. Plain NEW_ARRAY never emits
-                // it. A fully-written const CLEAR is a no-op.
-                if op.opcode == OpCode::NewArrayClear
-                    && !skip_payload_zero
-                    && !OpRef::raw_is_constant(vi)
-                {
-                    emit_zero_array_items(
+                // rewrite.py `handle_clear_array_contents` / `emit_pending_zeros`.
+                if !OpRef::raw_is_constant(vi) {
+                    emit_zero_array_plan(
                         &mut sink,
                         constants,
                         value_types,
@@ -10664,6 +10669,7 @@ fn build_function(
                         base_size,
                         item_size,
                         op.arg(0).to_opref(),
+                        &zero_plan,
                     );
                 }
                 // rewrite.py `gen_malloc_nursery` remembers a const-length
