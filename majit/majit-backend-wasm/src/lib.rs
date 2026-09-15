@@ -2572,9 +2572,24 @@ pub fn record_inline_trip(pending_id: i64) {
 
 fn sweep_dead_pending() {
     PENDING_INLINES.with(|pending| {
-        pending
-            .borrow_mut()
-            .retain(|_, item| item.owner().is_some_and(|owner| !owner.is_invalidated()));
+        pending.borrow_mut().retain(|_, item| {
+            let Some(owner) = item.owner() else {
+                return false;
+            };
+            if !owner.is_invalidated() {
+                return true;
+            }
+            // The one-shot trip already zeroed the cell and marked the
+            // shared FailDescr withdrawn. Dropping the entry without
+            // restoring those leaves the next compile of that descr
+            // permanently cold.
+            if item.remap.is_none() {
+                #[cfg(target_arch = "wasm32")]
+                item.set_dispatch_withdrawn(false);
+                WasmBackend::restore_dispatch_cell(&owner, item.region.source_fail_index);
+            }
+            false
+        });
     });
 }
 
