@@ -5881,6 +5881,19 @@ fn host_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpR
     vec![advance, jump]
 }
 
+/// Same close as [`host_bridge_ops`], plus `GUARD_NOT_INVALIDATED` so the
+/// region would take the eager-merge arm if the owner were still small.
+fn host_gni_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec<OpRc> {
+    let gni = OpRc::new(Op::new(OpCode::GuardNotInvalidated, &[]));
+    gni.setfailargs(smallvec![
+        rb(OpRef::input_arg_int(40)),
+        rb(OpRef::input_arg_int(41)),
+    ]);
+    let mut ops = host_bridge_ops(label_descr);
+    ops.insert(0, gni);
+    ops
+}
+
 fn host_bridge_inputargs() -> Vec<InputArg> {
     vec![
         InputArg::from_type(Type::Int, 40),
@@ -6026,6 +6039,83 @@ fn assert_valid_owner_defers_inline_trial(preamble: bool, large_header: bool) {
     token.invalidate();
     assert!(token.is_invalidated());
     assert!(generation.load(std::sync::atomic::Ordering::Acquire));
+}
+
+/// After a peel has already grown the owner past
+/// [`majit_backend_wasm::set_inline_eager_max_bytes`], a later
+/// invalidation-watched region used to refuse the eager arm and never
+/// register a trip. That left `exception_loop_warmup`'s raise path as
+/// a permanent crossing. The size check still refuses the unmeasured
+/// re-emission; it now arms the same trip as the no-GNI deferral.
+#[test]
+fn an_oversized_owner_defers_a_gni_region_instead_of_dropping_it() {
+    use majit_backend::Backend;
+
+    let _serialized = HOST_COMPILE_LOCK.lock();
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    let token = std::sync::Arc::new(majit_backend::JitCellToken::new(1));
+    let clt = std::sync::Arc::new(majit_backend::CompiledLoopToken::new(1));
+    clt.set_loop_token_wref(std::sync::Arc::downgrade(&token));
+    token.set_compiled_loop_token(Some(clt));
+    let label_descr = majit_ir::make_loop_target_descr(71, false);
+
+    struct RestoreEagerMax(u32);
+    impl Drop for RestoreEagerMax {
+        fn drop(&mut self) {
+            majit_backend_wasm::set_inline_eager_max_bytes(self.0);
+        }
+    }
+    struct RestoreParams;
+    impl Drop for RestoreParams {
+        fn drop(&mut self) {
+            majit_backend_wasm::bridge_params_enable();
+        }
+    }
+    // Any compiled owner is larger than 1 byte.
+    let _restore = RestoreEagerMax(4096);
+    majit_backend_wasm::set_inline_eager_max_bytes(1);
+    // Parameter dispatch is not the point of this test and the host
+    // compile of a GNI+JUMP region asserts it is enabled.
+    let _restore_params = RestoreParams;
+    majit_backend_wasm::bridge_params_disable();
+
+    backend
+        .compile_loop(&host_loop_inputargs(), &host_loop_ops(&label_descr), &token)
+        .expect("the owner loop compiles");
+
+    let fail_descr = HostFailDescr {
+        fail_index: 0,
+        arg_types: vec![Type::Int, Type::Int],
+    };
+    let deferred_before = majit_backend_wasm::bridge_diag(54);
+    let inline_ok_before = majit_backend_wasm::bridge_diag(32);
+    let pending_before = majit_backend_wasm::pending_inline_count();
+    majit_backend_wasm::set_inline_trip_helper_slot(1);
+    backend
+        .compile_bridge(
+            &fail_descr,
+            &host_bridge_inputargs(),
+            &host_gni_bridge_ops(&label_descr),
+            &token,
+            &[],
+            None,
+        )
+        .expect("the GNI bridge still compiles out of line");
+    majit_backend_wasm::set_inline_trip_helper_slot(0);
+
+    assert!(
+        majit_backend_wasm::bridge_diag(54) > deferred_before,
+        "an oversized owner waits on the entry-count trip, not an unmeasured merge"
+    );
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(32),
+        inline_ok_before,
+        "an oversized owner is not merged before the trip"
+    );
+    assert!(
+        majit_backend_wasm::pending_inline_count() > pending_before,
+        "the trip is armed so the raise path can still merge once hot"
+    );
 }
 
 /// `model.py:145-152`, pinned upstream by `runner_test.py
