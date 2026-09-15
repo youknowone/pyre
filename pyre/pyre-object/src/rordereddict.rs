@@ -46,6 +46,190 @@ const DICT_INITSIZE: usize = 16;
 /// `PERTURB_SHIFT` (rordereddict.py:1021).
 const PERTURB_SHIFT: u32 = 5;
 
+/// Walk live `d.entries` slots with `ll_getitem_fast`, not
+/// `Enumerate` / `FilterMap`.
+pub struct LiveIter<'a, K, V> {
+    entries: &'a [Option<Entry<K, V>>],
+    front: usize,
+    back: usize,
+}
+
+impl<'a, K, V> LiveIter<'a, K, V> {
+    fn new(entries: &'a [Option<Entry<K, V>>]) -> Self {
+        Self {
+            entries,
+            front: 0,
+            back: entries.len(),
+        }
+    }
+
+    fn entry_at(&self, i: usize) -> Option<(&'a K, &'a V)> {
+        let e = unsafe { &*self.entries.as_ptr().add(i) };
+        e.as_ref().map(|e| (&e.key, &e.value))
+    }
+}
+
+impl<'a, K, V> Iterator for LiveIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.front < self.back {
+            let i = self.front;
+            self.front += 1;
+            if let Some(item) = self.entry_at(i) {
+                return Some(item);
+            }
+        }
+        None
+    }
+}
+
+impl<K, V> DoubleEndedIterator for LiveIter<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.front < self.back {
+            self.back -= 1;
+            if let Some(item) = self.entry_at(self.back) {
+                return Some(item);
+            }
+        }
+        None
+    }
+}
+
+pub struct LiveSlotIter<'a, K, V> {
+    inner: LiveIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for LiveSlotIter<'a, K, V> {
+    type Item = (usize, &'a K, &'a V);
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.inner.front < self.inner.back {
+            let i = self.inner.front;
+            self.inner.front += 1;
+            if let Some((k, v)) = self.inner.entry_at(i) {
+                return Some((i, k, v));
+            }
+        }
+        None
+    }
+}
+
+impl<K, V> DoubleEndedIterator for LiveSlotIter<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.inner.front < self.inner.back {
+            self.inner.back -= 1;
+            let i = self.inner.back;
+            if let Some((k, v)) = self.inner.entry_at(i) {
+                return Some((i, k, v));
+            }
+        }
+        None
+    }
+}
+
+pub struct LiveKeys<'a, K, V> {
+    inner: LiveIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for LiveKeys<'a, K, V> {
+    type Item = &'a K;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+impl<K, V> DoubleEndedIterator for LiveKeys<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(k, _)| k)
+    }
+}
+
+pub struct LiveValues<'a, K, V> {
+    inner: LiveIter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for LiveValues<'a, K, V> {
+    type Item = &'a V;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> DoubleEndedIterator for LiveValues<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(_, v)| v)
+    }
+}
+
+pub struct LiveIterMut<'a, K, V> {
+    entries: *mut Option<Entry<K, V>>,
+    len: usize,
+    front: usize,
+    back: usize,
+    _mark: std::marker::PhantomData<&'a mut Option<Entry<K, V>>>,
+}
+
+impl<'a, K, V> LiveIterMut<'a, K, V> {
+    fn new(entries: &'a mut [Option<Entry<K, V>>]) -> Self {
+        let len = entries.len();
+        Self {
+            entries: entries.as_mut_ptr(),
+            len,
+            front: 0,
+            back: len,
+            _mark: std::marker::PhantomData,
+        }
+    }
+
+    fn entry_at(&mut self, i: usize) -> Option<(&'a mut K, &'a mut V)> {
+        debug_assert!(i < self.len);
+        let e = unsafe { &mut *self.entries.add(i) };
+        e.as_mut().map(|e| (&mut e.key, &mut e.value))
+    }
+}
+
+impl<'a, K, V> Iterator for LiveIterMut<'a, K, V> {
+    type Item = (&'a mut K, &'a mut V);
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.front < self.back {
+            let i = self.front;
+            self.front += 1;
+            if let Some(item) = self.entry_at(i) {
+                return Some(item);
+            }
+        }
+        None
+    }
+}
+
+impl<K, V> DoubleEndedIterator for LiveIterMut<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        while self.front < self.back {
+            self.back -= 1;
+            if let Some(item) = self.entry_at(self.back) {
+                return Some(item);
+            }
+        }
+        None
+    }
+}
+
+pub struct LiveValuesMut<'a, K, V> {
+    inner: LiveIterMut<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for LiveValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(_, v)| v)
+    }
+}
+
+impl<K, V> DoubleEndedIterator for LiveValuesMut<'_, K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(_, v)| v)
+    }
+}
+
 /// Residual `mem::replace` of an entry value (`ll_dict_setitem` overwrite).
 #[majit_macros::dont_look_inside]
 fn replace_value<V>(slot: &mut V, value: V) -> V {
@@ -284,43 +468,38 @@ impl<K, V, S> RDict<K, V, S> {
         }
     }
 
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
-        self.entries
-            .iter()
-            .filter_map(|e| e.as_ref().map(|e| (&e.key, &e.value)))
+    pub fn iter(&self) -> LiveIter<'_, K, V> {
+        LiveIter::new(&self.entries)
     }
 
     /// Pairs with their slot numbers, for a caller that must name an entry
     /// again after the walk.
-    pub fn iter_slots(&self) -> impl DoubleEndedIterator<Item = (usize, &K, &V)> {
-        self.entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| e.as_ref().map(|e| (i, &e.key, &e.value)))
+    pub fn iter_slots(&self) -> LiveSlotIter<'_, K, V> {
+        LiveSlotIter {
+            inner: LiveIter::new(&self.entries),
+        }
     }
 
-    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = (&K, &mut V)> {
-        self.entries
-            .iter_mut()
-            .filter_map(|e| e.as_mut().map(|e| (&e.key, &mut e.value)))
+    pub fn iter_mut(&mut self) -> LiveIterMut<'_, K, V> {
+        LiveIterMut::new(&mut self.entries)
     }
 
-    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> {
-        self.entries
-            .iter()
-            .filter_map(|e| e.as_ref().map(|e| &e.key))
+    pub fn keys(&self) -> LiveKeys<'_, K, V> {
+        LiveKeys {
+            inner: LiveIter::new(&self.entries),
+        }
     }
 
-    pub fn values(&self) -> impl DoubleEndedIterator<Item = &V> {
-        self.entries
-            .iter()
-            .filter_map(|e| e.as_ref().map(|e| &e.value))
+    pub fn values(&self) -> LiveValues<'_, K, V> {
+        LiveValues {
+            inner: LiveIter::new(&self.entries),
+        }
     }
 
-    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut V> {
-        self.entries
-            .iter_mut()
-            .filter_map(|e| e.as_mut().map(|e| &mut e.value))
+    pub fn values_mut(&mut self) -> LiveValuesMut<'_, K, V> {
+        LiveValuesMut {
+            inner: LiveIterMut::new(&mut self.entries),
+        }
     }
 
     /// The slot the next insert will fill, i.e. `d.num_ever_used_items`.
@@ -819,15 +998,9 @@ impl<K: std::fmt::Debug, V: std::fmt::Debug, S> std::fmt::Debug for RDict<K, V, 
 
 impl<'a, K, V, S> IntoIterator for &'a RDict<K, V, S> {
     type Item = (&'a K, &'a V);
-    type IntoIter = std::iter::FilterMap<
-        std::slice::Iter<'a, Option<Entry<K, V>>>,
-        fn(&'a Option<Entry<K, V>>) -> Option<(&'a K, &'a V)>,
-    >;
+    type IntoIter = LiveIter<'a, K, V>;
     fn into_iter(self) -> Self::IntoIter {
-        fn pair<K, V>(e: &Option<Entry<K, V>>) -> Option<(&K, &V)> {
-            e.as_ref().map(|e| (&e.key, &e.value))
-        }
-        self.entries.iter().filter_map(pair as fn(_) -> _)
+        self.iter()
     }
 }
 
