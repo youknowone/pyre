@@ -1233,6 +1233,8 @@ impl W_Struct {
     }
 
     /// `_struct.Struct.__repr__` — `Struct('<format>')`.
+    /// Residual: PyPy `W_Struct` has no `descr_repr`; format! is host.
+    #[majit_macros::dont_look_inside]
     fn __repr__(&self) -> Result<String, crate::PyError> {
         self.ensure_ready()?;
         let fmt = unsafe { w_str_get_value(self.format) };
