@@ -2124,8 +2124,12 @@ impl PyFrame {
         let src_vals = locals_w!(src).as_slice().to_vec();
         let dst = locals_w_mut!(self);
         let n = src_vals.len().min(dst.as_slice().len());
+        let dst_p = dst.items_mut_ptr();
         for (i, &v) in src_vals.iter().take(n).enumerate() {
-            dst[i] = v;
+            // `ll_setitem_fast` on the locals array.
+            unsafe {
+                *dst_p.add(i) = v;
+            }
         }
         remember_frame_locals_array(self.locals_cells_stack_w);
     }
@@ -4792,7 +4796,8 @@ impl PyFrame {
         let mut i = lst.len();
         while i > 0 {
             i -= 1;
-            self.append_block(lst[i]);
+            // `ll_getitem_fast` on the rebuilt block list.
+            self.append_block(unsafe { *lst.as_ptr().add(i) });
         }
     }
 
