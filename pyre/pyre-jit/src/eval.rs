@@ -9780,9 +9780,11 @@ pub extern "C" fn ll_unpackiterable_portal_runner_shim(
 
 /// `warmspot.py handle_jitexception` for `unpackiterable_driver`.
 ///
-/// Greens are `['greenkey']`; reds are auto `w_iterator`, `items`.
-/// `portal_ptr(*args)` is the split-portal loop, not the `newlist_hint`
-/// prologue and not the bytecode portal's frame runner.
+/// `bhimpl_jit_merge_point` raises `ContinueRunningNormally(*args)` as the
+/// six banks; `handle_jitexception` walks `portalfunc_ARGS` and calls
+/// `portal_ptr(*args)`. The extracted portal's reds are `root_base`,
+/// `items_slot`, and the `RootScope` cell — not `w_iterator`/`items`.
+/// Reload those pinned objects the portal function still takes.
 fn unpackiterable_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<
@@ -9795,16 +9797,17 @@ fn unpackiterable_portal_runner(
     let JitException::ContinueRunningNormally(args) = exc else {
         return Ok((BhReturnType::Void, 0));
     };
-    let mut all_r = args.green_ref.clone();
-    all_r.extend(&args.red_ref);
-    let greenkey = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let w_iterator = all_r.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let items = all_r.get(2).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let greenkey = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let root_base = args.red_int.first().copied().unwrap_or(0) as usize;
+    let items_slot = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    let w_iterator = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let items = pyre_object::gc_roots::shadow_stack_get(items_slot);
     assert!(
-        !w_iterator.is_null() && !items.is_null(),
-        "unpackiterable portal runner: ContinueRunningNormally missing reds \
-         (iterator/items); greens={} reds={}",
+        !greenkey.is_null() && !w_iterator.is_null() && !items.is_null(),
+        "unpackiterable portal runner: ContinueRunningNormally missing extracted reds \
+         green_ref={} red_int={} red_ref={}",
         args.green_ref.len(),
+        args.red_int.len(),
         args.red_ref.len(),
     );
     match pyre_interpreter::unpackiterable_portal(greenkey, w_iterator, items) {
