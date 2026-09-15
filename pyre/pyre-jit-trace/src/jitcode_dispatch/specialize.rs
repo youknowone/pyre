@@ -16686,20 +16686,9 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return Ok(None);
     };
-    let w_mod = match import_cached_lookup(s, fromlist_empty) {
-        Ok(Some(w_mod)) => w_mod,
+    let probe = match import_cached_lookup(s, fromlist_empty) {
         Ok(None) => return Ok(None),
-        Err(mut err) => {
-            let exc = err.to_exc_object();
-            let raised = ctx.trace_ctx.const_ref(exc as i64);
-            ctx.set_last_exc_value(raised, ConcreteValue::Ref(exc));
-            ctx.fbw_mode.class_of_last_exc_is_const = true;
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-            return Ok(Some(DispatchOutcome::SubRaise {
-                exc: raised,
-                exc_concrete: ConcreteValue::Ref(exc),
-            }));
-        }
+        other => other,
     };
 
     let callable_op = r_args[0];
@@ -16754,31 +16743,65 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
 
     let helper = jit_import_cached as *const ();
-    // Impure `CallR`: `sys.modules` is mutable, so an elidable / `CallPureR`
-    // rewrite would fold the entry observed while tracing.  `_gcd_import`
-    // re-raises a non-`AttributeError` from `__spec__` / `_initializing`,
-    // so this is `EF_CAN_RAISE` plus `GuardNoException` (`pyjitpl.py`
-    // `handle_possible_exception`).  FastPathGiveUp stays a null result
-    // and fails the identity `GuardValue` instead.
+    // Impure `CallR`.  `__spec__` / `_initializing` can run Python, so this
+    // is `MOST_GENERAL` (`default_effect_info`) plus the same heap-cache
+    // invalidate `residual_call` applies after `execute_varargs`.  An empty
+    // `can_raise_effect_info` write set would keep pre-call field values.
+    // `_gcd_import` re-raises a non-`AttributeError`; `handle_possible_exception`
+    // records `GUARD_EXCEPTION` on that arm and `GUARD_NO_EXCEPTION` on a hit.
     let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
+    let ei = majit_metainterp::default_effect_info();
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
         &[name_op, fromlist_empty_op],
         &[majit_ir::Type::Ref, majit_ir::Type::Int],
         majit_ir::Type::Ref,
-        majit_metainterp::can_raise_effect_info(),
+        ei,
     );
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
+    let helper_op = ctx.trace_ctx.const_int(helper as usize as i64);
+    ctx.trace_ctx.heapcache_invalidate_caches_varargs(
+        OpCode::CallR,
+        Some(&majit_metainterp::default_effect_info()),
+        &[helper_op, name_op, fromlist_empty_op],
     );
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    let expected = ctx.trace_ctx.const_ref(w_mod as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-    Ok(Some(DispatchOutcome::Continue))
+    match probe {
+        Ok(Some(w_mod)) => {
+            ctx.trace_ctx.set_opref_concrete(
+                result,
+                majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
+            );
+            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+            let expected = ctx.trace_ctx.const_ref(w_mod as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[result, expected],
+            )?;
+            ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+            Ok(Some(DispatchOutcome::Continue))
+        }
+        Err(mut err) => {
+            // `execute_raised(..., constant=False)`: record the residual
+            // plus `GUARD_EXCEPTION` so compiled iterations re-run the
+            // accessor instead of baking this exception as a constant.
+            let exc = err.to_exc_object();
+            let raised = ctx.trace_ctx.const_ref(exc as i64);
+            ctx.set_last_exc_value(raised, ConcreteValue::Ref(exc));
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
+            if let Some(cb) = crate::callbacks::try_get() {
+                (cb.drain_backend_jit_exc)();
+            }
+            walker_record_guard_exception(ctx, op.pc);
+            Ok(Some(DispatchOutcome::SubRaise {
+                exc: raised,
+                exc_concrete: ConcreteValue::Ref(exc),
+            }))
+        }
+        Ok(None) => Ok(None),
+    }
 }
 
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
