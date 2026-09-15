@@ -304,6 +304,18 @@ fn get_or_create_array_descr_with_full_id(
             .get(&gc_key)
             .cloned()
         {
+            // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
+            // Runtime `init_array_descr` / `pyobject_gcarray_descr`
+            // carry the collector tid; stamp it onto the shared Arc
+            // so `gen_initialize_tid` does not fall back to
+            // `OBJECT_GC_TYPE_ID` (frame-locals walk as a 16-byte
+            // PyObject — `fib_recursive` SIGSEGV).
+            if type_id != 0
+                && let Some(ad) = existing.as_array_descr()
+                && ad.type_id() == 0
+            {
+                ad.set_type_id(type_id);
+            }
             // Memoise into the local structural cache so subsequent
             // `get_or_create_array_descr_with_full_id` calls with the
             // same structural key hit the local fast path without
@@ -7565,6 +7577,27 @@ mod tests {
             .get_parent_descr()
             .expect("interior field parent_descr must be preserved");
         assert_eq!(parent.as_size_descr().unwrap().size(), 16);
+    }
+
+    /// `pyobject_gcarray_descr` is `cpu.arraydescrof(GcArray(OBJECTPTR))`:
+    /// the runtime singleton must occupy the same `cache[ARRAY]` slot the
+    /// codewriter names (`OBJECT_REF_GCARRAY_TYPE_ID`) so short-preamble
+    /// `resolve_array_tid` recovers `PY_OBJECT_ARRAY_GC_TYPE_ID`.
+    #[test]
+    fn pyobject_gcarray_descr_publishes_under_the_codewriter_array_identity() {
+        let descr = crate::state::pyobject_gcarray_descr();
+        let array = descr
+            .as_array_descr()
+            .expect("pyobject_gcarray_descr must be an ArrayDescr");
+        let atid = majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+        let cache_key = majit_ir::descr::path_hash(atid);
+        assert_eq!(array.type_id(), PY_OBJECT_ARRAY_GC_TYPE_ID);
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_array_tid(cache_key),
+            Some(PY_OBJECT_ARRAY_GC_TYPE_ID),
+        );
     }
 }
 

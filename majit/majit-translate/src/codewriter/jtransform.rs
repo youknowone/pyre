@@ -6905,7 +6905,15 @@ impl<'a> Transformer<'a> {
                             result: op.result.clone(),
                             kind: OpKind::ArrayLen {
                                 base: block,
-                                array_type_id: None,
+                                // `cpu.arraydescrof(GcArray(OBJECTPTR))` —
+                                // the ItemsBlock identity
+                                // (`OBJECT_REF_GCARRAY_TYPE_ID`).  Without
+                                // it ArraylenGc mints cache_key=0 and
+                                // short-preamble `make_guards` cannot
+                                // resolve a GC tid, so unroll aborts.
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
                                 nolength: false,
                             },
                         },
@@ -7025,7 +7033,9 @@ impl<'a> Transformer<'a> {
                                 base: block,
                                 index,
                                 item_ty: ValueType::Ref(None),
-                                array_type_id: None,
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
                                 nolength: false,
                                 pure: false,
                             },
@@ -7057,7 +7067,9 @@ impl<'a> Transformer<'a> {
                                 index,
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Ref(None),
-                                array_type_id: None,
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
                                 nolength: false,
                             },
                         },
@@ -19314,6 +19326,49 @@ mod tests {
             OpKind::ArrayLen { base, nolength, .. } => {
                 assert_eq!(base, &block);
                 assert!(!*nolength, "the block carries its length header");
+            }
+            other => panic!("expected ArrayLen, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, Some(result));
+    }
+
+    /// `list.obj_capacity(l)` names the ItemsBlock ARRAY identity so
+    /// `arraylen_gc` carries a resolvable GC tid (`rlist.py len(l.items)`).
+    #[test]
+    fn handle_list_call_obj_capacity_names_the_items_block_array() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_obj_capacity");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.obj_capacity",
+                &op,
+                std::slice::from_ref(&l),
+                &mut graph,
+                "list_obj_capacity",
+            )
+            .expect("list.obj_capacity must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        match &ops[1].kind {
+            OpKind::ArrayLen {
+                array_type_id,
+                nolength,
+                ..
+            } => {
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                );
+                assert!(!*nolength, "the ItemsBlock carries its length header");
             }
             other => panic!("expected ArrayLen, got {other:?}"),
         }

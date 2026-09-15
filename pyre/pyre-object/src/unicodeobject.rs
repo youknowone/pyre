@@ -1342,15 +1342,25 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
     unsafe { w_str_concat(a as PyObjectRef, b as PyObjectRef) as i64 }
 }
 
-#[majit_macros::elidable]
+/// `rstr.py LLHelpers.ll_str_mul` — `@jit.elidable` on the STR payload.
+/// The wrapper is allocated here because wrap stays residual; the walker
+/// records this fused helper `CanRaise` so two `s * n` sites do not CSE
+/// (`descr_mul` / `is_w`).  `ovfcheck(len * times)` is MemoryError
+/// upstream; a later huge `times` must not hang on `"" * n` or panic
+/// in `with_capacity`.
 pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe {
         let sv = w_str_get_wtf8(s);
         let count = if n < 0 { 0 } else { n as usize };
-        let mut result = Wtf8Buf::with_capacity(sv.len() * count);
-        for _ in 0..count {
-            result.push_wtf8(sv);
+        let Some(cap) = sv.len().checked_mul(count) else {
+            return PY_NULL as i64;
+        };
+        let mut result = Wtf8Buf::with_capacity(cap);
+        if !sv.is_empty() {
+            for _ in 0..count {
+                result.push_wtf8(sv);
+            }
         }
         w_str_from_wtf8_managed(result) as i64
     }
@@ -1438,18 +1448,21 @@ pub extern "C" fn jit_str_rfind_bounds(s: i64, sub: i64, start: i64, end: i64) -
 
 /// `_unicode_sliced` (`unicodeobject.py`) with already-unboxed
 /// code-point bounds and step 1.  The payload cut is `_utf8[start_byte:
-/// end_byte]` after `_index_to_byte`; the wrap is `newutf8`.
-#[majit_macros::elidable_or_memerror]
+/// end_byte]` after `_index_to_byte`.  The wrap is `w_str_cut`:
+/// `ll_stringslice_startstop` returns the source STR when the window is
+/// the whole string (`start == 0 and stop >= len`), and `is_w` then
+/// reports `s[:] is s` via `_utf8` identity.  Not elidable: two
+/// `s[1:4]` sites allocate two wrappers / payloads (`is_w` of `_len() > 1`).
 pub extern "C" fn jit_str_slice(s: i64, start: i64, end: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe {
         let Some((lo, hi)) = str_byte_window(s, start, end) else {
             return w_str_new("") as i64;
         };
-        let hay = w_str_get_wtf8(s).as_bytes();
-        let part = rustpython_wtf8::Wtf8::from_bytes(&hay[lo..hi])
+        let hay = w_str_get_wtf8(s);
+        let part = rustpython_wtf8::Wtf8::from_bytes(&hay.as_bytes()[lo..hi])
             .expect("code-point-aligned slice is WTF-8");
-        w_str_from_wtf8_managed(part.to_wtf8_buf()) as i64
+        w_str_cut(s, part) as i64
     }
 }
 
@@ -1812,6 +1825,11 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_value(sliced), "二三四");
         }
+        let full = jit_str_slice(hay as i64, 0, unsafe { w_str_len(hay) } as i64) as PyObjectRef;
+        assert!(
+            std::ptr::eq(full, hay),
+            "full-window slice must reuse the receiver (`ll_stringslice_startstop` / `is_w`)"
+        );
     }
 
     #[test]
