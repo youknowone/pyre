@@ -934,7 +934,7 @@ pub(crate) fn fbw_append_promote_journal_rollback_last(list: pyre_object::PyObje
 /// Record the `intvalue` a walked eager `IntMutableCell` store displaces,
 /// for the in-place restore when the walk does not commit its end state.
 // Consumed by the StoreName/StoreGlobal cell fold
-// (`emit_namespace_cell_store_fold`).
+// (`try_walker_orthodox_write_cell`).
 pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intvalue_before: i64) {
     if fbw_debug_abort_enabled() {
         eprintln!(
@@ -942,8 +942,33 @@ pub(crate) fn fbw_cell_store_journal_push(cell: pyre_object::PyObjectRef, intval
             cell as usize
         );
     }
-    FBW_CELL_STORE_JOURNAL.with(|j| j.borrow_mut().push((cell, intvalue_before)));
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        j.borrow_mut().push(FbwCellStore::Int {
+            cell,
+            before: intvalue_before,
+        })
+    });
     // gh#467: see `fbw_store_journal_push`.
+    fbw_bump_executed_effect("cell_store_journal");
+}
+
+/// Record the `w_value` a walked eager `ObjectMutableCell` store displaces.
+pub(crate) fn fbw_obj_cell_store_journal_push(
+    cell: pyre_object::PyObjectRef,
+    w_value_before: pyre_object::PyObjectRef,
+) {
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-cell-journal] push-obj cell=0x{:x} before=0x{:x}",
+            cell as usize, w_value_before as usize
+        );
+    }
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        j.borrow_mut().push(FbwCellStore::Obj {
+            cell,
+            before: w_value_before,
+        })
+    });
     fbw_bump_executed_effect("cell_store_journal");
 }
 
@@ -2147,16 +2172,35 @@ pub(crate) fn fbw_store_journal_rollback() {
     // reverse push order (raw i64 write; allocation-free, cells immovable).
     FBW_CELL_STORE_JOURNAL.with(|j| {
         let mut entries = j.borrow_mut();
-        while let Some((cell, intvalue_before)) = entries.pop() {
+        while let Some(entry) = entries.pop() {
             unsafe {
-                if fbw_debug_abort_enabled() {
-                    eprintln!(
-                        "[fbw-cell-journal] rollback cell=0x{:x} {} -> {intvalue_before}",
-                        cell as usize,
-                        (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue
-                    );
+                match entry {
+                    FbwCellStore::Int { cell, before } => {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-cell-journal] rollback cell=0x{:x} {} -> {before}",
+                                cell as usize,
+                                (*(cell as *const pyre_object::celldict::IntMutableCell)).intvalue
+                            );
+                        }
+                        (*(cell as *mut pyre_object::celldict::IntMutableCell)).intvalue = before;
+                    }
+                    FbwCellStore::Obj { cell, before } => {
+                        if fbw_debug_abort_enabled() {
+                            eprintln!(
+                                "[fbw-cell-journal] rollback-obj cell=0x{:x} -> 0x{:x}",
+                                cell as usize, before as usize
+                            );
+                        }
+                        // `write_cell` dirtied the prebuilt-root bit for the
+                        // speculative store; a minor collection can consume
+                        // that bit before rollback.  Restoring a young
+                        // `before` without re-dirtying leaves this immortal
+                        // cell off the next prebuilt walk.
+                        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+                        (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
+                    }
                 }
-                (*(cell as *mut pyre_object::celldict::IntMutableCell)).intvalue = intvalue_before;
             }
         }
     });

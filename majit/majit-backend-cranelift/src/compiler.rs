@@ -18320,7 +18320,11 @@ impl majit_backend::Backend for CraneliftBackend {
             let old_weak = Arc::downgrade(&old_clt);
             new_clt.update_frame_info(&old_clt, old_weak, baseofs);
         }
-        redirect_call_assembler_target(old.number, new.number)
+        redirect_call_assembler_target(old.number, new.number)?;
+        // Non-x86 assemblers log `newlooptoken.number`
+        // (`aarch64/assembler.py redirect_call_assembler`).
+        majit_backend::redirect_assembler(old, new, new.number);
+        Ok(())
     }
 
     fn free_loop(&mut self, token: &JitCellToken) {

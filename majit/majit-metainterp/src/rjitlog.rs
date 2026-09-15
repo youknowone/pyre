@@ -155,8 +155,18 @@ pub fn register_get_location(types: &[(u8, u8)], get_location: GetLocation) {
     state.get_location = Some(get_location);
 }
 
+/// `rpython.rlib.rjitlog.redirect_assembler` — assemblers call
+/// `majit_backend::redirect_assembler`; this is the writer they install.
+pub fn install_backend_hooks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        majit_backend::register_redirect_assembler_log(redirect_assembler);
+    });
+}
+
 /// `rjitlog.py redirect_assembler`.
 pub fn redirect_assembler(old_id: u64, new_id: u64, asm_adr: u64) {
+    install_backend_hooks();
     jitlog_try_init_using_env();
     let mut state = lock();
     if state.file.is_none() {
@@ -302,12 +312,15 @@ impl VarMemo {
             return "-".into();
         }
         if let Some(value) = arg.const_value() {
-            // rjitlog.py var_to_str: ConstInt / ConstFloat / ConstPtr
-            // allocate a memo slot before formatting. Value::Void is
-            // not an upstream constant; do not consume a slot.
+            // rjitlog.py var_to_str: memo is keyed by the box object,
+            // not the printed value. Value::Void is not an upstream
+            // constant; do not consume a slot.
+            if matches!(value, Value::Void) {
+                return "None".into();
+            }
+            let id = self.assign(b'k', arg.identity_key());
             return match value {
                 Value::Int(v) => {
-                    let _ = self.assign(b'I', v as u64);
                     // rjitlog.py var_to_str: ConstClass(name) when the
                     // int could be an address and addr2name hits.
                     if int_could_be_an_address(v)
@@ -318,23 +331,14 @@ impl VarMemo {
                     }
                     v.to_string()
                 }
-                Value::Float(v) => {
-                    let _ = self.assign(b'F', v.to_bits());
-                    v.to_string()
-                }
-                Value::Ref(r) if r.is_null() => {
-                    let _ = self.assign(b'P', 0);
-                    "ConstPtr(null)".into()
-                }
-                Value::Ref(r) => {
-                    let id = self.assign(b'P', r.0 as u64);
-                    format!("ConstPtr(ptr{id})")
-                }
+                Value::Float(v) => python_float_str(v),
+                Value::Ref(r) if r.is_null() => "ConstPtr(null)".into(),
+                Value::Ref(_) => format!("ConstPtr(ptr{id})"),
                 Value::Void => "None".into(),
             };
         }
         if arg.is_null_ref() {
-            let _ = self.assign(b'P', 0);
+            let _ = self.assign(b'k', arg.identity_key());
             return "ConstPtr(null)".into();
         }
         if arg.is_inputarg() {
@@ -584,6 +588,56 @@ fn int_could_be_an_address(x: i64) -> bool {
     !(-32768..=32767).contains(&x)
 }
 
+/// `str(float)` spelling from `rjitlog.py var_to_str` (`str(arg.getfloat())`).
+///
+/// Rust `f64::to_string()` writes `NaN`, omits `.0` on integrals, and keeps
+/// fixed form past Python's `1e16` / `1e-4` switch. Match CPython's
+/// lowercase non-finites, signed two-digit exponents, and those thresholds.
+fn python_float_str(v: f64) -> String {
+    if v.is_nan() {
+        return "nan".into();
+    }
+    if !v.is_finite() {
+        return if v.is_sign_negative() {
+            "-inf".into()
+        } else {
+            "inf".into()
+        };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
+    }
+    let abs = v.abs();
+    if abs >= 1e16 || abs < 1e-4 {
+        return python_scientific_str(v);
+    }
+    let s = v.to_string();
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// `str(float)` scientific form. rustc's `{:e}` is the correctly-rounded
+/// shortest mantissa; Python only differs in the exponent's sign and
+/// minimum width (`e+16`, `e-05`). Reconstructing `mant * 10**exp` in
+/// `f64` underflows (`5e-324` → `infe-323`) and changes trailing digits.
+fn python_scientific_str(v: f64) -> String {
+    let s = format!("{v:e}");
+    let Some((mant, exp)) = s.split_once('e') else {
+        return s;
+    };
+    let Ok(exp) = exp.parse::<i32>() else {
+        return s;
+    };
+    format!("{mant}e{exp:+03}")
+}
+
 /// `rjitlog.py encode_str`.
 pub fn encode_str(string: &str) -> Vec<u8> {
     let len = string.len() as u32;
@@ -681,6 +735,46 @@ mod tests {
             "ConstClass(alpha)"
         );
         assert_eq!(memo.operand(&Operand::const_from_value(Value::Int(5))), "5");
+    }
+
+    #[test]
+    fn float_constants_keep_python_spelling() {
+        assert_eq!(python_float_str(1.0), "1.0");
+        assert_eq!(python_float_str(-0.0), "-0.0");
+        assert_eq!(python_float_str(0.0), "0.0");
+        assert_eq!(python_float_str(1.5), "1.5");
+        assert_eq!(python_float_str(1e16), "1e+16");
+        assert_eq!(python_float_str(1e15), "1000000000000000.0");
+        assert_eq!(python_float_str(1e-4), "0.0001");
+        assert_eq!(python_float_str(1e-5), "1e-05");
+        assert_eq!(python_float_str(1e20), "1e+20");
+        assert_eq!(python_float_str(5e-324), "5e-324");
+        assert_eq!(python_float_str(-5e-324), "-5e-324");
+        assert_eq!(python_float_str(f64::MAX), "1.7976931348623157e+308");
+        assert_eq!(python_float_str(f64::MIN), "-1.7976931348623157e+308");
+        assert_eq!(
+            python_float_str(2.2250738585072014e-308),
+            "2.2250738585072014e-308"
+        );
+        assert_eq!(python_float_str(f64::INFINITY), "inf");
+        assert_eq!(python_float_str(f64::NEG_INFINITY), "-inf");
+        assert_eq!(python_float_str(f64::NAN), "nan");
+        let mut memo = VarMemo::default();
+        assert_eq!(
+            memo.operand(&Operand::const_from_value(Value::Float(1.0))),
+            "1.0"
+        );
+    }
+
+    #[test]
+    fn equal_const_ints_keep_separate_memo_slots() {
+        let mut memo = VarMemo::default();
+        let a = Operand::const_from_value(Value::Int(5));
+        let b = Operand::const_from_value(Value::Int(5));
+        assert_eq!(memo.operand(&a), "5");
+        assert_eq!(memo.operand(&b), "5");
+        let i = InputArg::new_int(0);
+        assert_eq!(memo.inputarg(&i), "i2");
     }
 
     #[test]

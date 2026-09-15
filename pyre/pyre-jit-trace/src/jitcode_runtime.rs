@@ -382,6 +382,10 @@ static LIST_APPEND_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_list_pop_end_inner`, resolved by name for
 /// the same reason.
 static LIST_POP_END_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Cached `ALL_JITCODES` index of `write_cell` (`typeobject.py write_cell`).
+static WRITE_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Cached `ALL_JITCODES` index of `unwrap_cell` (`typeobject.py unwrap_cell`).
+static UNWRAP_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
 static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
@@ -515,6 +519,21 @@ pub fn list_append_jitcode() -> Option<Arc<JitCode>> {
 pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*LIST_POP_END_JITCODE_INDEX
         .get_or_init(|| compute_named_jitcode_index("w_list_pop_end_inner")))?;
+    get_jitcode_by_index(idx)
+}
+
+/// Generated `typeobject.py write_cell` body.  Leaf name is unique in the
+/// pipeline (one graph).  `None` when the helper is absent (compact tests).
+pub fn write_cell_jitcode() -> Option<Arc<JitCode>> {
+    let idx =
+        (*WRITE_CELL_JITCODE_INDEX.get_or_init(|| compute_named_jitcode_index("write_cell")))?;
+    get_jitcode_by_index(idx)
+}
+
+/// Generated `typeobject.py unwrap_cell` body.  Leaf name is unique.
+pub fn unwrap_cell_jitcode() -> Option<Arc<JitCode>> {
+    let idx =
+        (*UNWRAP_CELL_JITCODE_INDEX.get_or_init(|| compute_named_jitcode_index("unwrap_cell")))?;
     get_jitcode_by_index(idx)
 }
 
@@ -3209,6 +3228,25 @@ mod tests {
         assert!(
             !jc.code.is_empty(),
             "w_list_pop_end_inner jitcode should have non-empty bytecode (assembled body)"
+        );
+    }
+
+    #[test]
+    fn write_cell_jitcode_resolves_charon_body() {
+        let jc = write_cell_jitcode()
+            .expect("build-time pipeline must contain the charon `write_cell` jitcode");
+        assert_eq!(jc.name, "write_cell");
+        assert!(!jc.code.is_empty(), "write_cell jitcode should have a body");
+    }
+
+    #[test]
+    fn unwrap_cell_jitcode_resolves_charon_body() {
+        let jc = unwrap_cell_jitcode()
+            .expect("build-time pipeline must contain the charon `unwrap_cell` jitcode");
+        assert_eq!(jc.name, "unwrap_cell");
+        assert!(
+            !jc.code.is_empty(),
+            "unwrap_cell jitcode should have a body"
         );
     }
 

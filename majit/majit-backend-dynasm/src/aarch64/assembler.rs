@@ -5036,9 +5036,17 @@ impl<'a> AssemblerARM64<'a> {
 
     /// assembler.py:1138 redirect_call_assembler: patch old loop entry
     /// to JMP to new loop after retrace.
-    pub fn redirect_call_assembler(old_addr: *const u8, new_addr: *const u8) {
+    pub fn redirect_call_assembler(
+        old: &majit_backend::JitCellToken,
+        new: &majit_backend::JitCellToken,
+        old_addr: *const u8,
+        new_addr: *const u8,
+    ) {
         // redirect_call_assembler uses a plain B (no link) to the new loop.
         unsafe { Self::write_redirect_branch(old_addr as usize, new_addr as usize, false) };
+        // `aarch64/assembler.py redirect_call_assembler`:
+        // `jl.redirect_assembler(..., newlooptoken.number)`.
+        majit_backend::redirect_assembler(old, new, new.number);
     }
 
     // ----------------------------------------------------------------

@@ -29,6 +29,27 @@ pub fn take_null_mem_access() -> bool {
     NULL_MEM_ACCESS.with(|cell| cell.replace(false))
 }
 
+/// `rpython.rlib.rjitlog.redirect_assembler` — assemblers import
+/// `rjitlog` directly.  The writer lives in `majit-metainterp` (crate
+/// split of `rlib/rjitlog`); backends call this and the metainterp
+/// installs the writer.
+static REDIRECT_ASSEMBLER_LOG: OnceLock<fn(u64, u64, u64)> = OnceLock::new();
+
+pub fn register_redirect_assembler_log(f: fn(u64, u64, u64)) {
+    let _ = REDIRECT_ASSEMBLER_LOG.set(f);
+}
+
+/// `jl.redirect_assembler(oldtoken, newtoken, asm_adr)`.
+pub fn redirect_assembler(old: &JitCellToken, new: &JitCellToken, asm_adr: u64) {
+    if let Some(log) = REDIRECT_ASSEMBLER_LOG.get() {
+        log(
+            old as *const JitCellToken as u64,
+            new as *const JitCellToken as u64,
+            asm_adr,
+        );
+    }
+}
+
 /// `rpython/jit/backend/model.py CPUTotalTracker` — per-CPU totals
 /// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
 /// and bridges created) and by the memory manager (loops and bridges
@@ -1296,6 +1317,11 @@ pub struct JitCellToken {
     /// dynasm patches the old entry (`assembler.py:1138`), while
     /// cranelift updates its indirect dispatch state.
     pub _ll_function_addr: AtomicUsize,
+    /// `x86/assembler.py assemble_loop` `looptoken._ll_raw_start = rawstart`
+    /// — first byte of the allocated machine-code block.  x86
+    /// `redirect_call_assembler` logs this as `asm_adr`; aarch64 logs
+    /// `newlooptoken.number` instead.
+    pub _ll_raw_start: AtomicUsize,
     /// `memmgr.py:59-60` `looptoken.generation`. Updated by
     /// `MemoryManager.keep_loop_alive` and read by
     /// `_kill_old_loops_now`. Default `0` means "not yet seen by
@@ -1451,6 +1477,7 @@ impl JitCellToken {
                 number,
             )))),
             _ll_function_addr: AtomicUsize::new(0),
+            _ll_raw_start: AtomicUsize::new(0),
             // memmgr.py default; first keep_loop_alive overwrites this.
             generation: Cell::new(0),
             // history.py `retraced_count = 0` (class attribute default).
@@ -1545,6 +1572,17 @@ impl JitCellToken {
     #[inline]
     pub fn set_ll_function_addr(&self, addr: usize) {
         self._ll_function_addr.store(addr, Ordering::Release);
+    }
+
+    /// `looptoken._ll_raw_start` (`x86/assembler.py assemble_loop`).
+    #[inline]
+    pub fn ll_raw_start(&self) -> usize {
+        self._ll_raw_start.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_ll_raw_start(&self, addr: usize) {
+        self._ll_raw_start.store(addr, Ordering::Release);
     }
 
     /// Address of the atomic slot used by backend call thunks for pyre's

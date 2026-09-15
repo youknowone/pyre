@@ -13267,16 +13267,12 @@ impl<M: Clone> MetaInterp<M> {
             // the previous attach.
             //
             // `warmstate.py:344` `cpu.redirect_call_assembler(old, new)`.
+            // The assembler logs `jl.redirect_assembler` itself
+            // (`x86/assembler.py` / `aarch64/assembler.py`).
+            crate::rjitlog::install_backend_hooks();
             let _ = self
                 .backend
                 .redirect_call_assembler(&old_token, &attach_token);
-            // x86/assembler.py redirect_call_assembler: jl.redirect_assembler
-            // after the JMP patch. aarch64 logs newlooptoken.number as asm_adr.
-            crate::rjitlog::redirect_assembler(
-                std::sync::Arc::as_ptr(&old_token) as *const () as u64,
-                std::sync::Arc::as_ptr(&attach_token) as *const () as u64,
-                attach_token.number,
-            );
             // `warmstate.py` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
         }
@@ -13374,19 +13370,13 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Redirect existing call_assembler calls from one loop to another.
     ///
-    /// When a loop is recompiled (e.g., with bridges), existing
-    /// CALL_ASSEMBLER instructions in other compiled code should be
-    /// updated to point to the new version.
+    /// `jl.redirect_assembler` is logged by the backend assembler.
     pub fn redirect_call_assembler(&self, old_key: u64, new_key: u64) {
         let old_token = self.warm_state.get_compiled(old_key);
         let new_token = self.warm_state.get_compiled(new_key);
         if let (Some(old), Some(new)) = (old_token, new_token) {
+            crate::rjitlog::install_backend_hooks();
             let _ = self.backend.redirect_call_assembler(&old, &new);
-            crate::rjitlog::redirect_assembler(
-                std::sync::Arc::as_ptr(&old) as *const () as u64,
-                std::sync::Arc::as_ptr(&new) as *const () as u64,
-                new.number,
-            );
         }
     }
 

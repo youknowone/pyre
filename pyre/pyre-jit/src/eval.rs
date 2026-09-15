@@ -6859,6 +6859,31 @@ fn portal_unique_id_from_greens(greens: &[i64]) -> i64 {
     }
 }
 
+/// `pypy.tool.stdlib_opcode.opcode_method_names` — `LOAD_FAST`, not
+/// the Debug payload of the instruction enum. Digit suffixes stay
+/// underscored (`CallIntrinsic1` → `CALL_INTRINSIC_1`).
+fn opcode_method_name(instruction: pyre_interpreter::Instruction) -> String {
+    screaming_snake_opcode(&format!("{:?}", instruction.as_opcode()))
+}
+
+fn screaming_snake_opcode(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len() + 4);
+    let mut prev: Option<char> = None;
+    for ch in debug.chars() {
+        let split = match prev {
+            Some(p) if ch.is_uppercase() && (p.is_lowercase() || p.is_ascii_digit()) => true,
+            Some(p) if ch.is_ascii_digit() && p.is_ascii_alphabetic() => true,
+            _ => false,
+        };
+        if split {
+            out.push('_');
+        }
+        out.extend(ch.to_uppercase());
+        prev = Some(ch);
+    }
+    out
+}
+
 /// `interp_jit.py get_location` fields before they become a tuple.
 fn get_location_fields(
     next_instr: usize,
@@ -6875,7 +6900,7 @@ fn get_location_fields(
         code_ptr => {
             let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
             let opname = match pyre_interpreter::decode_instruction_at(code, next_instr) {
-                Some((instruction, _)) => format!("{instruction:?}"),
+                Some((instruction, _)) => opcode_method_name(instruction),
                 None => "<eof>".into(),
             };
             let line = pyre_interpreter::pycode::code_locations(code)
@@ -15285,6 +15310,17 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opcode_method_name_underscores_numeric_suffixes() {
+        assert_eq!(screaming_snake_opcode("LoadFast"), "LOAD_FAST");
+        assert_eq!(screaming_snake_opcode("CallIntrinsic1"), "CALL_INTRINSIC_1");
+        assert_eq!(screaming_snake_opcode("CallIntrinsic2"), "CALL_INTRINSIC_2");
+        assert_eq!(
+            screaming_snake_opcode("BinaryOpInplaceAddUnicode"),
+            "BINARY_OP_INPLACE_ADD_UNICODE"
+        );
+    }
 
     #[test]
     fn active_trace_root_walk_skips_unknown_concrete_values() {
