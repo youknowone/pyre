@@ -44,8 +44,14 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
             )),
             // `W_CTypePrimitiveUnsigned.convert_to_object`.
             ctypeobj::KIND_PRIM_UNSIGNED => {
-                let value = misc::read_raw_unsigned_data(cdata, ct.size)?;
-                Ok(unsigned_as_object(ct, value))
+                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_ULONG) {
+                    Ok(unsigned_as_object(
+                        ct,
+                        misc::read_raw_ulong_data(cdata, ct.size)?,
+                    ))
+                } else {
+                    convert_to_object_ulonglong(ct, cdata)
+                }
             }
             // `W_CTypePrimitiveFloat.convert_to_object`.
             ctypeobj::KIND_PRIM_FLOAT => Ok(pyre_object::w_float_new(misc::read_raw_float_data(
@@ -101,6 +107,31 @@ unsafe fn convert_from_object_longlong(
     unsafe { misc::write_raw_signed_data(cdata, value, ct.size) }
 }
 
+/// `W_CTypePrimitiveUnsigned._convert_to_object_longlong`.
+///
+/// In its own function: LONGLONG may make the whole function jit-opaque.
+unsafe fn convert_to_object_ulonglong(ct: &W_CType, cdata: usize) -> Result<PyObjectRef, PyError> {
+    // `space.newint(r_ulonglong)` — a value wider than a signed word is a
+    // long object. `VALUE_FITS_LONG` is off on this path, so
+    // `unsigned_as_object` takes that arm.
+    Ok(unsigned_as_object(
+        ct,
+        unsafe { misc::read_raw_unsigned_data(cdata, ct.size)? },
+    ))
+}
+
+/// `W_CTypePrimitiveUnsigned._convert_from_object_longlong`.
+///
+/// In its own function: LONGLONG may make the whole function jit-opaque.
+unsafe fn convert_from_object_ulonglong(
+    ct: &W_CType,
+    cdata: usize,
+    w_ob: PyObjectRef,
+) -> Result<(), PyError> {
+    let value = misc::as_unsigned_long_long(w_ob, true)?;
+    unsafe { misc::write_raw_unsigned_data(cdata, value, ct.size) }
+}
+
 /// `W_CTypePrimitive.convert_from_object`.
 ///
 /// # Safety
@@ -145,14 +176,18 @@ pub unsafe fn convert_from_object(
             // `W_CTypePrimitiveBool` and `W_CTypePrimitiveUnsigned` share
             // `convert_from_object`; only the range differs.
             ctypeobj::KIND_PRIM_BOOL | ctypeobj::KIND_PRIM_UNSIGNED => {
-                let roots = pyre_object::gc_roots::push_roots();
-                let ob_slot = roots.base();
-                let _ = roots.pin_root(w_ob);
-                let value = misc::as_unsigned_long(roots.get(ob_slot), true)?;
-                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) && value > vrange_max(ct) {
-                    return Err(overflow(ct, roots.get(ob_slot)));
+                if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_ULONG) {
+                    let roots = pyre_object::gc_roots::push_roots();
+                    let ob_slot = roots.base();
+                    let _ = roots.pin_root(w_ob);
+                    let value = misc::as_unsigned_long(roots.get(ob_slot), true)?;
+                    if ct.has(ctypeobj::CTypeFlags::VALUE_FITS_LONG) && value > vrange_max(ct) {
+                        return Err(overflow(ct, roots.get(ob_slot)));
+                    }
+                    misc::write_raw_unsigned_data(cdata, value, ct.size)
+                } else {
+                    convert_from_object_ulonglong(ct, cdata, w_ob)
                 }
-                misc::write_raw_unsigned_data(cdata, value, ct.size)
             }
             // `W_CTypePrimitiveFloat.convert_from_object`.
             ctypeobj::KIND_PRIM_FLOAT => {
