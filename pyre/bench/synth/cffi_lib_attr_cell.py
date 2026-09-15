@@ -6,16 +6,6 @@
 # `#[cfg(not(target_arch = "wasm32"))]` -- so that backend is skipped rather
 # than left to fail on the import.
 #
-# STAGED IN `_pending/`: check.py globs `synth/*.py` and does not descend here,
-# so this file gates nothing yet. Graduating it means moving it up one level and
-# recording `<name>.jitstats` (or `<name>.<backend>.jitstats` where a backend disagrees) beside it with
-# `check.py --snapshot`. That was not done in the change that added it because
-# check.py has no per-fixture filter, so a snapshot rewrites every fixture's
-# baseline including the macro benches, and the host was carrying a load average
-# of 22 from concurrent builds at the time. jitstats are deterministic counters
-# and would have been fine; the macro-bench baselines caught in the same sweep
-# would not.
-#
 # No `max-pypy-ratio`: absence exempts the fixture from the ratio gate, which
 # is what this file wants. Every leg's wall-clock is dominated by the libffi
 # trampoline pyre still pays per foreign call -- `direct_libffi_call` is
