@@ -19,6 +19,7 @@ pub mod failguard;
 #[cfg(target_arch = "wasm32")]
 mod glue;
 
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -2468,8 +2469,8 @@ impl PendingInline {
 
 thread_local! {
     /// Deferred merges by id, the id being what the bridge module passes back.
-    static PENDING_INLINES: RefCell<HashMap<i64, PendingInline>> =
-        RefCell::new(HashMap::new());
+    static PENDING_INLINES: RefCell<IndexMap<i64, PendingInline>> =
+        RefCell::new(IndexMap::new());
     /// Source of the ids above.
     static NEXT_PENDING_INLINE_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
 }
