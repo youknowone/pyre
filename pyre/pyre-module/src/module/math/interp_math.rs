@@ -206,8 +206,47 @@ macro_rules! pm1_plain {
 }
 
 // Trigonometric
-pm1_edom!(sin, "expected a finite input");
-pm1_edom!(cos, "expected a finite input");
+/// `math.sin` after `_get_double`: domain pin, then [`_float_sin`].
+pub fn sin(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "sin() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::sin(val) {
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_SIN,
+        ),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a finite input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
+
+/// `math.cos` after `_get_double`: domain pin, then [`_float_cos`].
+pub fn cos(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "cos() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::cos(val) {
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_COS,
+        ),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a finite input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
 pm1_edom!(tan, "expected a finite input");
 pm1_edom!(asin, "expected a number in range from -1 up to 1");
 pm1_edom!(acos, "expected a number in range from -1 up to 1");
@@ -229,7 +268,10 @@ pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
     }
     let val = try_get_double(args[0])?;
     match pymath::math::sqrt(val) {
-        Ok(_) => crate::objspace::descroperation::_float_abs_or_sqrt(val, true),
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_SQRT,
+        ),
         Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
             "expected a nonnegative input, got {}",
             float_repr(val)

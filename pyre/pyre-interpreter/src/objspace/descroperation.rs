@@ -3062,18 +3062,27 @@ pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
     if result.is_infinite() && ar.is_finite() && ai.is_finite() {
         return Err(PyError::overflow_error("absolute value too large"));
     }
-    // Loop-free looked-inside caller of both unboxed float leaves. `_float_sqrt`
-    // is otherwise only reached from `interp_math::sqrt` under opaque
-    // `crate::module`, the same class as `_float_lt` before [`compare_slot`].
-    _float_abs_or_sqrt(result, false)
+    // Loop-free looked-inside caller of the unboxed float math leaves.
+    // `interp_math::{sqrt,sin,cos}` live under opaque `crate::module`,
+    // the same class as `_float_lt` before [`compare_slot`].
+    _float_math1(result, FLOAT_MATH1_ABS)
 }
 
-/// Hub so `_float_sqrt` is a jitcode (`_float_lt` / [`compare_slot`]).
-/// `inline(never)` keeps both arms in the graph when the abs caller
-/// passes a constant `false`.
+pub(crate) const FLOAT_MATH1_ABS: i64 = 0;
+pub(crate) const FLOAT_MATH1_SQRT: i64 = 1;
+pub(crate) const FLOAT_MATH1_SIN: i64 = 2;
+pub(crate) const FLOAT_MATH1_COS: i64 = 3;
+
+/// Hub so `_float_{sqrt,sin,cos}` are jitcodes (`_float_lt` / [`compare_slot`]).
+/// `inline(never)` keeps every arm in the graph when a caller passes a constant.
 #[inline(never)]
-pub(crate) fn _float_abs_or_sqrt(x: f64, sqrt: bool) -> PyResult {
-    if sqrt { _float_sqrt(x) } else { _float_abs(x) }
+pub(crate) fn _float_math1(x: f64, kind: i64) -> PyResult {
+    match kind {
+        FLOAT_MATH1_SQRT => _float_sqrt(x),
+        FLOAT_MATH1_SIN => _float_sin(x),
+        FLOAT_MATH1_COS => _float_cos(x),
+        _ => _float_abs(x),
+    }
 }
 
 /// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
@@ -6644,6 +6653,34 @@ pub(crate) fn _float_sqrt(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.sqrt(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.
+#[inline(never)]
+pub(crate) fn _float_sin(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.sin(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_cos` after the finite pin: `W_FloatObject(cos(x))`.
+#[inline(never)]
+pub(crate) fn _float_cos(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.cos(),
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)
