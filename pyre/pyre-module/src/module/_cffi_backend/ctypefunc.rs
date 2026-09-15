@@ -88,7 +88,7 @@ pub fn fargs_of(ct: &W_CType) -> Vec<PyObjectRef> {
     if ct.fargs.is_null() {
         return Vec::new();
     }
-    unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(ct.fargs) }
+    unsafe { pyre_object::w_list_items_copy_as_vec(ct.fargs) }
 }
 
 /// `W_CTypeFunc.call` — the entry `W_CData.call` reaches.
@@ -121,19 +121,30 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
     call_varargs(ct, funcaddr, args_w)
 }
 
-/// `len(self.fargs)` — the declared argument count of a function type.
-fn fargs_len(w_fargs: PyObjectRef) -> usize {
+/// `self.fargs` as the object-strategy list `_immutable_fields_ =
+/// ['fargs[*]']` requires (`rclass.py _parse_field_list`).
+fn fargs_list(w_fargs: PyObjectRef) -> Option<&'static pyre_object::W_ListObject> {
     if w_fargs.is_null() {
-        return 0;
+        return None;
     }
-    unsafe { pyre_object::tupleobject::w_tuple_len(w_fargs) }
+    Some(unsafe { &*(w_fargs as *const pyre_object::W_ListObject) })
 }
 
-/// `self.fargs[i]` — the declared ctype of argument `i`.
+/// `len(self.fargs)` — the declared argument count of a function type.
+fn fargs_len(w_fargs: PyObjectRef) -> usize {
+    fargs_list(w_fargs)
+        .map(pyre_object::ll_list_obj_length)
+        .unwrap_or(0)
+}
+
+/// `self.fargs[i]` — `ctypefunc.py` `_call`.  `ll_getitem_fast` on the
+/// object-strategy list, so the codewriter sees `list.obj_getitem`.
 fn farg(w_fargs: PyObjectRef, i: usize) -> PyObjectRef {
-    match unsafe { pyre_object::tupleobject::w_tuple_getitem(w_fargs, i as i64) } {
-        Some(w_farg) => w_farg,
-        None => pyre_object::PY_NULL,
+    match fargs_list(w_fargs) {
+        Some(list) if i < pyre_object::ll_list_obj_length(list) => {
+            pyre_object::ll_list_obj_getitem_fast(list, i)
+        }
+        _ => pyre_object::PY_NULL,
     }
 }
 
@@ -192,7 +203,7 @@ fn complete_argtypes(
 ///
 /// Upstream reads `self.fargs[i]` off the promoted function type
 /// (`ctypefunc.py` `_call`). The ctype is `allocate_stable`, so `self` does
-/// not move and a collection rewrites the `fargs` field when the tuple does.
+/// not move and a collection rewrites the `fargs` field when the list does.
 /// Re-reading the field is that load; a second root bracket around a copy of
 /// the pointer was only there so the jitcode eraser could see a single pin.
 ///
@@ -223,15 +234,10 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     let called = 'body: {
         for i in 0..args_w.len() {
             let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-            // `self.fargs[i]` is read out of a list declared
-            // `_immutable_fields_ = ['fargs[*]']` (`ctypefunc.py:30`), so with
-            // the function type promoted the element is a trace constant and
-            // the `W_CType` dispatch below folds against it.  Here `fargs` is
-            // a tuple object whose items block shares one array identity with
-            // every object-strategy list, so the element read cannot carry
-            // that purity; promoting the element hands the trace the same
-            // constant behind one guard.
-            let w_argtype = majit_metainterp::jit::promote(farg(ct.fargs, i));
+            // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The list
+            // is `_immutable_fields_ = ['fargs[*]']`, so a promoted function
+            // type makes the element a trace constant.
+            let w_argtype = farg(ct.fargs, i);
             let argtype = match ctypeobj::ctype_arg(w_argtype) {
                 Ok(argtype) => argtype,
                 Err(e) => break 'body Err(e),
