@@ -3221,10 +3221,37 @@ impl WasmBackend {
             .filter(|(_, _, remap)| remap.is_none())
             .map(|(id, region, _)| (region.source_fail_index, *id))
             .collect();
-        let (leftover, terminal) = self.install_inline_region_batch(
+        let trigger_is_core = pending.remap.is_none();
+        let had_remaps = work.iter().any(|(_, _, remap)| remap.is_some());
+        let (mut leftover, mut terminal) = self.install_inline_region_batch(
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
         );
+        // Cold remaps must not make a hot parent fail the whole rebuild.
+        if terminal && trigger_is_core && had_remaps && !owner.is_invalidated() {
+            let (remap_left, core_left): (Vec<_>, Vec<_>) =
+                leftover.into_iter().partition(|(_, remap)| remap.is_some());
+            for (region, remap) in remap_left {
+                let Some(key) = remap else {
+                    continue;
+                };
+                let Some(&id) = remap_pending_ids.get(&key) else {
+                    continue;
+                };
+                PENDING_INLINES.with(|pending| {
+                    pending.borrow_mut().insert(
+                        id,
+                        PendingInline {
+                            owner: Arc::downgrade(&owner),
+                            region,
+                            remap,
+                            retry_on_sibling: false,
+                        },
+                    )
+                });
+            }
+            (leftover, terminal) = self.install_inline_region_batch(&owner, core_left);
+        }
         if leftover.iter().any(|(_, remap)| remap.is_none()) {
             for source_fail_index in fail_indices {
                 Self::restore_dispatch_cell(&owner, source_fail_index);
@@ -5467,7 +5494,9 @@ impl majit_backend::Backend for WasmBackend {
                 // 0, so this stays a permanent out-of-line decline.
                 if inline_trip_helper_slot() != 0
                     && bridge_is_loop_closing
-                    && (resumes_at_loop_header || inline_nonheader_enabled())
+                    && (resumes_at_loop_header
+                        || inline_nonheader_enabled()
+                        || region_external.is_some())
                     && let Some(owner) = original_token
                         .compiled_loop_token()
                         .and_then(|clt| clt.upgrade_loop_token())
