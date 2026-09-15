@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=83
+# pyre-check: max-wasm-ratio=5.9
 # PEP 709 inlines comprehensions into their enclosing scope. At module
 # scope the iteration variable becomes a CO_FAST_HIDDEN local, yet a later
 # top-level binding of the same name is a normal global (STORE_NAME). The
