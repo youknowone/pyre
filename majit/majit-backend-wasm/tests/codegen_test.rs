@@ -9405,6 +9405,103 @@ fn plain_new_array(result: u32, type_id: u32, length: i64) -> Op {
     op
 }
 
+fn plain_new_array_clear(result: u32, type_id: u32, length: i64) -> Op {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+    let descr = SimpleArrayDescr::new(1, 16, 8, type_id, Type::Int);
+    let op = make_op(
+        OpCode::NewArrayClear,
+        &[OpRef::const_int(length)],
+        OpRef::ref_op(result),
+    );
+    op.setdescr(Arc::new(descr));
+    op
+}
+
+fn setarrayitem_gc(array: u32, index: i64, value: OpRef, type_id: u32) -> Op {
+    use majit_ir::descr::SimpleArrayDescr;
+    use std::sync::Arc;
+    let op = make_op(
+        OpCode::SetarrayitemGc,
+        &[OpRef::ref_op(array), OpRef::const_int(index), value],
+        OpRef::NONE,
+    );
+    op.setdescr(Arc::new(SimpleArrayDescr::new(
+        1,
+        16,
+        8,
+        type_id,
+        Type::Int,
+    )));
+    op
+}
+
+fn memory_fill_count(bytes: &[u8]) -> usize {
+    let mut fills = 0;
+    count_operators(bytes, |op| {
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            fills += 1;
+        }
+    });
+    fills
+}
+
+/// rewrite.py: plain NEW_ARRAY never emits ZERO_ARRAY.
+#[test]
+fn inline_newarray_does_not_memory_fill() {
+    let inputs = nursery_new_inputs(vec![plain_new_array(1, 53, 2), finish_int_arg0()], 53);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        memory_fill_count(&bytes),
+        0,
+        "NEW_ARRAY must not memory.fill; rewrite emits ZERO_ARRAY only for CLEAR"
+    );
+}
+
+/// rewrite.py emit_pending_zeros: SETARRAYITEM covering 0..len-1
+/// rewrites ZERO_ARRAY to a no-op.
+#[test]
+fn inline_newarray_clear_skips_fill_when_every_item_is_stored() {
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array_clear(1, 53, 2),
+            setarrayitem_gc(1, 0, OpRef::const_int(7), 53),
+            setarrayitem_gc(1, 1, OpRef::const_int(8), 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        memory_fill_count(&bytes),
+        0,
+        "fully-written NEW_ARRAY_CLEAR is a ZERO_ARRAY no-op"
+    );
+}
+
+#[test]
+fn inline_newarray_clear_fills_when_an_item_is_unwritten() {
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array_clear(1, 53, 2),
+            setarrayitem_gc(1, 0, OpRef::const_int(7), 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert!(
+        memory_fill_count(&bytes) >= 1,
+        "partial NEW_ARRAY_CLEAR still ZERO_ARRAYs the unwritten tail"
+    );
+}
+
 #[test]
 fn consecutive_new_ops_share_one_nursery_bump() {
     let inputs = nursery_new_inputs(
