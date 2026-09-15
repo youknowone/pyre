@@ -3030,11 +3030,14 @@ where
         // post-call bytecode cursor so the snapshot reads the trailing
         // `-live-` marker for this residual call.
         let Some(resume_pc) = self.after_residual_live_pc(ctx) else {
-            if exc != 0 {
-                self.last_exception_value = exc;
-                return self.unwind_to_exception_handler(ctx);
-            }
-            return TraceAction::Continue;
+            // pyjitpl.py `handle_possible_exception` always
+            // `generate_guard(GUARD_EXCEPTION)` or
+            // `generate_guard(GUARD_NO_EXCEPTION)`. A missing trailing
+            // `-live-` cannot skip that guard: the compiled residual would
+            // then follow the recorded success path when a later invocation
+            // raises, or unwind without GUARD_EXCEPTION. Decline the trace
+            // so lowering can grow the marker; do not emit the call unguarded.
+            return TraceAction::Abort;
         };
 
         if exc == 0 {
