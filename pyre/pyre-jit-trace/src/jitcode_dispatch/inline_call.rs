@@ -12893,6 +12893,38 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     ref_arg_concretes: &[ConcreteValue],
     float_args: &[OpRef],
 ) -> Result<InlineCallOutcome, DispatchError> {
+    // LOAD_ATTR helpers are fold-or-residual only.  Walking
+    // `getattr_str` / `getattr_str_impl` records the whole MRO protocol
+    // into the caller trace and the walk does not bound its allocations.
+    let callee = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
+    // An orthodox helper descent (`inline_subwalk`) is already bounded
+    // by exact-int operands; residualizing `*_inner` there makes
+    // `compare_op_descent` decline.  The generic walk is the unbounded one.
+    if !ctx.fbw_mode.inline_subwalk
+        && (callee
+            .as_deref()
+            .is_some_and(super::specialize::name_is_unbounded_helper_body)
+            || super::specialize::jitcode_is_space_getattr(sub_index, sub_body)
+            || super::specialize::jitcode_is_frame_load_attr(sub_index)
+            || super::specialize::jitcode_leaf_is(sub_index, "getattr_str_impl")
+            || super::specialize::jitcode_is_pathed(
+                sub_index,
+                sub_body,
+                "pyre_interpreter::baseobjspace::getattr_str_impl",
+            )
+            || super::specialize::jitcode_leaf_is(sub_index, "compare_value_from_tag_inner")
+            || super::specialize::jitcode_leaf_is(sub_index, "binary_value_from_tag_inner"))
+    {
+        return residualize_inline_call_via_fnaddr(
+            ctx,
+            code,
+            pc,
+            descr_index,
+            int_args,
+            ref_args,
+            float_args,
+        );
+    }
     // `pyjitpl.py MIFrame.setup` walks the *callee* jitcode with that
     // jitcode's own descrs.  Build-time helpers (`from_canonical`)
     // resolve `d`/`j` through the process-wide table.  The caller's
@@ -14193,6 +14225,36 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 ///   this helper because the codewriter doesn't emit a `dR>f` shape
 ///   (float return paths use the `dIRF` arglist family).
 ///
+/// Fold `space.getattr` / `getattr_str` or residualize the helper.
+/// Never descend the MRO body: that graph is the whole attribute
+/// protocol and a declined walk grows without bound.
+fn finish_getattr_inline_or_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    descr_index: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    folded: bool,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    if folded {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    let residualized = residualize_inline_call_via_fnaddr(
+        ctx,
+        code,
+        op.pc,
+        descr_index,
+        int_args,
+        ref_args,
+        &[],
+    )?;
+    match residualized.outcome {
+        DispatchOutcome::SubReturn { .. } => Ok((DispatchOutcome::Continue, op.next_pc)),
+        other => Ok((other, op.next_pc)),
+    }
+}
+
 /// `kind_label` mirrors `dst_bank` as a static `&str` for typed-error
 /// reporting (`RegisterOutOfRange::bank`).
 pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
@@ -14217,6 +14279,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })?;
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
+    let callee_name = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
 
     if dst_bank == 'r'
         && args.len() == 1
@@ -14329,6 +14392,145 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+    }
+
+    // Jitted LOAD_ATTR is `PyFrame::load_attr` → `getattr_str`, not the
+    // 4-arg `load_attr_fn` residual.  Flatten's 2-arg HLOp is `getattr`.
+    // Fold here so `f_lasti` / mapdict still run; a declined fold must
+    // residualize — descending the MRO graph is unbounded.
+    if dst_bank == 'r' {
+        let callee = callee_name.as_deref().unwrap_or("");
+        let is_getattr = super::specialize::name_is_getattr_family(callee)
+            || super::specialize::jitcode_is_space_getattr(sub_index, &sub_body)
+            || super::specialize::jitcode_is_frame_load_attr(sub_index);
+        if is_getattr {
+            let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+            let getattr_pair = if args.len() == 3
+                && (super::specialize::name_is_frame_load_attr(callee)
+                    || super::specialize::jitcode_is_frame_load_attr(sub_index))
+            {
+                Some((args[1], args[2]))
+            } else if args.len() >= 2 {
+                Some((args[0], args[1]))
+            } else {
+                None
+            };
+            let folded = if let Some((obj, name_opref)) = getattr_pair {
+                super::specialize::try_fold_inline_getattr(
+                    ctx, op.pc, obj, name_opref, dst, dst_bank,
+                )?
+                .is_some()
+            } else {
+                false
+            };
+            return finish_getattr_inline_or_residual(
+                ctx,
+                code,
+                op,
+                descr_index,
+                &[],
+                &args,
+                folded,
+            );
+        }
+    }
+
+    // Jitted STORE_ATTR is `setattr_str` (`PyResult`, so `>r` as well as
+    // void).  Fold the mapdict write or residualize; do not walk the MRO.
+    if dst_bank == 'r' || dst_bank == 'v' {
+        let callee = callee_name.as_deref().unwrap_or("");
+        if super::specialize::name_is_setattr_family(callee)
+            || super::specialize::jitcode_leaf_is(sub_index, "setattr")
+            || super::specialize::jitcode_leaf_is(sub_index, "setattr_str")
+            || super::specialize::jitcode_is_pathed(
+                sub_index,
+                &sub_body,
+                "pyre_interpreter::baseobjspace::setattr_str",
+            )
+        {
+            let (obj, name_opref, value) = if args.len() == 4 {
+                (args[1], args[2], args[3])
+            } else if args.len() >= 3 {
+                (args[0], args[1], args[2])
+            } else {
+                return finish_getattr_inline_or_residual(
+                    ctx, code, op, descr_index, &[], &args, false,
+                );
+            };
+            let folded = if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
+                && unsafe {
+                    pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
+                }
+            {
+                let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+                if let Ok(name) = name.as_str() {
+                    matches!(
+                        spec_gate_store_attr(|| {
+                            super::specialize::try_walker_specialize_store_attr_named(
+                                ctx,
+                                op.pc,
+                                obj,
+                                value,
+                                name,
+                                &majit_ir::EffectInfo::default(),
+                            )
+                        })?,
+                        Some(WalkerStoreAttrSpecialization::Direct)
+                    )
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            return finish_getattr_inline_or_residual(
+                ctx, code, op, descr_index, &[], &args, folded,
+            );
+        }
+    }
+
+    // Flatten lowers BOOL / TO_BOOL to `inline_call_r_i` of `space.is_true`.
+    // The eval-loop path may land on `is_true_slot` / `is_true_lookup`.
+    if dst_bank == 'i'
+        && args.len() == 1
+        && (callee_name
+            .as_deref()
+            .is_some_and(super::specialize::name_is_space_is_true)
+            || super::specialize::jitcode_is_space_is_true(sub_index, &sub_body))
+    {
+        let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(truth) = spec_gate(SpecFold::TruthInt, || {
+            super::specialize::try_walker_specialize_truth_int(ctx, op.pc, args[0])
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, truth);
+            write_int_reg(ctx, op.pc, dst, truth, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if let Some(truth) = spec_gate(SpecFold::TruthBool, || {
+            super::specialize::try_walker_specialize_truth_bool(ctx, op.pc, args[0])
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, truth);
+            write_int_reg(ctx, op.pc, dst, truth, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+
+    // Flatten lowers FORMAT_SIMPLE to `inline_call_r_r` of `format_simple_w`.
+    if dst_bank == 'r'
+        && args.len() == 1
+        && super::specialize::jitcode_is_pathed(
+            sub_index,
+            &sub_body,
+            "pyre_interpreter::type_methods::format_simple_w",
+        )
+        && spec_gate(SpecFold::FormatSimple, || {
+            super::specialize::try_walker_specialize_format_simple(ctx, op, &args, {
+                code[op.pc + 1 + 2 + arg_width] as usize
+            })
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // Bracket the session-wide exception slot around the callee so a NULL
@@ -14545,6 +14747,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
+    let callee_name = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
 
     if dst_bank == 'r'
         && int_args.len() == 1
@@ -14843,6 +15046,128 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+    }
+
+    // `getattr_str` / `getattr_str_impl` / `load_attr` take the name as a
+    // Rust `&str`.  Fold or residualize; never walk the MRO body.
+    if dst_bank == 'r' {
+        let callee = callee_name.as_deref().unwrap_or("");
+        let is_getattr = super::specialize::name_is_getattr_family(callee)
+            || super::specialize::jitcode_is_space_getattr(sub_index, &sub_body)
+            || super::specialize::jitcode_is_frame_load_attr(sub_index)
+            || super::specialize::jitcode_leaf_is(sub_index, "getattr_str_impl");
+        if is_getattr {
+            let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+            let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
+            let obj = if ref_args.len() == 2
+                && (super::specialize::name_is_frame_load_attr(callee)
+                    || super::specialize::jitcode_is_frame_load_attr(sub_index))
+            {
+                ref_args.get(1).copied()
+            } else {
+                ref_args.first().copied()
+            };
+            let folded = if let (Some(obj), Some(name)) = (obj, str_name.as_deref()) {
+                super::specialize::try_fold_inline_getattr_named(
+                    ctx, op.pc, obj, name, dst, dst_bank,
+                )?
+                .is_some()
+            } else if let (Some(obj), Some(&name_opref)) = (obj, ref_args.get(1).filter(|_| ref_args.len() >= 2)) {
+                super::specialize::try_fold_inline_getattr(
+                    ctx, op.pc, obj, name_opref, dst, dst_bank,
+                )?
+                .is_some()
+            } else {
+                false
+            };
+            return finish_getattr_inline_or_residual(
+                ctx,
+                code,
+                op,
+                descr_index,
+                &int_args,
+                &ref_args,
+                folded,
+            );
+        }
+    }
+
+    // Flatten lowers COMPARE_OP to `inline_call_ir_r` of
+    // `compare_value_from_tag`.  The residual COMPARE_OP arm never sees
+    // that call, so the orthodox descent / exact-int folds have to run
+    // here — the same helper both spellings reach. The eval-loop path
+    // calls `compare_value` with a `ComparisonOperator` discriminant.
+    let is_compare_from_tag = callee_name
+        .as_deref()
+        .is_some_and(super::specialize::name_is_compare_value)
+        || super::specialize::jitcode_is_compare_value_from_tag(sub_index, &sub_body);
+    if is_compare_from_tag
+        && dst_bank == 'r'
+        && ref_args.len() == 2
+        && let Some(ConcreteValue::Int(op_tag)) = int_arg_concretes.first().copied()
+    {
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        let tag_opref = int_args
+            .first()
+            .copied()
+            .unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
+        if let Some(outcome) = spec_gate(SpecFold::CompareOpDescent, || {
+            super::specialize::try_walker_orthodox_compare_op(
+                ctx, op.pc, op_tag, tag_opref, &ref_args, dst, dst_bank,
+            )
+        })? {
+            return Ok((outcome, op.next_pc));
+        }
+        if let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+        {
+            if spec_gate(SpecFold::CompareOpInt, || {
+                super::specialize::try_walker_specialize_compare_op_int(
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
+                )
+            })?
+            .is_some()
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            if spec_gate(SpecFold::CompareOpLongInt, || {
+                super::specialize::try_walker_specialize_compare_op_long_int(
+                    ctx,
+                    op.pc,
+                    op_tag,
+                    &ref_args,
+                    &setup.allboxes,
+                    call_descr,
+                    dst,
+                    dst_bank,
+                )
+            })?
+            .is_some()
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+        }
+    }
+    // A declined compare fold must not walk `compare_value_from_tag`:
+    // that body is the whole rich-compare protocol and is unbounded.
+    if is_compare_from_tag {
+        return finish_getattr_inline_or_residual(
+            ctx,
+            code,
+            op,
+            descr_index,
+            &int_args,
+            &ref_args,
+            false,
+        );
     }
 
     // `w_complex_new` is `malloc_typed` of a header-plus-payload struct.

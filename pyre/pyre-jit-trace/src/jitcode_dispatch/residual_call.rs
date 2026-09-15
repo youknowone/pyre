@@ -46,6 +46,17 @@ static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Hash
 static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
 
+/// Two-Ref `space.getattr` residuals (`bh_getattr_fn` /
+/// `jit_baseobjspace_getattr`).  Flatten tags some of them `LoadAttr`
+/// and some `None`; identify both by address so `f_lasti` / mapdict
+/// specializations still run.
+static GETATTR_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("jit_baseobjspace_getattr") || name.ends_with("bh_getattr_fn")
+        })
+    });
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -7296,6 +7307,47 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    if ctx.is_authoritative_executor && dst_bank == 'r' && r_args.len() == 2 {
+        let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        let is_space_getattr = foldable_runtime_helper
+            == majit_ir::RuntimeHelperKind::LoadAttr
+            || (func_addr != 0 && GETATTR_FNADDRS.contains(&func_addr));
+        if is_space_getattr
+            && let Some(concrete_name) = walker_concrete_ref_object(ctx, r_args[1])
+            && unsafe {
+                pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
+            }
+        {
+            let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+            if let Ok(name) = name.as_str() {
+                if !r_args[1].is_constant() {
+                    let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op.pc,
+                        majit_ir::OpCode::GuardValue,
+                        &[r_args[1], name_const],
+                    )?;
+                    ctx.trace_ctx
+                        .heap_cache_mut()
+                        .replace_box(r_args[1], name_const);
+                }
+                if spec_gate(SpecFold::LoadAttr, || {
+                    try_walker_specialize_load_attr(
+                        ctx, op.pc, r_args[0], name, dst, dst_bank,
+                    )
+                })?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
@@ -9015,6 +9067,47 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // guard proves the attribute is present on this shape), so it is attempted
     // even in handler-bearing bodies; every unfoldable shape falls through to
     // the residual (which keeps its exception guard).
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr
+        && r_args.len() == 2
+        && i_args.is_empty()
+    {
+        // Flatten's unbound fallback is `getattr_fn(obj, w_name)`, the
+        // same two-Ref `space.getattr` the builtin spelling carries.
+        // Resolve the name off the constant str and reuse the 4-arg
+        // fold — `try_walker_specialize_load_attr` already takes a
+        // resolved `&str`.
+        if let Some(concrete_name) = walker_concrete_ref_object(ctx, r_args[1])
+            && unsafe {
+                pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
+            }
+        {
+            let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+            if let Ok(name) = name.as_str() {
+                if !r_args[1].is_constant() {
+                    let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+                    walker_emit_fold_guard_with_snapshot(
+                        ctx,
+                        op.pc,
+                        majit_ir::OpCode::GuardValue,
+                        &[r_args[1], name_const],
+                    )?;
+                    ctx.trace_ctx
+                        .heap_cache_mut()
+                        .replace_box(r_args[1], name_const);
+                }
+                if spec_gate(SpecFold::LoadAttr, || {
+                    try_walker_specialize_load_attr(
+                        ctx, op.pc, r_args[0], name, dst, dst_bank,
+                    )
+                })?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr
     {

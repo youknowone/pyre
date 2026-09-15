@@ -1299,10 +1299,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // suffix, advertise `.abi3.so` so a 3.12+ limited-API
                     // wheel is findable.  A bare `.so` stays off the list.
                     let abi3 = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(".abi3.so"));
-                    Ok(pyre_object::w_list_new(vec![
-                        pyre_object::gc_roots::shadow_stack_get(native),
-                        pyre_object::gc_roots::shadow_stack_get(abi3),
-                    ]))
+                    Ok(pyre_object::w_list_new(vec![native, abi3]))
                 }
                 #[cfg(not(all(
                     feature = "cpyext",
