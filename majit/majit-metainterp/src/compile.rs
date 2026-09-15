@@ -3585,10 +3585,16 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     let leftover_empty_len_mismatch = leftover.is_empty()
         && !entry_field_oprefs.is_empty()
         && baked_field_len != entry_field_oprefs.len();
+    // leftover-empty GETFIELD of a one-slot TOS frame (exception
+    // helper / inlined raise) remaps callee fields onto the portal
+    // mint and SIGSEGVs `from_callee`.
+    let leftover_empty_short_tos =
+        leftover.is_empty() && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] <= 1);
     if leftover_has_listiter_id()
         && (listiter_leftover
             || leftover_extras_any
             || leftover_empty_len_mismatch
+            || leftover_empty_short_tos
             || mint_string_method
             || mint_nongc_field)
     {
