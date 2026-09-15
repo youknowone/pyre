@@ -398,6 +398,17 @@ fn cpa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
+fn ucpa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: unsafe extern "C" fn(A1, A2) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
 fn pa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     module_path: &'static str,
@@ -2577,7 +2588,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `pycode.py lookup_exceptiontable` is `@jit.elidable`. The wrapper
     // returns a packed i64 so the residual ABI is one word.
-    cpa2(
+    ucpa2(
         &mut entries,
         "pyre_interpreter::pycode::w_code_lookup_exceptiontable",
         "pyre_interpreter::w_code_lookup_exceptiontable",

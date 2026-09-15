@@ -6726,6 +6726,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // operand still uses GETFIELD+GUARD_VALUE because the owner
         // address changes every iteration.
         if callable_guard_op.is_constant() {
+            // A bound-method inline can cache `Method.w_function` as a
+            // constant while the method operand itself is nonconstant,
+            // so the earlier `!guards_the_callee_function && can_move`
+            // check does not cover this Function. Refuse a nursery
+            // owner before baking raw-address `code?` markers.
+            if majit_gc::can_move(majit_ir::GcRef(callable as usize)) {
+                return resolved_inline_decline(op.pc, line!());
+            }
             walker_pin_function_code(ctx, op.pc, callable)?;
             walker_pin_function_globals(ctx, op.pc, callable)?;
         } else {

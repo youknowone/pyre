@@ -4311,7 +4311,7 @@ pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
 /// `obj` must point to a valid `PyCode`.
 #[inline]
 #[majit_macros::elidable]
-pub extern "C" fn w_code_lookup_exceptiontable(obj: PyObjectRef, instr_offset: u32) -> i64 {
+pub unsafe extern "C" fn w_code_lookup_exceptiontable(obj: PyObjectRef, instr_offset: u32) -> i64 {
     if obj.is_null() {
         return pack_exceptiontable_lookup(None);
     }
