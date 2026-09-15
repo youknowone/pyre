@@ -6803,6 +6803,7 @@ impl CodeWriter {
             load_from_dict_or_globals_fn_idx,
             call_function_ex_fn_idx,
             unary_not_fn_idx,
+            get_iter_fn_idx,
             load_fast_check_fn_idx,
             unbound_local_error_fn_idx,
             list_extend_fn_idx,
@@ -11156,30 +11157,23 @@ impl CodeWriter {
                         }
 
                         // GET_ITER — pop the iterable, call `iter(obj)`, push the
-                        // iterator.  Net: 0 (replace TOS).  Residual-call lowering
-                        // (range-only spike) so the for-loop body stays on the
-                        // full-body-walk tracer like a while-loop, instead of the
-                        // `abort_permanent` decline that routed it to the weaker
-                        // trait leg (the +1 double-apply, #57).  pyopcode.rs
+                        // iterator.  Net: 0 (replace TOS).  The graph records
+                        // `iter(iterable)`; flatten emits `inline_call_r_r` of
+                        // `baseobjspace::iter` when that body is fully bound,
+                        // otherwise the MayForce residual.  pyopcode.rs
                         // `opcode_get_iter` → `baseobjspace::iter`; a user
-                        // `__iter__` may run Python → `CallFlavor::MayForce`.
+                        // `__iter__` may run Python.
                         Instruction::GetIter => {
                             let _iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let iter_var = residual_call!(
-                                get_iter_fn_idx,
-                                CallFlavor::MayForce,
-                                majit_ir::RuntimeHelperKind::GetIter,
-                                vec![],
-                                vec![iterable_value],
-                                vec![],
-                                vec![Kind::Ref],
-                                ResKind::Ref,
+                            let iter_value = super::flow::FlowValue::from(emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "iter",
+                                vec![iterable_value.into()],
+                                Kind::Ref,
                                 py_pc as i64,
-                            );
-                            let iter_value = iter_var
-                                .map(super::flow::FlowValue::from)
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            ));
                             // Physically write the iterator into its value-stack
                             // slot (`pyframe.py pushvalue` →
                             // `setarrayitem_vable_r` via `jtransform.py:1898

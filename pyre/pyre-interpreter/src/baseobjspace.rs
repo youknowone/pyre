@@ -17015,6 +17015,10 @@ unsafe fn builtin_iter_override(
 
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
+///
+/// `inline(never)` so the codewriter mints the graph the jitted
+/// GET_ITER path calls (`opcode_get_iter` → `iter`).
+#[inline(never)]
 pub fn iter(obj: PyObjectRef) -> PyResult {
     if obj.is_null() {
         return Err(PyError::type_error("'NoneType' object is not iterable"));

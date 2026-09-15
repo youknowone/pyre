@@ -14576,6 +14576,37 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         }
     }
 
+    // Jitted GET_ITER is `space.iter`.  Fold the range iterator or
+    // residualize; do not walk the protocol body.
+    if dst_bank == 'r' && args.len() == 1 {
+        let callee = callee_name.as_deref().unwrap_or("");
+        if super::specialize::name_is_space_iter(callee)
+            || super::specialize::jitcode_is_pathed(
+                sub_index,
+                &sub_body,
+                "pyre_interpreter::baseobjspace::iter",
+            )
+        {
+            let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+            if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
+                super::specialize::try_walker_specialize_get_iter(ctx, op.pc, &args, dst, dst_bank)
+            })? {
+                let concrete_for_shadow = concrete_from_recorded_opref(ctx, iter_op);
+                write_ref_reg(ctx, op.pc, dst, iter_op, concrete_for_shadow)?;
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            return finish_getattr_inline_or_residual(
+                ctx,
+                code,
+                op,
+                descr_index,
+                &[],
+                &args,
+                false,
+            );
+        }
+    }
+
     // Flatten lowers BOOL / TO_BOOL to `inline_call_r_i` of `space.is_true`.
     // The eval-loop path may land on `is_true_slot` / `is_true_lookup`.
     if dst_bank == 'i'

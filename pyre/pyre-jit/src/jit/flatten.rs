@@ -2727,6 +2727,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "match_keys"
             | "match_class"
             | "not_"
+            | "iter"
             | "import_from"
             | "load_from_dict_or_globals"
             | "load_super_attr"
@@ -3766,6 +3767,11 @@ pub struct LoweringContext {
     /// `inline_call_r_r` of `baseobjspace::not_` when that body is fully
     /// bound, otherwise this residual (`bh_unary_not_fn`, MayForce).
     pub unary_not_fn_idx: u16,
+    /// `get_iter_fn` descrs-pool index.  GET_ITER records the object-space
+    /// `iter(iterable)` op; [`lower_iter_hlop_to_insn`] emits
+    /// `inline_call_r_r` of `baseobjspace::iter` when that body is fully
+    /// bound, otherwise this residual (`bh_get_iter_fn`, MayForce).
+    pub get_iter_fn_idx: u16,
     /// `load_fast_check_fn` descrs-pool index.  LOAD_FAST_CHECK records the
     /// `load_fast_check(value, code, name_idx)` HLOp lowered to
     /// `residual_call_ir_r(ConstInt(fn_idx), ListR([value, code]),
@@ -5829,6 +5835,9 @@ where
     if let Some(insn) = lower_unary_not_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
+    if let Some(insn) = lower_iter_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
     if let Some(insn) = lower_load_fast_check_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -6610,6 +6619,8 @@ mod inline_call_targets {
     pub const DELITEM: &str = "pyre_interpreter::baseobjspace::delitem";
     /// STORE_SUBSCR — `space.setitem`.
     pub const SETITEM: &str = "pyre_interpreter::baseobjspace::setitem";
+    /// GET_ITER — `space.iter`.
+    pub const ITER: &str = "pyre_interpreter::baseobjspace::iter";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -7134,6 +7145,37 @@ where
         inline_call_targets::NOT,
         ctx.unary_not_fn_idx,
         majit_ir::RuntimeHelperKind::UnaryNot,
+        value,
+        dst_reg,
+    ))
+}
+
+/// Lower the GET_ITER object-space op `iter(iterable)` → `result: Ref`
+/// (pyopcode.py GET_ITER → `space.iter`) to `inline_call_r_r` of
+/// `baseobjspace::iter` when that body is fully bound, otherwise the
+/// MayForce `get_iter_fn` residual.
+pub fn lower_iter_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "iter" || op.args.len() != 1 {
+        return None;
+    }
+    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    Some(build_unary_inline_call_or_residual(
+        inline_call_targets::ITER,
+        ctx.get_iter_fn_idx,
+        majit_ir::RuntimeHelperKind::GetIter,
         value,
         dst_reg,
     ))

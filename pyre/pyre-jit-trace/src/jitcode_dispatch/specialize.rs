@@ -9977,6 +9977,10 @@ pub(crate) fn name_is_setitem_family(name: &str) -> bool {
     name_leaf_is(name, "setitem") || name_leaf_is(name, "setitem_slot")
 }
 
+pub(crate) fn name_is_space_iter(name: &str) -> bool {
+    name.ends_with("baseobjspace::iter")
+}
+
 /// `PyFrame::load_attr` / `SharedOpcodeHandler::load_attr` — `(frame, obj, name)`.
 pub(crate) fn jitcode_is_frame_load_attr(sub_index: usize) -> bool {
     jitcode_leaf_is(sub_index, "load_attr")
@@ -10015,6 +10019,7 @@ pub(crate) fn name_is_unbounded_helper_body(name: &str) -> bool {
     name_is_getattr_family(name)
         || name_is_setattr_family(name)
         || name_is_setitem_family(name)
+        || name_is_space_iter(name)
         || name_leaf_is(name, "compare_value_from_tag_inner")
         || name_leaf_is(name, "binary_value_from_tag_inner")
 }
