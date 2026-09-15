@@ -10553,6 +10553,113 @@ pub(crate) fn try_emit_exact_int_uneg<Sym: WalkSym>(
     }))
 }
 
+fn orthodox_list_getitem_body_and_sym<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(SubJitCodeBody, *const Sym)> {
+    let jc_arc = crate::jitcode_runtime::list_getitem_jitcode()?;
+    let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return None;
+    }
+    Some((sub_body, sym_ptr))
+}
+
+/// Descend `w_list_getitem_inner` the way list-setitem descends its inner.
+/// Returns `Ok(None)` when the body is missing or the walk does not finish.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    list_op: OpRef,
+    key_op: OpRef,
+    list_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    sid: i64,
+    index: i64,
+) -> Result<Option<OpRef>, DispatchError> {
+    let Some((sub_body, sym_ptr)) = orthodox_list_getitem_body_and_sym(ctx) else {
+        return Ok(None);
+    };
+    let sym = unsafe { &*sym_ptr };
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, list_op, list_type_addr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(sid);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
+    ctx.trace_ctx.set_opref_concrete(
+        list_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(list_obj as usize)),
+    );
+
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "list_getitem_commit",
+        "w_list_getitem_call_site",
+        &[raw_index],
+        &[ConcreteValue::Int(index)],
+        &[list_op],
+        &[ConcreteValue::Ref(list_obj)],
+        &[],
+    );
+    match walk {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-GETITEM-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            Ok(None)
+        }
+        Ok((
+            DispatchOutcome::SubReturn {
+                result: Some(boxed),
+            },
+            _,
+        )) => Ok(Some(boxed)),
+        Ok(_) => {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Exact `list[int]` for a declined/admitted getitem helper: the storage
 /// load `try_walker_specialize_subscr` records, without a residual
 /// `call_descr` (inline_call has none).  Fannkuch's `p[i]`/`q[q0]`
@@ -10605,6 +10712,13 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
+    if let Some(boxed) = try_walker_orthodox_list_getitem(
+        ctx, op_pc, r_args[0], r_args[1], list_obj, key_obj, sid, index,
+    )? {
+        return Ok(Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }));
+    }
     let Some(elem_obj) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
         return Ok(None);
     };
@@ -21636,16 +21750,24 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     _dst: usize,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || dst_bank != 'r'
-        || r_args.len() != 1
-        || ctx.fbw_mode.inline_subwalk
-    {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
         return Ok(None);
     }
 
-    let range_op = r_args[0];
+    // GET_ITER pops the iterable, then calls `space.iter`.  The inline_call
+    // arg may be a graph-shadow box with no concrete; the just-popped
+    // vable slot (`vstack_last_ref`) still names the live range.
+    let mut range_op = r_args[0];
+    if walker_concrete_ref_object(ctx, range_op).is_none() {
+        let last = ctx.frame_state.borrow().vstack_last_ref;
+        if last != OpRef::NONE && walker_concrete_ref_object(ctx, last).is_some() {
+            range_op = last;
+        }
+    }
     let Some(range_obj) = walker_concrete_ref_object(ctx, range_op) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!("[decline-why] GET-ITER-NO-CONCRETE pc={op_pc}");
+        }
         return Ok(None);
     };
 
@@ -21674,6 +21796,14 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         if !pyre_object::functional::is_w_range(range_obj)
             || !pyre_object::functional::is_exact_w_range(range_obj)
         {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[decline-why] GET-ITER-NOT-RANGE pc={op_pc} is_range={} exact={} ty={}",
+                    pyre_object::functional::is_w_range(range_obj),
+                    pyre_object::functional::is_exact_w_range(range_obj),
+                    unsafe { pyre_object::type_name_of(range_obj) },
+                );
+            }
             return Ok(None);
         }
         let (start_obj, _stop_obj, step_obj) = pyre_object::functional::w_range_fields(range_obj);

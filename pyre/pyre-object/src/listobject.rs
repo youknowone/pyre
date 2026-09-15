@@ -2620,11 +2620,22 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    // Same wrapper/inner split as `w_list_setitem`: the getitem fold
+    // descends the lock-free body.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
+    w_list_getitem_inner(obj, index)
+}
+
+/// [`w_list_getitem`]'s body, run with the list's guard already held.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`, and the caller must hold
+/// `w_list_lock(obj)`.
+pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
         // listobject.py EmptyListStrategy.getitem raises IndexError.
@@ -2643,8 +2654,7 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
             if idx < 0 || idx >= len {
                 return None;
             }
-            let base = items_block_items_base(list.items);
-            Some(*base.add(idx as usize))
+            Some(ll_list_obj_getitem_fast(list, idx as usize))
         }
         ListStrategy::Integer => {
             let len = ll_list_int_length(list) as i64;

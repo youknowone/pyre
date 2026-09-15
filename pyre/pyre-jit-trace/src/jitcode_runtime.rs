@@ -389,6 +389,9 @@ static UNWRAP_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_list_setitem_inner`, resolved by name for
 /// the same reason.
 static LIST_SETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Cached `ALL_JITCODES` index of `w_list_getitem_inner`, resolved by name for
+/// the same reason.
+static LIST_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
 static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
@@ -546,6 +549,13 @@ pub fn unwrap_cell_jitcode() -> Option<Arc<JitCode>> {
 pub fn list_setitem_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*LIST_SETITEM_JITCODE_INDEX
         .get_or_init(|| compute_named_jitcode_index("w_list_setitem_inner")))?;
+    get_jitcode_by_index(idx)
+}
+
+/// The lock-guard-free charon `w_list_getitem_inner` body in `ALL_JITCODES`.
+pub fn list_getitem_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*LIST_GETITEM_JITCODE_INDEX
+        .get_or_init(|| compute_named_jitcode_index("w_list_getitem_inner")))?;
     get_jitcode_by_index(idx)
 }
 
@@ -3241,6 +3251,17 @@ mod tests {
         assert!(
             !jc.code.is_empty(),
             "w_list_setitem_inner jitcode should have non-empty bytecode (assembled body)"
+        );
+    }
+
+    #[test]
+    fn list_getitem_jitcode_resolves_charon_body() {
+        let jc = list_getitem_jitcode()
+            .expect("build-time pipeline must contain the charon `w_list_getitem_inner` jitcode");
+        assert_eq!(jc.name, "w_list_getitem_inner");
+        assert!(
+            !jc.code.is_empty(),
+            "w_list_getitem_inner jitcode should have non-empty bytecode (assembled body)"
         );
     }
 
