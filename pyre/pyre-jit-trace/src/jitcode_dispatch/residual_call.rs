@@ -5466,17 +5466,20 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     for (slot, value, concrete) in slots {
         let index = ctx.trace_ctx.const_int(slot);
         let guards_before = ctx.trace_ctx.num_guards();
-        let write = match ctx.trace_ctx.vable_setarrayitem_indexed(
-            pc,
-            callee_frame,
-            index,
-            slot,
-            fdescr.clone(),
-            adescr.clone(),
-            value,
-            concrete,
-            false,
-        ) {
+        let store = vable_ops::with_replace_frames(ctx, |ctx| {
+            ctx.trace_ctx.vable_setarrayitem_indexed(
+                pc,
+                callee_frame,
+                index,
+                slot,
+                fdescr.clone(),
+                adescr.clone(),
+                value,
+                concrete,
+                false,
+            )
+        });
+        let write = match store {
             VableArrayStore::Stored(write) => write,
             // The out-of-vable store recorded nothing, so there is no pre-store
             // entry to roll back. Whether it should abort the trace is tracked
