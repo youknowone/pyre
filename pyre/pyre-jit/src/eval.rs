@@ -1586,6 +1586,16 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
+    // PyCode is born old-gen (`malloc_typed_stable`). Visiting the field
+    // greys it but a minor does not scan an old object; walk `co_consts_w`
+    // here the way `walk_pyframe_roots` already does for stdalloc frames.
+    let mut code_adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_code_roots(
+            frame.pycode as pyre_object::PyObjectRef,
+            &mut code_adapter,
+        );
+    }
     f(&mut frame.vable_token as *mut usize as *mut majit_ir::GcRef);
 
     // locals_cells_stack_w: visit the field slot for every GC array so major

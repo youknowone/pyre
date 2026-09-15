@@ -949,6 +949,34 @@ unsafe fn is_gc_managed_pyframe(frame: *mut PyFrame) -> bool {
     }
 }
 
+/// Interiors of a `try_gc_alloc_stable_raw` PyFrame that a minor must still
+/// see. PyPy's `pyframe.py` `PyFrame` is a young `W_Root` and is copied
+/// then scanned; pyre's executing frame is born old-gen so a root visit
+/// does not scan it. Walk `pycode` / `co_consts_w` and the live locals
+/// prefix here. Do not follow `f_backref`.
+unsafe fn walk_managed_frame_interiors(
+    frame: *mut PyFrame,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe {
+        let pycode_slot = &mut (*frame).pycode as *mut *const ();
+        visitor(&mut *(pycode_slot as *mut majit_ir::GcRef));
+        walk_raw_code_roots((*frame).pycode as PyObjectRef, visitor);
+        let locals_slot =
+            &mut (*frame).locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray;
+        visitor(&mut *(locals_slot as *mut majit_ir::GcRef));
+        if (*frame).locals_cells_stack_w.is_null() {
+            return;
+        }
+        let arr = &*(*frame).locals_cells_stack_w;
+        let depth = walk_depth(&*frame, arr);
+        let arr_ptr = arr.items_ptr() as *mut PyObjectRef;
+        for i in 0..depth {
+            walk_frame_value_slot(arr_ptr.add(i) as *mut majit_ir::GcRef, visitor);
+        }
+    }
+}
+
 /// Continue only through the non-GC fallback frame chain.
 ///
 /// A managed `PyFrame` or `JitVirtualRef` has already been exposed through the
@@ -1200,6 +1228,7 @@ pub unsafe fn walk_pyframe_roots_area(
             // a callee PyFrame still named by a pre-forward CALL_ASSEMBLER
             // jitframe slot.
             if unsafe { is_gc_managed_pyframe(frame) } {
+                unsafe { walk_managed_frame_interiors(frame, visitor) };
                 break;
             }
             // SAFETY: PyFrame pointers on the f_backref chain are valid
