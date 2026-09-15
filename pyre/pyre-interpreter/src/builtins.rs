@@ -19481,15 +19481,23 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             // host lseek.  Reading their object payloads unchecked made a
             // float such as 0.0 look like offset zero instead of raising
             // TypeError (test_io.IOTest.write_ops).
-            let offset = crate::builtins::space_index_w(args[1])?;
-            let whence = match args.get(2).copied() {
-                Some(value) => crate::baseobjspace::index_c_int_w(value)?,
-                None => 0,
+            let _roots = pyre_object::gc_roots::push_roots();
+            let file_slot = pyre_object::gc_roots::pin_roots(args);
+            let offset = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
+                file_slot + 1,
+            ))?;
+            let whence = if args.len() >= 3 {
+                crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
+                    file_slot + 2,
+                ))?
+            } else {
+                0
             };
             // CPython 3.14 TextIOWrapper only permits the opaque-cookie
             // forms for current/end-relative seeks; FileIO remains free
             // to use ordinary non-zero offsets.
-            if !file_is_binary(args[0]) && offset != 0 {
+            let file = || pyre_object::gc_roots::shadow_stack_get(file_slot);
+            if !file_is_binary(file()) && offset != 0 {
                 // POSIX/Python's public SEEK_CUR and SEEK_END values are
                 // 1 and 2.  Keep this semantic validation target-neutral;
                 // wasm libc intentionally does not expose lseek constants.
@@ -19504,7 +19512,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     ));
                 }
             }
-            if let Some(fd) = file_get_fd(args[0]) {
+            if let Some(fd) = file_get_fd(file()) {
                 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                 {
                     #[cfg(not(feature = "sandbox"))]
@@ -19532,17 +19540,17 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     ));
                 }
             }
-            let base = match whence {
+            let origin = match whence {
                 0 => 0,
-                1 => file_get_pos(args[0]) as i64,
-                2 => file_get_data(args[0]).len() as i64,
+                1 => file_get_pos(file()) as i64,
+                2 => file_get_data(file()).len() as i64,
                 _ => return Err(crate::PyError::value_error("invalid whence")),
             };
-            let pos = base
+            let pos = origin
                 .checked_add(offset)
                 .filter(|pos| *pos >= 0)
                 .ok_or_else(|| crate::PyError::value_error("negative seek position"))?;
-            file_set_pos(args[0], pos as usize);
+            file_set_pos(file(), pos as usize);
             Ok(w_int_new(pos))
         }),
     );

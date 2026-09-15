@@ -1329,8 +1329,8 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// passes lone surrogates through unchanged.
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "casefold")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) };
-    Ok(w_str_from_wtf8_managed(case::casefold_wtf8(s)))
+    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
+    Ok(w_str_from_wtf8_managed(case::casefold_wtf8(&s)))
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
@@ -4127,8 +4127,8 @@ pub(crate) fn encode_utf8_with_errors(
     w_object: PyObjectRef,
     err_mode: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let s: &Wtf8 = unsafe { w_str_get_wtf8(w_object) };
-    crate::codec_engine::encode_utf8(s, w_object, err_mode)
+    let s = unsafe { w_str_get_wtf8(w_object) }.to_wtf8_buf();
+    crate::codec_engine::encode_utf8(&s, w_object, err_mode)
 }
 
 /// PyPy: unicodeobject.py descr_encode → encode_object.
@@ -4198,6 +4198,7 @@ pub fn encode_object(
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
     let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
+    let s = unsafe { w_str_get_wtf8(w_object) }.to_wtf8_buf();
     if crate::importing::dev_mode_flag()
         && matches!(
             enc_lower.as_str(),
@@ -4225,14 +4226,13 @@ pub fn encode_object(
     if matches!(enc_lower.as_str(), "utf-8" | "utf8" | "u8") {
         return encode_utf8_with_errors(w_object, errors);
     }
-    let s = unsafe { w_str_get_wtf8(w_object) };
     match enc_lower.as_str() {
-        "ascii" | "us-ascii" | "646" => crate::codec_engine::encode_ascii(s, w_object, errors),
+        "ascii" | "us-ascii" | "646" => crate::codec_engine::encode_ascii(&s, w_object, errors),
         "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
-            crate::codec_engine::encode_latin1(s, w_object, errors)
+            crate::codec_engine::encode_latin1(&s, w_object, errors)
         }
-        "raw-unicode-escape" => Ok(encode_raw_unicode_escape(s)),
-        _ => match encode_utf16_32(s, &enc_lower, w_object, errors) {
+        "raw-unicode-escape" => Ok(encode_raw_unicode_escape(&s)),
+        _ => match encode_utf16_32(&s, &enc_lower, w_object, errors) {
             Some(out) => out,
             None => {
                 let encoded =
