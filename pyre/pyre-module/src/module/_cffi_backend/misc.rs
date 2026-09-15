@@ -235,6 +235,16 @@ pub unsafe fn read_raw_unsigned_data(target: usize, size: i64) -> Result<u64, Py
     }
 }
 
+/// `misc.py read_raw_ulong_data`.
+///
+/// # Safety
+/// `target` must point at `size` readable bytes, and `size` must not
+/// exceed `sizeof(Unsigned)`.
+pub unsafe fn read_raw_ulong_data(target: usize, size: i64) -> Result<u64, PyError> {
+    debug_assert!(size <= std::mem::size_of::<u64>() as i64);
+    unsafe { read_raw_unsigned_data(target, size) }
+}
+
 /// `misc.py write_raw_signed_data`.
 ///
 /// # Safety
