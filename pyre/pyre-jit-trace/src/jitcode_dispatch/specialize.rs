@@ -17346,11 +17346,18 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let fromlist_empty = w_fromlist.is_null() || unsafe { pyre_object::is_none(w_fromlist) };
-    let fromlist_empty = fromlist_empty
-        || unsafe {
-            pyre_object::is_tuple(w_fromlist) && pyre_object::w_tuple_len(w_fromlist) == 0
-        };
+    // `interp___import__` uses `space.is_true(w_fromlist)`.  Only None
+    // and tuples are classified here: an empty list is falsey, and a
+    // list can change emptiness after GuardValue on the pointer.
+    if !w_fromlist.is_null()
+        && !unsafe { pyre_object::is_none(w_fromlist) }
+        && !unsafe { pyre_object::is_tuple(w_fromlist) }
+    {
+        return Ok(None);
+    }
+    let fromlist_empty = w_fromlist.is_null()
+        || unsafe { pyre_object::is_none(w_fromlist) }
+        || unsafe { pyre_object::w_tuple_len(w_fromlist) == 0 };
     let w_mod = jit_import_cached(w_name as i64, i64::from(fromlist_empty));
     if w_mod == 0 {
         return Ok(None);

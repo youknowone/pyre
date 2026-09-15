@@ -12538,6 +12538,10 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // Last-write-wins: a residual Call is not `as_bytes` /
+        // `w_str_get_wtf8`.  Those arms mark dest and return above.
+        self.string_byte_view_locals
+            .retain(|&local| local != dest_local);
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
