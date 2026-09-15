@@ -9697,6 +9697,142 @@ fn inline_new_skips_null_when_setfield_covers() {
     );
 }
 
+/// rewrite.py `transform_to_gc_load` flushes pending zeros before
+/// GETFIELD_GC, so a later SETFIELD_GC must not cancel the NULL the
+/// load is about to observe.
+#[test]
+fn inline_new_nulls_gc_field_read_before_setfield() {
+    let fd = {
+        use majit_ir::descr::SimpleFieldDescr;
+        use std::sync::Arc;
+        Arc::new(SimpleFieldDescr::new(0, 8, 4, Type::Ref, false))
+    };
+    let getfield = make_op(OpCode::GetfieldGcR, &[OpRef::ref_op(1)], OpRef::ref_op(2));
+    getfield.setdescr(fd);
+    let uncovered = nursery_new_inputs(vec![new_with_gc_field(1, 53, 8), finish_int_arg0()], 53);
+    let read_then_store = nursery_new_inputs(
+        vec![
+            new_with_gc_field(1, 53, 8),
+            getfield,
+            setfield_gc(1, OpRef::input_arg_int(0), 8),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (uncovered_bytes, _, _, _) =
+        codegen::build_wasm_module(&uncovered).expect("wasm codegen should succeed");
+    let (read_bytes, _, _, _) =
+        codegen::build_wasm_module(&read_then_store).expect("wasm codegen should succeed");
+    validate_wasm(&uncovered_bytes);
+    validate_wasm(&read_bytes);
+    assert_eq!(
+        i32_store_const0_count(&read_bytes),
+        i32_store_const0_count(&uncovered_bytes),
+        "GETFIELD_GC flushes pending NULLs; a later SETFIELD must not drop them"
+    );
+}
+
+/// rewrite.py `handle_clear_array_contents` emits ZERO_ARRAY before a
+/// later GETARRAYITEM, so a store after that read must not trim the fill.
+#[test]
+fn inline_newarray_clear_fills_when_an_item_is_read_before_store() {
+    let getitem = {
+        use majit_ir::descr::SimpleArrayDescr;
+        use std::sync::Arc;
+        let op = make_op(
+            OpCode::GetarrayitemGcI,
+            &[OpRef::ref_op(1), OpRef::const_int(0)],
+            OpRef::int_op(2),
+        );
+        op.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
+        op
+    };
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array_clear(1, 53, 1),
+            getitem,
+            setarrayitem_gc(1, 0, OpRef::const_int(7), 53),
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert!(
+        memory_fill_count(&bytes) >= 1,
+        "GETARRAYITEM of the new array must keep ZERO_ARRAY for the unread-then-stored slot"
+    );
+}
+
+/// `handle_new` only skips the class-word NULL after it stamps `w_class`.
+/// A class-word field with no `w_class_obj` still needs the delayed NULL.
+#[test]
+fn inline_new_nulls_class_word_when_w_class_is_not_stamped() {
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+    let fd = Arc::new(SimpleFieldDescr::new(0, 8, 4, Type::Ref, false).with_class_word(true));
+    let descr = SimpleSizeDescr::new(0, 16, 53).with_all_fielddescrs(vec![fd]);
+    descr.set_non_moving(false);
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new_op.setdescr(Arc::new(descr));
+    let inputs = nursery_new_inputs(vec![new_op, finish_int_arg0()], 53);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert!(
+        i32_store_const0_count(&bytes) >= 1,
+        "class-word field without a stamped w_class must still get the delayed NULL"
+    );
+}
+
+/// rewrite.py `remember_setarrayitem_occurred` canonicalizes through
+/// `get_box_replacement`, so SameAsR aliases of the array still trim.
+#[test]
+fn inline_newarray_clear_trims_stores_through_same_as_r() {
+    let alias = make_op(OpCode::SameAsR, &[OpRef::ref_op(1)], OpRef::ref_op(2));
+    let store0 = {
+        use majit_ir::descr::SimpleArrayDescr;
+        use std::sync::Arc;
+        let op = make_op(
+            OpCode::SetarrayitemGc,
+            &[OpRef::ref_op(2), OpRef::const_int(0), OpRef::const_int(7)],
+            OpRef::NONE,
+        );
+        op.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
+        op
+    };
+    let store1 = {
+        use majit_ir::descr::SimpleArrayDescr;
+        use std::sync::Arc;
+        let op = make_op(
+            OpCode::SetarrayitemGc,
+            &[OpRef::ref_op(2), OpRef::const_int(1), OpRef::const_int(8)],
+            OpRef::NONE,
+        );
+        op.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
+        op
+    };
+    let inputs = nursery_new_inputs(
+        vec![
+            plain_new_array_clear(1, 53, 2),
+            alias,
+            store0,
+            store1,
+            finish_int_arg0(),
+        ],
+        53,
+    );
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        memory_fill_count(&bytes),
+        0,
+        "SETARRAYITEM through a SameAsR alias must still rewrite ZERO_ARRAY to a no-op"
+    );
+}
+
 /// rewrite.py emits pending zeros at a guard, so a SETFIELD after the
 /// guard does not cancel the NULL store.
 #[test]
