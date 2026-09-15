@@ -8825,6 +8825,10 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
+        // Set when this Call's dest is still a string byte view after
+        // the residual is emitted (`as_bytes()[a..b]`).  Those arms
+        // fall through; `as_bytes` / `w_str_get_wtf8` return above.
+        let mut residual_preserves_byte_view = false;
 
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
         // `base()` and the read-back all leave the jitcode here, before any
@@ -9524,9 +9528,11 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|local| self.string_byte_view_locals.contains(&local))
                     && !self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                     && matches!(&reg.kind, CallKind::Fun(FunId::Regular { id }) if self.llbc.fn_by_id(*id).is_some_and(|fd| fd.item_meta.name_path().rsplit("::").next() == Some("index")))
-                    && !self.string_byte_view_locals.contains(&dest_local)
                 {
-                    self.string_byte_view_locals.push(dest_local);
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    residual_preserves_byte_view = true;
                 }
                 // `ArrayRead` addresses its element as `base + index *
                 // itemsize`.  A scalar host element carries its spelling as
@@ -12553,8 +12559,12 @@ impl<'a> Lowering<'a> {
         self.local_var[dest_local] = Some(result_var.clone());
         // Last-write-wins: a residual Call is not `as_bytes` /
         // `w_str_get_wtf8`.  Those arms mark dest and return above.
-        self.string_byte_view_locals
-            .retain(|&local| local != dest_local);
+        // A recognized `as_bytes()[a..b]` keeps the dest mark and
+        // falls through so `slice_index` can rewrite the call.
+        if !residual_preserves_byte_view {
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+        }
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
