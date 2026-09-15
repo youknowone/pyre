@@ -27,8 +27,8 @@ use majit_backend::{
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op, OpCode,
-    OpRc, OpRef, RdVirtualInfo, Type, Value,
+    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, InputArgRc,
+    Op, OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
@@ -628,8 +628,8 @@ pub(crate) fn stamp_guard_descr_trace_positions<T: AsRef<majit_ir::Op>>(ops: &[T
 /// [`crate::jitdriver::JitDriverStaticData::frame_value_count_fn`] override for
 /// the `jitcode.py enumerate_vars` frame box count; `None` falls back to the
 /// process-global callback the host registered.
-pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
-    inputargs: &[InputArg],
+pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
+    inputargs: &[A],
     ops: &[T],
     pc: u64,
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
@@ -758,7 +758,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
         } else if let Some(types) = op.get_fail_arg_types() {
             types.to_vec()
         } else {
-            inputargs.iter().map(|arg| arg.tp).collect()
+            inputargs.iter().map(|arg| arg.as_ref().tp).collect()
         };
         // Both resume-layout consumers below decode the same guard-owned
         // `rd_numb`. RPython keeps one numbering stream on the descr and its
@@ -1620,10 +1620,10 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
     }
 }
 
-pub(crate) fn enrich_resume_layout_with_trace_metadata(
+pub(crate) fn enrich_resume_layout_with_trace_metadata<A: AsRef<InputArg>>(
     layout: &mut ResumeLayoutSummary,
     trace_id: u64,
-    inputargs: &[InputArg],
+    inputargs: &[A],
     trace_info: Option<&CompiledTraceInfo>,
     recovery_layout: Option<&ExitRecoveryLayout>,
 ) {
@@ -1678,7 +1678,7 @@ pub(crate) fn enrich_resume_layout_with_trace_metadata(
         None => true,
     };
     if needs_slot_types && inputargs.len() == innermost.slot_layouts.len() {
-        innermost.slot_types = Some(inputargs.iter().map(|arg| arg.tp).collect());
+        innermost.slot_types = Some(inputargs.iter().map(|arg| arg.as_ref().tp).collect());
     }
 }
 
@@ -1699,8 +1699,8 @@ pub(crate) fn find_fail_index_for_exit_op<T: AsRef<majit_ir::Op>>(
     None
 }
 
-pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
-    inputargs: &[InputArg],
+pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
+    inputargs: &[A],
     ops: &[T],
     owning_key: u64,
     trace_id: u64,
@@ -1749,8 +1749,8 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
     })
 }
 
-pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
-    inputargs: &[InputArg],
+pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
+    inputargs: &[A],
     ops: &[T],
 ) -> indexmap::IndexMap<usize, StoredExitLayout> {
     let mut layouts: indexmap::IndexMap<usize, StoredExitLayout> = indexmap::IndexMap::new();
@@ -1942,7 +1942,7 @@ pub(crate) fn normalize_closing_jump_args(
 /// which is why the green-key argument above has to hold.
 pub fn patch_new_loop_to_load_virtualizable_fields(
     ops: &mut Vec<majit_ir::OpRc>,
-    inputargs: &mut Vec<InputArg>,
+    inputargs: &mut Vec<InputArgRc>,
     vinfo: &crate::virtualizable::VirtualizableInfo,
     vable_array_lengths: &[usize],
     entry_prefix_len: usize,
@@ -1956,13 +1956,10 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // keyed by source `OpRef`.
     //
     // Not for want of the slots: `InputArg` carries one and `Operand` walks it.
-    // They are unobservable HERE. The entry args this function rewrites against
-    // are fresh copies (`fresh_value_copy` deliberately clears the slot), the
-    // caller's own `Vec<InputArg>` is value-typed and truncated below, and the
-    // ops name their arguments by flat `OpRef` rather than by shared inputarg
-    // identity — so a chain rooted at any of them would have no reader. The
-    // table is dropped only after the rewrite is fully materialized into `ops`,
-    // which is what makes the two constructions equivalent.
+    // They are unobservable HERE. The ops name their arguments by flat `OpRef`
+    // rather than by shared inputarg identity, so a chain rooted at an
+    // inputarg box would have no reader. The table is dropped only after the
+    // rewrite is fully materialized into `ops`.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
     fn set_local_forwarded(forwarding: &mut Vec<Option<Operand>>, source: OpRef, target: Operand) {
@@ -2083,10 +2080,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         return;
     }
 
-    let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs
-        .iter()
-        .map(|ia| majit_ir::InputArgRc::new(ia.fresh_value_copy()))
-        .collect();
+    let expanded_inputargs: Vec<majit_ir::InputArgRc> = inputargs.clone();
 
     // compile.py:429-430 — vable_box = inputargs[index_of_virtualizable].
     let vable_box = Operand::from_bound_inputarg(&expanded_inputargs[index_of_virtualizable]);
@@ -2380,11 +2374,11 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<majit_ir::OpRc>) -> Vec<majit
     result
 }
 
-pub(crate) fn enrich_guard_resume_layouts_for_trace(
+pub(crate) fn enrich_guard_resume_layouts_for_trace<A: AsRef<InputArg>>(
     resume_layouts: &mut indexmap::IndexMap<u32, crate::resume::ResumeLayoutSummary>,
     exit_layouts: &mut crate::FxIndexMap<u32, StoredExitLayout>,
     trace_id: u64,
-    inputargs: &[InputArg],
+    inputargs: &[A],
     trace_info: Option<&CompiledTraceInfo>,
 ) {
     for (fail_index, layout) in resume_layouts.iter_mut() {
@@ -2719,11 +2713,9 @@ pub fn compile_tmp_callback(
     // variant (history.py:227/268/314), so the backend pool is left
     // empty for `compile_tmp_callback`.
     backend.set_constants_pool(majit_ir::ConstMap::default());
-    // The backend boundary takes `&[InputArg]` by value (the flat OpRef
-    // encoding survives past this point); identity ends here.
-    let backend_inputargs: Vec<InputArg> =
-        inputargs.iter().map(|ia| ia.fresh_value_copy()).collect();
-    backend.compile_loop(&backend_inputargs, &operations, &jitcell_token)?;
+    // compile.py `cpu.compile_loop(inputargs, operations, jitcell_token)`
+    // — the same boxes, after forget_optimization_info.
+    backend.compile_loop(&inputargs, &operations, &jitcell_token)?;
     // `compile.py:180-181` wire wref now that all `Arc::get_mut` writes
     // have settled.  `compile_tmp_callback` doesn't go through
     // `record_loop_or_bridge` (the tmp callback is a synthetic
@@ -3005,7 +2997,7 @@ mod tests {
             OpRc::new(op)
         };
         let mut ops: Vec<majit_ir::OpRc> = vec![op0, op1, op2];
-        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         patch_new_loop_to_load_virtualizable_fields(
@@ -3018,7 +3010,10 @@ mod tests {
             &mut constants,
         );
 
-        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0)]
+        );
         assert_eq!(ops.len(), 4);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         let vable_field = ops[0].pos().get();
@@ -3079,9 +3074,9 @@ mod tests {
             ],
         )];
         let mut inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_ref(1),
-            InputArg::new_ref(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_ref_rc(1),
+            InputArg::new_ref_rc(2),
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
@@ -3096,7 +3091,10 @@ mod tests {
             &mut constants,
         );
 
-        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0)]
+        );
         assert_eq!(ops.len(), 5);
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         assert_eq!(ops[1].opcode, OpCode::GetfieldGcI);
@@ -3158,7 +3156,7 @@ mod tests {
             OpCode::Label,
             &[rooted_inputarg_operand(Type::Ref, 0), reminted],
         ))];
-        let mut inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let mut inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
 
         patch_new_loop_to_load_virtualizable_fields(
@@ -3171,7 +3169,10 @@ mod tests {
             &mut constants,
         );
 
-        assert_eq!(inputargs, vec![InputArg::new_ref(0)]);
+        assert_eq!(
+            inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_ref(0)]
+        );
         let label = ops.iter().find(|op| op.opcode == OpCode::Label).unwrap();
         let getitem = ops
             .iter()
@@ -3220,10 +3221,10 @@ mod tests {
             ],
         )];
         let mut inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_ref(1),
-            InputArg::new_int(2),
-            InputArg::new_int(3),
+            InputArg::new_int_rc(0),
+            InputArg::new_ref_rc(1),
+            InputArg::new_int_rc(2),
+            InputArg::new_int_rc(3),
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
         let mut ops: Vec<majit_ir::OpRc> = ops.into_iter().map(OpRc::new).collect();
@@ -3240,7 +3241,10 @@ mod tests {
 
         // The scalar at slot 0 survives the truncation alongside the
         // virtualizable; only the two array elements are reconstructed.
-        assert_eq!(inputargs, vec![InputArg::new_int(0), InputArg::new_ref(1)]);
+        assert_eq!(
+            inputargs.iter().map(|a| a.opref()).collect::<Vec<_>>(),
+            vec![OpRef::input_arg_int(0), OpRef::input_arg_ref(1)]
+        );
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcR);
         // The array load reads through the virtualizable at slot 1, not the
         // int scalar at slot 0.

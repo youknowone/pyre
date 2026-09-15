@@ -417,31 +417,9 @@ pub struct InputArg {
     pub value: std::cell::Cell<Option<Value>>,
 }
 
-impl InputArg {
-    /// Produce a fresh-identity `InputArg` from this one. The
-    /// `_forwarded` slot (`resoperation.py:700
-    /// AbstractInputArg._forwarded`) is per-instance mutable state tied
-    /// to that identity and resets to `Forwarded::None` for the new
-    /// object, mirroring RPython where every `InputArgInt(pos) /
-    /// InputArgFloat(pos) / InputArgRef(pos)` instantiation yields a
-    /// fresh Python object with `_forwarded = None`.
-    ///
-    /// `InputArg` deliberately is **not** `Clone`. Identity-shared
-    /// cloning (preserving the `_forwarded` slot) must go through
-    /// [`InputArgRc`](crate::value::InputArgRc) (`Rc::clone`); call this
-    /// helper only at boundaries where a value-typed `InputArg` is
-    /// intentionally being detached from its origin (e.g. backend input
-    /// list materialization).
-    pub fn fresh_value_copy(&self) -> Self {
-        InputArg {
-            tp: self.tp,
-            index: self.index,
-            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            // A new InputArg object has no payload yet
-            // (`resoperation.py InputArgInt/Float/Ref`). Remint that
-            // must keep stack bits uses the original box, not this copy.
-            value: std::cell::Cell::new(None),
-        }
+impl AsRef<InputArg> for InputArg {
+    fn as_ref(&self) -> &InputArg {
+        self
     }
 }
 
@@ -682,6 +660,14 @@ impl std::ops::Deref for InputArgRc {
     type Target = InputArg;
     fn deref(&self) -> &InputArg {
         unsafe { &self.ptr.as_ref().value }
+    }
+}
+
+impl std::ops::DerefMut for InputArgRc {
+    fn deref_mut(&mut self) -> &mut InputArg {
+        // Shared-box mutation, matching a Python InputArg's in-place
+        // `_forwarded` / type updates. Compile is single-threaded.
+        unsafe { &mut (*self.ptr.as_ptr()).value }
     }
 }
 

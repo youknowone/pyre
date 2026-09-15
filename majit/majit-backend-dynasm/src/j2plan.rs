@@ -182,7 +182,7 @@ impl TracePlan {
         ops.iter().map(|op| lower_op(op.as_ref())).collect()
     }
 
-    pub(crate) fn build<T: AsRef<Op>>(inputargs: &[InputArg], ops: &[T]) -> Self {
+    pub(crate) fn build<T: AsRef<Op>, A: AsRef<InputArg>>(inputargs: &[A], ops: &[T]) -> Self {
         let lowered = Self::lower_ops(ops);
         let live_points = compute_live_points(&lowered);
         let max_live = live_points
@@ -193,7 +193,10 @@ impl TracePlan {
         let fallback_ops = 0;
 
         TracePlan {
-            inputargs: inputargs.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
+            inputargs: inputargs
+                .iter()
+                .map(|arg| arg.as_ref().opref())
+                .collect::<Vec<_>>(),
             lowered_ops: lowered.len() - fallback_ops,
             fallback_ops,
             ops: lowered,

@@ -23,7 +23,8 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex,
+    TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -845,7 +846,7 @@ pub struct Assembler386<'a> {
     /// Maps OpRef → jitframe slot index.
     opref_to_slot: IndexMap<OpRef, usize>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
-    inputargs: &'a [InputArg],
+    inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [OpRc],
@@ -1118,11 +1119,11 @@ impl<'a> Assembler386<'a> {
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         malloc_slowpath_headerless: usize,
-        inputargs: &'a [InputArg],
+        inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
-        let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::build_op_pos(operations);
+        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
+        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         Assembler386 {
             mc: Assembler::new(0),
             asm_memory_manager,
@@ -1538,7 +1539,7 @@ impl<'a> Assembler386<'a> {
 
     // assembler.py:543 _call_header — function prologue
 
-    fn setup_input_state(&mut self, inputargs: &[InputArg]) {
+    fn setup_input_state(&mut self, inputargs: &[InputArgRc]) {
         // opref_to_slot stores ABSOLUTE jitframe slot indices so that
         // slot_offset(slot) returns the correct byte offset directly.
         // User position `p` maps to absolute slot `p + JITFRAME_FIXED_SIZE`.
@@ -1586,7 +1587,7 @@ impl<'a> Assembler386<'a> {
     ///   JZ   continue              ; slowpath: 0 = OK
     ///   ; fallthrough = real overflow → return rbp as jf_ptr
     /// ```
-    fn _call_header(&mut self, inputargs: &[InputArg]) {
+    fn _call_header(&mut self, inputargs: &[InputArgRc]) {
         // x86/assembler.py _call_header parity. PyPy reserves the
         // whole frame in a single `SUB esp, FRAME_FIXED_SIZE * WORD` and
         // stores `CALLEE_SAVE_REGISTERS` plus `ebp` at fixed offsets.
@@ -2559,7 +2560,7 @@ impl<'a> Assembler386<'a> {
     /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
         descr: &dyn majit_ir::FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
     ) -> Vec<Loc> {
         let mut locs = Vec::new();
         let gpr_regs = crate::x86::regalloc::ALL_CORE_REGS;
@@ -2680,7 +2681,7 @@ impl<'a> Assembler386<'a> {
     /// locations, then emits code using those locations. This replaces the
     /// old frame-slot model where every value went through [rbp+offset].
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
-        let inputargs: &'a [InputArg] = self.inputargs;
+        let inputargs: &'a [InputArgRc] = self.inputargs;
         let ops: &'a [OpRc] = self.operations;
         self.unrelocated_jump_target = None;
         if emit_prologue {

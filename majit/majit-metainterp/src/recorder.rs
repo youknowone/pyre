@@ -1351,11 +1351,11 @@ impl Trace {
     /// hole-filtered list with `History.set_inputargs`; each surviving box
     /// retains its original position in the recorder's reserved coordinate
     /// space.  This is the pre-`into_parts` view used while closing a bridge.
-    pub fn live_inputargs_cloned(&self) -> Vec<InputArg> {
+    pub fn live_inputargs_cloned(&self) -> Vec<InputArgRc> {
         self.inputargs
             .iter()
             .zip(self.inputarg_live.iter())
-            .filter_map(|(arg, &live)| live.then(|| arg.fresh_value_copy()))
+            .filter_map(|(arg, &live)| live.then(|| arg.clone()))
             .collect()
     }
 
@@ -2409,7 +2409,7 @@ mod tests {
 
         let live = rec.live_inputargs_cloned();
         assert_eq!(
-            live.iter().map(InputArg::opref).collect::<Vec<_>>(),
+            live.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
         );
 

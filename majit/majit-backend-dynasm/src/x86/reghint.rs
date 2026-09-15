@@ -59,7 +59,7 @@ impl RegisterHints {
     pub fn add_hints(
         &self,
         longevity: &mut LifetimeManager,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         operations: &[impl AsRef<Op>],
     ) {
         for (i, op) in operations.iter().enumerate() {

@@ -16,8 +16,8 @@ use crate::value::{InputArg, Type};
 /// `inputarg_pos` and `op_pos` are stored as `Cow` so callers may
 /// either let `new` build them eagerly or share pre-built indexes that
 /// outlive the trace (e.g. `RegAlloc<'a>`).
-pub struct OpTypeIndex<'a, T: AsRef<Op> = Op> {
-    inputargs: &'a [InputArg],
+pub struct OpTypeIndex<'a, T: AsRef<Op> = Op, A: AsRef<InputArg> = InputArg> {
+    inputargs: &'a [A],
     ops: &'a [T],
     /// `arg.index` raw -> slice index in inputargs. `arg.index` raw
     /// uniqueness is enforced at build time, mirroring RPython's backend
@@ -103,8 +103,8 @@ impl PosIndex {
     }
 }
 
-impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
-    pub fn new(inputargs: &'a [InputArg], ops: &'a [T]) -> Self {
+impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
+    pub fn new(inputargs: &'a [A], ops: &'a [T]) -> Self {
         let inputarg_pos = Self::build_inputarg_pos(inputargs);
         let op_pos = Self::build_op_pos(ops);
         Self {
@@ -118,7 +118,7 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// Construct from pre-built indexes (e.g. owned by `RegAlloc<'a>`).
     /// O(1) — borrows slices instead of rebuilding the position arrays.
     pub fn from_parts(
-        inputargs: &'a [InputArg],
+        inputargs: &'a [A],
         ops: &'a [T],
         inputarg_pos: &'a PosIndex,
         op_pos: &'a PosIndex,
@@ -141,17 +141,22 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// one in any variant-blind reader. Hard-panic on raw collision so
     /// the violation surfaces here rather than as a wrong-type guard
     /// fail much further along.
-    pub fn build_inputarg_pos(inputargs: &[InputArg]) -> PosIndex {
-        let Some(base) = inputargs.iter().map(|a| a.index).min() else {
+    pub fn build_inputarg_pos<IA: AsRef<InputArg>>(inputargs: &[IA]) -> PosIndex {
+        let Some(base) = inputargs.iter().map(|a| a.as_ref().index).min() else {
             return PosIndex::new();
         };
-        let max = inputargs.iter().map(|a| a.index).max().unwrap_or(base);
+        let max = inputargs
+            .iter()
+            .map(|a| a.as_ref().index)
+            .max()
+            .unwrap_or(base);
         let mut pos = PosIndex::spanning(base, max);
         for (idx, arg) in inputargs.iter().enumerate() {
+            let arg = arg.as_ref();
             if let Some(prev) = pos.bind(arg.index, idx as u32) {
                 panic!(
                     "OpTypeIndex: raw inputarg index {} bound to inputargs[{}] {:?} and inputargs[{}] {:?} — backend uniqueness violated",
-                    arg.index, prev, inputargs[prev as usize].tp, idx, arg.tp,
+                    arg.index, prev, inputargs[prev as usize].as_ref().tp, idx, arg.tp,
                 );
             }
         }
@@ -260,7 +265,7 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// same OpRef with a different type.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
         let idx = self.inputarg_pos.get(opref.raw())?;
-        Some(self.inputargs[idx].tp)
+        Some(self.inputargs[idx].as_ref().tp)
     }
 
     /// Raw-keyed companion of `inputarg_type`. Used by callers that hold
@@ -270,6 +275,6 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
     /// inputarg base) internally, so the round-trip carries no information.
     pub fn inputarg_type_raw(&self, raw: u32) -> Option<Type> {
         let idx = self.inputarg_pos.get(raw)?;
-        Some(self.inputargs[idx].tp)
+        Some(self.inputargs[idx].as_ref().tp)
     }
 }

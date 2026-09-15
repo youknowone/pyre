@@ -20,7 +20,9 @@ use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
-use majit_ir::{InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity};
+use majit_ir::{
+    InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity,
+};
 use smallvec::SmallVec;
 
 // ── Constants ──────────────────────────────────────────────────────
@@ -421,8 +423,8 @@ impl LifetimeManager {
 // ── compute_vars_longevity ─────────────────────────────────────────
 
 /// regalloc.py compute_vars_longevity — backward liveness analysis.
-pub fn compute_vars_longevity<T: AsRef<Op>>(
-    inputargs: &[InputArg],
+pub fn compute_vars_longevity<T: AsRef<Op>, A: AsRef<InputArg>>(
+    inputargs: &[A],
     operations: &[T],
 ) -> LifetimeManager {
     let mut longevity = LifetimeManager::new();
@@ -483,7 +485,7 @@ pub fn compute_vars_longevity<T: AsRef<Op>>(
 
     // regalloc.py:1210-1213 input arguments
     for iarg in inputargs {
-        let opref = iarg.opref();
+        let opref = iarg.as_ref().opref();
         if !longevity.contains(opref) {
             longevity.set(opref, Lifetime::new(-1, -1));
         }
@@ -1482,14 +1484,14 @@ impl RegisterManager {
     /// regalloc.py — RPython reads `v.type` directly during the
     /// reg-binding walk; pyre routes the lookup through `OpTypeIndex`
     /// since `OpRef(u32)` has no intrinsic type.
-    pub fn before_call<T: AsRef<Op>>(
+    pub fn before_call<T: AsRef<Op>, A: AsRef<InputArg>>(
         &mut self,
         force_store: &[OpRef],
         save_all_regs: u8,
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
-        type_index: &OpTypeIndex<'_, T>,
+        type_index: &OpTypeIndex<'_, T, A>,
     ) {
         self.spill_or_move_registers_before_call(
             &self.save_around_call_regs.clone(),
@@ -1503,7 +1505,7 @@ impl RegisterManager {
     }
 
     /// regalloc.py:714
-    pub fn spill_or_move_registers_before_call<T: AsRef<Op>>(
+    pub fn spill_or_move_registers_before_call<T: AsRef<Op>, A: AsRef<InputArg>>(
         &mut self,
         save_sublist: &[RegLoc],
         force_store: &[OpRef],
@@ -1511,7 +1513,7 @@ impl RegisterManager {
         longevity: &mut LifetimeManager,
         fm: &mut FrameManager,
         pending_moves: &mut Vec<(Loc, Loc)>,
-        type_index: &OpTypeIndex<'_, T>,
+        type_index: &OpTypeIndex<'_, T, A>,
     ) {
         let mut new_free_regs: Vec<RegLoc> = Vec::new();
         let mut move_or_spill: Vec<OpRef> = Vec::new();
@@ -1734,7 +1736,7 @@ pub struct RegAlloc<'a> {
     /// Each entry is (source_loc, dest_loc).
     pub pending_moves: Vec<(Loc, Loc)>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
-    inputargs: &'a [InputArg],
+    inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     pub(crate) operations: &'a [OpRc],
@@ -1776,7 +1778,7 @@ impl<'a> RegAlloc<'a> {
     /// x86/regalloc.py:170
     pub fn new(
         constants: indexmap::IndexMap<u32, i64>,
-        inputargs: &'a [InputArg],
+        inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
         // We create with empty longevity/managers; they get initialized in _prepare.
@@ -1784,8 +1786,8 @@ impl<'a> RegAlloc<'a> {
         let rm = Self::make_gpr_manager();
         let xrm = Self::make_xmm_manager();
         let fm = FrameManager::new(0);
-        let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::build_op_pos(operations);
+        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
+        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         RegAlloc {
             longevity,
             rm,
@@ -2019,7 +2021,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// regalloc.py _set_initial_bindings — place all inputargs in frame slots.
-    fn _set_initial_bindings(&mut self, inputargs: &[InputArg]) {
+    fn _set_initial_bindings(&mut self, inputargs: &[InputArgRc]) {
         for iarg in inputargs {
             let opref = iarg.opref();
             let _loc = self.fm.get_new_loc(opref, iarg.tp, &mut self.longevity);
@@ -2027,7 +2029,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _update_bindings — bind bridge inputargs to their locations.
-    fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArg]) {
+    fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArgRc]) {
         let mut used: IndexMap<RegLoc, ()> = IndexMap::new();
 
         // x86/regalloc.py:295-312
@@ -2547,7 +2549,7 @@ impl<'a> RegAlloc<'a> {
             .sum();
         self.faillocs_arena.reserve(failarg_slots);
         let operations: &'a [OpRc] = self.operations;
-        let inputargs: &'a [InputArg] = self.inputargs;
+        let inputargs: &'a [InputArgRc] = self.inputargs;
         // Take the lowering plan so dispatch can borrow each LirOp without cloning it.
         let j2_ops = std::mem::take(&mut self.j2_ops);
         let mut output = Vec::with_capacity(operations.len());
@@ -6455,7 +6457,7 @@ mod tests {
         let _i2 = OpRef::int_op(1);
         let _i3 = OpRef::int_op(2);
 
-        let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, i0.raw())];
         let ops = vec![
             make_op(OpCode::IntAdd, 0, &[i0, i0]),
             make_guard(OpCode::GuardTrue, 1, &[i1], &[i0]),
@@ -6483,8 +6485,8 @@ mod tests {
         let vm = OpRef::input_arg_typed(1, Type::Ref);
         let add = OpRef::int_op(0);
         let inputargs = vec![
-            InputArg::from_type(Type::Int, 0),
-            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
         ];
         let ops = vec![
             make_op(OpCode::IntAdd, 0, &[i0, i0]),
@@ -6630,7 +6632,7 @@ mod tests {
         let live_ref = OpRef::input_arg_ref(0);
         let malloc_result = OpRef::ref_op(0);
         let size = OpRef::const_int(16);
-        let inputargs = vec![InputArg::from_type(Type::Ref, live_ref.raw())];
+        let inputargs = vec![InputArg::from_type_rc(Type::Ref, live_ref.raw())];
 
         let malloc = Op::new(OpCode::CallMallocNursery, &[rb(size)]);
         malloc.pos().set(malloc_result);
@@ -6699,7 +6701,7 @@ mod tests {
         let i2 = OpRef::int_op(2);
         let c1 = OpRef::const_int(1);
 
-        let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, i0.raw())];
 
         let add = Op::new(OpCode::IntAdd, &[rb(i0), rb(c1)]);
         add.pos().set(i1);
@@ -6757,8 +6759,8 @@ mod tests {
         let i3 = OpRef::int_op(3);
 
         let inputargs = vec![
-            InputArg::from_type(Type::Int, i0.raw()),
-            InputArg::from_type(Type::Int, i1.raw()),
+            InputArg::from_type_rc(Type::Int, i0.raw()),
+            InputArg::from_type_rc(Type::Int, i1.raw()),
         ];
 
         let mul_ovf = Op::new(OpCode::IntMulOvf, &[rb(i0), rb(i1)]);
@@ -6807,7 +6809,7 @@ mod tests {
         // by typed `OpRef::input_arg_ref` (variant-aware Eq).
         let i0 = OpRef::input_arg_ref(0);
         let c0 = OpRef::const_int(0);
-        let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
+        let inputargs = vec![InputArg::from_type_rc(Type::Ref, i0.raw())];
 
         let store = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i0)]);
         let ops = vec![store];
@@ -6852,8 +6854,8 @@ mod tests {
         let i2 = OpRef::int_op(2);
 
         let inputargs = vec![
-            InputArg::from_type(Type::Int, i0.raw()),
-            InputArg::from_type(Type::Int, i1.raw()),
+            InputArg::from_type_rc(Type::Int, i0.raw()),
+            InputArg::from_type_rc(Type::Int, i1.raw()),
         ];
 
         let raw = Op::new(OpCode::IntIsTrue, &[rb(i0)]);
@@ -6905,7 +6907,7 @@ mod tests {
     #[test]
     fn call_malloc_nursery_varsize_hands_over_a_frame_resident_length() {
         let i0 = OpRef::int_op(0);
-        let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, i0.raw())];
 
         // arglocs = [lengthloc, imm(itemsize), imm(kind)] is built from
         // args [kind, itemsize, length].
@@ -6950,8 +6952,8 @@ mod tests {
         let i1 = OpRef::int_op(1);
 
         let inputargs = vec![
-            InputArg::from_type(Type::Int, i0.raw()),
-            InputArg::from_type(Type::Int, i1.raw()),
+            InputArg::from_type_rc(Type::Int, i0.raw()),
+            InputArg::from_type_rc(Type::Int, i1.raw()),
         ];
 
         let raw = Op::new(OpCode::GuardTrue, &[rb(i0)]);
@@ -6988,8 +6990,8 @@ mod tests {
         let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
-            InputArg::from_type(Type::Ref, i0.raw()),
-            InputArg::from_type(Type::Ref, i1.raw()),
+            InputArg::from_type_rc(Type::Ref, i0.raw()),
+            InputArg::from_type_rc(Type::Ref, i1.raw()),
         ];
 
         let raw = Op::new(OpCode::GcLoadI, &[rb(i0), rb(c0), rb(c8)]);
@@ -7032,9 +7034,9 @@ mod tests {
         let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
-            InputArg::from_type(Type::Ref, i0.raw()),
-            InputArg::from_type(Type::Ref, i1.raw()),
-            InputArg::from_type(Type::Int, i2.raw()),
+            InputArg::from_type_rc(Type::Ref, i0.raw()),
+            InputArg::from_type_rc(Type::Ref, i1.raw()),
+            InputArg::from_type_rc(Type::Int, i2.raw()),
         ];
 
         let raw = Op::new(OpCode::GcStore, &[rb(i0), rb(c0), rb(i2), rb(c8)]);
@@ -7071,8 +7073,8 @@ mod tests {
         let i2 = OpRef::int_op(2);
 
         let inputargs = vec![
-            InputArg::from_type(Type::Int, i0.raw()),
-            InputArg::from_type(Type::Int, i1.raw()),
+            InputArg::from_type_rc(Type::Int, i0.raw()),
+            InputArg::from_type_rc(Type::Int, i1.raw()),
         ];
 
         let raw = Op::new(OpCode::SameAsI, &[rb(i0)]);
