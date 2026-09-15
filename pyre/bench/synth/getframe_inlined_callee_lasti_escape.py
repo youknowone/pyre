@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main
+# leftover=[] abort of loop:main; the inlined leaf entry-bridge compiles.
+# pyre-check: selfcheck-compiles=entry-bridge:leaf
 # An inlined callee returns its own escaped frame.  PyPy's dispatch loop writes
 # `last_instr` for both the `_getframe` call and the later return opcode.  The
 # JitCode walker bypasses that loop, so both transitions must be emitted on the

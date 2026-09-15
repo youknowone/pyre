@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=warm
+# leftover=[] abort of the warm loop; the check entry-bridge is what compiles.
+# pyre-check: selfcheck-compiles=entry-bridge:check
 # Self-checking regression guard for the two `SetLikeDictView` walks that step
 # their operand one item at a time.
 #

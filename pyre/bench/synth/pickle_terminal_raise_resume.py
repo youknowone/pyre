@@ -1,4 +1,5 @@
-# pyre-check: spec-folds=load_attr,builtin_getattr
+# leftover=[] abort keeps builtin_getattr residual; load_attr still folds.
+# pyre-check: spec-folds=load_attr
 # pyre-check: max-wasm-ratio=6.3
 # Function.call_args now enters every application-level callee through the
 # recursive portal, matching PyPy's PyCode.funcrun -> PyFrame.run chain.  The
