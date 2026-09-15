@@ -1729,6 +1729,8 @@ impl BlackholeInterpreter {
     /// Returns `Some(args)` for `ContinueRunningNormally` (RPython: raise
     /// jitexc.ContinueRunningNormally propagates through run→_run_forever).
     pub fn run(&mut self) -> BhRunOutcome {
+        // rlib/jit.py we_are_jitted: true during tracing and blackholing.
+        let _jitted = crate::JittedGuard::enter();
         let _bh_phase = majit_gc::BhProbePhase::enter("blackhole");
         // Pooled interpreters are registered for life (`acquire_interp`).
         // `seed_deopt_vinfo_ptr` still stamps a no-token state-field

@@ -6439,6 +6439,11 @@ impl<M: Clone> MetaInterp<M> {
         sym: &mut S,
         portal_pc: usize,
     ) -> crate::TraceAction {
+        // rlib/jit.py we_are_jitted: true during tracing and blackholing
+        // so the jitted arm is the one recorded. The residual hook
+        // otherwise reads JIT_MODE_FLAG, which is only set in compiled
+        // code, and would keep interpreter-only reload/ticker in the trace.
+        let _jitted = crate::JittedGuard::enter();
         let cpu = self.cpu.clone();
         let issubclass = self.issubclass;
         let pending_exc_box = self.last_exc_box;
