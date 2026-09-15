@@ -11316,20 +11316,78 @@ pub(crate) fn correct_resume_vsd(frame: &mut PyFrame, resume_pc: usize) {
     }
 }
 
-/// Blackhole `ContinueRunningNormally` handoff: resume `frame` at the
-/// merge-point next_instr carried in `green_int[0]` and re-derive its
-/// `valuestackdepth` from that resume pc via [`correct_resume_vsd`].
+/// If `pc` is the loop-condition `POP_JUMP` whose taken target is the
+/// loop exit, return the header pc.
 ///
-/// warmspot.py `handle_jitexception` parity — the CRN carries the
-/// merge-point args, so the frame restarts at the merge point, not the
-/// guard-failure pc.
+/// After-opt unboxes `i < n` to `IntLt` + `GuardTrue`. The fail
+/// leftover still pushes the traced `True` (`space.newbool` folded on
+/// the success path). `portal_ptr` at that `POP_JUMP` then falls into
+/// the body past `i >= n`. Rewind to the header so dispatch re-reads
+/// the heap locals (`warmspot.py` `handle_jitexception` → `portal_ptr`
+/// at the merge-point next_instr of the condition, not the leftover
+/// const).
+fn loop_header_for_exit_pop_jump(code: &pyre_interpreter::CodeObject, pc: usize) -> Option<usize> {
+    let headers = cached_loop_header_pcs(code);
+    if headers.is_empty() {
+        return None;
+    }
+    // Nearest header before `pc`. The while-condition `POP_JUMP` sits
+    // a few opcodes after the header (`LOAD`/`COMPARE`/`POP_JUMP`).
+    // A later `if` `POP_JUMP` (rem==0 at pc=23) is much farther; do
+    // not rewind that one — its leftover True is the correct raise arm.
+    //
+    // `code_successors` also inserts exception-table edges, so a
+    // farthest-successor walk from the rem==0 jump wrongly spans the
+    // `JUMP_BACKWARD` and looks like a loop-exit.
+    let mut header = None;
+    for candidate in 0..pc {
+        if headers.contains(&candidate) {
+            header = Some(candidate);
+        }
+    }
+    let header = header?;
+    if pc - header > 6 {
+        return None;
+    }
+    Some(header)
+}
+
+/// Blackhole `ContinueRunningNormally` handoff: resume `frame` at the
+/// merge-point next_instr.
+///
+/// `interp_jit.py` `dispatch` passes `handle_bytecode`'s returned local
+/// into the next `jit_merge_point`. Pyre stores that local on the frame;
+/// BH already interpreted the write. The merge-point green can still hold
+/// the loop-entry pc (the label inputarg). Prefer the live field when it
+/// has moved.
+///
+/// `correct_resume_vsd` is only for the loop-header merge point, where
+/// the guard's recorded depth over-counts. A COMPARE / `POP_JUMP`
+/// merge already has the bool BH just pushed; shrinking vsd from
+/// header liveness wipes it and the interpreter then takes the wrong
+/// arm (`warmspot.py` `handle_jitexception` → `portal_ptr` does not
+/// rewrite vsd).
+///
+/// Exception: the loop-exit `POP_JUMP` after an unboxed `i < n`
+/// `GuardTrue` fail. The leftover bool is the traced `True`; rewind
+/// to the header and reset vsd so dispatch re-evaluates the condition.
 #[majit_macros::dont_look_inside]
 fn apply_blackhole_crn_handoff(frame: &mut PyFrame, green_int: &[i64]) {
-    let Some(&ni) = green_int.first() else {
+    let green_pc = green_int.first().copied().unwrap_or(0) as usize;
+    let live_pc = frame.next_instr();
+    let advanced = live_pc != 0 && live_pc != green_pc;
+    let ni = if advanced { live_pc } else { green_pc };
+    if ni == 0 {
         return;
-    };
-    frame.set_last_instr_from_next_instr(ni as usize);
-    correct_resume_vsd(frame, ni as usize);
+    }
+    frame.set_last_instr_from_next_instr(ni);
+    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame) };
+    if let Some(header) = loop_header_for_exit_pop_jump(code, ni) {
+        frame.set_last_instr_from_next_instr(header);
+        correct_resume_vsd(frame, header);
+    } else if cached_loop_header_pcs(code).contains(&ni) {
+        correct_resume_vsd(frame, ni);
+    }
 }
 
 /// compile.py handle_fail.
