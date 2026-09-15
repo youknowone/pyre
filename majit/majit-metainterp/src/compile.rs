@@ -3704,7 +3704,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     let leftover_empty_short_tos_call = leftover.is_empty()
         && baked_field_len >= 10
         && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] == 1)
-        && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR);
+        && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR)
+        && (ops.iter().any(|op| op.opcode == OpCode::Finish)
+            || ops.iter().any(|op| op.opcode == OpCode::CallR));
     // leftover=[] GETFIELD of the survey loop (`from_callee` path=[4]
     // baked=14 NewWithVtable + CallMayForceR). raise_here's same
     // survey is entry>baked and already hits mint_past_live.
@@ -3734,7 +3736,6 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         || (leftover_has_listiter_id()
             && (listiter_leftover
                 || leftover_extras_any
-                || mint_string_method
                 || mint_nongc_field))
     {
         if std::env::var_os("MAJIT_LEFTOVER").is_some() {
