@@ -303,20 +303,6 @@ impl FrameView {
     fn reload(frame: *mut PyFrame) -> *mut PyFrame {
         gc_roots::reload_top_root(frame as pyre_object::PyObjectRef) as *mut PyFrame
     }
-
-    /// `reload_top_root` is `dont_look_inside`; the jitted arm has no
-    /// interpreter-path collection between opcodes, so skip the residual.
-    /// `inline(always)` so debug builds still put `we_are_jitted` in the
-    /// portal body — `#[inline]` alone leaves a residual `CallR` that
-    /// official after-opt must not keep.
-    #[inline(always)]
-    fn reload_if_interp(frame: *mut PyFrame) -> *mut PyFrame {
-        if majit_rlib::jit::we_are_jitted() {
-            frame
-        } else {
-            Self::reload(frame)
-        }
-    }
 }
 
 /// Restores compiled execution's frame-chain and activation bookkeeping,
@@ -10106,14 +10092,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     .with(|c| c.borrow_mut().take())
                     .expect("eval_loop_dispatch_poll status 2 must leave WARMUP_TICK_ERR"));
             }
+            // interp_jit.py `PyFrame.dispatch` has no per-opcode frame
+            // reload. Keep the skip in this portal `we_are_jitted`
+            // arm so a helper jitcode cannot residualize `reload_top_root`.
+            f = FrameView::reload(f);
         }
-        // interp_jit.py `PyFrame.dispatch` has no per-opcode frame
-        // reload: the jitted arm has no interpreter-path collection
-        // between opcodes (`reload_if_interp`). A residual that can
-        // collect must reread its own roots (tuple_slice_index_rooting
-        // rereads the slice receiver), not force a residual
-        // `reload_top_root` into every compiled iteration.
-        f = FrameView::reload_if_interp(f);
 
         let pc = unsafe { &*f }.next_instr();
 
@@ -10231,7 +10214,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             Ok(StepResult::CloseLoop { loop_header_pc, .. }) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer for the compile path.
-                f = FrameView::reload_if_interp(f);
+                if !majit_rlib::jit::we_are_jitted() {
+                    f = FrameView::reload(f);
+                }
                 // ── can_enter_jit (RPython interp_jit.py:114) ──
                 // RPython interp_jit.py:114 → warmstate.py maybe_compile_and_run  allow-line-citation
                 // `ec` is the loop-carried portal red, not a fresh TLS read.
@@ -10275,7 +10260,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                             last_instr,
                         );
                         if next_instr >= 0 {
-                            f = FrameView::reload_if_interp(f);
+                            if !majit_rlib::jit::we_are_jitted() {
+                                f = FrameView::reload(f);
+                            }
                             unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
                             continue;
                         }
@@ -10297,14 +10284,18 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // generator keeps its frame alive after leaving the portal,
                 // so force precisely this exit.  Ordinary Return deliberately
                 // remains lazy through FORCE_TOKEN + GUARD_NOT_FORCED_2.
-                f = FrameView::reload_if_interp(f);
+                if !majit_rlib::jit::we_are_jitted() {
+                    f = FrameView::reload(f);
+                }
                 let _ = majit_metainterp::jit::hint_force_virtualizable(unsafe { &mut *f });
                 return Ok(result);
             }
             Err(mut err) => {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
-                f = FrameView::reload_if_interp(f);
+                if !majit_rlib::jit::we_are_jitted() {
+                    f = FrameView::reload(f);
+                }
                 let last_instr = unsafe { &*f }.last_instr as i64;
                 let next_instr = pyre_interpreter::eval::dispatch_exception_handler(
                     unsafe { &mut *f },
@@ -10312,7 +10303,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     last_instr,
                 );
                 if next_instr >= 0 {
-                    f = FrameView::reload_if_interp(f);
+                    if !majit_rlib::jit::we_are_jitted() {
+                        f = FrameView::reload(f);
+                    }
                     unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
                     continue;
                 }
