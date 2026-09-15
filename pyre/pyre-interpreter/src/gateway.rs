@@ -1572,18 +1572,22 @@ pub unsafe fn builtin_code_call_name(obj: PyObjectRef, receiver: Option<PyObject
     builtin_names(code, receiver).1
 }
 
-/// gateway.py BuiltinCode.getdocstring — return the stored docstring
-/// wrapped as a `str`, or `None` if no docstring was attached.
+/// `objspace.py` `ObjSpace.newtext_or_none`.
+fn newtext_or_none(s: Option<&str>) -> PyObjectRef {
+    match s {
+        None => pyre_object::w_none(),
+        Some(s) => pyre_object::w_str_new_managed(s),
+    }
+}
+
+/// gateway.py `BuiltinCode.getdocstring` — `space.newtext_or_none(self.docstring)`.
 ///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.
 #[inline]
 pub unsafe fn builtin_code_get_docstring(obj: PyObjectRef) -> PyObjectRef {
-    let func_obj = obj as *const BuiltinCode;
-    match unsafe { (*func_obj).docstring } {
-        Some(s) => pyre_object::w_str_new_managed(s),
-        None => pyre_object::w_none(),
-    }
+    let code = unsafe { &*(obj as *const BuiltinCode) };
+    newtext_or_none(code.docstring)
 }
 
 /// gateway.py GatewayCache.build() parity — wrap a BuiltinCodeFn as FunctionWithFixedCode.
