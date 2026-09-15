@@ -903,8 +903,9 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `space.newfloat(float(x)/float(y))`.  `space.newfloat` is
 /// `W_FloatObject(floatval)` (`objspace.py newfloat`); Charon cannot
 /// inline the cross-crate helper, so the constructor body lives here
-/// and `fuse_boxing_alloc` rewrites it to `new_with_vtable` in this
-/// graph.  The mantissa overflow (`r_uint(abs(n)) >> DBL_MANT_DIG`) is
+/// and `fuse_boxing_alloc` rewrites `malloc_typed_managed` to
+/// `new_with_vtable` in this graph.  The mantissa overflow
+/// (`r_uint(abs(n)) >> DBL_MANT_DIG`) is
 /// the `OverflowError` that `_make_descr_binop` catches in
 /// [`int_truediv`] / [`int_truediv_ovf2long`], so this graph has no
 /// ovf diamond (a backward `goto` into that block hung the helper walk).
@@ -914,7 +915,7 @@ pub(crate) fn _truediv(x: i64, y: i64) -> PyResult {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
     let value = (x as f64) / (y as f64);
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -1623,7 +1624,7 @@ unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// body lives in each leaf the way it lives in [`_truediv`].
 #[inline(never)]
 pub(crate) fn _float_add(x: f64, y: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -1636,7 +1637,7 @@ pub(crate) fn _float_add(x: f64, y: f64) -> PyResult {
 
 #[inline(never)]
 pub(crate) fn _float_sub(x: f64, y: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -1649,7 +1650,7 @@ pub(crate) fn _float_sub(x: f64, y: f64) -> PyResult {
 
 #[inline(never)]
 pub(crate) fn _float_mul(x: f64, y: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -1665,7 +1666,7 @@ pub(crate) fn _float_truediv(x: f64, y: f64) -> PyResult {
     if y == 0.0 {
         return Err(PyError::zero_division(ZERO_DIVISION_MSG));
     }
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6619,7 +6620,7 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
 /// no overflow diamond.
 #[inline(never)]
 pub(crate) fn _int_neg(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_IntObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
@@ -6633,7 +6634,7 @@ pub(crate) fn _int_neg(x: i64) -> PyResult {
 /// floatobject.py `descr_pos`: `W_FloatObject(self.floatval)`.
 #[inline(never)]
 pub(crate) fn _float_pos(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6647,7 +6648,7 @@ pub(crate) fn _float_pos(x: f64) -> PyResult {
 /// ll_math.py `sqrt_nonneg` after the domain pin: `W_FloatObject(sqrt(x))`.
 #[inline(never)]
 pub(crate) fn _float_sqrt(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6661,7 +6662,7 @@ pub(crate) fn _float_sqrt(x: f64) -> PyResult {
 /// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.
 #[inline(never)]
 pub(crate) fn _float_sin(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6675,7 +6676,7 @@ pub(crate) fn _float_sin(x: f64) -> PyResult {
 /// ll_math.py `ll_math_cos` after the finite pin: `W_FloatObject(cos(x))`.
 #[inline(never)]
 pub(crate) fn _float_cos(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6689,7 +6690,7 @@ pub(crate) fn _float_cos(x: f64) -> PyResult {
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
 #[inline(never)]
 pub(crate) fn _float_abs(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6703,7 +6704,7 @@ pub(crate) fn _float_abs(x: f64) -> PyResult {
 /// intobject.py `descr_abs` after `ovfcheck(abs(a))`.
 #[inline(never)]
 pub(crate) fn _int_abs(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_IntObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
@@ -6715,7 +6716,7 @@ pub(crate) fn _int_abs(x: i64) -> PyResult {
 /// floatobject.py `descr_neg`: `W_FloatObject(-self.floatval)`.
 #[inline(never)]
 pub(crate) fn _float_neg(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_FloatObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -6846,7 +6847,7 @@ pub fn invert(a: PyObjectRef) -> PyResult {
 /// intobject.py `descr_invert`: `wrapint(~self.intval)`.
 #[inline(never)]
 pub(crate) fn _int_invert(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed(W_IntObject {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
