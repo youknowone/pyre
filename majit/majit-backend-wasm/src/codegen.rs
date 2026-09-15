@@ -2067,9 +2067,36 @@ impl KnownArrayLengths {
 /// does not cancel a delayed NULL / ZERO_ARRAY — the object is visible
 /// at the flush (deopt, next malloc, merge).
 fn rewrite_pending_zero_flush(op: &Op) -> bool {
-    matches!(op.opcode, OpCode::Label | OpCode::Jump | OpCode::Finish)
-        || op.opcode.is_guard()
+    matches!(
+        op.opcode,
+        OpCode::Label
+            | OpCode::Jump
+            | OpCode::Finish
+            // rewrite.py `transform_to_gc_load` GETFIELD_GC arm:
+            // `emit_pending_zeros` before the load (`test_zero_ptr_field_before_getfield`).
+            | OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+    ) || op.opcode.is_guard()
         || op.opcode.can_malloc()
+}
+
+/// rewrite.py emits `ZERO_ARRAY` before later reads; a GETARRAYITEM /
+/// GETINTERIORFIELD of this array must not see a later SETARRAYITEM as
+/// covering the slot.
+fn observes_array_items(op: &Op, array: OpRef, forwardings: &[Option<OpRef>]) -> bool {
+    matches!(
+        op.opcode,
+        OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF
+            | OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF
+    ) && resolve_same_as_forwarding(op.arg(0).to_opref(), forwardings) == array
 }
 
 /// rewrite.py `could_merge_with_next_guard`: a comparison whose next
@@ -2116,6 +2143,7 @@ fn newarray_zero_plan(
     op_idx: usize,
     constants: &indexmap::IndexMap<u32, i64>,
     length_const: Option<i64>,
+    forwardings: &[Option<OpRef>],
 ) -> ZeroArrayPlan {
     match op.opcode {
         OpCode::NewArray => ZeroArrayPlan::Skip,
@@ -2125,7 +2153,7 @@ fn newarray_zero_plan(
                 if n == 0 {
                     ZeroArrayPlan::Skip
                 } else {
-                    trimmed_zero_array(ops, op_idx, op.pos().get(), n, constants)
+                    trimmed_zero_array(ops, op_idx, op.pos().get(), n, constants, forwardings)
                 }
             }),
             None => ZeroArrayPlan::Runtime,
@@ -2134,24 +2162,32 @@ fn newarray_zero_plan(
     }
 }
 
-/// rewrite.py `emit_pending_zeros`: advance `start` while the index was
-/// stored, retreat `stop` the same way. `start >= stop` is a no-op.
+/// rewrite.py `emit_pending_zeros` / `_setarrayitems_occurred`: a sparse
+/// set of constant indexes, then walk `start`/`stop` on membership.
 fn trimmed_zero_array(
     ops: &[Op],
     op_idx: usize,
     array: OpRef,
     length: usize,
     constants: &indexmap::IndexMap<u32, i64>,
+    forwardings: &[Option<OpRef>],
 ) -> ZeroArrayPlan {
-    let mut written = vec![false; length];
+    // rewrite.py `remember_setarrayitem_occurred` keys through
+    // `get_box_replacement`; SameAsR aliases of the NEW_ARRAY_CLEAR
+    // result must still cancel the matching ZERO_ARRAY indexes.
+    let array = resolve_same_as_forwarding(array, forwardings);
+    let mut written = indexmap::IndexSet::<usize>::new();
     for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
-        if rewrite_pending_zero_flush(later) || could_merge_with_next_guard(later, j, ops) {
+        if rewrite_pending_zero_flush(later)
+            || could_merge_with_next_guard(later, j, ops)
+            || observes_array_items(later, array, forwardings)
+        {
             break;
         }
         if later.opcode != OpCode::SetarrayitemGc {
             continue;
         }
-        if later.arg(0).to_opref() != array {
+        if resolve_same_as_forwarding(later.arg(0).to_opref(), forwardings) != array {
             continue;
         }
         let Some(idx) = const_operand_value(constants, later.arg(1).to_opref()) else {
@@ -2160,15 +2196,15 @@ fn trimmed_zero_array(
         if let Ok(i) = usize::try_from(idx)
             && i < length
         {
-            written[i] = true;
+            written.insert(i);
         }
     }
     let mut start = 0;
-    while start < length && written[start] {
+    while start < length && written.contains(&start) {
         start += 1;
     }
     let mut stop = length;
-    while stop > start && written[stop - 1] {
+    while stop > start && written.contains(&(stop - 1)) {
         stop -= 1;
     }
     if start >= stop {
@@ -2198,9 +2234,12 @@ fn pending_new_zero_offsets(
     op_idx: usize,
     obj: OpRef,
     write_vtable_offset: Option<usize>,
+    stamp_w_class: bool,
+    forwardings: &[Option<OpRef>],
 ) -> Vec<usize> {
     let class_word = descr.class_word_field().map(|fd| fd.offset());
-    let skip_class_word = class_word.is_some() && descr.w_class_obj().is_some_and(|w| w != 0);
+    let skip_class_word = stamp_w_class && class_word.is_some();
+    let obj = resolve_same_as_forwarding(obj, forwardings);
     let mut pending: Vec<usize> = descr
         .gc_fielddescrs()
         .iter()
@@ -2218,7 +2257,7 @@ fn pending_new_zero_offsets(
         if later.opcode != OpCode::SetfieldGc {
             continue;
         }
-        if later.arg(0).to_opref() != obj {
+        if resolve_same_as_forwarding(later.arg(0).to_opref(), forwardings) != obj {
             continue;
         }
         let descr = later.getdescr();
@@ -2292,13 +2331,26 @@ fn emit_zero_array_plan(
     match *plan {
         ZeroArrayPlan::Skip => {}
         ZeroArrayPlan::Items { start, count } => {
-            let Some(bytes) = (item_size as u32).checked_mul(count as u32) else {
+            // wasm32 memory.fill takes an i32 length; a truncated cast
+            // would zero a prefix and leave the rest dirty. Skip rather
+            // than emit a shorter fill (`handle_new_array` already sent
+            // oversized constants to the collecting helper).
+            let Some(item_size) = u32::try_from(item_size).ok() else {
                 return;
             };
-            let dest = base_size.saturating_add((item_size as i64).saturating_mul(start as i64));
+            let Some(count) = u32::try_from(count).ok() else {
+                return;
+            };
+            let Some(bytes) = item_size.checked_mul(count) else {
+                return;
+            };
+            let dest = base_size.saturating_add(i64::from(item_size).saturating_mul(start as i64));
             emit_zero_array_item_range(sink, value_types, result, dest, bytes);
         }
         ZeroArrayPlan::Runtime => {
+            let Ok(item_size) = i32::try_from(item_size) else {
+                return;
+            };
             sink.local_get(value_types.local(result));
             sink.i32_wrap_i64();
             if base_size != 0 {
@@ -2309,7 +2361,7 @@ fn emit_zero_array_plan(
             emit_resolve(sink, constants, value_types, length);
             sink.i32_wrap_i64();
             if item_size != 1 {
-                sink.i32_const(item_size as i32);
+                sink.i32_const(item_size);
                 sink.i32_mul();
             }
             sink.memory_fill(0);
@@ -9901,6 +9953,7 @@ fn build_function(
                 // delayed NULL at the same offset.
                 let write_vtable =
                     op.opcode == OpCode::NewWithVtable && vtable != 0 && vtable_offset.is_some();
+                let stamp_w_class = w_class_init.is_some_and(|(_, w_class)| w_class != 0);
                 let pending_zeros = sd.map_or_else(Vec::new, |sd| {
                     pending_new_zero_offsets(
                         sd,
@@ -9908,6 +9961,8 @@ fn build_function(
                         op_idx,
                         op.pos().get(),
                         vtable_offset.filter(|_| write_vtable),
+                        stamp_w_class,
+                        &same_as_forwardings,
                     )
                 });
 
@@ -10152,8 +10207,9 @@ fn build_function(
                     // Without it the nursery-zeroed `w_class` stays 0 and the
                     // promoted-`w_class` GuardValue fails every iteration on any
                     // escaping-builtin loop (e.g. `while: lst.append(i)`).
-                    if op.opcode == OpCode::NewWithVtable
-                        && let Some((w_class_offset, w_class)) = w_class_init
+                    // rewrite.rs `handle_new` stamps `w_class` for both
+                    // New and NewWithVtable before `clear_gc_fields`.
+                    if let Some((w_class_offset, w_class)) = w_class_init
                         && w_class != 0
                     {
                         sink.local_get(value_types.local(vi));
@@ -10231,7 +10287,14 @@ fn build_function(
                 // rewrite.py ZERO_ARRAY after the length store covers
                 // leftover `NewArrayClear` items; plain `NewArray` does not.
                 let length_const = const_operand_value(constants, op.arg(0).to_opref());
-                let zero_plan = newarray_zero_plan(op, ops, op_idx, constants, length_const);
+                let zero_plan = newarray_zero_plan(
+                    op,
+                    ops,
+                    op_idx,
+                    constants,
+                    length_const,
+                    &same_as_forwardings,
+                );
                 let inline_nursery_total = length_const.and_then(|len| {
                     use majit_gc::header::GcHeader;
                     let len = usize::try_from(len).ok()?;
