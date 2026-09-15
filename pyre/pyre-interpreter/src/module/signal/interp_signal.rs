@@ -1014,11 +1014,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let sigs =
                         rustpython_host_env::signal::valid_signals(signalstate::NSIG as usize)
                             .unwrap_or_default();
-                    let items: Vec<pyre_object::PyObjectRef> = sigs
-                        .into_iter()
-                        .map(|n| pyre_object::w_int_new(n as i64))
-                        .collect();
-                    Ok(pyre_object::w_set_from_items(&items))
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for n in sigs {
+                        items.push(pyre_object::w_int_new(n as i64));
+                    }
+                    Ok(pyre_object::w_set_from_items(&items.take()))
                 }
                 #[cfg(not(feature = "host_env"))]
                 Err(crate::PyError::not_implemented(
@@ -1332,11 +1332,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             return Err(errno_exception("OSError", errno));
                         }
                         // interp_signal.py _sigset_to_signals
-                        let items: Vec<pyre_object::PyObjectRef> = (1..signalstate::NSIG)
-                            .filter(|s| rustpython_host_env::signal::sigset_contains(mask, *s))
-                            .map(|s| pyre_object::w_int_new(s as i64))
-                            .collect();
-                        Ok(pyre_object::w_set_from_items(&items))
+                        let mut items = pyre_object::gc_roots::RootedItems::new();
+                        for s in 1..signalstate::NSIG {
+                            if rustpython_host_env::signal::sigset_contains(mask, s) {
+                                items.push(pyre_object::w_int_new(s as i64));
+                            }
+                        }
+                        Ok(pyre_object::w_set_from_items(&items.take()))
                     }
                     #[cfg(not(feature = "host_env"))]
                     Err(crate::PyError::not_implemented(
@@ -1462,11 +1464,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // interp_signal.py:546-547 — if signals were
                         // unblocked, their handlers may now be pending.
                         checksignals_now()?;
-                        let out: Vec<pyre_object::PyObjectRef> = (1..=64)
-                            .filter(|s| rustpython_host_env::signal::sigset_contains(prev, *s))
-                            .map(|s| pyre_object::w_int_new(s as i64))
-                            .collect();
-                        Ok(pyre_object::w_set_from_items(&out))
+                        let mut out = pyre_object::gc_roots::RootedItems::new();
+                        for s in 1..=64 {
+                            if rustpython_host_env::signal::sigset_contains(prev, s) {
+                                out.push(pyre_object::w_int_new(s as i64));
+                            }
+                        }
+                        Ok(pyre_object::w_set_from_items(&out.take()))
                     }
                     #[cfg(not(feature = "host_env"))]
                     {

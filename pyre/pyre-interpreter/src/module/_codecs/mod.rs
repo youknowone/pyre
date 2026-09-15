@@ -1530,7 +1530,8 @@ fn unicode_escape_encode_impl(
         return Err(bad_arg("unicode_escape_encode", Some(1), "str", w_obj));
     }
     let _errors = codec_errors_arg("unicode_escape_encode", 2, errors)?;
-    let out = crate::codec_engine::encode_unicode_escape(unsafe { w_str_get_wtf8(w_obj) });
+    let s = unsafe { w_str_get_wtf8(w_obj) }.to_wtf8_buf();
+    let out = crate::codec_engine::encode_unicode_escape(&s);
     Ok(rooted_tuple()
         .arg(w_bytes_from_bytes(&out))
         .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
@@ -1611,8 +1612,8 @@ fn escape_encode_impl(
         return Err(bad_arg("escape_encode", Some(1), "bytes", w_obj));
     }
     let _errors = codec_errors_arg("escape_encode", 2, errors)?;
-    let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) };
-    let out = crate::codec_engine::encode_escape(data);
+    let data = unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) }.to_vec();
+    let out = crate::codec_engine::encode_escape(&data);
     Ok(rooted_tuple()
         .arg(w_bytes_from_bytes(&out))
         .arg(w_int_new(data.len() as i64))
@@ -1631,8 +1632,9 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
     // PyPy `interp_codecs.py charmap_build`: build a dict mapping
     // each Unicode codepoint in `chars` to its ordinal position.
+    let chars = unsafe { w_str_get_wtf8(chars) }.to_wtf8_buf();
     let w_charmap = w_dict_new();
-    for (num, cp) in unsafe { w_str_get_wtf8(chars) }.code_points().enumerate() {
+    for (num, cp) in chars.code_points().enumerate() {
         unsafe {
             pyre_object::dictmultiobject::w_dict_store(
                 w_charmap,

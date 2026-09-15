@@ -10744,7 +10744,7 @@ fn exception_group_derive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (message, exceptions) = exception_group_fields(args[0])?;
-    let message = unsafe { pyre_object::w_str_get_wtf8(message) };
+    let message = unsafe { pyre_object::w_str_get_wtf8(message) }.to_wtf8_buf();
     let count = unsafe { pyre_object::w_tuple_len(exceptions) };
     let suffix = if count == 1 { "" } else { "s" };
     // `app_group.py:88-90` interpolates `self.message` into the result, and a
@@ -10753,7 +10753,7 @@ fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // U+FFFD, so `str(group)` answered a different string than `group.message`
     // held -- a loss visible from Python, not only on the way to stderr.
     let mut rendered = Wtf8Buf::with_capacity(message.len() + 32);
-    rendered.push_wtf8(message);
+    rendered.push_wtf8(&message);
     rendered.push_str(&format!(" ({count} sub-exception{suffix})"));
     Ok(pyre_object::w_str_from_wtf8_managed(rendered))
 }
@@ -11401,8 +11401,8 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py:1056-1070 — bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
         if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
-            let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
-            let s = String::from_utf8_lossy(data);
+            let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec();
+            let s = String::from_utf8_lossy(&data);
             return parse_int_from_str(obj, &s, 10);
         }
         return Err(crate::PyError::type_error(format!(
@@ -11422,8 +11422,8 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
         // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
-            let data = pyre_object::bytesobject::bytes_like_data(obj);
-            let s = String::from_utf8_lossy(data);
+            let data = pyre_object::bytesobject::bytes_like_data(obj).to_vec();
+            let s = String::from_utf8_lossy(&data);
             return parse_int_from_str(obj, &s, base);
         }
     }

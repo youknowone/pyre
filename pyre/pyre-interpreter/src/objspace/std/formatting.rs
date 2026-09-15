@@ -350,8 +350,8 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
     let fmt = pyre_object::gc_roots::pin_root(fmt);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let args = pyre_object::gc_roots::pin_root(args);
-    let fmt_str = w_str_get_wtf8(fmt);
-    let (format, deferred_error) = parse_wtf8_incremental(fmt_str)?;
+    let fmt_str = w_str_get_wtf8(fmt).to_wtf8_buf();
+    let (format, deferred_error) = parse_wtf8_incremental(&fmt_str)?;
 
     // `unicodeobject.c PyUnicode_Format` — the operand is usable as a
     // mapping (for `%(key)s` lookups) when it exposes `__getitem__` and is
@@ -492,8 +492,8 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
     let fmt = pyre_object::gc_roots::pin_root(fmt);
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let args = pyre_object::gc_roots::pin_root(args);
-    let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt);
-    let (format, deferred_error) = parse_bytes_incremental(fmt_bytes)?;
+    let fmt_bytes = pyre_object::bytesobject::bytes_like_data(fmt).to_vec();
+    let (format, deferred_error) = parse_bytes_incremental(&fmt_bytes)?;
     let (num_specifiers, mapping_required) = format
         .check_specifiers()
         .ok_or_else(|| PyError::type_error("format requires a mapping"))?;
