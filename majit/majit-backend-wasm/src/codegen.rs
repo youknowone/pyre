@@ -5910,7 +5910,7 @@ fn build_function(
         closed_outside_regions: 0,
         ref_homes,
         frame,
-        counter_slot: counter_slot(inputargs, ops).map(|slot| slot as u64),
+        counter_slot: counter_slot(entry_inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
         gc_table_slots: &gc_table_slots,
     };

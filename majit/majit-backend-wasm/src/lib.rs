@@ -3115,7 +3115,7 @@ impl WasmBackend {
         // An `uninitialized_label` trip can also fire before the sibling
         // peel that publishes its JUMP target; fold those too so the
         // one-shot probe is not the only retry.
-        let sibling_ids: Vec<i64> = PENDING_INLINES.with(|pending| {
+        let mut sibling_ids: Vec<i64> = PENDING_INLINES.with(|pending| {
             pending
                 .borrow()
                 .iter()
@@ -3126,6 +3126,7 @@ impl WasmBackend {
                 .map(|(&id, _)| id)
                 .collect()
         });
+        sibling_ids.sort_unstable();
         for id in sibling_ids {
             if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
                 work.push((id, item.region, item.remap));
@@ -5429,12 +5430,24 @@ impl majit_backend::Backend for WasmBackend {
                         .compiled_loop_token()
                         .and_then(|clt| clt.upgrade_loop_token())
                 {
-                    defer_inline = Some((
-                        owner,
-                        0,
-                        !resumes_at_loop_header,
-                        Some((source_trace_id, source_fail_index)),
-                    ));
+                    // A remap is only useful if the parent is itself waiting
+                    // to join this owner. A parent declined as
+                    // `not_loop_closing` never enters PENDING, so the child
+                    // would re-register forever.
+                    let parent_pending = PENDING_INLINES.with(|pending| {
+                        pending.borrow().values().any(|item| {
+                            Arc::ptr_eq(&item.owner, &owner)
+                                && item.region.trace_id == source_trace_id
+                        })
+                    });
+                    if parent_pending {
+                        defer_inline = Some((
+                            owner,
+                            0,
+                            !resumes_at_loop_header,
+                            Some((source_trace_id, source_fail_index)),
+                        ));
+                    }
                 }
             } else if !bridge_is_loop_closing {
                 diag_bump(34);
