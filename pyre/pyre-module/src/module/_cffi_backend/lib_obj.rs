@@ -172,11 +172,14 @@ fn build_cpython_func(
     )
 }
 
-fn cached_attr(lib: &W_LibObject, attr: &str) -> Option<PyObjectRef> {
+/// `W_LibObject._get_attr_elidable`.
+#[majit_macros::elidable_promote]
+fn get_attr_elidable(lib: &W_LibObject, attr: &str) -> Option<PyObjectRef> {
     unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(lib.dict_w, attr) }
 }
 
 /// `W_LibObject._build_attr`.
+#[majit_macros::dont_look_inside]
 fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let lib_slot = roots.base();
@@ -203,7 +206,7 @@ fn build_attr(w_lib: PyObjectRef, attr: &str) -> Result<Option<PyObjectRef>, PyE
                 let _ = roots.pin_root(item);
             }
             if !unsafe { pyre_object::pyobject::is_none(roots.get(base + 1)) } {
-                result = cached_attr(lib_arg(roots.get(base + 1))?, attr);
+                result = get_attr_elidable(lib_arg(roots.get(base + 1))?, attr);
                 if result.is_none() {
                     result = build_attr(roots.get(base + 1), attr)?;
                 }
@@ -328,7 +331,8 @@ fn get_attr(
     let attr_slot = lib_slot + 1;
     let _ = roots.pin_root(w_attr);
     let attr = pyre_interpreter::baseobjspace::text_w(roots.get(attr_slot))?.to_string();
-    let value = match cached_attr(lib_arg(roots.get(lib_slot))?, &attr) {
+    // `_get_attr`: `_get_attr_elidable` first, `_build_attr` on KeyError.
+    let value = match get_attr_elidable(lib_arg(roots.get(lib_slot))?, &attr) {
         Some(value) => Some(value),
         None => build_attr(roots.get(lib_slot), &attr)?,
     };
