@@ -3956,12 +3956,10 @@ impl Backend for DynasmBackend {
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        let offset = fielddescr.as_offset();
-        // Route through `read_float_at_mem` (`runner.rs` —
-        // `llmodel.py:490-491` parity) so misaligned struct fields use
-        // `read_unaligned`. Direct `*const f64` deref was UB-prone on
-        // misaligned vable float slots.
-        self.read_float_at_mem(struct_ptr, offset as i64)
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        unsafe {
+            majit_backend::llmodel::read_float_at_mem_sized(struct_ptr as usize, offset, size)
+        }
     }
 
     /// llmodel.py bh_setfield_gc_f delegates to write_float_at_mem.
@@ -3973,12 +3971,15 @@ impl Backend for DynasmBackend {
         value: f64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
-        // Route through `write_float_at_mem` (`runner.rs` —
-        // `llmodel.py:493-494` parity) so misaligned struct fields use
-        // `write_unaligned`; a direct `*mut f64` deref was UB-prone on
-        // misaligned vable float slots.
-        self.write_float_at_mem(struct_ptr, offset as i64, value);
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem_sized(
+                struct_ptr as usize,
+                offset,
+                size,
+                value,
+            )
+        }
     }
 
     fn compiled_fail_descr_layouts(

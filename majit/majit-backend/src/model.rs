@@ -425,10 +425,8 @@ impl Cpu for DefaultCpu {
     }
 
     fn bh_getfield_gc_f(&self, struct_ptr: usize, fd: &dyn FieldDescr) -> f64 {
-        // llmodel.py read_float_at_mem — 64-bit IEEE.
-        let addr = struct_ptr + fd.offset();
-        let bits = unsafe { *(addr as *const u64) };
-        f64::from_bits(bits)
+        // Size 8 is llmodel.py FLOATSTORAGE; size 4 widens f32.
+        unsafe { crate::llmodel::read_float_at_mem_sized(struct_ptr, fd.offset(), fd.field_size()) }
     }
 }
 

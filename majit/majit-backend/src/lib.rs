@@ -3391,17 +3391,16 @@ pub trait Backend: Send {
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
     /// model.py bh_getfield_gc_f(struct, fielddescr) →
-    /// `read_float_at_mem(struct, ofs)`.  Fixed `FLOATSTORAGE`-width
-    /// load at the field offset.  Shared by pyre's raw-memory backends.
+    /// `read_float_at_mem(struct, ofs)`.  Size 8 is `FLOATSTORAGE`;
+    /// size 4 is a jit_interp `float(f32)` field (widen to the float bank).
     fn bh_getfield_gc_f(
         &self,
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        let offset = fielddescr.as_offset();
-        let addr = (struct_ptr as usize).wrapping_add(offset);
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         // SAFETY: see `bh_getfield_gc_i`.
-        unsafe { (addr as *const f64).read_unaligned() }
+        unsafe { crate::llmodel::read_float_at_mem_sized(struct_ptr as usize, offset, size) }
     }
     /// model.py / llmodel.py bh_setfield_gc_i → `write_int_at_mem(struct,
     /// ofs, size, value)`.  Size + sign come from `unpack_fielddescr_size`;
@@ -3436,17 +3435,19 @@ pub trait Backend: Send {
         // This is the barrier `write_ref_at_mem` documents its callers as owing.
         majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
     }
-    /// model.py / llmodel.py bh_setfield_gc_f → `FLOATSTORAGE`-width
-    /// store at the field offset.
+    /// model.py / llmodel.py bh_setfield_gc_f. Size 8 is `FLOATSTORAGE`;
+    /// size 4 demotes to f32.
     fn bh_setfield_gc_f(
         &self,
         struct_ptr: i64,
         newvalue: f64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         // SAFETY: see `bh_setfield_gc_i`.
-        unsafe { crate::llmodel::write_float_at_mem(struct_ptr as usize, offset, newvalue) };
+        unsafe {
+            crate::llmodel::write_float_at_mem_sized(struct_ptr as usize, offset, size, newvalue)
+        };
     }
 
     // ── model.py:209-215, 247-253 array operations ──
