@@ -29,9 +29,19 @@ use pyre_object::{PY_NULL, PyObjectRef};
 
 /// jd1 symbolic state carried across the `unpackiterable_driver` back-edge.
 ///
-/// `baseobjspace.py` `reds='auto'` names whatever is live at the marker.
-/// The extracted Rust portal keeps `root_base`, `items_slot`, and the
-/// `RootScope` cell; JUMP / enter must match that bank.
+/// `baseobjspace.py` `reds='auto'` names the Python objects `w_iterator`
+/// and `items`.  The extracted Rust portal cannot: there is no RPython GC
+/// transform to keep those objects as traced locals, so they live on the
+/// shadow stack and `reds='auto'` names `root_base`, `items_slot`, and the
+/// `RootScope` cell.  Binding the objects as merge-point reds rematerializes
+/// the slots after the marker and silently declines `try_fuse_drain_match`
+/// (`front/result_exc.rs`), leaving `StopIteration` / `PyErrorKind::eq`
+/// residuals.  JUMP / enter must match the extracted banks.
+///
+/// Convergence: an RPython-style GC transform that keeps `w_iterator` /
+/// `items` as traced locals, so `reds='auto'` names them without a
+/// shadow-stack pin and the drain fusion still sees
+/// `next(shadow_stack_get(root_base))` as the last op of its block.
 #[allow(dead_code)]
 pub struct UnpackSym {
     /// baseobjspace.py jit_merge_point(greenkey=greenkey) green.

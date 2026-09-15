@@ -11110,7 +11110,6 @@ where
         let frame = self.frames.current_mut();
         frame.ref_regs[reg] = opref;
         frame.ref_values[reg] = value;
-        frame.retire_portal_red_ref(reg);
     }
 
     fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
@@ -12224,11 +12223,6 @@ pub fn setup_frame_from_merge_point(
                 JitArgKind::Float => Value::Float(f64::from_bits(value as u64)),
             };
             let _ = ctx.try_set_opref_concrete(opref, concrete);
-            if kind == JitArgKind::Ref && !opref.is_constant() {
-                if let Ok(reg) = u16::try_from(reg) {
-                    frame.portal_red_refs.push((reg, opref));
-                }
-            }
         }
     }
     // The walker reads from `code_cursor`; `pc` is only the portal anchor.
@@ -12239,7 +12233,7 @@ pub fn setup_frame_from_merge_point(
     if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
         eprintln!(
             "[portal-red] seed refs={:?} red_args={:?}",
-            frame.portal_red_refs,
+            frame.ref_regs,
             red_args
                 .iter()
                 .map(|(k, o, v)| (*k, *o, *v))
