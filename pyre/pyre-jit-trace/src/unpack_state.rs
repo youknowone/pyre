@@ -83,15 +83,16 @@ pub struct UnpackJitState {
 }
 
 /// Shadow-stack slot of the iterator pinned by `unpackiterable_portal`.
-/// The hook runs inside that portal, so the two pins are the top of the
-/// stack and this is `len - 2`.
+///
+/// Call this only while those two pins are still the top of the stack.
+/// `drive_unpack_iterable_trace` captures the value before
+/// `ResidualExceptionScope::park` can push exception roots on top.
 pub fn jd1_root_base() -> i64 {
     pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64
 }
 
 /// Loop-carried reds in merge-point bank order (red I, then red R).
-pub fn jd1_live_values() -> Vec<Value> {
-    let root_base = jd1_root_base();
+pub fn jd1_live_values_at(root_base: i64) -> Vec<Value> {
     vec![
         Value::Int(root_base),
         Value::Int(root_base + 1),

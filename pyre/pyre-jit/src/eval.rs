@@ -7729,6 +7729,10 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    // Portal pins are the two slots under this hook. Capture them before
+    // ResidualExceptionScope::park can pin a standing exception on top;
+    // otherwise jd1_root_base's `len - 2` names those parked roots.
+    let portal_root_base = pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64;
     // The walk below executes each residual concretely, so the raise that ends
     // the unpack is recorded into the residual-call exception cells. Those are
     // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
@@ -7800,7 +7804,7 @@ fn drive_unpack_iterable_trace(
     }
 
     // Extracted merge-point reds: root_base, items_slot, RootScope cell.
-    let live_values = pyre_jit_trace::unpack_state::jd1_live_values();
+    let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
     // the novable jd1 is elected over jd0 (whose `virtualizable_info` would
@@ -8005,7 +8009,7 @@ fn drive_unpack_iterable_trace(
         majit_metainterp::JitArgKind::Ref,
         greenkey_raw as usize as i64,
     )];
-    let root_base = pyre_jit_trace::unpack_state::jd1_root_base();
+    let root_base = portal_root_base;
     let red_args = [
         (
             majit_metainterp::JitArgKind::Int,
