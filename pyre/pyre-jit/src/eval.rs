@@ -5820,6 +5820,12 @@ fn build_jit_driver_pair() -> JitDriverPair {
             long::jit_w_long_fits_int as *const () as usize as i64,
             long::jit_w_long_toint as *const () as usize as i64,
             list::jit_list_append as *const () as usize as i64,
+            // #171 object-append fold: `jit_fnaddr` already registers the
+            // word-ABI call targets, but Vouched mode still sent every
+            // compiled append through `jit_call`. `nested_list_comprehension_hot`
+            // measured 970544 crossings each.
+            list::__majit_call_target_prepare_list_ref_store as *const () as usize as i64,
+            list::__majit_call_target_current_gc_ref as *const () as usize as i64,
             list::jit_list_getitem as *const () as usize as i64,
             list::jit_list_setitem as *const () as usize as i64,
             list::jit_list_reverse as *const () as usize as i64,
