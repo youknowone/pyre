@@ -3588,13 +3588,23 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // leftover-empty GETFIELD of a one-slot TOS frame (exception
     // helper / inlined raise) remaps callee fields onto the portal
     // mint and SIGSEGVs `from_callee`.
-    let leftover_empty_short_tos =
-        leftover.is_empty() && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] <= 1);
+    let leftover_empty_short_tos = leftover.is_empty()
+        && baked_field_len >= 10
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] <= 1);
+    // leftover-empty GETFIELD of a peeled inlined frame whose mint is
+    // shorter than the portal array (traceback lasti: mint 13, live 16)
+    // deopts into consume_vable_info mismatch. exception_reused mints
+    // the full portal (16) and must keep leftover-empty GETFIELD.
+    let leftover_empty_peeled_short_mint = leftover.is_empty()
+        && live_tos.as_ref().is_some_and(|p| p.len() > 1)
+        && baked_field_len >= 13
+        && entry_field_oprefs.len() < 16;
     if leftover_has_listiter_id()
         && (listiter_leftover
             || leftover_extras_any
             || leftover_empty_len_mismatch
             || leftover_empty_short_tos
+            || leftover_empty_peeled_short_mint
             || mint_string_method
             || mint_nongc_field)
     {
