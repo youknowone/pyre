@@ -14200,9 +14200,9 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-        if let Some(outcome) = super::specialize::try_walker_orthodox_unary_invert(
-            ctx, op.pc, &args, dst, dst_bank,
-        )? {
+        if let Some(outcome) =
+            super::specialize::try_walker_orthodox_unary_invert(ctx, op.pc, &args, dst, dst_bank)?
+        {
             return Ok((outcome, op.next_pc));
         }
     }

@@ -7314,8 +7314,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
     {
-        if let Some(outcome) =
-            try_walker_orthodox_unary_invert(ctx, op.pc, &r_args, dst, dst_bank)?
+        if let Some(outcome) = try_walker_orthodox_unary_invert(ctx, op.pc, &r_args, dst, dst_bank)?
         {
             return Ok((outcome, op.next_pc));
         }
