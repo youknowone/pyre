@@ -3886,6 +3886,10 @@ pub struct AllVirtuals {
     ptrs: *mut i64,
     n_ints: usize,
     ints: *mut i64,
+    /// Extra root slot so the object stays alive after the deadframe
+    /// that carried `jf_savedata` is dropped. Cleared by [`Self::show`]
+    /// and [`Self::destructor`].
+    root_slot: *mut majit_ir::GcRef,
 }
 
 impl AllVirtuals {
@@ -3906,18 +3910,37 @@ impl AllVirtuals {
             ptrs,
             n_ints,
             ints,
+            root_slot: std::ptr::null_mut(),
         };
         let type_id = ALL_VIRTUALS_GC_TYPE_ID.load(Ordering::Relaxed);
         if type_id == ALL_VIRTUALS_GC_TYPE_ID_UNSET {
             // Tests that never publish a leaf type keep the object via
             // this leak; production registers the type and owns it
-            // through the deadframe `jf_savedata` GCREF.
+            // through the deadframe `jf_savedata` GCREF plus the
+            // extra root released in `show` / `destructor`.
             return majit_ir::GcRef(Box::into_raw(Box::new(value)) as usize);
         }
         let obj = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<AllVirtuals>());
         assert!(!obj.is_null(), "AllVirtuals old-gen allocation failed");
         unsafe { std::ptr::write(obj.0 as *mut AllVirtuals, value) };
+        let slot = Box::into_raw(Box::new(obj));
+        unsafe {
+            majit_gc::gc_add_root(slot);
+            (*(obj.0 as *mut AllVirtuals)).root_slot = slot;
+        }
         obj
+    }
+
+    unsafe fn unroot(obj: *mut AllVirtuals) {
+        let slot = unsafe { (*obj).root_slot };
+        if slot.is_null() {
+            return;
+        }
+        unsafe {
+            (*obj).root_slot = std::ptr::null_mut();
+            majit_gc::gc_remove_root(slot);
+            drop(Box::from_raw(slot));
+        }
     }
 
     /// Trace the off-heap `ptrs` slice as GCREF slots.
@@ -3942,6 +3965,7 @@ impl AllVirtuals {
     /// allocated by [`AllVirtuals::hide`].
     pub unsafe fn destructor(obj_addr: usize) {
         let obj = obj_addr as *mut AllVirtuals;
+        unsafe { Self::unroot(obj) };
         unsafe {
             let _ptrs = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 (*obj).ptrs,
@@ -3967,6 +3991,7 @@ impl AllVirtuals {
             if (*obj).super_.typeptr != ALL_VIRTUALS_VTABLE {
                 return None;
             }
+            Self::unroot(obj as *mut AllVirtuals);
             let ptrs = if (*obj).n_ptrs == 0 {
                 Vec::new()
             } else {

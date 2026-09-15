@@ -1383,12 +1383,48 @@ impl TraceCtx {
 
     /// Install the framestack half of `MetaInterp.replace_box` for one
     /// vable op. `walk` receives `(framestack, old, new)`.
-    pub fn set_replace_frames(
+    ///
+    /// # Safety
+    /// `data` must stay a valid `walk` receiver until
+    /// [`Self::clear_replace_frames`] or the next `set_replace_frames`.
+    pub unsafe fn set_replace_frames(
         &mut self,
         walk: Option<unsafe fn(*mut (), OpRef, OpRef)>,
         data: *mut (),
     ) {
         self.replace_frames = walk.map(|walk| (walk, data));
+    }
+
+    pub fn clear_replace_frames(&mut self) {
+        self.replace_frames = None;
+    }
+
+    /// `fielddescr.get_vinfo()` including the codewriter
+    /// `vable_static_field_descr` / `vable_array_field_descr` singletons,
+    /// which implement only `Descr`. Resolve them through the live
+    /// vinfo's identity map to the finalize_arc FieldDescr that holds
+    /// the Weak backref (`vinfo is fielddescr.get_vinfo()`).
+    fn vinfo_from_fielddescr(
+        &self,
+        fielddescr: &DescrRef,
+    ) -> Option<std::sync::Arc<dyn majit_ir::descr::VinfoMarker>> {
+        if let Some(v) = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo()) {
+            return Some(v);
+        }
+        let vi = self.virtualizable_info.as_ref()?;
+        if let Some(idx) = vi.static_field_by_descr(fielddescr) {
+            return vi
+                .static_field_descr(idx)
+                .as_field_descr()
+                .and_then(|fd| fd.get_vinfo());
+        }
+        if let Some(idx) = vi.array_field_by_descr(fielddescr) {
+            return vi
+                .array_pointer_field_descr(idx)
+                .as_field_descr()
+                .and_then(|fd| fd.get_vinfo());
+        }
+        None
     }
 
     /// `pyjitpl.py _nonstandard_virtualizable`:
@@ -4210,7 +4246,7 @@ impl TraceCtx {
         // returns `None` and pyre falls back to the active
         // `self.virtualizable_info` slot so the existing by-value
         // test harness keeps working.
-        let marker = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
+        let marker = self.vinfo_from_fielddescr(fielddescr);
         let (token_descr, clear_ptr, clear_descr) = {
             let info_ref: &VirtualizableInfo = if let Some(ref m) = marker {
                 m.as_any()
@@ -4371,7 +4407,7 @@ impl TraceCtx {
             // PTR_EQ/replace_box short-circuit and falls through to Step 5 —
             // same behaviour as upstream when the fielddescr came from a
             // different jitdriver's vinfo.
-            let descriptor_vinfo = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
+            let descriptor_vinfo = self.vinfo_from_fielddescr(fielddescr);
             // pyjitpl.py `_nonstandard_virtualizable`:
             // `vinfo is fielddescr.get_vinfo()`. Object identity, not type.
             let descriptor_has_matching_vinfo =
@@ -4456,10 +4492,7 @@ impl TraceCtx {
             // assert vinfo is not None`. A plain heap FieldDescr (test harness)
             // has no backref and no active `virtualizable_info`; skip the
             // COND_CALL rather than invent a force helper.
-            let can_emit = fielddescr
-                .as_field_descr()
-                .and_then(|fd| fd.get_vinfo())
-                .is_some()
+            let can_emit = self.vinfo_from_fielddescr(fielddescr).is_some()
                 || self.virtualizable_info.is_some();
             if can_emit {
                 self.emit_force_virtualizable(fielddescr, vable_opref);
@@ -6387,9 +6420,9 @@ mod tests {
             let slot = unsafe { &*data.cast::<std::cell::Cell<Option<(OpRef, OpRef)>>>() };
             slot.set(Some((oldbox, newbox)));
         }
-        ctx.set_replace_frames(Some(walk), &raw mut walked as *mut ());
+        unsafe { ctx.set_replace_frames(Some(walk), &raw mut walked as *mut ()) };
         let nonstandard = ctx.nonstandard_virtualizable(0, alias, &fd);
-        ctx.set_replace_frames(None, std::ptr::null_mut());
+        ctx.clear_replace_frames();
 
         assert!(
             !nonstandard,

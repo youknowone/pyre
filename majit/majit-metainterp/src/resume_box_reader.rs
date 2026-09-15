@@ -1454,7 +1454,7 @@ pub fn replay_pending_fields(
 /// concrete value the guard did not carry.
 pub fn seed_bridge_virtualizable_boxes(
     ctx: &mut crate::TraceCtx,
-    info: &crate::virtualizable::VirtualizableInfo,
+    info: &std::sync::Arc<crate::virtualizable::VirtualizableInfo>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
     cache: &mut BridgeVirtualCache<'_>,
@@ -1559,7 +1559,8 @@ pub fn seed_bridge_virtualizable_boxes(
     }
     boxes.push(identity_op);
     values.push(identity_value);
-    ctx.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
+    ctx.install_virtualizable_info(info.clone());
+    ctx.set_virtualizable_boxes_with_info(boxes, values, info.as_ref(), &array_lengths);
     // `rebuild_state_after_failure`'s trailing `self.synchronize_virtualizable()`
     // (pyjitpl.py) — the object and the shadow have to agree before the bridge
     // replays a single vable op.

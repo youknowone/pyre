@@ -146,10 +146,14 @@ pub(super) fn with_replace_frames<Sym: WalkSym, R>(
         registers_f: ctx.registers_f,
         frame_state: &ctx.frame_state,
     };
-    ctx.trace_ctx
-        .set_replace_frames(Some(walk), &raw mut data as *mut ());
+    // SAFETY: `data` is the walk-local ReplaceData, live until the
+    // matching `clear_replace_frames` below.
+    unsafe {
+        ctx.trace_ctx
+            .set_replace_frames(Some(walk), &raw mut data as *mut ());
+    }
     let result = f(ctx);
-    ctx.trace_ctx.set_replace_frames(None, std::ptr::null_mut());
+    ctx.trace_ctx.clear_replace_frames();
     result
 }
 

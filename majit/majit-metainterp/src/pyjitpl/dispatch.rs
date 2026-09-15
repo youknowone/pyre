@@ -1795,7 +1795,7 @@ where
 
     fn install_replace_frames(&mut self, ctx: &mut TraceCtx) {
         let frames = self.frames as *mut MIFrameStack;
-        ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast());
+        unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
     }
 
     /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
@@ -3174,6 +3174,14 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        self.install_replace_frames(ctx);
+        struct ClearReplaceFrames(*mut TraceCtx);
+        impl Drop for ClearReplaceFrames {
+            fn drop(&mut self) {
+                unsafe { (*self.0).clear_replace_frames() };
+            }
+        }
+        let _clear = ClearReplaceFrames(ctx);
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local

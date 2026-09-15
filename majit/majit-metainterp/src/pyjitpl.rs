@@ -6687,9 +6687,9 @@ impl<M: Clone> MetaInterp<M> {
             .tracing
             .as_mut()
             .expect("vable op requires active tracing");
-        ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast());
+        unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
         let result = f(ctx);
-        ctx.set_replace_frames(None, std::ptr::null_mut());
+        ctx.clear_replace_frames();
         result
     }
 
