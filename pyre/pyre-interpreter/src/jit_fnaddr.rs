@@ -398,17 +398,6 @@ fn cpa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
 }
 
 #[inline]
-fn ucpa2<A1: ResidualSlot, A2: ResidualSlot, R: ResidualRet>(
-    entries: &mut Vec<(&'static str, i64)>,
-    module_path: &'static str,
-    root_path: &'static str,
-    f: unsafe extern "C" fn(A1, A2) -> R,
-) {
-    push_raw_fnaddr(entries, module_path, f as *const ());
-    push_raw_fnaddr(entries, root_path, f as *const ());
-}
-
-#[inline]
 fn pa3<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, R: ResidualRet>(
     entries: &mut Vec<(&'static str, i64)>,
     module_path: &'static str,
@@ -1482,17 +1471,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // residual sites.
     // `w_list_new_object` is residualized (`#[dont_look_inside]`) but was
     // unregistered; bind it too so any direct residual site resolves.
-    let w_method_new: fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> pyre_object::PyObjectRef = pyre_object::function::w_method_new;
-    pa3(
-        &mut entries,
-        "pyre_object::function::w_method_new",
-        "pyre_object::w_method_new",
-        w_method_new,
-    );
     let w_list_new_empty: fn() -> pyre_object::PyObjectRef =
         pyre_object::listobject::w_list_new_empty;
     pa0(
@@ -2588,11 +2566,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     // `pycode.py lookup_exceptiontable` is `@jit.elidable`. The wrapper
     // returns a packed i64 so the residual ABI is one word.
-    ucpa2(
+    cpa2(
         &mut entries,
         "pyre_interpreter::pycode::w_code_lookup_exceptiontable",
         "pyre_interpreter::w_code_lookup_exceptiontable",
-        crate::pycode::w_code_lookup_exceptiontable,
+        crate::pycode::w_code_lookup_exceptiontable_jit_abi,
     );
     // `compare` residualizes its `compare_slot` tail: the slot body reads two
     // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift

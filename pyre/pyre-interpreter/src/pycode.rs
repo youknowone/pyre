@@ -4326,6 +4326,11 @@ pub unsafe extern "C" fn w_code_lookup_exceptiontable(obj: PyObjectRef, instr_of
     ))
 }
 
+/// Residual ABI is one i64 per slot on every backend, including wasm32.
+pub extern "C" fn w_code_lookup_exceptiontable_jit_abi(obj: i64, instr_offset: i64) -> i64 {
+    unsafe { w_code_lookup_exceptiontable(obj as PyObjectRef, instr_offset as u32) }
+}
+
 /// No handler: `-1`. A hit cannot collide because `target`/`depth` are
 /// non-negative bytecode/stack quantities.
 pub const EXCEPTIONTABLE_LOOKUP_NONE: i64 = -1;
