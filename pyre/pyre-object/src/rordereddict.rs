@@ -46,6 +46,12 @@ const DICT_INITSIZE: usize = 16;
 /// `PERTURB_SHIFT` (rordereddict.py:1021).
 const PERTURB_SHIFT: u32 = 5;
 
+/// Residual `mem::replace` of an entry value (`ll_dict_setitem` overwrite).
+#[majit_macros::dont_look_inside]
+fn replace_value<V>(slot: &mut V, value: V) -> V {
+    std::mem::replace(slot, value)
+}
+
 /// One `d.entries` slot's payload — the key, its value, and the digest
 /// `ENTRY.f_hash` caches, so a reindex and a probe both read the digest
 /// instead of recomputing it.
@@ -548,7 +554,7 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let index_slot = match self.lookup_for_store(hash, &key) {
             Ok(slot) => {
                 let e = self.entry_at_mut(slot).as_mut().expect("valid slot");
-                return Some(std::mem::replace(&mut e.value, value));
+                return Some(replace_value(&mut e.value, value));
             }
             Err(index_slot) => index_slot,
         };
