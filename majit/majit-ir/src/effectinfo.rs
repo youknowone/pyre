@@ -1027,8 +1027,9 @@ pub enum RuntimeHelperKind {
     /// (FORMAT_* / CONVERT_VALUE ran first).  The walker recovers them
     /// from the backing-array heap-cache and left-folds `descr_add`
     /// (`jit_str_concat`), the same channel as `BINARY_OP ADD` of two
-    /// exact `str`s.  `Utf8StringBuilder` look-inside remains the next
-    /// port for a single virtualized build.
+    /// exact `str`s.  Interpreter/residual construction is
+    /// `Utf8StringBuilder`; the walker keeps this fold until
+    /// `StringBuilder` virtualizes.
     BuildStringFromArray,
     /// `n_varargs_fn(frame, exc, cause)` — the RAISE-family residual the
     /// codewriter emits for `n argc>=1` (`build_n_varargs_fn_residual_call_r_r_insn`).

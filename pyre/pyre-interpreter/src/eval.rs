@@ -5908,14 +5908,24 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── BuildString (f-string concatenation) ──
-    // CPython 3.13: concatenate N string fragments from stack
+    // `pyopcode.py BUILD_STRING`: `Utf8StringBuilder`, then
+    // `space.newutf8(builder.build(), builder.getlength())`.
     fn build_string(&mut self, count: usize) -> Result<(), PyError> {
-        let mut parts = Vec::with_capacity(count);
-        for _ in 0..count {
-            parts.push(self.pop());
+        let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
+        for i in (0..count).rev() {
+            let w_item = self.peekvalue(i);
+            let utf8 = unsafe { pyre_object::unicodeobject::w_str_storage(w_item) };
+            let length = unsafe { pyre_object::unicodeobject::w_str_len(w_item) } as i64;
+            builder.append_utf8(utf8, length);
         }
-        parts.reverse();
-        self.push(crate::runtime_ops::build_string_from_refs(&parts));
+        for _ in 0..count {
+            let _ = self.pop();
+        }
+        let payload = builder.build();
+        self.push(pyre_object::unicodeobject::w_str_from_storage_and_length(
+            payload,
+            builder.getlength() as usize,
+        ));
         Ok(())
     }
 

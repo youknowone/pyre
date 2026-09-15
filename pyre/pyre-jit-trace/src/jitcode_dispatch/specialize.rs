@@ -17919,9 +17919,10 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
 /// for `BINARY_OP ADD` of two exact `str`s.  A one-fragment BUILD_STRING
 /// declines: `BUILD_STRING` always allocates (`newutf8(builder.build())`).
 ///
-/// `Utf8StringBuilder` look-inside (`rutf8.py`) remains the next port
-/// for a single virtualized build.  The left-fold uses the same
-/// `descr_add` split as [`try_walker_specialize_binary_op_str`].
+/// Interpreter/residual construction is `Utf8StringBuilder` (`rutf8.py`).
+/// The walker keeps the `descr_add` fold until optimizeopt virtualizes
+/// `StringBuilder`.  The left-fold uses the same `descr_add` split as
+/// [`try_walker_specialize_binary_op_str`].
 pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
