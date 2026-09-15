@@ -2179,7 +2179,10 @@ pub fn handle_exception_with_context(
     // `pycode` is read off the frame, so a stale frame yields a stale code
     // object as well as a stale value stack.
     let frame = unsafe { &mut *frame_anchor.live() };
-    let code = unsafe { &*crate::pyframe_get_pycode(frame) };
+    // `pyopcode.py handle_operation_error`:
+    // `self.getcode().lookup_exceptiontable(self.last_instr)`.
+    // The method is `@jit.elidable`; call the PyCode wrapper so the
+    // residual ABI keys on the code object, not a table slice.
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
     // (See pycode.rs: varint values are word offsets but the lookup
@@ -2198,7 +2201,12 @@ pub fn handle_exception_with_context(
         None
     } else {
         let pc_bytes = (frame.last_instr as u32) * 2;
-        crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+        unsafe {
+            crate::pycode::w_code_lookup_exceptiontable(
+                frame.pycode as pyre_object::PyObjectRef,
+                pc_bytes,
+            )
+        }
     };
     let pc_units = if frame.last_instr < 0 {
         0u32
@@ -2212,9 +2220,8 @@ pub fn handle_exception_with_context(
         // stack); convert to absolute by adding the frame's locals+cells
         // base, then drop the stack to that depth.
         let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
-        while frame.valuestackdepth > target_depth {
-            frame.pop();
-        }
+        // `pyopcode.py handle_operation_error` → `dropvaluesuntil`.
+        frame.dropvaluesuntil(target_depth);
         // `pyopcode.py:157-170` — lasti=True: push the raise-site offset
         // as an int below the exception, so RERAISE N can read it for
         // traceback/f_lineno correctness.  If this dispatch was triggered

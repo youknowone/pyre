@@ -4636,9 +4636,13 @@ impl PyFrame {
         self.set_locals_w(index, value);
     }
 
-    /// PyPy-compatible `dropvaluesuntil()`.
+    /// `pyframe.py dropvaluesuntil` — `@jit.unroll_safe`, and
+    /// `finaldepth` is promoted so the drop loop unrolls at the
+    /// handler's known stack depth.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn dropvaluesuntil(&mut self, finaldepth: usize) {
+        let finaldepth = majit_metainterp::jit::promote(finaldepth);
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
             let idx = self.valuestackdepth - 1;

@@ -21,7 +21,7 @@ try:
 except ImportError:
     pass
 
-N = 100
+N = 200
 
 
 def thrower(i):

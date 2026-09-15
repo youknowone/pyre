@@ -412,6 +412,10 @@ pub struct ExceptionTableEntry {
 /// CPython's emission order) is returned. Scanning short-circuits when
 /// `start > instr_offset`, since entries are emitted in ascending
 /// `start` order.
+///
+/// `pycode.py lookup_exceptiontable` is `@jit.elidable`: the table is
+/// frozen on the code object, so a `(table, instr_offset)` pair folds.
+#[majit_macros::elidable]
 pub fn lookup_exceptiontable(table: &[u8], instr_offset: u32) -> Option<(u32, u32, bool)> {
     let n = table.len();
     if n == 0 {
@@ -4298,9 +4302,12 @@ pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
 /// covering `instr_offset` (byte offset into `co_code`).  Returns
 /// `Some((target, depth, lasti))` with byte-offset `target` when found.
 ///
+/// `pycode.py PyCode.lookup_exceptiontable` is `@jit.elidable`.
+///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
+#[majit_macros::elidable]
 pub unsafe fn w_code_lookup_exceptiontable(
     obj: PyObjectRef,
     instr_offset: u32,
