@@ -4646,6 +4646,31 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // different arm.  Suppressing the row restores the conservative scan and
     // is the A/B proof that the generated descent, rather than a hand emitter,
     // supplies the trace.
+    // Fold `getattr(obj, name)` at the CALL before descending the
+    // generated `builtin_getattr` wrapper.  Descent walks `getattr_str`
+    // and credits `load_attr` instead, which leaves the
+    // `builtin_getattr` census row at fired=0.
+    if receiver.is_none()
+        && r_args.len() == 4
+        && pyre_interpreter::builtins::is_builtin_getattr_function(callable)
+    {
+        if spec_gate(SpecFold::BuiltinTypeGetattr, || {
+            super::specialize::try_walker_specialize_builtin_type_getattr(
+                ctx, code, op, r_args, dst,
+            )
+        })?
+        .is_some()
+        {
+            return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        }
+        if spec_gate(SpecFold::BuiltinGetattr, || {
+            super::specialize::try_walker_specialize_builtin_getattr(ctx, code, op, r_args, dst)
+        })?
+        .is_some()
+        {
+            return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
+        }
+    }
     let builtin_len_shortcut = if receiver.is_none()
         && r_args.len() == 3
         && pyre_interpreter::builtins::is_builtin_len_function(callable)
@@ -9743,12 +9768,16 @@ pub(crate) fn try_walker_inline_builtin_getattr_property<Sym: WalkSym>(
         return Ok(None);
     }
     let concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (concretes[0], concretes[1], concretes[2], concretes[3])
+    let ConcreteValue::Ref(callable) = concretes[0] else {
+        return Ok(None);
+    };
+    let null_or_self = match concretes[1] {
+        ConcreteValue::Ref(value) => value,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
+    };
+    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
+        (concretes[2], concretes[3])
     else {
         return Ok(None);
     };
@@ -15116,6 +15145,59 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
     }
 
+    // Jitted STORE_ATTR is `setattr_str(obj, name: &str, value)` — I-list
+    // is the `&str` slice, R-list is `(obj, value)`.  Fold or residualize;
+    // do not walk the MRO.
+    if dst_bank == 'r' || dst_bank == 'v' {
+        let callee = callee_name.as_deref().unwrap_or("");
+        if super::specialize::name_is_setattr_family(callee)
+            || super::specialize::jitcode_leaf_is(sub_index, "setattr")
+            || super::specialize::jitcode_leaf_is(sub_index, "setattr_str")
+            || super::specialize::jitcode_is_pathed(
+                sub_index,
+                &sub_body,
+                "pyre_interpreter::baseobjspace::setattr_str",
+            )
+        {
+            let obj = ref_args.first().copied();
+            let value = ref_args.get(1).copied();
+            let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
+            let folded =
+                if let (Some(obj), Some(value), Some(name)) = (obj, value, str_name.as_deref()) {
+                    matches!(
+                        spec_gate_store_attr(|| {
+                            super::specialize::try_walker_specialize_store_attr_named(
+                                ctx,
+                                op.pc,
+                                obj,
+                                value,
+                                name,
+                                &majit_ir::EffectInfo::default(),
+                            )
+                        })?,
+                        Some(WalkerStoreAttrSpecialization::Direct)
+                    )
+                } else {
+                    false
+                };
+            if folded && dst_bank == 'r' {
+                let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+                let none_ptr = pyre_object::w_none();
+                let none = ctx.trace_ctx.const_ref(none_ptr as i64);
+                write_ref_reg(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
+            }
+            return finish_getattr_inline_or_residual(
+                ctx,
+                code,
+                op,
+                descr_index,
+                &int_args,
+                &ref_args,
+                folded,
+            );
+        }
+    }
+
     // Flatten lowers COMPARE_OP to `inline_call_ir_r` of
     // `compare_value_from_tag`.  The residual COMPARE_OP arm never sees
     // that call, so the orthodox descent / exact-int folds have to run
@@ -15135,6 +15217,22 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             .first()
             .copied()
             .unwrap_or_else(|| ctx.trace_ctx.const_int(op_tag));
+        if op_tag == pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG
+            && super::specialize::try_walker_fold_check_exc_match(
+                ctx, op.pc, &ref_args, dst, dst_bank,
+            )?
+            .is_some()
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        if (op_tag == 8 || op_tag == 9)
+            && super::specialize::try_walker_fold_is_op(
+                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
+            )?
+            .is_some()
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         if let Some(outcome) = spec_gate(SpecFold::CompareOpDescent, || {
             super::specialize::try_walker_orthodox_compare_op(
                 ctx, op.pc, op_tag, tag_opref, &ref_args, dst, dst_bank,
