@@ -3581,6 +3581,9 @@ struct Lowering<'a> {
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
+    block_entry_string_byte_view_locals: Vec<bit_set::BitSet>,
+    block_byte_view_seen: Vec<bit_set::BitSet>,
+    block_byte_view_conflict: Vec<bit_set::BitSet>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -3691,6 +3694,8 @@ struct Lowering<'a> {
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
     /// uses this provenance to emit exactly that pair of flowspace ops.
+    /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
+    /// same shape as [`Lowering::positional_aggregate_locals`].
     string_byte_view_locals: Vec<usize>,
     /// MIR locals holding the `ll_items(l)` view returned by the string-list
     /// slice adapters, each paired with the list's LOGICAL length.  Rust
@@ -4113,6 +4118,15 @@ impl<'a> Lowering<'a> {
             block_entry_positional_aggregate_locals,
             block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
             block_positional_conflict: vec![
+                bit_set::BitSet::with_capacity(n_locals);
+                body.body.len()
+            ],
+            block_entry_string_byte_view_locals: vec![
+                bit_set::BitSet::with_capacity(n_locals);
+                body.body.len()
+            ],
+            block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
+            block_byte_view_conflict: vec![
                 bit_set::BitSet::with_capacity(n_locals);
                 body.body.len()
             ],
@@ -4921,6 +4935,9 @@ impl<'a> Lowering<'a> {
         self.local_var = self.block_entry_local_var[mir_bb].unpack();
         self.positional_aggregate_locals =
             self.block_entry_positional_aggregate_locals[mir_bb].clone();
+        self.string_byte_view_locals = self.block_entry_string_byte_view_locals[mir_bb]
+            .iter()
+            .collect();
 
         // 1. Statements -> SpaceOperations on the corresponding block.
         for (s_idx, st) in bb.statements.iter().enumerate() {
@@ -19065,6 +19082,7 @@ impl<'a> Lowering<'a> {
                     ))
                 })?;
             self.merge_positional_aggregate_state(target_bb, local_idx);
+            self.merge_string_byte_view_state(target_bb, local_idx);
             args.push(var);
         }
         Ok(args)
@@ -19119,6 +19137,27 @@ impl<'a> Lowering<'a> {
         if current != incoming {
             self.block_positional_conflict[target_bb].insert(local_idx);
             self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
+        }
+    }
+
+    fn merge_string_byte_view_state(&mut self, target_bb: usize, local_idx: usize) {
+        if target_bb >= self.block_byte_view_seen.len()
+            || self.block_byte_view_conflict[target_bb].contains(local_idx)
+        {
+            return;
+        }
+        let incoming = self.string_byte_view_locals.contains(&local_idx);
+        if !self.block_byte_view_seen[target_bb].contains(local_idx) {
+            self.block_byte_view_seen[target_bb].insert(local_idx);
+            if incoming {
+                self.block_entry_string_byte_view_locals[target_bb].insert(local_idx);
+            }
+            return;
+        }
+        let current = self.block_entry_string_byte_view_locals[target_bb].contains(local_idx);
+        if current != incoming {
+            self.block_byte_view_conflict[target_bb].insert(local_idx);
+            self.block_entry_string_byte_view_locals[target_bb].remove(local_idx);
         }
     }
 }
