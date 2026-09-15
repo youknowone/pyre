@@ -10167,9 +10167,9 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
     )
 }
 
-/// Exact builtin `float` `UNARY_POSITIVE`: walk `_float_pos`.  Exact
-/// `int` is identity (`_self_unaryop('pos')` → `self`) and writes the
-/// operand through.
+/// Exact builtin `float` `UNARY_POSITIVE`: walk `_float_pos`.
+/// Exact `int` stays residual: `_self_unaryop('pos')` is `self.int(space)`
+/// and returns `self`, so a write-through here would be a new fold.
 pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10201,11 +10201,6 @@ pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
             dst_bank,
             &FLOAT_POS_DESCENT,
         );
-    }
-    if unsafe { pyre_object::is_int(obj) && !pyre_object::is_bool(obj) } {
-        walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, r_args[0])?;
-        return Ok(Some(DispatchOutcome::Continue));
     }
     Ok(None)
 }
@@ -15705,7 +15700,7 @@ pub(crate) fn try_walker_orthodox_float_abs<Sym: WalkSym>(
         op_pc,
         &[],
         &[],
-        &[(xa, x.abs())],
+        &[(xa, x)],
         dst,
         dst_bank,
         &FLOAT_ABS_DESCENT,
@@ -15744,7 +15739,7 @@ pub(crate) fn try_walker_orthodox_float_sqrt<Sym: WalkSym>(
         op_pc,
         &[],
         &[],
-        &[(xa, x.sqrt())],
+        &[(xa, x)],
         dst,
         dst_bank,
         &FLOAT_SQRT_DESCENT,
