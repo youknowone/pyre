@@ -11620,7 +11620,7 @@ fn try_walker_specialize_subscr_str_slice<Sym: WalkSym>(
         ],
         majit_ir::Type::Ref,
         majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::ElidableOrMemoryError,
+            majit_ir::ExtraEffect::CanRaise,
             majit_ir::OopSpecIndex::None,
         ),
     );
@@ -18152,6 +18152,35 @@ fn spec_has_plus_or_space_sign(spec: &str) -> bool {
     i < n && matches!(chars[i], '+' | ' ')
 }
 
+/// Minimum-width digits after align / sign / `#` / `0` (`newformat.py`
+/// `_parse_spec`).  `formatted == unpadded` on a value that already
+/// fills the width must not select the no-pad arm: a later shorter
+/// value (`format(12345, "3d")` then `format(1, "3d")`) would drop
+/// the spaces.
+fn spec_has_field_width(spec: &str) -> bool {
+    let chars: Vec<char> = spec.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return false;
+    }
+    let mut i = 0;
+    if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
+        i = 2;
+    } else if matches!(chars[0], '<' | '>' | '=' | '^') {
+        i = 1;
+    }
+    if i < n && matches!(chars[i], '+' | '-' | ' ') {
+        i += 1;
+    }
+    if i < n && chars[i] == '#' {
+        i += 1;
+    }
+    if i < n && chars[i] == '0' {
+        i += 1;
+    }
+    i < n && chars[i].is_ascii_digit()
+}
+
 /// FORMAT_WITH_SPEC on an exact `int` plus a constant decimal spec.
 ///
 /// Empty spec is [`try_walker_specialize_format_simple`].  A non-empty
@@ -18237,7 +18266,8 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     } else {
         return Ok(None);
     };
-    if pad.is_none() && spec_has_plus_or_space_sign(spec_text) {
+    if pad.is_none() && (spec_has_plus_or_space_sign(spec_text) || spec_has_field_width(spec_text))
+    {
         return Ok(None);
     }
     if !spec.is_constant() {
@@ -18421,6 +18451,17 @@ pub(crate) fn try_walker_specialize_binary_slice_str<Sym: WalkSym>(
                       raw: i64|
      -> Result<OpRef, DispatchError> {
         if unsafe { pyre_object::is_none(bound_obj) } {
+            // `sliceobject.py` `w_start is space.w_None` stays a live
+            // identity test.  Baking `0` / `i64::MAX` without pinning
+            // `bound_op` as None lets a later integer in the same
+            // register keep the compiled default.
+            let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[bound_op, none],
+            )?;
             return Ok(ctx.trace_ctx.const_int(raw));
         }
         walker_guard_class(ctx, op.pc, bound_op, int_type_addr)?;
@@ -18448,7 +18489,7 @@ pub(crate) fn try_walker_specialize_binary_slice_str<Sym: WalkSym>(
         ],
         majit_ir::Type::Ref,
         majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::ElidableOrMemoryError,
+            majit_ir::ExtraEffect::CanRaise,
             majit_ir::OopSpecIndex::None,
         ),
     );
@@ -25046,7 +25087,7 @@ fn try_walker_specialize_str_mul<Sym: WalkSym>(
         std::ptr::eq((*obj).ob_type, &pyre_object::pyobject::INT_TYPE)
             && std::ptr::eq((*obj).w_class, int_typeobj)
     };
-    let (str_op, _str_obj, int_op, int_obj) = if exact_str(lhs_obj) && exact_int(rhs_obj) {
+    let (str_op, str_obj, int_op, int_obj) = if exact_str(lhs_obj) && exact_int(rhs_obj) {
         (lhs, lhs_obj, rhs, rhs_obj)
     } else if exact_int(lhs_obj) && exact_str(rhs_obj) {
         (rhs, rhs_obj, lhs, lhs_obj)
@@ -25097,6 +25138,22 @@ fn try_walker_specialize_str_mul<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(gt1, majit_ir::Value::Int(1));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt1])?;
+
+    // `ll_str_mul` `ovfcheck(len(s.chars) * times)`.  A later huge
+    // machine-int `times` must side-exit to the interpreter rather than
+    // panic in `with_capacity` or hang on `"" * n`.
+    let payload_len = unsafe { pyre_object::w_str_get_wtf8(str_obj).len() };
+    if payload_len > 0 {
+        let max_times = (isize::MAX as i64) / (payload_len as i64);
+        if times > max_times {
+            return Ok(None);
+        }
+        let max_op = ctx.trace_ctx.const_int(max_times);
+        let fits = ctx.trace_ctx.record_op(OpCode::IntLe, &[times_raw, max_op]);
+        ctx.trace_ctx
+            .set_opref_concrete(fits, majit_ir::Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[fits])?;
+    }
 
     let helper = pyre_object::unicodeobject::jit_str_repeat as *const ();
     let raw = ctx.trace_ctx.call_typed_with_effect(

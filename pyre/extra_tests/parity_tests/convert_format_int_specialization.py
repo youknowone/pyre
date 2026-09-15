@@ -98,6 +98,21 @@ def plus_d_loop(lo, hi):
 assert plus_d_loop(-2, 2) == ["-2", "-1", "+0", "+1", "+2"]
 assert plus_d_loop(1, 3) == ["+1", "+2", "+3"]
 
+# `format(12345, "3d") == "12345"` must not select unpadded `str(i)`.
+# A compiled loop that then sees `1` has to print `"  1"`.
+def width_d_loop(values):
+    acc = []
+    i = 0
+    while i < len(values):
+        acc.append(format(values[i], "3d"))
+        i = i + 1
+    return acc
+
+
+wide_then_short = [12345] * 80 + [1]
+assert width_d_loop(wide_then_short)[-1] == "  1"
+assert format(12345, "3d") == "12345"
+
 
 class WideFmt(int):
     def __format__(self, spec):

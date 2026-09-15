@@ -3838,14 +3838,28 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     // mro blocks carry this tid, and a `const` assertion in `object_array.rs`
     // holds their two tokens equal.
     let token = &pyre_object::ITEMS_BLOCK_TOKEN;
-    make_array_descr_with_type(
+    let descr = make_array_descr_with_type(
         token.base_size,
         token.item_size,
         PY_OBJECT_ARRAY_GC_TYPE_ID,
         Some(token.len_offset),
         Type::Ref,
         false,
-    )
+    );
+    // Keep the mint above as `make_array_descr_with_type` (cache_key =
+    // tid 9).  Frame locals and list items share this singleton; routing
+    // the mint through `make_array_descr_with_full_id` let an analyzer
+    // type_id=0 Arc win the slot and `fib_recursive` SIGSEGV'd.
+    // Also publish the same Arc under the codewriter ARRAY identity so
+    // `resolve_array_tid(path_hash(OBJECT_REF_GCARRAY_TYPE_ID))` finds
+    // tid 9 (`cpu.arraydescrof(ARRAY)` / `descr.py get_array_descr`).
+    majit_ir::descr_registry::register_keyed_array(
+        majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(
+            majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
+        )),
+        descr.clone(),
+    );
+    descr
 }
 
 /// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block
