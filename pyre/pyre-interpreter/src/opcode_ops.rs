@@ -229,15 +229,9 @@ pub fn compare_value(
     b: PyObjectRef,
     op: ComparisonOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let cmp_op = match op {
-        ComparisonOperator::Less => CompareOp::Lt,
-        ComparisonOperator::LessOrEqual => CompareOp::Le,
-        ComparisonOperator::Greater => CompareOp::Gt,
-        ComparisonOperator::GreaterOrEqual => CompareOp::Ge,
-        ComparisonOperator::Equal => CompareOp::Eq,
-        ComparisonOperator::NotEqual => CompareOp::Ne,
-    };
-    compare(a, b, cmp_op)
+    // Same helper flatten's COMPARE_OP descends, so a jitted `COMPARE_OP`
+    // and a 2-arg HLOp share one minted graph (`compare_value_from_tag`).
+    compare_value_from_tag(a, b, crate::runtime_ops::compare_op_tag(op))
 }
 
 /// Body of [`compare_value_from_tag`].  See [`binary_value_from_tag_inner`].
@@ -1143,6 +1137,74 @@ pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
 #[inline(never)]
 pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
     match unary_not_value(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_format_simple_w(value: i64) -> i64 {
+    match crate::type_methods::format_simple_w(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_format_w(value: i64, spec: i64) -> i64 {
+    match crate::type_methods::format_w(value as PyObjectRef, spec as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_len(value: i64) -> i64 {
+    match crate::baseobjspace::len(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_is_true(value: i64) -> i64 {
+    match crate::baseobjspace::is_true(value as PyObjectRef) {
+        Ok(truth) => truth as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_delitem(obj: i64, key: i64) -> i64 {
+    match crate::baseobjspace::delitem(obj as PyObjectRef, key as PyObjectRef) {
+        Ok(()) => 0,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_setattr(obj: i64, name: i64, value: i64) -> i64 {
+    match crate::baseobjspace::setattr(
+        obj as PyObjectRef,
+        name as PyObjectRef,
+        value as PyObjectRef,
+    ) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_delattr(obj: i64, name: i64) -> i64 {
+    match crate::baseobjspace::delattr(obj as PyObjectRef, name as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_getattr(obj: i64, name: i64) -> i64 {
+    match crate::baseobjspace::getattr(obj as PyObjectRef, name as PyObjectRef) {
         Ok(result) => result as i64,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }

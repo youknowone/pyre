@@ -1292,13 +1292,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 ))]
                 {
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let suffix_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
+                    let native = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
                         crate::cpyext::extension_suffix(),
                     ));
-                    Ok(pyre_object::w_list_new(vec![
-                        pyre_object::gc_roots::shadow_stack_get(suffix_slot),
-                    ]))
+                    // interp_imp.py `extension_suffixes` returns only the
+                    // native suffix.  3.14's `_imp.extension_suffixes`
+                    // is `[native, ".abi3.so", ".so"]`.  Advertise
+                    // `.abi3.so` so a 3.12+ limited-API wheel is
+                    // findable (PyPy #5578); a bare `.so` stays off
+                    // the list because that tag is not an abi3 wheel.
+                    let abi3 = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(".abi3.so"));
+                    Ok(pyre_object::w_list_new(vec![native, abi3]))
                 }
                 #[cfg(not(all(
                     feature = "cpyext",

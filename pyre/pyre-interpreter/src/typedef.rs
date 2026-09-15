@@ -356,29 +356,27 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
         return gettypefor(&pyre_object::INT_TYPE);
     }
     unsafe {
-        // Exception instances share a single W_BaseException layout
-        // but carry an `ExcKind` tag that names the real Python class.
-        // `__new__` paths (exc_new_wrapper) overwrite `w_class` with the
-        // exact class that was called — including user subclasses such as
-        // `class MyErr(Exception): pass`. Trust `w_class` whenever it has
-        // been specialised away from the generic `EXCEPTION_TYPE` stub
-        // installed by `w_exception_new`; fall back to the kind-tag
-        // registry only for internal raise paths (`PyError::value_error`
-        // etc.) that bypass `__new__`.
-        if pyre_object::is_exception(obj) {
-            let w_class = (*obj).w_class;
+        // Trust a specialised `w_class` for every object, exception or not.
+        // The generic `EXCEPTION_TYPE` stub is *not* the real class — only
+        // then walk the `ExcKind` registry (`lookup_exc_class_for_kind`).
+        // Checking the stub after the field read (instead of `is_exception`
+        // first) keeps `type()` of ints/lists/specialised exceptions off
+        // the `ll_isinstance` range walk.
+        let w_class = (*obj).w_class;
+        if !w_class.is_null() {
             let exc_stub =
                 pyre_object::get_instantiate(&pyre_object::interp_exceptions::EXCEPTION_TYPE);
-            if !w_class.is_null() && !std::ptr::eq(w_class, exc_stub) {
+            if !std::ptr::eq(w_class, exc_stub) {
                 return NonNull::new(w_class);
             }
+        }
+        if pyre_object::is_exception(obj) {
             let kind = pyre_object::w_exception_get_kind(obj);
             let cls = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
             if !cls.is_null() {
                 return NonNull::new(cls);
             }
         }
-        let w_class = (*obj).w_class;
         if !w_class.is_null() {
             return NonNull::new(w_class);
         }

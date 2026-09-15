@@ -3297,6 +3297,20 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
 /// A `PY_NULL` or non-`str` spec reads as the empty spec, matching
 /// `format_simple`.  A user `__format__` reached that way is handed a real
 /// empty `str`, since its second parameter is a string.
+/// `pyopcode.py FORMAT_VALUE` without `FVS_HAVE_SPEC`:
+/// `space.format(w_value, space.newtext(''))`.  `PY_NULL` is the empty spec
+/// in `format_w`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `FORMAT_SIMPLE`.
+#[inline(never)]
+pub fn format_simple_w(val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    format_w(val, pyre_object::PY_NULL)
+}
+
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `FORMAT_W` (`pyopcode.py FORMAT_VALUE` → `space.format`).
+#[inline(never)]
 pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let spec_is_str = !w_spec.is_null() && unsafe { is_str(w_spec) };
     let spec_is_empty = !spec_is_str || unsafe { pyre_object::w_str_get_wtf8(w_spec) }.is_empty();

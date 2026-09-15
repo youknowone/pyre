@@ -168,7 +168,7 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
         return err;
     }
     if !err.exc_object.is_null() {
-        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
             return err;
@@ -192,7 +192,7 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
         return err;
     }
     if !err.exc_object.is_null() {
-        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
             return err;
@@ -891,7 +891,7 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
     if !is_type_like_w(w_obj) {
         return false;
     }
-    let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
+    let Some(base_exc) = cached_base_exception() else {
         return false;
     };
     issubtype_w(w_obj, base_exc)
@@ -909,15 +909,32 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
-    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if let Some(&base_exc) = BASE_EXC.get() {
-        return issubtype_w(w_cls, base_exc as PyObjectRef);
-    }
-    let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
+    let Some(base_exc) = cached_base_exception() else {
         return false;
     };
-    let _ = BASE_EXC.set(base_exc as usize);
     issubtype_w(w_cls, base_exc)
+}
+
+/// Canonical `BaseException` from `EXC_CLASS_REGISTRY`, cached after the
+/// first successful lookup.  The registry is populated once at
+/// `make_exc_type` and the class object is immortal, so the pointer is
+/// stable for the process lifetime.
+fn cached_base_exception() -> Option<PyObjectRef> {
+    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&base_exc) = BASE_EXC.get() {
+        return Some(base_exc as PyObjectRef);
+    }
+    let base_exc = crate::builtins::lookup_exc_class("BaseException")?;
+    Some(*BASE_EXC.get_or_init(|| base_exc as usize) as PyObjectRef)
+}
+
+fn cached_type_error() -> Option<PyObjectRef> {
+    static TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&cls) = TYPE_ERROR.get() {
+        return Some(cls as PyObjectRef);
+    }
+    let cls = crate::builtins::lookup_exc_class("TypeError")?;
+    Some(*TYPE_ERROR.get_or_init(|| cls as usize) as PyObjectRef)
 }
 
 /// pypy/interpreter/baseobjspace.py `exception_getclass`.
@@ -1566,6 +1583,9 @@ pub(crate) unsafe fn subclass_special_override(
 /// the by-layout result). Only objects matching no fast path reach the
 /// generic tail, which consults `__bool__` then `__len__`, where the call
 /// exceptions — and the non-bool-`__bool__` TypeError — propagate.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `IS_TRUE` (`space.is_true`).
+#[inline(never)]
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
     // descroperation.py:265 — `__bool__` (anywhere in the MRO) is consulted
     // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
@@ -5380,6 +5400,12 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
+    // baseobjspace.py `exception_match`: identity before the tuple walk
+    // and before `exception_issubclass_w`.
+    if is_w(exc_type, check_class) {
+        return true;
+    }
+
     let is_tuple_check = unsafe { is_tuple(check_class) };
     if is_tuple_check {
         let len = unsafe { w_tuple_len(check_class) };
@@ -5394,22 +5420,8 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
-    // Python 3: except clause only accepts tuple, not list.
-    if !unsafe { is_type(check_class) } {
-        return false;
-    }
-
-    if is_w(exc_type, check_class) {
-        return true;
-    }
-
-    let mro_ptr = unsafe { w_type_get_mro(exc_type) };
-    if mro_ptr.is_null() {
-        return false;
-    }
-
-    let mro = unsafe { (*mro_ptr).as_slice() };
-    mro.iter().any(|&klass| is_w(klass, check_class))
+    // baseobjspace.py `return self.exception_issubclass_w(...)`.
+    unsafe { exception_issubclass_w(exc_type, check_class) }
 }
 
 /// `pypy/objspace/descroperation.py _len` — invoke the concrete
@@ -5433,6 +5445,9 @@ fn _len(obj: PyObjectRef) -> PyResult {
 /// `pypy/objspace/descroperation.py len` — preserve the wrapped
 /// integer returned by `space.index`, but validate negativity and overflow
 /// before exposing it to app-level `len()`.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `LEN` (`space.len`).
+#[inline(never)]
 pub fn len(obj: PyObjectRef) -> PyResult {
     let w_res = _len(obj)?;
     let w_index = space_index(w_res)?;
@@ -6317,6 +6332,11 @@ pub fn clear_all_weakrefs(obj: PyObjectRef) {
 /// (PyPy: Module.getdict → w_dict lookup).
 /// For other objects, looks up the attribute in the per-object side table.
 
+/// `inline(never)` so the codewriter mints the graph the jitted
+/// `LOAD_ATTR` path actually calls (`eval.rs load_attr` → `getattr_str`).
+/// Without it rustc inlines this into the eval loop and the walker never
+/// sees a `space.getattr` boundary to fold `f_lasti` / mapdict.
+#[inline(never)]
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
     getattr_str_impl(obj, name, true, false).map_err(|mut err| {
@@ -7273,6 +7293,10 @@ pub(crate) unsafe fn super_getattribute_code_name(
 // valid UTF-8 name takes the `&str` fast path unchanged.
 
 /// `space.getattr(w_obj, w_name)`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `GETATTR` (`pyopcode.py LOAD_ATTR` → `space.getattr`).
+#[inline(never)]
 pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     // `getattr` accepts a wrapped attribute name.  Validate it before the
     // Unicode storage access below: callers such as `_abc._abc_init` can
@@ -7339,6 +7363,10 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 }
 
 /// `space.setattr(w_obj, w_name, w_val)`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `SETATTR`.
+#[inline(never)]
 pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
     if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
         return Err(PyError::type_error(format!(
@@ -7359,6 +7387,10 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
 }
 
 /// `space.delattr(w_obj, w_name)`.
+///
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `DELATTR`.
+#[inline(never)]
 pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
         return Err(PyError::type_error(format!(
@@ -13339,6 +13371,9 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
     Ok(w_none())
 }
 
+/// `inline(never)` so the codewriter mints the graph the jitted
+/// `STORE_ATTR` path calls (`eval.rs store_attr` → `setattr_str`).
+#[inline(never)]
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
@@ -14560,6 +14595,9 @@ fn missing_attribute_subject(obj: PyObjectRef) -> String {
 /// Delete an attribute: `del obj.name`.
 ///
 /// PyPy: descroperation.py descr__delattr__
+/// `inline(never)` so the codewriter mints the graph the jitted
+/// `DELETE_ATTR` path calls.
+#[inline(never)]
 pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
@@ -21635,6 +21673,9 @@ pub fn side_effects_ok() -> bool {
 /// Delete item: `del obj[index]`
 ///
 /// PyPy: descroperation.py delitem → dispatches to type-specific __delitem__.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `DELITEM` (`space.delitem`).
+#[inline(never)]
 pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {

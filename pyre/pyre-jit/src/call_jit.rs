@@ -6266,8 +6266,7 @@ pub extern "C" fn bh_getattr_fn(obj: i64, w_name: i64) -> i64 {
     match res {
         Ok(w_value) => w_value as i64,
         Err(mut err) => {
-            let exc_obj = err.to_exc_object();
-            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+            publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
     }

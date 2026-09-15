@@ -4491,15 +4491,29 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
-        return Ok(None);
-    };
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
-        pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
-    }) else {
+    try_walker_specialize_load_type_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
+}
+
+pub(crate) fn try_walker_specialize_load_type_attr_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some((w_type, _version_tag, w_value, binding)) =
+        (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name)) })
+    else {
         return Ok(None);
     };
 
@@ -4575,8 +4589,28 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
+    try_walker_specialize_load_bound_method_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
+}
+
+pub(crate) fn try_walker_specialize_load_bound_method_attr_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
     let Some((w_type, version_tag, w_descr, owes_shadow_guard)) = (unsafe {
-        pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, &name)
+        pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, name)
     }) else {
         return Ok(None);
     };
@@ -6151,12 +6185,6 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
-    let (Some(concrete_obj), Some(concrete_value)) = (
-        walker_concrete_ref_object(ctx, obj),
-        walker_concrete_ref_object(ctx, value),
-    ) else {
-        return Ok(None);
-    };
     let name = unsafe {
         let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
         if code_ptr.is_null() {
@@ -6167,6 +6195,26 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             Some(n) => n.to_string(),
             None => return Ok(None),
         }
+    };
+    try_walker_specialize_store_attr_named(ctx, op_pc, obj, value, &name, original_effect)
+}
+
+pub(crate) fn try_walker_specialize_store_attr_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    value: OpRef,
+    name: &str,
+    original_effect: &majit_ir::EffectInfo,
+) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
+    if !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    let (Some(concrete_obj), Some(concrete_value)) = (
+        walker_concrete_ref_object(ctx, obj),
+        walker_concrete_ref_object(ctx, value),
+    ) else {
+        return Ok(None);
     };
     if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
@@ -9479,6 +9527,226 @@ pub(crate) fn binary_value_from_tag_jitcode()
 /// helper that `pathed_jitcode_cached` still owns, and a name-only
 /// check then skipped descent so a declined sub-walk residualized
 /// `CallMayForce` (`binary_value_from_tag`) on fib bridges.
+pub(crate) fn jitcode_is_pathed(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+    path: &str,
+) -> bool {
+    let leaf = path.rsplit("::").next().unwrap_or(path);
+    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| jc.name == path || jc.name == leaf || jc.name.ends_with(path))
+    {
+        return true;
+    }
+    crate::jitcode_runtime::pathed_jitcode_cached(path).is_some_and(|jc| {
+        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+    })
+}
+
+/// Leaf-name match that does not treat `foo_bar` as `bar`.
+pub(crate) fn name_leaf_is(name: &str, leaf: &str) -> bool {
+    name == leaf || name.rsplit("::").next() == Some(leaf)
+}
+
+pub(crate) fn jitcode_leaf_is(sub_index: usize, leaf: &str) -> bool {
+    crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+        .is_some_and(|jc| name_leaf_is(&jc.name, leaf))
+}
+
+/// Runtime descr-pool name first (`binary_value_from_tag` identification),
+/// then the ALL_JITCODES slot.  Flatten's `inline_call` operand is a
+/// per-fn JitCode descr; its index is not always the global table's.
+pub(crate) fn inline_callee_name<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    descr_index: usize,
+    sub_index: usize,
+) -> Option<String> {
+    if let Some(jc) = ctx.raw_descrs.runtime_jitcode_at(descr_index) {
+        return Some(jc.name().to_owned());
+    }
+    crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).map(|jc| jc.name.clone())
+}
+
+/// `space.getattr` / `getattr_str` — the two spellings of the same
+/// `DescrOperation.getattr` body.  The jitted `LOAD_ATTR` path calls
+/// `getattr_str` (`eval.rs load_attr`); flatten's 2-arg HLOp calls
+/// `getattr`.
+pub(crate) fn name_is_space_getattr(name: &str) -> bool {
+    name_leaf_is(name, "getattr") || name_leaf_is(name, "getattr_str")
+}
+
+/// Callers of `space.getattr` plus the shared impl.  The impl body is the
+/// whole MRO walk; a declined fold must residualize it, not descend.
+pub(crate) fn name_is_getattr_family(name: &str) -> bool {
+    name_is_space_getattr(name)
+        || name_leaf_is(name, "getattr_str_impl")
+        || name_leaf_is(name, "load_attr")
+}
+
+pub(crate) fn jitcode_is_space_getattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::getattr",
+    ) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::getattr_str",
+    ) || jitcode_leaf_is(sub_index, "getattr")
+        || jitcode_leaf_is(sub_index, "getattr_str")
+}
+
+pub(crate) fn name_is_frame_load_attr(name: &str) -> bool {
+    name_leaf_is(name, "load_attr")
+}
+
+pub(crate) fn name_is_setattr_family(name: &str) -> bool {
+    name_leaf_is(name, "setattr") || name_leaf_is(name, "setattr_str")
+}
+
+/// `PyFrame::load_attr` / `SharedOpcodeHandler::load_attr` — `(frame, obj, name)`.
+pub(crate) fn jitcode_is_frame_load_attr(sub_index: usize) -> bool {
+    jitcode_leaf_is(sub_index, "load_attr")
+}
+
+pub(crate) fn name_is_space_is_true(name: &str) -> bool {
+    name_leaf_is(name, "is_true")
+        || name_leaf_is(name, "is_true_slot")
+        || name_leaf_is(name, "is_true_lookup")
+}
+
+/// `space.is_true` and the two layout/lookup helpers it dispatches to.
+pub(crate) fn jitcode_is_space_is_true(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::is_true",
+    ) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::is_true_slot",
+    ) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::baseobjspace::is_true_lookup",
+    ) || jitcode_leaf_is(sub_index, "is_true")
+        || jitcode_leaf_is(sub_index, "is_true_slot")
+        || jitcode_leaf_is(sub_index, "is_true_lookup")
+}
+
+pub(crate) fn name_is_compare_value(name: &str) -> bool {
+    name_leaf_is(name, "compare_value_from_tag") || name_leaf_is(name, "compare_value")
+}
+
+pub(crate) fn name_is_unbounded_helper_body(name: &str) -> bool {
+    name_is_getattr_family(name)
+        || name_is_setattr_family(name)
+        || name_leaf_is(name, "compare_value_from_tag_inner")
+        || name_leaf_is(name, "binary_value_from_tag_inner")
+}
+
+pub(crate) fn jitcode_is_compare_value_from_tag(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
+        name_leaf_is(&jc.name, "compare_value_from_tag") || name_leaf_is(&jc.name, "compare_value")
+    }) {
+        return true;
+    }
+    crate::jitcode_runtime::pathed_jitcode_cached(COMPARE_OP_DESCENT.path).is_some_and(|jc| {
+        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+    }) || jitcode_is_pathed(
+        sub_index,
+        sub_body,
+        "pyre_interpreter::opcode_ops::compare_value",
+    )
+}
+
+/// Guard a non-constant attribute name and run the LOAD_ATTR specializations
+/// that used to sit on the `load_attr_fn` residual.
+pub(crate) fn try_fold_inline_getattr<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name_opref: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+    let Ok(name) = name.as_str() else {
+        return Ok(None);
+    };
+    if !name_opref.is_constant() {
+        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            majit_ir::OpCode::GuardValue,
+            &[name_opref, name_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(name_opref, name_const);
+    }
+    try_fold_inline_getattr_named(ctx, op_pc, obj, name, dst, dst_bank)
+}
+
+pub(crate) fn resolved_attr_name_from_str_slice(int_concretes: &[ConcreteValue]) -> Option<String> {
+    let (ptr, len) = match int_concretes {
+        [ConcreteValue::Int(ptr), ConcreteValue::Int(len), ..] if *len >= 0 && *len < 4096 => {
+            (*ptr as *const u8, *len as usize)
+        }
+        _ => return None,
+    };
+    if ptr.is_null() {
+        return None;
+    }
+    std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) })
+        .ok()
+        .map(str::to_string)
+}
+
+pub(crate) fn try_fold_inline_getattr_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if spec_gate(SpecFold::LoadAttr, || {
+        try_walker_specialize_load_attr(ctx, op_pc, obj, name, dst, dst_bank)
+    })?
+    .is_some()
+    {
+        return Ok(Some(()));
+    }
+    if spec_gate(SpecFold::LoadTypeAttr, || {
+        try_walker_specialize_load_type_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
+    })?
+    .is_some()
+    {
+        return Ok(Some(()));
+    }
+    if spec_gate(SpecFold::LoadAttrOnSuper, || {
+        try_walker_specialize_load_attr_on_super(ctx, op_pc, obj, name, dst, dst_bank)
+    })?
+    .is_some()
+    {
+        return Ok(Some(()));
+    }
+    spec_gate(SpecFold::LoadBoundMethodAttr, || {
+        try_walker_specialize_load_bound_method_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
+    })
+}
+
 pub(crate) fn jitcode_is_binary_value_from_tag(
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
@@ -11196,17 +11464,16 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let ConcreteValue::Ref(concrete_callable) = arg_concretes[0] else {
+        return Ok(None);
+    };
+    let null_or_self = match arg_concretes[1] {
+        ConcreteValue::Ref(value) => value,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
+    };
+    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
+        (arg_concretes[2], arg_concretes[3])
     else {
         return Ok(None);
     };
@@ -11309,17 +11576,16 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let ConcreteValue::Ref(concrete_callable) = arg_concretes[0] else {
+        return Ok(None);
+    };
+    let null_or_self = match arg_concretes[1] {
+        ConcreteValue::Ref(value) => value,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
+    };
+    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
+        (arg_concretes[2], arg_concretes[3])
     else {
         return Ok(None);
     };
@@ -11420,7 +11686,10 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // two guards above are the premise of a fold that is no longer there, and
     // the residual the caller falls through to recomputes the lookup from the
     // unguarded operands.
-    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none() {
+    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none()
+        && (try_walker_specialize_load_type_attr_named(ctx, op.pc, r_args[2], name, dst, 'r')?)
+            .is_none()
+    {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);

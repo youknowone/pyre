@@ -2502,33 +2502,52 @@ fn emit_frontend_delsubscr(
     );
 }
 
-#[allow(dead_code)]
 fn emit_frontend_setattr(
-    _graph: &mut super::flow::FunctionGraph,
+    graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     attr_name: super::flow::FlowValue,
     value: super::flow::FlowValue,
     offset: i64,
-) {
-    // flowcontext.py STORE_ATTR ->
-    // `op.setattr(w_obj, w_attributename, w_newvalue).eval(self)`.
-    // See `emit_frontend_setitem` for the void-result rationale.
-    record_graph_op(
+) -> super::flow::Variable {
+    // flowcontext.py STORE_ATTR → `op.setattr(w_obj, w_name, w_newvalue)`.
+    // The opcode discards the return; flatten still needs the dest so
+    // `inline_call_r_r` of `space.setattr` can write it.
+    emit_graph_op_with_result(
+        graph,
         block,
         "setattr",
         vec![obj.into(), attr_name.into(), value.into()],
-        None,
+        Kind::Ref,
         offset,
-    );
+    )
+}
+
+fn emit_frontend_delattr(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    obj: super::flow::FlowValue,
+    attr_name: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py DELETE_ATTR → `op.delattr(w_obj, w_name)`.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "delattr",
+        vec![obj.into(), attr_name.into()],
+        Kind::Ref,
+        offset,
+    )
 }
 
 /// STORE_ATTR — the residual counterpart of [`emit_frontend_getattr`].
 /// Records the 4-arg `store_attr(obj, value, code, name_idx)` HLOp (void
 /// result) that `flatten.rs::lower_setattr_hlop_to_insn` threads into the
 /// `bh_store_attr_fn(obj, value, code, name_idx)` residual.  Distinct from
-/// the bare `setattr` HLOp (an `is_pyre_canonical_elidable_hlop` rewritten
-/// to `setfield_gc`), so the generic attribute store survives lowering.
+/// the bare `setattr` HLOp that [`emit_frontend_setattr`] records for
+/// `space.setattr`.
+#[allow(dead_code)]
 fn emit_frontend_store_attr(
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
@@ -2555,6 +2574,7 @@ fn emit_frontend_store_attr(
 /// with no stored value.  Records the 3-arg `delete_attr(obj, code,
 /// name_idx)` HLOp (void result) that `flatten.rs::lower_delete_attr_hlop_to_insn`
 /// threads into the `bh_delete_attr_fn(obj, code, name_idx)` residual.
+#[allow(dead_code)]
 fn emit_frontend_delete_attr(
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
@@ -2666,32 +2686,28 @@ fn emit_accumulator_reload(
     .into()
 }
 
+fn interned_attr_name(name: &str) -> super::flow::FlowValue {
+    let w_name = pyre_object::intern_str_value(name);
+    super::flow::Constant::new(
+        super::flow::ConstantValue::Signed(w_name as i64),
+        Some(Kind::Ref),
+    )
+    .into()
+}
+
 fn emit_frontend_getattr(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     attr_name: super::flow::FlowValue,
-    code_const: super::flow::FlowValue,
-    name_idx_const: super::flow::FlowValue,
     offset: i64,
 ) -> super::flow::Variable {
-    // flowcontext.py LOAD_ATTR ->
-    // `op.getattr(w_obj, w_attributename).eval(self)`, extended with
-    // two rtyper-surrogate operands (the code object as a post-rtype
-    // `Signed(ptr) + Kind::Ref` constant and the `co_names` index)
-    // that `flatten.rs::lower_getattr_hlop_to_insn` threads into the
-    // `bh_load_attr_fn(obj, code, name_idx)` residual — pyre runs no
-    // `rclass.py rtype_getattr` to rewrite the HLOp post-record.
+    // flowcontext.py LOAD_ATTR → `op.getattr(w_obj, w_attributename)`.
     emit_graph_op_with_result(
         graph,
         block,
         "getattr",
-        vec![
-            obj.into(),
-            attr_name.into(),
-            code_const.into(),
-            name_idx_const.into(),
-        ],
+        vec![obj.into(), attr_name.into()],
         Kind::Ref,
         offset,
     )
@@ -3006,6 +3022,23 @@ fn compare_opname(op: pyre_interpreter::bytecode::ComparisonOperator) -> &'stati
         C::Greater => "gt",
         C::GreaterOrEqual => "ge",
     }
+}
+
+fn emit_frontend_check_exc_match(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    exc: super::flow::FlowValue,
+    match_type: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "check_exc_match",
+        vec![exc.into(), match_type.into()],
+        Kind::Ref,
+        offset,
+    )
 }
 
 fn emit_frontend_compare(
@@ -3604,6 +3637,8 @@ struct FnPtrIndices {
     call_kw_fn_13: HelperHandle,
     unbound_local_error_fn: HelperHandle,
     clear_in_flight_exception_fn: HelperHandle,
+    setattr_fn: HelperHandle,
+    delattr_fn: HelperHandle,
 }
 
 /// Register every blackhole helper fn pointer with the assembler in
@@ -4348,6 +4383,21 @@ fn register_helper_fn_pointers(
         cpu.load_import_globals_fn as *const (),
         CallFlavor::PlainCannotRaise,
     );
+    // 3-arg `space.setattr` / 2-arg `space.delattr` residuals for the
+    // unbound fallback of the flowspace STORE_ATTR / DELETE_ATTR
+    // shapes.  Bound last so every pre-existing helper index remains
+    // stable.  User `__setattr__` / `__delattr__` may force
+    // virtualizables → `MayForce`.
+    let setattr_fn = bind(
+        assembler,
+        pyre_interpreter::opcode_ops::jit_baseobjspace_setattr as *const (),
+        CallFlavor::MayForce,
+    );
+    let delattr_fn = bind(
+        assembler,
+        pyre_interpreter::opcode_ops::jit_baseobjspace_delattr as *const (),
+        CallFlavor::MayForce,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -4455,6 +4505,8 @@ fn register_helper_fn_pointers(
         set_function_attribute_fn,
         unbound_local_error_fn,
         clear_in_flight_exception_fn,
+        setattr_fn,
+        delattr_fn,
     }
 }
 
@@ -6628,6 +6680,16 @@ impl CodeWriter {
                     idx: clear_in_flight_exception_fn_idx,
                     flavor: _clear_in_flight_exception_fn_flavor,
                 },
+            setattr_fn:
+                HelperHandle {
+                    idx: setattr_fn_idx,
+                    flavor: _setattr_fn_flavor,
+                },
+            delattr_fn:
+                HelperHandle {
+                    idx: delattr_fn_idx,
+                    flavor: _delattr_fn_flavor,
+                },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
         // codewriter.py `portal_jd = self.callcontrol.jitdriver_sd_from_portal_graph(graph)`
@@ -6671,6 +6733,8 @@ impl CodeWriter {
             truth_fn_idx,
             store_subscr_fn_idx,
             getattr_fn_idx,
+            setattr_fn_idx,
+            delattr_fn_idx,
             load_name_fn_idx,
             store_name_fn_idx,
             store_global_fn_idx,
@@ -10451,23 +10515,15 @@ impl CodeWriter {
                             // already records the same `compare_fn(...,
                             // ISINSTANCE_OP:Int) → Ref` `residual_call_ir_r`
                             // shape (recorded in this arm).
-                            // Walker-orthodoxy: compare_fn(exc,
-                            // match_type, ISINSTANCE_OP:Int) → Ref shape
-                            // residual_call_ir_r.  No frame_var threading.
-                            let cmp_result = residual_call!(
-                                compare_fn_idx,
-                                CallFlavor::MayForce,
-                                majit_ir::RuntimeHelperKind::CompareOp,
-                                vec![
-                                    super::flow::Constant::signed(
-                                        pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
-                                    )
-                                    .into(),
-                                ],
-                                vec![exc_value, match_type_value],
-                                vec![],
-                                vec![Kind::Ref, Kind::Ref, Kind::Int],
-                                ResKind::Ref,
+                            // pyopcode.py `cmp_exc_match` →
+                            // `exception_match(type(exc), T)`.  Flatten
+                            // lowers `check_exc_match` through
+                            // `compare_value_from_tag` tag 10.
+                            let cmp_result = emit_frontend_check_exc_match(
+                                &mut graph,
+                                &current_block.block(),
+                                exc_value,
+                                match_type_value,
                                 py_pc as i64,
                             );
                             // Push the compare result itself, not a fresh
@@ -10483,10 +10539,7 @@ impl CodeWriter {
                             // PopJumpIfFalse's pop re-pins the same value to the
                             // same slot and `truth_fn` reads the compare's own
                             // register.
-                            let result_value: super::flow::FlowValue = match cmp_result {
-                                Some(v) => v.into(),
-                                None => fresh_ref_value(&mut graph).into(),
-                            };
+                            let result_value: super::flow::FlowValue = cmp_result.into();
                             current_state.stack.push(result_value.clone());
                             emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }
@@ -10902,32 +10955,19 @@ impl CodeWriter {
                         }
                         Instruction::StoreAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            // rtyper-surrogate operands threaded into the
-                            // `bh_store_attr_fn(obj, value, code, name_idx)`
-                            // residual, identical to the LoadAttr arm: the
-                            // jitcode's own PyCode as a post-rtype
-                            // `Signed(ptr) + Kind::Ref` constant and the
-                            // `co_names` index the helper resolves the name
-                            // with.
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(name_idx as i64).into();
+                            let attr_name = interned_attr_name(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let stored_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            emit_frontend_store_attr(
+                            let _ = emit_frontend_setattr(
+                                &mut graph,
                                 &current_block.block(),
                                 obj_value,
+                                attr_name,
                                 stored_value,
-                                code_const,
-                                name_idx_const,
                                 py_pc as i64,
                             );
                         }
@@ -10948,14 +10988,7 @@ impl CodeWriter {
                             // arm pops null_or_self first).
                             let attr = namei.get(op_arg);
                             let name_idx = attr.name_idx() as usize;
-                            let attr_name =
-                                super::flow::Constant::string(code.names[name_idx].as_str());
-                            // rtyper-surrogate operands for the splice
-                            // lowering: the jitcode's own PyCode as a
-                            // post-rtype `Signed(ptr) + Kind::Ref` constant
-                            // (per-code jitcode ⇒ fixed pointer) and the
-                            // co_names index `bh_load_attr_fn` resolves the
-                            // name with.
+                            let attr_name = interned_attr_name(code.names[name_idx].as_str());
                             let code_const: super::flow::FlowValue = super::flow::Constant::new(
                                 super::flow::ConstantValue::Signed(w_code as i64),
                                 Some(Kind::Ref),
@@ -10969,9 +11002,7 @@ impl CodeWriter {
                                 &mut graph,
                                 &current_block.block(),
                                 obj_value.clone(),
-                                attr_name.into(),
-                                code_const.clone(),
-                                name_idx_const.clone(),
+                                attr_name,
                                 py_pc as i64,
                             );
                             current_state.stack.push(result_value.into());
@@ -12121,27 +12152,15 @@ impl CodeWriter {
                         // DeleteAttr: pops 1 (obj). Net: -1.
                         Instruction::DeleteAttr { namei } => {
                             let name_idx = namei.get(op_arg) as usize;
-                            // rtyper-surrogate operands threaded into the
-                            // `bh_delete_attr_fn(obj, code, name_idx)` residual,
-                            // identical to the StoreAttr arm: the jitcode's own
-                            // PyCode as a post-rtype `Signed(ptr) + Kind::Ref`
-                            // constant and the `co_names` index the helper resolves
-                            // the name with.
-                            let code_const: super::flow::FlowValue = super::flow::Constant::new(
-                                super::flow::ConstantValue::Signed(w_code as i64),
-                                Some(Kind::Ref),
-                            )
-                            .into();
-                            let name_idx_const: super::flow::FlowValue =
-                                super::flow::Constant::signed(name_idx as i64).into();
+                            let attr_name = interned_attr_name(code.names[name_idx].as_str());
                             current_depth = current_depth.saturating_sub(1);
                             emit_vsd!(current_depth, py_pc);
                             let obj_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            emit_frontend_delete_attr(
+                            let _ = emit_frontend_delattr(
+                                &mut graph,
                                 &current_block.block(),
                                 obj_value,
-                                code_const,
-                                name_idx_const,
+                                attr_name,
                                 py_pc as i64,
                             );
                         }
@@ -12658,15 +12677,12 @@ impl CodeWriter {
                                     vec![cls_value, self_value],
                                     py_pc as i64,
                                 );
-                                let attr_name =
-                                    super::flow::Constant::string(code.names[name_idx].as_str());
+                                let attr_name = interned_attr_name(code.names[name_idx].as_str());
                                 emit_frontend_getattr(
                                     &mut graph,
                                     &current_block.block(),
                                     proxy_value.into(),
-                                    attr_name.into(),
-                                    code_const,
-                                    name_idx_const,
+                                    attr_name,
                                     py_pc as i64,
                                 )
                             } else {
@@ -16807,22 +16823,36 @@ mod tests {
         // entered with the exception slot refilled.  Jumping into the landing
         // instead reaches its `last_exc_value` read with the slot already
         // drained by the match residual.
+        //
+        // Locate the FOR_ITER catch relative to its own `last_exc_value`,
+        // not the first `residual_call_*>i` in the whole stream: a Python
+        // `try` serializes more Int residuals (and the matcher itself may
+        // be an `inline_call` of `compare_value_from_tag`).
+        let last_exc_value_index = ops
+            .iter()
+            .position(|op| op.key == "last_exc_value/>r")
+            .expect("FOR_ITER catch must materialize the caught exception value");
+        let is_int_call = |key: &str| {
+            (key.starts_with("residual_call_") || key.starts_with("inline_call_"))
+                && key.ends_with(">i")
+        };
+        let match_call_index = ops
+            .iter()
+            .enumerate()
+            .skip(last_exc_value_index + 1)
+            .find_map(|(index, op)| is_int_call(op.key).then_some(index))
+            .expect("FOR_ITER catch must call the Python-level exception matcher");
         let raise_index = ops
             .iter()
-            .position(|op| op.key == "raise/r")
+            .enumerate()
+            .skip(match_call_index + 1)
+            .find_map(|(index, op)| (op.key == "raise/r").then_some(index))
             .expect("a mismatched FOR_ITER exception inside a try must re-raise");
         assert_eq!(
             ops[raise_index + 1].key,
             "catch_exception/L",
             "the re-raise must carry the catch dispatch its handler entry needs"
         );
-        let match_call_index = ops
-            .iter()
-            .enumerate()
-            .find_map(|(index, op)| {
-                (op.key.starts_with("residual_call_") && op.key.ends_with(">i")).then_some(index)
-            })
-            .expect("FOR_ITER catch must call the Python-level exception matcher");
         assert!(
             !ops[match_call_index + 1..raise_index]
                 .iter()
@@ -17304,7 +17334,7 @@ mod tests {
         let name = Constant::string("field");
         let value = Variable::new(VariableId(33), Kind::Ref);
 
-        emit_frontend_setattr(
+        let result = emit_frontend_setattr(
             &mut graph,
             &start,
             obj.into(),
@@ -17313,15 +17343,11 @@ mod tests {
             56,
         );
 
-        let block = start.borrow();
-        let op = block
-            .operations
-            .last()
-            .expect("setattr op should be recorded");
+        let op = last_recorded_op(&start);
         assert_eq!(op.opname, "setattr");
         assert_eq!(op.offset, 56);
         assert_eq!(op.args, vec![obj.into(), name.into(), value.into()]);
-        assert_eq!(op.result, None);
+        assert_eq!(op.result, Some(result.into()));
     }
 
     #[test]
@@ -17330,36 +17356,13 @@ mod tests {
         let mut graph = FunctionGraph::new("getattr", start.clone(), None);
         let obj = Variable::new(VariableId(34), Kind::Ref);
         let name = Constant::string("field");
-        // rtyper-surrogate operands (post-rtype code-object ConstRef + the
-        // co_names index) trail the upstream 2-arg flowspace shape.
-        let code_const = Constant::new(
-            super::super::flow::ConstantValue::Signed(0x1000),
-            Some(Kind::Ref),
-        );
-        let name_idx_const = Constant::signed(3);
 
-        let result = emit_frontend_getattr(
-            &mut graph,
-            &start,
-            obj.into(),
-            name.clone().into(),
-            code_const.clone().into(),
-            name_idx_const.clone().into(),
-            57,
-        );
+        let result = emit_frontend_getattr(&mut graph, &start, obj.into(), name.clone().into(), 57);
 
         let op = last_recorded_op(&start);
         assert_eq!(op.opname, "getattr");
         assert_eq!(op.offset, 57);
-        assert_eq!(
-            op.args,
-            vec![
-                obj.into(),
-                name.into(),
-                code_const.into(),
-                name_idx_const.into(),
-            ]
-        );
+        assert_eq!(op.args, vec![obj.into(), name.into()]);
         assert_eq!(op.result, Some(result.into()));
     }
 
