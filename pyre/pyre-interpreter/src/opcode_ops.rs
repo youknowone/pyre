@@ -229,15 +229,9 @@ pub fn compare_value(
     b: PyObjectRef,
     op: ComparisonOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let cmp_op = match op {
-        ComparisonOperator::Less => CompareOp::Lt,
-        ComparisonOperator::LessOrEqual => CompareOp::Le,
-        ComparisonOperator::Greater => CompareOp::Gt,
-        ComparisonOperator::GreaterOrEqual => CompareOp::Ge,
-        ComparisonOperator::Equal => CompareOp::Eq,
-        ComparisonOperator::NotEqual => CompareOp::Ne,
-    };
-    compare(a, b, cmp_op)
+    // Same helper flatten's COMPARE_OP descends, so a jitted `COMPARE_OP`
+    // and a 2-arg HLOp share one minted graph (`compare_value_from_tag`).
+    compare_value_from_tag(a, b, crate::runtime_ops::compare_op_tag(op))
 }
 
 /// Body of [`compare_value_from_tag`].  See [`binary_value_from_tag_inner`].
