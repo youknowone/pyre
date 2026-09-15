@@ -2703,6 +2703,10 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -> bool {
+    // Same wrapper/inner split as `w_list_append`: the store fold descends
+    // the lock-free body.  A `w_list_lock` pair inside that body declines
+    // the sub-walk, and a `dont_look_inside` wrapper would hide the inner
+    // graph from `grab_initial_jitcodes`.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::publish_roots(&[obj, value]);
@@ -2711,13 +2715,22 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
     let _list_guard = w_list_lock(obj);
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let value = crate::gc_roots::shadow_stack_get(root_base + 1);
+    w_list_setitem_inner(obj, index, value)
+}
+
+/// [`w_list_setitem`]'s body, run with the list's guard already held.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`, and the caller must hold
+/// `w_list_lock(obj)`.
+pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObjectRef) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         // listobject.py EmptyListStrategy.setitem raises IndexError.
         ListStrategy::Empty | ListStrategy::Size => false,
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let obj = switch_range_to_integer_strategy(list);
-            w_list_setitem(obj, index, crate::gc_roots::shadow_stack_get(root_base + 1))
+            w_list_setitem_inner(obj, index, current_gc_ref(value))
         }
         ListStrategy::Object => {
             let len = list.length_relaxed() as i64;
@@ -2726,10 +2739,9 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 return false;
             }
             let value = prepare_list_ref_store(obj, value);
-            let obj = crate::gc_roots::shadow_stack_get(root_base);
+            let obj = current_gc_ref(obj);
             let list = &mut *(obj as *mut W_ListObject);
-            let base = items_block_items_base(list.items);
-            *base.add(idx as usize) = value;
+            ll_list_obj_setitem_fast(list, idx as usize, value);
             true
         }
         ListStrategy::Integer => {
@@ -2743,18 +2755,10 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 ll_list_int_setitem_fast(list, idx as usize, plain_int_w(value));
                 true
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                w_list_setitem_inner(current_gc_ref(obj), index, current_gc_ref(value))
             } else {
-                switch_to_object_strategy(list);
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                let obj = switch_to_object_strategy(list);
+                w_list_setitem_inner(obj, index, current_gc_ref(value))
             }
         }
         ListStrategy::IntOrFloat => {
@@ -2767,12 +2771,8 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 list.int_items[idx as usize] = value;
                 true
             } else {
-                switch_to_object_strategy(list);
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                let obj = switch_to_object_strategy(list);
+                w_list_setitem_inner(obj, index, current_gc_ref(value))
             }
         }
         ListStrategy::Float => {
@@ -2782,24 +2782,16 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 return false;
             }
             if is_float_strategy_item(value) {
-                list.float_items[idx as usize] = w_float_get_value(value);
+                ll_list_float_setitem_fast(list, idx as usize, w_float_get_value(value));
                 true
             } else if is_plain_int1(value)
                 && int_or_float_encode_int(plain_int_w(value)).is_some()
                 && float_to_int_or_float(list)
             {
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                w_list_setitem_inner(current_gc_ref(obj), index, current_gc_ref(value))
             } else {
-                switch_to_object_strategy(list);
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                let obj = switch_to_object_strategy(list);
+                w_list_setitem_inner(obj, index, current_gc_ref(value))
             }
         }
         ListStrategy::Bytes => {
@@ -2812,12 +2804,8 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                 list.bytes_items.set(idx as usize, w_bytes_block(value));
                 true
             } else {
-                switch_to_object_strategy(list);
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                let obj = switch_to_object_strategy(list);
+                w_list_setitem_inner(obj, index, current_gc_ref(value))
             }
         }
         ListStrategy::Ascii => {
@@ -2831,12 +2819,8 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
                     .set(idx as usize, w_str_storage(value) as *const _);
                 true
             } else {
-                switch_to_object_strategy(list);
-                w_list_setitem(
-                    crate::gc_roots::shadow_stack_get(root_base),
-                    index,
-                    crate::gc_roots::shadow_stack_get(root_base + 1),
-                )
+                let obj = switch_to_object_strategy(list);
+                w_list_setitem_inner(obj, index, current_gc_ref(value))
             }
         }
     }

@@ -2437,27 +2437,24 @@ fn emit_frontend_buildslice_shadow_graph(
 }
 
 fn emit_frontend_setitem(
-    _graph: &mut super::flow::FunctionGraph,
+    graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
     obj: super::flow::FlowValue,
     key: super::flow::FlowValue,
     value: super::flow::FlowValue,
     offset: i64,
-) {
-    // flowcontext.py STORE_SUBSCR ->
-    // `op.setitem(w_obj, w_subscr, w_newvalue).eval(self)`.
-    // Upstream `HLOperation.__init__` (operation.py:66) unconditionally
-    // creates a result Variable that rtyper later rewrites to void.
-    // pyre has no rtyper, so the op is emitted directly without a
-    // result slot; `flatten_space_operation`'s `result == None` branch
-    // consumes it identically to what rtyper would produce.
-    record_graph_op(
+) -> super::flow::Variable {
+    // flowcontext.py STORE_SUBSCR → `op.setitem(w_obj, w_subscr, w_newvalue)`.
+    // The opcode discards the return; flatten still needs the dest so
+    // `inline_call_r_r` of `space.setitem` can write it.
+    emit_graph_op_with_result(
+        graph,
         block,
         "setitem",
         vec![obj.into(), key.into(), value.into()],
-        None,
+        Kind::Ref,
         offset,
-    );
+    )
 }
 
 fn emit_frontend_store_slice(
@@ -17321,7 +17318,7 @@ mod tests {
         assert_eq!(op.opname, "setitem");
         assert_eq!(op.offset, 55);
         assert_eq!(op.args, vec![obj.into(), key.into(), value.into()]);
-        assert_eq!(op.result, None);
+        assert!(op.result.is_some());
     }
 
     #[test]

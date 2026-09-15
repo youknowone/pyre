@@ -5535,12 +5535,28 @@ where
     if op.args.len() != 3 {
         return None;
     }
-    if op.result.is_some() {
-        return None;
-    }
     let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let key_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
     let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
+    // pyopcode.py STORE_SUBSCR → `space.setitem`.  The opcode discards
+    // the return; flatten still needs the dest so `inline_call_r_r` of
+    // `setitem` can write it.
+    if let Some(dst_reg) = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => Some(get_register(*var)),
+        _ => None,
+    } {
+        if let Some(insn) = build_orthodox_inline_call_r_r_n(
+            inline_call_targets::SETITEM,
+            vec![
+                obj_operand.clone(),
+                key_operand.clone(),
+                value_operand.clone(),
+            ],
+            dst_reg,
+        ) {
+            return Some(insn);
+        }
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.store_subscr_fn_idx,
         vec![obj_operand, key_operand, value_operand],
@@ -6592,6 +6608,8 @@ mod inline_call_targets {
     pub const IS_TRUE: &str = "pyre_interpreter::baseobjspace::is_true";
     /// DELETE_SUBSCR — `lower_delsubscr_hlop_to_insn`.
     pub const DELITEM: &str = "pyre_interpreter::baseobjspace::delitem";
+    /// STORE_SUBSCR — `space.setitem`.
+    pub const SETITEM: &str = "pyre_interpreter::baseobjspace::setitem";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.

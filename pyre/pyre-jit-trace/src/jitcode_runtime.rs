@@ -386,6 +386,9 @@ static LIST_POP_END_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 static WRITE_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `unwrap_cell` (`typeobject.py unwrap_cell`).
 static UNWRAP_CELL_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
+/// Cached `ALL_JITCODES` index of `w_list_setitem_inner`, resolved by name for
+/// the same reason.
+static LIST_SETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
 static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
@@ -536,6 +539,16 @@ pub fn unwrap_cell_jitcode() -> Option<Arc<JitCode>> {
         (*UNWRAP_CELL_JITCODE_INDEX.get_or_init(|| compute_named_jitcode_index("unwrap_cell")))?;
     get_jitcode_by_index(idx)
 }
+
+/// The lock-guard-free charon `w_list_setitem_inner` body in `ALL_JITCODES`,
+/// resolved by name and cached process-wide. Same lock-vs-trace-guard
+/// split as [`list_pop_end_jitcode`]: the body holds no `w_list_lock` pair.
+pub fn list_setitem_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*LIST_SETITEM_JITCODE_INDEX
+        .get_or_init(|| compute_named_jitcode_index("w_list_setitem_inner")))?;
+    get_jitcode_by_index(idx)
+}
+
 
 /// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
 /// graph key the codewriter allocated it under and cached process-wide.
@@ -3217,6 +3230,17 @@ mod tests {
         assert!(
             !jc.code.is_empty(),
             "w_list_append_inner jitcode should have non-empty bytecode (assembled body)"
+        );
+    }
+
+    #[test]
+    fn list_setitem_jitcode_resolves_charon_body() {
+        let jc = list_setitem_jitcode()
+            .expect("build-time pipeline must contain the charon `w_list_setitem_inner` jitcode");
+        assert_eq!(jc.name, "w_list_setitem_inner");
+        assert!(
+            !jc.code.is_empty(),
+            "w_list_setitem_inner jitcode should have non-empty bytecode (assembled body)"
         );
     }
 

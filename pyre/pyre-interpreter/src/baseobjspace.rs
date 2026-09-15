@@ -4507,6 +4507,10 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
 // return value.  STORE_SUBSCR and the `jit_setitem` residual drop this
 // result, so the void-ness lives at the opcode boundary, not in this
 // method's `PyResult` type.
+//
+// `inline(never)` so the codewriter mints the graph the jitted
+// STORE_SUBSCR path calls (`eval.rs store_subscr` → `setitem`).
+#[inline(never)]
 pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     unsafe {
         // `pypy/objspace/std/dictproxyobject.py` exposes neither

@@ -9973,6 +9973,10 @@ pub(crate) fn name_is_setattr_family(name: &str) -> bool {
     name_leaf_is(name, "setattr") || name_leaf_is(name, "setattr_str")
 }
 
+pub(crate) fn name_is_setitem_family(name: &str) -> bool {
+    name_leaf_is(name, "setitem") || name_leaf_is(name, "setitem_slot")
+}
+
 /// `PyFrame::load_attr` / `SharedOpcodeHandler::load_attr` — `(frame, obj, name)`.
 pub(crate) fn jitcode_is_frame_load_attr(sub_index: usize) -> bool {
     jitcode_leaf_is(sub_index, "load_attr")
@@ -10010,6 +10014,7 @@ pub(crate) fn name_is_compare_value(name: &str) -> bool {
 pub(crate) fn name_is_unbounded_helper_body(name: &str) -> bool {
     name_is_getattr_family(name)
         || name_is_setattr_family(name)
+        || name_is_setitem_family(name)
         || name_leaf_is(name, "compare_value_from_tag_inner")
         || name_leaf_is(name, "binary_value_from_tag_inner")
 }
@@ -21157,11 +21162,214 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
 
 /// #62: walker-native speculative specialization for the `STORE_SUBSCR`
 /// helper residual_call (oopspec `StoreSubscr`, void result).  Records the
+/// Resolve the compiled `w_list_setitem_inner` body + the full-body snapshot
+/// sym.  `None` when the helper is absent from this build (hand fold stays).
+fn orthodox_list_setitem_body_and_sym<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(SubJitCodeBody, *const Sym)> {
+    let jc_arc = crate::jitcode_runtime::list_setitem_jitcode()?;
+    let sub_body = sub_jitcode_body_by_index(jc_arc.index())?;
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return None;
+    }
+    Some((sub_body, sym_ptr))
+}
+
+/// Descend `w_list_setitem_inner` the way `orthodox_list_append_commit`
+/// descends `w_list_append_inner`: pin class/strategy, unbox the index,
+/// walk the lock-free body, journal the displaced element.
+///
+/// Returns `Ok(None)` when the body is missing or the walk hits an unlowered
+/// helper so the hand-emitted store fold can still serve the site.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    list_op: OpRef,
+    key_op: OpRef,
+    value_op: OpRef,
+    list_obj: pyre_object::PyObjectRef,
+    key_obj: pyre_object::PyObjectRef,
+    value_obj: pyre_object::PyObjectRef,
+    sid: i64,
+    index: i64,
+) -> Result<Option<()>, DispatchError> {
+    let Some((sub_body, sym_ptr)) = orthodox_list_setitem_body_and_sym(ctx) else {
+        return Ok(None);
+    };
+    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
+        return Ok(None);
+    };
+    // Typed getitem boxes the displaced int/float and may move the operands.
+    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+        walker_concrete_ref_object(ctx, value_op),
+    ) else {
+        return Ok(None);
+    };
+    let sym = unsafe { &*sym_ptr };
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
+        let type_const = ctx.trace_ctx.const_int(list_type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(list_op, list_type_addr);
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
+
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(sid);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
+    let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
+    let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
+
+    if sid != 0 {
+        let is_float_storage = sid == 2;
+        let value_is_long = unsafe { pyre_object::pyobject::is_long(value_obj) };
+        let value_type_addr = if is_float_storage {
+            &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64
+        } else if value_is_long {
+            &pyre_object::pyobject::LONG_TYPE as *const _ as i64
+        } else {
+            &pyre_object::pyobject::INT_TYPE as *const _ as i64
+        };
+        if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
+            let type_const = ctx.trace_ctx.const_int(value_type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        }
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(value_op, value_type_addr);
+        let concrete_w_class = unsafe { (*value_obj).w_class } as i64;
+        let w_class_ref = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            value_op,
+            crate::descr::w_class_descr(),
+        );
+        let w_class_const = ctx.trace_ctx.const_ref(concrete_w_class);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[w_class_ref, w_class_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(w_class_ref, w_class_const);
+    }
+
+    ctx.trace_ctx.set_opref_concrete(
+        list_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(list_obj as usize)),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        value_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(value_obj as usize)),
+    );
+
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "list_setitem_commit",
+        "w_list_setitem_call_site",
+        &[raw_index],
+        &[ConcreteValue::Int(index)],
+        &[list_op, value_op],
+        &[ConcreteValue::Ref(list_obj), ConcreteValue::Ref(value_obj)],
+        &[],
+    );
+    let walk_outcome = match walk {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-SETITEM-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Ok((outcome, _)) => outcome,
+        Err(error) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!(
+                    "[decline-why] LIST-SETITEM-SUBWALK-ERR pc={op_pc} error={}",
+                    error.variant_name()
+                );
+            }
+            return Err(error);
+        }
+    };
+    match walk_outcome {
+        DispatchOutcome::SubReturn { result } => {
+            // `w_list_setitem_inner` returns bool; the opcode discards it.
+            let _ = result;
+        }
+        _ => {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+    }
+
+    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+        walker_concrete_ref_object(ctx, list_op),
+        walker_concrete_ref_object(ctx, key_op),
+        walker_concrete_ref_object(ctx, value_op),
+    ) else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
+    fbw_store_journal_push(list_obj, key_obj, displaced);
+    // Overwrite is idempotent: a residual the sub-walk already executed
+    // wrote this same value.
+    let stored = unsafe { pyre_object::w_list_setitem(list_obj, index, value_obj) };
+    debug_assert!(stored, "orthodox list setitem: in-bounds store failed");
+    Ok(Some(()))
+}
+
 /// strategy-dispatched list store inline
 /// for the object-, int-, and float-storage list strategies with a non-negative
 /// concrete index (and a type-matching value for the unboxed strategies): `guard_class LIST` +
 /// `guard_value(strategy)` + unbox index + `IntLt` bounds guard + unbox
 /// value + the strategy's `setarrayitem_gc`.
+///
+/// Prefers an orthodox sub-walk of `w_list_setitem_inner` (the lock-free
+/// body, same split as `w_list_append_inner`).  The hand-emitted store
+/// remains the fallback when that body is missing or does not finish.
 ///
 /// No residual execution: the recorded `setarrayitem_gc` performs the
 /// mutation at runtime (the void residual was likewise not walk-executed —
@@ -21248,6 +21456,14 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         };
         (sid, index, concrete_len)
     };
+
+    if try_walker_orthodox_list_setitem(
+        ctx, op_pc, list_op, key_op, value_op, list_obj, key_obj, value_obj, sid, index,
+    )?
+    .is_some()
+    {
+        return Ok(Some(()));
+    }
 
     // --- emit the specialized IR (walker-native) ---
     // Exact `w_class` first: it implies the LIST vtable, so GuardClass skips.

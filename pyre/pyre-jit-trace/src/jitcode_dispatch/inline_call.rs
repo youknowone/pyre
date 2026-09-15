@@ -14540,6 +14540,42 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         }
     }
 
+    // Jitted STORE_SUBSCR is `setitem` (`PyResult`, so `>r` as well as
+    // void).  Fold the list store or residualize; do not walk the
+    // protocol body.
+    if dst_bank == 'r' || dst_bank == 'v' {
+        let callee = callee_name.as_deref().unwrap_or("");
+        if super::specialize::name_is_setitem_family(callee)
+            || super::specialize::jitcode_leaf_is(sub_index, "setitem")
+            || super::specialize::jitcode_is_pathed(
+                sub_index,
+                &sub_body,
+                "pyre_interpreter::baseobjspace::setitem",
+            )
+        {
+            let folded = args.len() >= 3
+                && spec_gate(SpecFold::StoreSubscr, || {
+                    super::specialize::try_walker_specialize_store_subscr(ctx, op.pc, &args)
+                })?
+                .is_some();
+            if folded && dst_bank == 'r' {
+                let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+                let none_ptr = pyre_object::w_none();
+                let none = ctx.trace_ctx.const_ref(none_ptr as i64);
+                write_ref_reg(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
+            }
+            return finish_getattr_inline_or_residual(
+                ctx,
+                code,
+                op,
+                descr_index,
+                &[],
+                &args,
+                folded,
+            );
+        }
+    }
+
     // Flatten lowers BOOL / TO_BOOL to `inline_call_r_i` of `space.is_true`.
     // The eval-loop path may land on `is_true_slot` / `is_true_lookup`.
     if dst_bank == 'i'
