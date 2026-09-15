@@ -3158,6 +3158,13 @@ impl WasmBackend {
             .filter(|(_, _, remap)| remap.is_none())
             .map(|(_, r, _)| r.source_fail_index)
             .collect();
+        // The compiled probe still names the id it was registered under.
+        // Leftover remaps must go back under that same id; a fresh one
+        // would leave the already-emitted trip calling a hole.
+        let remap_pending_ids: HashMap<(u64, u32), i64> = work
+            .iter()
+            .filter_map(|(id, _, remap)| remap.map(|key| (key, *id)))
+            .collect();
         let leftover = self.install_inline_region_batch(
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
@@ -3170,23 +3177,22 @@ impl WasmBackend {
         // Remapped children whose parent is not in the owner yet stay
         // pending so a later parent install can pick them up.
         for (region, remap) in leftover {
-            if remap.is_some() {
-                let id = NEXT_PENDING_INLINE_ID.with(|next| {
-                    let id = next.get();
-                    next.set(id + 1);
-                    id
-                });
-                PENDING_INLINES.with(|pending| {
-                    pending.borrow_mut().insert(
-                        id,
-                        PendingInline {
-                            owner: owner.clone(),
-                            region,
-                            remap,
-                        },
-                    )
-                });
-            }
+            let Some(key) = remap else {
+                continue;
+            };
+            let Some(&id) = remap_pending_ids.get(&key) else {
+                continue;
+            };
+            PENDING_INLINES.with(|pending| {
+                pending.borrow_mut().insert(
+                    id,
+                    PendingInline {
+                        owner: owner.clone(),
+                        region,
+                        remap,
+                    },
+                )
+            });
         }
     }
 
@@ -5384,9 +5390,12 @@ impl majit_backend::Backend for WasmBackend {
                 // The source guard is on a standalone parent. Arm a trip
                 // that does not touch the owner's cells; install remaps
                 // the fail index once that parent is in the merged stream.
-                if let Some(owner) = original_token
-                    .compiled_loop_token()
-                    .and_then(|clt| clt.upgrade_loop_token())
+                // Without the callback the probe would `call_indirect` slot
+                // 0, so this stays a permanent out-of-line decline.
+                if inline_trip_helper_slot() != 0
+                    && let Some(owner) = original_token
+                        .compiled_loop_token()
+                        .and_then(|clt| clt.upgrade_loop_token())
                 {
                     defer_inline = Some((
                         owner,
