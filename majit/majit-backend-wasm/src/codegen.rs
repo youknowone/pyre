@@ -12524,17 +12524,6 @@ fn emit_force_arm(
             } else {
                 emit_resolve(sink, constants, value_types, arg_ref);
             }
-        } else if descr.fail_arg_types.get(i) == Some(&Type::Ref) {
-            if let Some(home) = ref_homes.home(arg_ref) {
-                // `dead_frame_from_forced_frame` still decodes a tagged
-                // home (`offset * 2 + 1`) from this force slot. The home
-                // itself is already stored; publish its offset so a
-                // collection inside the bracketed call forwards the value.
-                let home_offset = frame.home_slot_base + home as u64 * SLOT_SIZE;
-                sink.i64_const((home_offset * 2 + 1) as i64);
-            } else {
-                emit_resolve(sink, constants, value_types, arg_ref);
-            }
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }
