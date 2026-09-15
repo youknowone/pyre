@@ -508,20 +508,70 @@ fn expr_is_ident(expr: &syn::Expr, name: &str) -> bool {
 }
 
 /// Statements the matchless compiled body will not run: everything before
-/// `jit_merge_point` except `let` bindings and the interpreter-only
-/// `can_enter_jit!` tick (`rewrite_can_enter_jit`).
+/// `jit_merge_point` except `let` bindings the lowerer can reproduce and
+/// the interpreter-only `can_enter_jit!` tick (`rewrite_can_enter_jit`).
 fn first_unsupported_pre_merge_stmt(func_block: &syn::Block) -> Option<&syn::Stmt> {
     let body = portal_loop_body(func_block)?;
     for stmt in &body.stmts {
         if is_jit_merge_point_macro(stmt) {
             return None;
         }
-        if matches!(stmt, syn::Stmt::Local(_)) || is_can_enter_jit_macro(stmt) {
+        if is_can_enter_jit_macro(stmt) {
+            continue;
+        }
+        if let syn::Stmt::Local(local) = stmt {
+            if local_init_has_side_effect(local) {
+                return Some(stmt);
+            }
             continue;
         }
         return Some(stmt);
     }
     None
+}
+
+/// A pre-merge `let` whose initializer mutates (an assignment or
+/// assign-op, including one nested in a block) runs in the interpreter
+/// but is omitted from the compiled back-edge if the lowerer cannot
+/// reproduce it. Reject those so the portal fails at compile time.
+fn local_init_has_side_effect(local: &syn::Local) -> bool {
+    let Some(init) = &local.init else {
+        return false;
+    };
+    expr_has_pre_merge_side_effect(&init.expr)
+}
+
+fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
+    use syn::visit::Visit;
+    struct Finder {
+        hit: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_expr_assign(&mut self, _: &'ast syn::ExprAssign) {
+            self.hit = true;
+        }
+        fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+            if matches!(
+                node.op,
+                syn::BinOp::AddAssign(_)
+                    | syn::BinOp::SubAssign(_)
+                    | syn::BinOp::MulAssign(_)
+                    | syn::BinOp::DivAssign(_)
+                    | syn::BinOp::RemAssign(_)
+                    | syn::BinOp::BitXorAssign(_)
+                    | syn::BinOp::BitAndAssign(_)
+                    | syn::BinOp::BitOrAssign(_)
+                    | syn::BinOp::ShlAssign(_)
+                    | syn::BinOp::ShrAssign(_)
+            ) {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_binary(self, node);
+        }
+    }
+    let mut finder = Finder { hit: false };
+    finder.visit_expr(expr);
+    finder.hit
 }
 
 /// The portal loop: a `while`/`loop` statement of the function body whose own
@@ -901,6 +951,30 @@ mod find_dispatch_match_tests {
             "while pos < len {
                 pos = pos + 1;
                 jit_merge_point!(driver, program, pc; state);
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    }
+
+    #[test]
+    fn a_plain_let_before_merge_is_allowed() {
+        let block = fn_block(
+            "while pos < len {
+                let n = 0;
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_none());
+    }
+
+    #[test]
+    fn a_mutating_let_before_merge_is_unsupported() {
+        let block = fn_block(
+            "while pos < len {
+                let ignored = { state.acc += 1; 0 };
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
             }",
         );
         assert!(first_unsupported_pre_merge_stmt(&block).is_some());

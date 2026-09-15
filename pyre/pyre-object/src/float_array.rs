@@ -170,7 +170,8 @@ impl FloatArray {
         false
     }
 
-    fn grow(&mut self, min_cap: usize) {
+    /// `_ll_list_resize_hint_really(overallocate=True)` for this block.
+    pub fn grow(&mut self, min_cap: usize) {
         let extra = if min_cap < 9 { 3 } else { 6 };
         let target_cap = min_cap
             .saturating_add(extra)

@@ -758,10 +758,11 @@ pub(super) fn bind_pre_merge_point_stmts(
             break;
         }
         if let syn::Stmt::Local(local) = stmt {
-            // lower_local delegates to lower_value_expr; failure here is
-            // intentionally silent — emit_promote_greens will produce the
-            // diagnostic if the green's binding is still missing.
-            let _ = lowerer.lower_local(local);
+            // A `let` the lowerer cannot reproduce must not stay in the
+            // interpreter-only prefix: the compiled back-edge would omit
+            // it. Fail the body so the portal stays in the interpreter
+            // rather than compiling a loop that drops the binding.
+            lowerer.lower_local(local)?;
         }
     }
     Some(())

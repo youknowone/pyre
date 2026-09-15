@@ -159,3 +159,63 @@ fn a_matchless_portal_with_a_local_match_still_runs_the_body() {
         "the compiled loop carries no increment: {body:#?}",
     );
 }
+
+/// A `continue` in the matchless body must re-check the while condition.
+/// Jumping to the merge point would skip that test and keep iterating
+/// after `pos` has reached `n`.
+struct ContinueState {
+    acc: i64,
+    pos: i64,
+    n: i64,
+}
+
+#[majit_macros::jit_interp(
+    state = ContinueState,
+    env = Bytecode,
+    greens = [pc, program],
+    state_fields = { acc: int, pos: int, n: int },
+)]
+#[allow(unused_assignments, unused_variables)]
+fn matchless_with_continue(program: &Bytecode, threshold: u32, n: i64) -> i64 {
+    let mut driver: JitDriver<ContinueState> = JitDriver::new(threshold);
+    driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
+        REC.compiles.fetch_add(1, Ordering::Relaxed);
+        *REC.body.lock() = opcodes.to_vec();
+    });
+    let mut pc: usize = 0;
+    let mut state = ContinueState { acc: 0, pos: 0, n };
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+    while state.pos < state.n {
+        can_enter_jit!(driver, 0usize, &mut state, program, || {});
+        jit_merge_point!(driver, program, pc; state);
+        if state.pos % 2i64 == 0i64 {
+            state.pos = state.pos + 1i64;
+            continue;
+        }
+        state.acc = state.acc + 1i64;
+        state.pos = state.pos + 1i64;
+    }
+    state.acc
+}
+
+#[test]
+fn a_matchless_portal_continue_rechecks_the_while_condition() {
+    let _guard = REC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    REC.compiles.store(0, Ordering::Relaxed);
+    REC.body.lock().clear();
+    let cold = matchless_with_continue(&PROGRAM, u32::MAX, N);
+    let warm = matchless_with_continue(&PROGRAM, 3, N);
+    assert_eq!(
+        warm, cold,
+        "continue skipped the while condition after warmup"
+    );
+    assert!(
+        REC.compiles.load(Ordering::Relaxed) > 0,
+        "the matchless portal with continue never compiled a loop",
+    );
+}

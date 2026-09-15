@@ -1695,6 +1695,14 @@ fn lower_matchless_portal_body(
     loop_start_label: &syn::Ident,
 ) -> Option<()> {
     let portal = find_portal_loop(func_block)?;
+    // `continue` in the body must re-check the while condition. The
+    // dispatch label the caller installed is the merge-point label, so
+    // a jump there would skip the condition emitted below and keep
+    // iterating after it is false.
+    let cond_label = lowerer.alloc_label();
+    lowerer.emit_aux(quote::quote! { let #cond_label = __builder.new_label(); });
+    let saved_loop = lowerer.dispatch_loop_label.replace(cond_label.clone());
+
     let mut seen_merge_point = false;
     for stmt in &portal.body.stmts {
         if is_jit_merge_point_macro(stmt) {
@@ -1714,6 +1722,7 @@ fn lower_matchless_portal_body(
         lowerer.lower_stmt(stmt)?;
     }
     if !seen_merge_point {
+        lowerer.dispatch_loop_label = saved_loop;
         return None;
     }
     if let Some(census_interp) = lowerer.config.map(|c| c.state_type_name.clone()) {
@@ -1724,6 +1733,10 @@ fn lower_matchless_portal_body(
             majit_metainterp::record_dispatch_arm_census(#census_interp, 1usize);
         });
     }
+    // Restore the merge-point label so the back-edge `continue` after
+    // a true condition lands on `jit_merge_point`, not the condition.
+    lowerer.dispatch_loop_label = saved_loop;
+    lowerer.emit_label_def(&cond_label);
     // Close the iteration the way marked.py's while does: test the
     // header condition after the body, then jump to the merge point.
     // `can_enter_jit!()` here is only the JitCode `loop_header` emit
@@ -3911,7 +3924,9 @@ pub(crate) fn lower_dispatch_body(
     // that consumer-declared `greens = [<body-local>]` (say
     // `greens = [ok]`) resolve via `lowerer.bindings` when
     // `emit_promote_greens` and `resolve_greens` consult it below.
-    let _ = bind_pre_merge_point_stmts(&mut lowerer, func_block);
+    if bind_pre_merge_point_stmts(&mut lowerer, func_block).is_none() {
+        return None;
+    }
     if lowerer.dispatch_tainted_reason.is_some() {
         return None;
     }

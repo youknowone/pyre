@@ -2380,6 +2380,56 @@ pub fn ll_list_float_set_len(l: &mut W_ListObject, n: usize) {
     l.float_items.set_len(n);
 }
 
+/// `rlist.py _ll_list_resize_hint_really` for Float storage.
+///
+/// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+fn ll_list_float_resize_hint_really_iff(
+    obj: PyObjectRef,
+    newsize: usize,
+    _overallocate: bool,
+) -> bool {
+    unsafe {
+        let cap = ll_list_float_capacity(&*(obj as *const W_ListObject));
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
+    }
+}
+
+#[majit_macros::look_inside_iff(ll_list_float_resize_hint_really_iff)]
+pub unsafe fn ll_list_float_resize_hint_really(
+    obj: PyObjectRef,
+    newsize: usize,
+    overallocate: bool,
+) {
+    let list = &mut *(obj as *mut W_ListObject);
+    if overallocate {
+        list.float_items.grow(newsize);
+    } else if newsize > list.float_items.heap_capacity() {
+        list.float_items.grow(newsize);
+    }
+}
+
+/// `rlist.py _ll_list_resize_ge` for Float storage.
+pub unsafe fn ll_list_float_resize_ge(obj: PyObjectRef, newsize: usize) {
+    let list = &*(obj as *const W_ListObject);
+    let allocated = ll_list_float_capacity(list);
+    let cond = allocated < newsize;
+    if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
+        if cond {
+            ll_list_float_resize_hint_really(obj, newsize, true);
+        }
+    } else {
+        majit_rlib::jit::conditional_call3(
+            cond,
+            ll_list_float_resize_hint_really,
+            obj,
+            newsize,
+            true,
+        );
+    }
+    let list = &mut *(obj as *mut W_ListObject);
+    ll_list_float_set_len(list, newsize);
+}
+
 // Object-strategy storage leaves, mirroring the Integer leaves above but
 // addressing the `length` header + the `items` GcArray block (`Ptr(GcArray
 // (OBJECTPTR))`). The element is a GC pointer, so the store carries the
@@ -2431,6 +2481,56 @@ pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObje
         let base = items_block_items_base(l.items);
         *base.add(index) = item;
     }
+}
+
+/// `rlist.py _ll_list_resize_hint_really` for Object storage.
+///
+/// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+fn ll_list_obj_resize_hint_really_iff(
+    obj: PyObjectRef,
+    newsize: usize,
+    _overallocate: bool,
+) -> bool {
+    unsafe {
+        let cap = ll_list_obj_capacity(&*(obj as *const W_ListObject));
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
+    }
+}
+
+/// `rlist.py _ll_list_resize_hint_really` — grow `l.items` with the
+/// 0, 4, 8, 16, 25, … over-allocation. `W_ListObject::object_grow`
+/// already applies that formula.
+#[majit_macros::look_inside_iff(ll_list_obj_resize_hint_really_iff)]
+pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
+    let list = &*(obj as *const W_ListObject);
+    if overallocate || newsize > ll_list_obj_capacity(list) {
+        let _ = W_ListObject::object_grow(obj, newsize);
+    }
+}
+
+/// `rlist.py _ll_list_resize_ge` for Object storage.
+///
+/// `cond = len(l.items) < newsize`; a constant pair inlines the realloc,
+/// otherwise `jit.conditional_call` keeps the fast path bridge-free.
+pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
+    let list = &*(obj as *const W_ListObject);
+    let allocated = ll_list_obj_capacity(list);
+    let cond = allocated < newsize;
+    if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
+        if cond {
+            ll_list_obj_resize_hint_really(obj, newsize, true);
+        }
+    } else {
+        majit_rlib::jit::conditional_call3(
+            cond,
+            ll_list_obj_resize_hint_really,
+            obj,
+            newsize,
+            true,
+        );
+    }
+    let list = &mut *(obj as *mut W_ListObject);
+    ll_list_obj_set_len(list, newsize);
 }
 
 /// Get the item at the given index from a list.
@@ -2666,20 +2766,21 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
 ///
 /// Splits into a guard-taking wrapper and a lock-free
 /// [`w_list_append_inner`], the same shape the dict side uses
-/// (`w_dict_store_checked` / `w_dict_store_checked_inner`), because the append
-/// fold descends this body:
+/// (`w_dict_store_checked` / `w_dict_store_checked_inner`), because the
+/// append descent walks this body:
 ///
 /// * the wrapper must stay look-inside — the codewriter only reaches graphs
 ///   through look-inside calls from a jitdriver portal
 ///   (`grab_initial_jitcodes` / `enum_pending_graphs`), so a
 ///   `dont_look_inside` wrapper hides the inner body from the pipeline as
 ///   well;
-/// * the descended body must hold no guard — a `w_list_lock` acquire/release
-///   pair inside it declines the fold's sub-walk.
+/// * the descended body must hold no lock — a `w_list_lock` acquire/release
+///   pair inside it declines the sub-walk.
 ///
-/// Either way `list_append_jitcode()` resolves to `None`, the fold declines,
-/// and every `list.append` becomes a `Void` residual — a body effect that
-/// refuses in-flight FOR_ITER delivery and silently drops the iteration.
+/// Either way `list_append_jitcode()` resolves to `None`, the descent
+/// declines, and every `list.append` becomes a `Void` residual — a body
+/// effect that refuses in-flight FOR_ITER delivery and silently drops the
+/// iteration.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
@@ -2793,41 +2894,27 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
         //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
         ListStrategy::Object => {
-            // ll_append (rlist.py) resize-ge fast case (rlist.py):
-            // store in place while there is spare capacity (bump the length
-            // and write the GC ref); otherwise fall back to the resizing
-            // push. The element is a GC pointer, so the in-place store runs
-            // the list write barrier after the store — a separate
-            // `dont_look_inside` call the orthodox fold keeps residual while
-            // the `set_len` / `setitem` leaves fold to native ops.
+            // ll_append (rlist.py): length = ll_length();
+            // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
             let length = ll_list_obj_length(list);
-            if length < ll_list_obj_capacity(list) {
-                let value = prepare_list_ref_store(obj, value);
-                let obj = current_gc_ref(obj);
-                let list = &mut *(obj as *mut W_ListObject);
-                ll_list_obj_set_len(list, length + 1);
-                ll_list_obj_setitem_fast(list, length, value);
-            } else {
-                list.object_push(value);
-            }
+            ll_list_obj_resize_ge(obj, length + 1);
+            let obj = current_gc_ref(obj);
+            let value = current_gc_ref(value);
+            let value = prepare_list_ref_store(obj, value);
+            let obj = current_gc_ref(obj);
+            let list = &mut *(obj as *mut W_ListObject);
+            ll_list_obj_setitem_fast(list, length, value);
         }
         ListStrategy::Integer => {
             if is_plain_int1(value) {
                 // ll_append (rtyper/rlist.py): length = ll_length();
                 // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
-                // The #171 append fold walks this capacity `goto_if_not`
-                // (`specialize.rs orthodox_list_append_recognize`) and lowers
-                // the `list.int_*` oopspecs; always calling
-                // `ll_list_int_resize_ge` is a residual the fold declines,
-                // so the compiled loop residual-calls every integer append.
                 let item = plain_int_w(value);
                 let length = ll_list_int_length(list);
-                if length < ll_list_int_capacity(list) {
-                    ll_list_int_set_len(list, length + 1);
-                    ll_list_int_setitem_fast(list, length, item);
-                } else {
-                    list.int_items.push(item);
-                }
+                ll_list_int_resize_ge(obj, length + 1);
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
+                ll_list_int_setitem_fast(list, length, item);
             } else if is_float_strategy_item(value) && integer_to_int_or_float(list) {
                 let obj = current_gc_ref(obj);
                 let value = current_gc_ref(value);
@@ -2848,18 +2935,13 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
             // rather than being stored unboxed (which would lose its identity).
             if is_float_strategy_item(value) {
                 // ll_append (rtyper/rlist.py): length = ll_length();
-                // _ll_resize_ge(length+1); ll_setitem_fast(length, item). The
-                // resize-ge fast case (rlist.py:285) inlines only while there
-                // is spare capacity; bump the length and store in place.
-                // Otherwise fall back to the resizing push.
+                // _ll_resize_ge(length+1); ll_setitem_fast(length, item).
                 let item = w_float_get_value(value);
                 let length = ll_list_float_length(list);
-                if length < ll_list_float_capacity(list) {
-                    ll_list_float_set_len(list, length + 1);
-                    ll_list_float_setitem_fast(list, length, item);
-                } else {
-                    list.float_items.push(item);
-                }
+                ll_list_float_resize_ge(obj, length + 1);
+                let obj = current_gc_ref(obj);
+                let list = &mut *(obj as *mut W_ListObject);
+                ll_list_float_setitem_fast(list, length, item);
             } else if is_plain_int1(value)
                 && int_or_float_encode_int(plain_int_w(value)).is_some()
                 && float_to_int_or_float(list)
@@ -5536,6 +5618,23 @@ mod tests {
             assert_eq!(l.strategy, ListStrategy::Integer);
             assert!(ll_list_int_capacity(l) >= 5);
             assert_eq!(ll_list_int_getitem_fast(l, 4), 5);
+        }
+    }
+
+    #[test]
+    fn object_resize_ge_grows_then_stores() {
+        // rlist.py `ll_append` / `_ll_list_resize_ge` for Object storage:
+        // a list-of-lists grow must not take a hard capacity guard.
+        let inner = w_list_new(vec![w_int_new(0)]);
+        let list = w_list_new(vec![inner]);
+        unsafe {
+            for i in 1..8 {
+                w_list_append(list, w_list_new(vec![w_int_new(i)]));
+            }
+            assert_eq!(w_list_len(list), 8);
+            let l = &*(list as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Object);
+            assert!(ll_list_obj_capacity(l) >= 8);
         }
     }
 

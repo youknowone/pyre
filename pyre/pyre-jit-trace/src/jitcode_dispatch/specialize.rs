@@ -18136,11 +18136,12 @@ pub(crate) fn set_add_method_descr() -> DescrRef {
     )
 }
 
-/// Shared recognition for the #171 orthodox list-append fold: the receiver
-/// must be a list with spare capacity whose storage strategy matches the
-/// value's strict type predicate (Integer / Object / Float).  Returns the
-/// list length before the append (the journal rewind point) on a match, or
-/// `None` (decline) otherwise.  No IR is emitted.
+/// Shared recognition for the list-append descent: the receiver must be a
+/// list whose storage strategy matches the value's strict type predicate
+/// (Integer / Object / Float).  Returns the list length before the append
+/// (the journal rewind point) on a match, or `None` (decline) otherwise.
+/// No IR is emitted.  Capacity is not a gate: `ll_append` records
+/// `conditional_call` of `_ll_list_resize_hint_really` (`rlist.py`).
 ///
 /// # Safety
 /// `inner_self` / `value` must be live `PyObjectRef`s.
@@ -18185,9 +18186,6 @@ unsafe fn orthodox_list_append_recognize(
         }
         // Empty length is 0 (the journal rewind point).
         return Some(0);
-    }
-    if !pyre_object::w_list_can_append_without_realloc(inner_self) {
-        return None;
     }
     // Int-storage specialization: `is_plain_int1` value (exact `W_IntObject`
     // or fits-int `W_LongObject`) stored unboxed. A tagged-immediate value
