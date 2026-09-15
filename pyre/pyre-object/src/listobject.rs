@@ -4127,12 +4127,15 @@ pub unsafe fn w_list_sort_strings(obj: PyObjectRef, reverse: bool) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         ListStrategy::Bytes => list.bytes_items.as_mut_slice().sort_by(|a, b| {
-            crate::bytesobject::bytes_block_chars(*a).cmp(crate::bytesobject::bytes_block_chars(*b))
+            crate::object_array::ll_chars_strcmp(
+                crate::bytesobject::bytes_block_chars(*a),
+                crate::bytesobject::bytes_block_chars(*b),
+            )
+            .cmp(&0)
         }),
-        ListStrategy::Ascii => list
-            .ascii_items
-            .as_mut_slice()
-            .sort_by(|a, b| (&**a).as_bytes().cmp((&**b).as_bytes())),
+        ListStrategy::Ascii => list.ascii_items.as_mut_slice().sort_by(|a, b| {
+            crate::object_array::ll_chars_strcmp((&**a).as_bytes(), (&**b).as_bytes()).cmp(&0)
+        }),
         _ => return false,
     }
     if reverse {
