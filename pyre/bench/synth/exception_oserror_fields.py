@@ -1,4 +1,8 @@
 # pyre-check: max-pypy-ratio=14
+# wasm_inline_merge_exits=1 is the priced deferred merge: owner is
+# just over INLINE_EAGER_MAX_BYTES, trip threshold is 40*owner_bytes,
+# and N=2500000 pays it once. Rise is a regression field; 1 is the
+# number that should hold, not a leaked withdrawn flag.
 N = 2500000
 
 
