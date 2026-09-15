@@ -94,16 +94,33 @@ pub fn install_optional_modules() {
 }
 
 /// Install [`install_optional_modules`] as the interpreter's optional-module hook.
+///
+/// Also run from a constructor so a binary that links this crate publishes
+/// the rclass aliases before any `init_subclass_ranges` OnceLock in a
+/// parallel test can freeze an incomplete census. PyPy has the same
+/// modules in the translated program from process start.
+#[::ctor::ctor(unsafe)]
+fn register_on_load() {
+    register();
+}
+
 pub fn register() {
-    pyre_interpreter::importing::set_optional_builtin_modules(install_optional_modules);
-    pyre_interpreter::eval::set_optional_prebuilt_slot_walker(|fwd| {
-        module::_csv::walk_csv_state_gc(fwd);
-    });
+    pyre_interpreter::importing::set_optional_module_hooks(
+        pyre_interpreter::importing::OptionalModuleHooks {
+            install_modules: install_optional_modules,
+            walk_global_roots: walk_optional_global_roots,
+            walk_prebuilt_slots: |fwd| {
+                module::_csv::walk_csv_state_gc(fwd);
+            },
+            subclass_range_aliases: optional_subclass_range_aliases,
+        },
+    );
+}
+
+fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    let _ = visitor;
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    pyre_interpreter::eval::set_optional_global_root_walker(|visitor| {
-        module::faulthandler::handler::walk_faulthandler_roots(visitor);
-    });
-    pyre_interpreter::set_optional_subclass_range_aliases(optional_subclass_range_aliases);
+    module::faulthandler::handler::walk_faulthandler_roots(visitor);
 }
 
 fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {

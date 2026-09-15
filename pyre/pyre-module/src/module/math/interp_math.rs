@@ -222,50 +222,58 @@ pm1_edom!(atanh, "expected a number between -1 and 1");
 // Exponential / logarithmic
 pm1_edom!(sqrt, "expected a nonnegative input");
 
-static MATH_SQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_LOG_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_COS_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_SIN_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_FABS_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_FLOOR_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_CEIL_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MATH_TRUNC_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// Checked-arity wrapper pointers installed by `py_module!` for the
+/// builtins the walker probes by identity.  One record, filled once at
+/// module init: `py_checked_arity_fn!` wraps each body in a non-capturing
+/// closure, so a BuiltinCode stores that wrapper rather than (for example)
+/// [`frexp`] itself.
+struct MathBuiltinWrappers {
+    sqrt: usize,
+    log: usize,
+    cos: usize,
+    sin: usize,
+    frexp: usize,
+    ldexp: usize,
+    isqrt: usize,
+    fabs: usize,
+    floor: usize,
+    ceil: usize,
+    trunc: usize,
+    isclose: usize,
+}
+
+static MATH_WRAPPERS: std::sync::OnceLock<MathBuiltinWrappers> = std::sync::OnceLock::new();
+
+fn math_wrapper_addr(ns: PyObjectRef, name: &str) -> usize {
+    let callable = pyre_interpreter::module_ns_get(ns, name)
+        .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
+    unsafe {
+        let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
+        debug_assert!(pyre_interpreter::gateway::is_builtin_code(code));
+        pyre_interpreter::gateway::builtin_code_get(code) as usize
+    }
+}
 
 /// Record the checked-arity wrapper pointers installed by `py_module!`.
 ///
-/// `py_checked_arity_fn!` wraps each `interp_math` body in a non-capturing
-/// closure, so a BuiltinCode stores the wrapper pointer rather than (for
-/// example) [`frexp`] itself.  The wrappers are immutable process code, hence
-/// process-global `OnceLock<usize>` is the same ownership shape as pyre's
-/// other immortal runtime metadata and needs no GC rooting.
+/// The wrappers are immutable process code, hence a process-global
+/// `OnceLock` is the same ownership shape as pyre's other immortal runtime
+/// metadata and needs no GC rooting.
 pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
-    for (name, slot) in [
-        ("sqrt", &MATH_SQRT_WRAPPER),
-        ("log", &MATH_LOG_WRAPPER),
-        ("cos", &MATH_COS_WRAPPER),
-        ("sin", &MATH_SIN_WRAPPER),
-        ("frexp", &MATH_FREXP_WRAPPER),
-        ("ldexp", &MATH_LDEXP_WRAPPER),
-        ("isqrt", &MATH_ISQRT_WRAPPER),
-        ("fabs", &MATH_FABS_WRAPPER),
-        ("floor", &MATH_FLOOR_WRAPPER),
-        ("ceil", &MATH_CEIL_WRAPPER),
-        ("trunc", &MATH_TRUNC_WRAPPER),
-        ("isclose", &MATH_ISCLOSE_WRAPPER),
-    ] {
-        let callable = pyre_interpreter::module_ns_get(ns, name)
-            .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
-        let wrapper = unsafe {
-            let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-            debug_assert!(pyre_interpreter::gateway::is_builtin_code(code));
-            pyre_interpreter::gateway::builtin_code_get(code) as usize
-        };
-        let installed = slot.get_or_init(|| wrapper);
-        debug_assert_eq!(*installed, wrapper);
-    }
+    let _ = MATH_WRAPPERS.set(MathBuiltinWrappers {
+        sqrt: math_wrapper_addr(ns, "sqrt"),
+        log: math_wrapper_addr(ns, "log"),
+        cos: math_wrapper_addr(ns, "cos"),
+        sin: math_wrapper_addr(ns, "sin"),
+        frexp: math_wrapper_addr(ns, "frexp"),
+        ldexp: math_wrapper_addr(ns, "ldexp"),
+        isqrt: math_wrapper_addr(ns, "isqrt"),
+        fabs: math_wrapper_addr(ns, "fabs"),
+        floor: math_wrapper_addr(ns, "floor"),
+        ceil: math_wrapper_addr(ns, "ceil"),
+        trunc: math_wrapper_addr(ns, "trunc"),
+        isclose: math_wrapper_addr(ns, "isclose"),
+    });
     // The generic float folds are identified the same way; they differ only in
     // that one table entry stands for one raw helper rather than one probe fn.
     for (name, slot) in MATH_FLOAT1_FOLDS
@@ -273,22 +281,13 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         .map(|fold| (fold.name, &fold.slot))
         .chain(MATH_FLOAT2_FOLDS.iter().map(|fold| (fold.name, &fold.slot)))
     {
-        let callable = pyre_interpreter::module_ns_get(ns, name)
-            .unwrap_or_else(|| panic!("math.{name} missing after module registration"));
-        let wrapper = unsafe {
-            let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
-            debug_assert!(pyre_interpreter::gateway::is_builtin_code(code));
-            pyre_interpreter::gateway::builtin_code_get(code) as usize
-        };
+        let wrapper = math_wrapper_addr(ns, name);
         let installed = slot.get_or_init(|| wrapper);
         debug_assert_eq!(*installed, wrapper);
     }
 }
 
-unsafe fn math_builtin_wrapper_matches(
-    callable: PyObjectRef,
-    expected: &std::sync::OnceLock<usize>,
-) -> bool {
+unsafe fn math_builtin_wrapper_matches(callable: PyObjectRef, expected: usize) -> bool {
     unsafe {
         if callable.is_null() || !pyre_interpreter::is_function(callable) {
             return false;
@@ -296,10 +295,14 @@ unsafe fn math_builtin_wrapper_matches(
         let code = pyre_interpreter::function_get_code(callable) as PyObjectRef;
         !code.is_null()
             && pyre_interpreter::gateway::is_builtin_code(code)
-            && expected.get().is_some_and(|addr| {
-                *addr == pyre_interpreter::gateway::builtin_code_get(code) as usize
-            })
+            && expected == pyre_interpreter::gateway::builtin_code_get(code) as usize
     }
+}
+
+fn math_wrapper_is(callable: PyObjectRef, pick: fn(&MathBuiltinWrappers) -> usize) -> bool {
+    MATH_WRAPPERS
+        .get()
+        .is_some_and(|wrappers| unsafe { math_builtin_wrapper_matches(callable, pick(wrappers)) })
 }
 
 /// True iff `callable` is the canonical builtin `math.sqrt` function object.
@@ -307,19 +310,19 @@ unsafe fn math_builtin_wrapper_matches(
 /// distinguish it from a value rebound under the same `math.sqrt` name, so a
 /// monkeypatched `math.sqrt` correctly declines the pure-inline specialization.
 pub fn is_math_sqrt_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_SQRT_WRAPPER) }
+    math_wrapper_is(callable, |w| w.sqrt)
 }
 
 pub fn is_math_log_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_LOG_WRAPPER) }
+    math_wrapper_is(callable, |w| w.log)
 }
 
 pub fn is_math_cos_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_COS_WRAPPER) }
+    math_wrapper_is(callable, |w| w.cos)
 }
 
 pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_SIN_WRAPPER) }
+    math_wrapper_is(callable, |w| w.sin)
 }
 
 /// Callable-identity probes used by the meta-trace walker.  As with
@@ -327,31 +330,31 @@ pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
 /// pointer rather than a module/name string so rebinding `math.frexp` or
 /// `math.ldexp` cannot enter a specialization for the old callable.
 pub fn is_math_frexp_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_FREXP_WRAPPER) }
+    math_wrapper_is(callable, |w| w.frexp)
 }
 
 pub fn is_math_ldexp_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_LDEXP_WRAPPER) }
+    math_wrapper_is(callable, |w| w.ldexp)
 }
 
 pub fn is_math_isqrt_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_ISQRT_WRAPPER) }
+    math_wrapper_is(callable, |w| w.isqrt)
 }
 
 pub fn is_math_fabs_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_FABS_WRAPPER) }
+    math_wrapper_is(callable, |w| w.fabs)
 }
 
 pub fn is_math_floor_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_FLOOR_WRAPPER) }
+    math_wrapper_is(callable, |w| w.floor)
 }
 
 pub fn is_math_ceil_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_CEIL_WRAPPER) }
+    math_wrapper_is(callable, |w| w.ceil)
 }
 
 pub fn is_math_trunc_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_TRUNC_WRAPPER) }
+    math_wrapper_is(callable, |w| w.trunc)
 }
 
 /// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
@@ -566,11 +569,9 @@ pub extern "C" fn jit_math_isclose_default(a: f64, b: f64) -> i64 {
     i64::from(diff <= (REL_TOL * b).abs() || diff <= (REL_TOL * a).abs())
 }
 
-static MATH_ISCLOSE_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
 /// True iff `callable` is the canonical builtin `math.isclose`.
 pub fn is_math_isclose_function(callable: PyObjectRef) -> bool {
-    unsafe { math_builtin_wrapper_matches(callable, &MATH_ISCLOSE_WRAPPER) }
+    math_wrapper_is(callable, |w| w.isclose)
 }
 
 macro_rules! math_fold_table {

@@ -1125,19 +1125,8 @@ pub fn all_immortal_w_class_only_descriptors()
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.
 /// `pyre-object::pyobject::all_subclass_range_aliases` supplies the object
 /// layer; `init_typeobjects` passes both slices to the common numbering
-/// writer.
-static OPTIONAL_SUBCLASS_RANGE_ALIASES: std::sync::OnceLock<
-    fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
-> = std::sync::OnceLock::new();
-
-/// Extra rclass aliases for types that live in `pyre-module`. Installed
-/// from `pyre_module::register` before the first `init_subclass_ranges`.
-pub fn set_optional_subclass_range_aliases(
-    extra: fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
-) {
-    let _ = OPTIONAL_SUBCLASS_RANGE_ALIASES.set(extra);
-}
-
+/// writer. Extra aliases for types that live in `pyre-module` come from
+/// [`crate::importing::OptionalModuleHooks`].
 pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
     use pyre_object::lltype::PyreClassPyTypeOf;
     use pyre_object::pyobject::subclass_range_alias;
@@ -1405,8 +1394,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             typed::<crate::module::_cffi_backend::wrapper::W_FunctionWrapper>(),
         ),
     ];
-    if let Some(extra) = OPTIONAL_SUBCLASS_RANGE_ALIASES.get() {
-        aliases.extend(extra());
+    if let Some(hooks) = crate::importing::optional_module_hooks() {
+        aliases.extend((hooks.subclass_range_aliases)());
     }
     aliases
 }
@@ -1453,12 +1442,19 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
 // installed it: a traceback or warning raised on any interpreter thread has to
 // reach the same embedder, and on wasm32 `std::io::stderr().write_all`
 // discards the bytes outright, so a thread that saw no hook would lose them.
-// Both are plain `fn` pointers, so one atomic word each holds them and the
-// write path takes no lock.
+// Both are plain `fn` pointers, so one atomic word each holds them in
+// `IO_HOOKS` and the write path takes no lock.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static PRINT_HOOK: AtomicUsize = AtomicUsize::new(0);
-static STDERR_HOOK: AtomicUsize = AtomicUsize::new(0);
+struct ProcessIoHooks {
+    print: AtomicUsize,
+    stderr: AtomicUsize,
+}
+
+static IO_HOOKS: ProcessIoHooks = ProcessIoHooks {
+    print: AtomicUsize::new(0),
+    stderr: AtomicUsize::new(0),
+};
 
 fn store_hook(slot: &AtomicUsize, hook: fn(&[u8])) {
     slot.store(hook as usize, Ordering::Release);
@@ -1479,13 +1475,13 @@ fn load_hook(slot: &AtomicUsize) -> Option<fn(&[u8])> {
 /// `sys.stdout.buffer` caller made is handed over unmodified; decoding it is
 /// the embedder's decision, not a lossy conversion applied on the way out.
 pub fn set_print_hook(hook: fn(&[u8])) {
-    store_hook(&PRINT_HOOK, hook);
+    store_hook(&IO_HOOKS.print, hook);
 }
 
 /// Offer already-encoded `bytes` to the print hook. Returns whether a hook
 /// consumed them; `false` leaves the caller on its own descriptor path.
 pub fn print_hook_emit_bytes(bytes: &[u8]) -> bool {
-    match load_hook(&PRINT_HOOK) {
+    match load_hook(&IO_HOOKS.print) {
         Some(hook) => {
             hook(bytes);
             true
@@ -1620,13 +1616,13 @@ pub fn print_output(s: &str) {
 /// discards the bytes, so without a hook a traceback simply vanishes. The
 /// stdout twin is [`set_print_hook`].
 pub fn set_stderr_hook(hook: fn(&[u8])) {
-    store_hook(&STDERR_HOOK, hook);
+    store_hook(&IO_HOOKS.stderr, hook);
 }
 
 /// Offer `bytes` to the stderr hook. Returns whether a hook consumed them;
 /// `false` leaves the caller on its own descriptor path.
 pub fn stderr_hook_emit(bytes: &[u8]) -> bool {
-    match load_hook(&STDERR_HOOK) {
+    match load_hook(&IO_HOOKS.stderr) {
         Some(hook) => {
             hook(bytes);
             true

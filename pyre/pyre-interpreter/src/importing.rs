@@ -499,14 +499,28 @@ pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinM
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Optional modules live in `pyre-module` so this crate does not depend on
-/// them. The final binary links both and installs the hook before
-/// [`install_builtin_modules`].
-static OPTIONAL_BUILTIN_MODULES: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+/// them. The final binary links both and installs the hooks once before
+/// [`install_builtin_modules`]. PyPy freezes the same surface at
+/// translation (`ObjSpace.get_builtinmodule_to_install` /
+/// `config.objspace.usemodules`); one write-once record is that boot
+/// install, not four independent caches.
+pub struct OptionalModuleHooks {
+    pub install_modules: fn(),
+    pub walk_global_roots: fn(&mut dyn FnMut(&mut majit_ir::GcRef)),
+    pub walk_prebuilt_slots: fn(&mut dyn FnMut(&mut PyObjectRef)),
+    pub subclass_range_aliases: fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
+}
 
-/// Install the `pyre-module` registry. Call once from the binary before
+static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
+
+/// Install the `pyre-module` hooks. Call once from the binary before
 /// [`init_sys_path`] / [`install_builtin_modules`].
-pub fn set_optional_builtin_modules(install: fn()) {
-    let _ = OPTIONAL_BUILTIN_MODULES.set(install);
+pub fn set_optional_module_hooks(hooks: OptionalModuleHooks) {
+    let _ = OPTIONAL_MODULE_HOOKS.set(hooks);
+}
+
+pub fn optional_module_hooks() -> Option<&'static OptionalModuleHooks> {
+    OPTIONAL_MODULE_HOOKS.get()
 }
 
 thread_local! {
@@ -826,8 +840,8 @@ pub fn install_builtin_modules() {
     // `_init_non_posix` and never names this module.
     #[cfg(not(windows))]
     register_builtin_module("_sysconfigdata", init_sysconfigdata);
-    if let Some(install) = OPTIONAL_BUILTIN_MODULES.get() {
-        install();
+    if let Some(hooks) = optional_module_hooks() {
+        (hooks.install_modules)();
     }
 }
 

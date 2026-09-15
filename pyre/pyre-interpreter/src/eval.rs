@@ -1422,26 +1422,9 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     crate::module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
-    if let Some(walk) = OPTIONAL_GLOBAL_ROOT_WALKER.get() {
-        walk(visitor);
+    if let Some(hooks) = crate::importing::optional_module_hooks() {
+        (hooks.walk_global_roots)(visitor);
     }
-}
-
-static OPTIONAL_GLOBAL_ROOT_WALKER: std::sync::OnceLock<fn(&mut dyn FnMut(&mut majit_ir::GcRef))> =
-    std::sync::OnceLock::new();
-
-/// Optional-module process-global roots (`faulthandler`, …). `pyre-module`
-/// installs this from [`crate::importing`]'s optional-module hook.
-pub fn set_optional_global_root_walker(walk: fn(&mut dyn FnMut(&mut majit_ir::GcRef))) {
-    let _ = OPTIONAL_GLOBAL_ROOT_WALKER.set(walk);
-}
-
-static OPTIONAL_PREBUILT_SLOT_WALKER: std::sync::OnceLock<fn(&mut dyn FnMut(&mut PyObjectRef))> =
-    std::sync::OnceLock::new();
-
-/// Optional-module `fromcache` slots (`_csv` dialects, …).
-pub fn set_optional_prebuilt_slot_walker(walk: fn(&mut dyn FnMut(&mut PyObjectRef))) {
-    let _ = OPTIONAL_PREBUILT_SLOT_WALKER.set(walk);
 }
 
 /// Install the interpreter's process-global GC root walker with the majit-gc
@@ -1558,8 +1541,8 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // first `_ast` import without a dirty bit, and the only owner of the
         // classes between one `_ast` module dict and the next.
         crate::module::_ast::moduledef::walk_ast_state_gc(&mut fwd);
-        if let Some(walk) = OPTIONAL_PREBUILT_SLOT_WALKER.get() {
-            walk(&mut fwd);
+        if let Some(hooks) = crate::importing::optional_module_hooks() {
+            (hooks.walk_prebuilt_slots)(&mut fwd);
         }
     }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
