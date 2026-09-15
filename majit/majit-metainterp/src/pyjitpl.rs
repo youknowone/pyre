@@ -1272,10 +1272,10 @@ fn prepare_bridge_trace_from_owned(
     let cache_size = ((max_pos as usize) + 1).max(bridge_inputargs.len());
     let mut cache: Vec<Option<majit_ir::operand::Operand>> = vec![None; cache_size];
     let mut fresh = bridge_inputarg_base;
-    let reminted_inputargs: Vec<InputArg> = bridge_inputargs
+    let reminted_inputargs: Vec<majit_ir::InputArgRc> = bridge_inputargs
         .iter()
         .map(|arg| {
-            let reminted = InputArg::from_type(arg.tp, fresh);
+            let reminted = InputArg::from_type_rc(arg.tp, fresh);
             fresh += 1;
             if let Some(value) = arg.get_value() {
                 reminted.set_value(value);
@@ -1288,11 +1288,9 @@ fn prepare_bridge_trace_from_owned(
         if p >= cache.len() {
             cache.resize(p + 1, None);
         }
-        let ia = InputArg::from_type_rc(arg.tp, reminted_inputargs[i].index);
-        if let Some(value) = reminted_inputargs[i].get_value() {
-            ia.set_value(value);
-        }
-        cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(&ia));
+        cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(
+            &reminted_inputargs[i],
+        ));
     }
     for i in 0..bridge_ops.len() {
         let op = &bridge_ops[i];
@@ -1421,7 +1419,7 @@ fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>
 
 /// The reminted InputArg that occupies the assembled loop Vm slot
 /// (`InputArg(1)`). `None` when that slot was not a Ref.
-fn reminted_loop_vm_red(original: &[InputArg], reminted: &[InputArg]) -> Option<OpRef> {
+fn reminted_loop_vm_red(original: &[InputArg], reminted: &[majit_ir::InputArgRc]) -> Option<OpRef> {
     let assembled = OpRef::input_arg_typed(1, Type::Ref);
     original.iter().zip(reminted.iter()).find_map(|(old, new)| {
         (old.opref() == assembled && old.tp == Type::Ref).then_some(new.opref())
@@ -1443,7 +1441,7 @@ fn hole_filtered_vm_failarg_index(fail_args: &[majit_ir::operand::Operand]) -> O
 fn finish_prepared_bridge(
     ops: Vec<majit_ir::OpRc>,
     original_inputargs: &[InputArg],
-    inputargs: Vec<InputArg>,
+    reminted_inputargs: Vec<majit_ir::InputArgRc>,
     cache: Vec<Option<majit_ir::operand::Operand>>,
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -1468,7 +1466,17 @@ fn finish_prepared_bridge(
         .into_iter()
         .map(|opref| translate_trace_iter_opref(opref, &cache))
         .collect();
-    let bridge_vm_red = reminted_loop_vm_red(original_inputargs, &inputargs);
+    let bridge_vm_red = reminted_loop_vm_red(original_inputargs, &reminted_inputargs);
+    let inputargs: Vec<InputArg> = reminted_inputargs
+        .iter()
+        .map(|rc| {
+            let ia = rc.fresh_value_copy();
+            if let Some(value) = rc.get_value() {
+                ia.set_value(value);
+            }
+            ia
+        })
+        .collect();
     PreparedBridgeTrace {
         ops,
         inputargs,
@@ -1541,20 +1549,16 @@ where
             dst.set_value(value);
         }
     }
-    let inputargs: Vec<InputArg> = bridge_inputargs
-        .iter()
-        .zip(iter.inputargs.iter())
-        .map(|(arg, ia)| {
-            let reminted = InputArg::from_type(arg.tp, ia.opref().raw());
-            // The inputarg half carries its value for the same reason as the op
-            // loop above: `pyjitpl.py compile_trace` keeps original InputArg and Op
-            // boxes alike.
-            if let Some(value) = arg.get_value() {
-                reminted.set_value(value);
-            }
-            reminted
-        })
-        .collect();
+    for (arg, ia) in bridge_inputargs.iter().zip(iter.inputargs.iter()) {
+        // The inputarg half carries its value for the same reason as the op
+        // loop above: `compile_trace` keeps original InputArg and Op
+        // boxes alike. Reuse the iterator's reminted Rc (`inputarg_from_tp`)
+        // rather than minting a second object for the same index.
+        if let Some(value) = arg.get_value() {
+            ia.set_value(value);
+        }
+    }
+    let reminted_inputargs = iter.inputargs;
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
@@ -1576,7 +1580,17 @@ where
         .into_iter()
         .map(|opref| translate_trace_iter_opref(opref, &cache))
         .collect();
-    let bridge_vm_red = reminted_loop_vm_red(bridge_inputargs, &inputargs);
+    let bridge_vm_red = reminted_loop_vm_red(bridge_inputargs, &reminted_inputargs);
+    let inputargs: Vec<InputArg> = reminted_inputargs
+        .iter()
+        .map(|rc| {
+            let ia = rc.fresh_value_copy();
+            if let Some(value) = rc.get_value() {
+                ia.set_value(value);
+            }
+            ia
+        })
+        .collect();
     PreparedBridgeTrace {
         ops,
         inputargs,
@@ -1673,7 +1687,11 @@ fn densify_root_loop_inputargs(
             };
             let dense = InputArgRc::new(InputArg::from_type(tp, position as u32));
             replacements.insert(opref, dense.clone());
-            InputArg::from_type(tp, position as u32)
+            let listed = dense.fresh_value_copy();
+            if let Some(value) = dense.get_value() {
+                listed.set_value(value);
+            }
+            listed
         })
         .collect();
 
