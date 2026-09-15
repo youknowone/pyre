@@ -21,7 +21,7 @@ use std::sync::{Arc, OnceLock};
 use smallvec::smallvec;
 
 use majit_backend::{
-    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, ExitFrameLayout,
+    Backend, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, ExitFrameLayout,
     ExitRecoveryLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
 use majit_ir::forwarding::ForwardingHost;
@@ -318,6 +318,11 @@ pub struct CompileResult<M> {
     /// entry they came in through.
     pub rd_loop_token: Option<u64>,
     pub savedata: Option<GcRef>,
+    /// `llmodel.py` deadframe from `cpu.force` / `execute_token`.
+    /// Kept until `AllVirtuals.show` so `jf_savedata` stays rooted the
+    /// way upstream traces it on the live jitframe. `None` on FINISH
+    /// and JUMP exits that never hide a cache.
+    pub deadframe: Option<DeadFrame>,
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.
     pub status: u64,
@@ -3887,10 +3892,6 @@ pub struct AllVirtuals {
     ptrs: *mut i64,
     n_ints: usize,
     ints: *mut i64,
-    /// Extra root slot so the object stays alive after the deadframe
-    /// that carried `jf_savedata` is dropped. Cleared by [`Self::show`]
-    /// and [`Self::destructor`].
-    root_slot: *mut majit_ir::GcRef,
 }
 
 impl AllVirtuals {
@@ -3911,14 +3912,13 @@ impl AllVirtuals {
             ptrs,
             n_ints,
             ints,
-            root_slot: std::ptr::null_mut(),
         };
         let type_id = ALL_VIRTUALS_GC_TYPE_ID.load(Ordering::Relaxed);
         if type_id == ALL_VIRTUALS_GC_TYPE_ID_UNSET {
             // Tests that never publish a leaf type keep the object via
             // this leak; production registers the type and owns it
-            // through the deadframe `jf_savedata` GCREF plus the
-            // extra root released in `show` / `destructor`.
+            // through the deadframe `jf_savedata` GCREF
+            // (`compile.py AllVirtuals.hide` / `cpu.set_savedata_ref`).
             return majit_ir::GcRef(Box::into_raw(Box::new(value)) as usize);
         }
         let obj = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<AllVirtuals>());
@@ -3930,24 +3930,7 @@ impl AllVirtuals {
         // `custom_trace`.
         majit_gc::gc_write_barrier_managed(obj);
         unsafe { std::ptr::write(obj.0 as *mut AllVirtuals, value) };
-        let slot = Box::into_raw(Box::new(obj));
-        unsafe {
-            majit_gc::gc_add_root(slot);
-            (*(obj.0 as *mut AllVirtuals)).root_slot = slot;
-        }
         obj
-    }
-
-    unsafe fn unroot(obj: *mut AllVirtuals) {
-        let slot = unsafe { (*obj).root_slot };
-        if slot.is_null() {
-            return;
-        }
-        unsafe {
-            (*obj).root_slot = std::ptr::null_mut();
-            majit_gc::gc_remove_root(slot);
-            drop(Box::from_raw(slot));
-        }
     }
 
     /// Trace the off-heap `ptrs` slice as GCREF slots.
@@ -3972,7 +3955,6 @@ impl AllVirtuals {
     /// allocated by [`AllVirtuals::hide`].
     pub unsafe fn destructor(obj_addr: usize) {
         let obj = obj_addr as *mut AllVirtuals;
-        unsafe { Self::unroot(obj) };
         unsafe {
             let _ptrs = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
                 (*obj).ptrs,
@@ -3998,7 +3980,6 @@ impl AllVirtuals {
             if (*obj).super_.typeptr != ALL_VIRTUALS_VTABLE {
                 return None;
             }
-            Self::unroot(obj as *mut AllVirtuals);
             let ptrs = if (*obj).n_ptrs == 0 {
                 Vec::new()
             } else {

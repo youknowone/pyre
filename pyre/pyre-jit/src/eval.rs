@@ -5219,9 +5219,6 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_young_owner_reconciler(
         pyre_interpreter::objspace::std::mapdict::reconcile_young_owner_entries,
     );
-    // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
-    // `JIT_DRIVER` rather than a global table, so it registers per mutator
-    // instead — see `forced_virtuals_pruner_area`.
 }
 
 fn register_thread_root_areas() {
@@ -5299,14 +5296,6 @@ fn register_thread_root_areas() {
             jit_driver,
             "compile_snapshot",
         );
-        register(
-            forced_virtuals_root_walker_area,
-            jit_driver,
-            "forced_virtuals",
-        );
-        // The ephemeron half of the walker above, on the same `data` so the
-        // prune reaches exactly the drivers the root walk reaches.
-        majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
     }
 }
 
@@ -6137,42 +6126,6 @@ unsafe fn compile_snapshot_root_walker_area(
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
         pair.0.walk_compile_snapshot_refs(visitor);
-    }
-}
-
-/// GC walker for the virtual caches `handle_async_forcing` produced and left
-/// for the `GUARD_NOT_FORCED` that follows. Upstream traces them through the
-/// deadframe's `jf_savedata` GCREF field; pyre holds them on `MetaInterp` and
-/// needs the edge drawn explicitly.
-/// See `MetaInterp::walk_forced_virtuals_refs`.
-unsafe fn forced_virtuals_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.walk_forced_virtuals_refs(visitor);
-    }
-}
-
-/// Drop forced-virtual caches whose owner frame the major collection is about
-/// to sweep — the ephemeron half of rooting them at all.
-///
-/// The force runs inside a residual `CALL_MAY_FORCE`, and two paths leave the
-/// entry unconsumed: an escaped virtualizable raises instead of failing a
-/// guard, and `handle_fail`'s bridge-compiled arm returns without resuming.
-/// Both would otherwise pin the materialized virtuals for the process lifetime
-/// and leave a key a recycled `PyFrame` address could match.
-///
-/// Registered per mutator, next to `forced_virtuals_root_walker_area` and with
-/// the same `data`, so the prune reaches every driver the root walk reaches. The
-/// global `register_ephemeron_pruner` cannot: the table lives in this thread's
-/// `JIT_DRIVER`, and a major driven by another thread would leave it pinned.
-unsafe fn forced_virtuals_pruner_area(
-    data: *const (),
-    classify: &mut dyn FnMut(usize) -> Option<usize>,
-) {
-    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.prune_forced_virtuals(classify);
     }
 }
 
@@ -11331,30 +11284,18 @@ fn forced_guard_cache_owner(
 }
 
 /// `compile.py:956-957` — `hidden_all_virtuals =
-/// metainterp_sd.cpu.get_savedata_ref(deadframe)`.
+/// metainterp_sd.cpu.get_savedata_ref(deadframe)` then `AllVirtuals.show`.
 ///
-/// Prefer the deadframe `jf_savedata` word when the failing exit carried
-/// it (`ResumeGuardForcedDescr.handle_fail_savedata` / `AllVirtuals.show`).
-/// A miss falls back to the frame-keyed cache `force_pyframe` left on
-/// `MetaInterp.forced_virtuals`: pyre's guard-failure path still surfaces
-/// the running frame at sites that have no jitframe.
-///
-/// A miss of both returns `None`, which resumes the ordinary way.
+/// The caller must keep the deadframe alive until this returns so
+/// `jf_savedata` stays a live GCREF.
 ///
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
 pub(crate) fn take_forced_virtuals_for_frame(
-    frame: *const pyre_interpreter::PyFrame,
+    _frame: *const pyre_interpreter::PyFrame,
     savedata: Option<majit_ir::GcRef>,
 ) -> Option<(Vec<i64>, Vec<i64>)> {
-    if let Some(cache) = savedata.and_then(majit_metainterp::AllVirtuals::show) {
-        return Some(cache);
-    }
-    if frame.is_null() {
-        return None;
-    }
-    let (driver, _) = driver_pair();
-    driver.meta_interp_mut().take_forced_virtuals(frame as u64)
+    savedata.and_then(majit_metainterp::AllVirtuals::show)
 }
 
 /// `cpu.get_savedata_ref(deadframe)` off a raw jitframe pointer.
@@ -11806,6 +11747,7 @@ fn execute_assembler(
             ref exit_layout,
             guard_exc,
             savedata,
+            deadframe: _deadframe,
         } => {
             match handle_fail(
                 frame_root.frame(),
@@ -12175,6 +12117,7 @@ fn bound_reached(
             ref exit_layout,
             guard_exc,
             savedata,
+            deadframe: _deadframe,
         } = outcome
         {
             match handle_fail(
@@ -12490,6 +12433,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref exit_layout,
             guard_exc,
             savedata,
+            deadframe: _deadframe,
         } = outcome
         {
             match handle_fail(
