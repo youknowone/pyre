@@ -4044,7 +4044,14 @@ impl CallControl {
             let Some(name) = vinfo.vtype_name() else {
                 continue;
             };
-            if name != owner && !owner.ends_with(name) && !name.ends_with(owner) {
+            // `is_vtypeptr(VTYPEPTR)` by name: the same path, or one path
+            // naming the other with a module prefix. A bare string suffix is
+            // not a match (`Frame` is not `PyFrame`).
+            let names_same_type = |path: &str, tail: &str| {
+                path.strip_suffix(tail)
+                    .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
+            };
+            if !names_same_type(owner, name) && !names_same_type(name, owner) {
                 continue;
             }
             let seen_already = seen
@@ -12328,6 +12335,12 @@ mod tests {
         assert_eq!(got.vtype_name(), Some("PyFrame"));
         assert_eq!(got.static_field_index("pycode"), Some(1));
         assert!(cc.get_vinfo_by_owner("ExecutionContext").is_none());
+        assert!(
+            cc.get_vinfo_by_owner("pyre_interpreter::pyframe::PyFrame")
+                .is_some()
+        );
+        assert!(cc.get_vinfo_by_owner("Frame").is_none());
+        assert!(cc.get_vinfo_by_owner("NotPyFrame").is_none());
     }
 
     #[test]
