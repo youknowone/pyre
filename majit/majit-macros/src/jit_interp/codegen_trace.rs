@@ -550,6 +550,18 @@ fn expr_is_tracing_hint_call(func: &syn::Expr) -> bool {
         || is_record_exact_class_call_path(func)
 }
 
+fn expr_is_tracing_hint_macro(mac: &syn::ExprMacro) -> bool {
+    use super::jitcode_lower::classify_virtualizable_hint_syn_path;
+    classify_virtualizable_hint_syn_path(&mac.mac.path).is_some()
+        || path_ends_with(&mac.mac.path, "promote")
+        || path_ends_with(&mac.mac.path, "assert_not_none")
+        || path_ends_with(&mac.mac.path, "record_exact_class")
+}
+
+fn path_ends_with(path: &syn::Path, name: &str) -> bool {
+    path.segments.last().is_some_and(|seg| seg.ident == name)
+}
+
 fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
     use syn::visit::Visit;
     struct Finder {
@@ -568,6 +580,15 @@ fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
             self.hit = true;
             syn::visit::visit_expr_method_call(self, node);
+        }
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            // syn::visit treats a macro body as opaque, so `tick!(state)`
+            // would otherwise look side-effect-free. Reject unrecognized
+            // expression macros; tracing hints stay allowed.
+            if !expr_is_tracing_hint_macro(node) {
+                self.hit = true;
+            }
+            syn::visit::visit_expr_macro(self, node);
         }
         fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
             if matches!(
@@ -1004,6 +1025,18 @@ mod find_dispatch_match_tests {
         let block = fn_block(
             "while pos < len {
                 let ignored = crate::tick();
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    }
+
+    #[test]
+    fn a_macro_let_before_merge_is_unsupported() {
+        let block = fn_block(
+            "while pos < len {
+                let ignored = tick!(state);
                 jit_merge_point!(driver, program, pc; state);
                 pos = pos + 1;
             }",
