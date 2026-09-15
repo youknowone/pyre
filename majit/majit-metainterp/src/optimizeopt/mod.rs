@@ -1496,8 +1496,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
         // host is the producer Op / InputArg, so two reaches of one logical box
         // return the same producer Rc (ptr_eq) — the #160 livebox dedup key.
-        // OptContext::get_box_replacement_operand resolves the chain terminal
-        // back through the position's canonical producer.
         if opref.is_none() {
             return Operand::None;
         }
@@ -2286,6 +2284,23 @@ impl OptContext {
     /// op.set_forwarded(newop)`, `OptUnroll.import_state`). Idempotent — re-running
     /// re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
+        // Reuse a reminted / recorder InputArg already in `input_ops`
+        // (`inputarg_from_tp` / `history.inputargs`) so the mint below
+        // does not create a second object for the same index.
+        for op in &self.input_ops {
+            for arg in op.getarglist() {
+                if let Some(ia) = arg.bound_inputarg() {
+                    self.inputarg_refs.entry(ia.index).or_insert(ia);
+                }
+            }
+            if let Some(failargs) = op.guard_fail_args() {
+                for arg in failargs {
+                    if let Some(ia) = arg.bound_inputarg() {
+                        self.inputarg_refs.entry(ia.index).or_insert(ia);
+                    }
+                }
+            }
+        }
         // Derive the materialized InputArg positions from `ctx` state.
         // The InputArg positions are exactly the
         // canonical/inherited set (`self.inputargs` = `optimizer.py
@@ -2726,6 +2741,26 @@ impl OptContext {
         // `live_synthetics` — the collision-safe stores `find_producer_op`
         // consults.
         for op in ops {
+            // Bridge / Phase-2 reminted InputArgs live on the op
+            // (`inputarg_from_tp`). `inputarg_base != 0` is that reminted
+            // namespace; reuse those Rcs instead of the stand-in
+            // `ensure_inputarg_bindings` just minted. `inputarg_base == 0`
+            // keeps test fixtures that seed `inputarg_refs` separately
+            // from per-call `bound_arg` mints.
+            if self.inputarg_base != 0 {
+                for arg in op.getarglist() {
+                    if let Some(ia) = arg.bound_inputarg() {
+                        self.inputarg_refs.insert(ia.index, ia);
+                    }
+                }
+                if let Some(failargs) = op.guard_fail_args() {
+                    for arg in failargs {
+                        if let Some(ia) = arg.bound_inputarg() {
+                            self.inputarg_refs.insert(ia.index, ia);
+                        }
+                    }
+                }
+            }
             let pos = op.pos().get();
             if pos.is_none() || pos.is_constant() {
                 continue;
@@ -3607,12 +3642,21 @@ impl OptContext {
     /// foreign Phase-1 `Rc` would split one position across two boxes.
     pub(crate) fn register_carried_host(&mut self, o: &Operand) {
         let pos = o.to_opref();
-        if pos.is_none() || pos.is_constant() || self.resolve_to_operand(pos).is_some() {
+        if pos.is_none() || pos.is_constant() {
             return;
         }
+        // A carried InputArg is the first object for that index
+        // (`inputarg_from_tp` / `history.inputargs`). Replace the
+        // `ensure_inputarg_bindings` stand-in so `_forwarded` and
+        // `resolve_to_operand` name the same Rc.
         if let Some(ia) = o.bound_inputarg() {
             self.inputarg_refs.insert(ia.index, ia);
-        } else if let Some(op) = o.bound_op() {
+            return;
+        }
+        if self.resolve_to_operand(pos).is_some() {
+            return;
+        }
+        if let Some(op) = o.bound_op() {
             self.install_canonical_producer(&op);
         }
     }
@@ -5328,8 +5372,10 @@ impl OptContext {
     ///
     /// Total, like the operand sibling [`Operand::get_box_replacement`]
     /// (returns the position-only operand on a miss) and
-    /// `get_box_replacement` (resoperation.py returns `op` itself when the
-    /// `_forwarded` chain is empty). A position that resolves to neither a
+    /// `get_box_replacement` (`resoperation.py` returns `op` itself when the
+    /// `_forwarded` chain is empty). The chain terminal is the result; a
+    /// debug assertion checks it is `Rc`-identical to the canonical
+    /// producer for that opref. A position that resolves to neither a
     /// producer `Op`, an `inputarg_refs` slot, nor a Const falls back to
     /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
     /// the same `pos` (`to_opref` byte-identical) rather than panicking. Every
@@ -5343,9 +5389,17 @@ impl OptContext {
         }
         if let Some(start) = self.resolve_to_operand(opref) {
             let terminal = start.get_box_replacement(false);
-            return self
-                .resolve_to_operand(terminal.to_opref())
-                .unwrap_or(terminal);
+            debug_assert!(
+                self.resolve_to_operand(terminal.to_opref())
+                    .as_ref()
+                    .is_some_and(|c| c.same_box(&terminal)),
+                "get_box_replacement_operand: chain terminal is not Rc-identical \
+                 to the canonical producer: terminal={terminal:?} \
+                 canonical={:?} opref={:?}",
+                self.resolve_to_operand(terminal.to_opref()),
+                terminal.to_opref(),
+            );
+            return terminal;
         }
         self.s9_probe_fire(opref);
         Operand::bound_from_opref(opref)
@@ -9853,17 +9907,13 @@ mod boxref_forwarding_tests {
     }
 
     #[test]
+    #[should_panic(expected = "chain terminal is not Rc-identical")]
     fn replacement_operand_rebinds_chain_terminal_to_canonical_producer() {
-        let (ctx, b0, _b1, ia_holder) = ctx_with_two_int_boxes();
+        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let foreign = InputArgRc::new(majit_ir::InputArg::from_type(Type::Int, 1));
         b0.set_forwarded_inputarg(&foreign);
 
-        let resolved = ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int));
-        let resolved_inputarg = resolved
-            .bound_inputarg()
-            .expect("replacement must remain an InputArg");
-        assert!(InputArgRc::ptr_eq(&resolved_inputarg, &ia_holder[1]));
-        assert!(!InputArgRc::ptr_eq(&resolved_inputarg, &foreign));
+        let _resolved = ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int));
     }
 
     /// Forward-reference dup-materialization regression: a

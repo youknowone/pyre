@@ -999,9 +999,10 @@ impl UnrollOptimizer {
             // source changes; `_forwarded` writes are untouched. No
             // forwarding yet at Phase 1 setup, so the seed is trivially the
             // authoritative source here.
-            if let Some(seed) = &self.phase2_input_ops_seed {
-                opt_p1.explicit_input_ops_seed = Some(seed.clone());
-            }
+            // The iterator's reminted ops carry the `inputarg_from_tp`
+            // InputArg Rcs. Seed them so `ensure_inputarg_bindings`
+            // reuses those objects instead of minting a second host.
+            opt_p1.explicit_input_ops_seed = Some(p1_ops_in.clone());
             let p1_ops =
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
             merge_quasi_immutable_deps(
