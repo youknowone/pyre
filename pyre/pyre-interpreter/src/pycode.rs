@@ -1312,14 +1312,14 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let obj = pyre_object::gc_roots::pin_root(obj);
-    // The shadow-stack root forwards the wrapper itself; only the raw walker
-    // driven from this registry reaches its `co_consts_w` slots. Enrol an
-    // off-GC wrapper before the fill loop, or a collection triggered by a
-    // later constant reclaims the constants already published into it. A
-    // managed wrapper is traced from its own allocation and stays out.
-    if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
-        register_prebuilt_code_root(obj);
-    }
+    // PyPy's `PyCode` is a young `W_Root`; a minor that reaches it copies
+    // then scans `co_consts_w`. pyre births the wrapper old-gen
+    // (`malloc_typed_stable`), so a root visit does not scan it and a
+    // remembered-set miss leaves young constants to die. Enrol every
+    // wrapper — managed or off-GC — so `walk_prebuilt_code_roots` is the
+    // space-held `w_code` analog and forwards `co_consts_w` on each
+    // collection. `pycode_destructor` retires a reclaimed managed wrapper.
+    register_prebuilt_code_root(obj);
     // Claim the graph before the fill loop: each nested constant publishes its
     // own wrapper against the same owner, and a wrapper that dies during the
     // loop must not find the count at zero.
@@ -3185,18 +3185,21 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         return existing;
     }
 
-    let mut realized = match &constants[idx] {
+    let realized = match &constants[idx] {
         crate::bytecode::ConstantData::Code { code } => unsafe {
             box_code_constant_inheriting_unit(&**code as *const crate::CodeObject, w_code)
         },
         constant => crate::pyframe::pyobject_from_constant(constant),
     };
-    // Keep the losing or winning candidate live until the CAS has either
-    // published it or selected the concurrently-published canonical object.
-    let candidate_root = &mut realized as *mut PyObjectRef as *mut *mut u8;
-    let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(candidate_root) };
+    // Keep the candidate on the same shadow-stack frame as the owner.
+    // `publish_code_slot_store` is a collection point (`gc_op_with_root`);
+    // a raw `try_gc_add_root` of a Rust local is not the translated
+    // livevar `framework.py transform_generic_set` emits for `newvalue`.
+    let realized_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(realized);
     publish_code_slot_store(roots.get(code_slot));
-    let published = match slot.compare_exchange(
+    let realized = roots.get(realized_slot);
+    match slot.compare_exchange(
         std::ptr::null_mut(),
         realized,
         std::sync::atomic::Ordering::AcqRel,
@@ -3204,11 +3207,7 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     ) {
         Ok(_) => realized,
         Err(winner) => winner,
-    };
-    if registered {
-        pyre_object::gc_hook::try_gc_remove_root(candidate_root);
     }
-    published
 }
 
 /// `pyopcode.py getname_w(index) -> self.getcode().co_names_w[index]`

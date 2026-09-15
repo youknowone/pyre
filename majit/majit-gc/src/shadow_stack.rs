@@ -880,6 +880,28 @@ pub fn walk_roots(mut visitor: impl FnMut(&mut GcRef)) {
     });
 }
 
+/// Address of this thread's `OWNER_ROOTS` cell, for a per-mutator extra area.
+pub fn capture_owner_roots_area() -> *const () {
+    OWNER_ROOTS.with(|roots| roots as *const _ as *const ())
+}
+
+/// Walk one captured thread's [`OwnerRootGuard`] slots.
+///
+/// # Safety
+/// `data` must come from [`capture_owner_roots_area`] and the owning thread
+/// must be the current thread or quiesced.
+pub unsafe fn walk_owner_roots_area(data: *const (), mut visitor: impl FnMut(&mut GcRef)) {
+    if data.is_null() {
+        return;
+    }
+    let roots = unsafe { &*(data as *const RefCell<Vec<Option<GcRef>>>) };
+    for root in roots.borrow_mut().iter_mut().flatten() {
+        if !root.is_null() {
+            visitor(root);
+        }
+    }
+}
+
 /// Walk every registered mutator's GcRef shadow stack during STW.
 ///
 /// This deliberately bypasses `RefCell::borrow_mut`: a RefCell borrow is a

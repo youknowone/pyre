@@ -4251,7 +4251,7 @@ impl PyFrame {
         // frame's debug data, and both locations root it once they return.
         let _root = pyre_object::gc_roots::push_roots();
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-        let w_code = crate::box_code_object(code);
+        let w_code = pyre_object::gc_roots::pin_root(crate::box_code_object(code));
         let ctx_ptr = Rc::into_raw(execution_context);
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }

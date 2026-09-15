@@ -57,6 +57,7 @@ thread_local! {
         pending_call_error: crate::call::capture_pending_call_error_area(),
         parked_call_errors: crate::call::capture_parked_call_errors_area(),
         pending_hash_error: crate::baseobjspace::capture_pending_hash_error_area(),
+        owner_roots: majit_gc::shadow_stack::capture_owner_roots_area(),
     };
 }
 
@@ -71,6 +72,7 @@ struct PyFrameRootArea {
     pending_call_error: *const (),
     parked_call_errors: *const (),
     pending_hash_error: *const (),
+    owner_roots: *const (),
 }
 use crate::pyframe::PyFrame;
 
@@ -465,12 +467,25 @@ pub unsafe fn walk_raw_code_roots(
         if value.is_null() || !crate::pycode::is_code(value) {
             return;
         }
-        // A GC trace callback reports one object's direct edges. PyPy's mark
-        // worklist provides transitive traversal and its VISITED bit provides
-        // cycle suppression; recursively walking nested PyCode values here
-        // duplicated both jobs and allocated a fresh identity Vec on every
-        // trace. Bootstrap wrappers are each registered individually in
-        // PREBUILT_CODE_ROOTS, so the same direct-edge shape covers them too.
+        // Direct edges of this wrapper. A nested *young* PyCode is left to
+        // the mark worklist after the visitor copies it. A nested *old-gen*
+        // PyCode is not: pyre births wrappers via `malloc_typed_stable`, so
+        // a minor that visits the pointer does not scan `co_consts_w`. Walk
+        // that old nested wrapper here. Bootstrap wrappers are each
+        // registered in PREBUILT_CODE_ROOTS and use the same direct-edge
+        // shape.
+        walk_raw_code_roots_inner(value, visitor, 0);
+    }
+}
+
+const WALK_RAW_CODE_NEST_LIMIT: u32 = 64;
+
+unsafe fn walk_raw_code_roots_inner(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    nest: u32,
+) {
+    unsafe {
         let code = &mut *(value as *mut crate::pycode::PyCode);
         visitor(&mut *(&mut code.w_globals as *mut PyObjectRef as *mut majit_ir::GcRef));
         // typedef.py:724 `make_weakref_descr(PyCode)` adds the strong
@@ -491,6 +506,22 @@ pub unsafe fn walk_raw_code_roots(
                 }
                 visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
                 slot.store(child, std::sync::atomic::Ordering::Release);
+                // PyPy's `PyCode` is a young `W_Root`; the mark worklist
+                // copies then scans a nested code reached through
+                // `co_consts_w`. pyre births `PyCode` old-gen
+                // (`malloc_typed_stable`), so visiting the pointer on a
+                // minor does not scan it. Walk that old wrapper's interiors
+                // here — the same direct-edge job this function already does
+                // for the outer code. A nursery nested code is left to the
+                // worklist after the visitor above copies it.
+                if nest < WALK_RAW_CODE_NEST_LIMIT
+                    && child != value
+                    && crate::pycode::is_code(child)
+                    && pyre_object::gc_hook::try_gc_owns_object(child as *mut u8)
+                    && !majit_gc::gc_is_nursery_object(child as usize)
+                {
+                    walk_raw_code_roots_inner(child, visitor, nest + 1);
+                }
             }
         }
         // mapdict.py CacheEntry.w_method is the cache's sole GC
@@ -953,7 +984,8 @@ unsafe fn is_gc_managed_pyframe(frame: *mut PyFrame) -> bool {
 /// see. PyPy's `pyframe.py` `PyFrame` is a young `W_Root` and is copied
 /// then scanned; pyre's executing frame is born old-gen so a root visit
 /// does not scan it. Walk `pycode` / `co_consts_w` and the live locals
-/// prefix here. Do not follow `f_backref`.
+/// prefix here. Forward `f_backref` so the caller can continue the chain;
+/// do not dereference a `JitVirtualRef` as a `PyFrame`.
 unsafe fn walk_managed_frame_interiors(
     frame: *mut PyFrame,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -965,6 +997,8 @@ unsafe fn walk_managed_frame_interiors(
         let locals_slot =
             &mut (*frame).locals_cells_stack_w as *mut *mut pyre_object::FixedObjectArray;
         visitor(&mut *(locals_slot as *mut majit_ir::GcRef));
+        let f_back_slot = &mut (*frame).f_backref as *mut *mut PyFrame;
+        visitor(&mut *(f_back_slot as *mut majit_ir::GcRef));
         if (*frame).locals_cells_stack_w.is_null() {
             return;
         }
@@ -973,6 +1007,28 @@ unsafe fn walk_managed_frame_interiors(
         let arr_ptr = arr.items_ptr() as *mut PyObjectRef;
         for i in 0..depth {
             walk_frame_value_slot(arr_ptr.add(i) as *mut majit_ir::GcRef, visitor);
+        }
+    }
+}
+
+/// Next interpreter `PyFrame` after a managed frame's forwarded `f_backref`.
+///
+/// PyPy reaches the parent by tracing `PyFrame.f_backref` off the copied
+/// young frame (`pyframe.py class PyFrame`). pyre's executing frame is
+/// old-gen, so the root walker has to continue the chain itself. A
+/// `JitVirtualRef` is left to its own custom trace (`virtualref.py`); a
+/// stdalloc fallback frame continues through [`raw_chain_next_frame`].
+unsafe fn managed_chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
+    if f_backref.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        if majit_metainterp::virtualref::ptr_is_virtual_ref(f_backref as *const u8) {
+            std::ptr::null_mut()
+        } else if is_gc_managed_pyframe(f_backref) {
+            f_backref
+        } else {
+            raw_chain_next_frame(f_backref)
         }
     }
 }
@@ -1221,15 +1277,18 @@ pub unsafe fn walk_pyframe_roots_area(
         visit_ec_slots(ambient_ec);
         while !frame.is_null() {
             // A GC-managed PyFrame was exposed by the CURRENT_FRAME slot (or
-            // by the preceding raw frame's f_backref slot).  Stop here and let
-            // `pyframe_object_custom_trace` follow its fields after the
-            // collector reaches the gray/remembered-set phase.  Walking those
-            // fields now is earlier than PyPy's root contract and can observe
-            // a callee PyFrame still named by a pre-forward CALL_ASSEMBLER
-            // jitframe slot.
+            // by the preceding raw frame's f_backref slot). PyPy then traces
+            // `f_backref` off the copied young frame (`pyframe.py class
+            // PyFrame`). pyre births executing frames old-gen, so a root
+            // visit does not scan them: walk this frame's interiors, forward
+            // `f_backref`, and continue. A `JitVirtualRef` stops the chain —
+            // its custom_trace follows `forced` after the gray/remembered-set
+            // phase, which is also what keeps a pre-forward CALL_ASSEMBLER
+            // jitframe slot out of this walk.
             if unsafe { is_gc_managed_pyframe(frame) } {
                 unsafe { walk_managed_frame_interiors(frame, visitor) };
-                break;
+                frame = unsafe { managed_chain_next_frame((*frame).f_backref) };
+                continue;
             }
             // SAFETY: PyFrame pointers on the f_backref chain are valid
             // for the duration of the enclosing `eval_with_jit` call. A
@@ -1383,6 +1442,22 @@ pub unsafe fn walk_pyframe_roots_area(
                 }
             }
             frame = next_frame;
+        }
+        // `FrameBox` keeps the executing frame in an `OwnerRootGuard` before
+        // `CURRENT_FRAME` is installed (`createframe` → `eval`). PyPy's
+        // translated livevar is copied then scanned (`pyframe.py class
+        // PyFrame`). pyre's frame is old-gen, so visiting the guard slot
+        // does not scan `pycode` / locals. Walk those interiors here.
+        unsafe {
+            majit_gc::shadow_stack::walk_owner_roots_area(area.owner_roots, |gcref| {
+                visitor(gcref);
+                let owned = gcref.0 as *mut PyFrame;
+                if is_gc_managed_pyframe(owned) {
+                    walk_managed_frame_interiors(owned, visitor);
+                } else {
+                    walk_raw_code_roots(gcref.0 as PyObjectRef, visitor);
+                }
+            });
         }
         // Box-immortal modules (and their Box-immortal dicts) are not
         // reachable transitively by the collector, so walk every loaded
@@ -1573,7 +1648,21 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         if let Some(hooks) = crate::importing::optional_module_hooks() {
             (hooks.walk_prebuilt_slots)(&mut fwd);
         }
+        // `rclass.py new_instance` / space `w_tuple` analog: the
+        // `PyType.instantiate` slot is a prebuilt GCREF.
+        pyre_object::walk_instantiate_slots(&mut fwd);
+        // Box-immortal types are not GC objects, so a store into `bases` /
+        // `mro_w` / `dict` cannot take MiniMark's write barrier. The dirty
+        // bit is the analog, but a missed mark would skip this walk on a
+        // clean minor and reclaim a young bases/mro block. Always forward
+        // those slots, like the lazily published states above.
+        unsafe { walk_builtin_type_dicts_gc(&mut fwd) };
     }
+    // Old-gen `PyCode` interiors (`co_consts_w`) are not scanned by a
+    // root visit. Walk every enrolled wrapper here, not behind the
+    // prebuilt dirty bit: a just-filled code can hold young constants
+    // without a further store that would set the bit.
+    crate::pycode::walk_prebuilt_code_roots(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor
@@ -1609,7 +1698,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             walk_raw_getset_roots(*slot, visitor);
             walk_raw_wrapped_function_roots(*slot, visitor);
         };
-        walk_builtin_type_dicts_gc(&mut forward);
         // `typeobject.py MethodCache` is an ordinary GC-managed
         // old/prebuilt object upstream.  A cache fill takes the write barrier;
         // pyre's off-GC equivalent calls `mark_prebuilt_roots_dirty`, so scan

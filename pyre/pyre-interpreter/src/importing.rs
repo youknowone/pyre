@@ -4398,13 +4398,17 @@ fn load_source_module(
             (crate::box_code_object(code), cache_key.is_some())
         }
     };
-    // The whole unit was named by this path, so recurse through the eager
-    // nested PyCode constants like PyPy `update_code_filenames`.
-    unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
-    // Root before any allocation (fresh_module_globals, the cache write) can
-    // collect the freshly boxed code out from under us.
+    // Root before `update_code_filenames` / later allocations can collect.
+    // `set_compilation_unit_filename_bytes` walks nested codes and may
+    // allocate; the pin is the shadow-stack livevar PyPy's gctransform
+    // keeps across `importing.py update_code_filenames`.
     let code_slot = roots.base();
     let _ = roots.pin_root(w_code);
+    // The whole unit was named by this path, so recurse through the eager
+    // nested PyCode constants like PyPy `update_code_filenames`.
+    unsafe {
+        crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
+    };
     if let (true, Some(key)) = (store, cache_key) {
         crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
     }

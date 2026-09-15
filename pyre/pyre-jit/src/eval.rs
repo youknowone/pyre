@@ -6207,6 +6207,13 @@ fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // object, which the visit above skips. See `pyre_object_root_walker_area`.
         let value = gcref.0 as pyre_object::PyObjectRef;
         unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
+        // PyPy's `PyCode` is a young `W_Root` (`pycode.py class PyCode`);
+        // a shadow-stack livevar is copied then scanned. pyre births the
+        // wrapper old-gen (`malloc_typed_stable`), so the visit above is
+        // a no-op and `walk_raw_immortal_roots` skips managed objects.
+        // Walk `co_consts_w` here or a minor during `w_code_new` fill
+        // reclaims the constants.
+        unsafe { pyre_interpreter::eval::walk_raw_code_roots(value, visitor) };
     });
 }
 
@@ -6225,6 +6232,10 @@ unsafe fn pyre_object_root_walker_area(
             // the live one.
             let value: pyre_object::PyObjectRef = *slot;
             pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor);
+            // Same old-gen `PyCode` hole as `pyre_object_root_walker`:
+            // a pinned wrapper is already old, so the slot visit does
+            // not scan `co_consts_w`.
+            pyre_interpreter::eval::walk_raw_code_roots(value, visitor);
         });
     }
 }
