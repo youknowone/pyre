@@ -17346,8 +17346,20 @@ mod tests {
         let Some((args_i, args_r, args_f, result_kind)) = residual else {
             panic!("expected a CallResidual, got {ops:?}");
         };
-        assert_eq!(args_i.len(), 3);
-        assert_eq!(args_r.len(), 2);
+        assert_eq!(args_r, &args[0..2], "source then dest");
+        let source_start = zeros[0]
+            .result
+            .as_ref()
+            .expect("source_start const has a result");
+        let dest_start = zeros[1]
+            .result
+            .as_ref()
+            .expect("dest_start const has a result");
+        assert_eq!(
+            args_i,
+            &[source_start.clone(), dest_start.clone(), args[2].clone()],
+            "starts then length"
+        );
         assert!(args_f.is_empty());
         assert_eq!(*result_kind, 'v');
         let callinfo = &transformer

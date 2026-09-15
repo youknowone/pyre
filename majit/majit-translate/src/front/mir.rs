@@ -8898,8 +8898,12 @@ impl<'a> Lowering<'a> {
                 let element = scalar.then(|| self.slice_get_element(reg)).flatten();
                 // `first` / `last` share `get`'s `T` generic; the same
                 // ARRAY identity / thin-pointer proof feeds their
-                // `ArrayRead`.
-                let first_element = self.slice_get_element(reg);
+                // `ArrayRead`. Skip the generic walk on every other
+                // Regular call.
+                let first_element = self
+                    .is_slice_first_or_last_call(reg)
+                    .then(|| self.slice_get_element(reg))
+                    .flatten();
                 (scalar, element, first_element)
             }
             _ => (false, None, None),
@@ -13484,6 +13488,18 @@ impl<'a> Lowering<'a> {
     /// builds, never inside the host slice this call reads.
     /// The outer `Option` is the proof, while the inner one is the optional
     /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
+    fn is_slice_first_or_last_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::<Impl>::first" | "core::slice::<Impl>::last"
+            )
+        })
+    }
+
     fn slice_get_element(&self, reg: &RegularCall) -> Option<(ValueType, Option<String>)> {
         let element_ty = reg
             .generics
