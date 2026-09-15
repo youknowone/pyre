@@ -4842,21 +4842,16 @@ impl<M: Clone> MetaInterp<M> {
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
         // `virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)`.
-        // Prefer that unwrap when it is a real GC pointer: `sync_before` can
-        // still hold a previous frame in `pending_vable_ptr` when this trace's
-        // reds name a different one. Fall back to pending only when the box
-        // is missing or not a dereferenceable identity (test sentinels such
-        // as `0x1234`, or a state-field JIT whose vable is not at `index`).
+        // `sync_before` can still hold a previous frame in `pending_vable_ptr`
+        // when this trace's reds name a different one, so the box wins.
+        // pyre adaptation: a box that is missing or not Ref-typed unwraps to
+        // null (a state-field JIT whose vable is not a red), and only then
+        // does `pending_vable_ptr` name the virtualizable.
         let unwrapped = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
             original_boxes.get(index).copied(),
         ) as *mut u8;
-        let pending = self.pending_vable_ptr as *mut u8;
-        let mut virtualizable_ptr = if !unwrapped.is_null()
-            && (unwrapped as usize).is_multiple_of(std::mem::align_of::<usize>())
-        {
-            unwrapped
-        } else if !pending.is_null() {
-            pending
+        let mut virtualizable_ptr = if unwrapped.is_null() {
+            self.pending_vable_ptr as *mut u8
         } else {
             unwrapped
         };
@@ -27239,8 +27234,9 @@ mod tests {
     ) -> Box<ResidualCallVableObj> {
         // `initialize_virtualizable` begins with `clear_vable_token`, so the
         // standard virtualizable must be a real, aligned object for the whole
-        // test, just as it is in every translated caller.  Older fixtures used
-        // 0x1234 because initialization previously never touched the heap.
+        // test, just as it is in every translated caller.  A Ref-typed
+        // identity in `live_values[0]` is replaced by that object, since
+        // `unwrap_virtualizable_box` dereferences whatever Ref it is given.
         let pc = match live_values.get(1) {
             Some(Value::Int(value)) => *value,
             _ => 0,
@@ -27251,10 +27247,15 @@ mod tests {
                 *slot = *value;
             }
         }
-        meta.set_vable_ptr((&mut *vable as *mut ResidualCallVableObj).cast());
+        let vable_ptr: *mut ResidualCallVableObj = &mut *vable;
+        let mut live_values = live_values.to_vec();
+        if let Some(identity @ Value::Ref(_)) = live_values.first_mut() {
+            *identity = Value::Ref(majit_ir::GcRef(vable_ptr as usize));
+        }
+        meta.set_vable_ptr(vable_ptr.cast());
         meta.set_virtualizable_info(std::sync::Arc::new(info));
         meta.set_vable_array_lengths(array_lengths);
-        let action = meta.force_start_tracing(777, (0, 0), None, live_values);
+        let action = meta.force_start_tracing(777, (0, 0), None, &live_values);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         vable
     }
