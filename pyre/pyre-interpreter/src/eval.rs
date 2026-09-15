@@ -4594,14 +4594,28 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn import_name(&mut self, name: &str, nameindex: usize) -> Result<(), PyError> {
-        let w_fromlist = self.pop();
-        let w_flag = self.pop();
+        // `pyopcode.py IMPORT_NAME`: the popped fromlist / level stay
+        // livevars across `getname_w` and `__import__`.  `intern_str_value`
+        // (the no-table fallback of `w_code_getname_w_or_new`) and the
+        // import itself both collect, so the copies must sit on the
+        // shadow stack the way `build_interpolation_op` roots its pops.
+        let _import_roots = pyre_object::gc_roots::push_roots();
+        let fromlist_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.pop());
+        let flag_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.pop());
         let anchor = FrameAnchor::new(self);
-        // PyPy pyopcode.py `w_modulename = self.getname_w(nameindex)`.
         let w_modulename = unsafe {
             crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
         };
-        let w_obj = crate::importing::import_name(self, w_modulename, w_fromlist, w_flag)?;
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_modulename);
+        let w_obj = crate::importing::import_name(
+            self,
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+            pyre_object::gc_roots::shadow_stack_get(flag_slot),
+        )?;
         Self::push_anchored(&anchor, w_obj)
     }
 

@@ -12012,10 +12012,14 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
 
     let lhs = r_args[0];
     let rhs = r_args[1];
-    let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
+    let Some(concrete_lhs) =
+        walker_concrete_ref_object(ctx, lhs).and_then(super::walker_live_heap_object)
+    else {
         decline!("lhs has no concrete ref");
     };
-    let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
+    let Some(concrete_rhs) =
+        walker_concrete_ref_object(ctx, rhs).and_then(super::walker_live_heap_object)
+    else {
         decline!("rhs has no concrete ref");
     };
 
@@ -12302,10 +12306,14 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
 
     let lhs = r_args[0];
     let rhs = r_args[1];
-    let Some(concrete_lhs) = walker_concrete_ref_object(ctx, lhs) else {
+    let Some(concrete_lhs) =
+        walker_concrete_ref_object(ctx, lhs).and_then(super::walker_live_heap_object)
+    else {
         return Ok(None);
     };
-    let Some(concrete_rhs) = walker_concrete_ref_object(ctx, rhs) else {
+    let Some(concrete_rhs) =
+        walker_concrete_ref_object(ctx, rhs).and_then(super::walker_live_heap_object)
+    else {
         return Ok(None);
     };
 

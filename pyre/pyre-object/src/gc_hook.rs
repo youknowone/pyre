@@ -698,6 +698,40 @@ pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
     majit_gc::gc_current_object_address(addr as usize) as *mut u8
 }
 
+/// Follow a forwarding stub and return the address only when it still
+/// names a managed live object whose fields may be loaded.
+///
+/// `gc_current_object_address` is a nursery-range check plus an optional
+/// stub follow (`_trace_drag_out`). After a `gc_nursery_debug` rotation the
+/// evacuated slot sits outside the published nursery, so that helper
+/// returns the old address unchanged. MiniMark's `is_managed_heap_object`
+/// (current nursery ∪ old-gen) is the liveness gate for that case. When
+/// the slot is still inside the current nursery, a debug fill
+/// (`tid == 0xaaaaaaaaaaaaaaaa`) or a leftover forwarding marker is not a
+/// live header.
+#[inline]
+pub fn try_gc_live_object_address(addr: *mut u8) -> *mut u8 {
+    if addr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let live = try_gc_current_object_address(addr);
+    if live.is_null() || !try_gc_owns_object(live) {
+        return std::ptr::null_mut();
+    }
+    if majit_gc::gc_is_nursery_object(live as usize) {
+        // SAFETY: `try_gc_owns_object` placed `live` in the current nursery,
+        // so a `GcHeader` sits immediately before the payload.
+        let hdr = unsafe { majit_gc::header::header_of(live as usize) };
+        let tid_and_flags = unsafe { (*hdr).tid_and_flags };
+        // incminimark.py arena_reset mode 3 / `NURSERY_POISON_WORD`.
+        const NURSERY_POISON_WORD: u64 = (u64::MAX / 0xff) * 0xaa;
+        if tid_and_flags == NURSERY_POISON_WORD || unsafe { (*hdr).is_forwarded() } {
+            return std::ptr::null_mut();
+        }
+    }
+    live
+}
+
 /// minimark.py `identityhash` hook.
 /// Returns a GC-move-stable address for the given object.
 pub type GcIdentityHashHookFn = fn(obj_addr: usize) -> usize;
