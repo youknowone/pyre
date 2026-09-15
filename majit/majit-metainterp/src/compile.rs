@@ -3624,12 +3624,12 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
             } else {
                 unsafe { vinfo.get_array_length(orig_vable, 0) }
             };
-            // Live array shorter than the mint, or baked walk_lengths
-            // shorter than the mint (`from_callee` entry=14 baked=10).
-            // Tests leave orig_vable null so a stale-short bake still
-            // walks the mint.
+            // Live array shorter than the mint. `entry > baked` also
+            // matches leftover=[] GETFIELD of a grown vsd
+            // (`loop_callee_shared_mutation` entry=11 baked=9) and
+            // aborted the hot loop (138x). Tests leave orig_vable
+            // null so a stale-short bake still walks the mint.
             entry_field_oprefs.len() > n_static + live_items
-                || entry_field_oprefs.len() > baked_field_len
         };
     // leftover=[] GETFIELD of a peeled inlined raise bakes a 13-field
     // snapshot (`traceback_inlined_callee_lasti` path=[3,0]). Deopt
