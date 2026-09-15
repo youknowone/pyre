@@ -87,10 +87,21 @@ def test_floor_is_312(fake_packaging):
 
 def test_no_abi3_for_other_targets(fake_packaging):
     tags = _import(fake_packaging)
-    for interpreter in ['pp311', 'pp310', 'cp312', 'cp3', None]:
+    others = ['pp311', 'pp310', 'cp312', 'cp3']
+    if sys.implementation.name not in ('pypy', 'pyre'):
+        others.append(None)
+    for interpreter in others:
         result = list(tags.compatible_tags(interpreter=interpreter,
                                            platforms=['p']))
         assert not [t for t in result if t.abi == 'abi3'], interpreter
+
+
+@pytest.mark.skipif(sys.implementation.name not in ('pypy', 'pyre'),
+                    reason='None means the running interpreter only here')
+def test_none_interpreter_is_running_impl(fake_packaging):
+    tags = _import(fake_packaging)
+    result = list(tags.compatible_tags(interpreter=None, platforms=['p']))
+    assert any(t.abi == 'abi3' for t in result)
 
 
 @pytest.mark.skipif(sys.implementation.name != 'pyre', reason='pyre interpreter tags')

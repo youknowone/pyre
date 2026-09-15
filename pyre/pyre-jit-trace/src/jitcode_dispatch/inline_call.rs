@@ -14240,15 +14240,8 @@ fn finish_getattr_inline_or_residual<Sym: WalkSym>(
     if folded {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    let residualized = residualize_inline_call_via_fnaddr(
-        ctx,
-        code,
-        op.pc,
-        descr_index,
-        int_args,
-        ref_args,
-        &[],
-    )?;
+    let residualized =
+        residualize_inline_call_via_fnaddr(ctx, code, op.pc, descr_index, int_args, ref_args, &[])?;
     match residualized.outcome {
         DispatchOutcome::SubReturn { .. } => Ok((DispatchOutcome::Continue, op.next_pc)),
         other => Ok((other, op.next_pc)),
@@ -14454,16 +14447,33 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 (args[0], args[1], args[2])
             } else {
                 return finish_getattr_inline_or_residual(
-                    ctx, code, op, descr_index, &[], &args, false,
+                    ctx,
+                    code,
+                    op,
+                    descr_index,
+                    &[],
+                    &args,
+                    false,
                 );
             };
             let folded = if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
                 && unsafe {
                     pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
-                }
-            {
+                } {
                 let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
                 if let Ok(name) = name.as_str() {
+                    if !name_opref.is_constant() {
+                        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+                        walker_emit_fold_guard_with_snapshot(
+                            ctx,
+                            op.pc,
+                            majit_ir::OpCode::GuardValue,
+                            &[name_opref, name_const],
+                        )?;
+                        ctx.trace_ctx
+                            .heap_cache_mut()
+                            .replace_box(name_opref, name_const);
+                    }
                     matches!(
                         spec_gate_store_attr(|| {
                             super::specialize::try_walker_specialize_store_attr_named(
@@ -14483,8 +14493,20 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             } else {
                 false
             };
+            if folded && dst_bank == 'r' {
+                let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+                let none_ptr = pyre_object::w_none();
+                let none = ctx.trace_ctx.const_ref(none_ptr as i64);
+                write_ref_reg(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
+            }
             return finish_getattr_inline_or_residual(
-                ctx, code, op, descr_index, &[], &args, folded,
+                ctx,
+                code,
+                op,
+                descr_index,
+                &[],
+                &args,
+                folded,
             );
         }
     }
@@ -15072,7 +15094,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     ctx, op.pc, obj, name, dst, dst_bank,
                 )?
                 .is_some()
-            } else if let (Some(obj), Some(&name_opref)) = (obj, ref_args.get(1).filter(|_| ref_args.len() >= 2)) {
+            } else if let (Some(obj), Some(&name_opref)) =
+                (obj, ref_args.get(1).filter(|_| ref_args.len() >= 2))
+            {
                 super::specialize::try_fold_inline_getattr(
                     ctx, op.pc, obj, name_opref, dst, dst_bank,
                 )?

@@ -63,7 +63,11 @@ def patch_tags_module(tags):
     def compatible_tags(python_version=None, interpreter=None,
                         platforms=None):
         platforms = list(platforms or tags.platform_tags())
-        if interpreter in interpreters:
+        # packaging.tags.sys_tags() passes interpreter=None for any
+        # implementation that is not `cp` or `pp`.  Under pyre/pypy
+        # that call is this process; under CPython it is not.
+        running = sys.implementation.name in ('pypy', 'pyre')
+        if interpreter in interpreters or (interpreter is None and running):
             for version in versions:
                 for platform_ in platforms:
                     yield Tag(version, 'abi3', platform_)
