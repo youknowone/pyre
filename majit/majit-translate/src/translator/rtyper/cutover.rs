@@ -359,17 +359,9 @@ pub(crate) fn dual_gate_check_with_registry(
     let followed_legacy = call_registry.session_if_started().map(|(annotator, _)| {
         annotator_followed_legacy_vars(&annotator, &graph, &real_value_to_var)
     });
-    if followed_legacy
+    let excluded_legacy = followed_legacy
         .as_ref()
-        .is_some_and(|followed| followed.is_empty())
-    {
-        return Ok(DualGateOutcome::Skip(
-            "dual-gate compared set empty".to_string(),
-        ));
-    }
-    let excluded_legacy = call_registry.session_if_started().map(|(annotator, _)| {
-        annotator_unfollowed_legacy_vars(&annotator, &graph, &real_value_to_var)
-    });
+        .map(|followed| annotator_unfollowed_legacy_vars(&real_value_to_var, followed));
     if let Some(divergence) = compare_real_against_legacy(
         &real_value_to_var,
         &real_constants,
@@ -1536,19 +1528,17 @@ fn annotator_followed_legacy_vars(
         .collect()
 }
 
-/// `value_to_var` keys whose typed twin is not on an annotated block
-/// of `graph`. The compared set is every other reachable legacy
-/// variable, including those `value_to_var` never paired.
+/// `value_to_var` keys that are not in `followed`. The compared set is
+/// every other reachable legacy variable, including those
+/// `value_to_var` never paired.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
 fn annotator_unfollowed_legacy_vars(
-    annotator: &crate::annotator::annrpython::RPythonAnnotator,
-    graph: &crate::flowspace::model::GraphRef,
     value_to_var: &LegacyToTyped,
+    followed: &HashSet<Variable>,
 ) -> HashSet<Variable> {
-    let followed = annotator_followed_legacy_vars(annotator, graph, value_to_var);
     value_to_var
         .keys()
         .filter(|legacy| !followed.contains(*legacy))
@@ -4633,17 +4623,9 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let followed_legacy = call_registry
         .session_if_started()
         .map(|(annotator, _)| annotator_followed_legacy_vars(&annotator, &graph, &value_to_var));
-    if followed_legacy
+    let excluded_legacy = followed_legacy
         .as_ref()
-        .is_some_and(|followed| followed.is_empty())
-    {
-        return Ok(DualGateOutcome::Skip(
-            "two-phase compared set empty".to_string(),
-        ));
-    }
-    let excluded_legacy = call_registry
-        .session_if_started()
-        .map(|(annotator, _)| annotator_unfollowed_legacy_vars(&annotator, &graph, &value_to_var));
+        .map(|followed| annotator_unfollowed_legacy_vars(&value_to_var, followed));
     if let Some(divergence) =
         compare_real_against_legacy(&value_to_var, &constants, legacy, excluded_legacy.as_ref())
     {
