@@ -1603,10 +1603,8 @@ crate::py_module! {
         // `iter_unpack(fmt, buffer)` — an iterator over the records.
         "iter_unpack" / 2 = |args| {
             let _roots = pyre_object::gc_roots::push_roots();
-            let fmt_obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(args[0]);
-            let buf_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(args[1]);
+            let fmt_obj_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+            let buf_slot = fmt_obj_slot + 1;
             let fmt = format_to_string(pyre_object::gc_roots::shadow_stack_get(fmt_obj_slot))?;
             let size = parse_format(&fmt)?.calcsize()?;
             let fmt_slot = pyre_object::gc_roots::shadow_stack_len();

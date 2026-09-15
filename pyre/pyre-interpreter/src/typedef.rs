@@ -6734,10 +6734,9 @@ fn init_str_type(ns: PyObjectRef) {
             make_builtin_function_with_arity(
                 "__repr__",
                 |args| {
+                    let s = unsafe { pyre_object::w_str_get_wtf8(args[0]) }.to_wtf8_buf();
                     Ok(pyre_object::w_str_new_managed(
-                        &crate::display::format_wtf8_repr(unsafe {
-                            pyre_object::w_str_get_wtf8(args[0])
-                        }),
+                        &crate::display::format_wtf8_repr(&s),
                     ))
                 },
                 1,
@@ -7398,32 +7397,37 @@ fn init_str_type(ns: PyObjectRef) {
                     // evaluate left to right, so an inline mint would hand over
                     // a receiver read before it ran.
                     let _roots = pyre_object::gc_roots::push_roots();
+                    let arg_base = pyre_object::gc_roots::pin_roots(args);
                     let d_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
                     if args.len() >= 2 {
-                        if !unsafe { pyre_object::is_str(args[0]) } {
+                        let x_obj = pyre_object::gc_roots::shadow_stack_get(arg_base);
+                        let y_obj = pyre_object::gc_roots::shadow_stack_get(arg_base + 1);
+                        if !unsafe { pyre_object::is_str(x_obj) } {
                             return Err(crate::PyError::type_error(
                                 "first maketrans argument must be a string if there is a second argument",
                             ));
                         }
-                        if !unsafe { pyre_object::is_str(args[1]) } {
+                        if !unsafe { pyre_object::is_str(y_obj) } {
                             return Err(crate::PyError::type_error(format!(
                                 "maketrans() argument 2 must be str, not {}",
-                                crate::type_methods::arg_type_name(args[1])
+                                crate::type_methods::arg_type_name(y_obj)
                             )));
                         }
-                        if args.len() == 3 && !unsafe { pyre_object::is_str(args[2]) } {
-                            return Err(crate::PyError::type_error(format!(
-                                "maketrans() argument 3 must be str, not {}",
-                                crate::type_methods::arg_type_name(args[2])
-                            )));
+                        if args.len() == 3 {
+                            let z_obj = pyre_object::gc_roots::shadow_stack_get(arg_base + 2);
+                            if !unsafe { pyre_object::is_str(z_obj) } {
+                                return Err(crate::PyError::type_error(format!(
+                                    "maketrans() argument 3 must be str, not {}",
+                                    crate::type_methods::arg_type_name(z_obj)
+                                )));
+                            }
                         }
 
-                        let x = unsafe { pyre_object::w_str_get_wtf8(args[0]) };
-                        let y = unsafe { pyre_object::w_str_get_wtf8(args[1]) };
-                        if unsafe {
-                            pyre_object::w_str_len(args[0]) != pyre_object::w_str_len(args[1])
-                        } {
+                        let x = unsafe { pyre_object::w_str_get_wtf8(x_obj) }.to_wtf8_buf();
+                        let y = unsafe { pyre_object::w_str_get_wtf8(y_obj) }.to_wtf8_buf();
+                        if unsafe { pyre_object::w_str_len(x_obj) != pyre_object::w_str_len(y_obj) }
+                        {
                             return Err(crate::PyError::value_error(
                                 "the first two maketrans arguments must have equal length",
                             ));
@@ -7445,7 +7449,12 @@ fn init_str_type(ns: PyObjectRef) {
                             }
                         }
                         if args.len() == 3 {
-                            let z = unsafe { pyre_object::w_str_get_wtf8(args[2]) };
+                            let z = unsafe {
+                                pyre_object::w_str_get_wtf8(
+                                    pyre_object::gc_roots::shadow_stack_get(arg_base + 2),
+                                )
+                            }
+                            .to_wtf8_buf();
                             for zc in z.code_points() {
                                 let key = pyre_object::w_int_new(zc.to_u32() as i64);
                                 unsafe {
@@ -26758,7 +26767,9 @@ fn bytearray_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 1)?;
-    let size = crate::builtins::space_index_w(args[1])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let size = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     if size < 0 {
         return Err(crate::PyError::value_error(format!(
             "Can only resize to positive sizes, got {size}"
@@ -26768,19 +26779,20 @@ fn bytearray_descr_resize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         // CPython 3.14 `bytearray_resize_impl` delegates to
         // `PyByteArray_Resize`, whose same-size fast path returns before the
         // export check.  A live buffer only forbids an actual size change.
+        let recv = pyre_object::gc_roots::shadow_stack_get(base);
         let new_size = size as usize;
-        let old_size = pyre_object::bytearrayobject::w_bytearray_len(args[0]);
+        let old_size = pyre_object::bytearrayobject::w_bytearray_len(recv);
         if old_size != new_size {
-            crate::builtins::bytearray_check_exports(args[0])?;
+            crate::builtins::bytearray_check_exports(recv)?;
         }
-        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(args[0]);
+        let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(recv);
         let previous_size = vec.len();
         if new_size > old_size {
             vec.try_reserve_exact(new_size - old_size)
                 .map_err(|_| crate::PyError::memory_error(""))?;
         }
         vec.resize(new_size, 0);
-        pyre_object::bytearrayobject::w_bytearray_sync_alloc(args[0], previous_size);
+        pyre_object::bytearrayobject::w_bytearray_sync_alloc(recv, previous_size);
     }
     Ok(w_none())
 }
