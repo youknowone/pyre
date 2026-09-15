@@ -9812,6 +9812,21 @@ fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str
     }
 }
 
+/// Rewrite a `symbolic_fnaddr_for_path` hash the host published for
+/// blackhole-only execute. The walker must still see the hash so it can
+/// fold (`try_record_newbool_singleton`); resume has no fold and needs
+/// the real address.
+fn require_callable_fnaddr(bh: &mut BlackholeInterpreter, func: i64) -> Result<i64, DispatchError> {
+    if is_callable_fnaddr(func) {
+        return Ok(func);
+    }
+    let resolved = crate::resolve_symbolic_residual_fnaddr(func);
+    if is_callable_fnaddr(resolved) {
+        return Ok(resolved);
+    }
+    Err(reject_unresolved_call(bh, func))
+}
+
 fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
     if crate::majit_log_enabled() {
         eprintln!(
@@ -9859,10 +9874,7 @@ fn handler_residual_call_irf_i(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9882,10 +9894,7 @@ fn handler_residual_call_irf_r(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9905,10 +9914,7 @@ fn handler_residual_call_irf_f(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9928,10 +9934,7 @@ fn handler_residual_call_irf_v(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (af, p) = read_list_f(bh, code, p);
@@ -9951,10 +9954,7 @@ fn handler_residual_call_ir_i(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
@@ -9973,10 +9973,7 @@ fn handler_residual_call_ir_r(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
@@ -9995,10 +9992,7 @@ fn handler_residual_call_ir_v(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
@@ -10016,10 +10010,7 @@ fn handler_residual_call_r_i(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
     let calldescr = calldescr_handle.get();
@@ -10037,10 +10028,7 @@ fn handler_residual_call_r_r(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
     let calldescr = calldescr_handle.get();
@@ -10058,10 +10046,7 @@ fn handler_residual_call_r_v(
     code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    let func = bh.registers_i[code[position] as usize];
-    if !is_callable_fnaddr(func) {
-        return Err(reject_unresolved_call(bh, func));
-    }
+    let func = require_callable_fnaddr(bh, bh.registers_i[code[position] as usize])?;
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
     let calldescr = calldescr_handle.get();
@@ -12440,9 +12425,7 @@ fn handler_conditional_call_ir_v(
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
     let calldescr = calldescr_handle.get();
     if condition != 0 {
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
+        let func = require_callable_fnaddr(bh, func)?;
         BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         bh.cpu()
             .bh_call_v(func, Some(&ai), Some(&ar), None, calldescr);
@@ -12462,9 +12445,7 @@ fn handler_conditional_call_value_ir_i(
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
     let calldescr = calldescr_handle.get();
     if value == 0 {
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
+        let func = require_callable_fnaddr(bh, func)?;
         BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
             .cpu()
@@ -12486,9 +12467,7 @@ fn handler_conditional_call_value_ir_r(
     let (calldescr_handle, p) = read_calldescr(bh, code, p);
     let calldescr = calldescr_handle.get();
     if value == 0 {
-        if !is_callable_fnaddr(func) {
-            return Err(reject_unresolved_call(bh, func));
-        }
+        let func = require_callable_fnaddr(bh, func)?;
         BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
             .cpu()
@@ -13227,6 +13206,35 @@ fn reject_unresolved_inline_call(
     DispatchError::LeaveFrame
 }
 
+/// `front::mir` aliases `&FrameAnchor` to the depth word. A tracing-time
+/// slot index is always `< 0x1000`; a live frame pointer is not.
+fn is_stale_frame_anchor_word(word: i64) -> bool {
+    word > 0 && (word as u64) < 0x1000
+}
+
+fn is_frame_anchor_self_callee(name: &str) -> bool {
+    name == "push_anchored" || name == "push_on_self" || name == "frame_anchor_live"
+}
+
+/// Interpret folds `live` to the red vable (`FrameAnchorLiveResidual`).
+/// Resume still has the slot index; put the portal frame in `self` so
+/// `push_on_self` writes the same heap `bhimpl_setarrayitem_vable_*` does.
+fn rewrite_stale_frame_anchor_self(callee: &mut BlackholeInterpreter, name: &str) {
+    if !is_frame_anchor_self_callee(name) {
+        return;
+    }
+    let frame = crate::bh_portal_frame();
+    if frame == 0 {
+        return;
+    }
+    if is_stale_frame_anchor_word(callee.registers_r[0]) {
+        callee.registers_r[0] = frame;
+    }
+    if is_stale_frame_anchor_word(callee.registers_i[0]) {
+        callee.registers_i[0] = frame;
+    }
+}
+
 /// Byte-interpret a canonical `inline_call_*` whose `fnaddr` is symbolic.
 ///
 /// Upstream `bhimpl_inline_call_*` (`blackhole.py`) calls
@@ -13258,6 +13266,7 @@ fn interpret_unresolved_inline_call(
             sub_jitcode.name,
         );
     }
+    let callee_name = sub_jitcode.name.clone();
     let mut callee = bh
         .inline_callee_scratch
         .take()
@@ -13279,6 +13288,12 @@ fn interpret_unresolved_inline_call(
             callee.registers_f[index] = value;
         }
     }
+    // `front::mir` aliases `&FrameAnchor` to the depth word. Interpret
+    // folds `live` to the red vable (`FrameAnchorLiveResidual`); resume
+    // still has the tracing-time slot. Replace that word with the portal
+    // frame so `push_on_self` is the same heap write
+    // `bhimpl_setarrayitem_vable_*` performs after `clear_vable_token`.
+    rewrite_stale_frame_anchor_self(&mut callee, callee_name.as_str());
 
     let outcome = 'callee: {
         match callee.run() {

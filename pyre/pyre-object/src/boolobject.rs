@@ -76,6 +76,19 @@ fn bool_singleton(slot: &'static std::sync::OnceLock<usize>, intval: i64) -> PyO
     }) as PyObjectRef
 }
 
+/// Word-ABI residual for [`bool_singleton`]. Bound only for blackhole
+/// resume: the translator must keep the path symbolic so
+/// `try_record_newbool_singleton` folds the OnceLock helper instead of
+/// executing it during the walk.
+pub extern "C" fn bool_singleton_jit_abi(slot: i64, intval: i64) -> i64 {
+    bool_singleton(
+        // SAFETY: the residual hands the live `TRUE_SINGLETON` /
+        // `FALSE_SINGLETON` cell the jitcode named.
+        unsafe { &*(slot as *const std::sync::OnceLock<usize>) },
+        intval,
+    ) as i64
+}
+
 /// Get a boolean PyObjectRef from a bool value.
 ///
 /// Returns a pointer to a pre-allocated static singleton,

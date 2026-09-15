@@ -1550,6 +1550,8 @@ static CRITICALCODE_START_FN: OnceLock<fn()> = OnceLock::new();
 static CRITICALCODE_STOP_FN: OnceLock<fn()> = OnceLock::new();
 static STACK_ALMOST_FULL_FN: OnceLock<fn() -> bool> = OnceLock::new();
 static ALLOW_SMALL_REF_RESIDUAL_FN: OnceLock<fn(usize) -> bool> = OnceLock::new();
+static SYMBOLIC_RESIDUAL_FNADDR_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
+static BH_PORTAL_FRAME_FN: OnceLock<fn() -> i64> = OnceLock::new();
 
 /// Register the `_stack_criticalcode_start` / `_stack_criticalcode_stop`
 /// hooks the interpreter implements. Called once at JIT install time.
@@ -1582,6 +1584,36 @@ pub fn allow_small_ref_residual(addr: usize) -> bool {
         .get()
         .copied()
         .is_some_and(|f| f(addr))
+}
+
+/// Residuals the codewriter must keep as `symbolic_fnaddr_for_path`
+/// hashes so the walker can fold them, while blackhole resume still
+/// needs a real address. Returns 0 when `fnaddr` is not one of those
+/// hashes.
+pub fn register_symbolic_residual_fnaddr(f: fn(i64) -> i64) {
+    let _ = SYMBOLIC_RESIDUAL_FNADDR_FN.set(f);
+}
+
+/// Host rewrite of a symbolic residual hash to a callable address, or 0.
+#[must_use]
+pub fn resolve_symbolic_residual_fnaddr(fnaddr: i64) -> i64 {
+    SYMBOLIC_RESIDUAL_FNADDR_FN
+        .get()
+        .copied()
+        .map_or(0, |f| f(fnaddr))
+}
+
+/// Portal virtualizable the blackhole should use when a FrameAnchor
+/// residual still holds a tracing-time slot index. `interp_jit.py` has
+/// no shadow-stack slot; the frame is the loop's red input.
+pub fn register_bh_portal_frame(f: fn() -> i64) {
+    let _ = BH_PORTAL_FRAME_FN.set(f);
+}
+
+/// Live portal frame pointer, or 0 when the host has not registered one.
+#[must_use]
+pub fn bh_portal_frame() -> i64 {
+    BH_PORTAL_FRAME_FN.get().copied().map_or(0, |f| f())
 }
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via

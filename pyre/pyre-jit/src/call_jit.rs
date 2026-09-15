@@ -1900,6 +1900,32 @@ fn materialize_str_call_for_cranelift(
     result.0 as i64
 }
 
+/// Blackhole-only rewrite of the `bool_singleton` symbolic hash.
+///
+/// The path stays off `jit_trace_fnaddrs` so interpret still folds the
+/// OnceLock helper (`try_record_newbool_singleton`). Resume of
+/// `w_bool_from` has no fold and must call the residual.
+fn resolve_bh_symbolic_residual(fnaddr: i64) -> i64 {
+    use majit_translate::codewriter::call::symbolic_fnaddr_for_segments;
+    use std::sync::OnceLock;
+    static MAP: OnceLock<Vec<(i64, i64)>> = OnceLock::new();
+    let abi = pyre_object::boolobject::bool_singleton_jit_abi as *const () as i64;
+    let map = MAP.get_or_init(|| {
+        [
+            ["boolobject", "bool_singleton"].as_slice(),
+            ["pyre_object", "boolobject", "bool_singleton"].as_slice(),
+            ["pyre_object", "bool_singleton"].as_slice(),
+        ]
+        .into_iter()
+        .map(|segs| (symbolic_fnaddr_for_segments(segs.iter().copied()), abi))
+        .collect()
+    });
+    map.iter()
+        .find(|(hash, _)| *hash == fnaddr)
+        .map(|(_, addr)| *addr)
+        .unwrap_or(0)
+}
+
 pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
@@ -1969,6 +1995,17 @@ pub fn install_jit_call_bridge() {
         majit_metainterp::register_allow_small_ref_residual(
             pyre_interpreter::is_frame_anchor_word_residual,
         );
+        // `bool_singleton` stays off `jit_trace_fnaddrs` so the walker
+        // still folds the symbolic hash (`try_record_newbool_singleton`).
+        // Blackhole resume of COMPARE_OP interprets `w_bool_from` and
+        // must call the residual instead of bailing to an empty stack.
+        majit_metainterp::register_symbolic_residual_fnaddr(resolve_bh_symbolic_residual);
+        // `FrameAnchorLiveResidual` reuses the red vable during the walk.
+        // Resume still has the tracing-time slot; the blackhole rewrites
+        // that word to this portal frame (`interp_jit.py` has no slot).
+        majit_metainterp::register_bh_portal_frame(|| {
+            pyre_interpreter::eval::current_frame() as i64
+        });
         #[cfg(feature = "cranelift")]
         {
             majit_backend_cranelift::register_call_assembler_force(jit_force_callee_frame);
