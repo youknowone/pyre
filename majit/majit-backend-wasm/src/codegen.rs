@@ -173,7 +173,7 @@ pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
         let mut map = cell.borrow_mut();
         let base = table.base_addr() as u32;
         for i in 0..table.len() {
-            map.insert(table.slot(i).0, (base, i as u32));
+            map.insert(table.compile_key(i), (base, i as u32));
         }
     });
 }
