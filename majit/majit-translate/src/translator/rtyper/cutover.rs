@@ -372,6 +372,17 @@ pub(crate) fn dual_gate_check_with_registry(
             "dual-gate divergence: {divergence}"
         )));
     }
+    // Compare unpaired vars first. Only if nothing was followed and
+    // nothing unpaired diverged is the compared set empty — a Match
+    // here would be a silent no-op.
+    if followed_legacy
+        .as_ref()
+        .is_some_and(|followed| followed.is_empty())
+    {
+        return Ok(DualGateOutcome::Skip(
+            "dual-gate compared set empty".to_string(),
+        ));
+    }
     Ok(DualGateOutcome::Match {
         real_value_to_var,
         real_constants,
@@ -4632,6 +4643,14 @@ pub(crate) fn dual_gate_outcome_from_cache(
         return Ok(DualGateOutcome::Skip(format!(
             "two-phase divergence: {divergence}"
         )));
+    }
+    if followed_legacy
+        .as_ref()
+        .is_some_and(|followed| followed.is_empty())
+    {
+        return Ok(DualGateOutcome::Skip(
+            "two-phase compared set empty".to_string(),
+        ));
     }
     Ok(DualGateOutcome::Match {
         real_value_to_var: value_to_var,

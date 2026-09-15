@@ -464,6 +464,11 @@ impl AppExecCache {
 /// Native class-object identities admitted by ObjSpace.fromcache. These keys
 /// represent constructor objects, not function addresses or result type IDs.
 /// Extend alongside each real SpaceCache subclass, not a parallel registry.
+///
+/// `GatewayCache` and `TypeCache` live as `ObjSpace` fields
+/// (`gateway_cache()`, `gettypeobject`), not as fromcache keys.
+/// `PREBUILT` is `const`, so those fields cannot be `Arc`-shared with a
+/// second fromcache instance. Production does not call `fromcache` for them.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpaceCacheClass {
     ClassDictStrategy,
