@@ -9671,8 +9671,12 @@ fn build_function(
                             .map(|fd| (fd.offset() as u64, w_class))
                     })
                 });
-                let stamps_class_word =
-                    op.opcode == OpCode::NewWithVtable && w_class_init.is_some();
+                // Same predicate as the store below (`w_class != 0`).
+                // `w_class_obj_for_vtable` already returns None for a
+                // null instantiate; keep the pair aligned if a descr
+                // answers Some(0).
+                let stamps_class_word = op.opcode == OpCode::NewWithVtable
+                    && w_class_init.is_some_and(|(_, w_class)| w_class != 0);
                 // `New` still fills: rewrite may leave gc Refs unstamped.
                 // `NewWithVtable` stamps `w_class` here; skip the fill when
                 // that covers every gc Ref (`malloc_cond` does not zero).
