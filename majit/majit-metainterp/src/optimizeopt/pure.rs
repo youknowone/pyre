@@ -425,10 +425,6 @@ pub struct OptPure {
     /// callback to the specific result object; pyre dispatches postprocess
     /// per pass, so a per-op flag stands in for that per-result binding.
     pending_call_pure_position: bool,
-    /// RPython pure.py / shortpreamble.py: pure ops that phase 2 should be
-    /// able to reproduce from the preamble via optimizer state, not by
-    /// textual body replay.
-    short_preamble_pure_ops: Vec<majit_ir::OpRc>,
     /// Whether the last emitted operation was removed (for GUARD_NO_EXCEPTION elimination).
     /// pure.py: last_emitted_operation is REMOVED check.
     last_emitted_was_removed: bool,
@@ -473,7 +469,6 @@ impl OptPure {
             postponed_box: None,
             call_pure_positions: Vec::new(),
             pending_call_pure_position: false,
-            short_preamble_pure_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
@@ -1070,13 +1065,8 @@ impl Optimization for OptPure {
                 }
                 // Record and emit both the OVF op and the guard.
                 self.cache.insert(key, postponed.pos().get());
-                // pure.py:321-322: an is_ovf op followed by GUARD_NO_OVERFLOW is
-                // hoistable into the short preamble, like an is_always_pure op
-                // (pure.py). Push it so produce_potential_short_preamble_ops
-                // replays it and a loop-invariant overflow-checked op is computed
-                // once in the peeled preamble instead of every iteration.
-                self.short_preamble_pure_ops
-                    .push(OpRc::new(postponed.clone()));
+                // pure.py:321-322 walks `_newoperations` for is_ovf followed
+                // by GUARD_NO_OVERFLOW; do not keep a parallel candidate list.
                 self.emit_postponed_downstream(postponed, ctx);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
@@ -1315,9 +1305,6 @@ impl Optimization for OptPure {
             if start_index == 0 {
                 // pure.py:222-225: replace CALL_PURE with CALL.
                 let new_op = self.demote_call_pure(op);
-                if !Self::call_pure_can_raise(op) {
-                    self.short_preamble_pure_ops.push(OpRc::new(new_op.clone()));
-                }
                 return OptimizationResult::Replace(new_op);
             } else {
                 // pure.py:226-227: COND_CALL_VALUE is NOT demoted.
@@ -1335,7 +1322,6 @@ impl Optimization for OptPure {
         self.postponed_box = None;
         self.call_pure_positions.clear();
         self.pending_call_pure_position = false;
-        self.short_preamble_pure_ops.clear();
         self.last_emitted_was_removed = false;
         self.known_result_call_pure.clear();
         // Note: extra_call_pure is NOT cleared on setup — it persists
@@ -1393,11 +1379,6 @@ impl Optimization for OptPure {
         // and identical IntEq never CSEd.
         if op.opcode.is_always_pure() {
             self.pure(op);
-            if let Some(shared) = ctx.producer_in_new_operations(op.pos().get())
-                && shared.opcode.is_always_pure()
-            {
-                self.short_preamble_pure_ops.push(shared);
-            }
         }
         if self.pending_call_pure_position
             && (op.opcode.is_real_call() || op.opcode.is_cond_call_value())
@@ -1408,8 +1389,6 @@ impl Optimization for OptPure {
         }
     }
 
-    /// pure.py: produce_potential_short_preamble_ops(sb)
-    /// Add pure operations and CALL_PURE results to the short preamble.
     /// shortpreamble.py: PureOp.produce_op stores PreambleOp in
     /// optpure. In RPython, produce_op accesses opt.optimizer.optpure directly.
     /// In majit, import_short_preamble_ops stores in ctx.imported_short_pure_ops,
@@ -1417,18 +1396,6 @@ impl Optimization for OptPure {
     fn install_preamble_pure_ops(&mut self, ctx: &mut OptContext) {
         let imported = ctx.imported_short_pure_ops.clone();
         for entry in &imported {
-            // The replay `preamble_op` was built by `ImportedShortPureOp::new`
-            // from the same arg list with producer-bound operands
-            // (shortpreamble.py:425 — the replay op carries the same Box
-            // objects); reuse them instead of re-deriving position-only
-            // echoes from the OpRef table.
-            let imported_args = entry.pop.preamble_op.getarglist();
-            let mut imported_op = Op::new(entry.opcode, &imported_args);
-            imported_op.pos().set(entry.result);
-            if let Some(d) = entry.descr.clone() {
-                imported_op.setdescr(d);
-            }
-            self.short_preamble_pure_ops.push(OpRc::new(imported_op));
             let resolved_args: Vec<OpRef> = entry
                 .args
                 .iter()
@@ -1458,8 +1425,41 @@ impl Optimization for OptPure {
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,
         ctx: &mut OptContext,
     ) {
-        for op in &self.short_preamble_pure_ops {
-            sb.add_pure_op(ctx, (**op).clone());
+        // pure.py produce_potential_short_preamble_ops: walk
+        // optimizer._newoperations, then call_pure_positions.
+        let n = ctx.new_operations.len();
+        for i in 0..n {
+            let opcode = ctx.new_operations[i].opcode;
+            let hoist = opcode.is_always_pure()
+                || (opcode.is_ovf()
+                    && ctx
+                        .new_operations
+                        .get(i + 1)
+                        .is_some_and(|next| next.opcode == OpCode::GuardNoOverflow));
+            if hoist {
+                let op = (*ctx.new_operations[i]).clone();
+                sb.add_pure_op(ctx, op);
+            }
+        }
+        for &i in &self.call_pure_positions {
+            let Some(op_rc) = ctx.new_operations.get(i).cloned() else {
+                continue;
+            };
+            // don't move call_pure_with_exception in the short preamble...
+            // issue #2015
+            //
+            // Also, don't move cond_call_value in the short preamble.
+            // The issue there is that it's usually pointless to try to
+            // because the 'value' argument is typically not a loop
+            // invariant, and would really need to be in order to end up
+            // in the short preamble.  Maybe the code works anyway in the
+            // other rare case, but better safe than sorry and don't try.
+            if !Self::call_pure_can_raise(op_rc.as_ref()) {
+                debug_assert!(op_rc.opcode.is_call());
+                if !op_rc.opcode.is_cond_call_value() {
+                    sb.add_pure_op(ctx, (*op_rc).clone());
+                }
+            }
         }
     }
 }
@@ -2090,7 +2090,6 @@ mod tests {
             postponed_box: None,
             call_pure_positions: Vec::new(),
             pending_call_pure_position: false,
-            short_preamble_pure_ops: Vec::new(),
             last_emitted_was_removed: false,
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
@@ -2903,16 +2902,13 @@ mod tests {
     }
 
     #[test]
-    fn test_imported_short_pure_result_is_reexported_to_short_preamble() {
-        // Imported pure ops (from previous peeling cycle) should be
-        // re-exported to ShortBoxes via short_preamble_pure_ops.
+    fn test_imported_short_pure_is_not_a_produce_side_table() {
+        // pure.py produce_potential_short_preamble_ops walks
+        // `_newoperations` only. An imported PreambleOp seeds RecentPureOps
+        // (shortpreamble.py opt.pure) and is not re-exported as a short box
+        // unless this compilation emits it again.
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(6, 0);
-        // history.py — the imported pure op carries an inline `Const`
-        // arg (`ConstInt.value`). seed_constant takes the inline branch (no
-        // const_pool), and the constant is recognised downstream via
-        // `is_constant()`, so the short-preamble producer re-exports the op
-        // without any const_pool / known_constants bridge.
         let const_opref = OpRef::const_int(7);
         let const_box = ctx.materialize_operand_at(const_opref);
         ctx.seed_constant(&const_box.clone(), majit_ir::Value::Int(7));
@@ -2937,7 +2933,6 @@ mod tests {
         pass.setup();
         pass.install_preamble_pure_ops(&mut ctx);
 
-        // Label args don't include OpRef::int_op(2), so the pure op should be produced.
         let mut sb = crate::optimizeopt::shortpreamble::ShortBoxes::with_label_args(&[
             OpRef::int_op(0),
             OpRef::int_op(1),
@@ -2947,8 +2942,6 @@ mod tests {
         }
         pass.produce_potential_short_preamble_ops(&mut sb, &mut ctx);
         let collected = sb.produced_ops(&mut ctx);
-        // Label args are also produced as ShortInputargs; the imported pure op
-        // is the single non-InputArg short box.
         let pure: Vec<_> = collected
             .iter()
             .filter(|(_, p)| {
@@ -2958,9 +2951,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(pure.len(), 1);
-        assert_eq!(pure[0].1.preamble_op.opcode, OpCode::IntAdd);
-        assert_eq!(pure[0].1.preamble_op.pos().get(), OpRef::int_op(2));
+        assert!(pure.is_empty());
     }
 
     #[test]
@@ -3091,8 +3082,7 @@ mod tests {
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
-        // Only downstream emission makes the producer a preamble candidate.
-        assert!(pass.short_preamble_pure_ops.is_empty());
+        // Only `_newoperations` (pure.py:317) makes the producer a candidate.
         ctx.push_new_operation(OpRc::new(op.clone()));
         pass.propagate_postprocess(&op, &mut ctx);
 
@@ -3147,10 +3137,17 @@ mod tests {
         let result = pass.propagate_forward(&op, &OpRc::new(op.clone()), &mut ctx);
         // The demote routes the CALL through the remaining passes (Replace),
         // mirroring RPython's `self.emit(newop)`, so OptHeap still processes it.
-        match result {
-            OptimizationResult::Replace(emitted) => assert_eq!(emitted.opcode, OpCode::CallI),
+        let emitted = match result {
+            OptimizationResult::Replace(emitted) => {
+                assert_eq!(emitted.opcode, OpCode::CallI);
+                emitted
+            }
             other => panic!("expected demoted call routed via Replace, got {other:?}"),
-        }
+        };
+        // pure.py:323-338 reads the demoted CALL out of `_newoperations`
+        // at `call_pure_positions`.
+        ctx.push_new_operation(OpRc::new(emitted.clone()));
+        pass.propagate_postprocess(&emitted, &mut ctx);
 
         // Deps are the call args (100, 0, 1); the call result (pos 2) is not a
         // label arg.
