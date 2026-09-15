@@ -3169,6 +3169,10 @@ impl WasmBackend {
         sibling_ids.sort_unstable();
         for id in sibling_ids {
             if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
+                #[cfg(target_arch = "wasm32")]
+                if item.remap.is_none() {
+                    item.set_dispatch_withdrawn(false);
+                }
                 work.push((id, item.region, item.remap));
             }
         }
@@ -3272,15 +3276,17 @@ impl WasmBackend {
                 continue;
             };
             PENDING_INLINES.with(|pending| {
-                pending.borrow_mut().insert(
-                    id,
-                    PendingInline {
-                        owner: Arc::downgrade(&owner),
-                        region,
-                        remap,
-                        retry_on_sibling: remap.is_none(),
-                    },
-                )
+                let item = PendingInline {
+                    owner: Arc::downgrade(&owner),
+                    region,
+                    remap,
+                    retry_on_sibling: remap.is_none(),
+                };
+                #[cfg(target_arch = "wasm32")]
+                if remap.is_none() {
+                    item.set_dispatch_withdrawn(false);
+                }
+                pending.borrow_mut().insert(id, item);
             });
         }
     }
