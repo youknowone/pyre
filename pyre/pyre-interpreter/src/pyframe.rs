@@ -2269,7 +2269,12 @@ pub struct FrameDebugData {
 impl FrameDebugData {
     /// `pyframe.py FrameDebugData.__init__`: initialize the rare-frame
     /// globals override from the code object's first-seen globals.
-    pub fn new(pycode: *const (), init_lineno: isize) -> Self {
+    ///
+    /// Named `init`, not `new`: Charon spells every inherent impl as
+    /// `<Impl>`, so `FrameDebugData::new` and `PyFrame::new` share
+    /// `pyframe::<Impl>::new` when `self_ty_root` is missing. The
+    /// `__init__` leaf cannot collide with `PyFrame::new`.
+    pub fn init(pycode: *const (), init_lineno: isize) -> Self {
         Self {
             w_globals: if pycode.is_null() {
                 pyre_object::PY_NULL
@@ -2292,7 +2297,7 @@ impl FrameDebugData {
 
 impl Default for FrameDebugData {
     fn default() -> Self {
-        Self::new(std::ptr::null(), -1)
+        Self::init(std::ptr::null(), -1)
     }
 }
 
@@ -3642,7 +3647,7 @@ impl PyFrame {
             } else {
                 std::ptr::null_mut()
             };
-            // Build the payload only after that allocation.  `FrameDebugData::new`
+            // Build the payload only after that allocation.  `FrameDebugData::init`
             // copies the code object's first-seen globals into this stack
             // temporary; a collection inside the allocation forwards the
             // anchored frame and the `PyCode` slot the copy came from, but
@@ -3650,7 +3655,7 @@ impl PyFrame {
             // publish a pre-collection address into the new block.  Only an
             // atomic field read separates the allocation from the write below,
             // so the fresh block crosses no safepoint unrooted.
-            let value = FrameDebugData::new(unsafe { (*frame_anchor.live()).pycode }, init_lineno);
+            let value = FrameDebugData::init(unsafe { (*frame_anchor.live()).pycode }, init_lineno);
             let debugdata = if raw.is_null() {
                 pyre_object::lltype::malloc_raw(value)
             } else {

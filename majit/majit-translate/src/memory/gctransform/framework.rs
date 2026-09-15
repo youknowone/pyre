@@ -555,8 +555,8 @@ impl CallGraph {
 /// # The name does not always identify a function; the name and line do
 ///
 /// `ItemMeta::name_path` renders an `impl` block as the opaque segment
-/// `<Impl>`, so `PyFrame::new` and `FrameDebugData::new` are both spelled
-/// `pyframe::<Impl>::new`.  Joining on that spelling merges them into one node
+/// `<Impl>`, so two inherent `new`s on types in the same module are both
+/// spelled `pyframe::<Impl>::new`.  Joining on that spelling merges them into one node
 /// and invents an edge from every caller of one to every callee of the other —
 /// which is how a `getorcreatedebug` that only allocates came out reaching
 /// `call_user_function_with_args`.  Widening is not automatically safe here:
