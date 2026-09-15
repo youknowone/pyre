@@ -4491,15 +4491,29 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
-        return Ok(None);
-    };
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
-        pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
-    }) else {
+    try_walker_specialize_load_type_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
+}
+
+pub(crate) fn try_walker_specialize_load_type_attr_named<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        return Ok(None);
+    };
+    let Some((w_type, _version_tag, w_value, binding)) =
+        (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name)) })
+    else {
         return Ok(None);
     };
 
@@ -9587,11 +9601,7 @@ pub(crate) fn name_is_frame_load_attr(name: &str) -> bool {
 }
 
 pub(crate) fn name_is_setattr_family(name: &str) -> bool {
-    name_leaf_is(name, "setattr")
-        || name_leaf_is(name, "setattr_str")
-        || name_leaf_is(name, "store_attr")
-        || name_leaf_is(name, "opcode_store_attr")
-        || name_leaf_is(name, "execute_store_attr")
+    name_leaf_is(name, "setattr") || name_leaf_is(name, "setattr_str")
 }
 
 /// `PyFrame::load_attr` / `SharedOpcodeHandler::load_attr` — `(frame, obj, name)`.
@@ -9713,6 +9723,20 @@ pub(crate) fn try_fold_inline_getattr_named<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     if spec_gate(SpecFold::LoadAttr, || {
         try_walker_specialize_load_attr(ctx, op_pc, obj, name, dst, dst_bank)
+    })?
+    .is_some()
+    {
+        return Ok(Some(()));
+    }
+    if spec_gate(SpecFold::LoadTypeAttr, || {
+        try_walker_specialize_load_type_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
+    })?
+    .is_some()
+    {
+        return Ok(Some(()));
+    }
+    if spec_gate(SpecFold::LoadAttrOnSuper, || {
+        try_walker_specialize_load_attr_on_super(ctx, op_pc, obj, name, dst, dst_bank)
     })?
     .is_some()
     {
@@ -11440,17 +11464,16 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let ConcreteValue::Ref(concrete_callable) = arg_concretes[0] else {
+        return Ok(None);
+    };
+    let null_or_self = match arg_concretes[1] {
+        ConcreteValue::Ref(value) => value,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
+    };
+    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
+        (arg_concretes[2], arg_concretes[3])
     else {
         return Ok(None);
     };
@@ -11553,17 +11576,16 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let ConcreteValue::Ref(concrete_callable) = arg_concretes[0] else {
+        return Ok(None);
+    };
+    let null_or_self = match arg_concretes[1] {
+        ConcreteValue::Ref(value) => value,
+        ConcreteValue::Null => pyre_object::PY_NULL,
+        _ => return Ok(None),
+    };
+    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
+        (arg_concretes[2], arg_concretes[3])
     else {
         return Ok(None);
     };
@@ -11664,7 +11686,10 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // two guards above are the premise of a fold that is no longer there, and
     // the residual the caller falls through to recomputes the lookup from the
     // unguarded operands.
-    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none() {
+    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none()
+        && (try_walker_specialize_load_type_attr_named(ctx, op.pc, r_args[2], name, dst, 'r')?)
+            .is_none()
+    {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);

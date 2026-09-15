@@ -57,6 +57,18 @@ static GETATTR_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
         })
     });
 
+/// Three-Ref `space.setattr` residuals (`bh_setattr_fn` /
+/// `jit_baseobjspace_setattr`).  Flatten's 3-arg `setattr` HLOp fallback
+/// tags them `None`, so the `StoreAttr` helper arm never sees them.
+static SETATTR_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("baseobjspace::setattr")
+                || name.ends_with("jit_baseobjspace_setattr")
+                || name.ends_with("bh_setattr_fn")
+        })
+    });
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -7342,6 +7354,53 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 .is_some()
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+
+    // Flatten's 3-arg `setattr` HLOp residual (`obj, name, value`) is
+    // tagged `None`, not `StoreAttr`.  Fold the mapdict write here.
+    if ctx.is_authoritative_executor && r_args.len() == 3 {
+        let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        if func_addr != 0 && SETATTR_FNADDRS.contains(&func_addr) {
+            if let Some(concrete_name) = walker_concrete_ref_object(ctx, r_args[1])
+                && unsafe {
+                    pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
+                }
+            {
+                let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+                if let Ok(name) = name.as_str() {
+                    if !r_args[1].is_constant() {
+                        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+                        walker_emit_fold_guard_with_snapshot(
+                            ctx,
+                            op.pc,
+                            majit_ir::OpCode::GuardValue,
+                            &[r_args[1], name_const],
+                        )?;
+                        ctx.trace_ctx
+                            .heap_cache_mut()
+                            .replace_box(r_args[1], name_const);
+                    }
+                    if matches!(
+                        spec_gate_store_attr(|| {
+                            try_walker_specialize_store_attr_named(
+                                ctx, op.pc, r_args[0], r_args[2], name, ei,
+                            )
+                        })?,
+                        Some(WalkerStoreAttrSpecialization::Direct)
+                    ) {
+                        if dst_bank == 'r' {
+                            let none_ptr = pyre_object::w_none();
+                            let none = ctx.trace_ctx.const_ref(none_ptr as i64);
+                            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, none)?;
+                        }
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
                 }
             }
         }
