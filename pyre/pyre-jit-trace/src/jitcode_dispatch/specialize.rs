@@ -9577,6 +9577,13 @@ fn descend_named_cell_helper<Sym: WalkSym>(
 }
 
 /// Walk `unwrap_cell` and return the unwrapped value's operand.
+///
+/// A non-cell slot is `unwrap_cell`'s identity return (`celldict.rs`):
+/// two `ob_type` compares fall through and the pointer is the value.
+/// That classification is a trace-time fact about `stored`, so the
+/// compiled loop keeps the `ConstPtr` and does not replay the compares.
+/// A cell still goes through the generated helper so the live field
+/// read is the helper's getfield, not a hand-written one.
 pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9584,6 +9591,18 @@ pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
 ) -> Result<Option<(OpRef, pyre_object::PyObjectRef)>, DispatchError> {
     if stored.is_null() {
         return Ok(None);
+    }
+    let is_cell = unsafe {
+        pyre_object::celldict::is_object_mutable_cell(stored)
+            || pyre_object::celldict::is_int_mutable_cell(stored)
+    };
+    if !is_cell {
+        let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
+        ctx.trace_ctx.set_opref_concrete(
+            cell_opref,
+            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+        );
+        return Ok(Some((cell_opref, stored)));
     }
     let Some(jc) = crate::jitcode_runtime::unwrap_cell_jitcode() else {
         return Ok(None);
