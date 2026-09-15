@@ -736,14 +736,6 @@ jobs:
         cargo test --release -p majit-translate \
           --test test_make_jitcodes_produces_graph_keyed_output
 
-    # Full-artefact root-bracket census. Debug `cargo test --all` spent 642s
-    # on `nearly_every_dropped_bracket_closes` (ubuntu 2026-09-15); the
-    # named-shape fixtures in the same file stay in the default pass.
-    - name: Run full-artefact root-bracket close census
-      run: |
-        cargo test --release -p majit-translate \
-          --test test_root_bracket_close -- --ignored --test-threads=1
-
     # The hand-written GC root brackets, held to what the analysis can prove.
     # This job is where the gate is cheapest: all four artefacts are already on
     # disk and the scan is ~25 s. Hanging it off `prepare` instead would put it

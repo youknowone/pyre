@@ -304,17 +304,12 @@ fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
 /// Both artefacts are counted. The erasure answers most of `pyre-object`'s
 /// brackets, so that crate alone no longer carries a population large enough
 /// for this to prove anything.
-///
-/// Ignored in the default `cargo test --all` pass: on ubuntu debug it spent
-/// 642s lowering every local body in `pyre-object` + `pyre-interpreter`
-/// (2026-09-15 run 34952670889), more than half the dynasm test step.
-/// CI runs it release-mode in the dispatcher-graph job, which already owns
-/// the other full-artefact translate census.
 #[test]
-#[ignore = "full-artefact census; CI: dispatcher-graph acceptance"]
 fn nearly_every_dropped_bracket_closes() {
-    let (mut bodies, mut closed) = (0usize, 0usize);
-    let mut short: Vec<String> = Vec::new();
+    // Collect first so the subsequent lowers can share threads. Each
+    // `lower_fun_decl` used to re-harvest whole-LLBC metadata; that is
+    // now cached, and the remaining cost is the per-body lower itself.
+    let mut work: Vec<(&Llbc, &majit_charon_reader::ullbc::FunDecl, usize)> = Vec::new();
     for llbc in [object_llbc(), interpreter_llbc()].into_iter().flatten() {
         for fd in llbc.iter_local_fns() {
             let Some(body) = fd.unstructured() else {
@@ -324,17 +319,43 @@ fn nearly_every_dropped_bracket_closes() {
             if want == 0 {
                 continue;
             }
-            bodies += 1;
-            let Ok(graph) = lower_fun_decl(llbc, fd) else {
-                continue;
-            };
-            if reachable_closes(&graph) >= want {
-                closed += 1;
-            } else {
-                short.push(fd.item_meta.name_path().to_string());
-            }
+            work.push((llbc, fd, want));
         }
     }
+    let bodies = work.len();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(work.len().max(1));
+    let chunk = work.len().div_ceil(threads).max(1);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = work
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || {
+                    let mut closed = 0usize;
+                    let mut short = Vec::new();
+                    for &(llbc, fd, want) in slice {
+                        let Ok(graph) = lower_fun_decl(llbc, fd) else {
+                            continue;
+                        };
+                        if reachable_closes(&graph) >= want {
+                            closed += 1;
+                        } else {
+                            short.push(fd.item_meta.name_path().to_string());
+                        }
+                    }
+                    (closed, short)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("census worker"))
+            .collect::<Vec<_>>()
+    });
+    let closed: usize = results.iter().map(|(c, _)| *c).sum();
+    let short: Vec<String> = results.into_iter().flat_map(|(_, s)| s).collect();
     assert!(
         bodies > 100,
         "only {bodies} bodies drop a surviving guard; the artefact looks wrong, so \
