@@ -9548,6 +9548,26 @@ fn inline_newarray_clear_fills_when_an_item_is_unwritten() {
         memory_fill_count(&bytes) >= 1,
         "partial NEW_ARRAY_CLEAR still ZERO_ARRAYs the unwritten tail"
     );
+    let fills = memory_fill_lengths(&bytes);
+    assert!(
+        fills.iter().any(|&n| n == 8),
+        "emit_pending_zeros trims the written prefix; leftover is one item (8 bytes), got {fills:?}"
+    );
+}
+
+fn memory_fill_lengths(bytes: &[u8]) -> Vec<i32> {
+    let mut last_const = None;
+    let mut lengths = Vec::new();
+    count_operators(bytes, |op| match op {
+        wasmparser::Operator::I32Const { value } => last_const = Some(*value),
+        wasmparser::Operator::MemoryFill { .. } => {
+            if let Some(n) = last_const {
+                lengths.push(n);
+            }
+        }
+        _ => last_const = None,
+    });
+    lengths
 }
 
 /// rewrite.py flushes pending zeros at a guard, so a later SETARRAYITEM
@@ -9932,6 +9952,11 @@ fn call_malloc_nursery_uses_one_inline_bump() {
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
+    assert_eq!(
+        memory_fill_count(&bytes),
+        0,
+        "CALL_MALLOC_NURSERY is the bump; rewrite emits zeros as later ops"
+    );
 }
 
 /// rewrite.py `clear_gc_fields`: IncrementalMiniMark is
