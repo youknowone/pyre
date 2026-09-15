@@ -491,6 +491,15 @@ impl<T> Default for SnapshotRunTable<T> {
     }
 }
 
+impl<T: PartialEq> PartialEq for SnapshotRunTable<T> {
+    fn eq(&self, other: &Self) -> bool {
+        let n = self.spans.len().max(other.spans.len());
+        (0..n).all(|i| self.get(i as i32) == other.get(i as i32))
+    }
+}
+
+impl<T: Eq> Eq for SnapshotRunTable<T> {}
+
 pub type SnapshotFrameSizes = SnapshotRunTable<usize>;
 pub type SnapshotFramePcs = SnapshotRunTable<(i32, i32, i32)>;
 
