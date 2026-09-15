@@ -1285,6 +1285,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // mirror plus the branch trampoline's ref moves, so a slot can
             // genuinely resolve to nothing.
             let mut unsourced_kept: Option<u32> = None;
+            // Overlay only a branch-guard kept bottom here.  Helper CALL
+            // snapshots pass their own vstack; overlaying every residual
+            // capture remaps reused Ref colors onto stack temps.
             let active = collect_outer_active_boxes(
                 sym,
                 ctx.trace_ctx,
@@ -1297,7 +1300,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 entry_jitcode_pc,
                 entry_twin,
                 entry_caller,
-                ctx.vstack_valid
+                (has_branch_guard && ctx.vstack_valid)
                     .then_some(ctx.frame_state.borrow().vstack_boxes.as_slice()),
                 scope.branch_guard_kept_recovered,
                 has_branch_guard.then_some(&mut unsourced_kept),
