@@ -1125,12 +1125,17 @@ fn real_main() {
     // resolved by `mem::offset_of!` are available.  build.rs cannot
     // import that crate (no metainterp build-dep, and the offsets are
     // a runtime fact), so the codewriter-side factory returns the
-    // offset-free `CodewriterVirtualizableInfo` from
-    // `codewriter_vinfo_for_vtype` (field membership and indices only)
+    // offset-free `CodewriterVirtualizableInfo` that
+    // `codewriter_vinfo_from_config` builds from the `vable_fields` /
+    // `vable_arrays` table above (field membership and indices only)
     // until the runtime metainterp setter overrides it.  TODO: documented at
     // `CallControl::make_virtualizable_infos`.
-    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> =
-        &|_jd_idx, vtype| majit_translate::call::codewriter_vinfo_for_vtype(vtype);
+    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, vtype| {
+        majit_translate::call::codewriter_vinfo_from_config(
+            vtype,
+            &analyze_config.pipeline.transform,
+        )
+    };
     let fnaddr_bindings = pyre_interpreter::jit_trace_fnaddrs();
     // Prebuilt object-space singleton addresses (static `PyType` pointers
     // and dict-strategy refs).  `majit-translate` is the translation

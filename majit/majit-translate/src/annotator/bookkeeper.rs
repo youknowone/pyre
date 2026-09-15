@@ -4508,13 +4508,16 @@ mod tests {
     }
 
     #[test]
-    fn intern_pyframe_stamps_interp_jit_virtualizable_list() {
-        crate::virtualizable_decl::register_virtualizable_roots(["PyFrame".to_string()]);
+    fn intern_class_stamps_the_declared_virtualizable_list() {
+        crate::virtualizable_decl::register_virtualizable_declarations([(
+            "Frame".to_string(),
+            vec!["last_instr".to_string()],
+        )]);
         let bk = bk();
-        let host = bk.intern_class_by_qualname("PyFrame");
+        let host = bk.intern_class_by_qualname("Frame");
         let listed = host
             .class_get("_virtualizable_")
-            .expect("interp_jit.py PyFrame._virtualizable_");
+            .expect("the declared class carries _virtualizable_");
         let ConstValue::List(items) = listed else {
             panic!("_virtualizable_ must be a list");
         };
@@ -4526,7 +4529,7 @@ mod tests {
         let classdesc = crate::annotator::classdesc::ClassDesc::new(
             &bk,
             host,
-            Some("PyFrame".into()),
+            Some("Frame".into()),
             None,
             None,
         )
@@ -4538,7 +4541,10 @@ mod tests {
             ),
             "classdesc.get_param('_virtualizable_') must see the class attribute"
         );
-        crate::virtualizable_decl::register_virtualizable_roots(std::iter::empty::<String>());
+        crate::virtualizable_decl::register_virtualizable_declarations(std::iter::empty::<(
+            String,
+            Vec<String>,
+        )>());
     }
 
     #[test]

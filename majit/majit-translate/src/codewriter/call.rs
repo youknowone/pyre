@@ -14,6 +14,7 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
+use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
 use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
@@ -419,20 +420,36 @@ pub struct CodewriterVirtualizableInfo {
 }
 
 impl CodewriterVirtualizableInfo {
-    /// `interp_jit.py PyFrame._virtualizable_` minus `w_globals` (not a
-    /// frame field after `frame_stores_global`) and with `[*]` stripped
-    /// from the array name.
-    pub fn for_pyframe() -> Self {
-        Self {
-            vtype_name: "PyFrame".into(),
-            static_fields: vec![
-                "last_instr".into(),
-                "pycode".into(),
-                "valuestackdepth".into(),
-                "debugdata".into(),
-            ],
-            array_fields: vec!["locals_cells_stack_w".into()],
+    /// `virtualizable.py VirtualizableInfo.__init__` over the declaration:
+    /// the static and array fields `config` declares on `vtype`, each in
+    /// declared index order, array names without the `[*]` suffix.
+    pub fn from_config(vtype: &str, config: &GraphTransformConfig) -> Option<Self> {
+        let declared = |fields: &[VirtualizableFieldDescriptor]| {
+            let mut owned: Vec<&VirtualizableFieldDescriptor> = fields
+                .iter()
+                .filter(|field| {
+                    field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|owner| names_same_type(owner, vtype))
+                })
+                .collect();
+            owned.sort_by_key(|field| field.index);
+            owned
+                .into_iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let static_fields = declared(&config.vable_fields);
+        let array_fields = declared(&config.vable_arrays);
+        if static_fields.is_empty() && array_fields.is_empty() {
+            return None;
         }
+        Some(Self {
+            vtype_name: vtype.to_string(),
+            static_fields,
+            array_fields,
+        })
     }
 }
 
@@ -455,17 +472,25 @@ impl VirtualizableInfoHandle for CodewriterVirtualizableInfo {
 }
 
 /// `WarmRunnerDesc.make_virtualizable_infos` constructor for the
-/// codewriter side. Returns a handle when `vtype` names PyFrame.
-pub fn codewriter_vinfo_for_vtype(
+/// codewriter side, for a host whose `_virtualizable_` declaration is the
+/// transform config.
+pub fn codewriter_vinfo_from_config(
     vtype: &str,
+    config: &GraphTransformConfig,
 ) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
-    if vtype == "PyFrame" || vtype.ends_with("::PyFrame") {
-        Some(std::sync::Arc::new(
-            CodewriterVirtualizableInfo::for_pyframe(),
-        ))
-    } else {
-        None
-    }
+    let info = CodewriterVirtualizableInfo::from_config(vtype, config)?;
+    Some(std::sync::Arc::new(info))
+}
+
+/// `is_vtypeptr(VTYPEPTR)` by name: the same path, or one path naming the
+/// other with a module prefix. A bare string suffix is not a match (`Frame`
+/// does not name `OtherFrame`).
+fn names_same_type(a: &str, b: &str) -> bool {
+    let names_tail = |path: &str, tail: &str| {
+        path.strip_suffix(tail)
+            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
+    };
+    names_tail(a, b) || names_tail(b, a)
 }
 
 /// greenfield.py `GreenFieldInfo.green_fields` membership test.
@@ -4044,14 +4069,7 @@ impl CallControl {
             let Some(name) = vinfo.vtype_name() else {
                 continue;
             };
-            // `is_vtypeptr(VTYPEPTR)` by name: the same path, or one path
-            // naming the other with a module prefix. A bare string suffix is
-            // not a match (`Frame` is not `PyFrame`).
-            let names_same_type = |path: &str, tail: &str| {
-                path.strip_suffix(tail)
-                    .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
-            };
-            if !names_same_type(owner, name) && !names_same_type(name, owner) {
+            if !names_same_type(owner, name) {
                 continue;
             }
             let seen_already = seen
@@ -12313,34 +12331,48 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&h0, &h1));
     }
 
+    fn frame_declaration() -> GraphTransformConfig {
+        GraphTransformConfig {
+            vable_fields: vec![
+                VirtualizableFieldDescriptor::new("pycode", Some("Frame".into()), 1),
+                VirtualizableFieldDescriptor::new("last_instr", Some("Frame".into()), 0),
+                VirtualizableFieldDescriptor::new("depth", Some("Other".into()), 0),
+            ],
+            vable_arrays: vec![VirtualizableFieldDescriptor::new(
+                "stack",
+                Some("Frame".into()),
+                0,
+            )],
+            ..GraphTransformConfig::default()
+        }
+    }
+
     #[test]
-    fn codewriter_vinfo_for_vtype_matches_pyframe_fields() {
-        let vinfo = codewriter_vinfo_for_vtype("PyFrame").expect("PyFrame handle");
-        assert_eq!(vinfo.vtype_name(), Some("PyFrame"));
-        assert!(vinfo.has_static_field("last_instr"));
-        assert!(vinfo.has_static_field("debugdata"));
-        assert!(vinfo.has_array_field("locals_cells_stack_w"));
-        assert!(
-            !vinfo.has_static_field("w_globals"),
-            "w_globals is not a frame field after frame_stores_global"
-        );
-        assert!(codewriter_vinfo_for_vtype("Plain").is_none());
+    fn codewriter_vinfo_from_config_takes_the_fields_declared_on_the_vtype() {
+        let config = frame_declaration();
+        let vinfo = codewriter_vinfo_from_config("Frame", &config).expect("Frame handle");
+        assert_eq!(vinfo.vtype_name(), Some("Frame"));
+        assert_eq!(vinfo.static_field_index("last_instr"), Some(0));
+        assert_eq!(vinfo.static_field_index("pycode"), Some(1));
+        assert!(vinfo.has_array_field("stack"));
+        assert!(!vinfo.has_static_field("depth"));
+        assert!(codewriter_vinfo_from_config("interp::frame::Frame", &config).is_some());
+        assert!(codewriter_vinfo_from_config("OtherFrame", &config).is_none());
+        assert!(codewriter_vinfo_from_config("Plain", &config).is_none());
     }
 
     #[test]
     fn get_vinfo_by_owner_finds_the_codewriter_handle() {
         let mut cc = cc_with_one_driver();
-        cc.jitdrivers_sd[0].virtualizable_info = codewriter_vinfo_for_vtype("PyFrame");
-        let got = cc.get_vinfo_by_owner("PyFrame").expect("owner match");
-        assert_eq!(got.vtype_name(), Some("PyFrame"));
+        cc.jitdrivers_sd[0].virtualizable_info =
+            codewriter_vinfo_from_config("Frame", &frame_declaration());
+        let got = cc.get_vinfo_by_owner("Frame").expect("owner match");
+        assert_eq!(got.vtype_name(), Some("Frame"));
         assert_eq!(got.static_field_index("pycode"), Some(1));
         assert!(cc.get_vinfo_by_owner("ExecutionContext").is_none());
-        assert!(
-            cc.get_vinfo_by_owner("pyre_interpreter::pyframe::PyFrame")
-                .is_some()
-        );
-        assert!(cc.get_vinfo_by_owner("Frame").is_none());
-        assert!(cc.get_vinfo_by_owner("NotPyFrame").is_none());
+        assert!(cc.get_vinfo_by_owner("interp::frame::Frame").is_some());
+        assert!(cc.get_vinfo_by_owner("OtherFrame").is_none());
+        assert!(cc.get_vinfo_by_owner("NotFrame").is_none());
     }
 
     #[test]
