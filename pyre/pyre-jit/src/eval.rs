@@ -5746,6 +5746,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
         for addr in [
             list::jit_drain_list_append as *const () as usize as i64,
             pyre_object::object_array::jit_ll_arraymove as *const () as usize as i64,
+            pyre_object::object_array::jit_ll_arraycopy as *const () as usize as i64,
             crate::call_jit::bh_set_current_exception as *const () as usize as i64,
             crate::call_jit::bh_clear_in_flight_exception as *const () as usize as i64,
             pyre_interpreter::jit_setitem as *const () as usize as i64,

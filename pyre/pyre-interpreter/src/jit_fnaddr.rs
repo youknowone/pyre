@@ -500,6 +500,24 @@ fn cpa4<A1: ResidualSlot, A2: ResidualSlot, A3: ResidualSlot, A4: ResidualSlot, 
 }
 
 #[inline]
+fn cpa5<
+    A1: ResidualSlot,
+    A2: ResidualSlot,
+    A3: ResidualSlot,
+    A4: ResidualSlot,
+    A5: ResidualSlot,
+    R: ResidualRet,
+>(
+    entries: &mut Vec<(&'static str, i64)>,
+    module_path: &'static str,
+    root_path: &'static str,
+    f: extern "C" fn(A1, A2, A3, A4, A5) -> R,
+) {
+    push_raw_fnaddr(entries, module_path, f as *const ());
+    push_raw_fnaddr(entries, root_path, f as *const ());
+}
+
+#[inline]
 fn cpa7<
     A1: ResidualSlot,
     A2: ResidualSlot,
@@ -3208,6 +3226,90 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::object_array::jit_ll_arraymove",
         "pyre_object::jit_ll_arraymove",
         pyre_object::object_array::jit_ll_arraymove,
+    );
+    // `rgc.ll_arraycopy` / `list.ll_arraycopy` keeps PyPy's five-argument
+    // residual ABI. `_handle_list_call` retargets the oopspec residual to
+    // `["jit_ll_arraycopy"]`.
+    cpa5(
+        &mut entries,
+        "pyre_object::object_array::jit_ll_arraycopy",
+        "pyre_object::jit_ll_arraycopy",
+        pyre_object::object_array::jit_ll_arraycopy,
+    );
+    // `ll_math.py math_hypot` llexternal.  The front retargets Opaque
+    // `f64::hypot` to `["ll_math", "math_hypot"]`; the crate-root alias
+    // leaf strips to that path.
+    cpa2(
+        &mut entries,
+        "ll_math::math_hypot",
+        "math_hypot",
+        crate::module::math::interp_math::jit_math_hypot,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_atan2",
+        "math_atan2",
+        crate::module::math::interp_math::jit_math_atan2,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_copysign",
+        "math_copysign",
+        crate::module::math::interp_math::jit_math_copysign,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_floor",
+        "math_floor",
+        crate::module::math::interp_math::jit_math_floor_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_ceil",
+        "math_ceil",
+        crate::module::math::interp_math::jit_math_ceil_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_log",
+        "math_log",
+        crate::module::math::interp_math::jit_math_log_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_exp",
+        "math_exp",
+        crate::module::math::interp_math::jit_math_exp_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_sin",
+        "math_sin",
+        crate::module::math::interp_math::jit_math_sin_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_cos",
+        "math_cos",
+        crate::module::math::interp_math::jit_math_cos_raw,
+    );
+    cpa2(
+        &mut entries,
+        "ll_math::math_pow",
+        "math_pow",
+        crate::module::math::interp_math::jit_math_pow_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_sqrt",
+        "math_sqrt",
+        crate::module::math::interp_math::jit_math_sqrt_raw,
+    );
+    cpa1(
+        &mut entries,
+        "ll_math::math_log10",
+        "math_log10",
+        crate::module::math::interp_math::jit_math_log10_raw,
     );
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /

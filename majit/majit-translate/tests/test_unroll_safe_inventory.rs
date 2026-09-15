@@ -238,6 +238,23 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "_orig_str_join_many_items",
         "rlib/jit.py look_inside_iff unroll_safe(_str_join_many_items)",
     ),
+    // `error.py OperationError.normalize_exception` is `@jit.unroll_safe`.
+    // Both pyre methods that share this leaf (the throw-surface table and
+    // the `PyError` materialiser) are loop-free, so `look_inside_graph`
+    // already admits them; the hint is the upstream decorator, not a
+    // descent-scope change.
+    (
+        "normalize_exception",
+        "error.py OperationError.normalize_exception",
+    ),
+    // `pyframe.py dropvaluesuntil` is `@jit.unroll_safe` and promotes
+    // `finaldepth`. The exception-table handler calls it after
+    // `lookup_exceptiontable`; without the hint the stack-clear loop is
+    // one residual. Measured on this branch after the hint landed:
+    // `exception_reraise_tb_depth_jitstress` at N=200 stayed under its
+    // 4x pypy gate on dynasm/cranelift/wasm, and the three-backend
+    // snapshot was re-recorded.
+    ("dropvaluesuntil", "pyframe.py dropvaluesuntil"),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

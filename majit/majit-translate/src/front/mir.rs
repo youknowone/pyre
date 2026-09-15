@@ -8892,13 +8892,17 @@ impl<'a> Lowering<'a> {
         // `call.func`.  This is the same two-source type test used for
         // `SliceIndex::index` below and keeps Range* implementations on the
         // separate getslice lowering.
-        let (slice_get_index_is_scalar, slice_get_element) = match &call.func {
+        let (slice_get_index_is_scalar, slice_get_element, slice_first_element) = match &call.func {
             CallFunc::Regular(reg) => {
                 let scalar = self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref());
                 let element = scalar.then(|| self.slice_get_element(reg)).flatten();
-                (scalar, element)
+                // `first` / `last` share `get`'s `T` generic; the same
+                // ARRAY identity / thin-pointer proof feeds their
+                // `ArrayRead`.
+                let first_element = self.slice_get_element(reg);
+                (scalar, element, first_element)
             }
-            _ => (false, None),
+            _ => (false, None, None),
         };
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
@@ -10518,6 +10522,32 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::UnaryOp {
                             op: "abs".to_string(),
                             operand: args[0].clone(),
+                            result_ty: ValueType::Float,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Opaque `f64::{hypot,atan2,copysign,floor,ceil,powf,ln,
+                // exp,sin,cos,sqrt,log10}` are the C llexternals in
+                // `ll_math.py` (`math_hypot`, …).  The raising wrappers
+                // (`ll_math_hypot`, …) stay around them.
+                if let Some((arity, leaf)) = self.f64_ll_math_leaf(&reg)
+                    && args.len() == arity
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["ll_math".to_string(), leaf.to_string()],
+                            },
+                            args: crate::model::call_args(args.iter().cloned()),
                             result_ty: ValueType::Float,
                         },
                     });
@@ -12669,8 +12699,9 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && fmt_path_ends_with(segments, &["slice", "<Impl>", "first"])
-            && let Some(site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
+            self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
             self.slice_first_sites.push(site);
         }
         // `<[T]>::last(slice)` is `first` with index `len-1` and the
@@ -12685,6 +12716,7 @@ impl<'a> Lowering<'a> {
             && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
         {
             site.access = crate::front::slice_first::SliceAccess::Last;
+            self.annotate_slice_first_site(&mut site, &arg_locals, slice_first_element.clone());
             self.slice_first_sites.push(site);
         }
         // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
@@ -14750,6 +14782,33 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
     }
 
+    /// Opaque `f64` math leaves that `ll_math.py` registers as C
+    /// llexternals.  Returns `(arity, math_* leaf)`.
+    fn f64_ll_math_leaf(&self, reg: &RegularCall) -> Option<(usize, &'static str)> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        let leaf = path
+            .strip_prefix("core::f64::<Impl>::")
+            .or_else(|| path.strip_prefix("std::f64::<Impl>::"))?;
+        Some(match leaf {
+            "hypot" => (2, "math_hypot"),
+            "atan2" => (2, "math_atan2"),
+            "copysign" => (2, "math_copysign"),
+            "powf" => (2, "math_pow"),
+            "floor" => (1, "math_floor"),
+            "ceil" => (1, "math_ceil"),
+            "ln" => (1, "math_log"),
+            "exp" => (1, "math_exp"),
+            "sin" => (1, "math_sin"),
+            "cos" => (1, "math_cos"),
+            "sqrt" => (1, "math_sqrt"),
+            "log10" => (1, "math_log10"),
+            _ => return None,
+        })
+    }
+
     /// `f64::is_finite(self)` — `core` has no graph body (Opaque), so the
     /// callsite would skip as an unregistered `FunctionPath`.  `is_finite`
     /// is `(x - x) == 0.0`: finite `x` gives `0.0 == 0.0` = true, while ±inf
@@ -15683,7 +15742,33 @@ impl<'a> Lowering<'a> {
             payload_ty,
             niche,
             payload_narrow_root,
+            array_type_id: None,
+            string_byte_view: false,
         })
+    }
+
+    /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
+    /// `as_bytes()` aliases the receiver to the `StringRepr`, so the
+    /// successful arm must emit `__string_byte_getitem`; any other
+    /// proven element spelling rides on `array_type_id` the way
+    /// [`Self::recognize_slice_get_site`] does.
+    fn annotate_slice_first_site(
+        &self,
+        site: &mut crate::front::slice_first::SliceFirstSite,
+        arg_locals: &[Option<usize>],
+        element: Option<(ValueType, Option<String>)>,
+    ) {
+        let string_byte_view = arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        if string_byte_view {
+            site.string_byte_view = true;
+            site.array_type_id = None;
+        } else if let Some((_item_ty, array_type_id)) = element {
+            site.array_type_id = array_type_id;
+        }
     }
 
     /// Resolve a recognized `<[T]>::get(slice, i)` call into a

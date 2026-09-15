@@ -501,6 +501,44 @@ jit_raw2!(jit_math_copysign, copysign);
 jit_raw2!(jit_math_remainder, remainder);
 jit_raw2!(jit_math_atan2, atan2);
 
+/// `ll_math.py math_hypot` — the C `hypot` llexternal, not the raising
+/// `ll_math_hypot` wrapper.  Two finite arguments that overflow return
+/// +inf; the wrapper (and `complex_abs`) turn that into OverflowError.
+pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
+    x.hypot(y)
+}
+
+/// `ll_math.py` C llexternals for Opaque
+/// `f64::{ln,exp,sin,cos,powf,sqrt,log10}`.
+/// IEEE, no raise — the `ll_math_*` wrappers stay around them.
+pub extern "C" fn jit_math_log_raw(x: f64) -> f64 {
+    x.ln()
+}
+
+pub extern "C" fn jit_math_exp_raw(x: f64) -> f64 {
+    x.exp()
+}
+
+pub extern "C" fn jit_math_sin_raw(x: f64) -> f64 {
+    x.sin()
+}
+
+pub extern "C" fn jit_math_cos_raw(x: f64) -> f64 {
+    x.cos()
+}
+
+pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {
+    x.powf(y)
+}
+
+pub extern "C" fn jit_math_sqrt_raw(x: f64) -> f64 {
+    x.sqrt()
+}
+
+pub extern "C" fn jit_math_log10_raw(x: f64) -> f64 {
+    x.log10()
+}
+
 /// Raw `math.isclose(a, b)` with both keyword tolerances left at their
 /// defaults, `rel_tol=1e-09` and `abs_tol=0.0`.
 ///

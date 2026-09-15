@@ -599,8 +599,29 @@ fn read_stdin_source() -> std::io::Result<String> {
 const INTERPRETER_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// Stack reserved outright for a spawned interpreter thread.
-#[cfg(not(any(target_os = "linux", feature = "sandbox")))]
+#[cfg(not(feature = "sandbox"))]
 const INTERPRETER_THREAD_STACK_SIZE: usize = 256 * 1024 * 1024;
+
+/// Size of the current thread's mapped stack, or 0 if it cannot be read.
+///
+/// `setrlimit(RLIMIT_STACK)` succeeding does not mean the stack can grow:
+/// a container, systemd `LimitSTACK`, or a VM can leave the mapping at
+/// the process default (~8 MiB). Announcing a 20 MiB byte budget against
+/// that mapping puts the RecursionError guard past the guard page.
+#[cfg(target_os = "linux")]
+fn mapped_thread_stack_size() -> usize {
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return 0;
+        }
+        let mut addr = std::ptr::null_mut();
+        let mut size = 0usize;
+        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        if rc == 0 { size } else { 0 }
+    }
+}
 
 pub fn main_entry(binary_name: &'static str) {
     configure_root_only_jit_stats();
@@ -646,15 +667,39 @@ pub fn main_entry(binary_name: &'static str) {
         // to `getrlimit`.
         let granted =
             pyre_interpreter::stack_check::raise_main_thread_stack_limit(INTERPRETER_STACK_SIZE);
-        let budget = if granted >= pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
-        {
-            pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
+        let mapped = mapped_thread_stack_size();
+        let usable = if mapped == 0 {
+            granted
         } else {
-            0
+            granted.min(mapped)
         };
-        pyre_interpreter::stack_check::configure_current_thread_stack_size(budget);
-        real_main(binary_name);
-        post_run_diagnostics();
+        // Capture the inherited mask before either path so `real_main`'s
+        // unblock restores signals the caller had blocked, instead of
+        // opening SIGINT/SIGALRM unconditionally.
+        pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
+        if usable >= pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE {
+            pyre_interpreter::stack_check::configure_current_thread_stack_size(
+                pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
+            );
+            real_main(binary_name);
+            post_run_diagnostics();
+        } else {
+            // The soft limit went up but the mapping did not. Same situation
+            // as darwin: reserve a thread whose stack is actually that large,
+            // and route process-directed signals onto that thread.
+            std::thread::Builder::new()
+                .stack_size(INTERPRETER_THREAD_STACK_SIZE)
+                .spawn(move || {
+                    pyre_interpreter::stack_check::configure_current_thread_stack_size(
+                        pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
+                    );
+                    real_main(binary_name);
+                    post_run_diagnostics();
+                })
+                .expect("spawn interpreter thread")
+                .join()
+                .unwrap();
+        }
     }
 
     // Block async signals on this (the process's original) thread so the
@@ -755,11 +800,10 @@ fn real_main(binary_name: &str) {
     }
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
-    // alarms.  Only the hosts that spawn an interpreter thread route them;
-    // where the interpreter is the process's original thread the kernel
-    // already delivers them here, and the sandboxed child does not touch the
-    // signal mask at all.
-    #[cfg(not(any(target_os = "linux", feature = "sandbox")))]
+    // alarms.  Hosts that stay on the original thread already receive them
+    // here; `unblock` is then a no-op.  The sandboxed child does not touch
+    // the signal mask at all.
+    #[cfg(not(feature = "sandbox"))]
     pyre_interpreter::module::signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for the optimizer's silent control-flow panics
     // (InvalidLoop, SpeculativeError) — these are caught by catch_unwind in
