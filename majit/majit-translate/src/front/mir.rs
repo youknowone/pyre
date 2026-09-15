@@ -11476,8 +11476,11 @@ impl<'a> Lowering<'a> {
                 }
                 // `Wtf8::len` is `len(s)` / `ll_strlen`.  After `as_bytes()`
                 // the same length is `Rvalue::Len`; this arm covers the
-                // inherent method on the Wtf8 receiver itself.
+                // inherent method on the Wtf8 receiver itself.  Only a
+                // marked string-byte-view is a `W_UnicodeObject`; a host
+                // `&Wtf8` stays residual.
                 if args.len() == 1
+                    && first_arg_is_string_byte_view
                     && (fmt_path_ends_with(&segments, &["Wtf8", "len"])
                         || fmt_path_ends_with(&segments, &["rustpython_wtf8", "Wtf8", "len"]))
                 {
