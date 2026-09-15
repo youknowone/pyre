@@ -3714,17 +3714,22 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
         && ops.iter().any(|op| op.opcode == OpCode::NewWithVtable)
         && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR);
     // leftover=[] GETFIELD safety does not wait for a listiter type
-    // word: `from_callee` / lineno_chain never create one, and
-    // leftover-empty GETFIELD of a mint past the live array SIGSEGVs
-    // before any FOR_ITER leftover exists.
+    // word: `from_callee` / lineno_chain never create one. Dualtape
+    // leftover=[] GETFIELD is a non-PyFrame vable and must stay
+    // (`jit_tier_liveness_gate` COMPILES=0 if we abort it).
+    let leftover_empty_pyframe = vinfo
+        .static_fields
+        .iter()
+        .any(|f| f.name == "valuestackdepth");
     let leftover_empty_unsafe = leftover_empty_unmapped_extras
-        || leftover_empty_mint_past_live
-        || leftover_empty_peeled_traceback
-        || leftover_empty_tos_is_frame
-        || leftover_empty_traceback_tos
-        || leftover_empty_mint_holds_frame
-        || leftover_empty_short_tos_call
-        || leftover_empty_survey_new;
+        || (leftover_empty_pyframe
+            && (leftover_empty_mint_past_live
+                || leftover_empty_peeled_traceback
+                || leftover_empty_tos_is_frame
+                || leftover_empty_traceback_tos
+                || leftover_empty_mint_holds_frame
+                || leftover_empty_short_tos_call
+                || leftover_empty_survey_new));
     if leftover_empty_unsafe
         || (leftover_has_listiter_id()
             && (listiter_leftover
