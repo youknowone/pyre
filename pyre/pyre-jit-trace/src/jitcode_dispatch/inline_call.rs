@@ -14254,6 +14254,35 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 ///   this helper because the codewriter doesn't emit a `dR>f` shape
 ///   (float return paths use the `dIRF` arglist family).
 ///
+/// Pin a `&str` slice's ptr/len ints before a named getattr/setattr fold
+/// bakes those bytes into the specialization.
+fn guard_concrete_int_slice<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    int_args: &[OpRef],
+    int_concretes: &[ConcreteValue],
+) -> Result<(), DispatchError> {
+    for (opref, concrete) in int_args.iter().zip(int_concretes).take(2) {
+        if opref.is_constant() {
+            continue;
+        }
+        let ConcreteValue::Int(value) = *concrete else {
+            continue;
+        };
+        let expected = ctx.trace_ctx.const_int(value);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            majit_ir::OpCode::GuardValue,
+            &[*opref, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(*opref, expected);
+    }
+    Ok(())
+}
+
 /// Fold `space.getattr` / `getattr_str` or residualize the helper.
 /// Never descend the MRO body: that graph is the whole attribute
 /// protocol and a declined walk grows without bound.
@@ -15186,6 +15215,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 ref_args.first().copied()
             };
             let folded = if let (Some(obj), Some(name)) = (obj, str_name.as_deref()) {
+                guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
                 super::specialize::try_fold_inline_getattr_named(
                     ctx, op.pc, obj, name, dst, dst_bank,
                 )?
@@ -15231,6 +15261,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
             let folded =
                 if let (Some(obj), Some(value), Some(name)) = (obj, value, str_name.as_deref()) {
+                    guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
                     matches!(
                         spec_gate_store_attr(|| {
                             super::specialize::try_walker_specialize_store_attr_named(
