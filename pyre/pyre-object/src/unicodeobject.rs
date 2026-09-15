@@ -324,11 +324,12 @@ pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
 /// `space.newutf8(utf8str, length)` — wrap a `STR` payload with an
 /// explicit code-point count (`W_UnicodeObject.__init__`).
 ///
-/// Look-inside: `newutf8` is the one-line constructor, so the generated
-/// JIT records `malloc_typed_managed` as `NewWithVtable` plus the `_utf8`
-/// / `_length` stores.  `malloc_typed_managed` is the movable GC malloc
-/// `fuse_boxing_alloc` rewrites; the nursery hook does not collect, so
-/// the payload pointer stays valid across the header alloc.
+/// Residual wrap: the walker descends this body (`NewWithVtable` + field
+/// stores) when the generated graph is not looked inside.  Looking inside
+/// the constructor currently feeds `stroruni.*` a non-`rpy_string` first
+/// argument (`jtransform.py` asserts STR/UNICODE).  Unseal once `Utf8Str`
+/// types as `Ptr(STR)` through that oopspec.
+#[majit_macros::dont_look_inside]
 pub fn w_str_from_storage_and_length(
     value: *mut UnicodeValueStorage,
     length: usize,
@@ -1744,12 +1745,14 @@ pub unsafe fn w_str_next_codepoint_pos_dont_look_inside(obj: PyObjectRef, pos: u
 /// `ll_stringslice_startstop` (`@jit.oopspec('stroruni.slice')`); the
 /// wrap is `space.newutf8`.
 ///
-/// Look-inside: the generated JIT records that split.  The walker
-/// descends this body instead of emitting `jit_str_getitem`.
+/// Residual: the walker folds exact-str getitem.  Looking inside this
+/// body currently hits `stroruni.slice` with a first argument whose
+/// concretetype is not `rpy_string`.  Unseal with the wrap helper.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_UnicodeObject`.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_str_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
     let len = unsafe { w_str_len(obj) } as i64;
     let idx = if index < 0 { index + len } else { index };

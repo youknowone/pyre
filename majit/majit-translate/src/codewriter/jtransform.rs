@@ -10213,7 +10213,11 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
         return StrOrUniKind::Other;
     };
     match s._name.as_str() {
-        "rpy_string" => StrOrUniKind::Str,
+        // `rstr.py STR` plus the Rust spellings bookkeeper maps to it
+        // (`Utf8Str` is `W_UnicodeObject._utf8`).
+        "rpy_string" | "Utf8Str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "String" => {
+            StrOrUniKind::Str
+        }
         "rpy_unicode" => StrOrUniKind::Unicode,
         "rpy_bytearray" => StrOrUniKind::ByteArray,
         _ => StrOrUniKind::Other,

@@ -470,6 +470,8 @@ pub fn codepoint_index_at_byte_position(
 /// `@always_inline` methods wrap a rbuilder `StringBuilder` (`_s`) and a
 /// code-point counter (`_lgt`).  `pyopcode.py BUILD_STRING` is
 /// `append_utf8` + `space.newutf8(builder.build(), builder.getlength())`.
+/// The rbuilder helpers residualise when jitted (`rbuilder.py ll_append`
+/// / `ll_build`); these wrappers stay look-inside like upstream.
 pub struct Utf8StringBuilder {
     _s: i64,
     _lgt: i64,
