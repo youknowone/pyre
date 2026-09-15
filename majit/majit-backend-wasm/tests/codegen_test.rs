@@ -6418,7 +6418,7 @@ fn an_inlined_preamble_region_observes_later_token_invalidation() {
             &[OpRef::input_arg_int(10)],
         ),
     );
-    let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).unwrap();
+    let (bytes, _, _) = codegen::build_wasm_module(&inputs).unwrap();
     validate_wasm(&bytes);
     let engine = Engine::default();
     let module = Module::new(&engine, &bytes).unwrap();
