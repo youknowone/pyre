@@ -5277,16 +5277,17 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
 }
 
 /// JIT residual view of [`gcd_import_cache_probe`]: the initialized
-/// `sys.modules` entry, or `None` on every `FastPathGiveUp` case.
+/// `sys.modules` entry, `Ok(None)` on every `FastPathGiveUp` case, or
+/// `Err` when `_gcd_import` would re-raise (`interp_import.py` keeps
+/// non-`AttributeError` from `__spec__` / `_initializing`).
 ///
-/// Does not wait and does not raise.  The compiled `jit_import_cached`
-/// residual is `cannot_raise`; a still-initializing module side-exits to
-/// the original `IMPORT_NAME`, which runs `dunder_import` (including the
-/// 3.14 wait).
-pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
-    match gcd_import_cache_probe(name) {
-        Ok(GcdCache::Ready(w_module)) => Some(w_module),
-        _ => None,
+/// Does not wait.  A still-initializing module is `Ok(None)` so the
+/// compiled residual's `GuardValue` side-exits to `IMPORT_NAME`, which
+/// runs `dunder_import` (including the 3.14 wait).
+pub fn sys_module_if_initialized(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match gcd_import_cache_probe(name)? {
+        GcdCache::Ready(w_module) => Ok(Some(w_module)),
+        _ => Ok(None),
     }
 }
 
