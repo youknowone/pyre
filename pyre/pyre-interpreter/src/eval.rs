@@ -2201,12 +2201,12 @@ pub fn handle_exception_with_context(
         None
     } else {
         let pc_bytes = (frame.last_instr as u32) * 2;
-        unsafe {
+        crate::pycode::unpack_exceptiontable_lookup(unsafe {
             crate::pycode::w_code_lookup_exceptiontable(
                 frame.pycode as pyre_object::PyObjectRef,
                 pc_bytes,
             )
-        }
+        })
     };
     let pc_units = if frame.last_instr < 0 {
         0u32

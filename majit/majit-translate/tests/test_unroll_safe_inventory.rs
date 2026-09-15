@@ -259,6 +259,20 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // Loop-free, so `look_inside_graph` already admits it; the hint is
     // the upstream decorator, not a descent-scope change.
     ("run_trace_func", "executioncontext.py run_trace_func"),
+    // `pyframe.py` stack helpers and scope init are `@jit.unroll_safe`.
+    // Each has a loop over n / cells; without the hint `look_inside_graph`
+    // residualizes the whole helper. Descent-scope change matching upstream.
+    ("popvalues", "pyframe.py popvalues"),
+    ("popvalues_mutable", "pyframe.py popvalues_mutable"),
+    ("peekvalues", "pyframe.py peekvalues"),
+    ("dropvalues", "pyframe.py dropvalues"),
+    ("pushrevvalues", "pyframe.py pushrevvalues"),
+    ("dupvalues", "pyframe.py dupvalues"),
+    (
+        "initialize_frame_scopes",
+        "pyframe.py initialize_frame_scopes",
+    ),
+    ("locals2fast", "pyframe.py locals2fast"),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

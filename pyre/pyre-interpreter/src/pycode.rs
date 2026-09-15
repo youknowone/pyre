@@ -4304,23 +4304,52 @@ pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
 ///
 /// `pycode.py PyCode.lookup_exceptiontable` is `@jit.elidable`.
 ///
+/// The residual ABI is one register. Pack the handler as
+/// `(target << 32) | (depth << 1) | lasti`; `-1` is no handler.
+///
 /// # Safety
 /// `obj` must point to a valid `PyCode`.
 #[inline]
 #[majit_macros::elidable]
-pub unsafe fn w_code_lookup_exceptiontable(
-    obj: PyObjectRef,
-    instr_offset: u32,
-) -> Option<(u32, u32, bool)> {
+pub extern "C" fn w_code_lookup_exceptiontable(obj: PyObjectRef, instr_offset: u32) -> i64 {
     if obj.is_null() {
-        return None;
+        return pack_exceptiontable_lookup(None);
     }
     let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
     if code_ptr.is_null() {
-        return None;
+        return pack_exceptiontable_lookup(None);
     }
     let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
-    crate::pycode::lookup_exceptiontable(&code.exceptiontable, instr_offset)
+    pack_exceptiontable_lookup(crate::pycode::lookup_exceptiontable(
+        &code.exceptiontable,
+        instr_offset,
+    ))
+}
+
+/// No handler: `-1`. A hit cannot collide because `target`/`depth` are
+/// non-negative bytecode/stack quantities.
+pub const EXCEPTIONTABLE_LOOKUP_NONE: i64 = -1;
+
+pub fn pack_exceptiontable_lookup(hit: Option<(u32, u32, bool)>) -> i64 {
+    match hit {
+        None => EXCEPTIONTABLE_LOOKUP_NONE,
+        Some((target, depth, lasti)) => {
+            debug_assert!(depth < (1u32 << 31));
+            ((target as i64) << 32) | ((depth as i64) << 1) | i64::from(lasti)
+        }
+    }
+}
+
+pub fn unpack_exceptiontable_lookup(packed: i64) -> Option<(u32, u32, bool)> {
+    if packed < 0 {
+        None
+    } else {
+        Some((
+            (packed as u64 >> 32) as u32,
+            (packed as u64 >> 1) as u32,
+            packed & 1 != 0,
+        ))
+    }
 }
 
 /// pycode.py `self.co_exceptiontable = exceptiontable` — copy the
@@ -4630,6 +4659,25 @@ pub unsafe fn is_code(obj: PyObjectRef) -> bool {
 mod tests {
     use super::*;
     use crate::compile_exec;
+
+    #[test]
+    fn exceptiontable_lookup_pack_roundtrip() {
+        assert_eq!(
+            unpack_exceptiontable_lookup(pack_exceptiontable_lookup(None)),
+            None
+        );
+        let hit = Some((100, 3, true));
+        assert_eq!(
+            unpack_exceptiontable_lookup(pack_exceptiontable_lookup(hit)),
+            hit
+        );
+        let zero = Some((0, 0, false));
+        assert_eq!(
+            unpack_exceptiontable_lookup(pack_exceptiontable_lookup(zero)),
+            zero
+        );
+        assert_eq!(pack_exceptiontable_lookup(None), EXCEPTIONTABLE_LOOKUP_NONE);
+    }
 
     /// Build a minimal varint-encoded exception table from `(start, length,
     /// target, depth, lasti)` tuples, mirroring the encoding produced by
