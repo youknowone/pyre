@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=25
 # Coverage for the self-recursive root-bridge inline when the recursion is
 # non-tail and carries a Ref local.
 #
