@@ -5081,6 +5081,7 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_reloads_listiter_from_live_tos() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
         // leftover ListIter must GETARRAYITEM(valuestackdepth - 1), not a
         // baked locals slot (field 26 = `_compile.p` under expanded-tail).
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
@@ -5189,6 +5190,7 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_reloads_listiter_from_inlined_callee_tos() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
         // Portal TOS is the inlined `_compile` frame. leftover-empty
         // must GETARRAYITEM that frame's TOS, not use the frame as
         // the iterator (`'frame' object is not an iterator`).
@@ -5292,6 +5294,7 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_peels_inlined_compile_box_not_portal() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
         // leftover-empty must leftover_peel_tos the inlined `_compile`
         // box (a body New/Getfield), not the portal red.
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
@@ -5402,6 +5405,7 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_reloads_foriter_residual_from_live_tos() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
         // Specialize declined: leftover is the ForIterNext residual arg,
         // not a Getfield(seq). Still reload live TOS.
         let mut vinfo = crate::virtualizable::VirtualizableInfo::new(0);
@@ -5484,6 +5488,7 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_reloads_foriter_at_peeled_portal_tos() {
+        let _guard = PEEL_TEST_LOCK.lock().unwrap();
         // Portal TOS index equals the leftover field (`InputArg(6)` =
         // prefix+n_static+0). After a peel that slot is the callee
         // frame; leftover must follow the inner TOS, not stay on
