@@ -578,17 +578,55 @@ fn int_could_be_an_address(x: i64) -> bool {
     !(-32768..=32767).contains(&x)
 }
 
-/// `str(float)` spelling: `1.0` / `-0.0`, not Rust's `1` / `-0`.
+/// `str(float)` spelling from `rjitlog.py var_to_str` (`str(arg.getfloat())`).
+///
+/// Rust `f64::to_string()` writes `NaN`, omits `.0` on integrals, and keeps
+/// fixed form past Python's `1e16` / `1e-4` switch. Match CPython's
+/// lowercase non-finites, signed two-digit exponents, and those thresholds.
 fn python_float_str(v: f64) -> String {
-    if v == 0.0 && v.is_sign_negative() {
-        return "-0.0".into();
+    if v.is_nan() {
+        return "nan".into();
+    }
+    if !v.is_finite() {
+        return if v.is_sign_negative() {
+            "-inf".into()
+        } else {
+            "inf".into()
+        };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
+    }
+    let abs = v.abs();
+    if abs >= 1e16 || abs < 1e-4 {
+        return python_scientific_str(v);
     }
     let s = v.to_string();
-    if v.is_finite() && !s.contains('.') && !s.contains('e') && !s.contains('E') {
-        format!("{s}.0")
-    } else {
+    if s.contains('.') || s.contains('e') || s.contains('E') {
         s
+    } else {
+        format!("{s}.0")
     }
+}
+
+fn python_scientific_str(v: f64) -> String {
+    let sign = if v.is_sign_negative() { "-" } else { "" };
+    let abs = v.abs();
+    let mut exp = abs.log10().floor() as i32;
+    let mut mant = abs / 10f64.powi(exp);
+    if mant >= 10.0 {
+        mant /= 10.0;
+        exp += 1;
+    } else if mant < 1.0 {
+        mant *= 10.0;
+        exp -= 1;
+    }
+    let mant_s = mant.to_string();
+    format!("{sign}{mant_s}e{exp:+03}")
 }
 
 /// `rjitlog.py encode_str`.
@@ -694,7 +732,16 @@ mod tests {
     fn float_constants_keep_python_spelling() {
         assert_eq!(python_float_str(1.0), "1.0");
         assert_eq!(python_float_str(-0.0), "-0.0");
+        assert_eq!(python_float_str(0.0), "0.0");
         assert_eq!(python_float_str(1.5), "1.5");
+        assert_eq!(python_float_str(1e16), "1e+16");
+        assert_eq!(python_float_str(1e15), "1000000000000000.0");
+        assert_eq!(python_float_str(1e-4), "0.0001");
+        assert_eq!(python_float_str(1e-5), "1e-05");
+        assert_eq!(python_float_str(1e20), "1e+20");
+        assert_eq!(python_float_str(f64::INFINITY), "inf");
+        assert_eq!(python_float_str(f64::NEG_INFINITY), "-inf");
+        assert_eq!(python_float_str(f64::NAN), "nan");
         let mut memo = VarMemo::default();
         assert_eq!(
             memo.operand(&Operand::const_from_value(Value::Float(1.0))),

@@ -6860,15 +6860,26 @@ fn portal_unique_id_from_greens(greens: &[i64]) -> i64 {
 }
 
 /// `pypy.tool.stdlib_opcode.opcode_method_names` — `LOAD_FAST`, not
-/// the Debug payload of the instruction enum.
+/// the Debug payload of the instruction enum. Digit suffixes stay
+/// underscored (`CallIntrinsic1` → `CALL_INTRINSIC_1`).
 fn opcode_method_name(instruction: pyre_interpreter::Instruction) -> String {
-    let debug = format!("{:?}", instruction.as_opcode());
+    screaming_snake_opcode(&format!("{:?}", instruction.as_opcode()))
+}
+
+fn screaming_snake_opcode(debug: &str) -> String {
     let mut out = String::with_capacity(debug.len() + 4);
-    for (i, ch) in debug.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
+    let mut prev: Option<char> = None;
+    for ch in debug.chars() {
+        let split = match prev {
+            Some(p) if ch.is_uppercase() && (p.is_lowercase() || p.is_ascii_digit()) => true,
+            Some(p) if ch.is_ascii_digit() && p.is_ascii_alphabetic() => true,
+            _ => false,
+        };
+        if split {
             out.push('_');
         }
         out.extend(ch.to_uppercase());
+        prev = Some(ch);
     }
     out
 }
@@ -15299,6 +15310,17 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opcode_method_name_underscores_numeric_suffixes() {
+        assert_eq!(screaming_snake_opcode("LoadFast"), "LOAD_FAST");
+        assert_eq!(screaming_snake_opcode("CallIntrinsic1"), "CALL_INTRINSIC_1");
+        assert_eq!(screaming_snake_opcode("CallIntrinsic2"), "CALL_INTRINSIC_2");
+        assert_eq!(
+            screaming_snake_opcode("BinaryOpInplaceAddUnicode"),
+            "BINARY_OP_INPLACE_ADD_UNICODE"
+        );
+    }
 
     #[test]
     fn active_trace_root_walk_skips_unknown_concrete_values() {

@@ -13374,11 +13374,21 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Redirect existing call_assembler calls from one loop to another.
     ///
-    /// x86/assembler.py logs `_ll_raw_start`; aarch64 logs `number`.
-    /// Use the compiled entry when the backend has stored it.
+    /// x86/assembler.py logs `_ll_raw_start`; aarch64 (and the other
+    /// non-x86 assemblers) log `newlooptoken.number`. A compiled
+    /// AArch64 token always has a nonzero `ll_function_addr`, so
+    /// picking the address whenever it exists writes the x86 payload
+    /// on this host.
     fn jitlog_redirect_asm_adr(token: &JitCellToken) -> u64 {
-        let addr = token.ll_function_addr();
-        if addr != 0 { addr as u64 } else { token.number }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let addr = token.ll_function_addr();
+            if addr != 0 { addr as u64 } else { token.number }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            token.number
+        }
     }
 
     /// When a loop is recompiled (e.g., with bridges), existing
