@@ -244,8 +244,22 @@ pub extern "C" fn jit_ll_arraycopy(
         "ll_arraycopy dest_start must be non-negative"
     );
 
-    let source_address = crate::gc_hook::try_gc_current_object_address(source as *mut u8) as usize;
-    let dest_address = crate::gc_hook::try_gc_current_object_address(dest as *mut u8) as usize;
+    // Publish both blocks before any GC hook. The second
+    // `try_gc_current_object_address` and the dest write-barrier can wait
+    // behind a collection; that collection rewrites shadow-stack slots,
+    // not native copies of the ABI arguments.
+    let _roots = crate::gc_roots::push_roots();
+    let source_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(source as crate::pyobject::PyObjectRef);
+    let dest_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(dest as crate::pyobject::PyObjectRef);
+
+    let follow = |slot: usize| {
+        crate::gc_hook::try_gc_current_object_address(
+            crate::gc_roots::shadow_stack_get(slot) as *mut u8
+        ) as usize
+    };
+    let dest_address = follow(dest_slot);
     let fallback = majit_gc::GcVarSizeLayout {
         base_size: ITEMS_BLOCK_TOKEN.base_size,
         item_size: ITEMS_BLOCK_TOKEN.item_size,
@@ -265,8 +279,10 @@ pub extern "C" fn jit_ll_arraycopy(
         .expect("ll_arraycopy byte length overflow");
 
     if dest_layout.items_have_gc_ptrs {
-        crate::gc_hook::try_gc_write_barrier(dest_address as *mut u8);
+        crate::gc_hook::try_gc_write_barrier(follow(dest_slot) as *mut u8);
     }
+    let dest_address = follow(dest_slot);
+    let source_address = follow(source_slot);
     unsafe {
         std::ptr::copy_nonoverlapping(
             (source_address as *const u8).add(source_offset),

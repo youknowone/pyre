@@ -681,7 +681,9 @@ pub fn main_entry(binary_name: &'static str) {
             post_run_diagnostics();
         } else {
             // The soft limit went up but the mapping did not. Same situation
-            // as darwin: reserve a thread whose stack is actually that large.
+            // as darwin: reserve a thread whose stack is actually that large,
+            // and route process-directed signals onto that thread.
+            pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
             std::thread::Builder::new()
                 .stack_size(INTERPRETER_THREAD_STACK_SIZE)
                 .spawn(move || {
@@ -795,11 +797,10 @@ fn real_main(binary_name: &str) {
     }
     // Receive process-directed async signals on this thread (see
     // `main_entry`) so blocking syscalls here are interrupted by Ctrl-C /
-    // alarms.  Only the hosts that spawn an interpreter thread route them;
-    // where the interpreter is the process's original thread the kernel
-    // already delivers them here, and the sandboxed child does not touch the
-    // signal mask at all.
-    #[cfg(not(any(target_os = "linux", feature = "sandbox")))]
+    // alarms.  Hosts that stay on the original thread already receive them
+    // here; `unblock` is then a no-op.  The sandboxed child does not touch
+    // the signal mask at all.
+    #[cfg(not(feature = "sandbox"))]
     pyre_interpreter::module::signal::signalstate::unblock_async_signals_on_interp_thread();
     // Suppress panic messages for the optimizer's silent control-flow panics
     // (InvalidLoop, SpeculativeError) — these are caught by catch_unwind in
