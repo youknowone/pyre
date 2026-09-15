@@ -10416,7 +10416,11 @@ fn live_exception_group_condition(
             ))
         }
         ExceptionGroupCondition::Identity(ref addresses) => {
-            ExceptionGroupCondition::Identity(addresses.clone())
+            let mut live = pyre_object::gc_roots::RootedItems::new();
+            for i in 0..addresses.len() {
+                live.push(addresses.get(i));
+            }
+            ExceptionGroupCondition::Identity(live)
         }
     }
 }
