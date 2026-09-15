@@ -2160,6 +2160,67 @@ impl KnownArrayLengths {
     }
 }
 
+/// `rewrite.py emit_pending_zeros` / `handle_clear_array_contents`.
+///
+/// IncrementalMiniMark is `malloc_zero_filled=false`, so native rewrite
+/// emits `ZERO_ARRAY` only for `NEW_ARRAY_CLEAR` and then trims any
+/// prefix/suffix that later `SETARRAYITEM_GC` writes before the next
+/// collecting op. A fully-written constant-length clear is a no-op
+/// (`ConstInt(0)`). Plain `NEW_ARRAY` never emits `ZERO_ARRAY`.
+///
+/// Wasm skips `GcRewriterImpl.clear_gc_fields` and would otherwise
+/// `memory.fill` every array payload. Apply the same skip so a length-1
+/// list whose only slot is stored in this window does not fill-then-store.
+fn skip_newarray_payload_zero(
+    op: &Op,
+    ops: &[Op],
+    op_idx: usize,
+    constants: &indexmap::IndexMap<u32, i64>,
+    length_const: Option<i64>,
+) -> bool {
+    match op.opcode {
+        OpCode::NewArray => true,
+        OpCode::NewArrayClear => match length_const {
+            Some(0) => true,
+            Some(len) => usize::try_from(len).is_ok_and(|n| {
+                n > 0 && newarray_clear_fully_written(ops, op_idx, op.pos().get(), n, constants)
+            }),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn newarray_clear_fully_written(
+    ops: &[Op],
+    op_idx: usize,
+    array: OpRef,
+    length: usize,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> bool {
+    let mut written = vec![false; length];
+    for later in ops.iter().skip(op_idx + 1) {
+        if later.opcode == OpCode::Label || later.opcode.can_malloc() {
+            break;
+        }
+        if later.opcode != OpCode::SetarrayitemGc {
+            continue;
+        }
+        if later.arg(0).to_opref() != array {
+            continue;
+        }
+        let Some(idx) = const_operand_value(constants, later.arg(1).to_opref()) else {
+            continue;
+        };
+        if let Ok(i) = usize::try_from(idx)
+            && i < length
+        {
+            written[i] = true;
+        }
+    }
+    written.iter().all(|&w| w)
+}
+
 /// The element index a card-marking barrier needs, or `None` for a store that
 /// takes the plain barrier.
 ///
@@ -10167,6 +10228,8 @@ fn build_function(
                 // `NewArrayClear` items come from that, not from a nursery
                 // reset fill.
                 let length_const = const_operand_value(constants, op.arg(0).to_opref());
+                let skip_payload_zero =
+                    skip_newarray_payload_zero(op, ops, op_idx, constants, length_const);
                 let inline_nursery_total = length_const.and_then(|len| {
                     use majit_gc::header::GcHeader;
                     let len = usize::try_from(len).ok()?;
@@ -10234,12 +10297,14 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
-                    emit_zero_bytes(
-                        &mut sink,
-                        alloc_scratch_local,
-                        0,
-                        total.saturating_sub(GcHeader::SIZE) as u32,
-                    );
+                    if !skip_payload_zero {
+                        emit_zero_bytes(
+                            &mut sink,
+                            alloc_scratch_local,
+                            0,
+                            total.saturating_sub(GcHeader::SIZE) as u32,
+                        );
+                    }
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(length as i32);
                     sink.i32_store(MemArg {
@@ -10350,7 +10415,9 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
+                    if !skip_payload_zero {
+                        emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
+                    }
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -10489,16 +10556,18 @@ fn build_function(
                         memory_index: 0,
                     });
                     // Payload length = new_free - header - HDR.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i32_const(0);
-                    sink.local_get(alloc_size_local);
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_sub();
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_sub();
-                    sink.memory_fill(0);
+                    if !skip_payload_zero {
+                        sink.local_get(alloc_scratch_local);
+                        sink.i32_const(GcHeader::SIZE as i32);
+                        sink.i32_add();
+                        sink.i32_const(0);
+                        sink.local_get(alloc_size_local);
+                        sink.local_get(alloc_scratch_local);
+                        sink.i32_sub();
+                        sink.i32_const(GcHeader::SIZE as i32);
+                        sink.i32_sub();
+                        sink.memory_fill(0);
+                    }
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
