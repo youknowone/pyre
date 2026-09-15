@@ -304,7 +304,14 @@ fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
 /// Both artefacts are counted. The erasure answers most of `pyre-object`'s
 /// brackets, so that crate alone no longer carries a population large enough
 /// for this to prove anything.
+///
+/// Ignored in the default `cargo test --all` pass: on ubuntu debug it spent
+/// 642s lowering every local body in `pyre-object` + `pyre-interpreter`
+/// (2026-09-15 run 34952670889), more than half the dynasm test step.
+/// CI runs it release-mode in the dispatcher-graph job, which already owns
+/// the other full-artefact translate census.
 #[test]
+#[ignore = "full-artefact census; CI: dispatcher-graph acceptance"]
 fn nearly_every_dropped_bracket_closes() {
     let (mut bodies, mut closed) = (0usize, 0usize);
     let mut short: Vec<String> = Vec::new();

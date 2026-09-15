@@ -473,8 +473,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
-    # Two cargo passes, one per backend. They measured ~27 min together, so
-    # the cap bounds a hang without bounding the work.
+    # Two cargo passes, one per backend. Successful ubuntu runs in mid-Sep
+    # 2026 land at 41–58 min (median 57), so 60 min is the work plus a
+    # small hang margin, not a 27-min measurement that no longer holds.
     timeout-minutes: 60
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
@@ -610,27 +611,34 @@ jobs:
     - name: Build test binaries (cranelift)
       shell: bash
       # Keep this package list identical to the cranelift test step below.
+      # Two invocations: `--tests` is cargo-wide and would drop
+      # majit-backend-cranelift's `--lib` compiler tests if combined.
       run: |
         cargo test --no-run --no-default-features --features cranelift \
-          -p majit-metainterp -p majit-backend-cranelift
+          -p majit-backend-cranelift
+        cargo test --no-run --no-default-features --features cranelift \
+          -p majit-metainterp --tests
 
     - name: Run cargo tests (cranelift)
       shell: bash
       # This is a separate step so GitHub reports and reruns the backend passes
       # independently. Steps remain in one job, in order, so this pass starts
       # only after dynasm finishes and reuses that pass's Cargo target cache.
-      # Exercise the cranelift backend and the metainterp's backend-selection
-      # path. The dynasm pass above already covers the rest of the workspace;
-      # rebuilding the pyre stack and every example with a second backend adds
-      # substantial compile and link cost without covering backend code that
-      # these two crates do not already exercise.
+      # Exercise the cranelift backend and the metainterp integration tests
+      # that actually compile (jit_interp_*, vable blackhole, …). The dynasm
+      # pass already ran optimizeopt/resume/blackhole `--lib` unit tests and
+      # every other workspace crate; re-running those under cranelift only
+      # reproduced the same results while linking the metainterp unit harness.
+      # `--tests` is integration targets only, not `--lib`.
       # `--no-fail-fast` because these are several separate test binaries:
       # without it cargo stops at the first one that fails and the run names a
       # single failure where there may be more, which costs a round trip per
       # hidden sibling.
       run: |
         cargo test --no-fail-fast --no-default-features --features cranelift \
-          -p majit-metainterp -p majit-backend-cranelift
+          -p majit-backend-cranelift
+        cargo test --no-fail-fast --no-default-features --features cranelift \
+          -p majit-metainterp --tests
         # The two label-selector tests set PYRE_CL_NO_CLOSING_JUMP, a
         # process-global env var read while compiling, so they are `#[ignore]`d
         # out of the parallel run above and need a serial process of their own.
@@ -726,6 +734,14 @@ jobs:
       run: |
         cargo test --release -p majit-translate \
           --test test_make_jitcodes_produces_graph_keyed_output
+
+    # Full-artefact root-bracket census. Debug `cargo test --all` spent 642s
+    # on `nearly_every_dropped_bracket_closes` (ubuntu 2026-09-15); the
+    # named-shape fixtures in the same file stay in the default pass.
+    - name: Run full-artefact root-bracket close census
+      run: |
+        cargo test --release -p majit-translate \
+          --test test_root_bracket_close -- --ignored --test-threads=1
 
     # The hand-written GC root brackets, held to what the analysis can prove.
     # This job is where the gate is cheapest: all four artefacts are already on
