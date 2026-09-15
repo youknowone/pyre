@@ -3686,7 +3686,8 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     let leftover_empty_mint_holds_frame = leftover.is_empty()
         && !orig_vable.is_null()
         && !vinfo.array_fields.is_empty()
-        && live_tos.as_ref().is_some_and(|p| p.len() == 1)
+        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && p[0] >= 4)
+        && baked_field_len == 16
         && {
             let n_items = unsafe { vinfo.get_array_length(orig_vable, 0) };
             (0..n_items).any(|i| {
@@ -3710,8 +3711,8 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     let leftover_empty_survey_new = leftover.is_empty()
         && live_tos
             .as_ref()
-            .is_some_and(|p| p.len() == 1 && (4..=5).contains(&p[0]))
-        && (14..=16).contains(&baked_field_len)
+            .is_some_and(|p| p.len() == 1 && (3..=6).contains(&p[0]))
+        && (14..=17).contains(&baked_field_len)
         && ops.iter().any(|op| op.opcode == OpCode::NewWithVtable)
         && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR);
     // leftover=[] GETFIELD safety does not wait for a listiter type
