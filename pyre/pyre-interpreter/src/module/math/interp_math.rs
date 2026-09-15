@@ -508,7 +508,8 @@ pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
     x.hypot(y)
 }
 
-/// `ll_math.py` C llexternals for Opaque `f64::{ln,exp,sin,cos,powf}`.
+/// `ll_math.py` C llexternals for Opaque
+/// `f64::{ln,exp,sin,cos,powf,sqrt,log10}`.
 /// IEEE, no raise — the `ll_math_*` wrappers stay around them.
 pub extern "C" fn jit_math_log_raw(x: f64) -> f64 {
     x.ln()
@@ -528,6 +529,14 @@ pub extern "C" fn jit_math_cos_raw(x: f64) -> f64 {
 
 pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {
     x.powf(y)
+}
+
+pub extern "C" fn jit_math_sqrt_raw(x: f64) -> f64 {
+    x.sqrt()
+}
+
+pub extern "C" fn jit_math_log10_raw(x: f64) -> f64 {
+    x.log10()
 }
 
 /// Raw `math.isclose(a, b)` with both keyword tolerances left at their
