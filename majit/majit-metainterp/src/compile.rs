@@ -3578,16 +3578,28 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // must stay (SNAPDIFF if we abort here). An unmapped extra is a
     // residual execute_assembler will not pass (`tuple_slice` Idx
     // bound, pip charset `'frame' object has no attribute 'find'`).
+    // leftover=[] with baked != mint: leftover-empty GETFIELDs the
+    // shorter mint and leaves valuestack extras as residuals
+    // (`tuple_slice` Idx bounds). PyPy asserts `i == len(inputargs)`
+    // against the live length; refuse rather than compile that shape.
+    let leftover_empty_len_mismatch = leftover.is_empty()
+        && !entry_field_oprefs.is_empty()
+        && baked_field_len != entry_field_oprefs.len();
     if leftover_has_listiter_id()
-        && (listiter_leftover || leftover_extras_any || mint_string_method || mint_nongc_field)
+        && (listiter_leftover
+            || leftover_extras_any
+            || leftover_empty_len_mismatch
+            || mint_string_method
+            || mint_nongc_field)
     {
         if std::env::var_os("MAJIT_LEFTOVER").is_some() {
             eprintln!(
                 "leftover-empty reject extras past mint tos_src={:?} \
-                 listiter={} leftover_extras={} string={} nongc={}",
+                 listiter={} leftover_extras={} len_mismatch={} string={} nongc={}",
                 tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>(),
                 listiter_leftover,
                 leftover_extras_any,
+                leftover_empty_len_mismatch,
                 mint_string_method,
                 mint_nongc_field,
             );
@@ -3691,25 +3703,6 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     }
     if peel_emitted {
         attach_peel_guard_resume(&extra_ops);
-    }
-    if leftover_has_listiter_id()
-        && extra_ops.iter().any(|op| {
-            if matches!(op.opcode, OpCode::Label | OpCode::Jump) {
-                return false;
-            }
-            op.getarglist().iter().any(|a| {
-                let src = a.to_opref();
-                src.is_input_arg() && (src.raw() as usize) >= expanded_len
-            })
-        })
-    {
-        if std::env::var_os("MAJIT_LEFTOVER").is_some() {
-            eprintln!(
-                "leftover-empty reject unmapped extra past mint tos_src={:?}",
-                tos_sources.iter().map(|r| r.raw()).collect::<Vec<_>>()
-            );
-        }
-        note_leftover_empty_reject();
     }
     *ops = extra_ops;
     take_leftover_empty_reject()
@@ -6630,10 +6623,9 @@ mod tests {
 
     #[test]
     fn test_patch_new_loop_rejects_leftover_empty_present_extra() {
-        // leftover=[] because the extra is still on the entry list.
-        // leftover-empty remaps mint fields, not this extra; after
-        // emit the body Call still names it and must abort
-        // (tuple_slice Idx bound on the valuestack).
+        // leftover=[] and baked array length != mint: leftover-empty
+        // would GETFIELD the shorter mint and leave valuestack extras
+        // as residuals (tuple_slice Idx bound).
         let _guard = PEEL_TEST_LOCK.lock().unwrap();
         let prev = LISTITER_TYPE_WORD.swap(0x1A13, std::sync::atomic::Ordering::Relaxed);
         struct Restore(usize);
@@ -6699,7 +6691,7 @@ mod tests {
                 &mut ops,
                 &mut inputargs,
                 &vinfo,
-                &[1],
+                &[3],
                 2,
                 0,
                 &mut constants,
@@ -6707,7 +6699,7 @@ mod tests {
                 &[],
                 None,
             ),
-            "leftover-empty Call of a present extra past the mint must abort"
+            "leftover-empty baked!=mint with leftover=[] must abort"
         );
     }
 
