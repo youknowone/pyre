@@ -3107,16 +3107,18 @@ impl WasmBackend {
         // Other trips for this owner would each re-emit the whole module.
         // Fold them into this rebuild so one Cranelift compile covers them.
         // Children compiled as `not_direct` wait in PENDING with a remap.
-        // Fold them into this rebuild once their parent is attaching.
-        let remap_ids: Vec<i64> = PENDING_INLINES.with(|pending| {
+        // An `uninitialized_label` trip can also fire before the sibling
+        // peel that publishes its JUMP target; fold those too so the
+        // one-shot probe is not the only retry.
+        let sibling_ids: Vec<i64> = PENDING_INLINES.with(|pending| {
             pending
                 .borrow()
                 .iter()
-                .filter(|(_, item)| Arc::ptr_eq(&item.owner, &owner) && item.remap.is_some())
+                .filter(|(_, item)| Arc::ptr_eq(&item.owner, &owner))
                 .map(|(&id, _)| id)
                 .collect()
         });
-        for id in remap_ids {
+        for id in sibling_ids {
             if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
                 work.push((id, item.region, item.remap));
             }
@@ -3165,6 +3167,11 @@ impl WasmBackend {
             .iter()
             .filter_map(|(id, _, remap)| remap.map(|key| (key, *id)))
             .collect();
+        let fail_pending_ids: HashMap<u32, i64> = work
+            .iter()
+            .filter(|(_, _, remap)| remap.is_none())
+            .map(|(id, region, _)| (region.source_fail_index, *id))
+            .collect();
         let leftover = self.install_inline_region_batch(
             &owner,
             work.into_iter().map(|(_, r, remap)| (r, remap)).collect(),
@@ -3177,13 +3184,15 @@ impl WasmBackend {
         if owner.is_invalidated() {
             return;
         }
-        // Remapped children whose parent is not in the owner yet stay
-        // pending so a later parent install can pick them up.
+        // Leftovers whose parent or sibling is not in the owner yet stay
+        // pending so a later install can pick them up. The compiled probe
+        // still names this id.
         for (region, remap) in leftover {
-            let Some(key) = remap else {
-                continue;
+            let id = match remap {
+                Some(key) => remap_pending_ids.get(&key).copied(),
+                None => fail_pending_ids.get(&region.source_fail_index).copied(),
             };
-            let Some(&id) = remap_pending_ids.get(&key) else {
+            let Some(id) = id else {
                 continue;
             };
             PENDING_INLINES.with(|pending| {
@@ -3290,6 +3299,13 @@ impl WasmBackend {
                     .any(|r| r.source_fail_index == source_fail_index)
                 {
                     diag_bump(36);
+                    continue;
+                }
+                if region.external_jump.is_none()
+                    && region.outside_loop
+                    && !inline_nonheader_enabled()
+                {
+                    still.push((region, remap));
                     continue;
                 }
                 region.outside_loop = region.outside_loop
