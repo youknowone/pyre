@@ -3614,10 +3614,8 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // GETARRAYITEMs read past `locals_cells_stack_w` and SIGSEGV.
     // Tests leave orig_vable null so a stale-short bake still walks
     // the mint (`uses_entry_mints_not_stale_baked_length`).
-    let leftover_empty_mint_past_live = leftover.is_empty()
-        && !entry_field_oprefs.is_empty()
-        && !orig_vable.is_null()
-        && {
+    let leftover_empty_mint_past_live =
+        leftover.is_empty() && !entry_field_oprefs.is_empty() && !orig_vable.is_null() && {
             let n_static = vinfo.static_fields.len();
             let live_items = if vinfo.array_fields.is_empty() {
                 0
@@ -3710,7 +3708,9 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
     // baked=14 NewWithVtable + CallMayForceR). raise_here's same
     // survey is entry>baked and already hits mint_past_live.
     let leftover_empty_survey_new = leftover.is_empty()
-        && live_tos.as_ref().is_some_and(|p| p.len() == 1 && (4..=5).contains(&p[0]))
+        && live_tos
+            .as_ref()
+            .is_some_and(|p| p.len() == 1 && (4..=5).contains(&p[0]))
         && (14..=16).contains(&baked_field_len)
         && ops.iter().any(|op| op.opcode == OpCode::NewWithVtable)
         && ops.iter().any(|op| op.opcode == OpCode::CallMayForceR);
@@ -3733,9 +3733,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields_with_vable(
                 || leftover_empty_survey_new));
     if leftover_empty_unsafe
         || (leftover_has_listiter_id()
-            && (listiter_leftover
-                || leftover_extras_any
-                || mint_nongc_field))
+            && (listiter_leftover || leftover_extras_any || mint_nongc_field))
     {
         if std::env::var_os("MAJIT_LEFTOVER").is_some() {
             eprintln!(
