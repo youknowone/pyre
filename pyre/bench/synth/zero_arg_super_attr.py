@@ -1,11 +1,8 @@
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # pyre-check: spec-folds=load_deref,load_super_attr,super_attr_unwrap
-# Zero-argument super inside a FOR_ITER body. CPython is skipped because
-# even this N is impractical there. spec-folds is the gate: the compiled
-# loop still reads a virtualizable frame and is not yet as tight as
-# PyPy's virtualized super, so there is no max-pypy-ratio until that
-# virtualize lands. N is sized so the census finishes inside check.py's
-# 20s budget.
+# Zero-argument super inside a FOR_ITER body.  N keeps the pypy reference above
+# check.py's timing floor; CPython is skipped because that N is impractical.
 #
 # `load_super_attr_descent` still declines at unpublished `w_method_new`.
 # Publishing it in a throwaway dynasm binary exposed an unclosed RootScope
@@ -29,7 +26,7 @@ try:
 except ImportError:
     pass
 
-N = 5_000_000
+N = 250000000
 
 
 class Base:

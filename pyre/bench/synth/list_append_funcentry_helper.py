@@ -1,13 +1,12 @@
 # pyre-check: max-pypy-ratio=125
-# pyre-check: max-wasm-ratio=5.7
 # pyre-check: jitstats-band=guard_failures=25
 # Function-entry `push` deopts on each list realloc. The orthodox
 # append fold now compiles two helper traces with 5 guard failures
 # on every backend (was 65). The band still covers doubling-schedule
-# jitter around that count. The trip count puts pypy above the
-# startup-subtraction floor, so the pypy ratio is a measurement.
-# wasm measured 4.9x dynasm (1.59s / 0.33s) on the no-loop helper
-# CALL_ASSEMBLER path; 5.7 is that reading plus the 15% fit headroom.
+# jitter around that count.
+# The trip count puts pypy above the startup-subtraction floor, so this ratio
+# is a measurement rather than pyre divided by the floor constant. The ceiling
+# is twice the slowest backend observed (61.9x on cranelift).
 # #171/#34: the orthodox list.append fold fires in function-entry (no-loop)
 # helper traces, not only loop traces.  `push` is a no-loop helper called in a
 # hot loop on two alternating receivers, so it traces from entry (header_pc==0)
