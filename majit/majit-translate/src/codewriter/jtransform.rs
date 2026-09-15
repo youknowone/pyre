@@ -7569,6 +7569,42 @@ impl<'a> Transformer<'a> {
                     ],
                 )
             }
+            // `ll_getitem_foldable_nonneg` (rlist.py, `oopspec =
+            // 'list.getitem_foldable(l, index)'`) — selected by
+            // `rtype_getitem` when `not listdef.listitem.mutated`
+            // (rlist.py:256-258).  Same items-then-element decomposition
+            // as `list.obj_getitem`, except the element load is the
+            // foldable `getarrayitem_gc_r_pure` (`pure: true`).
+            "list.obj_getitem_foldable" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.obj_getitem_foldable → getfield_gc_r(items) + getarrayitem_gc_r_pure",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new("items", Some(LIST_OWNER.to_string())),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayRead {
+                                base: block,
+                                index,
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: None,
+                                nolength: false,
+                                pure: true,
+                            },
+                        },
+                    ],
+                )
+            }
             "list.obj_setitem" => {
                 let l = args.first()?.clone();
                 let index = args.get(1)?.clone();
@@ -21362,6 +21398,73 @@ mod tests {
                 assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
                 // The foldable element load — `getarrayitem_gc_i_pure`.
+                assert!(pure);
+            }
+            other => panic!("expected ArrayRead, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, Some(result));
+    }
+
+    /// `list.obj_getitem_foldable(l, i)` lowers to `getfield_gc_r(l,
+    /// items)` feeding the foldable `getarrayitem_gc_r_pure(block, i)`
+    /// (rlist.py `ll_getitem_foldable_nonneg`, oopspec
+    /// `list.getitem_foldable`).  The element load is `pure: true`; the
+    /// items FieldRead stays `pure: false`.
+    #[test]
+    fn handle_list_call_obj_getitem_foldable_emits_pure_arrayread() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_obj_getitem_foldable");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.obj_getitem_foldable",
+                &op,
+                &[l.clone(), index.clone()],
+                &mut graph,
+                "list_obj_getitem_foldable",
+            )
+            .expect("list.obj_getitem_foldable must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        let block = match &ops[0].kind {
+            OpKind::FieldRead {
+                base,
+                field,
+                ty,
+                pure,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "items");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert!(matches!(ty, ValueType::Ref(None)));
+                assert!(!pure);
+                ops[0].result.clone().expect("block result var")
+            }
+            other => panic!("expected FieldRead, got {other:?}"),
+        };
+        match &ops[1].kind {
+            OpKind::ArrayRead {
+                base,
+                index: idx,
+                item_ty,
+                array_type_id,
+                nolength,
+                pure,
+            } => {
+                assert_eq!(base, &block);
+                assert_eq!(idx, &index);
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(array_type_id, &None);
+                assert!(!nolength);
                 assert!(pure);
             }
             other => panic!("expected ArrayRead, got {other:?}"),
