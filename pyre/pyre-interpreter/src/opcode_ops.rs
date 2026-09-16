@@ -409,6 +409,8 @@ pub fn match_sequence_value(subject: PyObjectRef) -> PyObjectRef {
 /// return a tuple of the values, or `None` when any key is absent.
 /// MATCH_MAPPING already proved the subject is a mapping, so the keys are
 /// looked up directly without re-gating (`Python/ceval.c match_keys`).
+/// `pyopcode.py MATCH_KEYS` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let key_items = unsafe { pyre_object::tupleobject::w_tuple_items_copy_as_vec(keys) };
     // Every round runs `subject.get`, which is application-level Python: it
@@ -497,6 +499,8 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
 /// subject matches the class pattern, else `None`.  `count` is the number
 /// of positional sub-patterns; `kwd_attrs` is the keyword attribute-name
 /// tuple.
+/// `pyopcode.py _match_class` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn match_class_value(
     subject: PyObjectRef,
     cls: PyObjectRef,

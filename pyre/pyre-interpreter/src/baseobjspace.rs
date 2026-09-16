@@ -20187,6 +20187,8 @@ unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
 /// for it instead (`send_ex`).  Counting the yields is the whole test — the
 /// comment there records it as an approximate fix for the near-infinite
 /// slow-down a several-yield generator produced.
+/// `generator.py should_not_inline` is `@jit.elidable_promote()`.
+#[majit_macros::elidable_promote]
 pub fn should_not_inline(code: &crate::CodeObject) -> bool {
     let mut count_yields = 0usize;
     for index in 0..code.instructions.len() {

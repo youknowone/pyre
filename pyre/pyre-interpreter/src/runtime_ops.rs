@@ -633,6 +633,8 @@ pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 /// through the checked dict setitem, which hashes the key (may run user
 /// `__hash__` / `__eq__`); an unhashable key raises, so — like
 /// `build_set_from_refs` — this is fallible.
+/// `pyopcode.py BUILD_MAP` unrolls the pair-store loop.
+#[majit_macros::unroll_safe]
 pub fn build_map_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Each store hashes its key through `__hash__`, so every turn is a
     // collection point.  The fresh dict and `items` — for the JIT entries a

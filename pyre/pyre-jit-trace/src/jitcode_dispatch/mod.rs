@@ -10393,6 +10393,19 @@ fn walker_pin_function_code<Sym: WalkSym>(
     walker_pin_function_quasi_field(ctx, op_pc, callable, crate::descr::function_code_descr())
 }
 
+fn walker_pin_function_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    callable: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    walker_pin_function_quasi_field(
+        ctx,
+        op_pc,
+        callable,
+        crate::descr::function_w_globals_descr(),
+    )
+}
+
 /// `function.py:34 _immutable_fields_ = ['code?', 'w_func_globals?', ...]`
 /// marker on one `?` slot of a baked callee.
 fn walker_pin_function_quasi_field<Sym: WalkSym>(

@@ -6721,26 +6721,37 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // the guard failed forever while the code object it stands for is
         // loop-invariant.
         //
-        // Keep GETFIELD+GUARD_VALUE even on a ConstPtr callable.
-        // `code?` matches `function.py getcode()` but Linux `test_uuid`
-        // SIGSEGV's with the marker: after `test_UUID` warms the JIT,
-        // `jit_bigint_int_eq` treats a small int as `*const BigInt`.
-        // Comparing known class before skipping GuardClass was not
-        // enough; the live field read stays.
-        walker_guard_function_field(
-            ctx,
-            op.pc,
-            callable_guard_op,
-            crate::descr::function_code_descr(),
-            callee_code_key as i64,
-        )?;
-        walker_guard_function_field(
-            ctx,
-            op.pc,
-            callable_guard_op,
-            crate::descr::function_w_globals_descr(),
-            inline_consts.w_globals as i64,
-        )?;
+        // A constant callable can take the `code?` / `w_func_globals?`
+        // markers (`function.py getcode()`). A live MAKE_FUNCTION
+        // operand still uses GETFIELD+GUARD_VALUE because the owner
+        // address changes every iteration.
+        if callable_guard_op.is_constant() {
+            // A bound-method inline can cache `Method.w_function` as a
+            // constant while the method operand itself is nonconstant,
+            // so the earlier `!guards_the_callee_function && can_move`
+            // check does not cover this Function. Refuse a nursery
+            // owner before baking raw-address `code?` markers.
+            if majit_gc::can_move(majit_ir::GcRef(callable as usize)) {
+                return resolved_inline_decline(op.pc, line!());
+            }
+            walker_pin_function_code(ctx, op.pc, callable)?;
+            walker_pin_function_globals(ctx, op.pc, callable)?;
+        } else {
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                callable_guard_op,
+                crate::descr::function_code_descr(),
+                callee_code_key as i64,
+            )?;
+            walker_guard_function_field(
+                ctx,
+                op.pc,
+                callable_guard_op,
+                crate::descr::function_w_globals_descr(),
+                inline_consts.w_globals as i64,
+            )?;
+        }
         if !concrete_freevar_cells.is_empty() {
             // `closure?[*]`: the tuple itself is rebuilt by every
             // `MAKE_FUNCTION`, so read its cells live and thread those red

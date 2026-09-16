@@ -5860,12 +5860,12 @@ fn loop_body_abort_permanent_pc(w_code: *const (), start_pc: usize) -> Option<us
         });
 
     // `start_pc` is a code-unit index; the exception table lookup takes byte offsets (×2).
-    let loop_handler = unsafe {
+    let loop_handler = pyre_interpreter::pycode::unpack_exceptiontable_lookup(unsafe {
         pyre_interpreter::pycode::w_code_lookup_exceptiontable(
             w_code as pyre_object::PyObjectRef,
             (start_pc as u32) * 2,
         )
-    };
+    });
 
     // The loop body always scans.  What a covering exception-table entry adds
     // is its HANDLER, not the whole tail: an uncaught raise inside a compiled
