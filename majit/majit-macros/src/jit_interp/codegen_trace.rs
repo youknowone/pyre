@@ -590,6 +590,25 @@ fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
             }
             syn::visit::visit_expr_macro(self, node);
         }
+        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+            self.hit = true;
+        }
+        fn visit_expr_break(&mut self, _: &'ast syn::ExprBreak) {
+            self.hit = true;
+        }
+        fn visit_expr_continue(&mut self, _: &'ast syn::ExprContinue) {
+            self.hit = true;
+        }
+        fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+            self.hit = true;
+        }
+        fn visit_expr_yield(&mut self, _: &'ast syn::ExprYield) {
+            self.hit = true;
+        }
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {
+            // The closure body does not run at the merge point.
+        }
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
         fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
             if matches!(
                 node.op,
@@ -1042,5 +1061,29 @@ mod find_dispatch_match_tests {
             }",
         );
         assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    }
+
+    #[test]
+    fn a_return_in_a_pre_merge_let_is_unsupported() {
+        let block = fn_block(
+            "while pos < len {
+                let ignored = if stop { return 7 } else { 0 };
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    }
+
+    #[test]
+    fn a_closure_in_a_pre_merge_let_is_allowed() {
+        let block = fn_block(
+            "while pos < len {
+                let ignored = || return 7;
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_none());
     }
 }

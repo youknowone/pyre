@@ -10990,7 +10990,29 @@ where
             .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned);
         let Some(sub_jitcode) = sub_jitcode else {
             // The callee is in neither pool; abort the trace instead of
-            // crashing the process.
+            // crashing the process. Consume the remaining operands so
+            // `publish_walk_abort_handoff` (`top.pc = top.code_cursor`)
+            // lands on the next instruction, not a count/register byte.
+            let caller = self.frames.current_mut();
+            if has_i_list {
+                let n = caller.next_u8() as usize;
+                for _ in 0..n {
+                    let _ = caller.next_reg();
+                }
+            }
+            let n_r = caller.next_u8() as usize;
+            for _ in 0..n_r {
+                let _ = caller.next_reg();
+            }
+            if has_f_list {
+                let n_f = caller.next_u8() as usize;
+                for _ in 0..n_f {
+                    let _ = caller.next_reg();
+                }
+            }
+            if return_kind.is_some() {
+                let _ = caller.next_reg();
+            }
             return TraceAction::Abort;
         };
         let mut sub_frame = self.frames.take_frame(sub_jitcode, 0, None, Some(ctx));
