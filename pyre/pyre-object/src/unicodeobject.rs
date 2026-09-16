@@ -1594,7 +1594,9 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_value(cat), "abcd");
             assert_eq!(w_str_get_value(rep), "ababab");
-            assert_eq!(jit_str_compare(a as i64, b as i64), -1);
+            assert!(jit_str_compare(a as i64, b as i64) < 0);
+            assert_eq!(jit_str_compare(a as i64, a as i64), 0);
+            assert!(jit_str_compare(b as i64, a as i64) > 0);
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
         }
