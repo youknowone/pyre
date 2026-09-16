@@ -1159,6 +1159,13 @@ fn emit_float_load(
     Ok(())
 }
 
+fn value_is_f64(value_types: &ValueLocals, val: OpRef) -> bool {
+    if val.is_constant() {
+        return val.ty() == Some(Type::Float);
+    }
+    value_types.ty(val.raw()) == ValType::F64
+}
+
 fn emit_float_store(
     sink: &mut PeepSink<'_, '_>,
     offset: u64,
@@ -1910,11 +1917,7 @@ fn normal_frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots_for(inputargs, ops, inputargs.len())
 }
 
-fn normal_frame_value_slots_for(
-    inputargs: &[InputArgRc],
-    ops: &[Op],
-    entry_arity: usize,
-) -> usize {
+fn normal_frame_value_slots_for(inputargs: &[InputArgRc], ops: &[Op], entry_arity: usize) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
@@ -7826,7 +7829,7 @@ fn build_function(
                 );
                 let (size, _) = gc_rewrite_access_size(op, constants, 3)?;
                 let val = op.arg(2).to_opref();
-                if size == 4 && value_types.ty(val.raw()) == ValType::F64 {
+                if size == 4 && value_is_f64(value_types, val) {
                     emit_resolve_f64(&mut sink, constants, value_types, val);
                     emit_float_store(&mut sink, offset, size)?;
                 } else {
@@ -7845,7 +7848,7 @@ fn build_function(
                 let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 3, 4)?;
                 let (size, _) = gc_rewrite_access_size(op, constants, 5)?;
                 let val = op.arg(2).to_opref();
-                if size == 4 && value_types.ty(val.raw()) == ValType::F64 {
+                if size == 4 && value_is_f64(value_types, val) {
                     emit_resolve_f64(&mut sink, constants, value_types, val);
                     emit_float_store(&mut sink, offset, size)?;
                 } else {
@@ -13192,7 +13195,7 @@ mod tests {
         jump.setdescr(descr);
         let ops = vec![label, new, jump];
         assert_eq!(jump_phi_coalesce_pairs(&ops), vec![(10, 0)]);
-        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+        let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
         let locals = ValueLocals::collect(&inputargs, &ops, 16, 1);
         assert_eq!(
             locals.local(10),
@@ -13275,8 +13278,8 @@ mod tests {
         jump.setdescr(descr);
         let ops = vec![label, new, jump];
         let inputargs = vec![
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
         ];
         let homes = RefHomes::collect(&inputargs, &ops, true, &[], &[]);
         let h0 = homes.home(p0).expect("p0 lives across NewWithVtable");
