@@ -7355,7 +7355,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // per-call fresh Arcs let `force_lazy_sets_for_guard` flush the store
     // BELOW an emitted load of the same cell (the nested module-loop
     // `i = i + 1; while i < n` read the pre-increment value and ran one
-    // extra iteration).
+    // extra iteration).  An exception table is not a reason to skip:
+    // pypy's opt log of `exc_info_module_loop_hot` still folds
+    // `IntMutableCell.intvalue` through the `except` handler.
     if ctx.is_authoritative_executor
         && dst_bank == 'v'
         && r_args.len() == 3
@@ -7363,7 +7365,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ei.runtime_helper,
             majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
         )
-        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref), Some(&value_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2))
@@ -9189,10 +9190,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // LoadName: descend `typeobject.py unwrap_cell` for a name already
     // in the module dict.  A later `DELETE_NAME` (`except as`) still
     // forces `version?` (`opimpl_jit_force_quasi_immutable` →
-    // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).
+    // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).  The fold is not
+    // gated on an exception table: `exc_info_module_loop_hot`'s pypy
+    // opt log still reads/writes `IntMutableCell.intvalue` through the
+    // `except` handler, and a deleting handler already takes the
+    // quasi-immut abort below.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
-        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (
@@ -9984,12 +9988,20 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                     // (unicodeobject.py) answers from one WTF-8
                                     // ordering, which no numeric arm above can
                                     // express.
-                                    None => spec_gate(SpecFold::CompareOpStr, || {
+                                    None => match spec_gate(SpecFold::CompareOpStr, || {
                                         try_walker_specialize_compare_op_str(
                                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
                                             dst, dst_bank,
                                         )
-                                    })?,
+                                    })? {
+                                        Some(()) => Some(()),
+                                        None => spec_gate(SpecFold::CompareOpTuple, || {
+                                            try_walker_specialize_compare_op_tuple(
+                                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
+                                                dst, dst_bank,
+                                            )
+                                        })?,
+                                    },
                                 },
                             },
                         },

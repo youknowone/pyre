@@ -5819,6 +5819,14 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET)
 }
 
+/// Field descr for `ExecutionContext::current_gen_or_coroutine`, the slot
+/// `executioncontext.py sys_exc_info` reads after a null `sys_exc_operror`.
+/// Same group as [`ec_sys_exc_value_descr`] so a POP_EXCEPT restore of the
+/// exception slot and this generator-head pin share one struct identity.
+pub fn ec_current_gen_or_coroutine_descr() -> DescrRef {
+    ec_field_descr(pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET)
+}
+
 /// Field descr for `ExecutionContext::topframeref`, used by the JIT lowering
 /// of `executioncontext.py enter` / `:96-97 leave` at an inlined call:
 /// `frame.f_backref = self.topframeref` reads it and
@@ -5974,6 +5982,11 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
             pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
         ),
         profilefunc,
+        field(
+            6,
+            "current_gen_or_coroutine",
+            pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET,
+        ),
     ];
     // `index_in_parent` is the field's rank by byte offset
     // (`jitcode/assembler.rs`'s `field_specs_from_layout`), and once a parent
@@ -7481,6 +7494,11 @@ mod tests {
                 pyre_interpreter::EC_PROFILEFUNC_OFFSET,
                 ec_profilefunc_descr(),
             ),
+            (
+                "current_gen_or_coroutine",
+                pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET,
+                ec_current_gen_or_coroutine_descr(),
+            ),
         ] {
             let (field_size, field_type) = if name == "profilefunc" {
                 (std::mem::size_of::<usize>(), Type::Int)
@@ -8468,6 +8486,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "topframeref" => Some(ec_topframeref_descr()),
                     "w_tracefunc" => Some(ec_w_tracefunc_descr()),
                     "profilefunc" => Some(ec_profilefunc_descr()),
+                    "current_gen_or_coroutine" => Some(ec_current_gen_or_coroutine_descr()),
                     _ => None,
                 };
                 if let Some(canonical) = canonical
