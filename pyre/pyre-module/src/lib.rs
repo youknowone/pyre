@@ -113,7 +113,101 @@ pub fn register() {
                 module::_csv::walk_csv_state_gc(fwd);
             },
             subclass_range_aliases: optional_subclass_range_aliases,
+            publish_fnaddrs: publish_optional_fnaddrs,
         },
+    );
+}
+
+/// `ll_math.py` C llexternals. The front retargets Opaque
+/// `f64::{hypot,atan2,copysign,floor,ceil,ln,exp,sin,cos,powf,sqrt,log10}`
+/// to these paths; the raising `ll_math_*` wrappers stay around them.
+fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
+    use module::math::interp_math as math;
+
+    fn pair(
+        entries: &mut Vec<(&'static str, i64)>,
+        module_path: &'static str,
+        root_path: &'static str,
+        fnptr: *const (),
+    ) {
+        let addr = fnptr as usize as i64;
+        if addr != 0 {
+            entries.push((module_path, addr));
+            entries.push((root_path, addr));
+        }
+    }
+
+    pair(
+        entries,
+        "ll_math::math_hypot",
+        "math_hypot",
+        math::jit_math_hypot as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_atan2",
+        "math_atan2",
+        math::jit_math_atan2 as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_copysign",
+        "math_copysign",
+        math::jit_math_copysign as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_floor",
+        "math_floor",
+        math::jit_math_floor_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_ceil",
+        "math_ceil",
+        math::jit_math_ceil_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_log",
+        "math_log",
+        math::jit_math_log_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_exp",
+        "math_exp",
+        math::jit_math_exp_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_sin",
+        "math_sin",
+        math::jit_math_sin_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_cos",
+        "math_cos",
+        math::jit_math_cos_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_pow",
+        "math_pow",
+        math::jit_math_pow_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_sqrt",
+        "math_sqrt",
+        math::jit_math_sqrt_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_log10",
+        "math_log10",
+        math::jit_math_log10_raw as *const (),
     );
 }
 
@@ -182,6 +276,20 @@ mod tests {
                 "pyre_module::module::_bz2::compressor_methods::__majit_wrap___new__"
             ),
             "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_ll_math_hypot() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("ll_math::math_hypot"),
+            "moved ll_math hypot residual must publish after optional-module register",
+        );
+        assert!(
+            bindings.contains_key("math_hypot"),
+            "the crate-root hypot alias must resolve too",
         );
     }
 }

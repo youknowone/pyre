@@ -509,6 +509,10 @@ pub struct OptionalModuleHooks {
     pub walk_global_roots: fn(&mut dyn FnMut(&mut majit_ir::GcRef)),
     pub walk_prebuilt_slots: fn(&mut dyn FnMut(&mut PyObjectRef)),
     pub subclass_range_aliases: fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
+    /// Residual addresses whose functions live in `pyre-module` (`ll_math`
+    /// hypot/atan2/…). `jit_trace_fnaddrs` appends these after the
+    /// interpreter-owned table.
+    pub publish_fnaddrs: fn(&mut Vec<(&'static str, i64)>),
 }
 
 static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
