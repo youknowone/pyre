@@ -17537,7 +17537,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let _ = pyre_object::gc_roots::pin_root(obj);
                 let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                match getitem(seq, w_int_new(idx)) {
+                let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(seq);
+                let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_int_new(idx));
+                match getitem(
+                    pyre_object::gc_roots::shadow_stack_get(seq_slot),
+                    pyre_object::gc_roots::shadow_stack_get(idx_slot),
+                ) {
                     Ok(v) => {
                         let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
                             as *mut pyre_object::W_SeqIterObject;

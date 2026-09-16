@@ -517,7 +517,9 @@ pub(crate) fn show_warning(
                             getline,
                             &[
                                 pyre_object::gc_roots::shadow_stack_get(filename_slot),
-                                w_int_new(lineno),
+                                pyre_object::gc_roots::shadow_stack_get(pin_root_slot(w_int_new(
+                                    lineno,
+                                ))),
                             ],
                         )
                     })
@@ -647,7 +649,7 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
     let lines_slot = pin_root_slot(lines);
     match crate::baseobjspace::getitem(
         pyre_object::gc_roots::shadow_stack_get(lines_slot),
-        w_int_new(lineno - 1),
+        pyre_object::gc_roots::shadow_stack_get(pin_root_slot(w_int_new(lineno - 1))),
     ) {
         Ok(line) => Ok(line),
         Err(err)

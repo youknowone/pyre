@@ -19949,10 +19949,12 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let _ = pyre_object::gc_roots::pin_root(closefd_obj);
     let opener_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(opener);
+    let fd_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(-1));
     let opened = open_raw_file(&[
         pyre_object::gc_roots::shadow_stack_get(file_slot),
         pyre_object::gc_roots::shadow_stack_get(mode_slot),
-        w_int_new(-1),
+        pyre_object::gc_roots::shadow_stack_get(fd_slot),
         w_none(),
         w_none(),
         w_none(),
@@ -21801,11 +21803,13 @@ fn builtin_open_impl(
         let _ = allow_windows_console;
         (crate::module::_io::fileio_type(), false)
     };
+    let raw_mode_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&raw_mode));
     let raw = crate::call::call_function_impl_result(
         raw_type,
         &[
             pyre_object::gc_roots::shadow_stack_get(file_slot),
-            w_str_new_managed(&raw_mode),
+            pyre_object::gc_roots::shadow_stack_get(raw_mode_slot),
             pyre_object::gc_roots::shadow_stack_get(converted_closefd_slot),
             pyre_object::gc_roots::shadow_stack_get(opener_slot),
         ],
@@ -21862,11 +21866,13 @@ fn builtin_open_impl(
         } else {
             crate::module::_io::buffered_reader_type()
         };
+        let buffering_arg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(buffering));
         let buffer = crate::call::call_function_impl_result(
             buffer_type,
             &[
                 pyre_object::gc_roots::shadow_stack_get(raw_slot),
-                w_int_new(buffering),
+                pyre_object::gc_roots::shadow_stack_get(buffering_arg_slot),
             ],
         )?;
         let _ = pyre_object::gc_roots::pin_root(buffer);
@@ -22094,8 +22100,19 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         && !unsafe { pyre_object::is_none(opener) }
     {
         let flags = open_flags_for_mode(&mode);
-        let fd_obj =
-            crate::call::call_function_impl_result(opener, &[path_obj, w_int_new(flags as i64)])?;
+        let fd_obj = {
+            let _opener_roots = pyre_object::gc_roots::push_roots();
+            let path_slot = pyre_object::gc_roots::pin_roots(&[path_obj, opener]);
+            let flags_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(path_slot + 1),
+                &[
+                    pyre_object::gc_roots::shadow_stack_get(path_slot),
+                    pyre_object::gc_roots::shadow_stack_get(flags_slot),
+                ],
+            )?
+        };
         if !unsafe { pyre_object::is_int(fd_obj) } {
             return Err(crate::PyError::type_error("expected integer from opener"));
         }
