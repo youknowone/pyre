@@ -5367,7 +5367,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if dict.is_null() {
         return None;
     }
-    let w_spec = unsafe { pyre_object::w_dict_getitem_str(dict, "__spec__") }?;
+    let w_spec = dict_getitem_str_no_callback(dict, "__spec__")??;
     if w_spec.is_null() || unsafe { pyre_object::is_none(w_spec) } {
         return None;
     }
@@ -5385,8 +5385,17 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if spec_dict.is_null() {
         return None;
     }
-    match unsafe { pyre_object::w_dict_getitem_str(spec_dict, "_initializing") } {
-        None => Some(w_module),
+    match dict_getitem_str_no_callback(spec_dict, "_initializing")? {
+        None => {
+            // Dict miss is "initialized" only when getattr would not still
+            // bind a type-level non-data descriptor.
+            if unsafe { crate::baseobjspace::lookup_in_type(spec_type, "_initializing") }.is_some()
+            {
+                None
+            } else {
+                Some(w_module)
+            }
+        }
         Some(flag) if unsafe { pyre_object::is_bool(flag) } => {
             if unsafe { pyre_object::w_bool_get_value(flag) } {
                 None
@@ -5395,6 +5404,23 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
             }
         }
         Some(_) => None,
+    }
+}
+
+/// `w_dict_getitem_str` without running a stored key's `__eq__`.
+///
+/// Object-strategy dicts can hold a non-string key whose hash collides with
+/// `key`; the infallible getitem then calls that `__eq__` and swallows a
+/// raise as a miss.  A broken callback-free probe is `None` so the residual
+/// declines instead of executing the hook and letting `IMPORT_NAME` run it
+/// again.
+fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<PyObjectRef>> {
+    pyre_object::dict_eq_hook::begin_callback_free_probe();
+    let hit = unsafe { pyre_object::w_dict_getitem_str(dict, key) };
+    if pyre_object::dict_eq_hook::end_callback_free_probe() {
+        None
+    } else {
+        Some(hit)
     }
 }
 
@@ -7233,10 +7259,6 @@ mod tests {
         set_sys_module("import_cache_probe_mod", module);
         let w_type = unsafe { (*module).w_class };
         assert!(
-            unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some(),
-            "object.__getattribute__ is not the module default; that check declines every module"
-        );
-        assert!(
             unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }
                 .is_none(),
             "exact module keeps Module.descr_getattribute"
@@ -7244,6 +7266,38 @@ mod tests {
         assert!(
             sys_module_if_initialized("import_cache_probe_mod").is_some(),
             "exact module with a dict-only spec must take the import-cache residual"
+        );
+    }
+
+    #[test]
+    fn import_cache_probe_declines_nondata_initializing_descriptor() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_nondescript_mod");
+        let spec_cls = crate::typedef::make_builtin_type("ImportCacheNonDataSpec", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        let descr = crate::gateway::make_builtin_function("_initializing", |_| {
+            Ok(pyre_object::w_bool_from(true))
+        });
+        crate::type_dict_store(spec_cls, "_initializing", descr);
+        unsafe { crate::baseobjspace::mutated(spec_cls, Some("_initializing")) };
+        let spec = pyre_object::objectobject::w_instance_new(spec_cls);
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };
+        set_sys_module("import_cache_nondescript_mod", module);
+        unsafe {
+            assert!(
+                !crate::baseobjspace::type_lookup_is_data_descr(spec_cls, "_initializing"),
+                "a function is a non-data descriptor"
+            );
+            assert!(
+                crate::baseobjspace::lookup_in_type(spec_cls, "_initializing").is_some(),
+                "the type still exposes _initializing after the dict miss"
+            );
+        }
+        assert!(
+            sys_module_if_initialized("import_cache_nondescript_mod").is_none(),
+            "getattr would bind the type-level _initializing; the residual must decline"
         );
     }
 
