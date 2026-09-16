@@ -5657,9 +5657,10 @@ mod tests {
         // `_ll_list_resize_ge`) uses the word-ABI adapter, not the Rust fn.
         let list = w_list_new(vec![w_int_new(0)]);
         unsafe {
-            switch_to_object_strategy(&mut *(list as *mut W_ListObject));
+            let list = switch_to_object_strategy(&mut *(list as *mut W_ListObject));
             let before = ll_list_obj_capacity(&*(list as *const W_ListObject));
             __majit_call_target_ll_list_obj_resize_hint_really(list as i64, 8, 1);
+            let list = current_gc_ref(list);
             let after = ll_list_obj_capacity(&*(list as *const W_ListObject));
             assert!(after >= 8, "word-ABI grow: before={before} after={after}");
         }

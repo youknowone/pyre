@@ -2455,13 +2455,12 @@ pub(crate) fn patch_guard_recovery_layouts_for_trace(
     // `StoredExitLayout` populated with the resume_layout-derived
     // recovery so consumers see the patched virtuals/pending_fields.
     for (_, exit_layout) in exit_layouts.iter_mut() {
-        // resume.py walks `storage.rd_numb`. `build_guard_metadata` already
-        // projected that stream into `recovery_layout`. Rebuilding it from
-        // `resume_layout` cloned every frame's slots (32 B / 128 B) per
-        // guard on the regex and/or compile path.
-        if exit_layout.recovery_layout.is_some() {
-            continue;
-        }
+        // `build_guard_metadata` prepopulates `recovery_layout` from
+        // `rd_numb`. `enrich_guard_resume_layouts_for_trace` and
+        // `merge_frame_stack_into_resume_layout` then write trace_id,
+        // header_pc, source_guard, and extra outer frames onto
+        // `resume_layout`. Skip-if-already-Some never copies those
+        // enrichments, so recovery loses per-frame provenance.
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
             continue;
         };
@@ -3074,10 +3073,10 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_keeps_rd_numb_recovery_without_reprojecting() {
-        // resume.py walks storage.rd_numb. A second
-        // `to_exit_recovery_layout` per guard was 32 B / 128 B on the
-        // regex and/or compile path (`patch_guard_recovery_layouts_for_trace`).
+    fn test_patch_copies_enriched_resume_frames_into_recovery() {
+        // `build_guard_metadata` prepopulates recovery_layout, so the
+        // patch pass must still reproject from the later-enriched
+        // resume_layout (source_guard / extra outer frames).
         let mut memo = ResumeDataLoopMemo::new();
         let mut env = SimpleBoxEnv::new();
         env.types.insert(0, Type::Int);
@@ -3108,23 +3107,35 @@ mod tests {
         guard.set_fail_arg_types(vec![Type::Int]);
 
         let (_resume_data, mut exit_layouts) = build_guard_metadata(&inputargs, &[guard], 4, None);
-        let before = std::sync::Arc::as_ptr(
-            exit_layouts
-                .get(&0)
-                .and_then(|e| e.recovery_layout.as_ref())
-                .expect("rd_numb recovery"),
-        );
+        {
+            let exit = exit_layouts.get_mut(&0).expect("guard exit layout");
+            let resume =
+                std::sync::Arc::make_mut(exit.resume_layout.as_mut().expect("resume_layout"));
+            resume.frame_layouts[0].source_guard = Some((99, 7));
+            resume.frame_layouts[0].trace_id = Some(42);
+            let extra = ResumeFrameLayoutSummary {
+                trace_id: Some(7),
+                header_pc: Some(1),
+                source_guard: None,
+                jitcode_index: 3,
+                pc: 8,
+                slot_sources: Vec::new(),
+                slot_layouts: Vec::new(),
+                slot_types: None,
+            };
+            resume.frame_layouts.insert(0, extra);
+            resume.num_frames = resume.frame_layouts.len();
+        }
         patch_guard_recovery_layouts_for_trace(&mut exit_layouts);
-        let after = std::sync::Arc::as_ptr(
-            exit_layouts
-                .get(&0)
-                .and_then(|e| e.recovery_layout.as_ref())
-                .expect("rd_numb recovery after patch"),
-        );
-        assert_eq!(
-            before, after,
-            "patch must keep the rd_numb recovery; do not mint a second layout"
-        );
+        let recovery = exit_layouts
+            .get(&0)
+            .and_then(|e| e.recovery_layout.as_ref())
+            .expect("recovery after patch");
+        assert_eq!(recovery.frames.len(), 2);
+        assert_eq!(recovery.frames[0].jitcode_index, 3);
+        assert_eq!(recovery.frames[0].trace_id, Some(7));
+        assert_eq!(recovery.frames[1].source_guard, Some((99, 7)));
+        assert_eq!(recovery.frames[1].trace_id, Some(42));
     }
 
     #[test]
