@@ -16482,9 +16482,9 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py handle_async_forcing writes `deadframe.jf_savedata`
                 // through a GCREF store. Root the fresh AllVirtuals object and
                 // publish the forwarded address.
-                let savedata_slot = [savedata.as_usize() as i64];
+                let mut savedata_slot = [savedata.as_usize() as i64];
                 let _savedata_root =
-                    unsafe { crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| true) };
+                    unsafe { crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true) };
                 self.backend
                     .set_savedata_ref(&mut deadframe, majit_ir::GcRef(savedata_slot[0] as usize));
             }

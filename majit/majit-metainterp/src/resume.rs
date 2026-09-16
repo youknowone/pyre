@@ -8388,18 +8388,23 @@ impl<'a> ResumeDataDirectReader<'a> {
             }
         }
         vinfo.push_resume_ref_roots(self.virtualizable_ptr);
-        // A cut remapped the identity to NONE (`NULLREF`). The remaining
-        // vable items are still in the stream and must be skipped so the
-        // vref/frame sections stay aligned, but their tags are not a typed
-        // field image — `pycode` has been observed as TAGINT on this path.
-        // Writing that payload clobbers live fields (`'frame' object is
-        // not an iterator`, GC type_id of a string). resume.py:1408
-        // writes after `next_ref()` of a real identity; a NULL identity
-        // is the cut remap, not that path.
+        // A cut remaps the identity to `NULLREF` and leaves a field
+        // image whose tags do not match the live object (`pycode` as
+        // TAGINT on a 13-field peel that resumes at 16). Skip that
+        // payload so vref/frame stay aligned. A state-field host also
+        // encodes `NULLREF` (folded `&state`) but the remaining items
+        // are a real field image of matching size — write those.
         if tagged_eq(tagged_identity, NULLREF) {
-            self.resumecodereader.jump((vable_size - 1) as usize);
-            vinfo.reset_token_gcref(self.virtualizable_ptr);
-            return;
+            let expected = if self.virtualizable_ptr == 0 {
+                -1
+            } else {
+                vinfo.get_total_size(self.virtualizable_ptr) as i32
+            };
+            if expected != vable_size - 1 {
+                self.resumecodereader.jump((vable_size - 1) as usize);
+                vinfo.reset_token_gcref(self.virtualizable_ptr);
+                return;
+            }
         }
         // resume.py:1406: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(self.virtualizable_ptr) as i32;
@@ -8823,9 +8828,9 @@ impl DeadFrameRefRoots {
     /// `values` must stay alive and at a fixed address for the scope's whole
     /// lifetime; the collector writes forwarded addresses back through the
     /// registered pointers.
-    pub unsafe fn enter(values: &[i64], is_ref: impl Fn(usize) -> bool) -> Self {
+    pub unsafe fn enter(values: &mut [i64], is_ref: impl Fn(usize) -> bool) -> Self {
         let base_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-        let base = values.as_ptr() as *mut i64;
+        let base = values.as_mut_ptr();
         for index in 0..values.len() {
             if is_ref(index) {
                 // SAFETY: `index < values.len()`, and the caller pins the

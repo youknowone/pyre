@@ -2108,8 +2108,19 @@ fn leftover_has_listiter_id() -> bool {
         || LISTITER_TYPE_WORD.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
+fn leftover_ptr_looks_like_object(p: *const u8) -> bool {
+    if p.is_null() || (p as usize) & 1 != 0 {
+        return false;
+    }
+    let addr = p as usize;
+    addr.is_multiple_of(std::mem::size_of::<usize>()) && addr >= 4096
+}
+
 fn leftover_ptr_is_frame(vable: *const u8, p: *const u8) -> bool {
-    if vable.is_null() || p.is_null() || (p as usize) & 1 != 0 {
+    if !leftover_ptr_looks_like_object(p) {
+        return false;
+    }
+    if vable.is_null() {
         return false;
     }
     let vable_is_gc = majit_gc::gc_owns_object(vable as usize);
@@ -2127,7 +2138,7 @@ fn leftover_ptr_is_frame(vable: *const u8, p: *const u8) -> bool {
 }
 
 fn leftover_ptr_is_listiter(p: *const u8) -> bool {
-    if p.is_null() || (p as usize) & 1 != 0 {
+    if !leftover_ptr_looks_like_object(p) {
         return false;
     }
     let pred = LISTITER_PRED.load(std::sync::atomic::Ordering::Relaxed);
@@ -2145,7 +2156,7 @@ fn leftover_ptr_is_listiter(p: *const u8) -> bool {
 }
 
 fn leftover_ptr_is_str(p: *const u8) -> bool {
-    if p.is_null() || (p as usize) & 1 != 0 {
+    if !leftover_ptr_looks_like_object(p) {
         return false;
     }
     let pred = STR_PRED.load(std::sync::atomic::Ordering::Relaxed);
@@ -4272,6 +4283,15 @@ mod tests {
     use crate::history::test_support::{rooted_inputarg_operand, rooted_resop_operand};
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{ArrayFlag, Op, OpCode, OpRc, OpRef};
+
+    #[test]
+    fn leftover_ptr_is_str_rejects_nongc_mint_words() {
+        assert!(!leftover_ptr_is_str(std::ptr::null()));
+        assert!(!leftover_ptr_is_str((-42isize as usize) as *const u8));
+        assert!(!leftover_ptr_is_str(0x21 as *const u8));
+        assert!(!leftover_ptr_is_str(8 as *const u8));
+        assert!(!leftover_ptr_is_listiter((-42isize as usize) as *const u8));
+    }
 
     fn leftover_peel_index(ops: &[OpRc]) -> usize {
         let i = ops

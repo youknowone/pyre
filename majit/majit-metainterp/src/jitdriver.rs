@@ -6541,9 +6541,9 @@ impl<S: JitState> JitDriver<S> {
             // between deadframe release and this root; clear it after
             // the handoff so the last cache is not retained until
             // thread exit.
-            let savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
             let _savedata_root = unsafe {
-                crate::resume::DeadFrameRefRoots::enter(&savedata_slot, |_| savedata.is_some())
+                crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
             };
             majit_backend::release_forced_savedata();
             drop(result);

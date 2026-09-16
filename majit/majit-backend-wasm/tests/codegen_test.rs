@@ -9476,7 +9476,7 @@ fn inline_nursery_new_with_vtable_skips_payload_fill() {
     // has no leftover gc Refs (W_IntObject: only w_class, stamped here)
     // must not memory.fill — fannkuch does eight of these at JUMP.
     let inputs = nursery_new_inputs(vec![vtable_new(1, 53), finish_int_arg0()], 53);
-    let (bytes, _, _, _) =
+    let (bytes, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     let mut fills = 0;
