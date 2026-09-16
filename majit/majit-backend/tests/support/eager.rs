@@ -174,11 +174,7 @@ fn mixed_types_and_void_results_preserve_the_backend_contract() {
     let int = InputArg::from_type_rc(Type::Int, 0);
     let float = InputArg::from_type_rc(Type::Float, 1);
     let reference = InputArg::from_type_rc(Type::Ref, 2);
-    let inputs = vec![
-        int.clone(),
-        float.clone(),
-        reference.clone(),
-    ];
+    let inputs = vec![int.clone(), float.clone(), reference.clone()];
     let args = [&int, &float, &reference].map(Operand::from_bound_inputarg);
     let values = [
         Value::Int(42),

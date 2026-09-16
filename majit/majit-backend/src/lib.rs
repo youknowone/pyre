@@ -4567,11 +4567,7 @@ mod tests {
         assert_eq!(info.versions.len(), 1);
         assert_eq!(info.versions[0].0, 10);
 
-        info.add_version(
-            20,
-            vec![InputArg::new_int(0), InputArg::new_int(1)],
-            ops,
-        );
+        info.add_version(20, vec![InputArg::new_int(0), InputArg::new_int(1)], ops);
         assert_eq!(info.versions.len(), 2);
         assert_eq!(info.versions[1].0, 20);
     }

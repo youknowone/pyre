@@ -19945,7 +19945,11 @@ mod tests {
 
         let token = JitCellToken::new(1703);
         backend
-            .compile_loop(&[InputArg::new_ref_rc(0), InputArg::new_int_rc(1)], &ops, &token)
+            .compile_loop(
+                &[InputArg::new_ref_rc(0), InputArg::new_int_rc(1)],
+                &ops,
+                &token,
+            )
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
         let moved = backend.get_ref_value(&frame, 0);
