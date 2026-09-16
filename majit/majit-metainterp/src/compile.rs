@@ -6179,6 +6179,21 @@ impl TraceCtx {
             .find(|mp| mp.green_key == key && mp.header_pc == header_pc)
     }
 
+    /// `compile.py compile_retrace(..., start)` — the merge point the
+    /// `same_greenkey` scan already selected. Look up by that `start`
+    /// position, not by `(green_key, header_pc)`: `header_pc` is the
+    /// last registered header and a close on another loop leaves it
+    /// stale (`close_header_pc`).
+    pub fn merge_point_at_start(
+        &self,
+        start: crate::recorder::TracePosition,
+    ) -> Option<&MergePoint> {
+        self.current_merge_points
+            .iter()
+            .rev()
+            .find(|mp| mp.position == start)
+    }
+
     /// Get the current inlining depth.
     pub fn inline_depth(&self) -> usize {
         self.inline_frames.len()
