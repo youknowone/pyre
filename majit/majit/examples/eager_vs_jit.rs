@@ -46,10 +46,7 @@ fn add_ir() -> (Vec<InputArgRc>, Vec<OpRc>) {
         &[Operand::from_bound_op(&add)],
         make_finish_descr(0, vec![Type::Int]),
     ));
-    (
-        vec![x, y],
-        vec![add, finish],
-    )
+    (vec![x, y], vec![add, finish])
 }
 
 fn arguments(i: u64) -> [Value; 2] {

@@ -20,9 +20,7 @@ use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
-use majit_ir::{
-    InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity,
-};
+use majit_ir::{InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, descr_identity};
 use smallvec::SmallVec;
 
 // ── Constants ──────────────────────────────────────────────────────
