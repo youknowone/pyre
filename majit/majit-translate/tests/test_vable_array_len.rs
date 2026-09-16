@@ -9,7 +9,7 @@
 
 use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
-use majit_translate::front::mir::lower_fun_decl;
+use majit_translate::front::mir::{LowerContext, lower_fun_decl};
 use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
 use std::sync::OnceLock;
 
@@ -39,6 +39,12 @@ fn interpreter_llbc() -> Option<&'static Llbc> {
     .as_ref()
 }
 
+fn interpreter_context() -> Option<&'static LowerContext<'static>> {
+    static CONTEXT: OnceLock<LowerContext<'static>> = OnceLock::new();
+    let llbc = interpreter_llbc()?;
+    Some(CONTEXT.get_or_init(|| LowerContext::new(llbc)))
+}
+
 /// Lower `pyframe::<Impl>::<leaf>` out of the shipped interpreter LLBC.
 fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
     let llbc = interpreter_llbc()?;
@@ -47,7 +53,10 @@ fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
-    Some(lower_fun_decl(&llbc, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}")))
+    Some(
+        lower_fun_decl(interpreter_context()?, fd)
+            .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}")),
+    )
 }
 
 /// Every graph in the LLBC whose name path ends with `::<leaf>`.  Five
@@ -55,11 +64,12 @@ fn lower_pyframe_method(leaf: &str) -> Option<FunctionGraph> {
 /// test that wants one of them has to pick it out by shape.
 fn lower_all_named(leaf: &str) -> Option<Vec<FunctionGraph>> {
     let llbc = interpreter_llbc()?;
+    let context = interpreter_context()?;
     let suffix = format!("::{leaf}");
     Some(
         llbc.iter_local_fns()
             .filter(|fd| fd.item_meta.name_path().ends_with(&suffix))
-            .filter_map(|fd| lower_fun_decl(&llbc, fd).ok())
+            .filter_map(|fd| lower_fun_decl(context, fd).ok())
             .collect(),
     )
 }
@@ -357,10 +367,11 @@ fn report_vable_array_shape_of_frame_locals_proxy_snapshot() {
         return;
     };
     let mut graphs: Vec<FunctionGraph> = Vec::new();
+    let context = interpreter_context().expect("interpreter LLBC is present");
     for fd in llbc.iter_local_fns() {
         let path = fd.item_meta.name_path();
         if path.contains("frame_locals_proxy_snapshot") {
-            let g = lower_fun_decl(&llbc, fd).unwrap_or_else(|e| panic!("lower {path}: {e:?}"));
+            let g = lower_fun_decl(context, fd).unwrap_or_else(|e| panic!("lower {path}: {e:?}"));
             eprintln!("[vable-probe] lowered {path}");
             graphs.push(g);
         }
