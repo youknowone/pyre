@@ -30,26 +30,6 @@ impl OptSimplify {
         new_op.pos().set(op.pos().get());
         new_op
     }
-
-    /// `baseobjspace.py newbool` is look-inside; a residual `CALL_PURE`
-    /// whose result was replaced (`replace_box` after `IntIsTrue`) is
-    /// unused. `optimize_CALL_PURE_*` would reify it to `CALL` and keep
-    /// it. Drop it so the after-opt shape matches the look-inside.
-    fn call_pure_result_unused(op: &Op, ctx: &OptContext) -> bool {
-        if op.opcode == OpCode::CallPureN {
-            return false;
-        }
-        let res = op.pos().get();
-        let used_in = |ops: &[majit_ir::OpRc]| {
-            ops.iter().any(|other| {
-                if other.pos().get() == res {
-                    return false;
-                }
-                (0..other.num_args()).any(|i| other.arg(i).to_opref() == res)
-            })
-        };
-        !used_in(&ctx.input_ops) && !used_in(&ctx.new_operations)
-    }
 }
 
 impl Default for OptSimplify {
@@ -66,13 +46,9 @@ impl Optimization for OptSimplify {
         _ctx: &mut OptContext,
     ) -> OptimizationResult {
         match op.opcode {
-            // CALL_PURE_* -> CALL_*
+            // CALL_PURE_* -> CALL_* (`simplify.py optimize_CALL_PURE_I`)
             OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN => {
-                if Self::call_pure_result_unused(op, _ctx) {
-                    OptimizationResult::Remove
-                } else {
-                    OptimizationResult::Emit(Self::rewrite_call(op))
-                }
+                OptimizationResult::Emit(Self::rewrite_call(op))
             }
 
             // CALL_LOOPINVARIANT_* -> CALL_*
@@ -347,18 +323,16 @@ mod tests {
     }
 
     #[test]
-    fn test_unused_call_pure_removed() {
+    fn test_call_pure_rewrites_to_call() {
+        // `simplify.py optimize_CALL_PURE_I` always rewrites to CALL_*
+        // and emits. Unused results stay; they are not deleted.
         let mut b = TraceBuilder::new();
         let i0 = b.input(Type::Int, 0);
         b.op(OpCode::CallPureR, &[i0]);
         b.op(OpCode::Finish, &[]);
         let result = run_trace(b);
-        assert!(
-            !result
-                .iter()
-                .any(|o| o.opcode == OpCode::CallPureR || o.opcode == OpCode::CallR),
-            "unused CallPureR must not reify to CallR"
-        );
+        assert!(result.iter().any(|o| o.opcode == OpCode::CallR));
+        assert!(!result.iter().any(|o| o.opcode == OpCode::CallPureR));
     }
 
     #[test]

@@ -154,47 +154,6 @@ pub fn trace_box_int(
     obj
 }
 
-/// Host-registered rewrite of a residual wrapint allocator.
-///
-/// PyPy `intobject.py wrapint` is `return W_IntObject(x)` — instantiate
-/// plus `intval = x` — which `jtransform.py rewrite_op_malloc` already
-/// lowers to `new_with_vtable` + `setfield_gc`. Pyre's collector arm
-/// (`w_int_gc_alloc`) is `dont_look_inside`, so portal interpret records
-/// an opaque `CallR` whose recording-time heap pointer `heap.py`
-/// constant-folds through the immutable `intval`. The compiled exception
-/// bridge then rebakes that intval on every raise.
-///
-/// Looking inside the allocator into `add()` pulls `try_dispatch` onto
-/// the traced graph. This spec lets interpret execute the real allocator
-/// (so later `is_int` still sees a concrete pointer) and record the
-/// wrapint IR `OptVirtualize.optimize_NEW_WITH_VTABLE` can keep virtual
-/// — the same fold FBW `residual_call.rs` already applies to `BoxInt`.
-#[derive(Clone)]
-pub struct WrapintResidual {
-    pub alloc_fnaddrs: Vec<i64>,
-    pub size_descr: majit_ir::DescrRef,
-    pub intval_descr: majit_ir::DescrRef,
-    pub int_type_addr: i64,
-}
-
-impl WrapintResidual {
-    pub fn matches(&self, fnaddr: i64) -> bool {
-        self.alloc_fnaddrs.contains(&fnaddr)
-    }
-}
-
-static WRAPINT_RESIDUAL: std::sync::OnceLock<WrapintResidual> = std::sync::OnceLock::new();
-
-/// Install the host wrapint residual rewrite. First call wins; later
-/// calls are ignored so driver rebuilds do not replace the descrs.
-pub fn register_wrapint_residual(spec: WrapintResidual) {
-    let _ = WRAPINT_RESIDUAL.set(spec);
-}
-
-pub fn wrapint_residual() -> Option<&'static WrapintResidual> {
-    WRAPINT_RESIDUAL.get()
-}
-
 /// Residual `Ref -> Ref` helpers that return the argument when no
 /// collection moved it (`reload_top_root`, `try_gc_current_object_address`).
 /// `interp_jit.py PyFrame.dispatch` has no per-opcode frame reload; record
@@ -268,31 +227,6 @@ pub fn register_void_skip_residual(spec: VoidSkipResidual) {
 
 pub fn void_skip_residual() -> Option<&'static VoidSkipResidual> {
     VOID_SKIP_RESIDUAL.get()
-}
-
-/// Residual `Ref -> Ref` helpers whose result is a process-constant
-/// object (`w_code_const` / `PyCode.co_consts_w[idx]`). `pyopcode.py`
-/// `LOAD_CONST` reads the green constant array; record the traced
-/// `ConstPtr` instead of `CallR`.
-#[derive(Clone, Default)]
-pub struct ElidableRefResidual {
-    pub fnaddrs: Vec<i64>,
-}
-
-impl ElidableRefResidual {
-    pub fn matches(&self, fnaddr: i64) -> bool {
-        self.fnaddrs.contains(&fnaddr)
-    }
-}
-
-static ELIDABLE_REF_RESIDUAL: std::sync::OnceLock<ElidableRefResidual> = std::sync::OnceLock::new();
-
-pub fn register_elidable_ref_residual(spec: ElidableRefResidual) {
-    let _ = ELIDABLE_REF_RESIDUAL.set(spec);
-}
-
-pub fn elidable_ref_residual() -> Option<&'static ElidableRefResidual> {
-    ELIDABLE_REF_RESIDUAL.get()
 }
 
 /// Residual `Ref -> Int` helpers that publish a tracing-only

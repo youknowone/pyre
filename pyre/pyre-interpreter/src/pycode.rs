@@ -3172,37 +3172,55 @@ pub(crate) unsafe fn obj_to_constant_data(
 }
 
 /// `pyopcode.py getconstant_w(index) -> co_consts_w[index]`: return the
-/// one shared constant object the enclosing code holds at `index`. Normal
-/// constructors filled the slot eagerly, matching `pycode.py`; realization
-/// here is only a defensive fallback for a readable empty slot.
+/// one shared constant object the enclosing code holds at `index`.
 ///
-/// `w_code_obj` is the enclosing `PyCode` (`frame.pycode` for the interpreter,
-/// the virtualizable `pycode` field for the blackhole), and `idx` is the
-/// constant index. No side table is involved: the owner and storage shape are
-/// the literal port of `PyCode.co_consts_w`.
-///
-/// Returns `PY_NULL` only when the enclosing code/slot cannot be resolved.
+/// Look-inside. Constructors fill every slot eagerly (`pycode.py
+/// self.co_consts_w = consts`); the empty-slot realization is only for
+/// test stubs and stays off the jitted graph (`we_are_jitted` folds
+/// true, so `realize_code_const` is dead).
 ///
 /// # Safety
 /// `w_code_obj` must point to a valid `PyCode`.
-#[majit_macros::dont_look_inside]
 pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
+    if w_code_obj.is_null() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let w_code = unsafe { &*(w_code_obj as *const PyCode) };
+    if w_code.co_consts_w.is_null() {
+        return if majit_rlib::jit::we_are_jitted() {
+            pyre_object::pyobject::PY_NULL
+        } else {
+            unsafe { realize_code_const(w_code_obj, idx) }
+        };
+    }
+    let slot_table = unsafe { &*w_code.co_consts_w };
+    if idx >= slot_table.len() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    let existing = slot_table[idx].load(std::sync::atomic::Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    if majit_rlib::jit::we_are_jitted() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    unsafe { realize_code_const(w_code_obj, idx) }
+}
+
+/// Interpreter-only empty-slot fallback. `getconstant_w` has no
+/// counterpart; constructors already published the slot.
+#[majit_macros::dont_look_inside]
+unsafe fn realize_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
     let code_slot = roots.base();
     let w_code_obj = roots.pin_root(w_code_obj);
     let w_code = unsafe { &*(w_code_obj as *const PyCode) };
-    // Guard `code_ptr` before dereferencing it — the same null/alignment check
-    // the lazy-cache initializers use. A null/misaligned pointer means the
-    // nested code is unreadable, so return PY_NULL and let the caller realize
-    // the constant from its own code object.
     let align_mask = std::mem::align_of::<crate::CodeObject>() as i64 - 1;
     if w_code.code_ptr.is_null() || (w_code.code_ptr as i64) & align_mask != 0 {
         return pyre_object::pyobject::PY_NULL;
     }
     let code = unsafe { &*(w_code.code_ptr as *const crate::CodeObject) };
     let constants = crate::pyframe::code_constants(code);
-    // closure-free, Option-pattern-free `constants.get(idx)` rewrite — keep the
-    // bounds check a plain `lt + getitem` ahead of the variant destructure.
     if idx >= constants.len() {
         return pyre_object::pyobject::PY_NULL;
     }
@@ -3213,8 +3231,6 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     let Some(slot) = slot_table.get(idx) else {
         return pyre_object::pyobject::PY_NULL;
     };
-    // Normal slots are already filled. Keep the fallback free-thread safe for
-    // test stubs and alternate construction paths by retaining the AtomicPtr.
     let existing = slot.load(std::sync::atomic::Ordering::Acquire);
     if !existing.is_null() {
         return existing;
@@ -3226,8 +3242,6 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         },
         constant => crate::pyframe::pyobject_from_constant(constant),
     };
-    // Keep the losing or winning candidate live until the CAS has either
-    // published it or selected the concurrently-published canonical object.
     let candidate_root = &mut realized as *mut PyObjectRef as *mut *mut u8;
     let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(candidate_root) };
     publish_code_slot_store(roots.get(code_slot));

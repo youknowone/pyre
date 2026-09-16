@@ -9736,28 +9736,6 @@ where
                         }
                         return TraceAction::Continue;
                     }
-                    // `pyopcode.py LOAD_CONST` reads the green
-                    // `co_consts_w` slot. Record the traced ConstPtr.
-                    if let Some(spec) = crate::box_trace::elidable_ref_residual()
-                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
-                        && concrete != 0
-                    {
-                        let folded = ctx.const_ref(concrete);
-                        self.set_ref_reg(dst, Some(folded), Some(concrete));
-                        if is_forces
-                            && matches!(
-                                self.finalize_standard_virtualizable_may_force(
-                                    ctx,
-                                    sym,
-                                    active_vable
-                                ),
-                                TraceAction::Abort
-                            )
-                        {
-                            return TraceAction::Abort;
-                        }
-                        return TraceAction::Continue;
-                    }
                     // `frame_anchor_live` rereads the red frame. Reuse
                     // the standard virtualizable OpRef when the concrete
                     // equals that frame. Push stays recorded so
@@ -9783,39 +9761,7 @@ where
                         }
                         return TraceAction::Continue;
                     }
-                    // Residual wrapint (`w_int_gc_alloc`): execute already
-                    // ran; record `new_with_vtable` + `setfield_gc`
-                    // (`intobject.py wrapint`) instead of `CallR`.
-                    if let Some(spec) = crate::box_trace::wrapint_residual()
-                        && (spec.matches(concrete_ptr as i64) || spec.matches(trace_ptr as i64))
-                        && concrete != 0
-                        && let Some(&raw_op) = args.first()
                     {
-                        let boxed = crate::box_trace::trace_box_int(
-                            ctx,
-                            raw_op,
-                            spec.size_descr.clone(),
-                            spec.intval_descr.clone(),
-                            spec.int_type_addr,
-                        );
-                        ctx.set_opref_concrete(
-                            boxed,
-                            majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
-                        );
-                        self.set_ref_reg(dst, Some(boxed), Some(concrete));
-                        if is_forces
-                            && matches!(
-                                self.finalize_standard_virtualizable_may_force(
-                                    ctx,
-                                    sym,
-                                    active_vable
-                                ),
-                                TraceAction::Abort
-                            )
-                        {
-                            return TraceAction::Abort;
-                        }
-                    } else {
                         // pyjitpl.py do_residual_call plain branch —
                         // see the BC_RESIDUAL_CALL_*_I sibling for the full cite.
                         let plain_branch = !is_forces && !is_loopinvariant;

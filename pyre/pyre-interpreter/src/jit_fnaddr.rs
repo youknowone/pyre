@@ -2792,10 +2792,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::jit_compiler_bigint_to_rbigint",
         crate::jit_compiler_bigint_to_rbigint,
     );
-    // PyPy's getconstant_w is a pre-wrapped list read. Pyre's compiler stores
-    // ConstantData, so the first read realizes and atomically publishes that
-    // wrapped object. Keep this temporary compiler-boundary machinery opaque
-    // to source translation; all later reads return the same co_consts_w slot.
+    // `pyopcode.py getconstant_w` is look-inside. The address remains so a
+    // declined look-inside still has a real fnaddr instead of a symbolic hash.
     up2(
         &mut entries,
         "pyre_interpreter::pycode::w_code_const",
