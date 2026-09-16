@@ -266,8 +266,17 @@ pub extern "C" fn jit_ll_arraycopy(
         item_size: ITEMS_BLOCK_TOKEN.item_size,
         items_have_gc_ptrs: true,
     };
-    let dest_layout = majit_gc::gc_varsize_layout(dest_address).unwrap_or(fallback);
-    let source_layout = majit_gc::gc_varsize_layout(source_address).unwrap_or(fallback);
+    // An unmanaged typed block has no registry entry. If only one
+    // endpoint is registered, reuse that layout for both; the fallback
+    // is only for two unknown addresses.
+    let (source_layout, dest_layout) = match (
+        majit_gc::gc_varsize_layout(source_address),
+        majit_gc::gc_varsize_layout(dest_address),
+    ) {
+        (Some(source), Some(dest)) => (source, dest),
+        (Some(known), None) | (None, Some(known)) => (known, known),
+        (None, None) => (fallback, fallback),
+    };
     // rgc.py `ll_arraycopy`: `assert TP == typeOf(dest).TO`.
     assert!(
         source_layout.item_size == dest_layout.item_size
