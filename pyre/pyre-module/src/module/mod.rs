@@ -65,6 +65,8 @@ pub mod fcntl;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
 pub mod math;
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+pub mod pwd;
 pub mod pyexpat;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;

@@ -84,6 +84,8 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("pwd", module::pwd::init);
     pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);

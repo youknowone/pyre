@@ -82,8 +82,6 @@ pub mod mmap;
 pub mod msvcrt;
 pub mod operator;
 pub mod posix;
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-pub mod pwd;
 pub mod pypyjit;
 #[cfg(not(feature = "sandbox"))]
 pub mod select;
