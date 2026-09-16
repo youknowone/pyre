@@ -474,6 +474,25 @@ pub unsafe fn walk_raw_code_roots(
         // that old nested wrapper here. Bootstrap wrappers are each
         // registered in PREBUILT_CODE_ROOTS and use the same direct-edge
         // shape.
+        walk_enrolled_code_roots(value, visitor);
+    }
+}
+
+/// Walk interiors of a `PyCode` already known to be a code wrapper.
+///
+/// [`walk_raw_code_roots`] first asks [`is_code`], which reads `ob_type`.
+/// Enrolled prebuilt roots are code wrappers by construction; skip that
+/// predicate so a wrapper whose `ob_type` word is momentarily unreadable
+/// (a just-written stable allocation, a header the visitor has not yet
+/// forwarded) still has `co_consts_w` scanned.
+pub unsafe fn walk_enrolled_code_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if value.is_null() {
+        return;
+    }
+    unsafe {
         walk_raw_code_roots_inner(value, visitor, 0);
     }
 }
@@ -498,14 +517,21 @@ unsafe fn walk_raw_code_roots_inner(
         visitor(&mut *(&mut code.w_qualname as *mut PyObjectRef as *mut majit_ir::GcRef));
         // `co_name` is realized and retained the same way.
         visitor(&mut *(&mut code.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
+        // The list pointer itself (`PyCode.co_consts_w` is a GCREF to a
+        // `GcArray(OBJECTPTR)`). Greying an already-old array is a no-op
+        // on a minor, so the items still have to be named here the way a
+        // young list's scan would name them.
+        visitor(
+            &mut *(&mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray
+                as *mut majit_ir::GcRef),
+        );
         if !code.co_consts_w.is_null() {
-            for slot in (&*code.co_consts_w).iter() {
-                let mut child = slot.load(std::sync::atomic::Ordering::Acquire);
-                if child.is_null() {
+            for slot in (&mut *code.co_consts_w).as_mut_slice() {
+                if slot.is_null() {
                     continue;
                 }
-                visitor(&mut *(&mut child as *mut PyObjectRef as *mut majit_ir::GcRef));
-                slot.store(child, std::sync::atomic::Ordering::Release);
+                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                let child = *slot;
                 // PyPy's `PyCode` is a young `W_Root`; the mark worklist
                 // copies then scans a nested code reached through
                 // `co_consts_w`. pyre births `PyCode` old-gen
@@ -1011,6 +1037,53 @@ unsafe fn walk_managed_frame_interiors(
     }
 }
 
+/// Trace a managed old-gen frame the way PyPy's copy+scan of a young
+/// `PyFrame` traces `locals_cells_stack_w` / `f_backref` / `pycode`.
+///
+/// Greying the frame pointer itself is a no-op for an old-gen object
+/// during a minor (`incminimark.py` copies only nursery objects). The
+/// interiors — including the nursery `locals_cells_stack_w` array and
+/// every live valuestack slot — have to be walked here.
+unsafe fn walk_managed_frame_chain(
+    mut frame: *mut PyFrame,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    while !frame.is_null() && unsafe { is_gc_managed_pyframe(frame) } {
+        unsafe { walk_managed_frame_interiors(frame, visitor) };
+        frame = unsafe { managed_chain_next_frame((*frame).f_backref) };
+    }
+}
+
+/// `executioncontext.py` `self.topframeref` is the executing-frame root.
+/// Tracing that GCREF copies a young `PyFrame` and then scans it. pyre
+/// births executing frames old-gen, so the slot visit is a no-op; walk
+/// the interiors (and the `f_backref` chain) here.
+///
+/// A `JitVirtualRef` is not a `PyFrame`: forward `forced` and, when the
+/// forced object is already a managed frame, walk that chain. The vref's
+/// own custom trace still runs later for a not-yet-forced token.
+unsafe fn walk_topframeref_interiors(
+    top: *mut PyFrame,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if top.is_null() {
+        return;
+    }
+    unsafe {
+        if forward_virtual_ref_forced(top as *mut u8, visitor) {
+            let forced =
+                (*(top as *mut majit_metainterp::virtualref::JitVirtualRef)).forced as *mut PyFrame;
+            if !forced.is_null() && is_gc_managed_pyframe(forced) {
+                walk_managed_frame_chain(forced, visitor);
+            }
+            return;
+        }
+        if is_gc_managed_pyframe(top) {
+            walk_managed_frame_chain(top, visitor);
+        }
+    }
+}
+
 /// Next interpreter `PyFrame` after a managed frame's forwarded `f_backref`.
 ///
 /// PyPy reaches the parent by tracing `PyFrame.f_backref` off the copied
@@ -1099,6 +1172,31 @@ unsafe fn walk_frame_value_slot(
         }
         walk_raw_exception_roots(value, visitor);
         walk_raw_immortal_roots(value, visitor);
+        walk_raw_dict_roots(value, visitor);
+    }
+}
+
+/// Interiors of a managed dict reached as a root.
+///
+/// PyPy's `W_DictMultiObject` is a young `W_Root`: greying it copies the
+/// dict and the generated `rerased` trace scans `dstorage`. pyre's
+/// strategy storage is an old-gen box (`gc_alloc_storage_box`) whose
+/// only scanner is the dict's custom trace. A minor that only greys an
+/// already-old dict does not run that trace, so a class-namespace copy
+/// pinned on the shadow stack (or sitting on the valuestack) keeps
+/// young functions only if we descend here — the same compensation
+/// `walk_global_prebuilt_roots` already applies to type `dict` fields.
+pub unsafe fn walk_raw_dict_roots(
+    value: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    if value.is_null() || !pyre_object::is_dict(value) {
+        return;
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_walk_gc_refs(value, &mut |slot| {
+            visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+        });
     }
 }
 
@@ -1242,6 +1340,13 @@ pub unsafe fn walk_pyframe_roots_area(
             }
             let top_slot = unsafe { &mut (*ec).topframeref as *mut *mut PyFrame };
             visitor(unsafe { &mut *(top_slot as *mut majit_ir::GcRef) });
+            // `ExecutionContext.topframeref` is the executing-frame root
+            // (`executioncontext.py enter`). PyPy then copy+scans the young
+            // `PyFrame`. pyre's frame is old-gen, so greying the pointer
+            // does not scan `locals_cells_stack_w`; walk those interiors.
+            // Re-read the slot after the visitor so a nursery vref/frame
+            // that just moved is the one whose interiors we walk.
+            unsafe { walk_topframeref_interiors((*ec).topframeref, visitor) };
             unsafe { (*ec).walk_builtin_roots(visitor) };
             // `sys_exc_value` holds the active handler exception, which
             // is nursery-allocated and may move; forward it so the EC
@@ -1275,6 +1380,20 @@ pub unsafe fn walk_pyframe_roots_area(
             }
         };
         visit_ec_slots(ambient_ec);
+        // `CURRENT_FRAME` is a pyre extra TLS root. PyPy's only executing-
+        // frame root is `ec.topframeref`. When TLS is empty (enter has
+        // published the frame, eval_loop has not yet installed TLS) the
+        // valuestack still has to be reached the way tracing `topframeref`
+        // would reach it. `visit_ec_slots` already walked managed interiors;
+        // start this loop so a stdalloc fallback parent is still scanned.
+        if frame.is_null() && !ambient_ec.is_null() {
+            let top = unsafe { (*ambient_ec).topframeref };
+            if !top.is_null()
+                && !unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) }
+            {
+                frame = top;
+            }
+        }
         while !frame.is_null() {
             // A GC-managed PyFrame was exposed by the CURRENT_FRAME slot (or
             // by the preceding raw frame's f_backref slot). PyPy then traces
@@ -2805,7 +2924,14 @@ impl SharedOpcodeHandler for PyFrame {
     }
 
     fn push_value(&mut self, value: Self::Value) -> Result<(), PyError> {
-        self.push(value);
+        // `pyframe.py pushvalue` / `LOAD_CONST`'s livevar across the
+        // `setarrayitem_gc` that records the slot. A nursery locals
+        // array takes the no-barrier store, so pin the value the way
+        // the translated shadow stack would.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        self.push(pyre_object::gc_roots::shadow_stack_get(slot));
         Ok(())
     }
 

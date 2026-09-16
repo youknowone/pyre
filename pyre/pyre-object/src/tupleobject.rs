@@ -101,6 +101,13 @@ pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 187;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
+impl crate::lltype::GcType for W_TupleObject {
+    fn type_id() -> u32 {
+        W_TUPLE_GC_TYPE_ID
+    }
+    const SIZE: usize = W_TUPLE_OBJECT_SIZE;
+}
+
 impl crate::lltype::GcType for W_TupleObjectUser {
     fn type_id() -> u32 {
         W_TUPLE_USER_GC_TYPE_ID
@@ -234,6 +241,29 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     }
 }
 
+/// Process-global empty tuple. `_Py_SINGLETON(tuple_empty)` / PyPy
+/// `W_AbstractTupleObject.is_w` treats every empty tuple as one object,
+/// so `() is ()` holds. A nursery-allocated `()` in `co_consts_w` is
+/// recycled by a minor that misses that slot; the singleton cannot be.
+static EMPTY_TUPLE: crate::gc_roots::RootedOnceRef = crate::gc_roots::RootedOnceRef::new();
+
+/// The unique empty tuple object.
+#[majit_macros::dont_look_inside]
+pub fn w_empty_tuple() -> PyObjectRef {
+    EMPTY_TUPLE.get_or_init(|| {
+        let wrappeditems = unsafe { crate::object_array::alloc_tuple_items_block(&[]) };
+        crate::lltype::malloc_typed_stable(W_TupleObject {
+            ob_header: PyObject {
+                ob_type: &TUPLE_TYPE as *const PyType,
+                w_class: get_instantiate(&TUPLE_TYPE),
+            },
+            hash: AtomicI64::new(TUPLE_HASH_UNSET),
+            wrappeditems,
+            w_dict: PY_NULL,
+        }) as PyObjectRef
+    })
+}
+
 /// Allocate a new tuple from a Vec of items.
 ///
 /// Arity-2 tuples are routed through `makespecialisedtuple2`
@@ -247,6 +277,9 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// residual returning the fresh object pointer.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    if items.is_empty() {
+        return w_empty_tuple();
+    }
     if items.len() == 2 {
         // PyPy can use `_ff` here because its object space gives plain floats
         // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
@@ -309,6 +342,9 @@ fn w_tuple_new_array_backed_impl(
     w_class: PyObjectRef,
     user_layout: bool,
 ) -> PyObjectRef {
+    if !user_layout && items.is_empty() {
+        return w_empty_tuple();
+    }
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
     //   livevars = self.push_roots(hop)
     //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])

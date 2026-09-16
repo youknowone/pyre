@@ -4412,6 +4412,14 @@ impl PyFrame {
         unsafe { &mut *(pyre_object::gc_hook::try_gc_current_object_address(addr) as *mut Self) }
     }
 
+    /// Shared-ref twin of [`Self::live_mut`]: follow a nursery forwarding
+    /// stub so a `&self` peek reads the same frame `push` / `pop` write.
+    #[inline]
+    fn live(&self) -> &Self {
+        let addr = self as *const Self as *mut u8;
+        unsafe { &*(pyre_object::gc_hook::try_gc_current_object_address(addr) as *const Self) }
+    }
+
     #[inline]
     pub fn push(&mut self, value: PyObjectRef) {
         // Both writes below — the stack slot and the depth — have to land on
@@ -4423,24 +4431,24 @@ impl PyFrame {
         frame.valuestackdepth = idx + 1;
     }
 
-    /// Reads and writes through the caller's `&mut self`, without the
-    /// [`Self::live_mut`] reload [`Self::push`] takes.
+    /// Reload the frame the way RPython's GC transform reloads the
+    /// `popvalue` livevar after a safepoint (`pyframe.py popvalue_maybe_none`).
     ///
-    /// That is sound because the opcode bodies keep `pyopcode.py`'s
-    /// `pop; op; push` order: every pop runs before the operation that can
-    /// collect, and the push that follows the operation reloads for itself.
-    /// A body that allocates between two pops breaks the premise — the second
-    /// pop would read the abandoned copy — and owes the reload at its own call
-    /// site.
+    /// A between-opcode collection (`eval_loop` safepoint) or a pin that
+    /// grows the shadow stack can relocate a nursery frame (or only its
+    /// `locals_cells_stack_w` array, with the field updated on the live
+    /// copy). Reading through the caller's abandoned `&mut self` would pop
+    /// a recycled nursery word.
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
-        if self.valuestackdepth <= self.stack_base() {
-            report_stack_underflow(self);
+        let frame = self.live_mut();
+        if frame.valuestackdepth <= frame.stack_base() {
+            report_stack_underflow(frame);
         }
-        let depth = self.valuestackdepth - 1;
-        let value = locals_w!(self)[depth];
-        self.set_locals_w(depth, PY_NULL);
-        self.valuestackdepth = depth;
+        let depth = frame.valuestackdepth - 1;
+        let value = locals_w!(frame)[depth];
+        frame.set_locals_w(depth, PY_NULL);
+        frame.valuestackdepth = depth;
         value
     }
 
@@ -4453,16 +4461,18 @@ impl PyFrame {
         // `locals_cells_stack_w` read ahead of the subtraction's overflow
         // check, and that check's branch then carries the array out of the
         // block on a link — which `_check_no_vable_array` rejects.
-        let index = self.valuestackdepth - 1;
-        locals_w!(self)[index]
+        let frame = self.live();
+        let index = frame.valuestackdepth - 1;
+        locals_w!(frame)[index]
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
         // Hoisted for the reason given on [`Self::peek`].
-        let index = self.valuestackdepth - 1 - depth;
-        locals_w!(self)[index]
+        let frame = self.live();
+        let index = frame.valuestackdepth - 1 - depth;
+        locals_w!(frame)[index]
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the

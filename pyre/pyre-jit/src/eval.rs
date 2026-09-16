@@ -5438,6 +5438,7 @@ fn build_gc_global() {
 pub fn reset_gc_fresh_for_test() {
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
+    pyre_interpreter::pycode::clear_prebuilt_code_roots_for_test();
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.
@@ -6236,6 +6237,11 @@ unsafe fn pyre_object_root_walker_area(
             // a pinned wrapper is already old, so the slot visit does
             // not scan `co_consts_w`.
             pyre_interpreter::eval::walk_raw_code_roots(value, visitor);
+            // A pinned class-namespace / `dict.copy()` is old enough
+            // after the first minor that greying the dict is a no-op;
+            // strategy storage still holds young functions. Descend
+            // the way type-dict prebuilt walking already does.
+            pyre_interpreter::eval::walk_raw_dict_roots(value, visitor);
         });
     }
 }
