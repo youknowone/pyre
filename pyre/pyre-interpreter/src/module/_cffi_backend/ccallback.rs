@@ -383,7 +383,22 @@ fn handle_applevel_exception(
     let _ = roots.pin_root(w_type);
     let mut w_tb = error.get_traceback();
     if w_tb.is_null() {
-        w_tb = pyre_object::w_none();
+        // A raise that never entered `handle_operation_error` still
+        // owes `onerror` a traceback. Stamp the live callback frame.
+        let frame = crate::eval::current_frame();
+        if !frame.is_null() && !error.exc_object.is_null() {
+            unsafe {
+                crate::pytraceback::record_application_traceback(
+                    error.exc_object,
+                    frame,
+                    (*frame).last_instr as i64,
+                );
+            }
+            w_tb = error.get_traceback();
+        }
+        if w_tb.is_null() {
+            w_tb = pyre_object::w_none();
+        }
     }
     let _ = roots.pin_root(w_tb);
     match crate::call::call_function_impl_result(
