@@ -2194,6 +2194,12 @@ fn observes_array_items(op: &Op, array: OpRef, forwardings: &[Option<OpRef>]) ->
             | OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
             | OpCode::GetinteriorfieldGcF
+            // rewrite.py lowers GETARRAYITEM to these; wasm executes
+            // them, so a later SETARRAYITEM must not cancel ZERO_ARRAY
+            // for a slot the load already observed.
+            | OpCode::GcLoadIndexedI
+            | OpCode::GcLoadIndexedR
+            | OpCode::GcLoadIndexedF
     ) && resolve_same_as_forwarding(op.arg(0).to_opref(), forwardings) == array
 }
 
@@ -4639,7 +4645,7 @@ impl majit_ir::ArrayDescr for BuiltinArrayDescr {
     }
 }
 
-fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
+pub(crate) fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
     let (base_size, item_size, type_id) = match opcode {
         OpCode::Newstr
         | OpCode::Strlen
@@ -4677,7 +4683,7 @@ fn builtin_string_array_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
     }))
 }
 
-fn builtin_string_hash_field_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
+pub(crate) fn builtin_string_hash_field_descr(opcode: OpCode) -> Option<majit_ir::DescrRef> {
     if !matches!(opcode, OpCode::Strhash | OpCode::Unicodehash) {
         return None;
     }
