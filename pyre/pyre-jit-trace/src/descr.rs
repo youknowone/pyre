@@ -3432,7 +3432,8 @@ use pyre_object::interp_exceptions::{
     EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
     EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
     EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
-    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
+    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, W_EXCEPTION_EXTENDED_SIZE,
+    exc_kind_to_pytype, exc_kind_uses_extended_layout, exception_extended_gc_type_id,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -5155,17 +5156,107 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
-/// SizeDescr + field descrs for `W_BaseException` allocation via
-/// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
-/// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
-/// constructor-written fields — `kind`, `w_class`, `args_w`, and
-/// `suppress_context` — share the same offsets across kinds. `w_context`
-/// is written separately by the raise lowering; the remaining pointer slots
-/// stay zeroed by GC pointer clearing (PY_NULL), matching `w_exception_new_empty`.
+/// SizeDescr + field descrs for exception allocation via NewWithVtable,
+/// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
+/// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
+/// classes use the slim [`W_BaseException`] SizeDescr; extra-field
+/// subclasses use [`W_ExceptionExtended`].  The constructor-written
+/// fields — `kind`, `w_class`, `args_w` — share the same offsets and
+/// indices across both layouts. `w_context` is written separately by the
+/// raise lowering; remaining pointer slots stay zeroed by GC pointer
+/// clearing (PY_NULL), matching `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+    if !exc_kind_uses_extended_layout(kind) {
+        return build_object_descr_group_keyed_only(
+            W_BASE_EXCEPTION_SIZE,
+            pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID,
+            exc_kind_to_pytype(kind) as *const _ as usize,
+            &[
+                (
+                    "W_BaseException.kind",
+                    EXC_KIND_OFFSET,
+                    1,
+                    Type::Int,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_class",
+                    W_CLASS_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.args_w",
+                    EXC_ARGS_W_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_context",
+                    EXC_W_CONTEXT_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_cause",
+                    EXC_W_CAUSE_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_traceback",
+                    EXC_W_TRACEBACK_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_dict",
+                    EXC_W_DICT_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.suppress_context",
+                    EXC_SUPPRESS_CONTEXT_OFFSET,
+                    1,
+                    Type::Int,
+                    false,
+                    false,
+                    false,
+                ),
+            ],
+            "W_BaseException",
+        );
+    }
+    let extended_tid = exception_extended_gc_type_id();
+    let extended_tid = if extended_tid == 0 {
+        pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID
+    } else {
+        extended_tid
+    };
     build_object_descr_group_keyed_only(
-        W_BASE_EXCEPTION_SIZE,
-        W_BASE_EXCEPTION_GC_TYPE_ID,
+        W_EXCEPTION_EXTENDED_SIZE,
+        extended_tid,
         exc_kind_to_pytype(kind) as *const _ as usize,
         &[
             // `kind` is a `u8` tag (1 byte, unsigned).
@@ -5524,15 +5615,10 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        // Out of both name registries: the per-kind vtable means a shared
-        // "W_BaseException" name-registry slot would be first-write-wins and
-        // lose the other kinds' vtables.  NewWithVtable embeds the SizeDescr
-        // in the op, so the name-registry publish is not needed here.  The
-        // `_cache_size` identity is still required: `resolve_gc_tid` reads the
-        // header tid for a serialized `BhDescr` out of that slot, and every
-        // kind shares one layout and one `W_BASE_EXCEPTION_GC_TYPE_ID`, so one
-        // key for all of them is exactly the STRUCT identity they have.
-        "W_BaseException",
+        // Extra-field kinds share one STRUCT identity distinct from the
+        // slim `W_BaseException` key above, so `_cache_size` cannot
+        // first-write-wins the 72-byte SizeDescr onto an OSError.
+        "W_ExceptionExtended",
     )
 }
 
@@ -5621,7 +5707,13 @@ pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
-    field_descr_from_group(cache[idx].as_ref().unwrap(), 5)
+    let group = cache[idx].as_ref().unwrap();
+    let field = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == EXC_W_TRACEBACK_OFFSET)
+        .expect("exception descr group has no w_traceback field");
+    field_descr_from_group(group, field)
 }
 
 static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -6655,6 +6747,7 @@ mod tests {
     fn exception_size_descr_clears_every_runtime_traced_gc_field() {
         let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
         let size = descr.as_size_descr().expect("W_BaseException SizeDescr");
+        assert_eq!(size.size(), W_BASE_EXCEPTION_SIZE);
         let mut actual: Vec<usize> = size.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
         actual.sort_unstable();
         actual.dedup();
@@ -6664,6 +6757,16 @@ mod tests {
         expected.sort_unstable();
         expected.dedup();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn oserror_size_descr_uses_the_extended_layout() {
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::OSError);
+        let size = descr
+            .as_size_descr()
+            .expect("W_ExceptionExtended SizeDescr");
+        assert_eq!(size.size(), W_EXCEPTION_EXTENDED_SIZE);
+        assert!(size.size() > W_BASE_EXCEPTION_SIZE);
     }
 
     #[test]
