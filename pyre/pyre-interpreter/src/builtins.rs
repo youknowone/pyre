@@ -2908,10 +2908,13 @@ fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let base = pyre_object::gc_roots::pin_roots(&[mv, args[1]]);
     let item_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_none());
+    let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_none());
     for index in start..stop {
+        pyre_object::gc_roots::shadow_stack_set(idx_slot, w_int_new(index));
         let item = memoryview_getitem(&[
             pyre_object::gc_roots::shadow_stack_get(base),
-            w_int_new(index),
+            pyre_object::gc_roots::shadow_stack_get(idx_slot),
         ])?;
         pyre_object::gc_roots::shadow_stack_set(item_slot, item);
         if std::ptr::eq(item, pyre_object::gc_roots::shadow_stack_get(base + 1))

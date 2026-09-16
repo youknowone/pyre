@@ -344,13 +344,15 @@ pub fn app_profile_call(
     let _roots = pyre_object::gc_roots::push_roots();
     let frame_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame));
+    let event_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(event));
     let arg_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_arg);
     crate::call::call_function_impl_result(
         w_callable,
         &[
             pyre_object::gc_roots::shadow_stack_get(frame_slot),
-            pyre_object::w_str_new(event),
+            pyre_object::gc_roots::shadow_stack_get(event_slot),
             pyre_object::gc_roots::shadow_stack_get(arg_slot),
         ],
     )
