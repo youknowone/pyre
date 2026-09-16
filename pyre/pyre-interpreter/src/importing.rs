@@ -5291,10 +5291,10 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
 /// real module and force the slow `CallMayForce` importer on every
 /// `import math`.
 pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
-    if sys_modules_blocks(name) {
+    if sys_modules_blocks_no_callback(name)? {
         return None;
     }
-    let w_module = check_sys_modules(name)?;
+    let w_module = check_sys_modules_no_callback(name)??;
     if !unsafe { pyre_object::is_module(w_module) } {
         return None;
     }
@@ -5365,6 +5365,24 @@ fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<P
     } else {
         Some(hit)
     }
+}
+
+fn check_sys_modules_no_callback(name: &str) -> Option<Option<PyObjectRef>> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return Some(sys_modules_registry_get(name));
+    }
+    let entry = dict_getitem_str_no_callback(dict, name)?;
+    Some(entry.filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) }))
+}
+
+fn sys_modules_blocks_no_callback(name: &str) -> Option<bool> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return Some(false);
+    }
+    let hit = dict_getitem_str_no_callback(dict, name)?;
+    Some(hit.is_some_and(|m| !m.is_null() && unsafe { pyre_object::is_none(m) }))
 }
 
 /// Concurrent-import tail of `_gcd_import`: wait for `__spec__._initializing`
