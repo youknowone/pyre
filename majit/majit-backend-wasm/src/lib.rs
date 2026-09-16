@@ -4791,6 +4791,7 @@ impl majit_backend::Backend for WasmBackend {
         // creates the `CompiledLoopToken`.
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
+            clt.set_ca_unregister(crate::failguard::remove_call_assembler_target);
         }
         let mut ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);

@@ -13260,38 +13260,10 @@ impl<M: Clone> MetaInterp<M> {
     pub fn try_to_free_some_loops(&mut self) {
         let evicted = self.warm_state.memory_manager.next_generation();
         for token in evicted {
-            // model.py `cpu.free_loop_and_bridges` parity for the
-            // counter side: PyPy's `LoopToken.__del__` runs that
-            // routine, which on its way out bumps
-            // `cpu.tracker.total_freed_loops += 1` plus
-            // `total_freed_bridges += loop.bridges_count`.  Pyre routes
-            // both bumps through the backend's `CpuTotalTracker` Arc
-            // via `JitProfiler::inc_freed_loop` / `add_freed_bridges`
-            // (the profiler is rebound onto that Arc in
-            // `MetaInterp::new`).
-            //
-            // **TIMING DIVERGENCE.**  RPython fires `__del__` exactly
-            // when the GC collects the LoopToken — Rust's `Arc`
-            // cannot match that timing because the last strong ref
-            // may be held by a guard-failure path that hasn't dropped
-            // yet.  Pyre instead bumps the counters at memmgr
-            // eviction (memmgr.py `_kill_old_loops_now`), which is
-            // strictly upstream of `__del__` in PyPy: every evicted
-            // token will eventually `__del__`, but the counter is
-            // bumped at observe-time, not at the (later, unpredictable)
-            // Arc-drop time.  The observable difference is a small
-            // lead in the counter relative to actual memory release.
-            // `compiled_loop_token` is None before backend compile
-            // completes — never reachable on an evicted token, but
-            // guarded for safety.
-            let bridges = token
-                .compiled_loop_token()
-                .map(|clt| *clt.bridges_count.lock())
-                .unwrap_or(0);
-            self.staticdata.profiler.inc_freed_loop();
-            if bridges > 0 {
-                self.staticdata.profiler.add_freed_bridges(bridges);
-            }
+            // Counters move in `CompiledLoopToken::drop`
+            // (`model.py` `CompiledLoopToken.__del__`). This loop only
+            // retires the green-key side table whose metadata cannot
+            // live on the token (crate split).
             let gk = token.green_key();
             let Some(entry) = self.compiled_loops.get_mut(&gk) else {
                 continue;
