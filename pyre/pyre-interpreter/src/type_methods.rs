@@ -6522,16 +6522,22 @@ pub fn dict_method_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     arity_at_least(args, "get", 1)?;
     arity_at_most(args, "get", 2)?;
     let dict = resolve_dict_backing(args[0]);
-    let key = args[1];
     if dict.is_null() {
         return Ok(args.get(2).copied().unwrap_or_else(w_none));
     }
-    // The lookup hashes and compares the key, which is user code. `args` is
-    // the stack copy the gateway built, so a default read out of it after that
-    // is a pre-move address whenever the caller passed a list or a dict.
+    // The lookup hashes and compares the key, which is user code. Pin the
+    // backing, key, and default first and reload every operand from its slot.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
-    let found = dict_lookup_checked(dict, key)?;
+    let live: Vec<PyObjectRef> = if args.len() >= 3 {
+        vec![dict, args[1], args[2]]
+    } else {
+        vec![dict, args[1]]
+    };
+    let base = pyre_object::gc_roots::pin_roots(&live);
+    let found = dict_lookup_checked(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    )?;
     Ok(found.unwrap_or_else(|| {
         if args.len() >= 3 {
             pyre_object::gc_roots::shadow_stack_get(base + 2)

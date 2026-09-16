@@ -12345,9 +12345,8 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
 /// order before it is stored; `w_set_add` keeps the `dict_keys_equal`
 /// dedup, and the hash itself is not used for storage.
 pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let set = pyre_object::w_set_new();
-    builtin_set_add_items(set, items)?;
-    Ok(set)
+    // `w_set_new` can collect before `builtin_set_add_items` pins `items`.
+    builtin_set_add_items_impl(None, items, true)
 }
 
 /// Add each of `items` to `set`, hashing it as it enters.
@@ -12359,7 +12358,7 @@ pub fn builtin_set_add_items(
     set: PyObjectRef,
     items: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    builtin_set_add_items_impl(set, items, true)
+    builtin_set_add_items_impl(Some(set), items, true).map(|_| ())
 }
 
 /// Intersection materializes an operand through PyPy's internal `_newobj`
@@ -12369,28 +12368,28 @@ pub(crate) fn builtin_set_add_items_intersection(
     set: PyObjectRef,
     items: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    builtin_set_add_items_impl(set, items, false)
+    builtin_set_add_items_impl(Some(set), items, false).map(|_| ())
 }
 
 fn builtin_set_add_items_impl(
-    set: PyObjectRef,
+    set: Option<PyObjectRef>,
     items: &[PyObjectRef],
     wrap_hash_error: bool,
-) -> Result<(), crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         // `try_hash_value` may run a user `__hash__` that allocates and
         // triggers a moving minor collection; `set` and every not-yet-added
         // item are rooted for the whole loop and reloaded after each hash,
-        // matching `set_update_value`.
+        // matching `set_update_value`. Mint the empty set only after the
+        // items are published, so `w_set_new` cannot move them first.
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let set = pyre_object::gc_roots::pin_root(set);
-        let item_base = sp + 1;
-        for &item in items {
-            let _ = pyre_object::gc_roots::pin_root(item);
-        }
-        let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-        for i in 0..item_len {
+        let item_base = pyre_object::gc_roots::pin_roots(items);
+        let set = match set {
+            Some(set) => pyre_object::gc_roots::pin_root(set),
+            None => pyre_object::gc_roots::pin_root(pyre_object::w_set_new()),
+        };
+        let set_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        for i in 0..items.len() {
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             let hash = try_hash_value(item).map_err(|err| {
                 if wrap_hash_error {
@@ -12402,12 +12401,12 @@ fn builtin_set_add_items_impl(
                     err
                 }
             })?;
-            let set = pyre_object::gc_roots::shadow_stack_get(sp);
+            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             pyre_object::w_set_add_hashed_checked(set, item, hash)
                 .map_err(crate::baseobjspace::map_set_update_error)?;
         }
-        Ok(())
+        Ok(pyre_object::gc_roots::shadow_stack_get(set_slot))
     }
 }
 
