@@ -2546,7 +2546,8 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.bhimpl_residual_call_r_i(fnaddr, args_r, calldescr)
+        self.cpu()
+            .bh_call_i(fnaddr, None, Some(args_r), None, calldescr)
     }
     /// blackhole.py:1282-1285
     pub fn bhimpl_inline_call_r_r(
@@ -2555,7 +2556,8 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.bhimpl_residual_call_r_r(fnaddr, args_r, calldescr)
+        self.cpu()
+            .bh_call_r(fnaddr, None, Some(args_r), None, calldescr)
     }
     /// blackhole.py:1286-1289
     pub fn bhimpl_inline_call_r_v(
@@ -2564,7 +2566,8 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.bhimpl_residual_call_r_v(fnaddr, args_r, calldescr);
+        self.cpu()
+            .bh_call_v(fnaddr, None, Some(args_r), None, calldescr);
     }
     /// blackhole.py:1291-1294
     pub fn bhimpl_inline_call_ir_i(
@@ -2574,7 +2577,8 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.bhimpl_residual_call_ir_i(fnaddr, args_i, args_r, calldescr)
+        self.cpu()
+            .bh_call_i(fnaddr, Some(args_i), Some(args_r), None, calldescr)
     }
     /// blackhole.py:1295-1298
     pub fn bhimpl_inline_call_ir_r(
@@ -2584,7 +2588,8 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.bhimpl_residual_call_ir_r(fnaddr, args_i, args_r, calldescr)
+        self.cpu()
+            .bh_call_r(fnaddr, Some(args_i), Some(args_r), None, calldescr)
     }
     /// blackhole.py:1299-1302
     pub fn bhimpl_inline_call_ir_v(
@@ -2594,7 +2599,8 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.bhimpl_residual_call_ir_v(fnaddr, args_i, args_r, calldescr);
+        self.cpu()
+            .bh_call_v(fnaddr, Some(args_i), Some(args_r), None, calldescr);
     }
     /// blackhole.py:1304-1307
     pub fn bhimpl_inline_call_irf_i(
@@ -2605,7 +2611,8 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        self.bhimpl_residual_call_irf_i(fnaddr, args_i, args_r, args_f, calldescr)
+        self.cpu()
+            .bh_call_i(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
     /// blackhole.py:1308-1311
     pub fn bhimpl_inline_call_irf_r(
@@ -2616,7 +2623,8 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        self.bhimpl_residual_call_irf_r(fnaddr, args_i, args_r, args_f, calldescr)
+        self.cpu()
+            .bh_call_r(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
     /// blackhole.py:1312-1315
     pub fn bhimpl_inline_call_irf_f(
@@ -2627,7 +2635,8 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        self.bhimpl_residual_call_irf_f(fnaddr, args_i, args_r, args_f, calldescr)
+        self.cpu()
+            .bh_call_f(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
     /// blackhole.py:1316-1319
     pub fn bhimpl_inline_call_irf_v(
@@ -2638,7 +2647,8 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        self.bhimpl_residual_call_irf_v(fnaddr, args_i, args_r, args_f, calldescr);
+        self.cpu()
+            .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
 
     // ── bhimpl_recursive_call_{i,f,v} (blackhole.py:1102-1132) ──
@@ -13385,6 +13395,40 @@ fn cached_first_unsafe_native_entry_pc(jitcode: &JitCode) -> usize {
     })
 }
 
+/// `blackhole.py _setup_return_value_*` + `get_tmpreg_*`: copy the
+/// value the callee's return opcode actually wrote, not the trailing
+/// bytecode's source register (`trailing_return_info` misses
+/// `int_return/c` and the non-last exit of a multi-return helper).
+fn copy_inline_callee_tmpreg(
+    bh: &mut BlackholeInterpreter,
+    callee: &mut BlackholeInterpreter,
+    dest: Option<(JitArgKind, usize)>,
+) {
+    match dest {
+        None => {}
+        Some((JitArgKind::Int, dst)) => {
+            bh.registers_i[dst] = callee.get_tmpreg_i();
+        }
+        Some((JitArgKind::Ref, dst)) => {
+            bh.registers_r[dst] = callee.get_tmpreg_r();
+        }
+        Some((JitArgKind::Float, dst)) => {
+            bh.registers_f[dst] = callee.get_tmpreg_f();
+        }
+    }
+}
+
+fn return_kind_from_bh(return_type: BhReturnType) -> JitArgKind {
+    match return_type {
+        BhReturnType::Int => JitArgKind::Int,
+        BhReturnType::Ref => JitArgKind::Ref,
+        BhReturnType::Float => JitArgKind::Float,
+        BhReturnType::Void => {
+            panic!("inline_call: caller declared a dest but the callee returned void")
+        }
+    }
+}
+
 /// Refuse to call an unresolved `inline_call_*` target when its jitcode
 /// body is not available to interpret either.
 ///
@@ -13493,35 +13537,9 @@ fn interpret_unresolved_inline_call(
             bh.got_exception = true;
             break 'callee Err(DispatchError::LeaveFrame);
         }
-        if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
-            let caller_dst = dest.map(|(_, dst)| dst).expect(
-                "inline_call interpret: callee returns a value but the caller \
-                 declared no destination",
-            );
-            match return_kind {
-                JitArgKind::Int => {
-                    bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
-                }
-                JitArgKind::Ref => {
-                    bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
-                }
-                JitArgKind::Float => {
-                    bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
-                }
-            }
-        } else {
-            assert!(
-                dest.is_none(),
-                "inline_call interpret: callee jitcode {:?} ends without a \
-                 typed return, but the caller declared dest {dest:?}",
-                callee.jitcode.name,
-            );
-        }
+        copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(post_p)
     };
-    if callee.called_residual.get() {
-        bh.called_residual.set(true);
-    }
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
@@ -14378,50 +14396,10 @@ fn handler_inline_call_nested_ext(
             break 'callee Err(DispatchError::LeaveFrame);
         }
 
-        let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() else {
-            // No trailing return opcode means the callee produced no value.
-            // The caller emitted `NO_RETURN_REG` as the single dest byte
-            // (`inline_call_*_v`).  A real dest here names a register
-            // nothing will write.
-            assert!(
-                dest.is_none(),
-                "inline_call: callee jitcode {:?} index {:?} ends without a \
-                 typed return opcode, but the caller declared dest {dest:?}",
-                callee.jitcode.name,
-                callee.jitcode.try_index(),
-            );
-            break 'callee Ok(p);
-        };
-        {
-            let caller_dst = dest.expect("inline return missing caller destination");
-            match return_kind {
-                JitArgKind::Int => {
-                    bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
-                }
-                JitArgKind::Ref => {
-                    bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
-                }
-                JitArgKind::Float => {
-                    bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
-                }
-            }
-        }
-
+        let dest = dest.map(|dst| (return_kind_from_bh(callee.return_type), dst));
+        copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(p)
     };
-
-    // `called_residual` is "this frame left the interpreter", and
-    // `jitdriver.rs` reads it to decide whether a guard may spawn a bridge —
-    // a residual call is not a value the bridge can recompute.  The native arm
-    // of this opcode sets the CALLER's flag, because `inline_call_native` goes
-    // through `bhimpl_residual_call_*` on `bh` itself.  The interpreted arm
-    // runs the callee's own opcodes on `callee`, so a residual call inside it
-    // set the callee's flag and the caller's stayed clear: the same source
-    // call was judged escaping or not depending on which arm ran it.  Fold the
-    // callee's answer into the caller's before the frame is reset.
-    if callee.called_residual.get() {
-        bh.called_residual.set(true);
-    }
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
