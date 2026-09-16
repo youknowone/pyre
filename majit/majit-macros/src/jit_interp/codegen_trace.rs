@@ -431,8 +431,9 @@ pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch>
 }
 
 /// A match is the opcode dispatch only when an opcode-fetch binding
-/// (`let op = program[pc]` / `program.get_op(...)`) dominates it, or the
-/// scrutinee is itself `program[...]`.
+/// (`let op = program[pc]` / `program.get_op(pc)`) dominates it, or the
+/// scrutinee is itself `program[pc]`. A data index (`program[state.pos]`)
+/// is not the portal PC and stays on the matchless path.
 fn match_is_opcode_dispatch(loop_body: &syn::Block, candidate: &syn::ExprMatch) -> bool {
     let mut names = Vec::new();
     let mut seen_merge_point = false;
@@ -466,13 +467,12 @@ fn opcode_fetch_binding_name(stmt: &syn::Stmt) -> Option<String> {
         other => other,
     };
     let fetches_program = match init_expr {
-        syn::Expr::Index(idx) => expr_is_ident(&idx.expr, "program"),
-        // Only `get_op` is the opcode fetch. `program.len()` / `get_operand`
-        // are ordinary values; treating them as the dispatch would send a
-        // local match through `lower_dispatch_chain` and drop the body.
-        syn::Expr::MethodCall(mc) => {
-            expr_is_ident(&mc.receiver, "program") && mc.method == "get_op"
-        }
+        syn::Expr::Index(idx) => index_is_program_at_pc(idx),
+        // Only `get_op(pc)` is the opcode fetch. `program.len()` /
+        // `get_operand` / `program[state.pos]` are ordinary values;
+        // treating them as the dispatch would send a local match through
+        // `lower_dispatch_chain` and drop the body.
+        syn::Expr::MethodCall(mc) => method_is_get_op_at_pc(mc),
         _ => false,
     };
     if !fetches_program {
@@ -498,9 +498,29 @@ fn match_scrutinee_is_opcode_fetch(m: &syn::ExprMatch, names: &[String]) -> bool
             .path
             .get_ident()
             .is_some_and(|id| names.iter().any(|n| n == &id.to_string())),
-        syn::Expr::Index(idx) => expr_is_ident(&idx.expr, "program"),
+        syn::Expr::Index(idx) => index_is_program_at_pc(idx),
         _ => false,
     }
+}
+
+fn unwrap_cast(expr: &syn::Expr) -> &syn::Expr {
+    match expr {
+        syn::Expr::Cast(c) => unwrap_cast(&c.expr),
+        other => other,
+    }
+}
+
+fn index_is_program_at_pc(idx: &syn::ExprIndex) -> bool {
+    expr_is_ident(&idx.expr, "program") && expr_is_ident(unwrap_cast(&idx.index), "pc")
+}
+
+fn method_is_get_op_at_pc(mc: &syn::ExprMethodCall) -> bool {
+    expr_is_ident(&mc.receiver, "program")
+        && mc.method == "get_op"
+        && mc
+            .args
+            .first()
+            .is_some_and(|a| expr_is_ident(unwrap_cast(a), "pc"))
 }
 
 fn expr_is_ident(expr: &syn::Expr, name: &str) -> bool {
@@ -966,6 +986,41 @@ mod find_dispatch_match_tests {
                 jit_merge_point!(driver, program, pc; state);
                 let n = program.len();
                 match n {
+                    0 => {},
+                    1 => {},
+                    _ => {},
+                }
+                pos = pos + 1;
+            }",
+        );
+        assert!(find_dispatch_match(&block).is_none());
+        assert!(portal_loop_body(&block).is_some());
+    }
+
+    #[test]
+    fn match_on_program_data_index_is_not_the_dispatch() {
+        let block = fn_block(
+            "while pos < len {
+                jit_merge_point!(driver, program, pc; state);
+                match program[pos] {
+                    0 => {},
+                    1 => {},
+                    _ => {},
+                }
+                pos = pos + 1;
+            }",
+        );
+        assert!(find_dispatch_match(&block).is_none());
+        assert!(portal_loop_body(&block).is_some());
+    }
+
+    #[test]
+    fn a_let_of_program_data_index_is_not_the_dispatch() {
+        let block = fn_block(
+            "while pos < len {
+                jit_merge_point!(driver, program, pc; state);
+                let byte = program[pos];
+                match byte {
                     0 => {},
                     1 => {},
                     _ => {},
