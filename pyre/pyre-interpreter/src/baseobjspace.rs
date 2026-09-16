@@ -15629,7 +15629,10 @@ fn _unpackiterable_unknown_length(
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iterator);
-    let w_iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    // Reload through the named `shadow_stack_get` residual (`rlib/jit.py`
+    // `@dont_look_inside`), not a `||` closure: the codewriter would mint
+    // `target:closure.call` for the lambda, a hash `jit_trace_fnaddrs` cannot
+    // bind. The function itself is already registered.
     // baseobjspace.py — `try: items = newlist_hint(length_hint(...))
     // except MemoryError: items = []`.
     let sizehint = length_hint(w_iterable, 0)?;
@@ -15646,13 +15649,16 @@ fn _unpackiterable_unknown_length(
     // jd1 walk to invoke.  `test_result_exc_lowering.rs
     // unpackiterable_drain_match_fuses_to_kind_test` is the guard.
     let items_slot = root_base + 1;
-    let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     // baseobjspace.py `greenkey = self.iterator_greenkey(w_iterator)`.
-    let greenkey = iterator_greenkey(w_iterator());
+    let greenkey = iterator_greenkey(pyre_object::gc_roots::shadow_stack_get(root_base));
     // `warmspot.py rewrite_jit_merge_point`: the original portal ends at
     // `jit_merge_point` with `return portal_runner(*args)`. The split
     // portal (`unpackiterable_portal`) owns the loop from that marker.
-    crate::call::unpack_portal_runner(greenkey, w_iterator(), items())
+    crate::call::unpack_portal_runner(
+        greenkey,
+        pyre_object::gc_roots::shadow_stack_get(root_base),
+        pyre_object::gc_roots::shadow_stack_get(items_slot),
+    )
 }
 
 /// Split-portal body of `_unpackiterable_unknown_length`: the loop that
@@ -15666,16 +15672,25 @@ pub fn unpackiterable_portal(
     w_iterator: PyObjectRef,
     items: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // Keep the `try_fuse_drain_match` shape: `items_slot` is computed once
+    // before the loop, `next(shadow_stack_get(root_base))` is the last op of
+    // its block, and the Ok arm is only `drain_append_at`. Reloading the
+    // objects or rematerializing the slot after the merge declines the
+    // fusion and leaves `target:closure.call` residuals. `reds='auto'` then
+    // names `root_base`, `items_slot`, and the `RootScope`; the hook seeds
+    // those extracted banks.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iterator);
     let _ = pyre_object::gc_roots::pin_root(items);
-    let w_iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let items_slot = root_base + 1;
-    let items = || pyre_object::gc_roots::shadow_stack_get(items_slot);
     loop {
-        unpackiterable_driver.jit_merge_point(greenkey, w_iterator(), items());
-        match next(w_iterator()) {
+        unpackiterable_driver.jit_merge_point(
+            greenkey,
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            pyre_object::gc_roots::shadow_stack_get(items_slot),
+        );
+        match next(pyre_object::gc_roots::shadow_stack_get(root_base)) {
             Ok(w_item) => unsafe { drain_append_at(items_slot, w_item) },
             Err(e) => {
                 if e.matches_stop_iteration() {
@@ -15685,7 +15700,7 @@ pub fn unpackiterable_portal(
             }
         }
     }
-    Ok(items())
+    Ok(pyre_object::gc_roots::shadow_stack_get(items_slot))
 }
 
 /// Copy the drained `W_List` back into a `Vec<PyObjectRef>` for the Rust

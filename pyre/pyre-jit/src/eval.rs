@@ -5820,6 +5820,12 @@ fn build_jit_driver_pair() -> JitDriverPair {
             long::jit_w_long_fits_int as *const () as usize as i64,
             long::jit_w_long_toint as *const () as usize as i64,
             list::jit_list_append as *const () as usize as i64,
+            // #171 object-append fold: `jit_fnaddr` already registers the
+            // word-ABI call targets, but Vouched mode still sent every
+            // compiled append through `jit_call`. `nested_list_comprehension_hot`
+            // measured 970544 crossings each.
+            list::__majit_call_target_prepare_list_ref_store as *const () as usize as i64,
+            list::__majit_call_target_current_gc_ref as *const () as usize as i64,
             list::jit_list_getitem as *const () as usize as i64,
             list::jit_list_setitem as *const () as usize as i64,
             list::jit_list_reverse as *const () as usize as i64,
@@ -7658,6 +7664,15 @@ fn unpack_merge_point_jit(
     if !jd1_experiment_enabled() {
         return;
     }
+    // Untranslated body of the `can_enter_jit` that `rewrite_can_enter_jits`
+    // inserts at the portal startblock (`warmspot.py`, reds='auto' has none).
+    // `jit_merge_point` itself is only a translator marker; blackhole hits
+    // `bhimpl_jit_merge_point` (ContinueRunningNormally / recursive portal
+    // runner) and never this hook. A residual that reaches the interpreted
+    // portal goes through `ll_portal_runner` / this insert, which may start
+    // a trace — the same as PyPy. Same-green reentry is `JC_TRACING` /
+    // `meta.is_tracing()` inside `drive_unpack_iterable_trace`, not a
+    // blackhole-running flag (none exists upstream).
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
     }
@@ -7714,6 +7729,10 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    // Portal pins are the two slots under this hook. Capture them before
+    // ResidualExceptionScope::park can pin a standing exception on top;
+    // otherwise jd1_root_base's `len - 2` names those parked roots.
+    let portal_root_base = pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64;
     // The walk below executes each residual concretely, so the raise that ends
     // the unpack is recorded into the residual-call exception cells. Those are
     // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
@@ -7784,12 +7803,8 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // baseobjspace.py:31 reds='auto' → `w_iterator`, `items` as the two Ref
-    // input args, in the order `create_sym`/`collect_jump_args` use.
-    let live_values = [
-        majit_ir::Value::Ref(majit_ir::GcRef(w_iterator as usize)),
-        majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
-    ];
+    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
     // the novable jd1 is elected over jd0 (whose `virtualizable_info` would
@@ -7988,29 +8003,36 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // reds='auto' as the merge-point InputArgs: (w_iterator, items) in the
-    // order `collect_jump_args` returns, seeded onto the registers the
-    // `jit_merge_point` op names (decoded inside
-    // `trace_jitcode_from_merge_point`) so each residual runs on the shared
-    // heap objects the caller loop holds.
-    let red_refs = [
+    // Seed every bank the extracted `jit_merge_point` names.  Green is
+    // the type object; reds are root_base / items_slot / RootScope cell.
+    let green_args = [(
+        majit_metainterp::JitArgKind::Ref,
+        greenkey_raw as usize as i64,
+    )];
+    let root_base = portal_root_base;
+    let red_args = [
         (
-            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-            w_iterator as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+            root_base,
         ),
         (
-            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
-            items as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+            root_base + 1,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
         ),
     ];
-    // baseobjspace.py green `greenkey` = `iterator_greenkey(w_iterator)`,
-    // a per-type singleton pointer — seeded as the merge-point green Const.
-    let green_ref = greenkey_raw as usize as i64;
 
     let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
         greenkey: pyre_object::PY_NULL,
-        w_iterator: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-        items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+        root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -8050,7 +8072,13 @@ fn drive_unpack_iterable_trace(
                 recursive_exec_void,
             );
             majit_metainterp::trace_jitcode_from_merge_point(
-                ctx, &mut sym, &jitcode, header_pc, &runtime, green_ref, &red_refs,
+                ctx,
+                &mut sym,
+                &jitcode,
+                header_pc,
+                &runtime,
+                &green_args,
+                &red_args,
             )
         },
     );
@@ -9756,9 +9784,11 @@ pub extern "C" fn ll_unpackiterable_portal_runner_shim(
 
 /// `warmspot.py handle_jitexception` for `unpackiterable_driver`.
 ///
-/// Greens are `['greenkey']`; reds are auto `w_iterator`, `items`.
-/// `portal_ptr(*args)` is the split-portal loop, not the `newlist_hint`
-/// prologue and not the bytecode portal's frame runner.
+/// `bhimpl_jit_merge_point` raises `ContinueRunningNormally(*args)` as the
+/// six banks; `handle_jitexception` walks `portalfunc_ARGS` and calls
+/// `portal_ptr(*args)`. The extracted portal's reds are `root_base`,
+/// `items_slot`, and the `RootScope` cell — not `w_iterator`/`items`.
+/// Reload those pinned objects the portal function still takes.
 fn unpackiterable_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<
@@ -9771,16 +9801,17 @@ fn unpackiterable_portal_runner(
     let JitException::ContinueRunningNormally(args) = exc else {
         return Ok((BhReturnType::Void, 0));
     };
-    let mut all_r = args.green_ref.clone();
-    all_r.extend(&args.red_ref);
-    let greenkey = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let w_iterator = all_r.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let items = all_r.get(2).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let greenkey = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let root_base = args.red_int.first().copied().unwrap_or(0) as usize;
+    let items_slot = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    let w_iterator = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let items = pyre_object::gc_roots::shadow_stack_get(items_slot);
     assert!(
-        !w_iterator.is_null() && !items.is_null(),
-        "unpackiterable portal runner: ContinueRunningNormally missing reds \
-         (iterator/items); greens={} reds={}",
+        !greenkey.is_null() && !w_iterator.is_null() && !items.is_null(),
+        "unpackiterable portal runner: ContinueRunningNormally missing extracted reds \
+         green_ref={} red_int={} red_ref={}",
         args.green_ref.len(),
+        args.red_int.len(),
         args.red_ref.len(),
     );
     match pyre_interpreter::unpackiterable_portal(greenkey, w_iterator, items) {
@@ -11873,7 +11904,6 @@ fn compile_and_run_once(
     }
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
-    let had_compiled = driver.has_compiled_loop(green_key);
     match start {
         CompileOnceStart::BackEdge => {
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
@@ -11946,7 +11976,11 @@ fn compile_and_run_once(
             .meta_interp_mut()
             .warm_state_mut()
             .clear_tracing_flag(starting_tracing_key);
-        if !had_compiled && driver.has_compiled_loop(compiled_key) {
+        // compile.py record_loop_or_bridge: register every compiled
+        // loop/bridge's quasi_immutable_deps against its token. The
+        // `!had_compiled` extra gate dropped deps on a replace compile,
+        // so a later mutated() never saw the new token.
+        if driver.has_compiled_loop(compiled_key) {
             register_quasi_immutable_deps(compiled_key);
         } else {
             // `register_quasi_immutable_deps` is the only drain of

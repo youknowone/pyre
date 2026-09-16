@@ -1,11 +1,13 @@
-# pyre-check: max-pypy-ratio=2.1
+# pyre-check: max-pypy-ratio=1.8
 #
-# Ceiling 6 derived floor. After `get_instantiate` became a word load of
+# Floor is ceiling/6. After `get_instantiate` became a word load of
 # the immutable OBJECT_VTABLE slot, ubuntu dynasm reads 0.5x and
 # cranelift 0.6x (run 34382609753). A loaded dynasm job then read 0.4x
 # against a 0.88s pypy (run 34605279986) and missed the 2.4-derived
-# 0.4x floor. 2.1 puts the floor at 0.35x under that reading and still
-# covers the slower 1.4x cranelift host span from before the slot folded.
+# 0.4x floor; run 34835948314 read 0.25s / 0.80s pypy = 0.31x against
+# the 2.1-derived 0.35x floor. 1.8 puts the floor at 0.30x under that
+# reading and still covers the slower 1.4x cranelift host span from
+# before the slot folded. Two loops + three bridges; not over-tracing.
 #
 # A recursion deeper than the inline unroll bound, driven from a loop body.
 #

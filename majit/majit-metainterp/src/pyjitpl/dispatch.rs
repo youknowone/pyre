@@ -1653,6 +1653,20 @@ where
         })
     }
 
+    /// `pyjitpl.py` `get_list_of_active_boxes`: when
+    /// `after_residual_call`, `pc` is the trailing `-live-` (`:194-198`).
+    /// A residual whose calldescr was stamped `RandomEffects` but whose
+    /// transform treated it as cannot-raise has no `-live-` (the next
+    /// instruction is often an `int_copy` of the following funcptr).
+    /// Snapshotting that pc decodes operand bytes as an `all_liveness`
+    /// offset and indexes `constants_r` out of range.
+    fn after_residual_live_pc(&self, ctx: &TraceCtx) -> Option<usize> {
+        let frame = self.frames.frames.last()?;
+        let pc = frame.code_cursor;
+        let op_live = ctx.metainterp_sd().op_live as u8;
+        (frame.jitcode.code.get(pc) == Some(&op_live)).then_some(pc)
+    }
+
     fn finalize_standard_virtualizable_may_force(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1707,7 +1721,19 @@ where
             // sub-frame.  Same source as
             // `finish_residual_call_exception_path`, which records the
             // GUARD_NO_EXCEPTION that follows this guard.
-            let resume_pc = self.frames.current_mut().code_cursor;
+            let Some(resume_pc) = self.after_residual_live_pc(ctx) else {
+                // pyjitpl.py `generate_guard(rop.GUARD_NOT_FORCED)` is
+                // unconditional after a may-force residual. A missing
+                // trailing `-live-` cannot suppress that guard: the
+                // compiled CALL_MAY_FORCE would then keep stale
+                // virtualizable state when a later invocation forces.
+                // Decline the trace so lowering can grow the marker;
+                // do not emit the call unguarded.
+                if materialized {
+                    ctx.reload_tokenless_virtualizable_after_residual_call();
+                }
+                return TraceAction::Abort;
+            };
             self.record_state_guard(
                 ctx,
                 sym,
@@ -3003,7 +3029,16 @@ where
         // `MIFrame::pc` is only the saved resume position.  Capture the
         // post-call bytecode cursor so the snapshot reads the trailing
         // `-live-` marker for this residual call.
-        let resume_pc = self.frames.current_mut().code_cursor;
+        let Some(resume_pc) = self.after_residual_live_pc(ctx) else {
+            // pyjitpl.py `handle_possible_exception` always
+            // `generate_guard(GUARD_EXCEPTION)` or
+            // `generate_guard(GUARD_NO_EXCEPTION)`. A missing trailing
+            // `-live-` cannot skip that guard: the compiled residual would
+            // then follow the recorded success path when a later invocation
+            // raises, or unwind without GUARD_EXCEPTION. Decline the trace
+            // so lowering can grow the marker; do not emit the call unguarded.
+            return TraceAction::Abort;
+        };
 
         if exc == 0 {
             self.record_state_guard(
@@ -11075,7 +11110,6 @@ where
         let frame = self.frames.current_mut();
         frame.ref_regs[reg] = opref;
         frame.ref_values[reg] = value;
-        frame.retire_portal_red_ref(reg);
     }
 
     fn read_ref_reg(&mut self, reg: usize) -> (OpRef, i64) {
@@ -12024,18 +12058,19 @@ where
 /// (`blackhole.py` `@arguments("i","I","R","F","I","R","F")`) lists the
 /// green {I,R,F} register slots then the red {I,R,F} slots, each as
 /// `[len:u8][reg:u8 * len]`. The green ref is seeded as a `Const`
-/// (verify_green_args); each red ref as its InputArg, paired positionally with
-/// the op's red-ref list (the `collect_jump_args` order). Reds are Ref-typed
-/// to match the `reds='auto'` pointer set; int/float reds are unimplemented
-/// (no such driver exists yet).
+/// (verify_green_args); each red as its InputArg, paired positionally with
+/// the op's red lists in i/r/f bank order (`collect_jump_args`).  The
+/// extracted `unpackiterable_portal` merge point carries a red Int
+/// (`root_base`) plus three red Refs, so the caller must pass that shape
+/// rather than assuming every red is a Ref.
 pub fn trace_jitcode_from_merge_point<S, R>(
     ctx: &mut TraceCtx,
     sym: &mut S,
     jitcode: &JitCode,
     header_pc: usize,
     runtime: &R,
-    green_ref: i64,
-    red_refs: &[(OpRef, i64)],
+    green_args: &[(JitArgKind, i64)],
+    red_args: &[(JitArgKind, OpRef, i64)],
 ) -> TraceAction
 where
     S: JitCodeSym,
@@ -12044,19 +12079,14 @@ where
     if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
-    let green_args = [(JitArgKind::Ref, green_ref)];
-    let red_args: Vec<_> = red_refs
-        .iter()
-        .map(|&(opref, value)| (JitArgKind::Ref, opref, value))
-        .collect();
     let mut standalone = StandaloneFrameStack::new();
     let frame = setup_frame_from_merge_point(
         ctx,
         &mut standalone.frames,
         Arc::new(jitcode.clone()),
         header_pc,
-        &green_args,
-        &red_args,
+        green_args,
+        red_args,
     );
     standalone.frames.push(frame);
     let mut machine = JitCodeMachine::<S, _>::with_framestack(&mut standalone.frames, &[], &[]);
@@ -12085,6 +12115,42 @@ fn seed_register(frame: &mut MIFrame, kind: JitArgKind, reg: usize, opref: OpRef
     }
 }
 
+/// The six register lists a `jit_merge_point` names, in
+/// (green I, green R, green F, red I, red R, red F) order.
+/// `bhimpl_jit_merge_point` decodes the same layout.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergePointBanks {
+    pub green_i: Vec<usize>,
+    pub green_r: Vec<usize>,
+    pub green_f: Vec<usize>,
+    pub red_i: Vec<usize>,
+    pub red_r: Vec<usize>,
+    pub red_f: Vec<usize>,
+}
+
+/// Decode the six `[len:u8][reg:u8 * len]` lists after the merge-point
+/// opcode and jdindex bytes.
+pub fn decode_jit_merge_point_banks(code: &[u8], header_pc: usize) -> MergePointBanks {
+    let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+    let mut cur = header_pc + 2;
+    for regs in slot_regs.iter_mut() {
+        let len = code[cur] as usize;
+        cur += 1;
+        for _ in 0..len {
+            regs.push(code[cur] as usize);
+            cur += 1;
+        }
+    }
+    MergePointBanks {
+        green_i: std::mem::take(&mut slot_regs[0]),
+        green_r: std::mem::take(&mut slot_regs[1]),
+        green_f: std::mem::take(&mut slot_regs[2]),
+        red_i: std::mem::take(&mut slot_regs[3]),
+        red_r: std::mem::take(&mut slot_regs[4]),
+        red_f: std::mem::take(&mut slot_regs[5]),
+    }
+}
+
 /// Build an [`MIFrame`] whose first instruction is a JitDriver merge point.
 ///
 /// `MIFrame::setup_call` is the ordinary callee-entry path and resets the
@@ -12101,22 +12167,15 @@ pub fn setup_frame_from_merge_point(
     green_args: &[(JitArgKind, i64)],
     red_args: &[(JitArgKind, OpRef, i64)],
 ) -> MIFrame {
-    // Decode the six register lists of the `jit_merge_point` op at
-    // `header_pc`: opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` per
-    // slot in (green I, green R, green F, red I, red R, red F) order.
-    let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
-    {
-        let code = &jitcode_arc.code;
-        let mut cur = header_pc + 2;
-        for regs in slot_regs.iter_mut() {
-            let len = code[cur] as usize;
-            cur += 1;
-            for _ in 0..len {
-                regs.push(code[cur] as usize);
-                cur += 1;
-            }
-        }
-    }
+    let banks = decode_jit_merge_point_banks(&jitcode_arc.code, header_pc);
+    let slot_regs = [
+        banks.green_i,
+        banks.green_r,
+        banks.green_f,
+        banks.red_i,
+        banks.red_r,
+        banks.red_f,
+    ];
     let mut frame = frames.take_frame(jitcode_arc, header_pc, None, Some(ctx));
     for (bank, kind) in [JitArgKind::Int, JitArgKind::Ref, JitArgKind::Float]
         .into_iter()
@@ -12164,11 +12223,6 @@ pub fn setup_frame_from_merge_point(
                 JitArgKind::Float => Value::Float(f64::from_bits(value as u64)),
             };
             let _ = ctx.try_set_opref_concrete(opref, concrete);
-            if kind == JitArgKind::Ref && !opref.is_constant() {
-                if let Ok(reg) = u16::try_from(reg) {
-                    frame.portal_red_refs.push((reg, opref));
-                }
-            }
         }
     }
     // The walker reads from `code_cursor`; `pc` is only the portal anchor.
@@ -12179,7 +12233,7 @@ pub fn setup_frame_from_merge_point(
     if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
         eprintln!(
             "[portal-red] seed refs={:?} red_args={:?}",
-            frame.portal_red_refs,
+            frame.ref_regs,
             red_args
                 .iter()
                 .map(|(k, o, v)| (*k, *o, *v))

@@ -3477,16 +3477,26 @@ impl OptHeap {
                 // Records quasi_immutable_deps for invalidation tracking.
                 let obj = op.arg(0).to_opref();
                 let descr = op.getdescr();
-                // heap.py `structvalue = self.ensure_ptr_info_arg0(op)`
-                // / `if not structvalue.is_constant(): return`.  The dependency
-                // object is baked as a `ConstPtr`, so its pointer lives in
-                // `Value::Ref`, not `Value::Int`.
-                let struct_ptr = ctx
-                    .get_box_replacement_operand_opt(obj)
-                    .and_then(|b| ctx.get_constant_ptr_box(&b));
-                if let Some(struct_ptr) = struct_ptr
-                    && struct_ptr != 0
-                {
+                // heap.py `optimize_QUASIIMMUT_FIELD`:
+                //     structvalue = self.ensure_ptr_info_arg0(op)
+                //     if not structvalue.is_constant():
+                //         return
+                // `get_box_replacement_operand_opt` + `get_constant_ptr_box`
+                // skipped the dep block when the ConstPtr lived on the
+                // replacement chain that `ensure_ptr_info_arg0` already
+                // answers (`optimizer.py` `ensure_ptr_info_arg0`).
+                let structvalue = ctx.ensure_ptr_info_arg0(op);
+                let struct_ptr = if structvalue.is_constant() {
+                    match structvalue {
+                        crate::optimizeopt::info::EnsuredPtrInfo::Constant { gcref, .. } => {
+                            gcref.0 as u64
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                if struct_ptr != 0 {
                     // heap.py:812-814 `assert isinstance(qmutdescr,
                     // QuasiImmutDescr)`, answered as a verdict.  A marker whose
                     // recording resolved no instance has nobody to register the
