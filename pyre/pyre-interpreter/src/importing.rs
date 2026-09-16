@@ -767,10 +767,8 @@ pub fn install_builtin_modules() {
     pyre_install_module!(atexit);
 
     // Host-access modules — network (`_socket`), arbitrary FFI (`_ctypes`),
-    // subprocess/`fork`+`exec` (`_posixsubprocess`), shared memory
-    // (`_multiprocessing`/`_posixshmem`), system log, fd/tty control
-    // (`fcntl`/`termios`/`select`/`resource`), real signals, and the host
-    // user/group databases (`pwd`/`grp`).  None belong to the mediated
+    // real signals, `select`, `mmap`.  `pwd`/`grp` and the other optional
+    // host databases live in `pyre-module`.  None belong to the mediated
     // ll_os/ll_time surface, so the sandbox interpreter omits them entirely:
     // `import _socket` then raises ModuleNotFoundError, as in a build whose
     // syscall code is absent.
@@ -782,14 +780,6 @@ pub fn install_builtin_modules() {
         // handler table and `raise_signal`, and leaves out the itimers, the
         // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
-        // Only a POSIX host has the user/group databases these read; the
-        // platforms without them have no `pwd`/`grp` module at all, and the
-        // callers depend on that: `posixpath.expanduser`, `pathlib` and
-        // `tarfile` all reach for the module inside `try/except ImportError`
-        // and take a fallback when it is missing.
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(pwd);
-
         pyre_install_module!(select);
         // `socket.py`'s module body subclasses `_socket.socket`, so the type
         // has to be there even where nothing can be connected: a target with
