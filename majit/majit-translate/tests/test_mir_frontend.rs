@@ -360,16 +360,17 @@ fn front_graph_carries_no_synthesized_exception_edges() {
     //      count of `UnwindResume` / `Abort` MIR terminators. A Call /
     //      Assert / Drop success block contributes zero such edges.
     use majit_charon_reader::ullbc::{TermKind, Unstructured};
-    use majit_translate::front::mir::lower_fun_decl;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
     use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
 
     let llbc = load_corpus();
     let mut checked = 0usize;
+    let context = LowerContext::new(llbc);
     for fd in llbc.iter_local_fns() {
         let Some(body): Option<Unstructured> = fd.unstructured() else {
             continue;
         };
-        let graph = lower_fun_decl(llbc, fd)
+        let graph = lower_fun_decl(&context, fd)
             .unwrap_or_else(|e| panic!("{} failed to lower: {e}", fd.item_meta.name_path()));
 
         // Invariant A.  The iterator `next`-diamond rewrite
@@ -977,7 +978,7 @@ fn boxing_cluster_fuses_once_the_class_address_resolves() {
 /// static's declared `ClassObject` root for pointer-identity comparisons.
 #[test]
 fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
-    use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
     use majit_translate::model::{CallTarget, OpKind, ValueType};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
@@ -988,7 +989,8 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
     };
 
     let fd = llbc.local_fn("w_new_int").expect("w_new_int in corpus");
-    let graph = lower_fun_decl_with_static_addrs(llbc, fd, static_addrs).expect("lowering");
+    let context = LowerContext::new(llbc);
+    let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
 
     let mut fused = Vec::new();
     let mut payload_stores = 0usize;
@@ -1035,7 +1037,8 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
     let add = llbc
         .local_fn("w_number_add")
         .expect("w_number_add in corpus");
-    let add_graph = lower_fun_decl_with_static_addrs(llbc, add, static_addrs).expect("lowering");
+    let add_graph =
+        lower_fun_decl_with_static_addrs(&context, add, static_addrs).expect("lowering");
     let mut narrow_roots = std::collections::BTreeMap::new();
     let mut class_addr_narrowed = 0usize;
     for b in &add_graph.blocks {
@@ -1098,7 +1101,7 @@ fn boxing_cluster_fuses_from_the_host_supplied_class_address() {
 /// both layout registration and allocation fusion are covered.
 #[test]
 fn boxing_cluster_fuses_where_the_header_declares_no_class_word() {
-    use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
     use majit_translate::model::{CallTarget, OpKind};
 
     const CLASS_ADDR: i64 = 0x00C0_FFEE;
@@ -1111,7 +1114,8 @@ fn boxing_cluster_fuses_where_the_header_declares_no_class_word() {
     let fd = llbc
         .local_fn("w_new_type_only_int")
         .expect("w_new_type_only_int in corpus");
-    let graph = lower_fun_decl_with_static_addrs(llbc, fd, static_addrs).expect("lowering");
+    let context = LowerContext::new(llbc);
+    let graph = lower_fun_decl_with_static_addrs(&context, fd, static_addrs).expect("lowering");
 
     let mut fused = Vec::new();
     let mut payload_stores = 0usize;

@@ -135,7 +135,8 @@ pub fn lower_function_with_static_addrs(
     let fd = llbc
         .local_fn(function_name)
         .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
-    lower_fun_decl_with_static_addrs(llbc, fd, static_addrs)
+    let context = LowerContext::new(llbc);
+    lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
 }
 
 /// Merge functions and metadata from a slice of LLBCs into one
@@ -2395,8 +2396,11 @@ pub(crate) fn harden_duplicate_leaf_metadata(
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].
-pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerError> {
-    lower_fun_decl_with_static_addrs(llbc, fd, crate::HostStaticAddrs::default())
+pub fn lower_fun_decl(
+    context: &LowerContext<'_>,
+    fd: &FunDecl,
+) -> Result<FunctionGraph, LowerError> {
+    lower_fun_decl_with_static_addrs(context, fd, crate::HostStaticAddrs::default())
 }
 
 /// Whether the framestate-threaded lowering runs for acyclic bodies.
@@ -2409,46 +2413,33 @@ fn framestate_enabled() -> bool {
     )
 }
 
-/// Per-LLBC maps the whole-program loop computes once. Standalone
-/// `lower_fun_decl` used to re-derive them on every call, so a census
-/// that lowers hundreds of bodies paid `derive_program_metadata` +
-/// `dont_look_inside_set_of` once per body (642s on ubuntu debug for
-/// `nearly_every_dropped_bracket_closes`). Keyed by `Llbc` identity;
-/// the test process keeps each artefact in a `OnceLock`.
-struct StandaloneLowerMaps {
+/// Per-program owner of derived lowering metadata (`translator.py TranslationContext`).
+/// Callers share this context across declarations from the borrowed program.
+pub struct LowerContext<'a> {
+    llbc: &'a Llbc,
     struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: std::collections::HashSet<String>,
 }
 
-fn standalone_lower_maps(llbc: &Llbc) -> std::sync::Arc<StandaloneLowerMaps> {
-    static CACHE: std::sync::Mutex<Option<(usize, std::sync::Arc<StandaloneLowerMaps>)>> =
-        std::sync::Mutex::new(None);
-    let key = llbc as *const Llbc as usize;
-    let mut slot = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached, maps)) = slot.as_ref()
-        && *cached == key
-    {
-        return std::sync::Arc::clone(maps);
+impl<'a> LowerContext<'a> {
+    /// Derive the program's lowering metadata once for this context.
+    pub fn new(llbc: &'a Llbc) -> Self {
+        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+        Self {
+            llbc,
+            struct_field_attrs,
+            dont_look_inside: dont_look_inside_set_of(llbc),
+        }
     }
-    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
-    let maps = std::sync::Arc::new(StandaloneLowerMaps {
-        struct_field_attrs,
-        dont_look_inside: dont_look_inside_set_of(llbc),
-    });
-    *slot = Some((key, std::sync::Arc::clone(&maps)));
-    maps
 }
 
 pub fn lower_fun_decl_with_static_addrs(
-    llbc: &Llbc,
+    context: &LowerContext<'_>,
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
+    let llbc = context.llbc;
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
-        // Same maps the whole-program loop lowers with. Cached per LLBC
-        // so a stand-alone census is O(bodies) lowers, not O(bodies)
-        // full-artefact harvests.
-        let maps = standalone_lower_maps(llbc);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
         lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
@@ -2456,8 +2447,8 @@ pub fn lower_fun_decl_with_static_addrs(
             fd,
             static_addrs,
             &jitdriver_receiver_roots,
-            &maps.struct_field_attrs,
-            &maps.dont_look_inside,
+            &context.struct_field_attrs,
+            &context.dont_look_inside,
         )
     })
 }
@@ -30445,7 +30436,8 @@ mod tests {
             .iter_local_fns()
             .find(|fd| fd.item_meta.name_path().ends_with("::genrand32"))
             .expect("_random::Random::genrand32 in interpreter LLBC");
-        let graph = super::lower_fun_decl(&llbc, fd).expect("lower Random::genrand32");
+        let context = super::LowerContext::new(&llbc);
+        let graph = super::lower_fun_decl(&context, fd).expect("lower Random::genrand32");
 
         let mut reads = 0usize;
         let mut writes = 0usize;
@@ -30491,7 +30483,8 @@ mod tests {
             .iter_local_fns()
             .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
             .expect("_random::__majit_wrap_random");
-        let graph = super::lower_fun_decl(&llbc, fd).expect("lower wrapper");
+        let context = super::LowerContext::new(&llbc);
+        let graph = super::lower_fun_decl(&context, fd).expect("lower wrapper");
         let receiver = graph
             .blocks
             .iter()
@@ -32642,10 +32635,11 @@ mod tests {
         // survive, and the existing GC reference must flow to
         // `w_long_from_raw`.
         let mut boxed_handlers = 0usize;
+        let context = super::LowerContext::new(&llbc);
         for fd in llbc.iter_local_fns().filter(|fd| {
             fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
         }) {
-            let graph = super::lower_fun_decl(&llbc, fd)
+            let graph = super::lower_fun_decl(&context, fd)
                 .unwrap_or_else(|e| panic!("lower {}: {e:?}", fd.item_meta.name_path()));
             let calls: Vec<&[String]> = graph
                 .blocks
