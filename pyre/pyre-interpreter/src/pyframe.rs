@@ -4538,9 +4538,11 @@ impl PyFrame {
     }
 
     /// PyPy-compatible pop-values helper.
-    /// `pyframe.py popvalues` is `@jit.unroll_safe`.
+    /// `pyframe.py popvalues` is `@jit.unroll_safe`. The return is a
+    /// `Vec` (two residual words); until that ABI exists, looking
+    /// inside residualizes a one-slot pointer and the length is
+    /// garbage. Keep the loop residual.
     #[inline]
-    #[majit_macros::unroll_safe]
     pub fn popvalues(&mut self, n: usize) -> Vec<PyObjectRef> {
         let mut out = vec![PY_NULL; n];
         let mut idx = n;
@@ -4552,16 +4554,14 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `popvalues_mutable`.
-    /// Same `@jit.unroll_safe` factory as `popvalues`.
+    /// Same residual-ABI constraint as `popvalues`.
     #[inline]
-    #[majit_macros::unroll_safe]
     pub fn popvalues_mutable(&mut self, n: usize) -> Vec<PyObjectRef> {
         self.popvalues(n)
     }
 
-    /// pyframe.py peekvalues — `@jit.unroll_safe`.
+    /// pyframe.py peekvalues. Same residual-ABI constraint as `popvalues`.
     #[inline]
-    #[majit_macros::unroll_safe]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
         let base = self.valuestackdepth - n;
         // Reads cover `[base, valuestackdepth)`; the highest index is

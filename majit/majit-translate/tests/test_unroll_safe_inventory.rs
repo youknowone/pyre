@@ -262,9 +262,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // `pyframe.py` stack helpers and scope init are `@jit.unroll_safe`.
     // Each has a loop over n / cells; without the hint `look_inside_graph`
     // residualizes the whole helper. Descent-scope change matching upstream.
-    ("popvalues", "pyframe.py popvalues"),
-    ("popvalues_mutable", "pyframe.py popvalues_mutable"),
-    ("peekvalues", "pyframe.py peekvalues"),
+    // popvalues / peekvalues return Vec (two residual words). The hint
+    // stays off until that ABI exists; otherwise look_inside residualizes
+    // a one-slot pointer and the length is garbage (Linux test_uuid
+    // type_id OOB).
     ("dropvalues", "pyframe.py dropvalues"),
     ("pushrevvalues", "pyframe.py pushrevvalues"),
     ("dupvalues", "pyframe.py dupvalues"),
