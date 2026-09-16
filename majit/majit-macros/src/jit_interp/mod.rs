@@ -3720,8 +3720,50 @@ fn rewrite_body(
         quote! {}
     };
 
-    let stmts = &cloned_block.stmts;
-    quote! { #entry_door #(#stmts)* }
+    let stmts = insert_before_first_loop(cloned_block.stmts, entry_door);
+    quote! { #(#stmts)* }
+}
+
+/// `ll_portal_runner` sits after driver/pc/state exist and before the
+/// interpreter loop. Prepending it to the function body names those
+/// bindings before they are declared.
+fn insert_before_first_loop(stmts: Vec<syn::Stmt>, door: TokenStream) -> Vec<syn::Stmt> {
+    if door.is_empty() {
+        return stmts;
+    }
+    let door_stmt: syn::Stmt =
+        syn::parse2(door).expect("function-entry door must parse as a statement");
+    let mut out = Vec::with_capacity(stmts.len() + 1);
+    let mut inserted = false;
+    for stmt in stmts {
+        if !inserted && stmt_is_loop(&stmt) {
+            out.push(door_stmt.clone());
+            inserted = true;
+        }
+        out.push(stmt);
+    }
+    if !inserted {
+        out.insert(0, door_stmt);
+    }
+    out
+}
+
+fn stmt_is_loop(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Expr(expr, _) => expr_is_loop(expr),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .is_some_and(|init| expr_is_loop(&init.expr)),
+        _ => false,
+    }
+}
+
+fn expr_is_loop(expr: &syn::Expr) -> bool {
+    matches!(
+        expr,
+        syn::Expr::While(_) | syn::Expr::Loop(_) | syn::Expr::ForLoop(_)
+    )
 }
 
 #[cfg(test)]
@@ -4429,6 +4471,16 @@ mod tests {
             expanded.contains("function_entry_structured"),
             "the generated portal must call the function-entry door before \
              the interpreter loop. Expansion was:\n{expanded}"
+        );
+        let door_at = expanded
+            .find("function_entry_structured")
+            .expect("door present");
+        let pc_at = expanded.find("let mut pc").expect("pc binding");
+        let driver_at = expanded.find("let mut driver").expect("driver binding");
+        let state_at = expanded.find("let mut state").expect("state binding");
+        assert!(
+            pc_at < door_at && driver_at < door_at && state_at < door_at,
+            "the door must sit after driver/pc/state are bound. Expansion was:\n{expanded}"
         );
     }
 }
