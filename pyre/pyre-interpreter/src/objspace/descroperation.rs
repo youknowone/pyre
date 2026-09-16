@@ -5215,8 +5215,15 @@ pub(crate) fn try_dispatch_binary_special(
         // back through `operand`, so neither this frame nor the caller — which
         // goes on to concatenate, repeat or name them — is left holding a
         // pre-collection address.  That is why they arrive by `&mut`.
+        //
+        // Pin with one-word `pin_root` residuals, not `pin_roots(&[…])`.
+        // A slice argument is two words, so the translator leaves
+        // `pin_roots` as a symbolic hash; interpret then walks unpinned
+        // and a collection leaves `ll_issubclass` reading a corpse.
         let _roots = pyre_object::gc_roots::push_roots();
-        let operands = pyre_object::gc_roots::pin_roots(&[*lhs, *rhs]);
+        let operands = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(*lhs);
+        let _ = pyre_object::gc_roots::pin_root(*rhs);
         let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
         let (w_left_src, mut w_left_impl) =
             match lookup_where_with_method_cache(w_typ1.as_ptr(), dunder) {
