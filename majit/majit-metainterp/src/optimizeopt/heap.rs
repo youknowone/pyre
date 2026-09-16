@@ -1000,6 +1000,10 @@ impl OptHeap {
                 return false;
             }
         }
+        // quasiimmut.py `is_still_valid_for`: `qmut is not self.qmut`
+        // is unconditional False. A later wrapint New+setfield that
+        // revokes the process-global watcher must InvalidLoop, not be
+        // rescued by a live w_class compare.
         if !qmutdescr.qmut().is_current() {
             return false;
         }
@@ -2252,10 +2256,10 @@ impl OptHeap {
         let descr = op.getdescr().unwrap();
         let field_idx = Self::field_slot_index(&descr);
 
-        // heap.py:640-643: constant_fold — pure getfield on constant object.
-        //   if descr.is_always_pure() and self.get_constant_box(arg0):
-        //       resbox = self.optimizer.constant_fold(op)
-        //       self.optimizer.make_constant(op, resbox)
+        // heap.py `optimize_GETFIELD_GC_I`: constant_fold only when
+        // `descr.is_always_pure()` and arg0 is a constant box.
+        // Quasi-immutability is recorded by `optimize_QUASIIMMUT_FIELD`,
+        // not by widening this purity test.
         if descr.is_always_pure()
             && ctx
                 .get_constant_box(&op.arg(0).get_box_replacement(false))

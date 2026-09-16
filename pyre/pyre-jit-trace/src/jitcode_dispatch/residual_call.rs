@@ -9440,6 +9440,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 let intval =
                     unsafe { pyre_object::w_int_get_value(boxed_ptr as pyre_object::PyObjectRef) };
                 let boxed = walker_box_int(ctx, op.pc, raw_arg, intval)?;
+                // wrapint allocates; the concrete is that heap box,
+                // not the LOAD_SMALL_INT intern table.
                 ctx.trace_ctx
                     .set_opref_concrete(boxed, box_int_concrete(intval, boxed_ptr));
                 write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, boxed)?;

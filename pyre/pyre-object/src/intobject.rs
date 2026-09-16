@@ -330,6 +330,38 @@ pub fn w_int_small_cache_base_ptr() -> PyObjectRef {
     SMALL_INTS.0.as_ptr().cast_mut() as PyObjectRef
 }
 
+/// Compact integer-literal range for `LOAD_SMALL_INT` (oparg 0..=255).
+/// Values outside this range fall back to [`w_int_new`].
+pub const SMALL_INT_CONST_FROM: i64 = 0;
+pub const SMALL_INT_CONST_TO: i64 = 256;
+
+static SMALL_INT_CONSTS: [std::sync::OnceLock<usize>; 256] =
+    [const { std::sync::OnceLock::new() }; 256];
+
+/// Interned box for a `LOAD_SMALL_INT` literal.
+///
+/// `getconstant_w` / `co_consts_w` keep one identity per `LOAD_CONST` slot
+/// so a JUMP can carry `ConstPtr`. `LOAD_SMALL_INT` has no const index —
+/// the oparg *is* the value — so this table is that slot. `wrapint` /
+/// [`w_int_new`] still allocate a fresh box; this is not
+/// [`WITHPREBUILTINT`].
+#[inline]
+pub fn w_small_int_const(value: i64) -> PyObjectRef {
+    if (SMALL_INT_CONST_FROM..SMALL_INT_CONST_TO).contains(&value) {
+        let idx = (value - SMALL_INT_CONST_FROM) as usize;
+        return *SMALL_INT_CONSTS[idx].get_or_init(|| {
+            crate::lltype::malloc_typed_immortal(W_IntObject {
+                ob_header: PyObject {
+                    ob_type: &INT_TYPE as *const PyType,
+                    w_class: get_instantiate(&INT_TYPE),
+                },
+                intval: value,
+            }) as usize
+        }) as PyObjectRef;
+    }
+    w_int_new(value)
+}
+
 /// `intobject.py _bit_count` parity — population count of an i64.
 ///
 /// `@jit.elidable` (`rlib/jit.py`): deterministic, no allocation,
@@ -398,6 +430,24 @@ mod tests {
     #[test]
     fn test_int_field_offset() {
         assert_eq!(INT_INTVAL_OFFSET, 16);
+    }
+
+    #[test]
+    fn small_int_const_reuses_identity_and_does_not_alias_wrapint() {
+        let a = w_small_int_const(1);
+        let b = w_small_int_const(1);
+        assert_eq!(a, b, "LOAD_SMALL_INT 1 is one interned box");
+        assert_ne!(
+            a,
+            w_int_new(1),
+            "wrapint still allocates; intern is LOAD_SMALL_INT only"
+        );
+        unsafe {
+            assert!(is_int(a));
+            assert_eq!(w_int_get_value(a), 1);
+        }
+        let outside = w_small_int_const(SMALL_INT_CONST_TO);
+        assert_ne!(outside, w_small_int_const(SMALL_INT_CONST_TO));
     }
 
     /// `intobject.py wrapint` parity: with `withprebuiltint=False`

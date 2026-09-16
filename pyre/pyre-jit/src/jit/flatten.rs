@@ -5203,16 +5203,15 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
 /// register indices.  Production codewriter callsites replace three prior `emit_residual_call(
 /// box_int_fn_idx, ...)` SSARepr emits with single direct pushes of
 /// this helper's output:
-///   * `Instruction::LoadSmallInt` (val = literal small
-///     int from the consts table).
 ///   * `Instruction::UnaryNegative` `box_int(0)` (val =
 ///     0, materialises the zero operand for the trailing
 ///     `binary_op_fn(zero, operand, sub_tag)` emit).
 ///   * Exception-frame lasti boxing in codewriter.rs (val
 ///     = `lasti_py_pc`, captures the frame's last-instruction offset
 ///     into the exception slot).
-/// All 3 sites' graph dual-writes stay in place — incremental
-/// factor refactor only.
+/// `LoadSmallInt` no longer residual-calls `box_int_fn`; it pushes
+/// the interned `w_small_int_const` Ref. The two remaining sites'
+/// graph dual-writes stay in place.
 ///
 /// `box_int_fn` has signature `(val: Int) → Ref` with
 /// `CallFlavor::Plain` (per `register_helper_fn_pointers` — `bh_box_int_fn`
@@ -11314,8 +11313,8 @@ mod tests {
         // box_int_fn factor refactor.  The
         // helper must produce the same `residual_call_ir_r` Insn
         // shape that `build_box_int_fn_residual_call_ir_r_insn` produced inline at
-        // all 3 box_int_fn callsites (LoadSmallInt / UnaryNegative /
-        // lasti): `[ConstInt(fn_idx), ListI([ConstInt(val)]),
+        // remaining box_int_fn callsites (UnaryNegative / lasti):
+        // `[ConstInt(fn_idx), ListI([ConstInt(val)]),
         // ListR([]), Descr(CallDescrStub{Plain, [Int]})] →
         // Reg(Ref, dst)`.  Empty `ListR` is required by RPython
         // jtransform.py (`elif lst_i or force_ir: kinds = 'ir'`)

@@ -3813,6 +3813,10 @@ impl ConstantOpcodeHandler for PyFrame {
         Ok(w_int_new(value))
     }
 
+    fn small_int_constant(&mut self, value: i64) -> Result<Self::Value, PyError> {
+        Ok(w_small_int_const(value))
+    }
+
     fn bigint_constant(&mut self, value: &crate::PyBigInt) -> Result<Self::Value, PyError> {
         Ok(w_long_new(value.clone()))
     }

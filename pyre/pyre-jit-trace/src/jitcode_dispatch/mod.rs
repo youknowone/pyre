@@ -9173,7 +9173,10 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
 )> {
     let (lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val) =
         walker_int_specialization_input_operands(ctx, r_args)?;
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    // A virtual wrapint has no concrete pointer, so the authentic helper
+    // cannot run.  `walker_newbool_guarded` / wrapint of the raw result
+    // does not need that shadow; 0 is only the residual-box fallback.
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr).unwrap_or(0);
     Some((
         lhs,
         rhs,
@@ -9205,31 +9208,50 @@ fn walker_int_specialization_input_operands<Sym: WalkSym>(
     }
     let lhs = r_args[0];
     let rhs = r_args[1];
-    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
-    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
-    let (lhs_val, rhs_val) = unsafe {
-        // `bool` is a `W_IntObject` subclass sharing the `intval` layout; the
-        // consumer unboxes it through its own `&BOOL_TYPE` guard, so it stays
-        // on the int path. Returns the concrete objects so the consumer can
-        // pick the per-operand class/descr.
-        if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
-            return None;
-        }
-        // A numeric subclass keeps the builtin `ob_type` layout while its
-        // Python-visible class lives in `w_class`.  The raw int specialization
-        // bypasses special-method dispatch, so only exact builtin ints/bools
-        // may enter it; subclasses continue through the residual BINARY_OP.
-        if !pyre_object::is_exact_builtin_instance(lhs_obj)
-            || !pyre_object::is_exact_builtin_instance(rhs_obj)
-        {
-            return None;
-        }
-        (
-            pyre_object::w_int_get_value(lhs_obj),
-            pyre_object::w_int_get_value(rhs_obj),
-        )
-    };
+    let (lhs_obj, lhs_val) = walker_int_specialization_one_operand(ctx, lhs)?;
+    let (rhs_obj, rhs_val) = walker_int_specialization_one_operand(ctx, rhs)?;
     Some((lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val))
+}
+
+/// One operand of [`walker_int_specialization_input_operands`].
+///
+/// A heap `W_IntObject` / `W_BoolObject` still answers from its concrete
+/// shadow.  A walker-made wrapint (`emit_box_int_inline`) has no concrete
+/// pointer — `set_opref_concrete` is not called — so the concrete path
+/// declines and COMPARE/BINARY residualise as `CallMayForceR`.  That New
+/// already has `intval` in the heapcache and `class_now_known`; read those
+/// the way `optimizeopt` folds `getfield intval` on a virtual wrapint.
+fn walker_int_specialization_one_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    operand: OpRef,
+) -> Option<(pyre_object::PyObjectRef, i64)> {
+    if let Some(obj) = walker_concrete_ref_object(ctx, operand) {
+        let val = unsafe {
+            if !pyre_object::is_int(obj) {
+                return None;
+            }
+            // A numeric subclass keeps the builtin `ob_type` layout while its
+            // Python-visible class lives in `w_class`.  The raw int
+            // specialization bypasses special-method dispatch, so only exact
+            // builtin ints/bools may enter it; subclasses continue through
+            // the residual BINARY_OP / COMPARE_OP.
+            if !pyre_object::is_exact_builtin_instance(obj) {
+                return None;
+            }
+            pyre_object::w_int_get_value(obj)
+        };
+        return Some((obj, val));
+    }
+    if !ctx.trace_ctx.heap_cache().is_class_known(operand) {
+        return None;
+    }
+    let cached = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(operand, crate::descr::int_intval_descr().index())?;
+    let majit_ir::Value::Int(n) = ctx.trace_ctx.box_value(cached)? else {
+        return None;
+    };
+    Some((std::ptr::null_mut(), n))
 }
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
@@ -9354,6 +9376,21 @@ fn walker_unbox_int<Sym: WalkSym>(
     )
 }
 
+/// Pin exact `w_class` first, then unbox. Exact class implies the layout
+/// vtable, so [`walker_unbox_int_typed`] sees `is_class_known` and skips
+/// the redundant `GuardClass`.
+fn walker_unbox_int_exact<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+    expected_class: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    walker_guard_exact_w_class(ctx, op_pc, obj, expected_class)?;
+    walker_unbox_int_typed(ctx, op_pc, obj, type_addr, intval_descr)
+}
+
 /// True when `obj` is an InputArg the concrete boundary GUARANTEES was
 /// converted from a tagged immediate to a heap `W_IntObject` — i.e. a
 /// frame LOCALS-region array-item InputArg (`raw() - vable_array_base <
@@ -9456,13 +9493,29 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
         }
     }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, type_addr);
+        let already_this_class = obj.is_constant()
+            && walker_concrete_ref_object(ctx, obj).is_some_and(|o| {
+                !o.is_null()
+                    && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(o))
+                    && std::ptr::eq(
+                        unsafe { (*o).ob_type },
+                        type_addr as *const pyre_object::PyType,
+                    )
+            });
+        if already_this_class {
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        } else {
+            let type_const = ctx.trace_ctx.const_int(type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        }
     }
     Ok(crate::trace_unbox_int(
         ctx.trace_ctx,
@@ -9968,6 +10021,11 @@ fn walker_box_int<Sym: WalkSym>(
     value: i64,
 ) -> Result<OpRef, DispatchError> {
     let _ = (op_pc, value);
+    // intobject.py `wrapint` (withprebuiltint=False): every boxing
+    // allocates a fresh `W_IntObject`. Interning a constant raw here
+    // is WITHPREBUILTINT for the residual `box_int_fn` path. Only
+    // `LOAD_SMALL_INT` / `getconstant_w` intern, via the codewriter
+    // frontend.
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
 }
 
@@ -10579,6 +10637,11 @@ unsafe fn walker_exact_builtin_class(
 /// already sufficient. Heap operands were admitted by
 /// `is_exact_builtin_instance` in the shared operand gate.
 fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    // A walker-made wrapint has no concrete object; it is always `int`
+    // (`emit_box_int_inline` / `note_class_word_after_new`).
+    if obj.is_null() {
+        return pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    }
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         pyre_object::PY_NULL
     } else if unsafe { pyre_object::is_bool(obj) } {
@@ -10666,6 +10729,21 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
         return Ok(());
     }
+    // A ConstPtr interned / co_consts box already is the exact builtin.
+    // Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every iteration is
+    // the leftover the `guard_value` comment below exists to kill;
+    // for a compile-time constant the proof is the object itself.
+    if obj.is_constant()
+        && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+    {
+        // Exact class implies the layout vtable; a later unbox / GuardClass
+        // of this ConstPtr already has its own `already_this_class` fold.
+        return Ok(());
+    }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
     // second spelling of "exact builtin", while the guard below reads the slot and
@@ -10683,6 +10761,12 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
     );
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
+    // Do not stamp `class_now_known` here. Exact `w_class` is a stronger
+    // proof, but `optimize_GETFIELD` / peel import can fold the
+    // Getfield+GuardValue away on a LABEL input. `walker_guard_class`
+    // must still emit `GuardClass` so a later entry whose box is an
+    // int cannot take the long `GetfieldGcR(value)` path and pass
+    // intval to `jit_bigint_int_mul` (`selfrec_bridge_nontail_promote`).
     Ok(())
 }
 

@@ -2975,6 +2975,13 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 
 /// Comparison special-method dispatch.
 ///
+/// `dont_look_inside`: `policy.py look_inside_graph` rejects a graph
+/// that contains a loop. This arm walks the MRO (`lookup_in_type_where`);
+/// keeping that walk residual lets [`compare`] stay loop-free so a
+/// traced `int < int` can look inside `comparison_impl` and reach
+/// [`compare_slot`]. Exact builtin pairs never call this
+/// (`pair_can_override` is false on a promoted decision).
+///
 /// PyPy: `descroperation.py:_make_comparison_impl`.  Generic instances use
 /// the complete MRO lookup, including inherited `object.__eq__` /
 /// `object.__ne__`; the latter deliberately calls the receiver's live
@@ -2985,6 +2992,7 @@ unsafe fn issubtype_cached(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
 /// 3.14 `Objects/object.c:do_richcompare` tries `tp_richcompare` in both
 /// operand directions when the first call returns `NotImplemented`; pyre's
 /// Python 3.14 compatibility rule takes precedence here.
+#[majit_macros::dont_look_inside]
 unsafe fn try_compare_override(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -3553,7 +3561,7 @@ unsafe fn is_exact_builtin_instance_promoted(a: PyObjectRef) -> bool {
 /// Both operands of a binary operator are exact builtin instances, each
 /// decided by [`is_exact_builtin_instance_promoted`].
 #[inline]
-unsafe fn both_exact_builtin_instances_promoted(a: PyObjectRef, b: PyObjectRef) -> bool {
+pub(crate) unsafe fn both_exact_builtin_instances_promoted(a: PyObjectRef, b: PyObjectRef) -> bool {
     is_exact_builtin_instance_promoted(a) && is_exact_builtin_instance_promoted(b)
 }
 
@@ -5729,7 +5737,10 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 }
 
 /// Comparison operation dispatch.
-
+///
+/// Loop-free: the MRO override walk lives in residual
+/// [`try_compare_override`] (`look_inside_graph` / `contains_loop`).
+/// `compare_slot_rest` is the same split for non-int layouts.
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.

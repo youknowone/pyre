@@ -197,8 +197,14 @@ pub(crate) fn try_walker_specialize_truth_int<Sym: WalkSym>(
         pyre_object::w_int_get_value(obj)
     };
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, operand, walker_numeric_builtin_class(obj))?;
+    let raw = walker_unbox_int_exact(
+        ctx,
+        op_pc,
+        operand,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+        walker_numeric_builtin_class(obj),
+    )?;
     let truth = ctx.trace_ctx.record_op(OpCode::IntIsTrue, &[raw]);
     ctx.trace_ctx
         .set_opref_concrete(truth, majit_ir::Value::Int((val != 0) as i64));
@@ -283,8 +289,8 @@ unsafe fn long_payload_of(obj: pyre_object::PyObjectRef) -> i64 {
 }
 
 /// `longobject.py _make_descr_cmp`'s `isinstance(self, W_LongObject)` plus
-/// the `self.num` field read.  Always records `GuardClass(LONG)` — the
-/// tracing heapcache's `is_class_known` flag is not `isinstance`, and
+/// the `self.num` field read.  Exact `w_class` first implies the LONG
+/// vtable, so `walker_guard_class` then skips the redundant `GuardClass`.
 /// `W_IntObject.intval` sits at the same offset as `W_LongObject.value`.
 fn walker_guard_long_and_read_payload<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -305,12 +311,8 @@ fn walker_guard_long_and_read_payload<Sym: WalkSym>(
         let lowbit = crate::helpers::emit_tag_lowbit_test(ctx.trace_ctx, boxed, false);
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
     }
-    let type_const = ctx.trace_ctx.const_int(long_type_addr);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[boxed, type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(boxed, long_type_addr);
     walker_guard_exact_w_class(ctx, op_pc, boxed, expected_class)?;
+    walker_guard_class(ctx, op_pc, boxed, long_type_addr)?;
     let payload = unsafe { long_payload_of(obj) };
     let field =
         crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, boxed, crate::descr::long_value_descr());
@@ -571,11 +573,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int<Sym: WalkSym>(
     };
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-    let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+    let int_raw = walker_unbox_int_exact(ctx, op_pc, int, int_type, int_descr, int_class)?;
     let off = pyre_object::longobject::LONG_VALUE_OFFSET;
     let long_payload = unsafe { *((long_obj as *const u8).add(off) as *const i64) };
     let long_pl = ctx.trace_ctx.record_op_with_descr(
@@ -845,11 +846,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
         };
 
         let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-        walker_guard_class(ctx, op_pc, long, long_type_addr)?;
         walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+        walker_guard_class(ctx, op_pc, long, long_type_addr)?;
         let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-        let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
-        walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+        let int_raw = walker_unbox_int_exact(ctx, op_pc, int, int_type, int_descr, int_class)?;
         let zero = ctx.trace_ctx.const_int(0);
         let is_zero = ctx.trace_ctx.record_op(OpCode::IntEq, &[int_raw, zero]);
         ctx.trace_ctx
@@ -890,11 +890,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_div<Sym: WalkSym>(
     };
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-    let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+    let int_raw = walker_unbox_int_exact(ctx, op_pc, int, int_type, int_descr, int_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let nonzero = ctx.trace_ctx.record_op(OpCode::IntNe, &[int_raw, zero]);
     ctx.trace_ctx
@@ -1089,11 +1088,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_pow<Sym: WalkSym>(
     };
 
     let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, long, long_class)?;
+    walker_guard_class(ctx, op_pc, long, long_type_addr)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-    let exp_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+    let exp_raw = walker_unbox_int_exact(ctx, op_pc, int, int_type, int_descr, int_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let positive = ctx.trace_ctx.record_op(OpCode::IntGt, &[exp_raw, zero]);
     ctx.trace_ctx
@@ -1233,11 +1231,10 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
         };
 
         let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
-        walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
         walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
+        walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
         let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-        let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
-        walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
+        let rhs_raw = walker_unbox_int_exact(ctx, op_pc, rhs, rhs_type, rhs_descr, rhs_class)?;
         let zero = ctx.trace_ctx.const_int(0);
         let is_negative = ctx.trace_ctx.record_op(OpCode::IntLt, &[rhs_raw, zero]);
         ctx.trace_ctx
@@ -1269,8 +1266,7 @@ pub(crate) fn try_walker_specialize_binary_op_long_int_shift<Sym: WalkSym>(
     walker_guard_class(ctx, op_pc, lhs, long_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, lhs, lhs_class)?;
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, rhs_class)?;
+    let rhs_raw = walker_unbox_int_exact(ctx, op_pc, rhs, rhs_type, rhs_descr, rhs_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[rhs_raw, zero]);
     ctx.trace_ctx
@@ -6223,13 +6219,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         let raw_live = match unbox_type {
             pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
-                // A subclass shares the builtin's `ob_type`, which is all the unbox
-                // guard proves; the operand gate read `w_class`, so pin that too.
-                walker_guard_exact_w_class(
+                let raw = walker_unbox_int_exact(
                     ctx,
                     op_pc,
                     value,
+                    int_type_addr,
+                    crate::descr::int_intval_descr(),
                     walker_numeric_builtin_class(concrete_value),
                 )?;
                 crate::state::trace_int_block_setitem_value(
@@ -6490,10 +6485,18 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 // guard pins a tagged operand, the `w_class` pin a heap one
                 // (a subclass shares `W_IntObject`'s `ob_type`).
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-                let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
-                if let Some(canonical) = canonical {
-                    walker_guard_exact_w_class(ctx, op_pc, value, canonical)?;
-                }
+                let raw = if let Some(canonical) = canonical {
+                    walker_unbox_int_exact(
+                        ctx,
+                        op_pc,
+                        value,
+                        int_type_addr,
+                        crate::descr::int_intval_descr(),
+                        canonical,
+                    )?
+                } else {
+                    walker_unbox_int(ctx, op_pc, value, int_type_addr)?
+                };
                 crate::helpers::emit_mapdict_add_unboxed_attr_inline(
                     ctx.trace_ctx,
                     obj,
@@ -6733,16 +6736,22 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             let long_type_addr = &pyre_object::pyobject::LONG_TYPE as *const _ as i64;
             let mut raws: Vec<OpRef> = Vec::with_capacity(len);
             for (&it, &(v, is_fits_long)) in items.iter().zip(vals.iter()) {
+                let exact_class = walker_concrete_ref_object(ctx, it)
+                    .map(walker_numeric_builtin_class)
+                    .unwrap_or(pyre_object::PY_NULL);
                 let raw = if is_fits_long {
+                    walker_guard_exact_w_class(ctx, op_pc, it, exact_class)?;
                     walker_unbox_long(ctx, op_pc, it, long_type_addr)?
                 } else {
-                    walker_unbox_int(ctx, op_pc, it, int_type_addr)?
+                    walker_unbox_int_exact(
+                        ctx,
+                        op_pc,
+                        it,
+                        int_type_addr,
+                        crate::descr::int_intval_descr(),
+                        exact_class,
+                    )?
                 };
-                // The unbox proves `ob_type`, which a subclass shares; without
-                // the `w_class` pin the element is rewrapped as a plain int.
-                if let Some(obj) = walker_concrete_ref_object(ctx, it) {
-                    walker_guard_exact_w_class(ctx, op_pc, it, walker_numeric_builtin_class(obj))?;
-                }
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(v));
                 raws.push(raw);
@@ -6760,10 +6769,10 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
             let mut raws: Vec<OpRef> = Vec::with_capacity(len);
             for (&it, &v) in items.iter().zip(vals.iter()) {
-                let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
                 if let Some(obj) = walker_concrete_ref_object(ctx, it) {
                     walker_guard_exact_w_class(ctx, op_pc, it, walker_numeric_builtin_class(obj))?;
                 }
+                let raw = walker_unbox_float(ctx, op_pc, it, float_type_addr)?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(v));
                 // `walker_unbox_float` guards `ob_type` only, which a float
@@ -7145,14 +7154,22 @@ pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     // is a bool either way.
     let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-    let lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
-    // `walker_unbox_int_typed` proves only `ob_type`, which an `int` subclass
-    // shares with `int`; the operand gate reads `w_class`, which it does not.
-    // Without these the compiled guard admits the subclass and the comparison
-    // is answered by `IntLt` instead of the overriding `__lt__`.
-    walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
-    let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
+    let lhs_raw = walker_unbox_int_exact(
+        ctx,
+        op_pc,
+        lhs,
+        lhs_type,
+        lhs_descr,
+        walker_numeric_builtin_class(lhs_obj),
+    )?;
+    let rhs_raw = walker_unbox_int_exact(
+        ctx,
+        op_pc,
+        rhs,
+        rhs_type,
+        rhs_descr,
+        walker_numeric_builtin_class(rhs_obj),
+    )?;
     let truth = ctx.trace_ctx.record_op(cmp, &[lhs_raw, rhs_raw]);
     let folded = majit_metainterp::eval_binop_i(cmp, la, rb);
     ctx.trace_ctx
@@ -8172,8 +8189,7 @@ pub(crate) fn try_walker_specialize_compare_op_long_int<Sym: WalkSym>(
         _ => return Ok(None),
     };
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-    let int_raw = walker_unbox_int_typed(ctx, op_pc, int, int_type, int_descr)?;
-    walker_guard_exact_w_class(ctx, op_pc, int, int_class)?;
+    let int_raw = walker_unbox_int_exact(ctx, op_pc, int, int_type, int_descr, int_class)?;
     let helper_ptr = helper as *const ();
     let truth = ctx.trace_ctx.call_typed_with_effect_pure(
         OpCode::CallI,
@@ -8851,8 +8867,16 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     };
 
     // --- emit the specialized IR (walker-native) ---
-    // guard_class LIST (skip when class already known / operand is constant).
+    // Exact `w_class` first: it implies the LIST vtable, so the GuardClass
+    // below is skipped. A list subclass shares `ob_type == &LIST_TYPE` but
+    // retags `w_class` and may override `__getitem__`.
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
     if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
         let type_const = ctx.trace_ctx.const_int(list_type_addr);
         ctx.trace_ctx
@@ -8862,18 +8886,6 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, list_type_addr);
-
-    // A list SUBCLASS instance shares `ob_type == &LIST_TYPE` (so it passes
-    // the GuardClass above) but retags `w_class` and may override
-    // `__getitem__`; guard the exact canonical `w_class` so such an instance
-    // side-exits to the generic residual (which honours the override) rather
-    // than taking this direct-storage load.
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
 
     // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
     let strategy = crate::state::opimpl_getfield_gc_i(
@@ -9146,6 +9158,12 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
 
     // --- commit: exact tuple guards, fixed length, immutable item reads ---
     let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        tuple_op,
+        pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE),
+    )?;
     if !tuple_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(tuple_op) {
         let tuple_type = ctx.trace_ctx.const_int(tuple_type_addr);
         walker_emit_fold_guard_with_snapshot(
@@ -9158,12 +9176,6 @@ pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(tuple_op, tuple_type_addr);
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        tuple_op,
-        pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE),
-    )?;
 
     let items_block = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
@@ -9260,8 +9272,13 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     };
 
     // --- emit the specialized IR (walker-native) ---
-    // guard_class TUPLE (skip when class already known / operand is constant).
     let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
+    )?;
     if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
         let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
         ctx.trace_ctx
@@ -9271,18 +9288,6 @@ pub(crate) fn try_walker_specialize_subscr_tuple<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, tuple_type_addr);
-
-    // A tuple SUBCLASS instance shares `ob_type == &TUPLE_TYPE` (so it passes
-    // the GuardClass above) but retags `w_class` and may override
-    // `__getitem__`; guard the exact canonical `w_class` so such an instance
-    // side-exits to the generic residual (which honours the override) rather
-    // than taking this pure `wrappeditems[i]` load.
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
-    )?;
 
     // Unbox the index operand (guard_class + getfield intval).  bool shares
     // int's `intval`, so a bool index guards its own &BOOL_TYPE.
@@ -15097,11 +15102,12 @@ pub(crate) fn try_walker_specialize_math_isqrt<Sym: WalkSym>(
     }
     let arg_op = r_args[2];
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let raw_int = walker_unbox_int(ctx, op.pc, arg_op, int_type_addr)?;
-    walker_guard_exact_w_class(
+    let raw_int = walker_unbox_int_exact(
         ctx,
         op.pc,
         arg_op,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE),
     )?;
     ctx.trace_ctx
@@ -16697,8 +16703,14 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     }
     let level_op = r_args[6];
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(w_level);
-    let level_raw = walker_unbox_int_typed(ctx, op.pc, level_op, int_type, int_descr)?;
-    walker_guard_exact_w_class(ctx, op.pc, level_op, walker_numeric_builtin_class(w_level))?;
+    let level_raw = walker_unbox_int_exact(
+        ctx,
+        op.pc,
+        level_op,
+        int_type,
+        int_descr,
+        walker_numeric_builtin_class(w_level),
+    )?;
     let zero = ctx.trace_ctx.const_int(0);
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
 
@@ -17002,8 +17014,7 @@ fn try_walker_specialize_builtin_divmod_long_int<Sym: WalkSym>(
     walker_guard_class(ctx, op.pc, long_op, long_type_addr)?;
     walker_guard_exact_w_class(ctx, op.pc, long_op, long_class)?;
     let (int_type, int_descr) = crate::state::int_or_bool_unbox_type_descr(int_obj);
-    let int_raw = walker_unbox_int_typed(ctx, op.pc, int_op, int_type, int_descr)?;
-    walker_guard_exact_w_class(ctx, op.pc, int_op, int_class)?;
+    let int_raw = walker_unbox_int_exact(ctx, op.pc, int_op, int_type, int_descr, int_class)?;
     let zero = ctx.trace_ctx.const_int(0);
     let nonzero = ctx.trace_ctx.record_op(OpCode::IntNe, &[int_raw, zero]);
     ctx.trace_ctx
@@ -20246,8 +20257,14 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     };
 
     // --- emit the specialized IR (walker-native) ---
-    // guard_class LIST (skip when class already known / operand is constant).
+    // Exact `w_class` first: it implies the LIST vtable, so GuardClass skips.
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        list_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
     if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
         let type_const = ctx.trace_ctx.const_int(list_type_addr);
         ctx.trace_ctx
@@ -20257,18 +20274,6 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(list_op, list_type_addr);
-
-    // A list SUBCLASS instance shares `ob_type == &LIST_TYPE` (so it passes
-    // the GuardClass above) but retags `w_class` and may override
-    // `__setitem__`; guard the exact canonical `w_class` so such an instance
-    // side-exits to the generic residual (which honours the override) rather
-    // than taking this direct-storage store.
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        list_op,
-        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
-    )?;
 
     // guard_value(strategy == sid): getfield strategy + GuardValue + replace_box.
     let strategy = crate::state::opimpl_getfield_gc_i(
@@ -20322,14 +20327,12 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
         // The value is a true W_IntObject (the gate excludes bool from int
         // storage), so it unboxes through the plain INT_TYPE guard.
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        let raw = walker_unbox_int(ctx, op_pc, value_op, int_type_addr)?;
-        // The list gets an exact-`w_class` guard above; the VALUE needs its own,
-        // because the unbox proves only `ob_type` and a subclass shares it —
-        // storing its payload would drop the element's Python class.
-        walker_guard_exact_w_class(
+        let raw = walker_unbox_int_exact(
             ctx,
             op_pc,
             value_op,
+            int_type_addr,
+            crate::descr::int_intval_descr(),
             walker_numeric_builtin_class(value_obj),
         )?;
         let elem = unsafe { pyre_object::w_int_get_value(value_obj) };
@@ -20343,13 +20346,13 @@ pub(crate) fn try_walker_specialize_store_subscr<Sym: WalkSym>(
             crate::descr::list_float_items_block_descr(),
         );
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-        let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
         walker_guard_exact_w_class(
             ctx,
             op_pc,
             value_op,
             walker_numeric_builtin_class(value_obj),
         )?;
+        let raw = walker_unbox_float(ctx, op_pc, value_op, float_type_addr)?;
         let elem = unsafe { pyre_object::w_float_get_value(value_obj) };
         ctx.trace_ctx
             .set_opref_concrete(raw, majit_ir::Value::Float(elem));
@@ -21766,6 +21769,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE);
     let sid_const_val = pyre_object::listobject::ListStrategy::Integer as i64;
     for &lst_op in &[list_op, value_op] {
+        walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
         if !lst_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(lst_op) {
             let type_const = ctx.trace_ctx.const_int(list_type_addr);
             ctx.trace_ctx
@@ -21775,7 +21779,6 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         ctx.trace_ctx
             .heap_cache_mut()
             .class_now_known(lst_op, list_type_addr);
-        walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
 
         let strategy = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
