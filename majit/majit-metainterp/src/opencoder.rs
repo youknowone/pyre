@@ -1281,9 +1281,10 @@ pub struct SnapshotIterator<'a> {
     /// opencoder.py:211,214-217 self.framestack — snapshot byte
     /// offsets in bottom-up order (outermost frame first, innermost
     /// frame last), built by reversing the top-down iterator.
-    /// Eight inline slots cover the inlined-callee chain so
-    /// `SnapshotIterator.__init__` does not spill a 64 B heap per snapshot.
-    pub framestack: SmallVec<[usize; 8]>,
+    /// Sixteen inline slots cover the inlined-callee chain so
+    /// `SnapshotIterator.__init__` does not spill a 128 B heap per snapshot.
+    /// Regex `and`/`or` inlines past eight (`number_from_parts`).
+    pub framestack: SmallVec<[usize; 16]>,
     /// Back-reference to `_snapshot_array_data` so callers can
     /// construct fresh `BoxArrayIter` values without rethreading the
     /// buffer. Matches RPython's implicit `main_iter.trace._snapshot_array_data`
@@ -1620,14 +1621,22 @@ impl Trace {
             _descrs: vec![None],
             // opencoder.py:482 — `_refs = [lltype.nullptr(GCREF.TO)]` so
             // index 0 is the null reference / empty-array sentinel.
-            _refs: vec![0u64],
-            rooted_refs: Vec::new(),
-            _refs_dict: indexmap::IndexMap::new(),
+            // A fresh Trace per bridge grew these through the 64 B / 128 B
+            // classes on the regex and/or timed row (`_encode_ptr`,
+            // `encode_varint_signed`). One reserve matches
+            // `recorder::Trace::attach_byte_buffer`'s slots/py_pc reserve.
+            _refs: {
+                let mut refs = Vec::with_capacity(32);
+                refs.push(0);
+                refs
+            },
+            rooted_refs: Vec::with_capacity(32),
+            _refs_dict: indexmap::IndexMap::with_capacity(32),
             _bigints: Vec::new(),
             _bigints_dict: indexmap::IndexMap::new(),
             _floats: Vec::new(),
-            _snapshot_data: Vec::new(),
-            _snapshot_array_data: Vec::new(),
+            _snapshot_data: Vec::with_capacity(128),
+            _snapshot_array_data: Vec::with_capacity(128),
             _total_snapshots: 0,
             tag_overflow: false,
             _consts_bigint: 0,
@@ -3022,6 +3031,47 @@ mod tests {
     /// hold in `self.metainterp_sd`.
     fn empty_sd() -> Arc<crate::MetaInterpStaticData> {
         Arc::new(crate::MetaInterpStaticData::new())
+    }
+
+    #[test]
+    fn trace_new_reserves_constptr_and_snapshot_pools() {
+        // opencoder.py Trace.__init__ starts `_refs` / snapshot lists
+        // empty. A Vec that doubles through 8/16/32/64/128 B on every
+        // regex bridge was the timed-row class (`_encode_ptr`,
+        // `encode_varint_signed`). The first 16 unique ConstPtrs and the
+        // first 128 snapshot bytes must stay inside the constructor
+        // reserve.
+        let mut trace = TraceRecordBuffer::new(0, empty_sd());
+        assert!(
+            trace._refs.capacity() >= 32,
+            "_refs must absorb the first unique ConstPtrs without growing"
+        );
+        assert!(
+            trace._snapshot_data.capacity() >= 128,
+            "_snapshot_data must absorb the first snapshot without a 64 B grow"
+        );
+        assert!(
+            trace._snapshot_array_data.capacity() >= 128,
+            "_snapshot_array_data must absorb the first snapshot without a 64 B grow"
+        );
+        let refs_cap = trace._refs.capacity();
+        let snap_cap = trace._snapshot_array_data.capacity();
+        for i in 1..=16u64 {
+            let _ = trace._encode_ptr(i * 0x1000);
+        }
+        assert_eq!(
+            trace._refs.capacity(),
+            refs_cap,
+            "16 unique ConstPtrs grew _refs off the constructor reserve"
+        );
+        for i in 0..32 {
+            trace.append_snapshot_array_data_int(i);
+        }
+        assert_eq!(
+            trace._snapshot_array_data.capacity(),
+            snap_cap,
+            "32 snapshot varints grew _snapshot_array_data off the constructor reserve"
+        );
     }
 
     #[test]

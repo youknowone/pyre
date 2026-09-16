@@ -693,7 +693,11 @@ fn is_gc_ref_type(ty: &Type) -> bool {
 }
 
 fn is_raw_pointer_type(ty: &Type) -> bool {
-    matches!(ty, Type::Ptr(_))
+    // `PyObjectRef` is `*mut PyObject`. The alias is a `Type::Path`, so
+    // a `Type::Ptr` match alone would skip it and `emit_helper_call_target_fn`
+    // would refuse the word-ABI adapter (`prepare_list_ref_store` had to
+    // spell `*mut PyObject` for that reason).
+    matches!(ty, Type::Ptr(_)) || path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef")
 }
 
 fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
@@ -2637,6 +2641,17 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     let orig_unroll_marker = format_ident!("_jit_unroll_safe_{}", orig_name);
     let trampoline_opaque_marker = format_ident!("_jit_look_inside_{}", trampoline_name);
 
+    // Residual CondCall (rlist.py `_ll_list_resize_ge` →
+    // `jit.conditional_call(_ll_list_resize_hint_really, ...)`) needs the
+    // same word-ABI entry `#[dont_look_inside]` emits. The public name is
+    // the dispatch wrapper; the adapter calls that, matching
+    // `getfunctionptr` of the decorated function.
+    let call_target_fn = match emit_helper_call_target_fn(&func) {
+        Ok(Some((_, _, tokens))) => Some(tokens),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error().into(),
+    };
+
     let expanded = quote! {
         // rlib/jit.py — func = unroll_safe(func)
         #[doc(hidden)]
@@ -2680,6 +2695,8 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #trampoline_name(#(#call_args),*)
             }
         }
+
+        #call_target_fn
     };
 
     expanded.into()

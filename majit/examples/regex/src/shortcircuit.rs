@@ -14,8 +14,8 @@
 //! `interp.rs` and `jit_interp.rs` both take that advice, and this crate had
 //! documented it without ever measuring it. This module is the unadapted side
 //! of the A/B, and therefore the post's own source: `jit_interp`'s portal
-//! copied whole — same state fields, same greens, same three-instruction
-//! program, same promote, same `_immutable_fields_` declarations, same inline
+//! copied whole — same state fields, same greens, same matchless
+//! `while pos < len` portal, same promote, same `_immutable_fields_` declarations, same inline
 //! policy — with `shift`'s four arms written the way part 1's Python writes
 //! them, `and`/`or` that stop early. The state struct's NAME is the one other
 //! difference, and only so a degraded arm stays attributable; the field list is
@@ -41,8 +41,8 @@
 //!   getfield_gc_i        24            24           24
 //!   setfield_gc          93            93           93
 //!   int_eq                2             2            2
-//!   guards               27            26            1
-//!   total               153           150          194
+//!   guards               27            27            1
+//!   total               153           151          194
 //!
 //!   21 nodes        RPython   this module   jit_interp
 //!   getfield_gc_r         0             0            0
@@ -115,17 +115,17 @@
 //! **And the guards say this module, not `jit_interp`, is the post's own
 //! spelling.** The post's source is Python `and`/`or`, which really do
 //! short-circuit, so RPython's tracer emits branches — 27 guards. This module
-//! reproduces them with explicit `if`s and lands on 26. `jit_interp` masks with
+//! reproduces them with explicit `if`s and lands on 27. `jit_interp` masks with
 //! `&`/`|` and has 1. So `jit_interp` is the *adapted* version the post's
 //! remark tells you to write, and this module is what the post's code does
 //! before you take that advice.
 //!
-//! # Why the totals differ by three
+//! # Why the totals differ by two
 //!
-//! 153 ops (RPython) against 150 (here). The operational bodies now agree:
+//! 153 ops (RPython) against 151 (here). The operational bodies now agree:
 //! RPython's listing contains two zero-cost `debug_merge_point` operations
-//! that majit's IR does not represent, and RPython records one additional
-//! guard. Those three entries account for the entire total difference.
+//! that majit's IR does not represent. Those two entries account for the
+//! entire total difference.
 //!
 //! RPython carries the marks as `Bool`. A `Bool` local *is* a branch
 //! condition, so `flatten.py` emits a plain `goto_if_not` and
@@ -154,17 +154,17 @@
 //! ```text
 //!            ops guard_true guard_false gf_gc_r gf_gc_i setfield_gc int_eq guard_value
 //! masking    194     1           0         0      24        93        2        0
-//! branching  150     6          20         0      24        93        2        0
+//! branching  151     6          21         0      24        93        2        0
 //! ```
 //!
-//! One guard against twenty-six. The masking body's single guard is the loop
+//! One guard against twenty-seven. The masking body's single guard is the loop
 //! exit — the `pos < len` test — and the branching body carries that one plus
-//! twenty-five more, one per `and`/`or` whose operand the optimizer could not
+//! twenty-six more, one per `and`/`or` whose operand the optimizer could not
 //! prove constant. That is exactly the mechanism the post names: a branch the
 //! tracer records becomes a guard, and masking has no branch to record.
 //!
 //! The surprise is the op count. The branching body is SMALLER, not bigger —
-//! 150 against 194 — because a guard replaces the `int_and` / `int_or` it
+//! 151 against 194 — because a guard replaces the `int_and` / `int_or` it
 //! stands in for, and because the dead side of a branch takes its ops out of
 //! the trace with it. The specialization is untouched too: both bodies fold
 //! the whole 93-node tree walk to zero `getfield_gc_r`, both store one mark
@@ -486,16 +486,9 @@ fn shift(n: usize, c: i64, mark: bool) -> bool {
 
 pub type Bytecode = [u8];
 
-/// Shift the next character in, and advance.
-const OP_SHIFT: u8 = 0;
-/// Close the back edge while the input has characters left.
-const OP_LOOP: u8 = 1;
-const OP_HALT: u8 = 2;
-
-/// The whole "program". `pc` and `program` are the greens, and the back edge
-/// returns to `pc = 0`, so every character shares one green key — the regex,
-/// which the loop promotes, is what the trace actually specializes on.
-pub const PROGRAM: [u8; 3] = [OP_SHIFT, OP_LOOP, OP_HALT];
+/// Dummy env the portal ABI still threads as a green. The loop does not
+/// dispatch on it; `pc` stays 0 so the green key is the regex.
+pub const PROGRAM: [u8; 1] = [0];
 
 /// The input string, as a headerless buffer plus its length.
 #[repr(C)]
@@ -608,27 +601,15 @@ fn mainloop(
         len,
         result: first,
     };
-    while pc < program.len() {
+    // marked.py: first char is outside; the header tick is what
+    // `rewrite_can_enter_jit` inserts in front of `jit_merge_point`.
+    while state.pos < state.len {
+        can_enter_jit!(driver, 0usize, &mut state, program, || {});
         jit_merge_point!(driver, program, pc; state);
-        let opcode = program[pc];
-        pc += 1;
-        match opcode {
-            OP_SHIFT => {
-                let idx = state.pos as usize;
-                let c = state.inp.data[idx] as i64;
-                state.result = shift(root, c, false) as i64;
-                state.pos = state.pos + 1i64;
-            }
-            OP_LOOP => {
-                if state.pos < state.len {
-                    can_enter_jit!(driver, 0usize, &mut state, program, || {});
-                    pc = 0;
-                    continue;
-                }
-            }
-            OP_HALT => break,
-            _ => break,
-        }
+        let idx = state.pos as usize;
+        let c = state.inp.data[idx] as i64;
+        state.result = shift(root, c, false) as i64;
+        state.pos = state.pos + 1i64;
     }
     for (i, slot) in ABORT_REASONS.iter().enumerate() {
         slot.store(
@@ -938,12 +919,12 @@ mod tests {
         getfield_gc_i: usize,
         setfield_gc: usize,
         int_eq: usize,
-        /// majit's branching body, recorded. Its three-op difference from
-        /// RPython is the two upstream debug merge points plus one guard.
+        /// majit's branching body, recorded. Its two-op difference from
+        /// RPython is the two upstream debug merge points.
         /// Pinned exactly rather than as a band around RPython's: a band wide
         /// enough to hold the real gap is wide enough to hold a *changed* gap, and
         /// this was measured letting a `Char` arm silently switch from
-        /// branching to masking (guards 26 -> 28) straight through.
+        /// branching to masking (guards 27 -> 29) straight through.
         branching_total: usize,
         branching_guards: usize,
         /// majit's masking body, recorded, for the same reason the branching
@@ -967,9 +948,12 @@ mod tests {
         getfield_gc_i: 24,
         setfield_gc: 93,
         int_eq: 2,
-        // RPython has one extra guard and two `debug_merge_point`s.
-        branching_total: 150,
-        branching_guards: 26,
+        // Two remaining ops are RPython's `debug_merge_point`s. The
+        // first and/or after the two Char `int_eq`s is now
+        // `guard_false` at threshold 3 — the header tick matches
+        // `rewrite_can_enter_jit`, so the guard count lands on 27.
+        branching_total: 151,
+        branching_guards: 27,
         // masking: one guard -- the loop-exit `IntLt` -- and the 18 ops the
         // branching column spends on its other 25 guards reappear as
         // straight-line `IntAnd`/`IntOr`, so the body is LONGER than the
@@ -1089,6 +1073,118 @@ mod tests {
             after_first,
             "a second call rebuilt the regex's JitDriver cell instead of reusing it",
         );
+    }
+
+    /// The header `can_enter_jit` is what `warmspot.rewrite_can_enter_jit`
+    /// inserts in front of `jit_merge_point`, so threshold N traces
+    /// character N — RPython's polarity. The first and/or guard after the
+    /// two `int_eq`s is the witness: threshold 3 emits `guard_false`
+    /// (27 guards), matching RPython. Threshold 2 specializes a different
+    /// character and flips that guard.
+    #[test]
+    fn header_threshold_selects_the_specialized_character() {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let input = nonmatching(4096, 20, 42);
+        let mut rows = [(2u32, 0usize, OpCode::Label), (3, 0, OpCode::Label)];
+        GUARD_FAILURE_PROBE.store(true, Ordering::Relaxed);
+        for row in &mut rows {
+            let root = lower(&bench_regex(20));
+            LAST_BODY.lock().unwrap().clear();
+            COMPILES.store(0, Ordering::Relaxed);
+            BRIDGES.store(0, Ordering::Relaxed);
+            GUARD_FAILURES.store(0, Ordering::Relaxed);
+            assert!(!Matcher::new(root, row.0).matches(&input));
+            let body = last_peeled_body();
+            row.1 = guards(&body);
+            // First guard after the two Char int_eq / setfield pairs.
+            if let Some(op) = body
+                .iter()
+                .skip_while(|op| **op != OpCode::IntEq)
+                .skip(1)
+                .skip_while(|op| **op != OpCode::IntEq)
+                .skip(1)
+                .find(|op| **op == OpCode::GuardTrue || **op == OpCode::GuardFalse)
+            {
+                row.2 = *op;
+            }
+            println!(
+                "[threshold] {} -> {} guards, first post-inteq guard {:?}, \
+                 {} deopt(s), {} bridge(s)",
+                row.0,
+                row.1,
+                row.2,
+                GUARD_FAILURES.load(Ordering::Relaxed),
+                BRIDGES.load(Ordering::Relaxed),
+            );
+        }
+        GUARD_FAILURE_PROBE.store(false, Ordering::Relaxed);
+        assert_eq!(
+            rows[1].2,
+            OpCode::GuardFalse,
+            "threshold 3 should specialize s[3] like RPython and emit \
+             guard_false; got {:?} with {} guards",
+            rows[1].2,
+            rows[1].1,
+        );
+        assert_eq!(
+            rows[1].1, 27,
+            "RPython's 27-guard body should appear at threshold 3"
+        );
+        assert_eq!(
+            rows[0].2,
+            OpCode::GuardTrue,
+            "threshold 2 specializes a different character"
+        );
+    }
+
+    /// Same Matcher, same input, several passes: the bridge counter after each
+    /// one. `bridge_was_compiled` already refuses a (trace_id, fail_index)
+    /// that has a bridge; later passes compile *new* fail sites at the
+    /// `trace_eagerness` rate (a bridge's own guards), not the same site
+    /// again. The count therefore keeps growing at about `n / 200` per pass.
+    #[test]
+    fn matcher_bridge_count_across_repeated_passes() {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        COMPILES.store(0, Ordering::Relaxed);
+        BRIDGES.store(0, Ordering::Relaxed);
+        let root = lower(&bench_regex(20));
+        let input = nonmatching(4096, 20, 42);
+        let mut matcher = Matcher::new(root, 3);
+        let mut after = [0usize; 6];
+        for slot in &mut after {
+            assert!(!matcher.matches(&input));
+            *slot = BRIDGES.load(Ordering::Relaxed);
+        }
+        let deltas: [usize; 6] = std::array::from_fn(|i| {
+            if i == 0 {
+                after[0]
+            } else {
+                after[i] - after[i - 1]
+            }
+        });
+        println!(
+            "[bridges-per-pass] 4096 chars: cumulative {after:?} deltas {deltas:?} loops {}",
+            COMPILES.load(Ordering::Relaxed),
+        );
+        assert_eq!(
+            COMPILES.load(Ordering::Relaxed),
+            1,
+            "repeated passes compiled more than the one loop",
+        );
+        assert!(
+            after[0] > 0,
+            "the first pass compiled no bridges; the later deltas are unreadable",
+        );
+        assert!(
+            after[5] > after[0],
+            "later passes compiled no new bridges ({after:?}); the eagerness \
+             cascade on this body is supposed to keep trailing the mark pattern",
+        );
+        // A full reset of the compile decision would grow ~`after[0]` every
+        // pass *and* retrace the same (trace_id, fail_index). The cascade
+        // grows at a similar rate from *new* sites; the unique-source check
+        // lives in the dynasm `source=` diag, not in this total.
+        let _ = deltas;
     }
 
     #[test]
@@ -1330,9 +1426,8 @@ mod tests {
     /// The guard counts are asserted as a relationship, not an equality,
     /// because they are the thing the two portals are *supposed* to differ on:
     /// RPython's source short-circuits, so it guards; the `&`/`|` variant next
-    /// door does not. The branching portal must land within one guard of
-    /// RPython (it does: 26 against 27 — majit's loop exit is one `IntLt`
-    /// where RPython also re-checks the string length), and the masking portal
+    /// door does not. The branching portal lands on RPython's 27 (the header
+    /// tick matches `rewrite_can_enter_jit`), and the masking portal
     /// must be far below both, or the A/B is not an A/B.
     #[test]
     fn the_peeled_body_matches_the_rpython_original() {
@@ -1409,11 +1504,10 @@ mod tests {
             }
 
             // majit's own two numbers, pinned exactly rather than as a band
-            // around RPython's. The gap between the columns is understood — an
-            // RPython's two debug merge points and one additional guard — and
+            // around RPython's. The gap is RPython's two debug merge points;
             // a *changed* gap is a finding, not noise. A +/-1 band here was
             // measured letting a `Char` arm switch from branching to masking
-            // (26 guards -> 28, 150 ops -> 154)
+            // (27 guards -> 29, 151 ops -> 155)
             // straight through, which is precisely the difference the two
             // portals are supposed to be an A/B of.
             assert_eq!(
@@ -1490,7 +1584,7 @@ mod tests {
     /// The mechanism behind the timing row, and the half that is free to
     /// assert: the branching body deopts once per input character.
     ///
-    /// 26 guards in the peeled body and 4080 failures over 4096 characters is
+    /// 27 guards in the peeled body and ~4092 failures over 4096 characters is
     /// not "some guards sometimes fail" — it is compiled code leaving through a
     /// guard on essentially every pass. Ten of those failures now grow a
     /// bridge, and the rest still take a blackhole deopt, because a bridge

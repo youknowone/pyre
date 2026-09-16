@@ -3095,6 +3095,30 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // the 2-segment `[receiver, method]` key `register_macro_helper_trace_fnaddr`
     // derives by stripping the leading crate segment — hence the
     // `pyre_object::<Type>::<method>` spelling here.
+    // `rlist.py _ll_list_resize_ge` records `conditional_call` of
+    // `_ll_list_resize_hint_really`. The look_inside_iff public name is
+    // residual when capacity is not constant. Bind the word-ABI
+    // `__majit_call_target_*` adapter (`dont_look_inside` / `getfunctionptr`
+    // residual entry), not the raw Rust `unsafe fn` — residual CondCall
+    // passes one i64 per slot.
+    cpa3(
+        &mut entries,
+        "pyre_object::listobject::ll_list_obj_resize_hint_really",
+        "pyre_object::ll_list_obj_resize_hint_really",
+        pyre_object::listobject::__majit_call_target_ll_list_obj_resize_hint_really,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_object::listobject::ll_list_int_resize_hint_really",
+        "pyre_object::ll_list_int_resize_hint_really",
+        pyre_object::listobject::__majit_call_target_ll_list_int_resize_hint_really,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_object::listobject::ll_list_float_resize_hint_really",
+        "pyre_object::ll_list_float_resize_hint_really",
+        pyre_object::listobject::__majit_call_target_ll_list_float_resize_hint_really,
+    );
     let object_push: unsafe fn(&mut pyre_object::W_ListObject, pyre_object::PyObjectRef) =
         pyre_object::W_ListObject::object_push;
     up2(
@@ -5334,6 +5358,23 @@ mod tests {
             list_append
         );
         assert_eq!(bindings["pyre_object::jit_list_append"], list_append);
+
+        let obj_hint = pyre_object::listobject::__majit_call_target_ll_list_obj_resize_hint_really
+            as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::listobject::ll_list_obj_resize_hint_really"],
+            obj_hint
+        );
+        assert_eq!(
+            bindings["pyre_object::ll_list_obj_resize_hint_really"],
+            obj_hint
+        );
+        let raw_hint: unsafe fn(pyre_object::PyObjectRef, usize, bool) =
+            pyre_object::listobject::ll_list_obj_resize_hint_really;
+        assert_ne!(
+            obj_hint, raw_hint as *const () as usize as i64,
+            "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
     }
 
     #[test]

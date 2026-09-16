@@ -8,7 +8,7 @@
 pub(crate) mod call_policy_byte;
 mod classify;
 mod codegen_state;
-mod codegen_trace;
+pub(crate) mod codegen_trace;
 mod green_type_tag;
 pub(crate) mod jitcode_lower;
 

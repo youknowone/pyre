@@ -7547,19 +7547,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'v'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::ListAppendValue
     {
-        // Fold to native array stores when the receiver has spare capacity, or
-        // fall through to the generic `jit_list_append` residual below.  The
-        // fold's `orthodox_list_append_commit` journals the append
-        // (`fbw_list_journal_push_append`) so `fbw_store_journal_rollback` rewinds it
-        // on abort; the generic executor is now equally abort-safe — its
-        // `list_append_journal` records the same pre-append length before
-        // running `jit_list_append`, so a later abort + interpreter replay
-        // applies the append exactly once (no silent double).  The fold's
-        // decline point (`try_walker_orthodox_list_append_opcode`) is
-        // side-effect-free — it declines BEFORE emitting any IR — so the
-        // fall-through starts from a clean trace position.  This lets a resize
-        // side-exit's bridge (the fold declines at a full backing block) compile
-        // a `jit_list_append` residual instead of aborting the whole bridge.
+        // Descend `w_list_append_inner` (`ll_append` / `_ll_list_resize_ge`)
+        // so the walk records `conditional_call` + `setarrayitem`. Fall
+        // through to the generic `jit_list_append` residual when recognition
+        // or the body walk declines. The commit journals the append
+        // (`fbw_list_journal_push_append`) so `fbw_store_journal_rollback`
+        // rewinds it on abort; the generic executor records the same
+        // pre-append length before running `jit_list_append`. The decline
+        // point is side-effect-free — it declines BEFORE emitting any IR.
         if try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }

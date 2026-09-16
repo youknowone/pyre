@@ -3772,6 +3772,30 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn test_read_list_keeps_small_inline_call_args_off_heap() {
+        // blackhole.py `_get_list_of_values` + `make_sure_not_resized`.
+        // handler_inline_call_ir_i reads a 1-item I list and a 2-item R
+        // list; a Vec<i64> each was the 8 B / 16 B class on the regex
+        // and/or timed row.
+        let regs = [10i64, 20, 30, 40];
+        let code = [1u8, 0, 2, 1, 2];
+        let (one, pos) = read_list_from_regs(&regs, &code, 0);
+        assert_eq!(pos, 2);
+        assert_eq!(&one[..], &[10]);
+        assert!(
+            !one.spilled(),
+            "a 1-item I/R/F list must stay inline (8 B Vec was the timed-row class)"
+        );
+        let (two, pos) = read_list_from_regs(&regs, &code, 2);
+        assert_eq!(pos, 5);
+        assert_eq!(&two[..], &[20, 30]);
+        assert!(
+            !two.spilled(),
+            "a 2-item I/R/F list must stay inline (16 B Vec was the timed-row class)"
+        );
+    }
+
     // ── StateFieldLayout field→slot mapping tests (#183) ──
 
     #[test]
@@ -9668,29 +9692,34 @@ fn handler_setinteriorfield_gc_i(
     Ok(pos)
 }
 
+/// blackhole.py `_get_list_of_values` + `make_sure_not_resized`.
+/// I/R/F lists are the inline_call arity — a handful of register values.
+/// A 1-item / 2-item `Vec<i64>` was the 8 B / 16 B class on the regex
+/// and/or timed row (`handler_inline_call_ir_i`).
+const BH_ARG_LIST_INLINE: usize = 8;
+type BhArgList = smallvec::SmallVec<[i64; BH_ARG_LIST_INLINE]>;
+
 #[inline]
-fn read_list_i(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
+fn read_list_from_regs(regs: &[i64], code: &[u8], pos: usize) -> (BhArgList, usize) {
     let count = code[pos] as usize;
-    let values: Vec<i64> = (0..count)
-        .map(|i| bh.registers_i[code[pos + 1 + i] as usize])
-        .collect();
+    let mut values = BhArgList::new();
+    for i in 0..count {
+        values.push(regs[code[pos + 1 + i] as usize]);
+    }
     (values, pos + 1 + count)
 }
+
 #[inline]
-fn read_list_r(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
-    let count = code[pos] as usize;
-    let values: Vec<i64> = (0..count)
-        .map(|i| bh.registers_r[code[pos + 1 + i] as usize])
-        .collect();
-    (values, pos + 1 + count)
+fn read_list_i(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhArgList, usize) {
+    read_list_from_regs(&bh.registers_i, code, pos)
 }
 #[inline]
-fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (Vec<i64>, usize) {
-    let count = code[pos] as usize;
-    let values: Vec<i64> = (0..count)
-        .map(|i| bh.registers_f[code[pos + 1 + i] as usize])
-        .collect();
-    (values, pos + 1 + count)
+fn read_list_r(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhArgList, usize) {
+    read_list_from_regs(&bh.registers_r, code, pos)
+}
+#[inline]
+fn read_list_f(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhArgList, usize) {
+    read_list_from_regs(&bh.registers_f, code, pos)
 }
 
 /// blackhole.py `_get_method`'s `except Exception` for every opcode that
@@ -14501,7 +14530,14 @@ fn read_recursive_call_args(
     // handlers hand over the raw greens / reds tuples so the bhimpl
     // method owns the merge.
     (
-        jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p,
+        jdindex,
+        greens_i.into_vec(),
+        greens_r.into_vec(),
+        greens_f.into_vec(),
+        reds_i.into_vec(),
+        reds_r.into_vec(),
+        reds_f.into_vec(),
+        p,
     )
 }
 // blackhole.py bhimpl_recursive_call_i

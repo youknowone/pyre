@@ -296,11 +296,13 @@ pub struct Trace {
     /// in capture order. Sequential `rd_resume_position` indexes this
     /// list; `into_tree_loop` decodes it back to `Vec<Snapshot>`.
     snapshot_offsets: Vec<usize>,
-    /// Per-snapshot `py_pc` words, outermost-first. RPython's
-    /// `_encode_snapshot` has no twin; resume still reads this pyre
-    /// extra after decode. Inline capacity covers the portal plus the
-    /// inlined matcher frames; `[; 4]` heap-grew 32 B on this path.
-    snapshot_py_pcs: Vec<smallvec::SmallVec<[u32; 8]>>,
+    /// Concatenated per-snapshot `py_pc` words, outermost-first. RPython's
+    /// `_encode_snapshot` has no twin; resume still reads this pyre extra
+    /// after decode. A `SmallVec<[u32; 8]>` per snapshot spills 64 B once
+    /// regex `and`/`or` inlines past eight frames.
+    py_pc_data: Vec<u32>,
+    /// `(start, len)` into `py_pc_data` for snapshot id `i`.
+    py_pc_spans: Vec<(u32, u32)>,
 }
 
 impl Trace {
@@ -323,7 +325,8 @@ impl Trace {
             slots: Vec::new(),
             unique_to_box: Vec::new(),
             snapshot_offsets: Vec::new(),
-            snapshot_py_pcs: Vec::new(),
+            py_pc_data: Vec::new(),
+            py_pc_spans: Vec::new(),
         }
     }
 
@@ -377,6 +380,10 @@ impl Trace {
         // doubling through the 16/32/64-byte size classes on every record.
         self.unique_to_box.reserve(128);
         self.slots.reserve(128);
+        // ~16 snapshots × 16 inlined frames; one reserve so 9-frame
+        // captures do not mint a 64 B SmallVec spill per guard.
+        self.py_pc_data.reserve(256);
+        self.py_pc_spans.reserve(16);
         self.trb = Some(Box::new(trb));
     }
 
@@ -404,7 +411,34 @@ impl Trace {
 
     pub fn truncate_snapshot_offsets(&mut self, len: usize) {
         self.snapshot_offsets.truncate(len);
-        self.snapshot_py_pcs.truncate(len);
+        if len == 0 {
+            self.py_pc_data.clear();
+            self.py_pc_spans.clear();
+            return;
+        }
+        if let Some(&(start, _)) = self.py_pc_spans.get(len) {
+            self.py_pc_data.truncate(start as usize);
+        }
+        self.py_pc_spans.truncate(len);
+    }
+
+    fn push_py_pcs(&mut self, pcs: impl IntoIterator<Item = u32>) {
+        let start = self.py_pc_data.len() as u32;
+        self.py_pc_data.extend(pcs);
+        let len = self.py_pc_data.len() as u32 - start;
+        self.py_pc_spans.push((start, len));
+    }
+
+    fn py_pcs_at(&self, i: usize) -> &[u32] {
+        let Some(&(start, len)) = self.py_pc_spans.get(i) else {
+            return &[];
+        };
+        let start = start as usize;
+        &self.py_pc_data[start..start + len as usize]
+    }
+
+    pub(crate) fn captured_frame_count(&self) -> usize {
+        self.py_pc_data.len()
     }
 
     fn encode_jitcode_index(idx: u32) -> i64 {
@@ -504,8 +538,6 @@ impl Trace {
     /// `rd_resume_position`; the byte offset lives in `snapshot_offsets`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: smallvec::SmallVec<[u32; 8]> =
-            snapshot.frames.iter().map(|f| f.py_pc).collect();
 
         // Write `_snapshot_data` only. `create_top_snapshot` also patches
         // the last op's descr slot (`opencoder.py`); that slot is the
@@ -558,7 +590,7 @@ impl Trace {
             s
         };
         self.snapshot_offsets.push(offset as usize);
-        self.snapshot_py_pcs.push(py_pcs);
+        self.push_py_pcs(snapshot.frames.iter().map(|f| f.py_pc));
         id
     }
 
@@ -575,7 +607,6 @@ impl Trace {
         all_liveness: &[u8],
     ) -> i32 {
         let id = self.snapshot_offsets.len() as i32;
-        let py_pcs: smallvec::SmallVec<[u32; 8]> = framestack.iter().map(|f| f.pc as u32).collect();
         // opencoder.py Trace.create_top_snapshot encodes the existing box
         // lists directly. Map the recorder's positions while consuming them,
         // without allocating intermediate virtualizable/virtualref arrays.
@@ -605,7 +636,7 @@ impl Trace {
             )
         };
         self.snapshot_offsets.push(offset as usize);
-        self.snapshot_py_pcs.push(py_pcs);
+        self.push_py_pcs(framestack.iter().map(|f| f.pc as u32));
         id
     }
 
@@ -633,12 +664,7 @@ impl Trace {
         };
         for (i, &offset) in self.snapshot_offsets.iter().enumerate() {
             let it = trb.get_snapshot_iter(offset);
-            let py_pcs = self
-                .snapshot_py_pcs
-                .get(i)
-                .map(smallvec::SmallVec::as_slice)
-                .unwrap_or(&[]);
-            f(&it, py_pcs);
+            f(&it, self.py_pcs_at(i));
         }
         true
     }
@@ -653,11 +679,7 @@ impl Trace {
             // Decode directly into the consumer's snapshot, without copying
             // every tagged array to a temporary buffer first.
             let it = trb.get_snapshot_iter(offset);
-            let py_pcs = self
-                .snapshot_py_pcs
-                .get(i)
-                .map(smallvec::SmallVec::as_slice)
-                .unwrap_or(&[]);
+            let py_pcs = self.py_pcs_at(i);
             let frames = it
                 .framestack
                 .iter()
@@ -731,10 +753,10 @@ impl Trace {
         let unique = self.op_count;
         let opref = OpRef::op_typed(unique, opcode.result_type());
         let first_arg = args.first().copied();
-        // history.py record0/1/2/3 take the boxes inline. A heap `Vec`
-        // here would be one allocation per recorded op; arity ≤ 4 is
-        // the fixed-op surface (`resoperation.py oparity`).
-        let boxes: smallvec::SmallVec<[OcBox; 4]> =
+        // history.py record0/1/2/3 take the boxes inline. JUMP and
+        // other N-ary ops exceed that 0–3 surface; eight OcBoxes stay
+        // off the process allocator.
+        let boxes: smallvec::SmallVec<[OcBox; 8]> =
             args.iter().copied().map(|a| self.arg_to_box(a)).collect();
         let trb = self
             .trb
@@ -778,7 +800,11 @@ impl Trace {
         self.slots.last_mut()
     }
 
-    fn materialize_ops(&self) -> Vec<OpRc> {
+    /// opencoder.py `Trace.get_iter()` materialize: one `ByteTraceIter`
+    /// walk, then restamp unique positions / fail_args so snapshot maps
+    /// keyed by recorder OpRefs still resolve. `prepare_bridge` remints
+    /// those unique boxes into the fresh-iterator namespace.
+    pub(crate) fn materialize_ops(&self) -> Vec<OpRc> {
         let Some(trb) = self.trb.as_ref() else {
             return self.ops.clone();
         };
@@ -902,7 +928,7 @@ impl Trace {
     /// directly. Frame registers and the public `record_*` API stay OpRef; the
     /// optimizer bridges back with `Operand::to_opref`, which round-trips to the
     /// same `OpRef` the `from_opref` view produced.
-    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 8]> {
+    fn box_args(&mut self, args: &[OpRef]) -> smallvec::SmallVec<[Operand; 16]> {
         args.iter().map(|&a| self.box_for_operand(a)).collect()
     }
 

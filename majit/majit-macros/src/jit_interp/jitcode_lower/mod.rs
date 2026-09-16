@@ -20,7 +20,7 @@ pub(crate) use api::{
 };
 #[allow(unused_imports)]
 pub use api::{try_generate_jitcode_body, try_generate_jitcode_body_with_config};
-pub(crate) use dispatch::{is_jit_merge_point_macro, lower_dispatch_body};
+pub(crate) use dispatch::{is_can_enter_jit_macro, is_jit_merge_point_macro, lower_dispatch_body};
 pub(crate) use helpers::classify_param_type;
 pub(super) use helpers::helper_policy_path;
 
@@ -73,8 +73,8 @@ use super::call_policy_byte::{
     VOID_MAY_FORCE, VOID_RELEASE_GIL,
 };
 use super::codegen_trace::{
-    block_contains_match, find_dispatch_match, is_assert_not_none_call_path, is_promote_call_path,
-    is_record_exact_class_call_path, stmt_contains_match,
+    block_contains_match, find_dispatch_match, find_portal_loop, is_assert_not_none_call_path,
+    is_promote_call_path, is_record_exact_class_call_path, portal_loop_body, stmt_contains_match,
 };
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprCall, ExprCast, ExprIf, ExprLit, ExprMatch,
