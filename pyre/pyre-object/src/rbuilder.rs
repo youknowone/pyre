@@ -373,7 +373,7 @@ pub mod rbuilder_runtime {
     }
 
     /// `rbuilder.py _ll_append`.
-    pub fn ll_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
+    pub fn _ll_append(builder: i64, ll_str: i64, start: i64, size: i64, item_size: usize) {
         // STR-only — see [`ll_new`].
         assert_eq!(
             item_size, 1,
@@ -490,8 +490,19 @@ pub mod rbuilder_runtime {
         }
     }
 
+    /// `rbuilder.py ll_build`: `@jit.look_inside_iff(isvirtual(ll_builder))`.
+    /// Without StringBuilder virtualization the builder is never virtual, so
+    /// the generated JIT residualizes this body.
+    fn ll_build_iff(builder: i64, _item_size: usize) -> bool {
+        if builder == 0 {
+            return false;
+        }
+        unsafe { majit_rlib::jit::isvirtual(&*(builder as *const StringBuilderBox)) }
+    }
+
     /// `rbuilder.py ll_build`: consolidate to a single buffer and return the
     /// builder's GC reference. The builder intentionally keeps the same reference.
+    #[majit_macros::look_inside_iff(ll_build_iff)]
     pub fn ll_build(builder: i64, item_size: usize) -> i64 {
         // STR-only — see [`ll_new`].
         assert_eq!(
@@ -510,20 +521,146 @@ pub mod rbuilder_runtime {
         unsafe { (*(builder as *const StringBuilderBox)).current_buf }
     }
 
+    /// `rbuilder.py ll_append(ll_builder, ll_str)` — `@always_inline`.
+    /// Jitted: `ll_jit_append` (`ll_jit_try_append_slice`, else residual
+    /// `ll_append_res0`). Interpreter: inline `_ll_append(..., 0, len)`.
+    #[inline]
+    pub fn ll_append(builder: i64, ll_str: i64) {
+        if majit_rlib::jit::we_are_jitted() {
+            ll_jit_append(builder, ll_str);
+        } else {
+            let size = bh_lowlevel_string_len(ll_str) as i64;
+            _ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
+        }
+    }
+
+    /// `rbuilder.py ll_jit_append` — `@dont_inline`.
+    #[inline(never)]
+    fn ll_jit_append(builder: i64, ll_str: i64) {
+        let size = bh_lowlevel_string_len(ll_str) as i64;
+        if ll_jit_try_append_slice(builder, ll_str, 0, size) {
+            return;
+        }
+        jit_ll_append_res0(builder, ll_str);
+    }
+
+    /// `rbuilder.py make_func_for_size` — `@dont_look_inside` copy of
+    /// `_ll_append` with a known `N` in `2..=MAX_N`.
+    macro_rules! ll_append_known_size {
+        ($name0:ident, $namestart:ident, $n:expr) => {
+            #[majit_macros::dont_look_inside]
+            fn $name0(builder: i64, ll_str: i64) {
+                _ll_append(builder, ll_str, 0, $n, STR_ITEM_SIZE);
+            }
+            #[majit_macros::dont_look_inside]
+            fn $namestart(builder: i64, ll_str: i64, start: i64) {
+                _ll_append(builder, ll_str, start, $n, STR_ITEM_SIZE);
+            }
+        };
+    }
+    ll_append_known_size!(ll_append_0_2, ll_append_start_2, 2);
+    ll_append_known_size!(ll_append_0_3, ll_append_start_3, 3);
+    ll_append_known_size!(ll_append_0_4, ll_append_start_4, 4);
+    ll_append_known_size!(ll_append_0_5, ll_append_start_5, 5);
+    ll_append_known_size!(ll_append_0_6, ll_append_start_6, 6);
+    ll_append_known_size!(ll_append_0_7, ll_append_start_7, 7);
+    ll_append_known_size!(ll_append_0_8, ll_append_start_8, 8);
+    ll_append_known_size!(ll_append_0_9, ll_append_start_9, 9);
+    ll_append_known_size!(ll_append_0_10, ll_append_start_10, 10);
+
+    /// `rbuilder.py ll_jit_try_append_slice` — `@jit.unroll_safe`.
+    ///
+    /// When `size` and the builder's `current_pos`/`current_end` are
+    /// constant (typically a still-virtual builder) the copy stays in the
+    /// trace. Otherwise fall through so `ll_jit_append` residuals
+    /// `ll_append_res0`.
+    #[majit_macros::unroll_safe]
+    fn ll_jit_try_append_slice(builder: i64, ll_str: i64, start: i64, size: i64) -> bool {
+        if !majit_rlib::jit::isconstant(&size) {
+            return false;
+        }
+        if size == 0 {
+            return true;
+        }
+        let (pos, end, buf) = {
+            let b = unsafe { &*(builder as *const StringBuilderBox) };
+            (b.current_pos, b.current_end, b.current_buf)
+        };
+        // Virtual builder: pos/end stay constant, size fits, copy in-trace.
+        if majit_rlib::jit::isconstant(&pos)
+            && majit_rlib::jit::isconstant(&end)
+            && size <= (end - pos)
+            && size <= 16
+        {
+            let stop = pos + size;
+            let mut p = pos;
+            let mut s = start;
+            while p < stop {
+                copy_string_contents(ll_str, buf, s as usize, p as usize, 1, STR_ITEM_SIZE);
+                p += 1;
+                s += 1;
+            }
+            unsafe {
+                (*(builder as *mut StringBuilderBox)).current_pos = stop;
+            }
+            return true;
+        }
+        if size == 1 {
+            let ch = {
+                if ll_str == 0 {
+                    0
+                } else {
+                    let chars_off = bh_lowlevel_chars_offset(STR_ITEM_SIZE);
+                    unsafe {
+                        *((ll_str as *const u8).add(chars_off + start as usize) as *const u8) as i64
+                    }
+                }
+            };
+            ll_append_char(builder, ch, STR_ITEM_SIZE);
+            return true;
+        }
+        // `unroll_func_for_size`: residual known-length copies for 2..=10.
+        let start0 = majit_rlib::jit::isconstant(&start) && start == 0;
+        match (size, start0) {
+            (2, true) => ll_append_0_2(builder, ll_str),
+            (2, false) => ll_append_start_2(builder, ll_str, start),
+            (3, true) => ll_append_0_3(builder, ll_str),
+            (3, false) => ll_append_start_3(builder, ll_str, start),
+            (4, true) => ll_append_0_4(builder, ll_str),
+            (4, false) => ll_append_start_4(builder, ll_str, start),
+            (5, true) => ll_append_0_5(builder, ll_str),
+            (5, false) => ll_append_start_5(builder, ll_str, start),
+            (6, true) => ll_append_0_6(builder, ll_str),
+            (6, false) => ll_append_start_6(builder, ll_str, start),
+            (7, true) => ll_append_0_7(builder, ll_str),
+            (7, false) => ll_append_start_7(builder, ll_str, start),
+            (8, true) => ll_append_0_8(builder, ll_str),
+            (8, false) => ll_append_start_8(builder, ll_str, start),
+            (9, true) => ll_append_0_9(builder, ll_str),
+            (9, false) => ll_append_start_9(builder, ll_str, start),
+            (10, true) => ll_append_0_10(builder, ll_str),
+            (10, false) => ll_append_start_10(builder, ll_str, start),
+            _ => return false,
+        }
+        true
+    }
+
     /// `ll_append_res0(ll_builder, ll_str)` = `_ll_append(ll_builder, ll_str, 0,
     /// len(ll_str.chars))` (`rbuilder.py`). The `dont_look_inside` residual
     /// target the codewriter binds when an append cannot be inlined; mutates the
     /// builder in place and returns void.
+    #[majit_macros::dont_look_inside]
     pub extern "C" fn jit_ll_append_res0(builder: i64, ll_str: i64) {
         let size = bh_lowlevel_string_len(ll_str) as i64;
-        ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
+        _ll_append(builder, ll_str, 0, size, STR_ITEM_SIZE);
     }
 
     /// `ll_append_res_slice(ll_builder, ll_str, start, end)` =
     /// `_ll_append(ll_builder, ll_str, start, end - start)` (`rbuilder.py`). The
     /// slice helper takes `end`; `_ll_append` takes the count, so convert here.
+    #[majit_macros::dont_look_inside]
     pub extern "C" fn jit_ll_append_res_slice(builder: i64, ll_str: i64, start: i64, end: i64) {
-        ll_append(builder, ll_str, start, end - start, STR_ITEM_SIZE);
+        _ll_append(builder, ll_str, start, end - start, STR_ITEM_SIZE);
     }
 
     #[cfg(test)]
@@ -558,7 +695,7 @@ pub mod rbuilder_runtime {
             let item = STR_ITEM_SIZE;
             let builder = ll_new(100, item);
             let hello = make_str(b"hello");
-            ll_append(builder, hello, 0, 5, item);
+            _ll_append(builder, hello, 0, 5, item);
             assert_eq!(ll_getlength(builder), 5);
             // current_pos (5) != total_size (100) ⇒ ll_shrink_final.
             let result = ll_build(builder, item);
@@ -572,7 +709,7 @@ pub mod rbuilder_runtime {
             // init 4 forces a grow when appending 10 chars.
             let builder = ll_new(4, item);
             let s = make_str(b"abcdefghij");
-            ll_append(builder, s, 0, 10, item);
+            _ll_append(builder, s, 0, 10, item);
             // Must have chained a piece.
             let extra = {
                 let b = unsafe { &*(builder as *const StringBuilderBox) };
@@ -596,8 +733,8 @@ pub mod rbuilder_runtime {
             let builder = ll_new(2, item);
             let bytes: Vec<u8> = (0..70u8).map(|i| b'A' + (i % 26)).collect();
             let s = make_str(&bytes);
-            ll_append(builder, s, 0, 10, item);
-            ll_append(builder, s, 10, 60, item);
+            _ll_append(builder, s, 0, 10, item);
+            _ll_append(builder, s, 10, 60, item);
             // Two grows ⇒ a two-node chain: the head node's prev_piece is another
             // node, not the chain-end sentinel.
             let head = {
@@ -623,6 +760,26 @@ pub mod rbuilder_runtime {
             assert_eq!(ll_getlength(builder), 3);
             let result = ll_build(builder, item);
             assert_eq!(read_str(result), b"xyz");
+        }
+
+        #[test]
+        fn ll_jit_append_residuals_when_size_is_not_constant() {
+            // Runtime `isconstant` is false, so try_append_slice declines
+            // and `ll_jit_append` takes `ll_append_res0`.
+            let builder = ll_new(16, STR_ITEM_SIZE);
+            let hello = make_str(b"hello");
+            ll_jit_append(builder, hello);
+            assert_eq!(ll_getlength(builder), 5);
+            assert_eq!(read_str(ll_build(builder, STR_ITEM_SIZE)), b"hello");
+        }
+
+        #[test]
+        fn ll_append_known_size_two_copies() {
+            let builder = ll_new(8, STR_ITEM_SIZE);
+            let ab = make_str(b"ab");
+            ll_append_0_2(builder, ab);
+            assert_eq!(ll_getlength(builder), 2);
+            assert_eq!(read_str(ll_build(builder, STR_ITEM_SIZE)), b"ab");
         }
 
         #[test]

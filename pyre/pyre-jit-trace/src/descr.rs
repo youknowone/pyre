@@ -304,6 +304,18 @@ fn get_or_create_array_descr_with_full_id(
             .get(&gc_key)
             .cloned()
         {
+            // Analyzer `arraydescrof_concrete` mints `type_id = 0`.
+            // Runtime `init_array_descr` / `pyobject_gcarray_descr`
+            // carry the collector tid; stamp it onto the shared Arc
+            // so `gen_initialize_tid` does not fall back to
+            // `OBJECT_GC_TYPE_ID` (frame-locals walk as a 16-byte
+            // PyObject — `fib_recursive` SIGSEGV).
+            if type_id != 0
+                && let Some(ad) = existing.as_array_descr()
+                && ad.type_id() == 0
+            {
+                ad.set_type_id(type_id);
+            }
             // Memoise into the local structural cache so subsequent
             // `get_or_create_array_descr_with_full_id` calls with the
             // same structural key hit the local fast path without
@@ -1351,7 +1363,7 @@ static W_UNICODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
             (
                 "value",
                 pyre_object::unicodeobject::UNICODE_VALUE_OFFSET,
-                std::mem::size_of::<*mut rustpython_wtf8::Wtf8Buf>(),
+                std::mem::size_of::<*mut pyre_object::unicodeobject::UnicodeValueStorage>(),
                 Type::Ref,
                 false,
                 true,
@@ -4885,6 +4897,23 @@ pub fn str_len_descr() -> DescrRef {
     field_descr_from_group(&W_UNICODE_DESCR_GROUP, 2)
 }
 
+/// `W_UnicodeObject.value` — `_utf8`, the rstr `STR` payload
+/// `descr_add` concatenates.
+pub fn unicode_utf8_descr() -> DescrRef {
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 0)
+}
+
+/// `W_UnicodeObject.byte_len` — cached `len(_utf8)`, the rstr `STR` length.
+pub fn unicode_byte_len_descr() -> DescrRef {
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 1)
+}
+
+/// `W_UnicodeObject.index_storage` — `_index_storage`, `rutf8.null_storage()`
+/// until the first non-ASCII index.
+pub fn unicode_index_storage_descr() -> DescrRef {
+    field_descr_from_group(&W_UNICODE_DESCR_GROUP, 4)
+}
+
 // Object header and allocation descriptors.
 
 /// `PyCode.code_ptr` — the host `CodeObject` every code-field getter resolves
@@ -5041,6 +5070,12 @@ pub fn pycode_hidden_applevel_descr() -> DescrRef {
 /// vtable = &INT_TYPE (ob_type for virtual materialization).
 pub fn w_int_size_descr() -> DescrRef {
     W_INT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_UnicodeObject` allocation via NewWithVtable.
+/// vtable = &STR_TYPE (`unicodeobject.py W_UnicodeObject.__init__`).
+pub fn w_unicode_size_descr() -> DescrRef {
+    W_UNICODE_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_BoolObject allocation via NewWithVtable.
@@ -7542,6 +7577,27 @@ mod tests {
             .get_parent_descr()
             .expect("interior field parent_descr must be preserved");
         assert_eq!(parent.as_size_descr().unwrap().size(), 16);
+    }
+
+    /// `pyobject_gcarray_descr` is `cpu.arraydescrof(GcArray(OBJECTPTR))`:
+    /// the runtime singleton must occupy the same `cache[ARRAY]` slot the
+    /// codewriter names (`OBJECT_REF_GCARRAY_TYPE_ID`) so short-preamble
+    /// `resolve_array_tid` recovers `PY_OBJECT_ARRAY_GC_TYPE_ID`.
+    #[test]
+    fn pyobject_gcarray_descr_publishes_under_the_codewriter_array_identity() {
+        let descr = crate::state::pyobject_gcarray_descr();
+        let array = descr
+            .as_array_descr()
+            .expect("pyobject_gcarray_descr must be an ArrayDescr");
+        let atid = majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+        let cache_key = majit_ir::descr::path_hash(atid);
+        assert_eq!(array.type_id(), PY_OBJECT_ARRAY_GC_TYPE_ID);
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_array_tid(cache_key),
+            Some(PY_OBJECT_ARRAY_GC_TYPE_ID),
+        );
     }
 }
 

@@ -46,6 +46,10 @@ static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Hash
 static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
 
+/// `space.newutf8` / `w_str_from_storage_and_length`, identified by path.
+static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -4004,6 +4008,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         helper,
         majit_ir::RuntimeHelperKind::NewtupleFromArray
             | majit_ir::RuntimeHelperKind::NewlistFromArray
+            | majit_ir::RuntimeHelperKind::BuildStringFromArray
     );
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
@@ -7070,6 +7075,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // BINARY_SLICE of an exact `str` plus exact-int / None bounds:
+    // `_unicode_sliced` instead of the opaque MayForce residual.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinarySlice
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::BinarySliceStr, || {
+            try_walker_specialize_binary_slice_str(ctx, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // FORMAT_SIMPLE on an exact `int` / `str`: the empty-spec fast path
     // `format_w` already takes, instead of the opaque MayForce residual.
     // Keyed off the helper tag; anything else (bool, subclass, user
@@ -7080,6 +7098,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && spec_gate(SpecFold::FormatSimple, || {
             try_walker_specialize_format_simple(ctx, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // BUILD_STRING of already-str fragments: left-fold `descr_add`
+    // (`jit_str_concat`) off the backing-array heap-cache, the same
+    // channel as `BINARY_OP ADD` of two exact `str`s.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BuildStringFromArray
+        && spec_gate(SpecFold::BuildString, || {
+            try_walker_specialize_build_string(ctx, op.pc, &r_args, dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // FORMAT_WITH_SPEC: an exact `int` plus a constant decimal spec
+    // (`:d` / `:05d`) is `ll_int2dec` + pad, the same split
+    // `format_int_or_long` records.  Tried before the Python `__format__`
+    // inline so a builtin `int.__format__` never takes that route.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatWithSpec
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::FormatWithSpecInt, || {
+            try_walker_specialize_format_with_spec_int(ctx, op, &r_args, dst)
         })?
         .is_some()
     {
@@ -7941,6 +7986,60 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrFind, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::Find,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrRfind, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::RFind,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrCount, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::Count,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     // `divmod(a, b)` on two exact ints: inline the guarded
     // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
@@ -8503,6 +8602,32 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         None,
     );
 
+    if ctx.is_authoritative_executor && dst_bank == 'r' && i_args.len() == 1 && r_args.len() == 1 {
+        let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        if func_addr != 0 && NEWUTF8_FNADDRS.contains(&func_addr) {
+            if let (Some(majit_ir::Value::Int(len)), Some(storage_obj)) = (
+                ctx.trace_ctx.box_value(i_args[0]),
+                walker_concrete_ref_object(ctx, r_args[0]),
+            ) {
+                if len >= 0 {
+                    let boxed = pyre_object::unicodeobject::w_str_from_storage_and_length(
+                        storage_obj as *mut pyre_object::unicodeobject::UnicodeValueStorage,
+                        len as usize,
+                    );
+                    if let Some(result) =
+                        try_walker_orthodox_newutf8(ctx, op.pc, r_args[0], i_args[0], boxed)?
+                    {
+                        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
+            }
+        }
+    }
+
     // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before
     // any fold or residual applies the opcode. In particular,
     // `try_walker_specialize_store_attr` mutates `?` fields while resolving,
@@ -8759,6 +8884,21 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if let Some(inlined) = try_walker_inline_object_new(ctx, op, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
+    }
+
+    // CONVERT_VALUE on an exact `int` (`!s`/`!r`/`!a`) or exact `str`
+    // `!s`: `descr_str` / `descr_repr` (intobject.py) share a body, and
+    // `descr_str` of an exact `str` is identity.  Keyed off the helper
+    // tag; a bool / subclass / Python `__str__` falls through.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::ConvertValue
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::ConvertValue, || {
+            try_walker_specialize_convert_value(ctx, op, &r_args, &i_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // LoadConst fold: the LOAD_CONST helper (oopspec `LoadConst`, set

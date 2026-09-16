@@ -971,16 +971,22 @@ pub enum RuntimeHelperKind {
     /// `__format__` runs Python here, so the generic residual is opaque for
     /// the whole method body.
     ///
-    /// The walker folds an exact `int` to `jit_int_str` and an exact `str`
-    /// to identity — the empty-spec arms of `format_w`.  A bool, subclass,
-    /// or Python `__format__` stays residual.  [`FormatWithSpec`] inlines a
-    /// Python `__format__` when a spec operand is present.
+    /// The walker folds an exact `int` to `ll_int2dec` + `newutf8` and an
+    /// exact `str` to identity — the empty-spec arms of `format_w`.  A bool,
+    /// subclass, or Python `__format__` stays residual.  [`FormatWithSpec`]
+    /// inlines a Python `__format__` when a spec operand is present.
     FormatSimple,
     /// `bh_format_with_spec_fn(value, spec)` — the FORMAT_WITH_SPEC helper,
     /// the two-operand sibling of [`RuntimeHelperKind::FormatSimple`] carrying
     /// the f-string's format spec.  Recognised for the same receiver-pinned
     /// `__format__` inline; `spec` is threaded to the callee as its second
     /// parameter.
+    ///
+    /// The walker also folds an exact `int` plus a constant decimal spec
+    /// (`:d` / `:05d` / `:5d`) to `ll_int2dec` + optional `ll_strconcat` pad
+    /// + residual `newutf8` — `newformat.py` `format_int_or_long` /
+    /// `_int_to_base` / `_fill_number`.  A bool, subclass, sign-interior
+    /// pad, or Python `__format__` stays residual or takes the inline.
     FormatWithSpec,
     /// `bh_unpack_sequence_fn(count, seq)` — the UNPACK_SEQUENCE validator
     /// emitted by the codewriter UNPACK_SEQUENCE arm.  Validates the exact
@@ -1016,6 +1022,15 @@ pub enum RuntimeHelperKind {
     /// recovered from the backing array (const length + per-index element
     /// shadows) rather than from residual args.
     NewlistFromArray,
+    /// `bh_build_string_from_array(array)` — the BUILD_STRING array consumer
+    /// (`pyopcode.py BUILD_STRING`).  Fragments are already strings
+    /// (FORMAT_* / CONVERT_VALUE ran first).  The walker recovers them
+    /// from the backing-array heap-cache and left-folds `descr_add`
+    /// (`jit_str_concat`), the same channel as `BINARY_OP ADD` of two
+    /// exact `str`s.  Interpreter/residual construction is
+    /// `Utf8StringBuilder`; the walker keeps this fold until
+    /// `StringBuilder` virtualizes.
+    BuildStringFromArray,
     /// `n_varargs_fn(frame, exc, cause)` — the RAISE-family residual the
     /// codewriter emits for `n argc>=1` (`build_n_varargs_fn_residual_call_r_r_insn`).
     /// `cause` (the trailing Ref arg) is a `PY_NULL` sentinel for `raise X`
@@ -1251,6 +1266,20 @@ pub enum RuntimeHelperKind {
     /// (`pyjitpl.py _establish_nullity`).  A guard failure resumes at the
     /// opcode, where the interpreter re-runs it and raises.
     LoadFastCheck,
+    /// `bh_convert_value_fn(value, conv)` — the CONVERT_VALUE helper
+    /// (`runtime_ops::convert_value`: `!s`/`!r`/`!a`).  A user `__str__` /
+    /// `__repr__` runs Python here, so the generic residual is opaque.
+    ///
+    /// The walker folds an exact `int` to `ll_int2dec` + `newutf8`
+    /// (`intobject.py` `descr_str` / `descr_repr`, which share a body) and
+    /// an exact `str` `!s` to identity (`unicodeobject.py` `descr_str`).
+    /// A bool, subclass, or Python `__str__` / `__repr__` stays residual.
+    ConvertValue,
+    /// `bh_binary_slice_fn(obj, start, stop)` — BINARY_SLICE.  The walker
+    /// folds an exact `str` plus exact-int / `None` bounds to
+    /// `_unicode_sliced` (`ll_int2dec` sibling: elidable cut + residual
+    /// wrap).  A custom `__index__`, subclass, or non-str stays residual.
+    BinarySlice,
 }
 
 impl EffectInfo {

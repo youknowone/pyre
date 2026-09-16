@@ -2478,22 +2478,14 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     } else {
         return Err(string_index_type_error(index));
     };
-    let actual_idx = if idx < 0 { len as i64 + idx } else { idx };
-    // `usize` is 32 bits on the wasm guest while the index is a 64-bit
-    // machine int, so converting is what rejects a negative index and one
-    // past `usize::MAX` alike: an `as` cast would truncate `2**32` to `0`
-    // and answer `s[0]` where this owes an `IndexError`.
-    if let Ok(actual_idx) = usize::try_from(actual_idx)
-        && let Some(cp) = pyre_object::w_str_codepoint_at(obj, actual_idx)
-    {
-        return Ok(pyre_object::unicodeobject::w_str_from_codepoint(
-            cp.to_u32(),
-        ));
+    // `_getitem_result` (`unicodeobject.py`) after `getindex_w`.
+    match unsafe { pyre_object::unicodeobject::w_str_getitem(obj, idx) } {
+        Some(item) => Ok(item),
+        None => Err(PyError::new(
+            PyErrorKind::IndexError,
+            "string index out of range",
+        )),
     }
-    Err(PyError::new(
-        PyErrorKind::IndexError,
-        "string index out of range",
-    ))
 }
 
 #[inline(never)]

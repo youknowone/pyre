@@ -418,8 +418,12 @@ spec_folds! {
     StrCall              => ("str_call",                 "residual_call", "-"),
     FormatSimple         => ("format_simple",            "residual_call", "-"),
     FormatWithSpec       => ("format_with_spec",         "residual_call", "-"),
+    BuildString          => ("build_string",             "residual_call", "-"),
     StrStartswith        => ("str_startswith",           "residual_call", "-"),
     StrEndswith          => ("str_endswith",             "residual_call", "-"),
+    StrFind              => ("str_find",                 "residual_call", "-"),
+    StrRfind             => ("str_rfind",                "residual_call", "-"),
+    StrCount             => ("str_count",                "residual_call", "-"),
     ImportCached         => ("import_cached",            "residual_call", "-"),
     BuiltinDivmod        => ("builtin_divmod",           "residual_call", "-"),
     ExceptionReduce      => ("exception_reduce",         "residual_call", "-"),
@@ -476,6 +480,9 @@ spec_folds! {
     LocalsTraceLimitCut  => ("builtin_locals_trace_limit_cut", "specialize", "builtin_locals"),
     LoadSpecialMethod    => ("load_special_method",      "residual_call", "-"),
     LoadFastCheck        => ("load_fast_check",          "residual_call", "-"),
+    ConvertValue         => ("convert_value",            "residual_call", "-"),
+    FormatWithSpecInt    => ("format_with_spec_int",     "residual_call", "-"),
+    BinarySliceStr       => ("binary_slice_str",         "residual_call", "-"),
 }
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();

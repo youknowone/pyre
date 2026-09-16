@@ -9694,6 +9694,7 @@ const INT_POW_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::FunctionPath(
 const STR_CONCAT_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["str_concat"]),
     CallTargetPattern::FunctionPath(&["jit_str_concat"]),
+    CallTargetPattern::FunctionPath(&["jit_ll_strconcat"]),
 ];
 
 const STR_CMP_TARGETS: &[CallTargetPattern] =

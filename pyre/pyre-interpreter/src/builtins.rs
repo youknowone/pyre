@@ -11207,6 +11207,16 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             return exception_str_method(&[obj]);
         }
     }
+    // Exact machine int: `intobject.py descr_str`.  A look-inside
+    // call from this graph is what gives `descr_str` its own jitcode
+    // so the walker can descend it.  A subclass keeps `ob_type` at
+    // `INT_TYPE` and may override `__str__`; `is_int` is too wide.
+    if unsafe {
+        std::ptr::eq((*obj).ob_type, &pyre_object::INT_TYPE)
+            && pyre_object::is_exact_builtin_instance(obj)
+    } {
+        return Ok(unsafe { pyre_object::descr_str(obj) });
+    }
     let w = unsafe { crate::py_str_wtf8(obj)? };
     // `StdObjSpace.str` returns the ordinary movable `space.newtext` result.
     // The input is fully consumed above, so only the newly built WTF-8 value
