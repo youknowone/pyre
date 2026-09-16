@@ -476,8 +476,7 @@ jobs:
     # Two cargo passes used to measure ~27 min together; PR 1832 run
     # 34968256365 spent ~55 min on dynasm alone (29 compile + 21 test +
     # 3 serial) and the 60 min cap cancelled cranelift mid-link. 90 min
-    # bounds a hang without cutting the work. Linux cranelift now runs
-    # in `cargo-test-linux-cranelift` so this job is dynasm-only.
+    # bounds a hang without cutting the sequential dynasm+cranelift work.
     timeout-minutes: 90
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
@@ -611,9 +610,6 @@ jobs:
           --test llbc_fingerprint_format_test -- --ignored
 
     - name: Build test binaries (cranelift)
-      # Linux runs these two crates in `cargo-test-linux-cranelift`, which
-      # starts after `pre-commit` instead of after 55 min of dynasm.
-      if: runner.os != 'Linux'
       shell: bash
       # Keep this package list identical to the cranelift test step below.
       run: |
@@ -621,7 +617,6 @@ jobs:
           -p majit-metainterp -p majit-backend-cranelift
 
     - name: Run cargo tests (cranelift)
-      if: runner.os != 'Linux'
       shell: bash
       # This is a separate step so GitHub reports and reruns the backend passes
       # independently. Steps remain in one job, in order, so this pass starts
@@ -643,39 +638,6 @@ jobs:
         # out of the parallel run above and need a serial process of their own.
         # The name filter narrows the run to those two tests and reuses the
         # backend test harness built above.
-        cargo test --no-fail-fast -p majit-backend-cranelift \
-          --lib -- --ignored --test-threads=1 \
-          compiler::tests::test_host_loop_external_jump_to
-
-  cargo-test-linux-cranelift:
-    name: cargo test cranelift (ubuntu-24.04)
-    runs-on: ubuntu-24.04
-    # Two crates, no LLBC: start after the cheap gate instead of after
-    # prepare + 55 min of dynasm. That is the signal that used to die
-    # when the 60 min cap cancelled the combined job mid-link.
-    needs: pre-commit
-    if: ${{ !cancelled() && needs.pre-commit.result == 'success' }}
-    timeout-minutes: 45
-    steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      with:
-        persist-credentials: false
-    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      with:
-        cache-bin: false
-        shared-key: ${{ runner.arch }}
-        save-if: ${{ github.ref == 'refs/heads/main' }}
-    - name: Build test binaries (cranelift)
-      shell: bash
-      run: |
-        cargo test --no-run --no-default-features --features cranelift \
-          -p majit-metainterp -p majit-backend-cranelift
-    - name: Run cargo tests (cranelift)
-      shell: bash
-      run: |
-        cargo test --no-fail-fast --no-default-features --features cranelift \
-          -p majit-metainterp -p majit-backend-cranelift
         cargo test --no-fail-fast -p majit-backend-cranelift \
           --lib -- --ignored --test-threads=1 \
           compiler::tests::test_host_loop_external_jump_to
