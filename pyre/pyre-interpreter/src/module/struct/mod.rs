@@ -22,6 +22,10 @@ const fn native_is_bigendian() -> bool {
 /// `interp_struct.py get_error` — raise an instance of `struct.error`
 /// (registered in the exc-class registry under its qualified name) carrying
 /// `msg`.
+///
+/// `dont_look_inside` so `lookup_exc_class` stays off the wrapper hot graph
+/// (`unicodeobject.py descr_startswith` / `str_prefix_match_slow`).
+#[majit_macros::dont_look_inside]
 fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let msg = msg.into();
     let cls = crate::builtins::lookup_exc_class("struct.error")
@@ -255,26 +259,37 @@ fn align_up(pos: usize, alignment: usize) -> usize {
     (pos + alignment - 1) & !(alignment - 1)
 }
 
+/// `FormatIterator.interpret` — `@jit.look_inside_iff(lambda self, fmt:
+/// jit.isconstant(fmt))`.  A constant format unrolls the unit walk.
+fn parse_format_iff(format: &str) -> bool {
+    majit_rlib::jit::isconstant(format)
+}
+
 /// `FormatIterator.interpret` — decode the leading byte-order char then
 /// each format unit, validating repetition counts and codes.
+///
+/// Formats are ASCII (`format_to_string`); walk the byte index so the
+/// unrolled body does not allocate a `Vec<char>` or emit pointer-sub
+/// length.
+#[majit_macros::look_inside_iff(parse_format_iff)]
 fn parse_format(format: &str) -> Result<Parsed, crate::PyError> {
-    let chars: Vec<char> = format.chars().collect();
+    let bytes = format.as_bytes();
     let mut native = true;
     let mut bigendian = native_is_bigendian();
     let mut index = 0;
-    if let Some(&first) = chars.first() {
+    if let Some(&first) = bytes.first() {
         match first {
-            '@' => index = 1,
-            '=' => {
+            b'@' => index = 1,
+            b'=' => {
                 native = false;
                 index = 1;
             }
-            '<' => {
+            b'<' => {
                 native = false;
                 bigendian = false;
                 index = 1;
             }
-            '>' | '!' => {
+            b'>' | b'!' => {
                 native = false;
                 bigendian = true;
                 index = 1;
@@ -284,26 +299,26 @@ fn parse_format(format: &str) -> Result<Parsed, crate::PyError> {
     }
 
     let mut units = Vec::new();
-    while index < chars.len() {
-        let mut c = chars[index];
+    while index < bytes.len() {
+        let mut c = bytes[index];
         index += 1;
-        if c.is_whitespace() {
+        if c.is_ascii_whitespace() {
             continue;
         }
         let repetitions = if c.is_ascii_digit() {
-            let mut rep: i64 = (c as i64) - ('0' as i64);
+            let mut rep: i64 = i64::from(c - b'0');
             loop {
-                if index == chars.len() {
+                if index == bytes.len() {
                     return Err(struct_error("repeat count given without format specifier"));
                 }
-                c = chars[index];
+                c = bytes[index];
                 index += 1;
                 if !c.is_ascii_digit() {
                     break;
                 }
                 rep = rep
                     .checked_mul(10)
-                    .and_then(|v| v.checked_add((c as i64) - ('0' as i64)))
+                    .and_then(|v| v.checked_add(i64::from(c - b'0')))
                     .ok_or_else(|| struct_error("overflow in item count"))?;
             }
             rep as usize
@@ -311,10 +326,10 @@ fn parse_format(format: &str) -> Result<Parsed, crate::PyError> {
             1
         };
 
-        let fmt = match lookup_fmt(c, native) {
+        let fmt = match lookup_fmt(c as char, native) {
             Some(f) => f,
             None => {
-                if c == '\0' {
+                if c == 0 {
                     return Err(struct_error("embedded null character"));
                 }
                 return Err(struct_error("bad char in struct format"));
@@ -401,6 +416,47 @@ unsafe fn accept_bytes<'a>(arg: PyObjectRef, msg: &str) -> Result<&'a [u8], crat
 
 // ── per-code packing ─────────────────────────────────────────────────
 
+/// Write `v` as `size` bytes after the `make_int_packer` range check.
+/// Exact `int` / `bool` stay on this `intval` path (`space.int_w`);
+/// the bigint arm is only for `long` / `__index__`.
+fn pack_i64(
+    out: &mut Vec<u8>,
+    v: i64,
+    size: usize,
+    signed: bool,
+    fmtchar: char,
+    bigendian: bool,
+) -> Result<(), crate::PyError> {
+    let ulargest = u64::MAX >> ((8 - size) * 8);
+    let le8: [u8; 8] = if signed {
+        let max = (ulargest >> 1) as i64;
+        let min = !max;
+        if v >= min && v <= max {
+            v.to_le_bytes()
+        } else {
+            return Err(range_error(fmtchar, size, signed));
+        }
+    } else if size < 8 {
+        if v >= 0 && (v as u64) <= ulargest {
+            (v as u64).to_le_bytes()
+        } else {
+            return Err(range_error(fmtchar, size, signed));
+        }
+    } else if v >= 0 {
+        (v as u64).to_le_bytes()
+    } else {
+        return Err(range_error(fmtchar, size, signed));
+    };
+    if bigendian {
+        for i in (0..size).rev() {
+            out.push(le8[i]);
+        }
+    } else {
+        out.extend_from_slice(&le8[0..size]);
+    }
+    Ok(())
+}
+
 /// `make_int_packer.pack_int` — range-check then write `size` low bytes.
 unsafe fn pack_int(
     out: &mut Vec<u8>,
@@ -410,6 +466,24 @@ unsafe fn pack_int(
     fmtchar: char,
     bigendian: bool,
 ) -> Result<(), crate::PyError> {
+    if unsafe { is_int(arg) } {
+        return pack_i64(
+            out,
+            unsafe { w_int_get_value(arg) },
+            size,
+            signed,
+            fmtchar,
+            bigendian,
+        );
+    }
+    if unsafe { is_bool(arg) } {
+        let v = if unsafe { w_bool_get_value(arg) } {
+            1
+        } else {
+            0
+        };
+        return pack_i64(out, v, size, signed, fmtchar, bigendian);
+    }
     let value = unsafe { accept_int(arg)? };
     // Largest unsigned value representable in `size` bytes (`ulargest` in
     // `_range_error`); the signed bounds are `ulargest >> 1` and its
@@ -559,13 +633,117 @@ fn pack_string_bytes(out: &mut Vec<u8>, data: &[u8], count: usize) {
 
 // ── packing driver ───────────────────────────────────────────────────
 
+/// A format that is only an optional endian prefix and one integer code.
+/// `None` is the startswith-style miss: the caller residualizes rather than
+/// building `struct.error` on this graph.
+///
+/// Spelled as a macro so the generated `descr_pack` wrapper contains the
+/// walk, the way `rstring_prefix_eq` sits inside `descr_startswith`.
+macro_rules! simple_int_format {
+    ($format:expr) => {{
+        let bytes = $format.as_bytes();
+        if bytes.is_empty() {
+            None
+        } else {
+            let mut native = true;
+            let mut bigendian = native_is_bigendian();
+            let mut index = 0;
+            match bytes[0] {
+                b'@' => index = 1,
+                b'=' => {
+                    native = false;
+                    index = 1;
+                }
+                b'<' => {
+                    native = false;
+                    bigendian = false;
+                    index = 1;
+                }
+                b'>' | b'!' => {
+                    native = false;
+                    bigendian = true;
+                    index = 1;
+                }
+                _ => index = 0,
+            }
+            if index + 1 != bytes.len() {
+                None
+            } else {
+                // Native `l`/`L` take `sizeof(long)` and stay on `pack_slow`:
+                // `core::mem::size_of` is an un-lowered helper.
+                match (bytes[index], native) {
+                    (b'b', _) => Some((1usize, true, bigendian)),
+                    (b'B', _) => Some((1usize, false, bigendian)),
+                    (b'h', _) => Some((2usize, true, bigendian)),
+                    (b'H', _) => Some((2usize, false, bigendian)),
+                    (b'i', _) | (b'l', false) => Some((4usize, true, bigendian)),
+                    (b'I', _) | (b'L', false) => Some((4usize, false, bigendian)),
+                    (b'q', _) => Some((8usize, true, bigendian)),
+                    (b'Q', _) => Some((8usize, false, bigendian)),
+                    _ => None,
+                }
+            }
+        }
+    }};
+}
+
+fn unpack_simple_int(raw: &[u8], size: usize, signed: bool, bigendian: bool) -> Option<i64> {
+    if raw.len() != size || size == 0 || size > 8 {
+        return None;
+    }
+    let mut le = [0u8; 8];
+    for i in 0..size {
+        le[i] = if bigendian { raw[size - 1 - i] } else { raw[i] };
+    }
+    if signed {
+        let fill = if le[size - 1] & 0x80 != 0 { 0xff } else { 0x00 };
+        for b in le.iter_mut().skip(size) {
+            *b = fill;
+        }
+        Some(i64::from_le_bytes(le))
+    } else {
+        let u = u64::from_le_bytes(le);
+        if u <= i64::MAX as u64 {
+            Some(u as i64)
+        } else {
+            None
+        }
+    }
+}
+
+/// Repeat / `__index__` / error residual of `descr_pack`.
+#[majit_macros::dont_look_inside]
+fn pack_slow(this: &W_Struct, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    this.ensure_ready()?;
+    let format = majit_metainterp::jit::promote_string(this.format);
+    let fmt = unsafe { w_str_get_value(format) };
+    do_pack(fmt, &args[1..])
+}
+
+/// Length / bytes-like / error residual of `descr_unpack`.
+#[majit_macros::dont_look_inside]
+fn unpack_slow(this: &W_Struct, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    this.ensure_ready()?;
+    let format = majit_metainterp::jit::promote_string(this.format);
+    let fmt = unsafe { w_str_get_value(format) };
+    let buf = unsafe { readbuf(w_str)? };
+    do_unpack(fmt, buf)
+}
+
+fn do_pack_iff(format: &str, _values: &[PyObjectRef]) -> bool {
+    majit_rlib::jit::isconstant(format)
+}
+
 /// `do_pack` — pack `values` according to `format`.
+#[majit_macros::look_inside_iff(do_pack_iff)]
 fn do_pack(format: &str, values: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     Ok(w_bytes_from_bytes(&pack_values(&parsed, values)?))
 }
 
 /// `_pack` — the packed bytes of `values` according to a parsed format.
+/// `PackFormatIterator.operate` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let expected = parsed.expected_args();
     if values.len() != expected {
@@ -841,6 +1019,11 @@ pub(crate) fn unpack_single(format: &str, item: &[u8]) -> Result<PyObjectRef, cr
     }
 }
 
+fn do_unpack_iff(format: &str, _buf: &[u8]) -> bool {
+    majit_rlib::jit::isconstant(format)
+}
+
+#[majit_macros::look_inside_iff(do_unpack_iff)]
 fn do_unpack(format: &str, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()? as usize;
@@ -852,6 +1035,8 @@ fn do_unpack(format: &str, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
     unpack_units(&parsed, buf)
 }
 
+/// `UnpackFormatIterator.operate` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn unpack_units(parsed: &Parsed, buf: &[u8]) -> Result<PyObjectRef, crate::PyError> {
     let mut out: Vec<PyObjectRef> = Vec::new();
     let mut pos = 0usize;
@@ -1180,21 +1365,53 @@ impl W_Struct {
     /// `do_pack(space, jit.promote_string(self.format), args_w)`.
     /// The whole-args-slice ABI hands `args[0]` = self; the packed values
     /// are `args[1..]`.
+    ///
+    /// The one-exact-int arm is spelled here so the generated wrapper graph
+    /// is the rstring-style default path: a byte walk of the promoted format,
+    /// an `intval` range check, and `w_bytes_from_bytes`.  Repeat counts,
+    /// `__index__`, and `struct.error` stay in [`pack_slow`].
     fn pack(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        self.ensure_ready()?;
-        let format = majit_metainterp::jit::promote_string(self.format);
-        let fmt = unsafe { w_str_get_value(format) };
-        do_pack(fmt, &args[1..])
+        // startswith shape: the residual is only the tail, after the
+        // exact-int / little-endian-`i` checks.  Those checks must stay
+        // effect-free (`is_str` in `descr_startswith`).
+        if self.size >= 0 && args.len() == 2 {
+            let value = args[1];
+            if unsafe { is_int(value) } {
+                let format = majit_metainterp::jit::promote_string(self.format);
+                let fmt = unsafe { w_str_get_value(format) };
+                if let Some((4, true, false)) = simple_int_format!(fmt) {
+                    let v = unsafe { w_int_get_value(value) };
+                    if v >= -2147483648 && v <= 2147483647 {
+                        let b0 = v as u8;
+                        let b1 = (v >> 8) as u8;
+                        let b2 = (v >> 16) as u8;
+                        let b3 = (v >> 24) as u8;
+                        return Ok(w_bytes_from_bytes(&[b0, b1, b2, b3]));
+                    }
+                }
+            }
+        }
+        pack_slow(self, args)
     }
 
     /// `interp_struct.py descr_unpack` —
     /// `do_unpack(space, jit.promote_string(self.format), w_str)`.
     fn unpack(&self, w_str: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        self.ensure_ready()?;
-        let format = majit_metainterp::jit::promote_string(self.format);
-        let fmt = unsafe { w_str_get_value(format) };
-        let buf = unsafe { readbuf(w_str)? };
-        do_unpack(fmt, buf)
+        if self.size >= 0 {
+            let format = majit_metainterp::jit::promote_string(self.format);
+            let fmt = unsafe { w_str_get_value(format) };
+            if let Some((size, signed, bigendian)) = simple_int_format!(fmt) {
+                if unsafe { bytesobject::is_bytes_like(w_str) } {
+                    let buf = unsafe { bytesobject::bytes_like_data(w_str) };
+                    if buf.len() == size {
+                        if let Some(v) = unpack_simple_int(buf, size, signed, bigendian) {
+                            return Ok(w_tuple_new(vec![w_int_new(v)]));
+                        }
+                    }
+                }
+            }
+        }
+        unpack_slow(self, w_str)
     }
 
     /// `interp_struct.py descr_unpack_from(self, w_buffer, offset=0)` —
