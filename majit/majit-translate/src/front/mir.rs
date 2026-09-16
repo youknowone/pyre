@@ -9186,7 +9186,7 @@ impl<'a> Lowering<'a> {
                         &call.dest.ty,
                     )
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9240,7 +9240,7 @@ impl<'a> Lowering<'a> {
                         || self.is_arguments_from_str(&reg)
                         || self.is_rbigint_translated_alias(&reg, first_arg_ty.as_ref()))
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9267,7 +9267,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|t| tyref_is_string_value(t, self.llbc))
                     && tyref_is_string_value(&call.dest.ty, self.llbc)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9305,7 +9305,7 @@ impl<'a> Lowering<'a> {
                 // the receiver instead of emitting a `deref` method call
                 // the rtyper cannot route on the classdef-less receiver.
                 if args.len() == 1 && self.is_container_identity_deref(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9339,7 +9339,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9353,10 +9353,7 @@ impl<'a> Lowering<'a> {
                 // `as_bytes()[i]` / `len` become `strgetitem` / `strlen`
                 // on the object, not on a fat `&Wtf8`.
                 if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9378,10 +9375,7 @@ impl<'a> Lowering<'a> {
                 // UTF-8/WTF-8 storage exposed explicitly by `as_bytes`.
                 if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
                 {
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9409,7 +9403,7 @@ impl<'a> Lowering<'a> {
                         && str_builder_ctor_leaf(self.llbc, &reg).is_some()
                         && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9424,7 +9418,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && self.is_option_value_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9462,7 +9456,7 @@ impl<'a> Lowering<'a> {
                 // identity before the scalar element arm; Range/RangeFrom/
                 // RangeTo remain real getslice operations.
                 if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9867,7 +9861,7 @@ impl<'a> Lowering<'a> {
                     && self.string_array_remove_owner().is_some()
                     && regular_call_is_ptr_add(&reg, self.llbc)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10366,7 +10360,7 @@ impl<'a> Lowering<'a> {
                         });
                         self.local_var[dest_local] = Some(res);
                     } else {
-                        self.local_var[dest_local] = Some(args[0].clone());
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -10385,7 +10379,7 @@ impl<'a> Lowering<'a> {
                 // integer/raw-address uses elsewhere must keep their runtime
                 // normalization.
                 if args.len() == 1 && self.is_gc_current_object_address_adapter(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10398,7 +10392,7 @@ impl<'a> Lowering<'a> {
                 // unicode `hash`, `rstr.py:1238`), so alias the view to the
                 // field pointer exactly like the raw-pointer casts above.
                 if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10428,7 +10422,7 @@ impl<'a> Lowering<'a> {
                             ordering.unwrap_or("unknown")
                         )));
                     }
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10522,7 +10516,7 @@ impl<'a> Lowering<'a> {
                 // ([`is_items_block_base_ptr_add`] keys on the enclosing
                 // accessor so a dereferenced `.add` elsewhere is untouched).
                 if args.len() == 2 && self.is_items_block_base_ptr_add(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10591,7 +10585,7 @@ impl<'a> Lowering<'a> {
                 // (an object list's logical length can differ from its items
                 // block capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11101,7 +11095,7 @@ impl<'a> Lowering<'a> {
                 // annotation.  Same shape as the reflexive identity aliases
                 // below.
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11114,7 +11108,7 @@ impl<'a> Lowering<'a> {
                 // (its items live behind a getfield, not the receiver) — see
                 // `is_container_as_ptr_identity`.
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11131,7 +11125,7 @@ impl<'a> Lowering<'a> {
                     && self.is_fmt_format_call(&reg)
                     && self.traces_to_str_const(&args[0])
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11644,7 +11638,7 @@ impl<'a> Lowering<'a> {
                         .and_then(|id| self.llbc.type_by_id(id))
                         .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc));
                     if pointee_fieldless {
-                        self.local_var[dest_local] = Some(args[0].clone());
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -14611,6 +14605,35 @@ impl<'a> Lowering<'a> {
     /// that local; a later `slice::len` / `slice::is_empty` often
     /// receives `Copy(*local)` rather than the local itself, so the
     /// mark must follow the projection the same way `Rvalue::Len` does.
+    /// Last-write-wins for a call dest aliased to `args[0]`.  Inherit the
+    /// mark when the receiver is already a string byte view (`x = x.as_slice()`
+    /// after `as_bytes`); drop it when the receiver is an ordinary `&[u8]`.
+    fn alias_dest_to_arg0(&mut self, dest_local: usize, arg: Variable, inherit_byte_view: bool) {
+        if inherit_byte_view {
+            if !self.string_byte_view_locals.contains(&dest_local) {
+                self.string_byte_view_locals.push(dest_local);
+            }
+        } else {
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+        }
+        self.local_var[dest_local] = Some(arg);
+    }
+
+    fn alias_dest_to_arg0_inherit(
+        &mut self,
+        dest_local: usize,
+        arg: Variable,
+        arg_locals: &[Option<usize>],
+    ) {
+        let inherit = arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        self.alias_dest_to_arg0(dest_local, arg, inherit);
+    }
+
     fn operand_is_string_byte_view(&self, op: &Operand) -> bool {
         match op {
             Operand::Copy(place) | Operand::Move(place) => self
