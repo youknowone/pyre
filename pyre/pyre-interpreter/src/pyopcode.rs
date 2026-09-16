@@ -3164,9 +3164,9 @@ where
         let w_value = executor.pop_value()?;
         let exc = crate::eval::raise_prepared_exc(w_value);
         if exc.is_null() {
-            return Err(crate::PyError::type_error(
-                "exceptions must derive from BaseException",
-            ));
+            return Err(crate::call::take_call_error().unwrap_or_else(|| {
+                crate::PyError::type_error("exceptions must derive from BaseException")
+            }));
         }
         let mut err = unsafe { crate::PyError::from_exc_object(exc) };
         err.reraise_lasti = executor.last_instr() as i32;

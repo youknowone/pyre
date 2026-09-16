@@ -154,9 +154,6 @@ pub extern "C" fn jit_load_name_from_namespace(
             return v as i64;
         }
     }
-    if let Some(exc) = crate::builtins::lookup_exc_class(name) {
-        return exc as i64;
-    }
     std::ptr::null_mut::<()>() as i64
 }
 

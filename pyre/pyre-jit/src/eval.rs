@@ -5061,43 +5061,17 @@ static PORTAL_MAINJITCODE: std::sync::OnceLock<Option<std::sync::Arc<majit_metai
 
 fn load_portal_mainjitcode() -> Option<std::sync::Arc<majit_metainterp::JitCode>> {
     PORTAL_MAINJITCODE
-        .get_or_init(|| {
-            pyre_jit_trace::jitcode_runtime::portal_jitcode().map(|canonical| {
-                std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
-                    (*canonical).clone(),
-                ))
-            })
-        })
+        .get_or_init(pyre_jit_trace::jitcode_runtime::new_portal_metainterp_jitcode)
         .clone()
 }
 
 fn build_jit_driver_pair() -> JitDriverPair {
-    majit_metainterp::set_record_application_traceback_hook(Some(
-        crate::call_jit::record_caught_blackhole_traceback,
-    ));
-    majit_metainterp::set_record_inline_application_traceback_hook(Some(
-        crate::call_jit::record_inline_traceback_for_recording,
-    ));
-    majit_metainterp::set_record_discarded_level_traceback_hook(Some(
-        crate::call_jit::record_discarded_level_traceback,
-    ));
-    majit_metainterp::set_resolve_exception_context_hook(Some(
-        crate::call_jit::resolve_exception_context,
-    ));
-    majit_metainterp::set_symbolic_fnaddr_path_resolver(Some(
-        pyre_jit_trace::runtime_fnaddr_patch::symbolic_fnaddr_path,
-    ));
-    // `quasiimmut.py do_force_quasi_immutable`'s host half — the blackhole
-    // computes the hidden mutate field's address, pyre unlinks the instance
-    // and flips every loop flag it recorded.
-    majit_metainterp::set_force_quasi_immutable_hook(Some(crate::call_jit::force_quasi_immutable));
+    crate::call_jit::publish_pyre_host_hooks();
     // Residual wrapint: `w_int_gc_alloc` is `dont_look_inside`, so portal
     // interpret would record `CallR`. Register the trampoline the
     // residual actually calls so interpret emits wrapint
     // (`new_with_vtable` + `setfield_gc`) with a concrete pointer.
     {
-        let trampoline: extern "C" fn(i64) -> i64 =
-            pyre_object::intobject::__majit_call_target_w_int_gc_alloc;
         majit_metainterp::register_identity_ref_residual(majit_metainterp::IdentityRefResidual {
             fnaddrs: {
                 let mut addrs: Vec<i64> = pyre_interpreter::jit_trace_fnaddrs()
@@ -5147,12 +5121,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                 addrs
             },
         });
-        majit_metainterp::register_elidable_ref_residual(majit_metainterp::ElidableRefResidual {
-            fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
-                .into_iter()
-                .filter_map(|(name, addr)| name.contains("w_code_const").then_some(addr))
-                .collect(),
-        });
         majit_metainterp::register_frame_anchor_push_residual(
             majit_metainterp::FrameAnchorPushResidual {
                 fnaddrs: pyre_interpreter::jit_trace_fnaddrs()
@@ -5196,15 +5164,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
                     .then_some(addr)
                 })
                 .collect(),
-        });
-        majit_metainterp::register_wrapint_residual(majit_metainterp::WrapintResidual {
-            alloc_fnaddrs: vec![
-                trampoline as i64,
-                pyre_object::intobject::w_int_gc_alloc as *const () as i64,
-            ],
-            size_descr: pyre_jit_trace::descr::w_int_size_descr(),
-            intval_descr: pyre_jit_trace::descr::int_intval_descr(),
-            int_type_addr: &pyre_object::INT_TYPE as *const _ as i64,
         });
         majit_metainterp::register_exception_trace_residual(
             majit_metainterp::ExceptionTraceResidual {

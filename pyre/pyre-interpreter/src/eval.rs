@@ -1828,7 +1828,10 @@ unsafe fn raise_prepared_exc_obj(w_value: PyObjectRef) -> PyObjectRef {
                 }
                 result
             }
-            Err(_) => pyre_object::PY_NULL,
+            Err(err) => {
+                crate::call::set_call_error(err);
+                pyre_object::PY_NULL
+            }
         }
     } else if pyre_object::is_exception(w_value) {
         if attach_raise_cause(w_value, None).is_err() {

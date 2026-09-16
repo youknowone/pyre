@@ -13467,13 +13467,22 @@ fn is_frame_anchor_self_callee(name: &str) -> bool {
 }
 
 /// Interpret folds `live` to the red vable (`FrameAnchorLiveResidual`).
-/// Resume still has the slot index; put the portal frame in `self` so
-/// `push_on_self` writes the same heap `bhimpl_setarrayitem_vable_*` does.
+/// Resume still has the slot index. Replace that word with this
+/// blackhole level's virtualizable — the same red frame the parent
+/// `MIFrame` / `BlackholeInterpreter` is interpreting, not the portal
+/// TLS `CURRENT_FRAME`. An inlined callee has its own virtualizable.
 fn rewrite_stale_frame_anchor_self(callee: &mut BlackholeInterpreter, name: &str) {
     if !is_frame_anchor_self_callee(name) {
         return;
     }
-    let frame = crate::bh_portal_frame();
+    // Prefer this level's virtualizable (the inlined callee's own
+    // frame). Fall back to the TLS current frame only when this
+    // blackhole has no vable — libffi callbacks resume without one.
+    let frame = if callee.virtualizable_ptr != 0 {
+        callee.virtualizable_ptr
+    } else {
+        crate::bh_portal_frame()
+    };
     if frame == 0 {
         return;
     }
@@ -13586,9 +13595,8 @@ fn interpret_unresolved_inline_call(
     copy_identity_slots_from_parent(bh, &mut callee);
     // `front::mir` aliases `&FrameAnchor` to the depth word. Interpret
     // folds `live` to the red vable (`FrameAnchorLiveResidual`); resume
-    // still has the tracing-time slot. Replace that word with the portal
-    // frame so `push_on_self` is the same heap write
-    // `bhimpl_setarrayitem_vable_*` performs after `clear_vable_token`.
+    // still has the tracing-time slot. Replace that word with this
+    // level's virtualizable (cloned from the parent above).
     rewrite_stale_frame_anchor_self(&mut callee, callee_name.as_str());
 
     let outcome = 'callee: {

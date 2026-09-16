@@ -110,14 +110,12 @@ pub fn __majit_struct_type_id_path(module_path: &str, type_path: &str, is_gc_man
 pub mod blackhole;
 pub mod box_trace;
 pub use box_trace::{
-    CompareOpResidual, ElidableIntResidual, ElidableRefResidual, ExactIntFalseResidual,
-    ExceptionTraceResidual, FrameAnchorLiveResidual, FrameAnchorPushResidual, IdentityRefResidual,
-    IntPyModResidual, VoidSkipResidual, WrapintResidual, register_compare_op_residual,
-    register_elidable_int_residual, register_elidable_ref_residual,
+    CompareOpResidual, ElidableIntResidual, ExactIntFalseResidual, ExceptionTraceResidual,
+    FrameAnchorLiveResidual, FrameAnchorPushResidual, IdentityRefResidual, IntPyModResidual,
+    VoidSkipResidual, register_compare_op_residual, register_elidable_int_residual,
     register_exact_int_false_residual, register_exception_trace_residual,
     register_frame_anchor_live_residual, register_frame_anchor_push_residual,
     register_identity_ref_residual, register_int_py_mod_residual, register_void_skip_residual,
-    register_wrapint_residual,
 };
 pub(crate) mod call_descr;
 pub(crate) mod compile;
@@ -161,6 +159,7 @@ pub mod optimize;
 pub mod optimizeopt;
 pub(crate) mod parity;
 mod pyjitpl;
+pub use pyjitpl::{HostHooks, host_hooks, publish_host_hooks};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pyjitpl::{
     active_backend_jit_exc_value_forward, active_backend_jit_exc_value_peek,
@@ -1553,28 +1552,9 @@ pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 // — so the interpreter registers the two hooks at startup.
 use std::sync::OnceLock;
 
-static CRITICALCODE_START_FN: OnceLock<fn()> = OnceLock::new();
-static CRITICALCODE_STOP_FN: OnceLock<fn()> = OnceLock::new();
-static STACK_ALMOST_FULL_FN: OnceLock<fn() -> bool> = OnceLock::new();
 static ALLOW_SMALL_REF_RESIDUAL_FN: OnceLock<fn(usize) -> bool> = OnceLock::new();
 static SYMBOLIC_RESIDUAL_FNADDR_FN: OnceLock<fn(i64) -> i64> = OnceLock::new();
 static BH_PORTAL_FRAME_FN: OnceLock<fn() -> i64> = OnceLock::new();
-
-/// Register the `_stack_criticalcode_start` / `_stack_criticalcode_stop`
-/// hooks the interpreter implements. Called once at JIT install time.
-pub fn register_criticalcode_hooks(start: fn(), stop: fn()) {
-    let _ = CRITICALCODE_START_FN.set(start);
-    let _ = CRITICALCODE_STOP_FN.set(stop);
-}
-
-/// Register the `rstack.stack_almost_full` hook the interpreter
-/// implements against its `PYRE_STACKTOOBIG` budget. Called once at
-/// JIT install time. When no hook is registered, [`stack_almost_full`]
-/// returns `false` — matching RPython's untranslated fallback in
-/// `rpython/rlib/rstack.py`.
-pub fn register_stack_almost_full_hook(f: fn() -> bool) {
-    let _ = STACK_ALMOST_FULL_FN.set(f);
-}
 
 /// Residuals whose `Ref` argument is a small integer word (a shadow-stack
 /// depth), not a heap pointer. `refuse_walk_local_ref_args` would otherwise
@@ -1610,14 +1590,13 @@ pub fn resolve_symbolic_residual_fnaddr(fnaddr: i64) -> i64 {
         .map_or(0, |f| f(fnaddr))
 }
 
-/// Portal virtualizable the blackhole should use when a FrameAnchor
-/// residual still holds a tracing-time slot index. `interp_jit.py` has
-/// no shadow-stack slot; the frame is the loop's red input.
+/// Fallback frame when a blackhole level has no virtualizable.
+/// Used only if `virtualizable_ptr` is 0 (cffi/libffi callbacks).
 pub fn register_bh_portal_frame(f: fn() -> i64) {
     let _ = BH_PORTAL_FRAME_FN.set(f);
 }
 
-/// Live portal frame pointer, or 0 when the host has not registered one.
+/// Live TLS frame pointer, or 0 when the host has not registered one.
 #[must_use]
 pub fn bh_portal_frame() -> i64 {
     BH_PORTAL_FRAME_FN.get().copied().map_or(0, |f| f())
@@ -2236,7 +2215,7 @@ pub fn mc_diag_bump(i: usize) {
 /// False`).
 #[inline]
 pub fn stack_almost_full() -> bool {
-    if let Some(f) = STACK_ALMOST_FULL_FN.get() {
+    if let Some(f) = crate::pyjitpl::host_hooks().stack_almost_full {
         let r = f();
         if r {
             mc_diag_bump(5); // stack_almost_full returned true
@@ -2252,7 +2231,7 @@ pub fn stack_almost_full() -> bool {
 /// that don't install the interpreter's stack-check layer).
 #[inline]
 pub fn criticalcode_start() {
-    if let Some(f) = CRITICALCODE_START_FN.get() {
+    if let Some(f) = crate::pyjitpl::host_hooks().criticalcode_start {
         f();
     }
 }
@@ -2260,7 +2239,7 @@ pub fn criticalcode_start() {
 /// rpython/translator/c/src/stack.h:43 `LL_stack_criticalcode_stop`.
 #[inline]
 pub fn criticalcode_stop() {
-    if let Some(f) = CRITICALCODE_STOP_FN.get() {
+    if let Some(f) = crate::pyjitpl::host_hooks().criticalcode_stop {
         f();
     }
 }
