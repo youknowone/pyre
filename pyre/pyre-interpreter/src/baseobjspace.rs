@@ -11415,7 +11415,10 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // only stable while no other thread invalidates the type: both halves are
     // then read under a tag that is no longer current, exactly as a lookup
     // that had completed one instruction earlier would have been.
-    let w_name = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name));
+    let w_name = pyre_object::unicodeobject::box_str_constant_jit_abi(
+        name.as_ptr() as i64,
+        name.len() as i64,
+    ) as PyObjectRef;
     let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {
         None
