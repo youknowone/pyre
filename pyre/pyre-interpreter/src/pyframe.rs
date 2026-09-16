@@ -4613,13 +4613,20 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `dupvalues`.
-    /// `pyframe.py dupvalues` is `@jit.unroll_safe`.
+    /// `pyframe.py dupvalues` is `@jit.unroll_safe` and peeks one
+    /// slot at a time (`peekvalue(delta)`), not `peekvalues`.
     #[inline]
     #[majit_macros::unroll_safe]
     pub fn dupvalues(&mut self, n: usize) {
-        let values = self.peekvalues(n);
-        for value in values {
-            self.push(value);
+        if n == 0 {
+            return;
+        }
+        let delta = n - 1;
+        let mut remaining = n;
+        while remaining > 0 {
+            remaining -= 1;
+            let w_value = self.peekvalue(delta);
+            self.push(w_value);
         }
     }
 
@@ -5727,18 +5734,9 @@ impl PyFrame {
             }
         }
 
-        let pure_cells: Vec<&_> = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !code.varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .collect();
-        let npure = pure_cells.len();
+        // Same positional band as `fast2locals`: a filtered `Vec` would
+        // residualize iterator adapters under `unroll_safe`.
+        let npure = npure_cellvars(code);
         let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
         let freevarnames_len = if include_freevars {
             npure + code.freevars.len()
@@ -5747,7 +5745,7 @@ impl PyFrame {
         };
         for i in 0..freevarnames_len {
             let name: &str = if i < npure {
-                pure_cells[i].as_ref()
+                code.cellvars[nth_pure_cellvar_index(code, i)].as_ref()
             } else {
                 code.freevars[i - npure].as_ref()
             };
