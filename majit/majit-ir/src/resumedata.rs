@@ -149,6 +149,8 @@ pub enum ResumeVirtualKind {
     UniConcat,
     /// resume.py VUniSliceInfo — virtual unicode slice.
     UniSlice,
+    /// resume.py `rd_virtuals[i] is None` hole.
+    Hole,
 }
 
 /// Per-frame layout summary used by `ResumeLayoutSummary`.
@@ -309,6 +311,8 @@ pub enum ResumeVirtualLayoutSummary {
         start: ResumeValueLayoutSummary,
         length: ResumeValueLayoutSummary,
     },
+    /// resume.py `rd_virtuals[i] is None` hole.
+    Hole,
 }
 const TAGMASK: u8 = 3;
 

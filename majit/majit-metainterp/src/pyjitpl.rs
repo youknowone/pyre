@@ -9522,11 +9522,12 @@ impl<M: Clone> MetaInterp<M> {
                 Some(ctx) => ctx.green_key,
                 None => return false,
             };
-            let Some(token) = self
-                .compiled_loops
-                .get(&green_key)
-                .and_then(|compiled| compiled.live_token())
-            else {
+            // compile.py `compile_retrace` `loop_jitcell_token = metainterp.get_procedure_token(greenkey)`
+            // — the warmstate cell, which rejects an invalidated token.
+            // `compiled.live_token()` upgrades the side-table Weak without
+            // that filter and disagrees exactly when the cell has lost
+            // its token.
+            let Some(token) = self.warm_state.get_procedure_token(green_key) else {
                 return false;
             };
             token
@@ -9567,7 +9568,6 @@ impl<M: Clone> MetaInterp<M> {
             phase2_input_ops_seed,
         ) = {
             let green_key = ctx.green_key;
-            let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
             // `compile.py:341-347` takes `start` as a parameter; there is no
             // upstream `compile_retrace` without one. Requiring it here rather
@@ -9581,9 +9581,9 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let retrace_merge_point = ctx.get_merge_point_at(green_key, header_pc).filter(|mp| {
-                mp.position == retrace_pos && mp.position.has_prefix_ops(ctx.num_inputargs())
-            });
+            let retrace_merge_point = ctx
+                .merge_point_at_start(retrace_pos)
+                .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()));
             // compile.py:347 `trace = metainterp.history.trace.cut_trace_from(
             // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
             // caller's single merge-point selection (pyjitpl.py:3019), and
@@ -9606,7 +9606,7 @@ impl<M: Clone> MetaInterp<M> {
             if retrace_merge_point.is_none() {
                 crate::debug::log_one(
                     "jit-abort",
-                    "compile_retrace: no merge point at header_pc for retracing_from \
+                    "compile_retrace: no merge point at retracing_from start \
                      — declining rather than assembling an uncut trace",
                 );
                 return false;
@@ -9637,11 +9637,10 @@ impl<M: Clone> MetaInterp<M> {
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
+                        "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={}",
                         start.op_index,
                         original_boxes.len(),
                         trace.ops.len(),
-                        header_pc,
                     );
                 }
                 // As in `compile_loop_body`: a declined cut cannot fall back to
@@ -9787,12 +9786,7 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|bridge| bridge.source_descr.as_fail_descr())
             .and_then(majit_backend::descr_owning_jct)
             .map(|source_jct| source_jct.number);
-        unroll_opt.retraced_count = self
-            .compiled_loops
-            .get(&green_key)
-            .and_then(|compiled| compiled.live_token())
-            .map(|token| token.get_retraced_count())
-            .unwrap_or(0);
+        unroll_opt.retraced_count = loop_jitcell_token.get_retraced_count();
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
@@ -15853,6 +15847,14 @@ impl<M: Clone> MetaInterp<M> {
                 return None;
             }
         };
+        // compile.py compile_retrace `get_procedure_token(greenkey)`:
+        // an invalidated cell is not a live procedure, even if
+        // `compiled_loops` still holds a Weak that upgrades.
+        if self.warm_state.get_procedure_token(green_key).is_none() {
+            crate::mc_diag_bump(7);
+            self.leave_profiler_tracing();
+            return None;
+        }
 
         let norm_tid = trace_id;
         let fail_descr = descr_arc

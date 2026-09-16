@@ -2062,6 +2062,313 @@ impl KnownArrayLengths {
     }
 }
 
+/// `rewrite.py` flush points for `emit_pending_zeros`: LABEL, JUMP,
+/// FINISH, any guard, and any collecting op. A store after one of these
+/// does not cancel a delayed NULL / ZERO_ARRAY — the object is visible
+/// at the flush (deopt, next malloc, merge).
+fn rewrite_pending_zero_flush(op: &Op) -> bool {
+    matches!(
+        op.opcode,
+        OpCode::Label
+            | OpCode::Jump
+            | OpCode::Finish
+            // rewrite.py `transform_to_gc_load` GETFIELD_GC arm:
+            // `emit_pending_zeros` before the load (`test_zero_ptr_field_before_getfield`).
+            | OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+    ) || op.opcode.is_guard()
+        || op.opcode.can_malloc()
+}
+
+/// rewrite.py emits `ZERO_ARRAY` before later reads; a GETARRAYITEM /
+/// GETINTERIORFIELD of this array must not see a later SETARRAYITEM as
+/// covering the slot.
+fn observes_array_items(op: &Op, array: OpRef, forwardings: &[Option<OpRef>]) -> bool {
+    matches!(
+        op.opcode,
+        OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF
+            | OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF
+    ) && resolve_same_as_forwarding(op.arg(0).to_opref(), forwardings) == array
+}
+
+/// rewrite.py `could_merge_with_next_guard`: a comparison whose next
+/// op is GUARD_TRUE / GUARD_FALSE / COND_CALL on that result, or any
+/// ovf op, flushes pending zeros before the comparison.
+fn could_merge_with_next_guard(op: &Op, i: usize, operations: &[Op]) -> bool {
+    if !op.opcode.is_comparison() {
+        return op.opcode.is_ovf();
+    }
+    let Some(next_op) = operations.get(i + 1) else {
+        return false;
+    };
+    if !matches!(
+        next_op.opcode,
+        OpCode::GuardTrue
+            | OpCode::GuardFalse
+            | OpCode::CondCallN
+            | OpCode::CondCallValueI
+            | OpCode::CondCallValueR
+    ) {
+        return false;
+    }
+    next_op.arg(0).to_opref() == op.pos().get()
+}
+
+/// rewrite.py `emit_pending_zeros` rewrite of the `ZERO_ARRAY` emitted
+/// by `handle_clear_array_contents`.
+enum ZeroArrayPlan {
+    /// `NEW_ARRAY`, length 0, or every index written (`ConstInt(0)`).
+    Skip,
+    /// Const-length CLEAR: items `[start, start+count)`.
+    Items { start: usize, count: usize },
+    /// Runtime-length CLEAR: items `0..length`.
+    Runtime,
+}
+
+/// IncrementalMiniMark is `malloc_zero_filled=false`, so native rewrite
+/// emits `ZERO_ARRAY` only for `NEW_ARRAY_CLEAR` and then trims any
+/// written prefix/suffix (`emit_pending_zeros`). Plain `NEW_ARRAY`
+/// never emits `ZERO_ARRAY`.
+fn newarray_zero_plan(
+    op: &Op,
+    ops: &[Op],
+    op_idx: usize,
+    constants: &indexmap::IndexMap<u32, i64>,
+    length_const: Option<i64>,
+    forwardings: &[Option<OpRef>],
+) -> ZeroArrayPlan {
+    match op.opcode {
+        OpCode::NewArray => ZeroArrayPlan::Skip,
+        OpCode::NewArrayClear => match length_const {
+            Some(0) => ZeroArrayPlan::Skip,
+            Some(len) => usize::try_from(len).map_or(ZeroArrayPlan::Runtime, |n| {
+                if n == 0 {
+                    ZeroArrayPlan::Skip
+                } else {
+                    trimmed_zero_array(ops, op_idx, op.pos().get(), n, constants, forwardings)
+                }
+            }),
+            None => ZeroArrayPlan::Runtime,
+        },
+        _ => ZeroArrayPlan::Skip,
+    }
+}
+
+/// rewrite.py `emit_pending_zeros` / `_setarrayitems_occurred`: a sparse
+/// set of constant indexes, then walk `start`/`stop` on membership.
+fn trimmed_zero_array(
+    ops: &[Op],
+    op_idx: usize,
+    array: OpRef,
+    length: usize,
+    constants: &indexmap::IndexMap<u32, i64>,
+    forwardings: &[Option<OpRef>],
+) -> ZeroArrayPlan {
+    // rewrite.py `remember_setarrayitem_occurred` keys through
+    // `get_box_replacement`; SameAsR aliases of the NEW_ARRAY_CLEAR
+    // result must still cancel the matching ZERO_ARRAY indexes.
+    let array = resolve_same_as_forwarding(array, forwardings);
+    let mut written = indexmap::IndexSet::<usize>::new();
+    for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
+        if rewrite_pending_zero_flush(later)
+            || could_merge_with_next_guard(later, j, ops)
+            || observes_array_items(later, array, forwardings)
+        {
+            break;
+        }
+        if later.opcode != OpCode::SetarrayitemGc {
+            continue;
+        }
+        if resolve_same_as_forwarding(later.arg(0).to_opref(), forwardings) != array {
+            continue;
+        }
+        let Some(idx) = const_operand_value(constants, later.arg(1).to_opref()) else {
+            continue;
+        };
+        if let Ok(i) = usize::try_from(idx)
+            && i < length
+        {
+            written.insert(i);
+        }
+    }
+    let mut start = 0;
+    while start < length && written.contains(&start) {
+        start += 1;
+    }
+    let mut stop = length;
+    while stop > start && written.contains(&(stop - 1)) {
+        stop -= 1;
+    }
+    if start >= stop {
+        ZeroArrayPlan::Skip
+    } else {
+        ZeroArrayPlan::Items {
+            start,
+            count: stop - start,
+        }
+    }
+}
+
+/// `rewrite.py clear_gc_fields` + `consider_setfield_gc` + `emit_pending_zeros`.
+///
+/// IncrementalMiniMark does not zero-fill. Native rewrite only NULLs
+/// unwritten GC-pointer fields (`descr.gc_fielddescrs`) and drops any
+/// offset a later `SETFIELD_GC` writes before the next flush. The class
+/// word is omitted when `handle_new` already stamped `w_class_obj`
+/// (`rewrite.rs clear_gc_fields`); a `NEW_WITH_VTABLE` vtable store is
+/// the same as `emit_setfield` after `handle_new_fixedsize`.
+///
+/// Wasm skips that rewrite and would otherwise `memory.fill` the whole
+/// `New` payload, including scalar fields rewrite never touches.
+fn pending_new_zero_offsets(
+    descr: &dyn majit_ir::descr::SizeDescr,
+    ops: &[Op],
+    op_idx: usize,
+    obj: OpRef,
+    write_vtable_offset: Option<usize>,
+    stamp_w_class: bool,
+    forwardings: &[Option<OpRef>],
+) -> Vec<usize> {
+    let class_word = descr.class_word_field().map(|fd| fd.offset());
+    let skip_class_word = stamp_w_class && class_word.is_some();
+    let obj = resolve_same_as_forwarding(obj, forwardings);
+    let mut pending: Vec<usize> = descr
+        .gc_fielddescrs()
+        .iter()
+        .map(|fd| fd.offset())
+        .filter(|&ofs| !(skip_class_word && class_word == Some(ofs)))
+        .filter(|&ofs| write_vtable_offset != Some(ofs))
+        .collect();
+    if pending.is_empty() {
+        return pending;
+    }
+    for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
+        if rewrite_pending_zero_flush(later) || could_merge_with_next_guard(later, j, ops) {
+            break;
+        }
+        if later.opcode != OpCode::SetfieldGc {
+            continue;
+        }
+        if resolve_same_as_forwarding(later.arg(0).to_opref(), forwardings) != obj {
+            continue;
+        }
+        let descr = later.getdescr();
+        let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) else {
+            continue;
+        };
+        let ofs = fd.offset();
+        pending.retain(|&pending_ofs| pending_ofs != ofs);
+        if pending.is_empty() {
+            break;
+        }
+    }
+    pending
+}
+
+/// rewrite.py `emit_pending_zeros` GC_STORE of NULL at each leftover
+/// offset. Pointer-width (`WORD`) like `emit_gc_store_or_indexed(..., WORD)`.
+fn emit_pending_null_fields(sink: &mut PeepSink<'_, '_>, base_local: u32, offsets: &[usize]) {
+    for &ofs in offsets {
+        sink.local_get(base_local);
+        sink.i32_wrap_i64();
+        sink.i32_const(0);
+        sink.i32_store(MemArg {
+            offset: ofs as u64,
+            align: 2,
+            memory_index: 0,
+        });
+    }
+}
+
+/// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
+/// length store: items only, starting at `basesize`. IncrementalMiniMark
+/// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
+fn emit_zero_array_item_range(
+    sink: &mut PeepSink<'_, '_>,
+    value_types: &ValueLocals,
+    result: u32,
+    dest_ofs: i64,
+    bytes: u32,
+) {
+    if bytes == 0 {
+        return;
+    }
+    sink.local_get(value_types.local(result));
+    sink.i32_wrap_i64();
+    if dest_ofs != 0 {
+        sink.i32_const(dest_ofs as i32);
+        sink.i32_add();
+    }
+    sink.i32_const(0);
+    sink.i32_const(bytes as i32);
+    sink.memory_fill(0);
+}
+
+/// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
+/// length store: items only, starting at `basesize`. IncrementalMiniMark
+/// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
+fn emit_zero_array_plan(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    result: u32,
+    base_size: i64,
+    item_size: i64,
+    length: OpRef,
+    plan: &ZeroArrayPlan,
+) {
+    if item_size <= 0 {
+        return;
+    }
+    match *plan {
+        ZeroArrayPlan::Skip => {}
+        ZeroArrayPlan::Items { start, count } => {
+            // wasm32 memory.fill takes an i32 length; a truncated cast
+            // would zero a prefix and leave the rest dirty. Skip rather
+            // than emit a shorter fill (`handle_new_array` already sent
+            // oversized constants to the collecting helper).
+            let Some(item_size) = u32::try_from(item_size).ok() else {
+                return;
+            };
+            let Some(count) = u32::try_from(count).ok() else {
+                return;
+            };
+            let Some(bytes) = item_size.checked_mul(count) else {
+                return;
+            };
+            let dest = base_size.saturating_add(i64::from(item_size).saturating_mul(start as i64));
+            emit_zero_array_item_range(sink, value_types, result, dest, bytes);
+        }
+        ZeroArrayPlan::Runtime => {
+            let Ok(item_size) = i32::try_from(item_size) else {
+                return;
+            };
+            sink.local_get(value_types.local(result));
+            sink.i32_wrap_i64();
+            if base_size != 0 {
+                sink.i32_const(base_size as i32);
+                sink.i32_add();
+            }
+            sink.i32_const(0);
+            emit_resolve(sink, constants, value_types, length);
+            sink.i32_wrap_i64();
+            if item_size != 1 {
+                sink.i32_const(item_size);
+                sink.i32_mul();
+            }
+            sink.memory_fill(0);
+        }
+    }
+}
+
 /// The element index a card-marking barrier needs, or `None` for a store that
 /// takes the plain barrier.
 ///
@@ -4431,47 +4738,6 @@ fn emit_nursery_ptr_increment(
     });
     sink.local_get(alloc_scratch_local);
     sink.i64_extend_i32_u();
-}
-
-/// Zero `len` bytes at `base_local + offset`. `base_local` holds an i32
-/// linear-memory address. Operand-stack-neutral.
-fn emit_zero_bytes(sink: &mut PeepSink<'_, '_>, base_local: u32, offset: u32, len: u32) {
-    if len == 0 {
-        return;
-    }
-    sink.local_get(base_local);
-    if offset != 0 {
-        sink.i32_const(offset as i32);
-        sink.i32_add();
-    }
-    sink.i32_const(0);
-    sink.i32_const(len as i32);
-    sink.memory_fill(0);
-}
-
-/// `malloc_cond` does not zero the payload. Nursery reset is dirty
-/// (`malloc_zero_filled = False`), so a leftover *gc pointer* would be
-/// traced. Skip the fill when this lowering stamps every gc Ref
-/// (`NewWithVtable` writes `w_class`) or the descr has none — fannkuch's
-/// eight `W_IntObject` bumps at JUMP are that case.
-fn nursery_new_has_unstamped_gc_refs(sd: &dyn SizeDescr, stamps_class_word: bool) -> bool {
-    let class_off = stamps_class_word
-        .then(|| sd.class_word_field().map(|fd| fd.offset()))
-        .flatten();
-    sd.gc_fielddescrs()
-        .iter()
-        .any(|fd| fd.field_type() == Type::Ref && Some(fd.offset()) != class_off)
-}
-
-/// Zero the payload of a headered nursery object whose header is in
-/// `header_local` and whose allocated total is `total` bytes.
-fn emit_zero_headered_payload(sink: &mut PeepSink<'_, '_>, header_local: u32, total: usize) {
-    emit_zero_bytes(
-        sink,
-        header_local,
-        GcHeader::SIZE as u32,
-        total.saturating_sub(GcHeader::SIZE) as u32,
-    );
 }
 
 /// `__indirect_function_table` indices of the allocation helpers a compiled
@@ -8366,6 +8632,19 @@ fn build_function(
                     ca.ca_reload_fn_ptr,
                     ca.jf_top_addr,
                 );
+                // rewrite.py `clear_varsize_gc_fields` FLAG_STR / FLAG_UNICODE:
+                // `emit_setfield(result, 0, descr=hash_descr)`. Both layouts
+                // keep `hash` at offset 0 (`rewrite.rs clear_varsize_gc_fields`).
+                if !OpRef::raw_is_constant(vi) {
+                    sink.local_get(value_types.local(vi));
+                    sink.i32_wrap_i64();
+                    sink.i32_const(0);
+                    sink.i32_store(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    });
+                }
                 let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
                 emit_reload_frame_if_necessary(
                     &mut sink,
@@ -8542,7 +8821,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, bump_size as usize);
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(GcHeader::SIZE as i32);
                     sink.i32_add();
@@ -8656,7 +8934,6 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
-                    emit_zero_bytes(&mut sink, alloc_scratch_local, 0, bump_size);
                     sink.local_get(alloc_scratch_local);
                     sink.i64_extend_i32_u();
                     sink.end();
@@ -8824,7 +9101,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, bump_size as usize);
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(GcHeader::SIZE as i32);
                     sink.i32_add();
@@ -9671,17 +9947,23 @@ fn build_function(
                             .map(|fd| (fd.offset() as u64, w_class))
                     })
                 });
-                // Same predicate as the store below (`w_class != 0`).
-                // `w_class_obj_for_vtable` already returns None for a
-                // null instantiate; keep the pair aligned if a descr
-                // answers Some(0).
-                let stamps_class_word = op.opcode == OpCode::NewWithVtable
-                    && w_class_init.is_some_and(|(_, w_class)| w_class != 0);
-                // `New` still fills: rewrite may leave gc Refs unstamped.
-                // `NewWithVtable` stamps `w_class` here; skip the fill when
-                // that covers every gc Ref (`malloc_cond` does not zero).
-                let zero_payload = op.opcode != OpCode::NewWithVtable
-                    || sd.is_none_or(|sd| nursery_new_has_unstamped_gc_refs(sd, stamps_class_word));
+                // rewrite.py NEW_WITH_VTABLE `emit_setfield` of the vtable
+                // after `handle_new_fixedsize`; that store cancels the
+                // delayed NULL at the same offset.
+                let write_vtable =
+                    op.opcode == OpCode::NewWithVtable && vtable != 0 && vtable_offset.is_some();
+                let stamp_w_class = w_class_init.is_some_and(|(_, w_class)| w_class != 0);
+                let pending_zeros = sd.map_or_else(Vec::new, |sd| {
+                    pending_new_zero_offsets(
+                        sd,
+                        ops,
+                        op_idx,
+                        op.pos().get(),
+                        vtable_offset.filter(|_| write_vtable),
+                        stamp_w_class,
+                        &same_as_forwardings,
+                    )
+                });
 
                 // `rewrite.rs handle_new`: a `non_moving` descr declines the
                 // nursery outright — both the inline bump and the collecting
@@ -9730,14 +10012,7 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
-                    if zero_payload {
-                        emit_zero_bytes(
-                            &mut sink,
-                            alloc_scratch_local,
-                            0,
-                            total_size.saturating_sub(GcHeader::SIZE) as u32,
-                        );
-                    }
+
                     sink.else_();
                     sink.i64_const(type_id);
                     sink.i64_const(size);
@@ -9836,9 +10111,7 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    if zero_payload {
-                        emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
-                    }
+
                     if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
                         sink.i32_const(1);
                         sink.local_set(alloc_batch_flag_local);
@@ -9914,9 +10187,6 @@ fn build_function(
                     // WORD, vtable). The `ob_type` field is pointer-width: 4
                     // bytes on wasm32 (GuardClass reads it as i32), so store
                     // the low 32 bits to avoid clobbering the next field.
-                    let write_vtable = op.opcode == OpCode::NewWithVtable
-                        && vtable != 0
-                        && vtable_offset.is_some();
                     if write_vtable {
                         let vt_off = vtable_offset.unwrap() as u64;
                         sink.local_get(value_types.local(vi));
@@ -9936,8 +10206,9 @@ fn build_function(
                     // Without it the nursery-zeroed `w_class` stays 0 and the
                     // promoted-`w_class` GuardValue fails every iteration on any
                     // escaping-builtin loop (e.g. `while: lst.append(i)`).
-                    if op.opcode == OpCode::NewWithVtable
-                        && let Some((w_class_offset, w_class)) = w_class_init
+                    // rewrite.rs `handle_new` stamps `w_class` for both
+                    // New and NewWithVtable before `clear_gc_fields`.
+                    if let Some((w_class_offset, w_class)) = w_class_init
                         && w_class != 0
                     {
                         sink.local_get(value_types.local(vi));
@@ -9949,6 +10220,9 @@ fn build_function(
                             memory_index: 0,
                         });
                     }
+                    // rewrite.py emit_pending_zeros: leftover GC-pointer
+                    // fields only. Scalar payload stays dirty.
+                    emit_pending_null_fields(&mut sink, value_types.local(vi), &pending_zeros);
                 }
                 // The collecting allocation may have moved every other live
                 // Ref; reload them from their (forwarded) homes. Skip the fresh
@@ -9974,9 +10248,13 @@ fn build_function(
                         frame,
                     );
                 }
-                // `New*` overflow may still return old-gen when the nursery
-                // cannot hold the object. Do not seed `wb_applied` here —
-                // the first store emits the barrier, later stores CSE it.
+                // rewrite.py `gen_malloc_nursery` `remember_write_barrier`:
+                // a nursery-sized New is young on every arm (overflow
+                // collects and retries). Collecting / old-gen New stays
+                // out of the set (`_gen_call_malloc_gc`).
+                if inline_nursery.is_some() {
+                    remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
+                }
             }
             OpCode::NewArray | OpCode::NewArrayClear => {
                 let vi = op.pos().get().raw();
@@ -10005,10 +10283,17 @@ fn build_function(
                 // Constant lengths keep the existing compile-time total; a
                 // runtime length uses malloc_cond_varsize's precheck against a
                 // compile-time maxlength before computing the bump size.
-                // The inline bump zeros the payload with `memory.fill`;
-                // `NewArrayClear` items come from that, not from a nursery
-                // reset fill.
+                // rewrite.py ZERO_ARRAY after the length store covers
+                // leftover `NewArrayClear` items; plain `NewArray` does not.
                 let length_const = const_operand_value(constants, op.arg(0).to_opref());
+                let zero_plan = newarray_zero_plan(
+                    op,
+                    ops,
+                    op_idx,
+                    constants,
+                    length_const,
+                    &same_as_forwardings,
+                );
                 let inline_nursery_total = length_const.and_then(|len| {
                     use majit_gc::header::GcHeader;
                     let len = usize::try_from(len).ok()?;
@@ -10056,7 +10341,7 @@ fn build_function(
                 let batch_role = nursery_batches.get(op_idx).and_then(|role| role.as_ref());
                 if let (
                     Some(base),
-                    Some((length, total)),
+                    Some((length, _total)),
                     Some(NurseryBatchRole::Follower {
                         prev_result,
                         prev_size,
@@ -10075,12 +10360,6 @@ fn build_function(
                         *prev_result,
                         *prev_size,
                         type_id,
-                    );
-                    emit_zero_bytes(
-                        &mut sink,
-                        alloc_scratch_local,
-                        0,
-                        total.saturating_sub(GcHeader::SIZE) as u32,
                     );
                     sink.local_get(alloc_scratch_local);
                     sink.i32_const(length as i32);
@@ -10192,7 +10471,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -10330,17 +10608,6 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    // Payload length = new_free - header - HDR.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i32_const(0);
-                    sink.local_get(alloc_size_local);
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_sub();
-                    sink.i32_const(GcHeader::SIZE as i32);
-                    sink.i32_sub();
-                    sink.memory_fill(0);
                     // Length field (usize, 4 bytes on wasm32) at
                     // `payload + len_offset`.
                     sink.local_get(alloc_scratch_local);
@@ -10454,10 +10721,25 @@ fn build_function(
                         frame,
                     );
                 }
-                // GcRewriterAssembler.gen_malloc_nursery_varsize only remembers
-                // a proven nursery allocation. A runtime length can take our
-                // external/old-generation helper arm, so eligibility for the
-                // inline arm is not a generation proof at this join.
+                // rewrite.py `handle_clear_array_contents` / `emit_pending_zeros`.
+                if !OpRef::raw_is_constant(vi) {
+                    emit_zero_array_plan(
+                        &mut sink,
+                        constants,
+                        value_types,
+                        vi,
+                        base_size,
+                        item_size,
+                        op.arg(0).to_opref(),
+                        &zero_plan,
+                    );
+                }
+                // rewrite.py `gen_malloc_nursery` remembers a const-length
+                // nursery array. `gen_malloc_nursery_varsize` does not —
+                // the array may be large and card-marked.
+                if inline_nursery_total.is_some() {
+                    remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
+                }
             }
 
             // ── Misc ──
