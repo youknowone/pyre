@@ -396,7 +396,7 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
     }
     let session = ctx.session.borrow();
     let parent = need!(
-        need!(session.framestack.first(), "empty framestack")
+        need!(session.first_inline(), "empty framestack")
             .parents
             .first(),
         "innermost frame has no parent"
@@ -482,7 +482,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         _ => 0,
     };
 
-    if ctx.session.borrow().framestack.is_empty() && !ctx.fbw_mode.inline_subwalk {
+    if ctx.session.borrow().at_portal() && !ctx.fbw_mode.inline_subwalk {
         let Some((jitcode, cf_addr, live_root_addr)) = (unsafe {
             if ctx.fbw_mode.snapshot_sym.is_null() {
                 None
@@ -604,7 +604,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
     } else {
         latchdbg!(
             "origin={origin} no-arm framestack_empty={} inline_subwalk={}",
-            ctx.session.borrow().framestack.is_empty(),
+            ctx.session.borrow().at_portal(),
             ctx.fbw_mode.inline_subwalk
         );
         false
@@ -1114,7 +1114,7 @@ fn build_multi_frame_miframe<Sym: WalkSym>(
         };
     }
     let session = ctx.session.borrow();
-    if session.framestack.is_empty() {
+    if session.at_portal() {
         s2dbg!(
             "origin={origin} framestack empty depth={} transparent_helper_subwalk={}",
             session.framestack.len(),
@@ -4644,7 +4644,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                 // Same non-bridge latch as the escape-flush commit above:
                 // a bridge walk never adopts this image (`run_perfn_walk`
                 // epilogue is skipped).
-                if ctx.session.borrow().framestack.is_empty()
+                if ctx.session.borrow().at_portal()
                     && !ctx.fbw_mode.inline_subwalk
                     && !ctx.trace_ctx.is_bridge_trace
                 {
@@ -5466,17 +5466,20 @@ pub(crate) fn disarm_folded_inline_callee_after_escape<Sym: WalkSym>(
     for (slot, value, concrete) in slots {
         let index = ctx.trace_ctx.const_int(slot);
         let guards_before = ctx.trace_ctx.num_guards();
-        let write = match ctx.trace_ctx.vable_setarrayitem_indexed(
-            pc,
-            callee_frame,
-            index,
-            slot,
-            fdescr.clone(),
-            adescr.clone(),
-            value,
-            concrete,
-            false,
-        ) {
+        let store = vable_ops::with_replace_frames(ctx, |ctx| {
+            ctx.trace_ctx.vable_setarrayitem_indexed(
+                pc,
+                callee_frame,
+                index,
+                slot,
+                fdescr.clone(),
+                adescr.clone(),
+                value,
+                concrete,
+                false,
+            )
+        });
+        let write = match store {
             VableArrayStore::Stored(write) => write,
             // The out-of-vable store recorded nothing, so there is no pre-store
             // entry to roll back. Whether it should abort the trace is tracked

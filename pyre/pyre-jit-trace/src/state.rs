@@ -2005,6 +2005,7 @@ pub(crate) fn seed_virtualizable_boxes(
     heap_ptr: *const u8,
 ) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    ctx.install_virtualizable_info(info.clone());
     let expected_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     assert_eq!(
         scalar_oprefs.len(),

@@ -17,7 +17,7 @@ use super::*;
 /// All register banks share the frame's owned slots, so replacement follows
 /// `MIFrame.replace_active_box_in_frame` without a retained mutable slice or
 /// delayed replay. A paused Python caller stores those lists on
-/// `InlineParentFrame`; the portal uses `WalkSession.portal_live`; a
+/// `InlineParentFrame`; the portal is `WalkSession.framestack[0]`; a
 /// transparent helper uses `WalkSession.helper_live`.
 fn replace_slots(slots: &mut [OpRef], oldbox: OpRef, newbox: OpRef) {
     for slot in slots {
@@ -50,11 +50,14 @@ pub(super) fn bind_paused_caller_regs(
 ) {
     let live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
     let mut session = session.borrow_mut();
-    if let Some(top) = session.framestack.last_mut() {
-        top.live = Some(live);
-    } else {
-        session.portal_live = Some(live);
+    if session.framestack.is_empty() {
+        session.framestack.push(InlineFrame::portal());
     }
+    session
+        .framestack
+        .last_mut()
+        .expect("portal occupies framestack[0]")
+        .live = Some(live);
 }
 
 pub(super) fn push_helper_live(
@@ -77,9 +80,6 @@ pub(super) fn pop_helper_live(session: &std::cell::RefCell<WalkSession>) {
 }
 
 fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox: OpRef) {
-    if let Some(live) = session.portal_live.as_ref() {
-        replace_live_regs(live, oldbox, newbox);
-    }
     for live in &session.helper_live {
         replace_live_regs(live, oldbox, newbox);
     }
@@ -110,27 +110,51 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
             }
         }
     }
-    if session.last_exc_value == Some(oldbox) {
-        session.last_exc_value = Some(newbox);
-    }
-    for slot in [
-        &mut session.tmpreg_r,
-        &mut session.tmpreg_i,
-        &mut session.tmpreg_f,
-    ] {
-        replace_slots(std::slice::from_mut(slot), oldbox, newbox);
-    }
 }
 
-/// `pyjitpl.py MetaInterp.replace_box` framestack half for the walker.
-///
-/// `_nonstandard_virtualizable` Step 4 already rewrote the TraceCtx
-/// records. The live register banks are this walk's `MIFrame` analogue.
-pub(super) fn apply_pending_vable_box_replace<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
-    let Some((oldbox, newbox)) = ctx.trace_ctx.take_pending_box_replace() else {
-        return;
+/// Install the walker's framestack half of `MetaInterp.replace_box` so
+/// `_nonstandard_virtualizable` can rewrite banks immediately.
+pub(super) fn with_replace_frames<Sym: WalkSym, R>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    f: impl FnOnce(&mut WalkContext<'_, '_, Sym>) -> R,
+) -> R {
+    struct WalkerReplaceData {
+        session: *const std::cell::RefCell<WalkSession>,
+        registers_r: *const RegisterBank,
+        registers_i: *const RegisterBank,
+        registers_f: *const RegisterBank,
+        frame_state: *const WalkFrameState,
+    }
+    unsafe fn walk(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+        let data = unsafe { &*data.cast::<WalkerReplaceData>() };
+        let mut session = unsafe { (*data.session).borrow_mut() };
+        replace_box_in_paused_frames(&mut session, oldbox, newbox);
+        match oldbox.ty() {
+            Some(Type::Int) => unsafe { (*data.registers_i).replace_active_box(oldbox, newbox) },
+            Some(Type::Ref) => unsafe { (*data.registers_r).replace_active_box(oldbox, newbox) },
+            Some(Type::Float) => unsafe { (*data.registers_f).replace_active_box(oldbox, newbox) },
+            _ => {}
+        }
+        unsafe {
+            (*data.frame_state).replace_active_box(oldbox, newbox);
+        }
+    }
+    let mut data = WalkerReplaceData {
+        session: ctx.session,
+        registers_r: ctx.registers_r,
+        registers_i: ctx.registers_i,
+        registers_f: ctx.registers_f,
+        frame_state: &ctx.frame_state,
     };
-    replace_box_in_all_walk_frames(ctx, oldbox, newbox);
+    // SAFETY: `data` is the walk-local ReplaceData, live until the
+    // matching `clear_replace_frames` below.
+    unsafe {
+        ctx.trace_ctx
+            .set_replace_frames(Some(walk), &raw mut data as *mut ());
+    }
+    let result = f(ctx);
+    ctx.trace_ctx.clear_replace_frames();
+    result
 }
 
 /// `pyjitpl.py MetaInterp.replace_box`: promotion updates the recording
@@ -195,6 +219,7 @@ mod frame_replacement_tests {
             &suspended_state,
         );
         session.borrow_mut().framestack.push(InlineFrame {
+            is_portal: false,
             w_code: 1,
             recursion_greenkey: true,
             call_id: 1,
@@ -225,7 +250,7 @@ mod frame_replacement_tests {
         assert_eq!(active_state.borrow().vstack_boxes, [old]);
         // Guard capture in the child already sees the rewritten caller.
         assert_eq!(
-            session.borrow().framestack[0].parents[0].boxes,
+            session.borrow().framestack.last().unwrap().parents[0].boxes,
             vec![standard]
         );
         // Both frames have already changed before either continuation runs.
@@ -292,21 +317,22 @@ mod frame_replacement_tests {
             // nonstandard virtualizable promotion, not just this Ref bank.
             walker_replace_box(&mut ctx, standard, middle);
             assert_eq!(ctx.frame_state.borrow().vstack_boxes, [middle]);
-            assert_eq!(session.borrow().framestack[0].parents[0].boxes, [middle]);
+            assert_eq!(
+                session.borrow().framestack.last().unwrap().parents[0].boxes,
+                [middle]
+            );
             walker_replace_box(&mut ctx, middle, standard);
             ctx.registers_r.set(0, old);
             ctx.frame_state.borrow_mut().vstack_boxes[0] = old;
-            let mut info =
-                majit_metainterp::virtualizable::VirtualizableInfo::without_vable_token();
-            info.add_field("last_instr", Type::Int, 0);
-            info.set_parent_descr(majit_ir::descr::make_size_descr(8));
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
             let initial = ctx.trace_ctx.const_int(0);
             let pointer = Value::Ref(majit_ir::GcRef(0x1000));
             ctx.trace_ctx.set_opref_concrete(old, pointer);
+            ctx.trace_ctx.install_virtualizable_info(info.clone());
             ctx.trace_ctx.set_virtualizable_boxes_with_info(
                 vec![initial, standard],
                 vec![Value::Int(0), pointer],
-                &info,
+                info.as_ref(),
                 &[],
             );
             let site = TracebackNodeSite {
@@ -329,7 +355,6 @@ mod frame_replacement_tests {
             assert!(ctx.trace_ctx.num_guards() > guards_before);
             assert_eq!(ctx.registers_r.to_vec(), vec![standard]);
             assert_eq!(ctx.frame_state.borrow().vstack_boxes, vec![standard]);
-            assert!(ctx.trace_ctx.take_pending_box_replace().is_none());
         }
     }
 
@@ -345,6 +370,7 @@ mod frame_replacement_tests {
             ..Default::default()
         });
         session.borrow_mut().framestack.push(InlineFrame {
+            is_portal: false,
             w_code: 1,
             recursion_greenkey: true,
             call_id: 1,
@@ -370,7 +396,10 @@ mod frame_replacement_tests {
         assert_eq!(parent_regs.get(0), Some(new));
         assert_eq!(parent_state.borrow().vstack_boxes, [new]);
         assert_eq!(parent_state.borrow().vstack_last_ref, new);
-        assert_eq!(session.borrow().framestack[0].parents[0].boxes, vec![new]);
+        assert_eq!(
+            session.borrow().framestack.last().unwrap().parents[0].boxes,
+            vec![new]
+        );
     }
 
     #[test]
@@ -390,11 +419,35 @@ mod frame_replacement_tests {
             &RegisterBank::default(),
             &state,
         );
-        assert!(session.borrow().framestack.is_empty());
-        assert!(session.borrow().portal_live.is_some());
+        assert!(session.borrow().at_portal());
+        assert!(session.borrow().framestack[0].is_portal);
+        assert!(session.borrow().framestack[0].live.is_some());
         replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
         assert_eq!(regs.get(0), Some(new));
         assert_eq!(state.borrow().vstack_boxes, [new]);
+    }
+
+    #[test]
+    fn replace_box_does_not_walk_last_exc_or_tmpreg() {
+        // `pyjitpl.py MetaInterp.replace_box` walks framestack only.
+        // `last_exc_value` is a MetaInterp concrete pointer, `tmpreg_*`
+        // belong to the blackhole interpreter.
+        let old = OpRef::input_arg_ref(0);
+        let new = OpRef::input_arg_ref(1);
+        let session = std::cell::RefCell::new(WalkSession::default());
+        {
+            let mut session = session.borrow_mut();
+            session.last_exc_value = Some(old);
+            session.tmpreg_r = old;
+            session.tmpreg_i = OpRef::input_arg_int(0);
+            session.tmpreg_f = OpRef::input_arg_float(0);
+        }
+        replace_box_in_paused_frames(&mut session.borrow_mut(), old, new);
+        let session = session.borrow();
+        assert_eq!(session.last_exc_value, Some(old));
+        assert_eq!(session.tmpreg_r, old);
+        assert_eq!(session.tmpreg_i, OpRef::input_arg_int(0));
+        assert_eq!(session.tmpreg_f, OpRef::input_arg_float(0));
     }
 
     #[test]
@@ -443,8 +496,12 @@ mod frame_replacement_tests {
             assert_eq!(banks[i].to_vec(), [new[i], new[i]]);
         }
         drop(banks);
-        // portal_live owns the storage, not a pointer into the dropped owner.
-        let live = session.borrow().portal_live.as_ref().unwrap().clone();
+        // The portal frame owns the storage, not a pointer into the dropped owner.
+        let live = session.borrow().framestack[0]
+            .live
+            .as_ref()
+            .expect("portal live")
+            .clone();
         for (bank, (old, new)) in [&live.registers_r, &live.registers_i, &live.registers_f]
             .into_iter()
             .zip(old.into_iter().zip(new))
@@ -639,7 +696,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // with, or the trace and the optimizer could disagree about the constant;
     // `trace.rs` installs this same `shared()` handle via `set_cpu`.
     let cpu = crate::pyre_cpu::shared();
-    let (result, shadow_value) = match dst_bank {
+    let (result, shadow_value) = with_replace_frames(ctx, |ctx| match dst_bank {
         'i' => ctx
             .trace_ctx
             .vable_getfield_int(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
@@ -650,8 +707,7 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
             .trace_ctx
             .vable_getfield_float(cpu.as_ref(), pc, obj, vable_struct_ptr, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
-    };
-    apply_pending_vable_box_replace(ctx);
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     // RPython `opimpl_getfield_vable_{i,r,f}` returns
     // `virtualizable_boxes[index]` (`pyjitpl.py`) — a Box whose
@@ -802,10 +858,10 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
     // JitCode PC, pass through.
     let guards_before = ctx.trace_ctx.num_guards();
-    let write = ctx
-        .trace_ctx
-        .vable_setfield(op.pc, obj, descr, value, concrete);
-    apply_pending_vable_box_replace(ctx);
+    let write = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .vable_setfield(op.pc, obj, descr, value, concrete)
+    });
     // `MIFrame` owns one red frame per inlined call.  The trace shadow remains
     // authoritative for optimization, while the matching concrete frame is
     // its blackhole-resume image; mirror only own-frame standard-vable writes,
@@ -1025,10 +1081,10 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // Upstream decides standardness before promoting the index: an ordinary
     // heap access on the non-standard leg must retain the index box as-is.
     let check_guards_before = ctx.trace_ctx.num_guards();
-    let nonstandard = ctx
-        .trace_ctx
-        .nonstandard_virtualizable(op.pc, vable, &fdescr);
-    apply_pending_vable_box_replace(ctx);
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .nonstandard_virtualizable(op.pc, vable, &fdescr)
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -1321,10 +1377,10 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // As in the read path, only the standard virtualizable leg promotes the
     // array index and needs the full walker-owned resume snapshot.
     let check_guards_before = ctx.trace_ctx.num_guards();
-    let nonstandard = ctx
-        .trace_ctx
-        .nonstandard_virtualizable(op.pc, vable, &fdescr);
-    apply_pending_vable_box_replace(ctx);
+    let nonstandard = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx
+            .nonstandard_virtualizable(op.pc, vable, &fdescr)
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, check_guards_before, None)?;
     let index = if nonstandard {
         index
@@ -1503,15 +1559,16 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     let (fdescr, adescr) = vable_array_descrs_from_jitcode(code, op, 1, 3, ctx)?;
     let guards_before = ctx.trace_ctx.num_guards();
     let cpu = crate::pyre_cpu::shared();
-    let result = ctx.trace_ctx.vable_arraylen_vable(
-        cpu.as_ref(),
-        op.pc,
-        vable,
-        vable_struct_ptr,
-        fdescr,
-        adescr,
-    );
-    apply_pending_vable_box_replace(ctx);
+    let result = with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx.vable_arraylen_vable(
+            cpu.as_ref(),
+            op.pc,
+            vable,
+            vable_struct_ptr,
+            fdescr,
+            adescr,
+        )
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, op.pc, guards_before, None)?;
     let dst = code[op.pc + 6] as usize;
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);

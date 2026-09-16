@@ -6535,11 +6535,13 @@ impl<S: JitState> JitDriver<S> {
             // exception guard unwinds into its handler instead of resuming
             // the no-exception continuation.
             let guard_exc = result.exception.exc_value;
-            drop(result);
-            // The deadframe root died with the grab and the reconstruction
-            // below allocates through the blackhole allocator, so hold the
-            // exception where the frontend's root walker can reach it until
-            // `prepare_resume_from_failure` hands it to the blackhole.
+            let savedata = result.savedata;
+            // Keep `result` (and its deadframe) until this arm returns so
+            // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
+            // `compile.py handle_fail(self, deadframe, ...)`.
+            // The reconstruction below allocates through the blackhole allocator,
+            // so hold the exception where the frontend's root walker can reach
+            // it until `prepare_resume_from_failure` hands it to the blackhole.
             let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
 
             // must_compile tick for bridge threshold counting.
@@ -6757,7 +6759,7 @@ impl<S: JitState> JitDriver<S> {
                         .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                     None, // ginfo
                     vable_identity_override,
-                    None, // all_virtuals
+                    savedata.and_then(crate::compile::AllVirtuals::show),
                     allocator,
                 );
                 let (mut bh, vable_ptr) = bh;
@@ -7973,18 +7975,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.walk_compile_snapshot_refs(visitor);
     }
 
-    /// GC walker for the forced-virtual caches awaiting a `GUARD_NOT_FORCED`.
-    /// See `MetaInterp::walk_forced_virtuals_refs`.
-    pub fn walk_forced_virtuals_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
-        self.meta.walk_forced_virtuals_refs(visitor);
-    }
-
-    /// Drop forced-virtual caches whose owner frame died.
-    /// See `MetaInterp::prune_forced_virtuals`.
-    pub fn prune_forced_virtuals(&mut self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        self.meta.prune_forced_virtuals(classify);
-    }
-
     pub fn run_compiled_detailed_keyed(
         &mut self,
         green_key: u64,
@@ -8255,6 +8245,12 @@ impl<S: JitState> JitDriver<S> {
         // guard failure travels with the GuardFailure outcome so the
         // blackhole resume can seed it (blackhole.py:1794).
         let guard_exc = result.exception.exc_value;
+        // compile.py `cpu.get_savedata_ref(deadframe)` — fished here
+        // while the CompileResult still owns the word, then handed to
+        // `ResumeGuardForcedDescr.handle_fail`. Keep the deadframe
+        // until `AllVirtuals.show` so `jf_savedata` stays rooted.
+        let savedata = result.savedata;
+        let deadframe = result.deadframe.take();
         drop(result);
 
         // memmgr.py: keep_loop_alive(loop_token)
@@ -8335,6 +8331,8 @@ impl<S: JitState> JitDriver<S> {
             raw_values,
             exit_layout,
             guard_exc,
+            savedata,
+            deadframe,
         }
     }
 
@@ -10173,7 +10171,13 @@ mod tests {
             DetailedDriverRunOutcome::Jump { via_blackhole, .. } => {
                 assert!(!via_blackhole);
             }
-            other => panic!("expected Jump outcome, got {other:?}"),
+            DetailedDriverRunOutcome::Finished { .. } => {
+                panic!("expected Jump outcome, got Finished")
+            }
+            DetailedDriverRunOutcome::GuardFailure { .. } => {
+                panic!("expected Jump outcome, got GuardFailure")
+            }
+            DetailedDriverRunOutcome::Abort { .. } => panic!("expected Jump outcome, got Abort"),
         }
         assert_eq!(state.restored_values, typed_live_values);
         assert_eq!(state.raw_restore_calls, 0);

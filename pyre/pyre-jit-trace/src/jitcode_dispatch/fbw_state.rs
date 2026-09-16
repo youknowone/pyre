@@ -139,6 +139,7 @@ mod recursion_depth_policy_tests {
 
     fn frame(w_code: usize, recursion_greenkey: bool) -> InlineFrame {
         InlineFrame {
+            is_portal: false,
             w_code,
             recursion_greenkey,
             call_id: 0,
@@ -2682,8 +2683,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
     let (outer_resume, stack_overrides, blackhole_required) = {
         let session = ctx.session.borrow();
         let outermost = session
-            .framestack
-            .first()
+            .first_inline()
             .filter(|f| fbw_executed_effect_count() == f.entry_executed_effects);
         let (outer_resume, stack_overrides) = match outermost.and_then(|f| f.parents.first()) {
             Some(frame) => (
@@ -2698,15 +2698,14 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
             ),
             None => (None, Vec::new()),
         };
-        // The aborting operation belongs to the innermost live MIFrame.
-        // If that frame has applied nothing since its CALL, discard the
-        // attempted frame and let its caller resume at the CALL.  A
-        // multi-frame blackhole conversion is required only once that
-        // frame itself has state to preserve; effects in paused ancestors
-        // are already represented by their own frame images.  This is the
-        // per-frame boundary `convert_and_run_from_pyjitpl` preserves when
-        // it copies every `MIFrame` independently (`blackhole.py`
-        // `convert_and_run_from_pyjitpl`).
+        // The aborting operation belongs to the innermost live MIFrame,
+        // including the portal at `framestack[0]`. A root walk has no
+        // inline frame, so `last_inline()` would miss the portal's own
+        // effect delta and drop `fbw_blackhole_adopted_single_frame`.
+        // `first_inline()` above is only for the paused caller's parent
+        // resume record; this test is the per-frame boundary
+        // `convert_and_run_from_pyjitpl` preserves when it copies every
+        // `MIFrame` independently (`blackhole.py`).
         // An in-flight FOR_ITER item is in no frame image, so the per-frame
         // test above cannot see it: a body effect committed in an enclosing
         // frame leaves the innermost frame's delta at zero while
@@ -2734,7 +2733,7 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
 pub(crate) fn fbw_innermost_inline_callee_key<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> Option<usize> {
-    ctx.session.borrow().framestack.last().map(|f| f.w_code)
+    ctx.session.borrow().last_inline().map(|f| f.w_code)
 }
 
 /// Take the outer-caller CALL JitCode coordinate stashed by

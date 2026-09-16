@@ -4946,7 +4946,7 @@ fn try_walker_orthodox_load_super_attr<Sym: WalkSym>(
     // than answering wrongly.  The two spaces coincide only when the walk is
     // executing the framestack frame's own jitcode, which is what an empty
     // framestack witnesses here.
-    if !ctx.session.borrow().framestack.is_empty() {
+    if !ctx.session.borrow().at_portal() {
         return Ok(None);
     }
     let Some(jc_arc) = crate::jitcode_runtime::load_super_attr_value_jitcode() else {
@@ -12906,14 +12906,16 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // `virtualizable_boxes[index]` and records no op.
         let index_const = ctx.trace_ctx.const_int(i as i64);
         index_consts.push(index_const);
-        let (slot_op, _) = ctx.trace_ctx.vable_getarrayitem_ref_indexed(
-            op.pc,
-            vable_op,
-            index_const,
-            i as i64,
-            fdescr.clone(),
-            adescr.clone(),
-        );
+        let (slot_op, _) = vable_ops::with_replace_frames(ctx, |ctx| {
+            ctx.trace_ctx.vable_getarrayitem_ref_indexed(
+                op.pc,
+                vable_op,
+                index_const,
+                i as i64,
+                fdescr.clone(),
+                adescr.clone(),
+            )
+        });
         // `pyframe.py:566-571` branches on the slot being bound; pin the
         // direction so a slot that changes bound-ness side-exits instead of
         // publishing a mapping with the wrong key set.  A slot the trace

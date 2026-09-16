@@ -248,25 +248,43 @@ fn config() -> GraphTransformConfig {
 /// `assembler.rs` asserts that index kind, so it aborted the build outright
 /// — asserting that this call returns at all is the assertion.
 ///
-/// The bare `CallControl` here is not a simplification: the production
-/// pipeline also declines `fast2locals` in the real rtyper's two-phase
-/// prepass and types it with the legacy walker, which is the tier that reads
-/// `result_ty` off the op.
+/// Production declines `fast2locals` in the rtyper's two-phase prepass and
+/// types it with the legacy walker, so this test still drives a standalone
+/// `CallControl` rather than the full portal set. `rewrite_op_jit_force_virtualizable`
+/// still asserts a jitdriver vinfo once a handle is attached
+/// (`jtransform.py`), so the eval-loop virtualizable is registered from
+/// `config()` the same way `codewriter_vinfo_from_config` does in the
+/// prepass.
 #[test]
 fn fast2locals_assembles() {
     let Some(graph) = lower_fast2locals() else {
         return;
     };
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
+    let cfg = config();
     let mut callcontrol = CallControl::new();
     callcontrol.register_function_graph(path.clone(), graph.clone());
+    callcontrol.setup_jitdriver(
+        CallPath::from_segments(["pyre_interpreter", "eval", "dispatch_bytecode"]),
+        vec![],
+        vec!["frame".into()],
+        vec![],
+        vec![],
+        false,
+        vec!["frame".into()],
+        vec!["PyFrame".into()],
+        CallPath::from_segments(["pyre_interpreter", "eval", "dispatch_bytecode"]),
+    );
+    callcontrol.make_virtualizable_infos(|_, vtype| {
+        majit_translate::codewriter::call::codewriter_vinfo_from_config(vtype, &cfg)
+    });
     let mut codewriter = CodeWriter::new();
     let jitcode = std::sync::Arc::new(JitCode::new("fast2locals"));
     codewriter.transform_graph_to_jitcode(
         &graph,
         &path,
         &mut callcontrol,
-        &config(),
+        &cfg,
         &jitcode,
         false,
         0,

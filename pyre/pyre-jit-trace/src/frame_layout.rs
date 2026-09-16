@@ -139,24 +139,35 @@ unsafe extern "C" fn pyre_clear_vable_token(obj_ptr: i64) {
 /// required by `OptContext::ensure_ptr_info_arg0` (`optimizer.py`)
 /// to dispatch GETFIELD/SETFIELD to `InstancePtrInfo` / `StructPtrInfo`.
 pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
-    let mut info = crate::virtualizable_gen::build_virtualizable_info();
-    // rpython/jit/metainterp/virtualizable.py `clear_vable_ptr`
-    // + `clear_vable_descr`. The descr must carry
-    // EffectInfo.MOST_GENERAL + OopSpecIndex.JitForceVirtualizable
-    // and mark the call CANNOT_RAISE — `VirtualizableInfo::make_clear
-    // _vable_descr` is the single-source-of-truth factory that
-    // constructs exactly that descriptor. Using
-    // `make_call_descr(.., EffectInfo::default())` here would drop
-    // the CANNOT_RAISE / OS_JIT_FORCE_VIRTUALIZABLE flags and cause
-    // the optimizer to treat the call as a raising general call.
-    //
-    // Populate clear_vable BEFORE `finalize_arc`: finalize consumes self
-    // and rebuilds descriptors inside `Arc::new_cyclic`, so any fields
-    // set here survive into the returned Arc. After the Arc is formed
-    // the vinfo is immutable through the shared handle.
-    info.clear_vable_ptr = Some(pyre_clear_vable_token as *const () as usize);
-    info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
-    info.finalize_arc(crate::state::pyframe_size_descr())
+    // warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`: one
+    // VirtualizableInfo per virtualizable type. Field descrs stamp a
+    // Weak back to that object, and `_nonstandard_virtualizable` asks
+    // `vinfo is fielddescr.get_vinfo()`.
+    static INFO: std::sync::OnceLock<std::sync::Arc<VirtualizableInfo>> =
+        std::sync::OnceLock::new();
+    INFO.get_or_init(|| {
+        let mut info = crate::virtualizable_gen::build_virtualizable_info();
+        // rpython/jit/metainterp/virtualizable.py `clear_vable_ptr`
+        // + `clear_vable_descr`. The descr must carry
+        // EffectInfo.MOST_GENERAL + OopSpecIndex.JitForceVirtualizable
+        // and mark the call CANNOT_RAISE — `VirtualizableInfo::make_clear
+        // _vable_descr` is the single-source-of-truth factory that
+        // constructs exactly that descriptor. Using
+        // `make_call_descr(.., EffectInfo::default())` here would drop
+        // the CANNOT_RAISE / OS_JIT_FORCE_VIRTUALIZABLE flags and cause
+        // the optimizer to treat the call as a raising general call.
+        //
+        // Populate clear_vable BEFORE `finalize_arc`: finalize consumes self
+        // and rebuilds descriptors inside `Arc::new_cyclic`, so any fields
+        // set here survive into the returned Arc. After the Arc is formed
+        // the vinfo is immutable through the shared handle.
+        info.clear_vable_ptr = Some(pyre_clear_vable_token as *const () as usize);
+        info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
+        let info = info.finalize_arc(crate::state::pyframe_size_descr());
+        info.finish();
+        info
+    })
+    .clone()
 }
 
 #[cfg(test)]
@@ -230,6 +241,16 @@ mod tests {
         FORCED_WITH_TOKEN.store(usize::MAX, Ordering::SeqCst);
         unsafe { pyre_clear_vable_token(0) };
         assert_eq!(FORCED_WITH_TOKEN.load(Ordering::SeqCst), usize::MAX);
+    }
+
+    #[test]
+    fn pyframe_vinfo_is_one_object_per_process() {
+        let a = build_pyframe_virtualizable_info();
+        let b = build_pyframe_virtualizable_info();
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "warmspot.py vinfos[VTYPEPTR] is one VirtualizableInfo"
+        );
     }
 
     #[test]

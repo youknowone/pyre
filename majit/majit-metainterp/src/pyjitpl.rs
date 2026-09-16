@@ -2256,34 +2256,9 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) pending_token: Option<(u64, Arc<JitCellToken>)>,
     /// Cumulative statistics counters.
     pub(crate) stats: JitStatsCounters,
-    /// Pointer to the live virtualizable object at trace entry.
-    /// Used to derive lengths from the actual object when the interpreter
-    /// does not provide them explicitly.
-    pub(crate) vable_ptr: *const u8,
-    /// `compile.py` — the virtual cache `handle_async_forcing`
-    /// produced, kept for the `GUARD_NOT_FORCED` failure that must follow.
-    ///
-    /// Upstream hides an `AllVirtuals` instance in the deadframe's
-    /// `jf_savedata` GCREF slot and `ResumeGuardForcedDescr.handle_fail`
-    /// fishes it back out. pyre cannot put a Rust value in that slot — the GC
-    /// traces it as a real object reference (`jitframe_trace` in
-    /// `majit-backend/src/jitframe.rs`)
-    /// — so the cache is held here, keyed by the virtualizable that was forced.
-    /// One entry per frame, overwritten on re-force, exactly like the single
-    /// `jf_savedata` word.
-    ///
-    /// The ptr half is a GC root for as long as the entry lives, walked by
-    /// [`Self::walk_forced_virtuals_refs`]: `force_all_virtuals`
-    /// (`resume.py:969-981`) materializes every `rd_virtuals` entry, including
-    /// ones named only by a resume frame's ref registers, and those are written
-    /// nowhere else at force time — this `Vec` is their only referent until the
-    /// `GUARD_NOT_FORCED` failure consumes it. Upstream gets that edge from
-    /// `jf_savedata` being traced; here it comes from the root walker.
-    ///
-    /// An entry the guard never consumes is dropped by
-    /// [`Self::prune_forced_virtuals`] when its owner frame dies, which is what
-    /// `jf_savedata` gets for free by living on the deadframe.
-    pub(crate) forced_virtuals: Vec<(u64, Vec<i64>, Vec<i64>)>,
+    /// Host-supplied virtualizable until `TraceCtx` exists.
+    /// `sync_before` / tests call `set_vable_ptr` before tracing starts.
+    pending_vable_ptr: *const u8,
     /// Virtualizable array lengths for trace-entry box layout.
     pub(crate) vable_array_lengths: Vec<usize>,
     /// warmspot.py:449 jd.result_type — per-driver static result type.
@@ -3350,66 +3325,6 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// GC walker for the forced-virtual caches held in
-    /// `Self::forced_virtuals`, standing in for the trace `jf_savedata` gets
-    /// as a real GCREF field (`jitframe_trace` in
-    /// `majit-backend/src/jitframe.rs`).
-    ///
-    /// Only the ptr half is walked. The int half is `virtuals_int_cache` —
-    /// unboxed integer field values — and handing those to the visitor would
-    /// test integers as heap addresses. `prepare_resume_heap_with_roots` roots
-    /// the same one half for the same reason.
-    ///
-    /// Unmaterialized `0` cache slots pass through unchanged, as they do in
-    /// `shadow_stack::walk_resume_ref_roots`.
-    ///
-    /// The walk is unconditional, so it is a strong edge where `jf_savedata` is
-    /// an ephemeron one: a major seeds these values from `seed_major_roots`,
-    /// while [`Self::prune_forced_virtuals`] can only drop a dead owner's entry
-    /// at the *end* of marking, once VISITED is decided. An entry whose owner
-    /// died inside the cycle therefore keeps its materialized graph until the
-    /// next major — one cycle of floating garbage, bounded: the sweep clears
-    /// VISITED on every survivor and the entry is gone, and the sole writer
-    /// (`save_forced_virtuals`) is reached only by forcing a live virtualizable,
-    /// so nothing re-adds it. The prune also strictly precedes the sweep, so a
-    /// named owner's address can never be recycled underneath an entry.
-    ///
-    /// That bound holds only while no cached virtual reaches the owner frame: a
-    /// back-edge would let this walk mark the owner, `classify_owner` would then
-    /// answer `Some`, and the entry would never be pruned at all. The vable is
-    /// returned beside the cache rather than inside it (`force_from_resumedata`)
-    /// and no such edge exists today.
-    pub fn walk_forced_virtuals_refs(&mut self, mut visitor: impl FnMut(&mut GcRef)) {
-        for (_owner, ptrs, _ints) in self.forced_virtuals.iter_mut() {
-            for slot in ptrs.iter_mut() {
-                // SAFETY: `GcRef` is a pointer-sized newtype over the same
-                // representation these slots hold, the same reinterpret
-                // `walk_resume_ref_roots` performs on `virtuals_ptr_cache`
-                // (`majit-gc/src/shadow_stack.rs`). Walked unconditionally
-                // for both collection kinds: the minor forwards a
-                // nursery-resident virtual in place, the major seeds it as a
-                // mark root so the sweep does not free it.
-                let gcref = unsafe { &mut *(slot as *mut i64 as *mut GcRef) };
-                visitor(gcref);
-            }
-        }
-    }
-
-    /// Drop the forced-virtual caches whose owner frame died.
-    ///
-    /// `classify` answers with the owner's current address, or `None` if it did
-    /// not survive. A major collection moves nothing, so a surviving owner
-    /// answers with the key it was asked about.
-    ///
-    /// Without this, rooting the ptr half would keep an unconsumed entry's
-    /// objects alive forever and leave a stale `PyFrame` key that a later frame
-    /// at the same address could fish. Upstream is immune because `jf_savedata`
-    /// dies with its deadframe; this reproduces that lifetime.
-    pub fn prune_forced_virtuals(&mut self, classify: &mut dyn FnMut(usize) -> Option<usize>) {
-        self.forced_virtuals
-            .retain(|(owner, _, _)| classify(*owner as usize) == Some(*owner as usize));
-    }
-
     #[inline]
     fn prepare_compiled_run_io() {
         io_buffer::io_buffer_discard();
@@ -4063,8 +3978,7 @@ impl<M: Clone> MetaInterp<M> {
             hooks: JitHooks::default(),
             pending_token: None,
             stats: JitStatsCounters::default(),
-            vable_ptr: std::ptr::null(),
-            forced_virtuals: Vec::new(),
+            pending_vable_ptr: std::ptr::null(),
             vable_array_lengths: Vec::new(),
             result_type: Type::Ref,
             max_unroll_recursion: 7, // RPython default from rlib/jit.py
@@ -4635,22 +4549,55 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_frontend_boxes.as_deref()
     }
 
-    /// Cache the current virtualizable object pointer for trace-entry setup.
-    /// Mirrored onto `TraceCtx::virtualizable_heap_ptr` so
-    /// `synchronize_virtualizable` can reach the live frame without a
-    /// callback back into MetaInterp.
+    /// Seed the live heap pointer on the active `TraceCtx`.
+    /// `vinfo.unwrap_virtualizable_box` is the reader; this only publishes
+    /// the host's current object so initialize / residual can unwrap it.
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
-        self.vable_ptr = ptr;
+        self.pending_vable_ptr = ptr;
         if let Some(ctx) = self.tracing.as_mut() {
             ctx.set_virtualizable_heap_ptr(ptr);
         }
     }
 
-    /// `pyjitpl.py:3326-3334` keeps exactly one standard virtualizable
-    /// identity in `virtualizable_boxes[-1]`; `vable_ptr` is its concrete
-    /// heap counterpart.
+    /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`.
+    ///
+    /// Residual-call and escape paths in `pyjitpl.py` unwrap the identity
+    /// box, not the host heap pointer. Fall back to
+    /// [`Self::unwrap_standard_virtualizable`] when the box has no concrete
+    /// ref yet.
+    fn unwrap_virtualizable_boxes_last(&self) -> *const u8 {
+        self.tracing
+            .as_ref()
+            .and_then(|ctx| {
+                let concrete = ctx.concrete_of_opref(ctx.standard_virtualizable_box()?)?;
+                let ptr = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(Some(
+                    concrete,
+                ));
+                (!ptr.is_null()).then_some(ptr as *const u8)
+            })
+            .unwrap_or_else(|| self.unwrap_standard_virtualizable())
+    }
+
+    /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])`.
+    ///
+    /// `pending_vable_ptr` is only the host seed until `TraceCtx` exists
+    /// (`set_vable_ptr` / `sync_before`). Once the boxes are installed the
+    /// identity is the last virtualizable box, matching
+    /// `virtualizable.py unwrap_virtualizable_box`. The sync target
+    /// (`virtualizable_heap_ptr`) can name a `snapshot_for_tracing` copy
+    /// and is not the unwrap source.
+    pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
+        if let Some(ctx) = self.tracing.as_ref()
+            && let Some(ptr) = ctx.standard_virtualizable_ptr()
+        {
+            return ptr as *const u8;
+        }
+        self.pending_vable_ptr
+    }
+
+    /// `pyjitpl.py` unwrap of the standard virtualizable identity.
     pub fn standard_virtualizable_heap_ptr(&self) -> *const u8 {
-        self.vable_ptr
+        self.unwrap_standard_virtualizable()
     }
 
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
@@ -4664,10 +4611,9 @@ impl<M: Clone> MetaInterp<M> {
         // heap object; RPython does not consult any interpreter-supplied
         // "trace-entry cache" for lengths. Match that here when the layout
         // exposes a readable header (the common case).
-        if !self.vable_ptr.is_null() && info.can_read_all_array_lengths_from_heap() {
-            // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
-            // for the currently active interpreter state.
-            return unsafe { info.read_array_lengths_from_heap(self.vable_ptr) };
+        let vable = self.unwrap_standard_virtualizable();
+        if !vable.is_null() && info.can_read_all_array_lengths_from_heap() {
+            return unsafe { info.read_array_lengths_from_heap(vable) };
         }
         // Fallback for layouts that cannot expose array length on the heap
         // object alone (header-less embedded arrays) and for unit tests that
@@ -4808,14 +4754,19 @@ impl<M: Clone> MetaInterp<M> {
         // token-none precondition.  The blackhole helper implements the same
         // two force_now arms and reaches the host's ResumeGuardForcedDescr
         // force hook for an Active token.
-        let mut virtualizable_ptr = if !self.vable_ptr.is_null() {
-            self.vable_ptr as *mut u8
+        // `virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)`.
+        // `sync_before` can still hold a previous frame in `pending_vable_ptr`
+        // when this trace's reds name a different one, so the box wins.
+        // pyre adaptation: a box that is missing or not Ref-typed unwraps to
+        // null (a state-field JIT whose vable is not a red), and only then
+        // does `pending_vable_ptr` name the virtualizable.
+        let unwrapped = crate::virtualizable::VirtualizableInfo::unwrap_virtualizable_box(
+            original_boxes.get(index).copied(),
+        ) as *mut u8;
+        let mut virtualizable_ptr = if unwrapped.is_null() {
+            self.pending_vable_ptr as *mut u8
         } else {
-            match original_boxes.get(index) {
-                Some(Value::Ref(r)) => r.as_usize() as *mut u8,
-                Some(Value::Int(v)) => *v as *mut u8,
-                _ => std::ptr::null_mut(),
-            }
+            unwrapped
         };
         if !virtualizable_ptr.is_null() {
             // RPython's `virtualizable` local is a GC pointer: `clear_vable_token`
@@ -4828,8 +4779,8 @@ impl<M: Clone> MetaInterp<M> {
             }
             virtualizable_ptr = majit_gc::shadow_stack::get(root).0 as *mut u8;
             majit_gc::shadow_stack::pop_to(root);
-            if !self.vable_ptr.is_null() {
-                self.vable_ptr = virtualizable_ptr;
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
             }
             // `initial_inputarg_consts` was copied from `live_values` before
             // this force. `ctx` is not in `self.tracing` yet, so
@@ -4905,11 +4856,12 @@ impl<M: Clone> MetaInterp<M> {
         // expanded-tail path still uses live_values directly; the short
         // path drives the `vable_ptr` heap read below to mint inputargs
         // for each vable static field + array item.
-        if total_vable == 0 {
-            return;
-        }
+        //
+        // `total_vable == 0` is still a live virtualizable: PyPy
+        // `initialize_virtualizable` always `read_boxes` (possibly empty)
+        // and `virtualizable_boxes.append(virtualizable_box)`.
         let _has_expanded_tail_outer = live_values.len() >= num_reds + total_vable;
-        if !_has_expanded_tail_outer && self.vable_ptr.is_null() {
+        if !_has_expanded_tail_outer && virtualizable_ptr.is_null() {
             return;
         }
         // pyjitpl.py:3317-3319: index = num_green_args + index_of_virtualizable.
@@ -4954,7 +4906,7 @@ impl<M: Clone> MetaInterp<M> {
         // `extract_live`.  A host that declares no position, or whose reds do
         // not agree with it, falls back to matching the pointer.
         let identity_index = if info.identity_ref_bank_index.is_some() {
-            Self::identity_live_position(info, live_values, self.vable_ptr)
+            Self::identity_live_position(info, live_values, virtualizable_ptr as *const u8)
         } else {
             None
         };
@@ -5022,9 +4974,11 @@ impl<M: Clone> MetaInterp<M> {
         // caller already supplied an expanded tail we reuse those inputarg
         // slots; otherwise we mint new inputargs here for each freshly-read
         // box, recovering the same `original_boxes += read_boxes(...)` shape.
-        let vable_values: Vec<Value> = if !self.vable_ptr.is_null() {
+        // `vinfo.read_boxes(cpu, virtualizable, startindex)` — always
+        // the heap object unwrap produced, never an expanded live_values tail.
+        let vable_values: Vec<Value> = if !virtualizable_ptr.is_null() {
             let (static_boxes, array_boxes) =
-                unsafe { info.read_all_boxes(self.vable_ptr, &array_lengths) };
+                unsafe { info.read_all_boxes(virtualizable_ptr as *const u8, &array_lengths) };
             let mut out = Vec::with_capacity(total_vable);
             for (i, bits) in static_boxes.iter().enumerate() {
                 out.push(heap_value_for(info.static_fields[i].field_type, *bits));
@@ -5075,6 +5029,7 @@ impl<M: Clone> MetaInterp<M> {
                 info.identity_ref_bank_index, live_values,
             );
         }
+        ctx.install_virtualizable_info(std::sync::Arc::clone(info));
         ctx.init_virtualizable_boxes(
             info,
             virtualizable_box,
@@ -5097,9 +5052,9 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py synchronize_virtualizable parity: TraceCtx needs
         // the live heap pointer to mirror shadow writes. Mirror here — the
-        // MetaInterp `vable_ptr` was cached before `tracing` existed, so
+        // MetaInterp `pending_vable_ptr` was cached before `tracing` existed, so
         // `set_vable_ptr` could not plumb it through.
-        ctx.set_virtualizable_heap_ptr(self.vable_ptr);
+        ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
         // pyjitpl.py `initialize_virtualizable` closes by asserting the
         // freshly read boxes still match the object it read them from.
         ctx.check_synchronized_virtualizable();
@@ -5752,6 +5707,7 @@ impl<M: Clone> MetaInterp<M> {
                 // is the parallel trace-start entry point and must keep the
                 // same invariant.
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
+                ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
                 // pyjitpl.py initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
                 // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
@@ -6067,6 +6023,7 @@ impl<M: Clone> MetaInterp<M> {
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
+        ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
         // pyjitpl.py initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
         // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
@@ -6617,37 +6574,30 @@ impl<M: Clone> MetaInterp<M> {
             Some(info) => info,
             None => return,
         };
-        let vable_ptr = self.vable_ptr;
+        let vable_ptr = self.unwrap_standard_virtualizable();
         let Some(ctx) = self.tracing.as_mut() else {
             return;
         };
         ctx.load_fields_from_virtualizable(&info, vable_ptr);
     }
 
-    /// pyjitpl.py `opimpl_getfield_vable_i(box, fielddescr, pc)`.
-    ///
-    /// `pyjitpl.py MetaInterp.replace_box` framestack half. Step 4 of
-    /// `_nonstandard_virtualizable` already rewrote the TraceCtx records;
-    /// this finishes the same walk on every live `MIFrame`.
-    fn apply_pending_box_replace(&mut self) {
-        let Some((oldbox, newbox)) = self
-            .tracing
-            .as_mut()
-            .and_then(|ctx| ctx.take_pending_box_replace())
-        else {
-            return;
-        };
-        for frame in self.framestack.frames.iter_mut() {
+    /// `pyjitpl.py MetaInterp.replace_box` framestack walk.
+    unsafe fn walk_miframe_stack(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+        let stack = unsafe { &mut *data.cast::<crate::pyjitpl::MIFrameStack>() };
+        for frame in stack.frames.iter_mut() {
             frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
         }
     }
 
     fn with_tracing_vable<R>(&mut self, f: impl FnOnce(&mut TraceCtx) -> R) -> R {
-        let result = f(self
+        let frames = &mut self.framestack as *mut crate::pyjitpl::MIFrameStack;
+        let ctx = self
             .tracing
             .as_mut()
-            .expect("vable op requires active tracing"));
-        self.apply_pending_box_replace();
+            .expect("vable op requires active tracing");
+        unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
+        let result = f(ctx);
+        ctx.clear_replace_frames();
         result
     }
 
@@ -7331,7 +7281,7 @@ impl<M: Clone> MetaInterp<M> {
         // compiled and never an ambient one.
         //
         // Prefer it over MetaInterp's ambient pointer: an inlined residual
-        // callee can temporarily update `self.vable_ptr`, while the residual
+        // callee can temporarily update `self.pending_vable_ptr`, while the residual
         // boundary restores the caller's pointer on this TraceCtx. Reading the
         // ambient slot here would combine the caller loop's expanded inputargs
         // with the callee frame's array length, collapsing frame identity.
@@ -7340,12 +7290,9 @@ impl<M: Clone> MetaInterp<M> {
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
-        // virtualizable inputarg's ConstPtr.  `vable_ptr` is retained only as
+        // virtualizable inputarg's ConstPtr.  `pending_vable_ptr` is retained only as
         // the legacy/test fallback when neither the rebuilt boxes nor their
         // heap mirror were installed.
-        if !self.vable_ptr.is_null() {
-            return self.vable_ptr;
-        }
         std::ptr::null()
     }
 
@@ -12457,6 +12404,7 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout: exit_layout.map(Box::new),
             rd_loop_token,
             savedata,
+            deadframe: Some(frame),
             exception,
             status,
             guard_value_operand,
@@ -12763,6 +12711,7 @@ impl<M: Clone> MetaInterp<M> {
                 exit_layout: None,
                 rd_loop_token: None,
                 savedata: None,
+                deadframe: None,
                 exception: ExceptionState {
                     exc_class: 0,
                     exc_value: 0,
@@ -12844,6 +12793,7 @@ impl<M: Clone> MetaInterp<M> {
             exit_layout: None,
             rd_loop_token,
             savedata,
+            deadframe: Some(frame),
             exception,
             status,
             guard_value_operand,
@@ -16098,10 +16048,10 @@ impl<M: Clone> MetaInterp<M> {
     /// RPython flow: force_now() → cpu.force(token) → handle_async_forcing()
     /// → force_from_resumedata() → materialize all virtuals → save on deadframe.
     ///
-    /// The forced virtual caches (ptr, int) are stored on
-    /// `Self::forced_virtuals` for the blackhole resumption from the
-    /// GUARD_NOT_FORCED — RPython's `AllVirtuals` via `cpu.set_savedata_ref()`.
-    /// They are also returned, which only the unit tests below read.
+    /// The forced virtual caches are returned so the caller can
+    /// `cpu.set_savedata_ref(deadframe, AllVirtuals(cache).hide())`,
+    /// matching `compile.py handle_async_forcing`. Tests read the same
+    /// return value.
     pub fn handle_async_forcing(
         &mut self,
         green_key: u64,
@@ -16151,15 +16101,10 @@ impl<M: Clone> MetaInterp<M> {
             None => self.get_compiled_exit_layout_in_trace(green_key, norm_tid, fail_index)?,
         };
 
-        // compile.py:973-985 don't interrupt me! If the stack runs out
-        // in force_from_resumedata() then we have seen cpu.force() but
-        // not self.save_data(), leaving in an inconsistent state.
-        //
-        // RPython wraps the body in try/finally. CriticalCodeGuard's
-        // Drop impl re-enables report_error on every exit — including
-        // panic unwind — matching the RPython contract.
-        let _cc_guard = crate::CriticalCodeGuard::enter();
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
+        // The stack-critical section lives on
+        // `ResumeGuardForcedDescr.force_now`, which wraps
+        // `cpu.force` + this method.
         // compile.py `ResumeGuardDescr` storage — borrow rd_numb /
         // rd_consts / rd_virtuals / rd_pendingfields off the guard-owned
         // Arc.  resume.py:1345-1351 init the reader with the storage
@@ -16216,7 +16161,6 @@ impl<M: Clone> MetaInterp<M> {
                 None, // ginfo — pyre has no greenfield mechanism
                 allocator,
             );
-        drop(_cc_guard);
         if crate::majit_log_enabled() {
             eprintln!(
                 "[jit][handle_async_forcing] forced {} ptr + {} int virtuals",
@@ -16227,17 +16171,8 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py: obj = AllVirtuals(all_virtuals)
         //   metainterp_sd.cpu.set_savedata_ref(deadframe, obj.hide())
         //
-        // The store lives here, inside `handle_async_forcing`, exactly as
-        // upstream — every force entry point reaching this function is covered
-        // by it, including `force_virtual_if_necessary`'s (virtualref.py)
-        // which never sees the returned caches.
-        if virtualizable_ptr != 0 {
-            self.save_forced_virtuals(
-                virtualizable_ptr as u64,
-                all_virtuals_ptr.clone(),
-                all_virtuals_int.clone(),
-            );
-        }
+        // The store is on the caller (`force_virtualizable_token_with_allocator`)
+        // which holds the deadframe, matching `handle_async_forcing`.
         Some((all_virtuals_ptr, all_virtuals_int))
     }
 
@@ -16257,91 +16192,46 @@ impl<M: Clone> MetaInterp<M> {
         token: u64,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) {
-        let deadframe = self
-            .backend
-            .force(GcRef(token as usize))
-            .expect("active virtualizable must have a backend deadframe");
-        let descr_arc = self.backend.get_latest_descr_arc(&deadframe);
-        let descr = descr_arc
-            .as_fail_descr()
-            .expect("forced virtualizable must have a fail descriptor");
-        let green_key = majit_backend::descr_owning_jct(descr)
-            .expect("forced virtualizable must belong to a compiled loop")
-            .green_key();
-        let trace_id = descr.trace_id();
-        let fail_index = descr.fail_index();
-        let fail_values = descr
-            .fail_arg_types()
-            .iter()
-            .enumerate()
-            .map(|(index, tp)| match tp {
-                Type::Int => self.backend.get_int_value(&deadframe, index),
-                Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
-                Type::Float => self.backend.get_float_value(&deadframe, index).to_bits() as i64,
-                Type::Void => 0,
-            })
-            .collect::<Vec<_>>();
-        // compile.py: faildescr.handle_async_forcing(deadframe)
-        self.handle_async_forcing_with_allocator(
-            Some(descr),
-            green_key,
-            trace_id,
-            fail_index,
-            &fail_values,
-            allocator,
-        );
-    }
-
-    /// `compile.py cpu.set_savedata_ref(deadframe, obj.hide())`.
-    ///
-    /// `owner` is the forced virtualizable, as the guard's own resume data
-    /// named it (`resume.py:1404`). Upstream can key on the deadframe because
-    /// `handle_fail` receives it; pyre's guard-failure path surfaces the frame
-    /// rather than the jitframe, and the two ends agree on the frame: the force
-    /// runs against a named virtualizable and the GUARD_NOT_FORCED that follows
-    /// deopts that same frame's loop.
-    fn save_forced_virtuals(&mut self, owner: u64, ptrs: Vec<i64>, ints: Vec<i64>) {
-        // The key is a bare address, so the mechanism holds only while that
-        // address is stable. It is: the virtualizable is an interpreter-created
-        // frame (`FrameBox::new` → `try_gc_alloc_stable_raw`, "stable across
-        // minor and major collections (MiniMark mark-sweep does not move
-        // old-gen objects)"), never one of the frames a trace builds virtually.
-        // A nursery owner would break both ends — a minor would forward the
-        // frame out from under this key, and the pruner's classifier keeps every
-        // non-old-gen owner, so the entry could never be dropped either.
-        debug_assert!(
-            !majit_gc::gc_is_nursery_object(owner as usize),
-            "forced-virtual cache keyed on a nursery-resident virtualizable \
-             (0x{owner:x}): the key must be a move-stable address",
-        );
-        match self.forced_virtuals.iter_mut().find(|e| e.0 == owner) {
-            // A second force of the same frame overwrites, the way a second
-            // `set_savedata_ref` overwrites the one `jf_savedata` word.
-            Some(entry) => *entry = (owner, ptrs, ints),
-            None => self.forced_virtuals.push((owner, ptrs, ints)),
-        }
-    }
-
-    /// `compile.py` — `handle_fail` of a `GUARD_NOT_FORCED` fishes
-    /// the cache `handle_async_forcing` left on the deadframe and hands it
-    /// to `resume_in_blackhole`, which is what makes the blackhole reuse
-    /// the objects the force already materialized instead of building a
-    /// second set (`resume.py:1373-1374`, and the `vable_size` skip in
-    /// `consume_vref_and_vable`).
-    pub fn take_forced_virtuals(&mut self, owner: u64) -> Option<(Vec<i64>, Vec<i64>)> {
-        let index = self.forced_virtuals.iter().position(|e| e.0 == owner);
-        // Only a GUARD_NOT_FORCED reaches here (`is_guard_forced()` gates the
-        // callers), so hit/miss is the force→resume handoff itself: the
-        // counterpart of the `handle_async_forcing` line above.
-        if crate::majit_log_enabled() {
-            eprintln!(
-                "[jit][take_forced_virtuals] owner=0x{:x} {}",
-                owner,
-                if index.is_some() { "hit" } else { "miss" },
+        crate::compile::ResumeGuardForcedDescr::force_now(|| {
+            let mut deadframe = self
+                .backend
+                .force(GcRef(token as usize))
+                .expect("active virtualizable must have a backend deadframe");
+            let descr_arc = self.backend.get_latest_descr_arc(&deadframe);
+            let descr = descr_arc
+                .as_fail_descr()
+                .expect("forced virtualizable must have a fail descriptor");
+            let green_key = majit_backend::descr_owning_jct(descr)
+                .expect("forced virtualizable must belong to a compiled loop")
+                .green_key();
+            let trace_id = descr.trace_id();
+            let fail_index = descr.fail_index();
+            let fail_values = descr
+                .fail_arg_types()
+                .iter()
+                .enumerate()
+                .map(|(index, tp)| match tp {
+                    Type::Int => self.backend.get_int_value(&deadframe, index),
+                    Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
+                    Type::Float => self.backend.get_float_value(&deadframe, index).to_bits() as i64,
+                    Type::Void => 0,
+                })
+                .collect::<Vec<_>>();
+            // compile.py: faildescr.handle_async_forcing(deadframe)
+            let cache = self.handle_async_forcing_with_allocator(
+                Some(descr),
+                green_key,
+                trace_id,
+                fail_index,
+                &fail_values,
+                allocator,
             );
-        }
-        let (_, ptrs, ints) = self.forced_virtuals.swap_remove(index?);
-        Some((ptrs, ints))
+            // compile.py: cpu.set_savedata_ref(deadframe, AllVirtuals(cache).hide())
+            if let Some(cache) = cache {
+                self.backend
+                    .set_savedata_ref(&mut deadframe, crate::compile::AllVirtuals::hide(cache));
+            }
+        });
     }
 
     pub fn is_force_token_armed(&self, token: u64) -> bool {
@@ -17487,17 +17377,19 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             if handled {
+                let vable = self.unwrap_standard_virtualizable();
                 let frame = self.framestack.current_mut();
                 if frame.jitcode.code[frame.last_opcode_position]
                     != crate::jitcode::insns::BC_RERAISE
                 {
-                    record_application_traceback(excvalue, self.vable_ptr, frame);
+                    record_application_traceback(excvalue, vable, frame);
                 }
                 return Err(FinishframeExceptionSignal::ChangeFrame);
             }
             {
+                let vable = self.unwrap_standard_virtualizable();
                 let frame = self.framestack.current_mut();
-                record_application_traceback(excvalue, self.vable_ptr, frame);
+                record_application_traceback(excvalue, vable, frame);
             }
             self.popframe(true);
         }
@@ -18935,7 +18827,9 @@ impl<M: Clone> MetaInterp<M> {
         if !vinfo.has_vable_token() {
             return;
         }
-        let vable_ptr = self.vable_ptr;
+        // pyjitpl.py: `virtualizable = vinfo.unwrap_virtualizable_box(
+        //     self.virtualizable_boxes[-1])`.
+        let vable_ptr = self.unwrap_virtualizable_boxes_last();
         let ctx = match self.tracing.as_mut() {
             Some(ctx) => ctx,
             None => return,
@@ -18997,7 +18891,7 @@ impl<M: Clone> MetaInterp<M> {
             Some(info) => info,
             None => return Ok(()),
         };
-        let vable_ptr = self.vable_ptr;
+        let vable_ptr = self.unwrap_standard_virtualizable();
         if vable_ptr.is_null() {
             return Ok(());
         }
@@ -19134,7 +19028,7 @@ impl<M: Clone> MetaInterp<M> {
         //                                                              None,
         //                                                              vref_box,
         //                                                              standard_box)
-        let standard_concrete = self.vable_ptr as usize as i64;
+        let standard_concrete = self.unwrap_standard_virtualizable() as usize as i64;
         let isstandard_int = if vref_concrete == standard_concrete {
             1
         } else {
@@ -19307,8 +19201,14 @@ impl<M: Clone> MetaInterp<M> {
             self.vable_after_residual_call(funcbox.2)
                 .map_err(DoResidualCallAbort::from)?;
             // pyjitpl.py: generate_guard(rop.GUARD_NOT_FORCED)
+            // → capture_resumedata(after_residual_call=True)
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+                if ctx.recorder.has_byte_buffer() {
+                    let snapshot_id =
+                        ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, true);
+                    ctx.set_last_guard_resume_position(snapshot_id);
+                }
             }
             // pyjitpl.py:2080-2081: KEEPALIVE for vablebox
             if let Some(vablebox) = vablebox
@@ -19766,7 +19666,6 @@ pub enum RunResult<M> {
     },
 }
 
-#[derive(Debug, Clone)]
 pub enum DetailedDriverRunOutcome {
     Finished {
         typed_values: Vec<Value>,
@@ -19819,6 +19718,15 @@ pub enum DetailedDriverRunOutcome {
         /// `_prepare_resume_from_failure`) so an exception guard unwinds
         /// to its handler instead of resuming the no-exception path.
         guard_exc: i64,
+        /// compile.py `cpu.get_savedata_ref(deadframe)` — the
+        /// `AllVirtuals` cache `handle_async_forcing` hid on the
+        /// failing jitframe. `None` when the backend left `jf_savedata`
+        /// empty.
+        savedata: Option<majit_ir::GcRef>,
+        /// The deadframe `savedata` was read from. Held until
+        /// `AllVirtuals.show` so `jf_savedata` stays a live GCREF the
+        /// way `compile.py handle_fail` keeps `deadframe`.
+        deadframe: Option<majit_backend::DeadFrame>,
     },
     Abort {
         restored: bool,
@@ -27174,8 +27082,9 @@ mod tests {
     ) -> Box<ResidualCallVableObj> {
         // `initialize_virtualizable` begins with `clear_vable_token`, so the
         // standard virtualizable must be a real, aligned object for the whole
-        // test, just as it is in every translated caller.  Older fixtures used
-        // 0x1234 because initialization previously never touched the heap.
+        // test, just as it is in every translated caller.  A Ref-typed
+        // identity in `live_values[0]` is replaced by that object, since
+        // `unwrap_virtualizable_box` dereferences whatever Ref it is given.
         let pc = match live_values.get(1) {
             Some(Value::Int(value)) => *value,
             _ => 0,
@@ -27186,10 +27095,15 @@ mod tests {
                 *slot = *value;
             }
         }
-        meta.set_vable_ptr((&mut *vable as *mut ResidualCallVableObj).cast());
+        let vable_ptr: *mut ResidualCallVableObj = &mut *vable;
+        let mut live_values = live_values.to_vec();
+        if let Some(identity @ Value::Ref(_)) = live_values.first_mut() {
+            *identity = Value::Ref(majit_ir::GcRef(vable_ptr as usize));
+        }
+        meta.set_vable_ptr(vable_ptr.cast());
         meta.set_virtualizable_info(std::sync::Arc::new(info));
         meta.set_vable_array_lengths(array_lengths);
-        let action = meta.force_start_tracing(777, (0, 0), None, live_values);
+        let action = meta.force_start_tracing(777, (0, 0), None, &live_values);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         vable
     }
@@ -27384,8 +27298,8 @@ mod tests {
 
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         assert_eq!(obj.token, 0);
-        assert_ne!(meta.vable_ptr as usize, old as usize);
-        let forwarded = meta.vable_ptr as usize;
+        assert_ne!(meta.unwrap_standard_virtualizable() as usize, old as usize);
+        let forwarded = meta.unwrap_standard_virtualizable() as usize;
         let ctx = meta.trace_ctx().expect("expected active trace context");
         assert_eq!(
             ctx.initial_inputarg_consts.first().copied(),
@@ -27394,6 +27308,41 @@ mod tests {
         assert_eq!(
             ctx.virtualizable_entry_at(0),
             Some((OpRef::input_arg_int(1), Value::Int(41)))
+        );
+    }
+
+    #[test]
+    fn initialize_virtualizable_appends_identity_when_there_are_no_static_fields() {
+        // `pyjitpl.py initialize_virtualizable` still
+        // `virtualizable_boxes.append(virtualizable_box)` when
+        // `read_boxes` is empty.
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let mut info = VirtualizableInfo::new(0);
+        info.set_parent_descr(majit_ir::descr::make_size_descr(8));
+        info.set_clear_vable(
+            test_clear_vable_token as *const (),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        meta.set_virtualizable_info(std::sync::Arc::new(info));
+
+        let mut obj = ResidualCallVableObj::new(0, 0);
+        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+        let descriptor = JitDriverStaticData::with_virtualizable(
+            vec![],
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        );
+        let frame = Value::Ref(majit_ir::GcRef(
+            (&mut obj as *mut ResidualCallVableObj) as usize,
+        ));
+        let action = meta.force_start_tracing(780, (0, 0), Some(descriptor), &[frame]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+
+        let ctx = meta.trace_ctx().expect("expected active trace context");
+        assert_eq!(
+            ctx.collect_virtualizable_boxes().unwrap(),
+            vec![OpRef::input_arg_ref(0)]
         );
     }
 
@@ -27513,22 +27462,15 @@ mod tests {
             majit_ir::descr::make_field_descr(8, 8, Type::Int, majit_ir::descr::ArrayFlag::Signed);
         let _result = meta.opimpl_getfield_vable_int(0, nonstandard_vable, 0, fd8);
 
-        // pyjitpl.py _nonstandard_virtualizable falls through
-        // to Step 4 (PTR_EQ + implement_guard_value) and Step 5a
-        // (emit_force_virtualizable: GETFIELD_GC_R(token_descr) +
-        // PTR_NE(CONST_NULL) + COND_CALL) before Step 5b marks the box
-        // known. The COND_CALL tail is currently a TODO; the observable
-        // prefix is the four ops emitted by `nonstandard_virtualizable`,
-        // followed by the caller's GETFIELD_GC_I (the actual non-vable
-        // field read).
+        // `vinfo is fielddescr.get_vinfo()` is false for a plain FieldDescr,
+        // so Step 4 PTR_EQ is skipped. Step 5a still emits force, then the
+        // caller records GETFIELD_GC_I.
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 6);
-        assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
-        assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
-        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
-        assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
-        assert_eq!(ops[4].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
-        assert_eq!(ops[5].opcode, OpCode::GetfieldGcI); // caller fallback
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
+        assert_eq!(ops[1].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
+        assert_eq!(ops[2].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcI); // caller fallback
     }
 
     #[test]
@@ -27552,21 +27494,15 @@ mod tests {
         let _result =
             meta.opimpl_getarrayitem_vable_int(0, nonstandard_vable, index, 1, fd24, adesc);
 
-        // pyjitpl.py _opimpl_getarrayitem_vable falls back to
-        // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when
-        // _nonstandard_virtualizable returns True. The four ops emitted
-        // by `_nonstandard_virtualizable` (Step 4 PTR_EQ + GUARD_VALUE
-        // and Step 5a GETFIELD_GC_R(token_descr) + PTR_NE) precede the
-        // caller's two-op fallback, totalling 6 ops.
+        // A descr with no vinfo skips Step 4. Step 5a plus the two-op
+        // heap fallback remain.
         let ops = take_recorded_ops(&mut meta);
-        assert_eq!(ops.len(), 7);
-        assert_eq!(ops[0].opcode, OpCode::PtrEq); // Step 4: PTR_EQ
-        assert_eq!(ops[1].opcode, OpCode::GuardValue); // Step 4: implement_guard_value
-        assert_eq!(ops[2].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
-        assert_eq!(ops[3].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
-        assert_eq!(ops[4].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
-        assert_eq!(ops[5].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
-        assert_eq!(ops[6].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcR); // Step 5a: token_descr read
+        assert_eq!(ops[1].opcode, OpCode::PtrNe); // Step 5a: PTR_NE(CONST_NULL)
+        assert_eq!(ops[2].opcode, OpCode::CondCallN); // Step 5a: COND_CALL(clear_vable)
+        assert_eq!(ops[3].opcode, OpCode::GetfieldGcR); // caller fallback: arraybox
+        assert_eq!(ops[4].opcode, OpCode::GetarrayitemGcI); // caller fallback: item read
     }
 
     #[test]
@@ -27614,25 +27550,20 @@ mod tests {
     fn do_jit_force_virtual_preserves_standard_concrete_value() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let _vable = start_tracing_with_virtualizable(
+        let mut vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        let mut obj = ResidualCallVableObj::new(0, 41);
-        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+        let vable_addr = (&mut *vable as *mut ResidualCallVableObj) as usize as i64;
         let vref_box = {
             let ctx = meta.trace_ctx().unwrap();
-            ctx.const_int((&mut obj as *mut ResidualCallVableObj) as usize as i64)
+            ctx.const_int(vable_addr)
         };
         let allboxes = [
             (JitArgKind::Int, OpRef::int_op(99), 0),
-            (
-                JitArgKind::Int,
-                vref_box,
-                (&mut obj as *mut ResidualCallVableObj) as usize as i64,
-            ),
+            (JitArgKind::Int, vref_box, vable_addr),
         ];
         let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Int);
 
@@ -27645,24 +27576,20 @@ mod tests {
             .expect("should resolve to standard virtualizable");
 
         assert_eq!(result.0, OpRef::input_arg_ref(0));
-        assert_eq!(
-            result.1,
-            (&mut obj as *mut ResidualCallVableObj) as usize as i64
-        );
+        assert_eq!(result.1, vable_addr);
     }
 
     #[test]
     fn load_fields_from_virtualizable_reloads_heap_values_into_boxes() {
         let mut meta = MetaInterp::<()>::new(10);
         meta.finish_setup_descrs_for_jitdrivers();
-        let _vable = start_tracing_with_virtualizable(
+        let mut vable = start_tracing_with_virtualizable(
             &mut meta,
             test_vable_info_static_only(),
             &[Value::Int(0x1234), Value::Int(41)],
             Vec::new(),
         );
-        let mut obj = ResidualCallVableObj::new(0, 99);
-        meta.set_vable_ptr((&mut obj as *mut ResidualCallVableObj).cast());
+        vable.pc = 99;
 
         meta.load_fields_from_virtualizable();
 

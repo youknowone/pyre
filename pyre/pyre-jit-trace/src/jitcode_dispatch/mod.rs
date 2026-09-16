@@ -526,6 +526,9 @@ impl CalleeLocalsShadow {
 
 /// One inlined-callee level of the walk's framestack.
 pub struct InlineFrame {
+    /// `true` for the portal `MIFrame` at `framestack[0]`.
+    /// `pyjitpl.py initialize_state_from_start` / `newframe(mainjitcode)`.
+    pub is_portal: bool,
     /// Callee `w_code`, used by the recursion-depth scan. Once the same code
     /// reaches the live `max_unroll_recursion`, the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
@@ -572,11 +575,27 @@ pub struct InlineFrame {
     live: Option<LiveFrameRegs>,
 }
 
+impl InlineFrame {
+    /// Portal frame `pyjitpl.py newframe(mainjitcode)` leaves at
+    /// `framestack[0]`.
+    pub(crate) fn portal() -> Self {
+        Self {
+            is_portal: true,
+            w_code: 0,
+            recursion_greenkey: false,
+            call_id: 0,
+            debug_merge_point_py_pc: None,
+            parents: Vec::new(),
+            entry_executed_effects: 0,
+            live: None,
+        }
+    }
+}
+
 /// The live register banks of one paused `MIFrame`.
 ///
 /// `MetaInterp.replace_box` writes `framestack` frames in place. The portal
-/// is not an `InlineFrame` (depth scans treat `framestack.len()` as the
-/// inlined-callee count), so it lives on [`WalkSession::portal_live`].
+/// is `framestack[0]`; inlined callees follow.
 #[derive(Clone)]
 pub(crate) struct LiveFrameRegs {
     pub(crate) registers_r: RegisterBank,
@@ -619,11 +638,8 @@ pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
 
-    /// Portal `MIFrame` registers while a child runs. Not on `framestack`
-    /// because `framestack.len()` is the inlined-callee depth.
-    pub(crate) portal_live: Option<LiveFrameRegs>,
     /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
-    /// Python `MIFrame`s and must not overwrite `portal_live`.
+    /// Python `MIFrame`s and must not sit on `framestack`.
     pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
@@ -759,7 +775,6 @@ impl Default for WalkSession {
         Self {
             is_being_profiled: false,
 
-            portal_live: None,
             helper_live: Vec::new(),
             framestack: Vec::new(),
             next_call_id: 1,
@@ -784,6 +799,27 @@ impl Default for WalkSession {
 }
 
 impl WalkSession {
+    /// `pyjitpl.py` portal is `framestack[0]`; inlined callees follow.
+    pub(crate) fn at_portal(&self) -> bool {
+        self.framestack.iter().all(|frame| frame.is_portal)
+    }
+
+    /// Inlined-callee depth, excluding the portal at `framestack[0]`.
+    pub(crate) fn inline_depth(&self) -> usize {
+        self.framestack
+            .iter()
+            .filter(|frame| !frame.is_portal)
+            .count()
+    }
+
+    pub(crate) fn last_inline(&self) -> Option<&InlineFrame> {
+        self.framestack.iter().rev().find(|frame| !frame.is_portal)
+    }
+
+    pub(crate) fn first_inline(&self) -> Option<&InlineFrame> {
+        self.framestack.iter().find(|frame| !frame.is_portal)
+    }
+
     /// Claim an abort coordinate for the frame whose `walk()` observed it.
     ///
     /// The first inline sub-walk to see the error owns its `pc` and may build
@@ -1500,14 +1536,15 @@ fn emit_traceback_node<Sym: WalkSym>(
     // without it the promote reaches the decoder holding
     // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
     let guards_before = ctx.trace_ctx.num_guards();
-    let write = ctx.trace_ctx.vable_setfield(
-        opcode_position,
-        site.frame,
-        last_instr_descr,
-        last_instr_value,
-        Some(Value::Int(i64::from(site.last_instruction))),
-    );
-    vable_ops::apply_pending_vable_box_replace(ctx);
+    let write = vable_ops::with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx.vable_setfield(
+            opcode_position,
+            site.frame,
+            last_instr_descr,
+            last_instr_value,
+            Some(Value::Int(i64::from(site.last_instruction))),
+        )
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
@@ -4662,8 +4699,8 @@ fn write_ref_reg<Sym: WalkSym>(
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
-/// `valuestackdepth(2)`, `debugdata(3)`, and `w_globals(4)`
-/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 5`). They are frame
+/// `valuestackdepth(2)` and `debugdata(3)` (`virtualizable_gen.rs`,
+/// `NUM_VABLE_SCALARS = 4`). They are frame
 /// bookkeeping; the Python operand stack lives in the separate
 /// `locals_cells_stack_w` array (`virtualizable_gen.rs`,
 /// `pyre-interpreter/src/pyframe.rs`).  PyPy's `interp_jit.py`
@@ -6810,6 +6847,7 @@ impl<'a> InlineFrameGuard<'a> {
             call_id
         };
         walk.framestack.push(InlineFrame {
+            is_portal: false,
             w_code,
             recursion_greenkey,
             call_id,
@@ -8065,7 +8103,7 @@ impl ActiveResumeFrame {
         session: &std::cell::RefCell<WalkSession>,
         snapshot_sym: *const Sym,
     ) -> Option<Self> {
-        let current_code = session.borrow().framestack.last().map(|frame| frame.w_code);
+        let current_code = session.borrow().last_inline().map(|frame| frame.w_code);
         match current_code {
             Some(callee_w_code) => {
                 let idx = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
@@ -11005,7 +11043,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                 .iter()
                 .filter(|frame| !frame.parents.is_empty())
                 .count();
-            let n_callees = session.framestack.len();
+            let n_callees = session.inline_depth();
             !(n_parents > 0 && n_parents == n_callees)
         };
         // A canonical helper body (`run_sub_jitcode_walk`) walks its OWN

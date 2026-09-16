@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::flowspace::model::{ConstValue, Constant, FunctionGraph, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
+use crate::translator::rtyper::rclass::const_truthy;
 
 /// RPython `class VirtualizableInstanceRepr(InstanceRepr)`.
 ///
@@ -18,15 +19,19 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// The rest of the production path follows the same division as upstream:
 /// the annotator stores `access_directly` / `fresh_virtualizable` on
 /// `Variable.annotation` as `SomeInstance.flags`; the codewriter's
-/// `rematerialize_vable_flags_for_access` performs the
+/// `Transformer.hook_access_field` performs the
 /// `VirtualizableInstanceRepr.hook_access_field` step for every configured
 /// redirected access; and `rewrite_op_jit_force_virtualizable` deletes the
 /// residual force marker from looked-inside graphs. The compiled interpreter
 /// retains that marker at the gateway, so residual execution forces while the
 /// generated JIT path does not.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,
+    /// Shared with `VTYPE._hints['virtualizable_accessor']` so
+    /// `_parse_field_list` initializes the same object the hint names.
+    pub accessor:
+        std::sync::Arc<parking_lot::Mutex<crate::translator::rtyper::rclass::FieldListAccessor>>,
     pub my_redirected_fields: HashMap<String, bool>,
 }
 
@@ -34,7 +39,36 @@ impl VirtualizableInstanceRepr {
     pub fn new(top_of_virtualizable_hierarchy: bool) -> Self {
         VirtualizableInstanceRepr {
             top_of_virtualizable_hierarchy,
+            accessor: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::translator::rtyper::rclass::FieldListAccessor::default(),
+            )),
             my_redirected_fields: HashMap::new(),
+        }
+    }
+
+    /// `VirtualizableInstanceRepr.__init__` after `InstanceRepr.__init__`.
+    pub fn from_classdesc(
+        classdesc: &crate::annotator::classdesc::ClassDesc,
+    ) -> Result<Self, crate::translator::rtyper::error::TyperError> {
+        if const_truthy(&classdesc.get_param("_virtualizable2_", None, true)) {
+            return Err(crate::translator::rtyper::error::TyperError::message(
+                "_virtualizable2_ is now called _virtualizable_, please rename".to_string(),
+            ));
+        }
+        let own = classdesc.get_param("_virtualizable_", None, false);
+        if const_truthy(&own) {
+            let basedesc = classdesc.basedesc.clone();
+            if let Some(base) = basedesc {
+                let base_param = base.borrow().get_param("_virtualizable_", None, true);
+                if !matches!(base_param, ConstValue::None) {
+                    return Err(crate::translator::rtyper::error::TyperError::message(
+                        "basedesc must not declare _virtualizable_".to_string(),
+                    ));
+                }
+            }
+            Ok(Self::new(true))
+        } else {
+            Ok(Self::new(false))
         }
     }
 
@@ -221,6 +255,44 @@ mod tests {
             VirtualizableInstanceRepr::new(false)
                 .setup_repr_llfields()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn from_classdesc_rejects_a_base_declaration_that_is_not_none() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::flowspace::model::HostObject;
+        use std::rc::Rc;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut base_members = indexmap::IndexMap::new();
+        base_members.insert("_virtualizable_".into(), ConstValue::List(vec![]));
+        let base = crate::annotator::classdesc::ClassDesc::new(
+            &bk,
+            HostObject::new_class_with_members("Base", vec![], base_members),
+            Some("Base".into()),
+            None,
+            None,
+        )
+        .expect("base ClassDesc");
+        let mut child_members = indexmap::IndexMap::new();
+        child_members.insert(
+            "_virtualizable_".into(),
+            ConstValue::List(vec![ConstValue::byte_str("x")]),
+        );
+        let child = crate::annotator::classdesc::ClassDesc::new(
+            &bk,
+            HostObject::new_class_with_members("Child", vec![], child_members),
+            Some("Child".into()),
+            Some(base),
+            None,
+        )
+        .expect("child ClassDesc");
+        let err = VirtualizableInstanceRepr::from_classdesc(&child.borrow())
+            .expect_err("empty-list base declaration is not None");
+        assert!(
+            err.to_string()
+                .contains("basedesc must not declare _virtualizable_")
         );
     }
 }

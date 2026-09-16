@@ -1784,15 +1784,18 @@ where
         guard_op
     }
 
-    fn apply_pending_box_replace(&mut self, ctx: &mut TraceCtx) {
-        let Some((oldbox, newbox)) = ctx.take_pending_box_replace() else {
-            return;
-        };
-        // `pyjitpl.MetaInterp.replace_box` framestack walk. TraceCtx already
-        // rewrote vrefs / vable boxes / heapcache; the register banks remain.
-        for frame in self.frames.frames.iter_mut() {
+    /// `pyjitpl.py MetaInterp.replace_box` framestack walk for the jitcode
+    /// machine. `_nonstandard_virtualizable` calls it immediately.
+    unsafe fn walk_miframe_stack(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+        let stack = unsafe { &mut *data.cast::<MIFrameStack>() };
+        for frame in stack.frames.iter_mut() {
             frame.replace_active_box_in_frame(oldbox, newbox, Type::Ref);
         }
+    }
+
+    fn install_replace_frames(&mut self, ctx: &mut TraceCtx) {
+        let frames = self.frames as *mut MIFrameStack;
+        unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
     }
 
     /// Attach a resume snapshot to a guard a `TraceCtx::vable_*` call emitted
@@ -1817,8 +1820,8 @@ where
     /// One call can emit TWO: a vable array access whose symbolic frame box
     /// differs from the standard box but shares its pointer promotes the
     /// `isstandard` PTR_EQ and then the index, so every guard the call added is
-    /// stamped, not just the last. `apply_pending_box_replace` updates the
-    /// live MIFrames as `MetaInterp.replace_box` does upstream. The loop runs in emission
+    /// stamped, not just the last. Framestack rewrite happens inside
+    /// `_nonstandard_virtualizable`. The loop runs in emission
     /// order because each capture leaves the root frame's in-flight result slot
     /// cleared.
     ///
@@ -1832,6 +1835,9 @@ where
     /// a `-live-` marker in front of every vable op (`lower_vable.rs`, mirroring
     /// `jtransform.py:764/798/814/845/926`), so `opcode_pc - SIZE_LIVE_OP`
     /// resolves the liveness the snapshot needs.
+    ///
+    /// Framestack rewrite now happens inside `_nonstandard_virtualizable`
+    /// via `set_replace_frames`, so this no longer drains a mailbox.
     fn capture_vable_promote_guard(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1840,7 +1846,6 @@ where
         guards_before: usize,
         write: Option<VableEntryWrite>,
     ) {
-        self.apply_pending_box_replace(ctx);
         let minted = ctx.num_guards().saturating_sub(guards_before);
         if minted == 0 {
             return;
@@ -3169,6 +3174,14 @@ where
     }
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
+        self.install_replace_frames(ctx);
+        struct ClearReplaceFrames(*mut TraceCtx);
+        impl Drop for ClearReplaceFrames {
+            fn drop(&mut self) {
+                unsafe { (*self.0).clear_replace_frames() };
+            }
+        }
+        let _clear = ClearReplaceFrames(ctx);
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local
@@ -3871,6 +3884,7 @@ where
     }
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
+        self.install_replace_frames(ctx);
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {
@@ -14493,10 +14507,14 @@ mod tests {
         recorder.record_input_arg(majit_ir::Type::Int); // index
         recorder.record_input_arg(majit_ir::Type::Int); // value
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
-        let info = make_test_vable_info();
+        // `virtualizable.py finish()` / `finalize_arc` stamps every field
+        // descr with the vinfo backref. `_nonstandard_virtualizable` only
+        // emits the isstandard PTR_EQ when `vinfo is fielddescr.get_vinfo()`.
+        let info = make_test_vable_info().finalize_arc(majit_ir::descr::make_size_descr(64));
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
         let standard_box = ctx.const_ref(999);
+        ctx.install_virtualizable_info(info.clone());
         ctx.init_virtualizable_boxes(
             &info,
             standard_box,
