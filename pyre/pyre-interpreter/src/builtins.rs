@@ -4960,23 +4960,31 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let mut w_start = range_index_bound(args[0])?;
-        let mut w_start = pyre_object::gc_roots::pin_root(w_start);
-        let w_stop;
-        let w_step;
+        let start_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(range_index_bound(args[0])?);
+        let stop_slot;
+        let step_slot;
         if n == 1 {
             // Only `stop` given — `w_start, w_stop = 0, w_start`.
-            w_stop = w_start;
-            w_start = w_int_new(0);
-            let _ = pyre_object::gc_roots::pin_root(w_start);
-            w_step = w_int_new(1);
-            let w_step = pyre_object::gc_roots::pin_root(w_step);
+            stop_slot = start_slot;
+            let start0_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+            step_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+            let start_slot = start0_slot;
+            Ok(pyre_object::w_range_new(
+                pyre_object::gc_roots::shadow_stack_get(start_slot),
+                pyre_object::gc_roots::shadow_stack_get(stop_slot),
+                pyre_object::gc_roots::shadow_stack_get(step_slot),
+                true,
+            ))
         } else {
-            w_stop = range_index_bound(args[1])?;
-            let _ = pyre_object::gc_roots::pin_root(w_stop);
+            stop_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(range_index_bound(args[1])?);
             if n == 3 {
-                w_step = range_index_bound(args[2])?;
-                let w_step = pyre_object::gc_roots::pin_root(w_step);
+                step_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(range_index_bound(args[2])?);
+                let w_step = pyre_object::gc_roots::shadow_stack_get(step_slot);
                 let step_is_zero = match pyre_object::range_obj_as_i64(w_step) {
                     Some(step) => step == 0,
                     None => pyre_object::range_obj_to_bigint(w_step) == BigInt::from(0),
@@ -4987,13 +4995,18 @@ pub(crate) fn builtin_range(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
                     ));
                 }
             } else {
-                w_step = w_int_new(1);
-                let _ = pyre_object::gc_roots::pin_root(w_step);
+                step_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
             }
+            // `descr_new` promotes the step exactly when no step argument was
+            // given, so `range(0, 10, 1)` keeps the general iterator.
+            Ok(pyre_object::w_range_new(
+                pyre_object::gc_roots::shadow_stack_get(start_slot),
+                pyre_object::gc_roots::shadow_stack_get(stop_slot),
+                pyre_object::gc_roots::shadow_stack_get(step_slot),
+                n != 3,
+            ))
         }
-        // `descr_new` promotes the step exactly when no step argument was
-        // given, so `range(0, 10, 1)` keeps the general iterator.
-        Ok(pyre_object::w_range_new(w_start, w_stop, w_step, n != 3))
     }
 }
 
@@ -19875,8 +19888,15 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none());
     let file = bind_pos_or_kw(pos, kwargs, 1, "file", "FileIO", 1)?
         .ok_or_else(|| crate::PyError::type_error("FileIO() missing required argument 'file'"))?;
-    let mode_obj =
-        bind_pos_or_kw(pos, kwargs, 2, "mode", "FileIO", 2)?.unwrap_or_else(|| w_str_new("r"));
+    let mode_obj = match bind_pos_or_kw(pos, kwargs, 2, "mode", "FileIO", 2)? {
+        Some(mode) => mode,
+        None => {
+            let _mode_roots = pyre_object::gc_roots::push_roots();
+            let _ = pyre_object::gc_roots::pin_root(file);
+            let _ = pyre_object::gc_roots::pin_root(self_obj);
+            w_str_new("r")
+        }
+    };
     if !unsafe { pyre_object::is_str(mode_obj) } {
         return Err(crate::PyError::type_error(
             "FileIO() argument 'mode' must be str",
@@ -22100,19 +22120,17 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         && !unsafe { pyre_object::is_none(opener) }
     {
         let flags = open_flags_for_mode(&mode);
-        let fd_obj = {
-            let _opener_roots = pyre_object::gc_roots::push_roots();
-            let path_slot = pyre_object::gc_roots::pin_roots(&[path_obj, opener]);
-            let flags_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
-            crate::call::call_function_impl_result(
-                pyre_object::gc_roots::shadow_stack_get(path_slot + 1),
-                &[
-                    pyre_object::gc_roots::shadow_stack_get(path_slot),
-                    pyre_object::gc_roots::shadow_stack_get(flags_slot),
-                ],
-            )?
-        };
+        let _opener_roots = pyre_object::gc_roots::push_roots();
+        let path_slot = pyre_object::gc_roots::pin_roots(&[path_obj, opener]);
+        let flags_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
+        let fd_obj = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(path_slot + 1),
+            &[
+                pyre_object::gc_roots::shadow_stack_get(path_slot),
+                pyre_object::gc_roots::shadow_stack_get(flags_slot),
+            ],
+        )?;
         if !unsafe { pyre_object::is_int(fd_obj) } {
             return Err(crate::PyError::type_error("expected integer from opener"));
         }
@@ -22138,14 +22156,17 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // An opener is free to ignore the flags it was handed, so the binary
         // mode `open_flags_for_mode` asked for is only guaranteed here.
         fileio_set_binary_mode(fd);
-        let _wrapper_roots = pyre_object::gc_roots::push_roots();
         let wrapper_slot = new_rooted_file_wrapper();
         file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
         file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
         file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new_managed(&mode));
         file_wrapper_store(wrapper_slot, "encoding", w_str_new_managed(&encoding));
         file_wrapper_store(wrapper_slot, "errors", w_str_new_managed(&errors));
-        file_wrapper_store(wrapper_slot, "name", path_obj);
+        file_wrapper_store(
+            wrapper_slot,
+            "name",
+            pyre_object::gc_roots::shadow_stack_get(path_slot),
+        );
         file_wrapper_store(wrapper_slot, "mode", w_str_new_managed(&mode));
         file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
         fileio_store_stat_atopen(
@@ -22555,23 +22576,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     kwarg_reject_unknown(kwargs, &["start"], "sum")?;
-    let iterable = pos[0];
-    let start = bind_pos_or_kw(pos, kwargs, 1, "start", "sum", 2)?.unwrap_or_else(|| w_int_new(0));
-    if unsafe { pyre_object::is_str(start) } {
-        return Err(crate::PyError::type_error(
-            "sum() can't sum strings [use ''.join(seq) instead]",
-        ));
-    }
-    if unsafe { pyre_object::is_bytes(start) } {
-        return Err(crate::PyError::type_error(
-            "sum() can't sum bytes [use b''.join(seq) instead]",
-        ));
-    }
-    if unsafe { pyre_object::is_bytearray(start) } {
-        return Err(crate::PyError::type_error(
-            "sum() can't sum bytearray [use b''.join(seq) instead]",
-        ));
-    }
+    let start_opt = bind_pos_or_kw(pos, kwargs, 1, "start", "sum", 2)?;
     // `_regular_sum`: `for x in sequence: last = last + x` over the generic
     // iterator protocol (so generators, ranges, sets, dict views, ... all
     // work).  Very intentionally `last + x`, not `+=` — preserving a mutable
@@ -22591,9 +22596,28 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `iter(iterable)` runs arbitrary allocating code before the fold begins,
     // so both operands are already live across a collection point here: root
     // them first and read every later use back out of the slot, never from the
-    // local a foreign collection has left stale.
+    // local a foreign collection has left stale. Pin the iterable before the
+    // default `start=0` mint so that nursery object cannot move first.
     let last_slot = roots.base();
-    let _ = roots.pin_root(start);
+    let _ = roots.pin_root(pos[0]);
+    let start = start_opt.unwrap_or_else(|| w_int_new(0));
+    if unsafe { pyre_object::is_str(start) } {
+        return Err(crate::PyError::type_error(
+            "sum() can't sum strings [use ''.join(seq) instead]",
+        ));
+    }
+    if unsafe { pyre_object::is_bytes(start) } {
+        return Err(crate::PyError::type_error(
+            "sum() can't sum bytes [use b''.join(seq) instead]",
+        ));
+    }
+    if unsafe { pyre_object::is_bytearray(start) } {
+        return Err(crate::PyError::type_error(
+            "sum() can't sum bytearray [use b''.join(seq) instead]",
+        ));
+    }
+    let iterable = roots.get(last_slot);
+    roots.set(last_slot, start);
     let iterable_slot = last_slot + 1;
     let _ = roots.pin_root(iterable);
     let it_slot = iterable_slot + 1;

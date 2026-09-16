@@ -116,8 +116,15 @@ fn scanstring_impl(doc: PyObjectRef, end: i64, strict_obj: PyObjectRef) -> PyRes
 fn stop_iteration(index: i64) -> PyError {
     let class = pyre_interpreter::builtins::lookup_exc_class("StopIteration")
         .expect("StopIteration installed before _json");
-    match pyre_interpreter::call::call_function_impl_result(class, &[pyre_object::w_int_new(index)])
-    {
+    let _roots = gc_roots::push_roots();
+    let class_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(class);
+    let idx_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(pyre_object::w_int_new(index));
+    match pyre_interpreter::call::call_function_impl_result(
+        gc_roots::shadow_stack_get(class_slot),
+        &[gc_roots::shadow_stack_get(idx_slot)],
+    ) {
         Ok(exc) => unsafe { PyError::from_exc_object(exc) },
         Err(err) => err,
     }

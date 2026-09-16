@@ -342,6 +342,8 @@ pub fn app_profile_call(
     // from here on, frame is just a normal w_object.
     let frame = majit_metainterp::jit::hint_no_access_directly(frame);
     let _roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_callable);
     let frame_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame));
     let event_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -349,7 +351,7 @@ pub fn app_profile_call(
     let arg_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_arg);
     crate::call::call_function_impl_result(
-        w_callable,
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
         &[
             pyre_object::gc_roots::shadow_stack_get(frame_slot),
             pyre_object::gc_roots::shadow_stack_get(event_slot),
@@ -1821,15 +1823,19 @@ impl ExecutionContext {
                 let frame = majit_metainterp::jit::hint_no_access_directly(frame);
                 // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
                 let _trace_roots = pyre_object::gc_roots::push_roots();
+                let callback_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_callback);
                 let frame_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(wrap_trace_frame(frame));
+                let event_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(event));
                 let arg_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_arg);
                 let call_result = crate::call::call_function_impl_result(
-                    w_callback,
+                    pyre_object::gc_roots::shadow_stack_get(callback_slot),
                     &[
                         pyre_object::gc_roots::shadow_stack_get(frame_slot),
-                        pyre_object::w_str_new(event),
+                        pyre_object::gc_roots::shadow_stack_get(event_slot),
                         pyre_object::gc_roots::shadow_stack_get(arg_slot),
                     ],
                 );

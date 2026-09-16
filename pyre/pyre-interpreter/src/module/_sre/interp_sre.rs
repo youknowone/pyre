@@ -603,10 +603,19 @@ fn sre_pattern_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 }
 
 fn extract_code(obj: PyObjectRef) -> Result<Vec<u32>, crate::PyError> {
-    let n = crate::baseobjspace::len_w(obj)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let n = crate::baseobjspace::len_w(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     let mut code = Vec::with_capacity(n.max(0) as usize);
     for i in 0..n {
-        let w_item = crate::baseobjspace::getitem(obj, w_int_new(i))?;
+        pyre_object::gc_roots::shadow_stack_set(idx_slot, w_int_new(i));
+        let w_item = crate::baseobjspace::getitem(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            pyre_object::gc_roots::shadow_stack_get(idx_slot),
+        )?;
         code.push(crate::baseobjspace::uint_w(w_item)? as u32);
     }
     Ok(code)

@@ -1431,7 +1431,15 @@ pub fn sequence_getitem(seq: PyObjectRef, index: usize) -> Result<PyObjectRef, P
         }
         // Try getitem for instances
         if is_instance(seq) {
-            return crate::baseobjspace::getitem(seq, w_int_new(index as i64));
+            let _roots = pyre_object::gc_roots::push_roots();
+            let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(seq);
+            let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(index as i64));
+            return crate::baseobjspace::getitem(
+                pyre_object::gc_roots::shadow_stack_get(seq_slot),
+                pyre_object::gc_roots::shadow_stack_get(idx_slot),
+            );
         }
         Err(PyError::type_error(format!(
             "cannot unpack non-sequence {}",

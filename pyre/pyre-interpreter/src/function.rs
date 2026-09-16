@@ -2143,16 +2143,26 @@ pub unsafe fn function_get_annotations(obj: PyObjectRef) -> Result<PyObjectRef, 
         }
         let annotate_fn = (*func).w_annotate;
         if !annotate_fn.is_null() && !pyre_object::is_none(annotate_fn) {
-            let dict =
-                crate::call::call_function_impl_result(annotate_fn, &[pyre_object::w_int_new(1)])?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(annotate_fn);
+            let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(1));
+            let dict = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(annotate_slot),
+                &[pyre_object::gc_roots::shadow_stack_get(idx_slot)],
+            )?;
             if !pyre_object::is_dict(dict) {
                 return Err(crate::PyError::type_error(format!(
                     "__annotate__ returned non-dict of type '{}'",
                     crate::baseobjspace::object_functionstr_type_name(dict),
                 )));
             }
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             function_write_barrier(obj);
-            (*func).w_ann = dict;
+            (*(obj as *mut Function)).w_ann = dict;
             return Ok(dict);
         }
         let fresh = pyre_object::w_dict_new();

@@ -766,13 +766,16 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     let _ = pyre_object::gc_roots::pin_root(peek.unwrap_or(PY_NULL));
+    let one_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+    let n_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
     let mut output = Vec::new();
     while limit < 0 || output.len() < limit as usize {
         let mut nreadahead = 1usize;
         let peek = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         if !peek.is_null() {
-            let one_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+            pyre_object::gc_roots::shadow_stack_set(one_slot, w_int_new(1));
             let readahead = crate::call::call_function_impl_result(
                 pyre_object::gc_roots::shadow_stack_get(sp + 1),
                 &[pyre_object::gc_roots::shadow_stack_get(one_slot)],
@@ -797,8 +800,7 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
             }
         }
 
-        let n_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_int_new(nreadahead as i64));
+        pyre_object::gc_roots::shadow_stack_set(n_slot, w_int_new(nreadahead as i64));
         let read = call_method_result(
             pyre_object::gc_roots::shadow_stack_get(sp),
             "read",
@@ -1172,10 +1174,11 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let n_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(DEFAULT_BUFFER_SIZE));
     let mut output = Vec::new();
     loop {
-        let n_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_int_new(DEFAULT_BUFFER_SIZE));
+        pyre_object::gc_roots::shadow_stack_set(n_slot, w_int_new(DEFAULT_BUFFER_SIZE));
         let data = call_method_result(
             pyre_object::gc_roots::shadow_stack_get(sp),
             "read",
@@ -1248,7 +1251,16 @@ fn buffered_iobase_readinto_impl(args: &[PyObjectRef], read_once: bool) -> crate
     let mut buffer = unsafe { crate::builtins::WritableBuffer::acquire(args[1]) }?;
     let target = unsafe { buffer.as_mut_slice() };
     let method = if read_once { "read1" } else { "read" };
-    let data = call_method_result(self_obj, method, &[w_int_new(target.len() as i64)])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let size_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(target.len() as i64));
+    let data = call_method_result(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+        method,
+        &[pyre_object::gc_roots::shadow_stack_get(size_slot)],
+    )?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(data) } {
         return Err(crate::PyError::type_error(format!(
             "{method}() should return bytes"
