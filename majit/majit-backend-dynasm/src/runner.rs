@@ -3957,9 +3957,10 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
-        unsafe {
-            majit_backend::llmodel::read_float_at_mem_sized(struct_ptr as usize, offset, size)
-        }
+        let Some(ptr) = Self::raw_mem_ptr(struct_ptr, offset as i64) else {
+            return 0.0;
+        };
+        unsafe { majit_backend::llmodel::read_float_at_mem_sized(ptr, 0, size) }
     }
 
     /// llmodel.py bh_setfield_gc_f delegates to write_float_at_mem.
@@ -3972,14 +3973,10 @@ impl Backend for DynasmBackend {
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
         let (offset, size, _) = fielddescr.unpack_fielddescr_size();
-        unsafe {
-            majit_backend::llmodel::write_float_at_mem_sized(
-                struct_ptr as usize,
-                offset,
-                size,
-                value,
-            )
-        }
+        let Some(ptr) = Self::raw_mem_ptr(struct_ptr, offset as i64) else {
+            return;
+        };
+        unsafe { majit_backend::llmodel::write_float_at_mem_sized(ptr, 0, size, value) }
     }
 
     fn compiled_fail_descr_layouts(

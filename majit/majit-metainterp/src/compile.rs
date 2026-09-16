@@ -27,8 +27,8 @@ use majit_backend::{
 use majit_ir::forwarding::ForwardingHost;
 use majit_ir::operand::Operand;
 use majit_ir::{
-    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, InputArgRc,
-    Op, OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
+    AccumInfo, Const, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, InputArgRc, Op,
+    OpCode, OpRc, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;

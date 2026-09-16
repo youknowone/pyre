@@ -9,7 +9,9 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type};
+use majit_ir::{
+    EffectInfo, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type,
+};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
@@ -7376,7 +7378,9 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         (false, Some(17)),
         (true, None),
     ] {
-        let inputargs: Vec<_> = (0..3).map(|i| InputArg::from_type_rc(Type::Int, i)).collect();
+        let inputargs: Vec<_> = (0..3)
+            .map(|i| InputArg::from_type_rc(Type::Int, i))
+            .collect();
         let mut failargs = vec![OpRef::NONE; 100];
         failargs[17] = OpRef::input_arg_int(2);
         failargs[99] = OpRef::input_arg_int(1);
