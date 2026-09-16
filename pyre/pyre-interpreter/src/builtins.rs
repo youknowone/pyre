@@ -10203,7 +10203,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // Each allocation below is a safepoint, so the nascent group and the tuple
     // it stores both go on the shadow stack before the next one runs.
-    let exc = pyre_object::interp_exceptions::w_exception_new_empty(kind);
+    let exc = pyre_object::interp_exceptions::w_exception_new_empty_extended(kind);
     let _ = pyre_object::gc_roots::pin_root(exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     crate::typedef::tag_subclass_instance(
