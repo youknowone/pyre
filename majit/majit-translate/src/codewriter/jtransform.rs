@@ -6097,15 +6097,24 @@ impl<'a> Transformer<'a> {
                     // `declares_cannot_raise` and a
                     // `#[dont_look_inside_cannot_raise]` residual emits
                     // GUARD_NO_EXCEPTION.
-                    let extraeffect = classified
+                    let libc_raw = libc_raw_alloc_oopspec(target);
+                    let extraeffect = libc_raw
                         .as_ref()
-                        .filter(|(_, _, is_override)| *is_override)
-                        .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect);
+                        .map(|(_, extra)| *extra)
+                        .or_else(|| {
+                            classified
+                                .as_ref()
+                                .filter(|(_, _, is_override)| *is_override)
+                                .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect)
+                        });
+                    let oopspecindex = libc_raw
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(OopSpecIndex::None);
                     let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
                         result_ir_type,
-                        OopSpecIndex::None,
+                        oopspecindex,
                         extraeffect,
                         &mut self.analysis_cache,
                         None,
@@ -6330,7 +6339,17 @@ impl<'a> Transformer<'a> {
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
         let (oopspecindex, extraeffect_override) =
-            if let Some((descriptor, _, _)) = classify_call(target, &self.config.call_effects) {
+            if let Some((idx, extra)) = libc_raw_alloc_oopspec(target) {
+                // `jtransform.py _rewrite_raw_malloc`: a char varsize raw
+                // malloc is `OS_RAW_MALLOC_VARSIZE_CHAR`. The frontend may
+                // already have inlined `raw_malloc_varsize_char` to
+                // `libc::malloc`, dropping the user oopspec; recover it
+                // before `describe_call` classifies the C leaf as a
+                // generic residual with `oopspecindex = None`.
+                (idx, Some(extra))
+            } else if let Some((descriptor, _, _)) =
+                classify_call(target, &self.config.call_effects)
+            {
                 (
                     descriptor.extra_info.oopspecindex,
                     Some(descriptor.extra_info.extraeffect),
@@ -10767,6 +10786,33 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
+    }
+}
+
+/// Recover `OS_RAW_MALLOC_VARSIZE_CHAR` / `OS_RAW_FREE` when the frontend
+/// has already inlined `raw_malloc_varsize_char` / `raw_free` to the C
+/// leaf (`support.py _ll_1_raw_malloc_varsize` is never `libc.malloc` in
+/// the jitcode; the oopspec sits on that helper).
+fn libc_raw_alloc_oopspec(
+    target: &CallTarget,
+) -> Option<(majit_ir::descr::OopSpecIndex, majit_ir::descr::ExtraEffect)> {
+    let CallTarget::FunctionPath { segments } = target else {
+        return None;
+    };
+    if !segments.iter().any(|s| s == "libc") {
+        return None;
+    }
+    match segments.last().map(String::as_str) {
+        // jtransform.py:677-681 `_rewrite_raw_malloc` uses `EF_CAN_RAISE`.
+        Some("malloc") => Some((
+            majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar,
+            majit_ir::descr::ExtraEffect::CanRaise,
+        )),
+        Some("free") => Some((
+            majit_ir::descr::OopSpecIndex::RawFree,
+            majit_ir::descr::ExtraEffect::CannotRaise,
+        )),
+        _ => None,
     }
 }
 
@@ -19114,6 +19160,54 @@ mod tests {
         assert_eq!(
             super::map_user_oopspec_to_index("dict.setitem"),
             OopSpecIndex::None
+        );
+    }
+
+    /// An inlined `raw_malloc_varsize_char` is a call to `libc::malloc`.
+    /// `_rewrite_raw_malloc` still owes that call `OS_RAW_MALLOC_VARSIZE_CHAR`.
+    #[test]
+    fn libc_malloc_call_lowers_to_raw_malloc_varsize_char() {
+        use crate::call::CallControl;
+        use majit_ir::descr::{ExtraEffect, OopSpecIndex};
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("raw_malloc_site");
+        let size = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["libc", "unix", "malloc"]);
+        let entry = graph.startblock;
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![size.clone()]),
+                result_ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.block_mut(entry).operations.last_mut().unwrap().result = Some(result);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let descriptor = transformed
+            .graph
+            .block(entry)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
+                _ => None,
+            })
+            .expect("expected CallResidual");
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::RawMallocVarsizeChar
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::CanRaise
         );
     }
 

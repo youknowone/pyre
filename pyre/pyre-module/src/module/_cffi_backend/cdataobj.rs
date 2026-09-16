@@ -486,6 +486,7 @@ pub fn add_memory_pressure(w_cdata: PyObjectRef, size: i64) {
 /// of every GC allocator, and the pointee of every root slot — so it banks
 /// as a reference the collector traces and rewrites.  A raw block is
 /// neither traced nor moved, and the two must not share a spelling.
+#[inline(never)]
 #[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn raw_malloc_varsize_char(size: usize) -> usize {
@@ -494,6 +495,7 @@ pub fn raw_malloc_varsize_char(size: usize) -> usize {
 
 /// `lltype.free(ptr, flavor='raw')` — the `raw_free` residual
 /// (`support.py ll_raw_free`).
+#[inline(never)]
 #[majit_macros::oopspec("raw_free(ptr)")]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn raw_free(ptr: usize) {
