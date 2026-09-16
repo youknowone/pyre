@@ -2533,43 +2533,51 @@ impl BlackholeInterpreter {
             .bh_call_v(func, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
 
-    // ── bhimpl_inline_call_* (blackhole.py:1278-1319) ──
+    // ── bhimpl_inline_call_* (`blackhole.py` `bhimpl_inline_call_*`) ──
     //
     // RPython unpacks `jitcode.fnaddr` and `jitcode.calldescr` from the
     // jitcode parameter; pyre passes them directly so the pyre tracer
     // can reuse the helpers without a JitCode object.
+    //
+    // RPython has no `called_residual`. pyre's `guard_may_bridge` uses
+    // that flag to refuse a next-merge-point fallback bridge after the
+    // walk left the interpreter. `bhimpl_inline_call_*` is `cpu.bh_call_*`
+    // of `jitcode.fnaddr`, so it must mark the same way residual does.
 
-    /// blackhole.py:1279-1281
+    /// blackhole.py `bhimpl_inline_call_r_i`
     pub fn bhimpl_inline_call_r_i(
         &self,
         fnaddr: i64,
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(fnaddr, None, Some(args_r), None, calldescr)
     }
-    /// blackhole.py:1282-1285
+    /// blackhole.py `bhimpl_inline_call_r_r`
     pub fn bhimpl_inline_call_r_r(
         &self,
         fnaddr: i64,
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(fnaddr, None, Some(args_r), None, calldescr)
     }
-    /// blackhole.py:1286-1289
+    /// blackhole.py `bhimpl_inline_call_r_v`
     pub fn bhimpl_inline_call_r_v(
         &self,
         fnaddr: i64,
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(fnaddr, None, Some(args_r), None, calldescr);
     }
-    /// blackhole.py:1291-1294
+    /// blackhole.py `bhimpl_inline_call_ir_i`
     pub fn bhimpl_inline_call_ir_i(
         &self,
         fnaddr: i64,
@@ -2577,10 +2585,11 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(fnaddr, Some(args_i), Some(args_r), None, calldescr)
     }
-    /// blackhole.py:1295-1298
+    /// blackhole.py `bhimpl_inline_call_ir_r`
     pub fn bhimpl_inline_call_ir_r(
         &self,
         fnaddr: i64,
@@ -2588,10 +2597,11 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(fnaddr, Some(args_i), Some(args_r), None, calldescr)
     }
-    /// blackhole.py:1299-1302
+    /// blackhole.py `bhimpl_inline_call_ir_v`
     pub fn bhimpl_inline_call_ir_v(
         &self,
         fnaddr: i64,
@@ -2599,10 +2609,11 @@ impl BlackholeInterpreter {
         args_r: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), None, calldescr);
     }
-    /// blackhole.py:1304-1307
+    /// blackhole.py `bhimpl_inline_call_irf_i`
     pub fn bhimpl_inline_call_irf_i(
         &self,
         fnaddr: i64,
@@ -2611,10 +2622,11 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_i(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
-    /// blackhole.py:1308-1311
+    /// blackhole.py `bhimpl_inline_call_irf_r`
     pub fn bhimpl_inline_call_irf_r(
         &self,
         fnaddr: i64,
@@ -2623,10 +2635,11 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_r(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
-    /// blackhole.py:1312-1315
+    /// blackhole.py `bhimpl_inline_call_irf_f`
     pub fn bhimpl_inline_call_irf_f(
         &self,
         fnaddr: i64,
@@ -2635,10 +2648,11 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_f(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr)
     }
-    /// blackhole.py:1316-1319
+    /// blackhole.py `bhimpl_inline_call_irf_v`
     pub fn bhimpl_inline_call_irf_v(
         &self,
         fnaddr: i64,
@@ -2647,6 +2661,7 @@ impl BlackholeInterpreter {
         args_f: &[i64],
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
+        self.called_residual.set(true);
         self.cpu()
             .bh_call_v(fnaddr, Some(args_i), Some(args_r), Some(args_f), calldescr);
     }
@@ -14400,6 +14415,12 @@ fn handler_inline_call_nested_ext(
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(p)
     };
+    // `reset_for_inline_reuse` clears the callee flag. Fold it onto the
+    // caller first so `guard_may_bridge` still sees a residual that ran
+    // inside this byte-interpreted inline callee.
+    if callee.called_residual.get() {
+        bh.called_residual.set(true);
+    }
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
@@ -14574,6 +14595,9 @@ fn inline_call_native_rii(
     }
     let dest = decode_return_slot_at(code, &mut p);
     bh.last_exc().set(0);
+    // Same `cpu.bh_call_*` leave as `bhimpl_inline_call_*`; this rii
+    // fast path does not go through those helpers.
+    bh.called_residual.set(true);
     let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
     unsafe {
         majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut r0));
