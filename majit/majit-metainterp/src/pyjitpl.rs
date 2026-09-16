@@ -5811,6 +5811,8 @@ impl<M: Clone> MetaInterp<M> {
                 // appended `virtualizable_boxes` onto `original_boxes`. Attach
                 // here so `Trace(max_num_inputargs)` sees the full cap.
                 ctx.attach_live_byte_recorder();
+                // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
+                ctx.seed_compile_and_run_once_merge_point();
                 // warmstate.py:439 `force_finish_trace=bool(cell.flags &
                 // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
                 // upstream (no clear in rpython/jit/metainterp/).
@@ -6135,6 +6137,10 @@ impl<M: Clone> MetaInterp<M> {
         // appended `virtualizable_boxes` onto `original_boxes`. Attach
         // here so `Trace(max_num_inputargs)` sees the full cap.
         ctx.attach_live_byte_recorder();
+        // pyjitpl.py `_compile_and_run_once` seeds the start boxes so
+        // the first matching header visit closes. Bridges go through
+        // `start_retrace_from_guard` and stay empty.
+        ctx.seed_compile_and_run_once_merge_point();
 
         // warmstate.py:439 `force_finish_trace=bool(cell.flags &
         // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky upstream.
@@ -16021,14 +16027,12 @@ impl<M: Clone> MetaInterp<M> {
                 return None;
             }
         };
-        // compile.py compile_retrace `get_procedure_token(greenkey)`:
-        // an invalidated cell is not a live procedure, even if
-        // `compiled_loops` still holds a Weak that upgrades.
-        if self.warm_state.get_procedure_token(green_key).is_none() {
-            crate::mc_diag_bump(7);
-            self.leave_profiler_tracing();
-            return None;
-        }
+        // pyjitpl.py `handle_guard_failure` keeps tracing while
+        // `resumedescr.rd_loop_token.loop_token_wref()` is live.
+        // `get_procedure_token` is `compile.py compile_retrace` only —
+        // applying it here would refuse an ordinary bridge when the
+        // warm-state cell was cleared but the source descr still names
+        // a live token.
 
         let norm_tid = trace_id;
         let fail_descr = descr_arc
