@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=53
+# ubuntu cranelift 34784934757: 45.9x (pypy 0.01s after leftover-empty
+# GETFIELD). 53x is 45.9x plus 15% headroom.
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame

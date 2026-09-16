@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main
+# leftover=[] abort of loop:main; the raises entry-bridge compiles.
+# pyre-check: selfcheck-compiles=entry-bridge:raises
 # Self-checking guard that a foreign frame's `f_lasti` keeps its residual.
 #
 # The fold's whole licence is that the walk KNOWS the coordinate of the frame

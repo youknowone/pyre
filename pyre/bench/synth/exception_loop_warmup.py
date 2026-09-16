@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=6.5
+# pyre-check: max-wasm-ratio=8.6
+# leftover-empty vable tails now GETFIELD the live/baked field list
+# (`compile.py patch_new_loop_to_load_virtualizable_fields`). dynasm
+# turns those into native loads; wasm emits them as guest ops. darwin-arm64
+# measured 7.4x against dynasm after rebase onto origin/main; 8.6x is
+# that reading plus WASM_RATIO_FIT_HEADROOM (15%).
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,

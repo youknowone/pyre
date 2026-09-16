@@ -50,6 +50,42 @@ pub fn redirect_assembler(old: &JitCellToken, new: &JitCellToken, asm_adr: u64) 
     }
 }
 
+thread_local! {
+    static FORCED_SAVEDATA_SLOT: std::cell::UnsafeCell<i64> =
+        const { std::cell::UnsafeCell::new(0) };
+    static FORCED_SAVEDATA_ROOTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Keep AllVirtuals reachable after a raw execute drops its deadframe.
+/// `handle_fail` parks the same pointer in `DeadFrameRefRoots` and then
+/// [`release_forced_savedata`].
+pub fn hold_forced_savedata(savedata: Option<GcRef>) {
+    let value = savedata
+        .filter(|g| !g.is_null())
+        .map(|g| g.0 as i64)
+        .unwrap_or(0);
+    FORCED_SAVEDATA_SLOT.with(|slot| {
+        unsafe { *slot.get() = value };
+        if value != 0 && !FORCED_SAVEDATA_ROOTED.get() {
+            FORCED_SAVEDATA_ROOTED.set(true);
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_raw_parts_mut(
+                    slot.get(),
+                    1,
+                ));
+            }
+        }
+    });
+}
+
+/// Drop the backend hold after the caller has installed its own root.
+/// The TLS slot stays registered (LIFO) but is zeroed so the last
+/// AllVirtuals graph is not retained until thread exit.
+pub fn release_forced_savedata() {
+    FORCED_SAVEDATA_SLOT.with(|slot| unsafe { *slot.get() = 0 });
+}
+
+
 /// `rpython/jit/backend/model.py CPUTotalTracker` — per-CPU totals
 /// bumped by `CompiledLoopToken.__init__` / `compiling_a_bridge` (loops
 /// and bridges created) and by the memory manager (loops and bridges
@@ -3075,6 +3111,7 @@ pub trait Backend: Send {
                 }
             }
         }
+        hold_forced_savedata(savedata);
         RawExecResult {
             outputs,
             typed_outputs,

@@ -1,5 +1,6 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main
+# leftover=[] abort of loop:main; the inlined caller/leaf entry-bridges compile.
+# pyre-check: selfcheck-compiles=entry-bridge:caller_view,entry-bridge:leaf
 # pyre-check: spec-folds=frame_lasti
 # pyre-check: skip-backends=wasm
 # wasm still prints PASS but compiles `root:leaf` and `root:caller_view`

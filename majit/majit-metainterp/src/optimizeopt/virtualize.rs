@@ -388,7 +388,9 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let descr = op.getdescr().expect("NEW_WITH_VTABLE needs descr");
+        let Some(descr) = op.getdescr() else {
+            return OptimizationResult::InvalidLoop("NEW_WITH_VTABLE needs descr");
+        };
         // virtualize.py `known_class = ConstInt(op.getdescr().get_vtable())`
         // — no null filter; ConstInt(0) flows downstream as the
         // known_class. info.py ConstPtrInfo.get_known_class
@@ -415,7 +417,9 @@ impl OptVirtualize {
         op_rc: &majit_ir::OpRc,
         ctx: &mut OptContext,
     ) -> OptimizationResult {
-        let descr = op.getdescr().expect("NEW needs descr");
+        let Some(descr) = op.getdescr() else {
+            return OptimizationResult::InvalidLoop("NEW needs descr");
+        };
         let vinfo = VirtualStructInfo {
             descr,
             fields: majit_ir::ptr_info::VirtualFieldList::new(),
@@ -686,9 +690,9 @@ impl OptVirtualize {
         ctx: &mut OptContext,
     ) -> OptimizationResult {
         let struct_box = ctx.resolve_operand_operand_opt(&op.arg(0));
-        let field_descr_arc = op
-            .getdescr()
-            .expect("optimize_getfield_gc: field op without FieldDescr");
+        let Some(field_descr_arc) = op.getdescr() else {
+            return OptimizationResult::InvalidLoop("getfield without FieldDescr");
+        };
         let field_descr = field_descr_arc
             .as_field_descr()
             .expect("optimize_getfield_gc: descr is not a FieldDescr");

@@ -6536,12 +6536,21 @@ impl<S: JitState> JitDriver<S> {
             // the no-exception continuation.
             let guard_exc = result.exception.exc_value;
             let savedata = result.savedata;
-            // Keep `result` (and its deadframe) until this arm returns so
-            // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
-            // `compile.py handle_fail(self, deadframe, ...)`.
-            // The reconstruction below allocates through the blackhole allocator,
-            // so hold the exception where the frontend's root walker can reach
-            // it until `prepare_resume_from_failure` hands it to the blackhole.
+            // Park AllVirtuals before `result` drops. The backend hold
+            // (dynasm raw / default execute_token_raw) covers the gap
+            // between deadframe release and this root; clear it after
+            // the handoff so the last cache is not retained until
+            // thread exit.
+            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
+            };
+            majit_backend::release_forced_savedata();
+            drop(result);
+            // The reconstruction below allocates through the blackhole
+            // allocator, so hold the exception where the frontend's root
+            // walker can reach it until `prepare_resume_from_failure`
+            // hands it to the blackhole.
             let _guard_exc_root = crate::blackhole::GuardExcRoot::park(guard_exc);
 
             // must_compile tick for bridge threshold counting.
@@ -7936,14 +7945,14 @@ impl<S: JitState> JitDriver<S> {
     /// virtuals through the same resume allocator used by ordinary guard
     /// failure.  In particular, a `jit.virtual_ref` frame must not be decoded
     /// through `NullAllocator`, or its `forced` writeback remains null.
-    pub fn force_virtualizable_token(&mut self, token: u64) {
+    pub fn force_virtualizable_token(&mut self, token: u64, identity_override: Option<i64>) {
         let fallback_alloc = crate::resume::NullAllocator;
         let allocator: &dyn crate::resume::BlackholeAllocator = self
             .blackhole_allocator
             .as_deref()
             .unwrap_or(&fallback_alloc);
         self.meta
-            .force_virtualizable_token_with_allocator(token, allocator);
+            .force_virtualizable_token_with_allocator(token, identity_override, allocator);
     }
 
     /// framework.py `root_walker.walk_roots` parity: visit every Ref-typed

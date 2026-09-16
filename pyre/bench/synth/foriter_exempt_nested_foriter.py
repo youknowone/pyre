@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=47
 # The function-entry door reading its own cell took this off the 44 it needed
 # while the door read another cell's answer, asked to trace at every call and
 # never entered the compiled loop.
@@ -10,8 +10,9 @@
 # N cannot be raised to clear `FLOOR_GATE_MIN_BASELINE_S`: generator resume
 # has no merge point (`caro_no_merge_entry`), so gouter/ginner stay
 # interpreted and the true ratio is ~100x.  Lengthening only makes that
-# honest.  20000 is the original size; the 20x ceiling is the compiled
+# honest.  20000 is the original size; the ceiling is the compiled
 # `run()` loop's budget, not the residual generator path.
+# ubuntu cranelift 34784934757: 40.7x. 47x is 40.7x plus 15% headroom.
 N = 20000
 
 

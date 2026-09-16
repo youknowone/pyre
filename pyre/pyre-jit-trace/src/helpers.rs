@@ -756,8 +756,7 @@ pub fn emit_box_int_inline(
     // entirely ("ignore the operation completely -- instead, it's done by
     // 'new'"). rewrite.py handle_malloc_operation emits the vtable
     // setfield via fielddescr_vtable during GC rewrite of NEW_WITH_VTABLE.
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(size_descr.clone());
     note_class_word_after_new(ctx, new_op, &size_descr);
     // Emit: SetfieldGc(v, intval, raw_int)
     let intval_idx = intval_descr.index();
@@ -785,8 +784,7 @@ pub fn emit_box_long_inline(
     size_descr: majit_ir::DescrRef,
     value_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(size_descr.clone());
     note_class_word_after_new(ctx, new_op, &size_descr);
     let value_idx = value_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, bigint_ref], value_descr);
@@ -813,8 +811,7 @@ pub fn emit_exception_new_inline(
 ) -> OpRef {
     let (size_descr, kind_descr, w_class_descr, args_w_descr) =
         crate::descr::w_exception_descrs(kind);
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
-    ctx.heap_cache_mut().new_object(new_op);
+    let new_op = ctx.execute_new_with_vtable(size_descr);
     let kind_const = ctx.const_int(kind as u8 as i64);
     let kind_idx = kind_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, kind_const], kind_descr);
@@ -1183,8 +1180,7 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     }
 
     // Step 3 — allocate the W_ListObject wrapper.
-    let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
-    ctx.heap_cache_mut().new_object(list);
+    let list = ctx.execute_new_with_vtable(w_list_size_descr());
 
     // Step 4 — length / items / strategy SetfieldGc, mirroring the
     // Object-strategy arm of `w_list_new`.
@@ -1238,8 +1234,7 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
         list_int_items_len_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
     };
 
-    let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
-    ctx.heap_cache_mut().new_object(list);
+    let list = ctx.execute_new_with_vtable(w_list_size_descr());
 
     let zero = ctx.const_int(0);
     let length_descr = list_length_descr();
@@ -1406,8 +1401,7 @@ pub fn emit_typed_list_inline(
     }
 
     // Step 3 — allocate the W_ListObject wrapper.
-    let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
-    ctx.heap_cache_mut().new_object(list);
+    let list = ctx.execute_new_with_vtable(w_list_size_descr());
 
     // Step 4 — initialize every scalar field, then install the active typed
     // storage. The pointer fields are cleared by the GC rewriter.
@@ -1596,9 +1590,7 @@ pub fn emit_box_slice_inline(
     w_stop_descr: majit_ir::DescrRef,
     w_step_descr: majit_ir::DescrRef,
 ) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
-    ctx.heap_cache_mut().new_object(new_op);
-    note_class_word_after_new(ctx, new_op, &size_descr);
+    let new_op = ctx.execute_new_with_vtable(size_descr);
     let w_start_idx = w_start_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, w_start], w_start_descr);
     ctx.heapcache_setfield_cached(new_op, w_start_idx, w_start);
@@ -1619,9 +1611,7 @@ pub fn emit_box_float_inline(
     floatval_descr: majit_ir::DescrRef,
 ) -> OpRef {
     // jtransform.py:908-911 parity: typeptr setfield filtered in trace.
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
-    ctx.heap_cache_mut().new_object(new_op);
-    note_class_word_after_new(ctx, new_op, &size_descr);
+    let new_op = ctx.execute_new_with_vtable(size_descr);
     let floatval_idx = floatval_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_float], floatval_descr);
     ctx.heapcache_setfield_cached(new_op, floatval_idx, raw_float);
@@ -1785,8 +1775,7 @@ pub fn emit_new_pyframe_inline_with_params(
         ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, cell);
     }
 
-    let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
-    ctx.heap_cache_mut().new_object(new_frame);
+    let new_frame = ctx.execute_new_with_vtable(pyframe_size_descr());
 
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
@@ -1917,8 +1906,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // Step 4 — allocate the new PyFrame. The GC tags it with
     // `PYFRAME_GC_TYPE_ID` because the size descr's parent type id is
     // registered in `pyre-jit/src/eval.rs`.
-    let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
-    ctx.heap_cache_mut().new_object(new_frame);
+    let new_frame = ctx.execute_new_with_vtable(pyframe_size_descr());
 
     // Step 5 — SetfieldGc for the constructor-visible fields, mirroring
     // the explicit assignments inside `new_for_call_with_closure`.

@@ -1,11 +1,11 @@
 /// Guard failure descriptors and frame data for the wasm backend.
 ///
-/// Simplified from CraneliftFailDescr — no bridge data, GC maps, or force tokens.
+/// Per-emission descriptor identity and deadframe storage.
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use majit_ir::{Descr, DescrRef, FailDescr, Type};
+use majit_ir::{Descr, DescrRef, FailDescr, GcRef, Type};
 
 /// Wasm-backend guard failure descriptor.
 #[derive(Debug)]
@@ -18,6 +18,9 @@ pub struct WasmFailDescr {
     /// An empty list is the identity layout used by reserved FINISH descrs
     /// and backend-only synthetic descriptors.
     pub fail_locs: Vec<Option<usize>>,
+    /// llmodel.py `_decode_pos`: physical Signed-word locations for force
+    /// failargs. None for the normal exit adapter's positional copy.
+    pub rd_locs: Option<Vec<u16>>,
     pub is_finish: bool,
     /// Byte offset of GUARD_NOT_FORCED(_2)'s force-only spill area. Native
     /// backends carry these coordinates in their fail locations; keeping a
@@ -58,6 +61,10 @@ impl Descr for WasmFailDescr {
 }
 
 impl FailDescr for WasmFailDescr {
+    fn rd_locs(&self) -> &[u16] {
+        self.rd_locs.as_deref().unwrap_or(&[])
+    }
+
     fn fail_index(&self) -> u32 {
         self.fail_index
     }
@@ -92,6 +99,9 @@ pub struct WasmFrameData {
     /// mid-call. `set_savedata` writes `jf_savedata` there so the
     /// later GUARD_NOT_FORCED exit can copy the word back.
     origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
+    /// Off-GC host-buffer owner. `take_host_frame` keeps the entry
+    /// JitFrame alive after `execute_token` returns.
+    host_frame: Option<majit_backend::libc_deadframe::LibcJitFrameDeadFrame>,
     /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
@@ -100,9 +110,9 @@ pub struct WasmFrameData {
 impl WasmFrameData {
     /// `llmodel.py` reads `get_ref_value` straight out of the JITFRAME,
     /// which stays a GC root (its `jf_gcmap` covers the exit slots) for as long
-    /// as the deadframe lives. wasm has no host-visible JITFRAME to hand back:
-    /// `execute_token` copies the exit values into `raw_values` and drops the
-    /// guest frame, so the copies must carry that rooting themselves. Between
+    /// as the deadframe lives. wasm retains that frame and also copies the
+    /// exit values into `raw_values` for its exit adapter, so the copies must
+    /// carry that rooting themselves. Between
     /// the copy and the last `get_ref_value`, resume/blackhole reconstruction
     /// allocates freely, and a minor collection there moves exactly the objects
     /// these slots name.
@@ -122,6 +132,7 @@ impl WasmFrameData {
             exc_value,
             savedata: 0,
             origin_jf: None,
+            host_frame: None,
             roots: Vec::new(),
         });
         let ref_count = data
@@ -176,10 +187,19 @@ impl WasmFrameData {
     pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
         let was_nonzero = self.savedata != 0;
         let now_nonzero = !data.is_null();
-        self.savedata = data.0 as i64;
+        let mut data_slot = data.0 as i64;
         if let Some(jf) = self.origin_jf {
-            unsafe { (*jf).jf_savedata = data.0 };
+            let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut data_slot));
+            }
+            if crate::wasm_gc_owns_object(jf as usize) {
+                crate::wasm_active_gc_write_barrier(majit_ir::GcRef(jf as usize));
+            }
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            unsafe { (*jf).jf_savedata = data_slot as usize };
         }
+        self.savedata = data_slot;
         if was_nonzero == now_nonzero {
             return;
         }
@@ -187,10 +207,32 @@ impl WasmFrameData {
         if now_nonzero {
             unsafe { crate::wasm_gc_add_roots(&[slot]) };
             self.roots.push(slot);
+            self.savedata = majit_gc::gc_current_object_address(self.savedata as usize) as i64;
         } else {
             crate::wasm_gc_remove_roots(std::iter::once(slot));
             self.roots.retain(|&s| s != slot);
         }
+    }
+
+    pub fn set_savedata_ref(&mut self, value: majit_ir::GcRef) {
+        self.set_savedata(value);
+    }
+
+    pub fn get_savedata_ref(&self) -> majit_ir::GcRef {
+        majit_ir::GcRef(self.savedata as usize)
+    }
+
+    /// Bind this snapshot to the live JITFRAME `force()` borrowed.
+    pub unsafe fn attach_forced_jitframe(&mut self, frame: majit_ir::GcRef) {
+        self.attach_origin_jf(frame.0 as *mut majit_backend::jitframe::JitFrame);
+    }
+
+    pub(crate) fn take_host_frame(
+        &mut self,
+        frame: majit_backend::libc_deadframe::LibcJitFrameDeadFrame,
+    ) {
+        self.attach_origin_jf(frame.frame_addr() as *mut majit_backend::jitframe::JitFrame);
+        self.host_frame = Some(frame);
     }
 }
 
@@ -297,11 +339,104 @@ mod tests {
             trace_id: 0,
             fail_arg_types,
             fail_locs: Vec::new(),
+            rd_locs: None,
             is_finish: false,
             force_args_offset: 8,
             force_gcmap_ptr: 0,
             meta_descr: None,
         })
+    }
+
+    #[test]
+    fn terminal_force_reads_the_retained_host_frames_physical_locations() {
+        use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, alloc_off_gc_jitframe};
+        use majit_backend::{Backend, DeadFrame};
+        let roots = install_root_counting_gc();
+        let backend = crate::WasmBackend::new();
+        // x86 `store_force_descr`: `jf_force_descr` holds `index + 1`. The
+        // force spill sits past FINISH's result slots so `_decode_pos` still
+        // sees the armed values after the exit adapter overwrites items[0..2].
+        let fail_index = reserve_fail_descrs(1);
+        let mut forced_descr = fail_descr(vec![Type::Int, Type::Float]);
+        {
+            let descr = Arc::get_mut(&mut forced_descr).unwrap();
+            descr.fail_index = fail_index;
+            descr.force_args_offset = 16;
+            descr.rd_locs = Some(vec![
+                (16 / std::mem::size_of::<usize>()) as u16,
+                (24 / std::mem::size_of::<usize>()) as u16,
+            ]);
+        }
+        register_fail_descrs(std::slice::from_ref(&forced_descr));
+        let depth = 32 / std::mem::size_of::<usize>();
+        let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(depth));
+        assert!(!jf.is_null());
+        unsafe { JitFrame::init(jf, std::ptr::null(), depth) };
+        majit_gc::shadow_stack::register_libc_jitframe(jf as usize);
+        let items = (jf as usize + FIRST_ITEM_OFFSET) as *mut i64;
+        unsafe {
+            (*jf).jf_force_descr = fail_index as usize + 1;
+            *items = 99; // FINISH's normal exit index
+            *items.add(1) = jf as usize as i64; // FINISH's returned token
+            *items.add(2) = 1i64 << 40; // must remain i64 on wasm32
+            *items.add(3) = 1.25f64.to_bits() as i64;
+        }
+        let finish_descr = fail_descr(vec![Type::Ref]);
+        let owner = unsafe {
+            majit_backend::libc_deadframe::LibcJitFrameDeadFrame::owning(
+                jf,
+                jf,
+                depth,
+                finish_descr.clone(),
+                None,
+            )
+        };
+        let mut data = WasmFrameData::boxed(vec![jf as usize as i64], finish_descr, 0);
+        data.take_host_frame(owner);
+        let mut retained = Vec::new();
+        majit_gc::walk_active_live_deadframes(&mut |addr| retained.push(addr));
+        assert!(retained.contains(&(jf as usize)));
+        let returned = DeadFrame::Boxed(data);
+        let token = backend.get_ref_value(&returned, 0);
+        assert!(backend.is_force_token_armed(token));
+        let forced = backend.force(token).unwrap();
+        assert_eq!(backend.get_int_value(&forced, 0), 1i64 << 40);
+        assert_eq!(backend.get_float_value(&forced, 1), 1.25);
+        assert_ne!(
+            unsafe { *items } & crate::codegen::FORCE_TAKEN_BIT,
+            0,
+            "force marks frame[0] so GUARD_NOT_FORCED deopts"
+        );
+        drop(forced);
+        assert!(majit_gc::shadow_stack::is_libc_jitframe(jf as usize));
+        drop(returned);
+        assert!(!majit_gc::shadow_stack::is_libc_jitframe(jf as usize));
+        assert_eq!(roots.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn forcing_publishes_savedata_on_the_running_frame() {
+        let roots = install_root_counting_gc();
+        use majit_backend::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
+        let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(0));
+        assert!(!jf.is_null());
+        unsafe { JitFrame::init(jf, std::ptr::null(), 0) };
+        {
+            let mut forced = WasmFrameData::boxed(vec![], fail_descr(vec![]), 0);
+            unsafe { forced.attach_forced_jitframe(GcRef(jf as usize)) };
+            forced.set_savedata_ref(GcRef(0x1000));
+            assert_eq!(forced.get_savedata_ref(), GcRef(0x1000));
+        }
+        // The force-time DeadFrame wrapper is gone; the subsequently failing
+        // guard must still find the cache on the actual JITFRAME.
+        assert_eq!(unsafe { (*jf).jf_savedata }, 0x1000);
+        let mut exited = WasmFrameData::boxed(vec![], fail_descr(vec![]), 0);
+        exited.set_savedata_ref(GcRef(unsafe { (*jf).jf_savedata }));
+        unsafe { free_off_gc_jitframe(jf) };
+        assert_eq!(exited.get_savedata_ref(), GcRef(0x1000));
+        assert_eq!(roots.load(Ordering::SeqCst), 1);
+        drop(exited);
+        assert_eq!(roots.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -355,6 +490,7 @@ mod tests {
                     trace_id: 0,
                     fail_arg_types: vec![Type::Ref],
                     fail_locs: Vec::new(),
+                    rd_locs: None,
                     is_finish: false,
                     force_args_offset: 8,
                     force_gcmap_ptr: 0,
@@ -390,6 +526,7 @@ mod tests {
                                 trace_id: trace_id as u64,
                                 fail_arg_types: vec![Type::Int],
                                 fail_locs: Vec::new(),
+                                rd_locs: None,
                                 is_finish: false,
                                 force_args_offset: 8,
                                 force_gcmap_ptr: 0,
@@ -690,6 +827,7 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
         trace_id: 0,
         fail_arg_types: reserved_fail_arg_types(exit_index),
         fail_locs: Vec::new(),
+        rd_locs: None,
         is_finish: true,
         force_args_offset: 0,
         force_gcmap_ptr: 0,
@@ -1276,6 +1414,11 @@ pub struct ChainedTraceMeta {
 
 /// Compiled wasm loop metadata, stored in `JitCellToken.compiled`.
 pub struct CompiledWasmLoop {
+    /// gcmap.py `allocate_gcmap` data blocks, including retained re-emissions
+    /// and bridges. Their addresses are embedded in the corresponding code.
+    pub gc_maps: RefCell<Vec<Box<[usize]>>>,
+    /// Assembler descriptor pointers embedded in current and retired code.
+    pub force_descrs: RefCell<Vec<Arc<WasmFailDescr>>>,
     /// Owning `JitCellToken` number, used to retract this loop's
     /// CALL_ASSEMBLER target metadata on drop.
     pub token_number: u64,

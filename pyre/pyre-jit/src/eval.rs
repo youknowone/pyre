@@ -5912,7 +5912,7 @@ unsafe extern "C" fn force_pyframe_vref(
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[jit][force-hook] vref token=0x{token:x}");
             }
-            driver.force_virtualizable_token(token);
+            driver.force_virtualizable_token(token, None);
         })
     };
     // `virtualref.py:174-176` — `token == TOKEN_NONE` with no `forced` means
@@ -5999,7 +5999,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
                 if majit_metainterp::majit_log_enabled() {
                     eprintln!("[jit][force-hook] frame token=0x{token:x} frame={ptr:p}");
                 }
-                driver.force_virtualizable_token(token);
+                driver.force_virtualizable_token(token, Some(ptr as i64));
             });
         };
         // Force the traced frame only when the frame handed to Python belongs
@@ -7869,7 +7869,7 @@ fn drive_unpack_iterable_trace(
                 is_exception_exit,
                 fail_index,
                 has_storage,
-                values,
+                mut values,
                 exit_layout,
                 guard_exc,
             )) = meta
@@ -7920,13 +7920,13 @@ fn drive_unpack_iterable_trace(
             // compile.py:710-716 resume_in_blackhole: complete the in-flight
             // `next()`/`append` and run forward to the next merge point.
             let bh = resume_in_blackhole_from_exit_layout(
-                &values,
+                &mut values,
                 exit_layout
                     .as_deref()
                     .expect("a guard exit carrying resume storage carries its layout"),
                 guard_exc,
                 // jd1 is novable: it has no virtualizable to force.
-                std::ptr::null(),
+                None,
                 true,
                 None,
             );
@@ -8185,6 +8185,49 @@ fn drive_unpack_iterable_trace(
     }
 }
 
+unsafe extern "C" fn leftover_is_listiter(p: *const u8) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    let obj = p as pyre_object::PyObjectRef;
+    unsafe {
+        (pyre_object::iterobject::is_list_iter(obj)
+            || pyre_object::iterobject::is_tuple_iter(obj)
+            || pyre_object::iterobject::is_seq_iter(obj)
+            || pyre_object::iterobject::is_list_reverse_iter(obj)) as i32
+    }
+}
+
+unsafe extern "C" fn leftover_is_str(p: *const u8) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    let obj = p as pyre_object::PyObjectRef;
+    unsafe { (pyre_object::is_str(obj) || pyre_object::is_bytes(obj)) as i32 }
+}
+
+/// Live EC top (`vref_referent`) for leftover_peel_tos. Read at peel
+/// time so a nested CALL_ASSEMBLER sees the callee frame, not a
+/// host-entry snapshot that a collection can move.
+fn leftover_scan_live_frame() -> *const u8 {
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return std::ptr::null();
+    }
+    let raw = unsafe { (*ec).topframeref };
+    let top = pyre_interpreter::executioncontext::vref_referent(raw);
+    if top.is_null()
+        || unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) }
+    {
+        return std::ptr::null();
+    }
+    top as *const u8
+}
+
+fn publish_leftover_scan_frame() {
+    majit_metainterp::register_leftover_scan_live(leftover_scan_live_frame);
+}
+
 /// Eagerly register pyre-jit's hooks into pyre-interpreter so callers
 /// like `sys.settrace` see the JIT side from the very first user call,
 /// not only after the first JIT-eligible eval.  Idempotent (the
@@ -8200,6 +8243,11 @@ pub fn init_jit_hooks() {
     // dispatch (object crate included) can read it without depending on
     // the metainterp.
     majit_rlib::jit::install_we_are_jitted(majit_backend::we_are_jitted);
+    majit_metainterp::register_listiter_type_word(
+        &pyre_object::iterobject::LIST_ITER_TYPE as *const _ as usize,
+    );
+    majit_metainterp::register_listiter_pred(leftover_is_listiter);
+    majit_metainterp::register_str_pred(leftover_is_str);
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
@@ -11097,10 +11145,19 @@ fn handle_fail(
     should_bridge: bool,
     _owning_key: u64,
     exit_layout: &CompiledExitLayout,
-    raw_values: &[i64],
+    raw_values: &mut [i64],
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-) -> HandleFailOutcome {
+    savedata: Option<majit_ir::GcRef>,
+) -> (HandleFailOutcome, Option<majit_ir::GcRef>) {
+    // compile.py ResumeGuardForcedDescr.handle_fail keeps the deadframe
+    // (and `jf_savedata`) alive across the bridge decision. The native
+    // raw-exit path has already copied that field out, so root the copy
+    // before this function's GC hooks and reload the forwarded address.
+    let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+    let _savedata_root = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
+    };
     // The guard exception arrives as a bare pointer whose deadframe root is
     // already gone, and bridge setup decodes resume data (allocating) before
     // `setup_bridge_sym` copies it onto the sym. Park it for the walker first.
@@ -11178,7 +11235,10 @@ fn handle_fail(
         // The `ResumeInBlackhole` below decodes off the exit layout it was
         // handed, so retiring the entry here cannot starve it of slot types.
         driver.remove_compiled_loop(green_key);
-        return HandleFailOutcome::ResumeInBlackhole;
+        return (
+            HandleFailOutcome::ResumeInBlackhole,
+            savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+        );
     }
 
     // A keyed failure proves this FOR_ITER site's instance-`__next__`
@@ -11247,7 +11307,10 @@ fn handle_fail(
                     // compile.py:708: bridge compiled → ContinueRunningNormally.
                     // RPython: the bridge is attached to the guard descr;
                     // re-entering compiled code will follow the bridge.
-                    return HandleFailOutcome::BridgeCompiled;
+                    return (
+                        HandleFailOutcome::BridgeCompiled,
+                        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                    );
                 }
                 crate::call_jit::BridgeResolution::Finished(cv) => {
                     // #177: the walk ran the resumed frame forward to its
@@ -11260,10 +11323,16 @@ fn handle_fail(
                         pyre_jit_trace::state::ConcreteValue::Null => w_none(),
                         other => other.to_pyobj(),
                     };
-                    return HandleFailOutcome::BridgeFinished(v);
+                    return (
+                        HandleFailOutcome::BridgeFinished(v),
+                        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                    );
                 }
                 crate::call_jit::BridgeResolution::FinishedException(cv) => {
-                    return HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv));
+                    return (
+                        HandleFailOutcome::BridgeRaised(finish_concrete_raise_error(cv)),
+                        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+                    );
                 }
                 crate::call_jit::BridgeResolution::ResumeBlackhole => {}
             }
@@ -11271,7 +11340,10 @@ fn handle_fail(
     }
     // compile.py:710-716 / pyjitpl.py:2906 (SwitchToBlackhole):
     // resume_in_blackhole(metainterp_sd, jitdriver_sd, self, deadframe)
-    HandleFailOutcome::ResumeInBlackhole
+    (
+        HandleFailOutcome::ResumeInBlackhole,
+        savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize)),
+    )
 }
 
 /// Short tag for a `BlackholeResult` variant, for the `[bh-rd-numb]`
@@ -11343,22 +11415,31 @@ pub(crate) fn savedata_from_jitframe(
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
 pub(crate) fn resume_in_blackhole_from_exit_layout(
-    raw_values: &[i64],
+    raw_values: &mut [i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
-    // `forced_guard_cache_owner` of the failing guard: the frame whose
-    // forced-virtual cache this resume may fish, null for any guard that is
-    // not a GUARD_NOT_FORCED.
-    forced_cache_owner: *const pyre_interpreter::PyFrame,
+    // `cpu.get_savedata_ref(deadframe)` for GUARD_NOT_FORCED; None for every
+    // other guard kind.
+    savedata: Option<majit_ir::GcRef>,
     // True when the failing guard belongs to a novable jitdriver (jd1
     // `unpackiterable_driver`): its resume data has no vable section, so the
     // decode must not consume one. jd0 guards pass `false`.
     novable: bool,
-    // compile.py `cpu.get_savedata_ref(deadframe)` for a
-    // `GUARD_NOT_FORCED` handle_fail. `None` when the exit had no
-    // jitframe savedata word.
-    savedata: Option<majit_ir::GcRef>,
+    // Live portal PyFrame for jd0. Used when the encoded vable identity is
+    // empty (`NULLREF` / unread failarg slot). Novable resumes pass `None`.
+    identity_override: Option<i64>,
 ) -> crate::call_jit::BlackholeResult {
+    // compile.py ResumeGuardForcedDescr.handle_fail keeps `deadframe` alive
+    // while it reads `cpu.get_savedata_ref(deadframe)` and passes the revealed
+    // AllVirtuals cache into resume.py.  The native raw-exit adaptation has
+    // already copied that field out of the JITFRAME, so give the copied GCREF
+    // the same precise root lifetime.  In particular, re-read the slot after
+    // entering it: a collection while the blackhole is being prepared may
+    // forward AllVirtuals and write the new address here.
+    let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+    let _savedata_root = unsafe {
+        majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
+    };
     // Same deadframe rooting as `handle_fail`: `decode_ref`'s TAGBOX arm reads
     // these slots after the resume construction has already allocated.  The
     // scope is handed to `blackhole_resume_via_rd_numb` below rather than held
@@ -11405,16 +11486,17 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         // kind out of the self-describing deadframe+descr it was handed.
         // The sibling resume paths already pass this slice directly
         // (`jitdriver.rs`).
-        let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner, savedata);
+        let all_virtuals = take_forced_virtuals_for_frame(std::ptr::null(), savedata);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
-            majit_backend::FailArgSource::from(raw_values),
+            majit_backend::FailArgSource::from(&*raw_values),
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
             Some(exit_layout.exit_types.as_slice()),
             guard_exc,
             novable,
+            identity_override,
             all_virtuals,
             Some(deadframe_roots),
         );
@@ -11542,7 +11624,8 @@ fn execute_assembler(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
+    let mut frame_root = FrameRoot::new(loop_red_frame(frame));
+    publish_leftover_scan_frame();
     frame_root.frame().set_last_instr_from_next_instr(entry_pc);
 
     // Convert tagged-immediate frame locals to heap `W_IntObject` before the
@@ -11619,7 +11702,7 @@ fn execute_assembler(
     // itself points into the evacuated (and debug-poisoned) frame.  PyPy roots
     // the frame object and lets its type tracer follow the locals-array field;
     // `FrameRoot` plus `pyframe_object_custom_trace` is that same ownership.
-    let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+    let mut outcome = driver.run_compiled_detailed_with_bridge_keyed(
         green_key,
         entry_pc,
         &mut jit_state,
@@ -11769,7 +11852,7 @@ fn execute_assembler(
             ref descr_arc,
             should_bridge,
             owning_key,
-            ref raw_values,
+            ref mut raw_values,
             ref exit_layout,
             guard_exc,
             savedata,
@@ -11787,20 +11870,21 @@ fn execute_assembler(
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
             ) {
-                HandleFailOutcome::BridgeCompiled => Some(LoopResult::ContinueRunningNormally),
+                (HandleFailOutcome::BridgeCompiled, _) => Some(LoopResult::ContinueRunningNormally),
                 // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => Some(LoopResult::Done(Ok(v))),
-                HandleFailOutcome::BridgeRaised(err) => Some(LoopResult::Done(Err(err))),
-                HandleFailOutcome::ResumeInBlackhole => {
+                (HandleFailOutcome::BridgeFinished(v), _) => Some(LoopResult::Done(Ok(v))),
+                (HandleFailOutcome::BridgeRaised(err), _) => Some(LoopResult::Done(Err(err))),
+                (HandleFailOutcome::ResumeInBlackhole, savedata) => {
                     // compile.py:710-716 / pyjitpl.py:2906 SwitchToBlackhole
                     let bh_result = resume_in_blackhole_from_exit_layout(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
+                        descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
-                        savedata,
+                        Some(frame_root.frame() as *mut PyFrame as i64),
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -11847,7 +11931,15 @@ fn compile_and_run_once(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
+    // Back-edge: leftover-empty GETFIELDs the red. An inlined `_compile`
+    // is EC top while `can_enter_jit` still holds the portal. Function
+    // entry's red is the callee being entered, not a deeper top frame.
+    let red = match start {
+        CompileOnceStart::BackEdge => loop_red_frame(frame),
+        CompileOnceStart::FunctionEntry => frame,
+    };
+    let mut frame_root = FrameRoot::new(red);
+    publish_leftover_scan_frame();
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {
         CompileOnceStart::BackEdge => 18,
@@ -12042,7 +12134,8 @@ fn bound_reached(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
-    let mut frame_root = FrameRoot::new(frame);
+    let mut frame_root = FrameRoot::new(loop_red_frame(frame));
+    publish_leftover_scan_frame();
     if majit_metainterp::majit_log_enabled() {
         let locals: Vec<(usize, Option<i64>)> = (0..locals_w!(frame_root.frame()).len().min(5))
             .map(|i| {
@@ -12123,7 +12216,7 @@ fn bound_reached(
     } else {
         None
     };
-    if let Some(outcome) = outcome {
+    if let Some(mut outcome) = outcome {
         // rstack.stack_check_slowpath → _StackOverflow parity: drain
         // the JIT-overflow flag the backend probe records when it
         // trips. The backend's prologue exits via the dedicated
@@ -12139,7 +12232,7 @@ fn bound_reached(
             ref descr_arc,
             should_bridge,
             owning_key,
-            ref raw_values,
+            ref mut raw_values,
             ref exit_layout,
             guard_exc,
             savedata,
@@ -12158,25 +12251,26 @@ fn bound_reached(
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
+                (HandleFailOutcome::BridgeCompiled, _) => {
                     return Some(LoopResult::ContinueRunningNormally);
                 }
                 // #177: single-frame bridge walk returned a concrete Finish.
-                HandleFailOutcome::BridgeFinished(v) => {
+                (HandleFailOutcome::BridgeFinished(v), _) => {
                     return Some(LoopResult::Done(Ok(v)));
                 }
-                HandleFailOutcome::BridgeRaised(err) => {
+                (HandleFailOutcome::BridgeRaised(err), _) => {
                     return Some(LoopResult::Done(Err(err)));
                 }
-                HandleFailOutcome::ResumeInBlackhole => {
+                (HandleFailOutcome::ResumeInBlackhole, savedata) => {
                     let bh_result = resume_in_blackhole_from_exit_layout(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
+                        descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
-                        savedata,
+                        Some(frame_root.frame() as *mut PyFrame as i64),
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -12413,7 +12507,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // callees and exits through the same guards.
         let _topframeref_guard =
             TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
-        let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+        let mut outcome = driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             frame_root.frame().next_instr(),
             &mut jit_state,
@@ -12455,7 +12549,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref descr_arc,
             should_bridge,
             owning_key,
-            ref raw_values,
+            ref mut raw_values,
             ref exit_layout,
             guard_exc,
             savedata,
@@ -12474,28 +12568,29 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 raw_values,
                 guard_exc,
                 info,
+                savedata,
             ) {
-                HandleFailOutcome::BridgeCompiled => {
+                (HandleFailOutcome::BridgeCompiled, _) => {
                     // Bridge compiled → ContinueRunningNormally → re-enter
                     // compiled code which will follow the new bridge.
                     // Fall through to eval_loop_jit below.
                 }
                 // #177: single-frame bridge walk returned a concrete Finish.
                 // This site returns `Option<PyResult>` (not `LoopResult`).
-                HandleFailOutcome::BridgeFinished(v) => {
+                (HandleFailOutcome::BridgeFinished(v), _) => {
                     return Some(Ok(v));
                 }
-                HandleFailOutcome::BridgeRaised(err) => {
+                (HandleFailOutcome::BridgeRaised(err), _) => {
                     return Some(Err(err));
                 }
-                HandleFailOutcome::ResumeInBlackhole => {
+                (HandleFailOutcome::ResumeInBlackhole, savedata) => {
                     let bh_result = resume_in_blackhole_from_exit_layout(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
+                        descr_arc.is_guard_forced().then_some(savedata).flatten(),
                         false,
-                        savedata,
+                        Some(frame_root.frame() as *mut PyFrame as i64),
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -14841,6 +14936,46 @@ fn replay_pending_fields(
             );
         }
     }
+}
+
+/// One red frame per frame (`AGENTS.md`). leftover-empty GETFIELDs
+/// `inputargs[index_of_virtualizable]`, the red `execute_assembler` passes.
+/// `portal_frame_reg` aliases the outermost caller for an inlined callee, so
+/// `can_enter_jit` can still hold the portal while the leftover iterator
+/// lives on the inlined `_compile`.
+///
+/// `topframeref` is a `jit.virtual_ref`. Do not `force_vref` here:
+/// `execute_assembler` is about to run compiled code against this vable,
+/// and `force_virtual` clears `TOKEN_TRACING_RESCALL`. Read the named
+/// frame only (`vref_referent`); a still-virtual vref stays on the
+/// dispatch red.
+fn loop_red_frame(dispatch: &mut PyFrame) -> &mut PyFrame {
+    let dispatch_ptr = dispatch as *mut PyFrame;
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return dispatch;
+    }
+    let raw = unsafe { (*ec).topframeref };
+    let top = pyre_interpreter::executioncontext::vref_referent(raw);
+    if top.is_null() || top == dispatch_ptr {
+        return dispatch;
+    }
+    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(top as *const u8) } {
+        return dispatch;
+    }
+    // One red frame per inlined call (`pyframe.py` `get_w_globals`).
+    // A different pycode is still that call's own frame; filtering it
+    // by identity hands LOAD_GLOBAL the portal's names.
+    if unsafe { (*top).locals_cells_stack_w }.is_null() {
+        return dispatch;
+    }
+    if std::env::var_os("MAJIT_LEFTOVER").is_some() {
+        eprintln!(
+            "loop-red dispatch={dispatch_ptr:p} top={top:p} pycode={:p}",
+            dispatch.pycode
+        );
+    }
+    unsafe { &mut *top }
 }
 
 // dont_look_inside: JIT-state construction machinery the tracer must not enter.

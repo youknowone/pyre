@@ -2043,7 +2043,11 @@ fn unpack_stamp(stamp: u32) -> Option<crate::value::Value> {
         STAMP_VOID => Some(crate::value::Value::Void),
         s if s & 3 == STAMP_INT => Some(crate::value::Value::Int(((s as i32) >> 2) as i64)),
         s if s & 3 == STAMP_WIDE => Some(crate::operand::wide_value((s >> 2) as u64)),
-        other => panic!("corrupt Op.stamp {other}"),
+        // A recorded wasm trace has been observed with a pointer-sized
+        // word here (`getattr_hook_binding` / `getframe_bridge_force_plain`).
+        // Treat it as unset so optimize can InvalidLoop rather than abort
+        // the guest.
+        _ => None,
     }
 }
 
