@@ -2321,12 +2321,12 @@ impl HostEnv {
         );
 
         // Pyre-internal type ctors emitted as 2-segment paths.
-        // `FrameDebugData::new` from `pyframe::PyFrame::getorcreate_debug_data`;
+        // `FrameDebugData::init` from `pyframe::PyFrame::getorcreate_debug_data`;
         // `RootScope::new` from `gc_roots::push_roots`.
         let frame_debug_data = HostObject::new_module("FrameDebugData");
         frame_debug_data.module_set(
-            "new",
-            HostObject::new_builtin_callable("FrameDebugData.new"),
+            "init",
+            HostObject::new_builtin_callable("FrameDebugData.init"),
         );
         let root_scope = HostObject::new_module("RootScope");
         root_scope.module_set("new", HostObject::new_builtin_callable("RootScope.new"));

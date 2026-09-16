@@ -57,6 +57,7 @@ pub fn install_force_frame_hook(f: ForceFrameFn) -> ForceFrameHookGuard {
 /// access at translation time. The 17 `force_frame` subjects stay residual
 /// until the front emits `jit_force_virtualizable` at those sites.
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn force_frame(frame: *mut PyFrame) {
     let p = FORCE_FRAME_HOOK.load(Ordering::Acquire);
     if !p.is_null() {

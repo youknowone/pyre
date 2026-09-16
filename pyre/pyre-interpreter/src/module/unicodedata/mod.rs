@@ -37,6 +37,9 @@ type PyResult = Result<PyObjectRef, PyError>;
 const UCD_MODERN: ucd_core::Ucd = ucd_core::Ucd::new(true);
 const UCD_LEGACY: ucd_core::Ucd = ucd_core::Ucd::new(false);
 
+/// Residual choke: `Ucd::new` is a foreign constructor. The two views
+/// are prebuilt consts (`interp_ucd.py` `_unicodedb` field).
+#[majit_macros::dont_look_inside]
 fn ucd(legacy: bool) -> &'static ucd_core::Ucd {
     if legacy { &UCD_LEGACY } else { &UCD_MODERN }
 }

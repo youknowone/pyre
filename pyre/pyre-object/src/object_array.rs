@@ -1,7 +1,33 @@
 use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::AtomicUsize;
 
 use crate::{PY_NULL, PyObjectRef};
+
+/// Host constructor for a 3.14t length cell. Upstream `l.length`
+/// (`rlist.py`) is a plain Signed; minting the atomic word is residual.
+#[majit_macros::dont_look_inside]
+pub(crate) fn length_cell(n: usize) -> AtomicUsize {
+    AtomicUsize::new(n)
+}
+
+/// `rstr.py` `AbstractStringRepr.ll_strcmp`.
+#[majit_macros::elidable]
+#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
+pub(crate) fn ll_chars_strcmp(left: &[u8], right: &[u8]) -> isize {
+    let cmplen = left.len().min(right.len());
+    let left_p = left.as_ptr();
+    let right_p = right.as_ptr();
+    let mut i = 0usize;
+    while i < cmplen {
+        let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
+        if diff != 0 {
+            return diff;
+        }
+        i += 1;
+    }
+    left.len() as isize - right.len() as isize
+}
 
 // The `GcArray(Float)` / `GcArray(Signed)` body and its no-collect allocation
 // live with `rbigint`, whose `_digits` is lowered to one

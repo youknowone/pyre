@@ -156,6 +156,7 @@ impl crate::lltype::GcType for W_UnicodeObject {
 }
 
 impl crate::lltype::GcType for W_UnicodeObjectUser {
+    #[inline(always)]
     fn type_id() -> u32 {
         W_UNICODE_USER_GC_TYPE_ID
     }
@@ -1273,19 +1274,16 @@ pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
 }
 
 #[majit_macros::elidable]
+#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
 pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;
     unsafe {
         // WTF-8 byte order matches code point order, so the byte
         // comparison yields the same result as comparing code points.
-        let sa = w_str_get_wtf8(a);
-        let sb = w_str_get_wtf8(b);
-        match sa.as_bytes().cmp(sb.as_bytes()) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }
+        let sa = w_str_get_wtf8(a).as_bytes();
+        let sb = w_str_get_wtf8(b).as_bytes();
+        crate::object_array::ll_chars_strcmp(sa, sb) as i64
     }
 }
 
@@ -1596,7 +1594,9 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_value(cat), "abcd");
             assert_eq!(w_str_get_value(rep), "ababab");
-            assert_eq!(jit_str_compare(a as i64, b as i64), -1);
+            assert!(jit_str_compare(a as i64, b as i64) < 0);
+            assert_eq!(jit_str_compare(a as i64, a as i64), 0);
+            assert!(jit_str_compare(b as i64, a as i64) > 0);
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
         }

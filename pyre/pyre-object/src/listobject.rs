@@ -3136,12 +3136,14 @@ pub unsafe fn w_list_resize_hint(obj: PyObjectRef, newsize: i64) -> bool {
     let requested = newsize.max(list.live_len());
     let target = if requested > current {
         let extra = if requested < 9 { 3 } else { 6 };
-        let Some(target) = requested
-            .checked_add(extra)
-            .and_then(|n| n.checked_add(requested >> 3))
-        else {
+        // rlist.py `_ll_list_resize_hint_really`: `some += newsize >> 3`
+        // then `new_allocated = newsize + some`. Overflow is a failed
+        // malloc, not `checked_add`.
+        let some = extra + (requested >> 3);
+        let target = requested.wrapping_add(some);
+        if target < requested {
             return false;
-        };
+        }
         target
     } else if requested < (current >> 1).saturating_sub(5) {
         requested
@@ -3284,9 +3286,12 @@ unsafe fn reserve_for_extend_target(list: &W_ListObject, extra: usize) -> Option
         return Some((extra + 1) & !1);
     }
     let old_size = list.live_len();
-    old_size
-        .checked_add(extra)
-        .map(|new_size| list.resized_allocation(old_size, new_size))
+    let new_size = old_size.wrapping_add(extra);
+    if new_size < old_size {
+        None
+    } else {
+        Some(list.resized_allocation(old_size, new_size))
+    }
 }
 
 /// Reserve CPython's logical slots before `list.extend` consumes its source.
@@ -3353,7 +3358,8 @@ pub unsafe fn w_list_resize_for_extend(obj: PyObjectRef, extra: usize) {
     let _list_guard = w_list_lock(obj);
     let list = &mut *(obj as *mut W_ListObject);
     let old_size = list.live_len();
-    if let Some(new_size) = old_size.checked_add(extra) {
+    let new_size = old_size.wrapping_add(extra);
+    if new_size >= old_size {
         list.allocated = list.resized_allocation(old_size, new_size) as isize;
     }
 }
@@ -4127,12 +4133,15 @@ pub unsafe fn w_list_sort_strings(obj: PyObjectRef, reverse: bool) -> bool {
     let list = &mut *(obj as *mut W_ListObject);
     match list.strategy {
         ListStrategy::Bytes => list.bytes_items.as_mut_slice().sort_by(|a, b| {
-            crate::bytesobject::bytes_block_chars(*a).cmp(crate::bytesobject::bytes_block_chars(*b))
+            crate::object_array::ll_chars_strcmp(
+                crate::bytesobject::bytes_block_chars(*a),
+                crate::bytesobject::bytes_block_chars(*b),
+            )
+            .cmp(&0)
         }),
-        ListStrategy::Ascii => list
-            .ascii_items
-            .as_mut_slice()
-            .sort_by(|a, b| (&**a).as_bytes().cmp((&**b).as_bytes())),
+        ListStrategy::Ascii => list.ascii_items.as_mut_slice().sort_by(|a, b| {
+            crate::object_array::ll_chars_strcmp((&**a).as_bytes(), (&**b).as_bytes()).cmp(&0)
+        }),
         _ => return false,
     }
     if reverse {
