@@ -12180,7 +12180,9 @@ unsafe fn is_module_getattribute_descr(w_descr: PyObjectRef) -> bool {
 /// The module default is `Module.descr_getattribute`, not
 /// `object.__getattribute__`, but it uses the same per-type memoized flag and
 /// mutation invalidation as the object-default path.
-unsafe fn module_getattribute_if_not_from_default(w_type: PyObjectRef) -> Option<PyObjectRef> {
+pub(crate) unsafe fn module_getattribute_if_not_from_default(
+    w_type: PyObjectRef,
+) -> Option<PyObjectRef> {
     if majit_metainterp::jit::we_are_jitted() {
         return lookup_in_type_where(w_type, "__getattribute__")
             .filter(|&w_descr| !is_module_getattribute_descr(w_descr));

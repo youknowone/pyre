@@ -16738,8 +16738,8 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
 
     let helper = jit_import_cached as *const ();
     // Impure `CallR`: `sys.modules` is mutable.  The helper only reads
-    // module/spec dicts on exact `module` objects with no Python
-    // `__getattribute__`, so it cannot raise or force a virtualizable.
+    // module/spec dicts on exact `module` objects whose `__getattribute__`
+    // is the module default, so it cannot raise or force a virtualizable.
     // Hook-shaped objects declined above; `IMPORT_NAME` keeps CallMayForce.
     let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
     let result = ctx.trace_ctx.call_typed_with_effect(

@@ -5339,9 +5339,14 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
 ///
 /// The residual is a non-forcing `CallR` so
 /// `test_import.test_import_in_function` stays `guard_not_invalidated`
-/// only.  A custom `__getattribute__`, a data descriptor, or a
+/// only.  A non-default module `__getattribute__`, a data descriptor, or a
 /// non-bool `_initializing` declines; the original `IMPORT_NAME` then
 /// runs `dunder_import` (including hooks and the 3.14 wait).
+///
+/// Exact `module` uses `Module.descr_getattribute`, not
+/// `object.__getattribute__`.  The object-default check would decline every
+/// real module and force the slow `CallMayForce` importer on every
+/// `import math`.
 pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if sys_modules_blocks(name) {
         return None;
@@ -5351,7 +5356,7 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
         return None;
     }
     let w_type = unsafe { (*w_module).w_class };
-    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some() {
+    if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
         return None;
     }
     // `getattr` consults a data descriptor before the instance dict.
@@ -7213,6 +7218,33 @@ mod tests {
         assert!(!exists_and_is_executable(&executable));
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(exists_and_is_executable(&executable));
+    }
+
+    #[test]
+    fn import_cache_probe_accepts_exact_module_with_spec() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_probe_mod");
+        let spec_cls = crate::typedef::make_builtin_type("ImportCacheProbeSpec", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        let spec = pyre_object::objectobject::w_instance_new(spec_cls);
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };
+        set_sys_module("import_cache_probe_mod", module);
+        let w_type = unsafe { (*module).w_class };
+        assert!(
+            unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some(),
+            "object.__getattribute__ is not the module default; that check declines every module"
+        );
+        assert!(
+            unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }
+                .is_none(),
+            "exact module keeps Module.descr_getattribute"
+        );
+        assert!(
+            sys_module_if_initialized("import_cache_probe_mod").is_some(),
+            "exact module with a dict-only spec must take the import-cache residual"
+        );
     }
 
     #[test]
