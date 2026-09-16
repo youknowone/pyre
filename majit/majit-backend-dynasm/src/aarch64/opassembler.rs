@@ -28,10 +28,10 @@ impl<'a> AssemblerARM64<'a> {
         match val_loc {
             Loc::Reg(v) if v.is_xmm => {
                 if field_size == 4 {
+                    let scratch = if v.value == 14 { 15 } else { 14 };
                     dynasm!(self.mc ; .arch aarch64
-                        ; fcvt S(v.value), D(v.value)
-                        ; str S(v.value), [X(base.value), ofs as u32]
-                        ; fcvt D(v.value), S(v.value)
+                        ; fcvt S(scratch), D(v.value)
+                        ; str S(scratch), [X(base.value), ofs as u32]
                     );
                 } else {
                     dynasm!(self.mc ; .arch aarch64 ; str D(v.value), [X(base.value), ofs as u32]);
@@ -257,10 +257,10 @@ impl<'a> AssemblerARM64<'a> {
         debug_assert!((-256..256).contains(&ofs));
         if val.is_xmm {
             if size == 4 {
+                let scratch = if val.value == 14 { 15 } else { 14 };
                 dynasm!(self.mc ; .arch aarch64
-                    ; fcvt S(val.value), D(val.value)
-                    ; stur S(val.value), [X(base.value), ofs]
-                    ; fcvt D(val.value), S(val.value)
+                    ; fcvt S(scratch), D(val.value)
+                    ; stur S(scratch), [X(base.value), ofs]
                 );
             } else {
                 dynasm!(self.mc ; .arch aarch64 ; stur D(val.value), [X(base.value), ofs]);
@@ -285,13 +285,13 @@ impl<'a> AssemblerARM64<'a> {
     ) {
         if val.is_xmm {
             if size == 4 {
-                dynasm!(self.mc ; .arch aarch64 ; fcvt S(val.value), D(val.value));
+                let scratch = if val.value == 14 { 15 } else { 14 };
+                dynasm!(self.mc ; .arch aarch64 ; fcvt S(scratch), D(val.value));
                 if let Some(r) = ofs_reg {
-                    dynasm!(self.mc ; .arch aarch64 ; str S(val.value), [X(base.value), X(r.value)]);
+                    dynasm!(self.mc ; .arch aarch64 ; str S(scratch), [X(base.value), X(r.value)]);
                 } else {
-                    dynasm!(self.mc ; .arch aarch64 ; str S(val.value), [X(base.value), ofs as u32]);
+                    dynasm!(self.mc ; .arch aarch64 ; str S(scratch), [X(base.value), ofs as u32]);
                 }
-                dynasm!(self.mc ; .arch aarch64 ; fcvt D(val.value), S(val.value));
             } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(base.value), X(r.value)]);
             } else {

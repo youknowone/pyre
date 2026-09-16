@@ -156,7 +156,11 @@ impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
             if let Some(prev) = pos.bind(arg.index, idx as u32) {
                 panic!(
                     "OpTypeIndex: raw inputarg index {} bound to inputargs[{}] {:?} and inputargs[{}] {:?} — backend uniqueness violated",
-                    arg.index, prev, inputargs[prev as usize].as_ref().tp, idx, arg.tp,
+                    arg.index,
+                    prev,
+                    inputargs[prev as usize].as_ref().tp,
+                    idx,
+                    arg.tp,
                 );
             }
         }

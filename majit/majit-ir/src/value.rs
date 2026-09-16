@@ -603,6 +603,14 @@ impl InputArgRc {
         this.ptr == other.ptr
     }
 
+    /// Update the box type in place. Fail-arg reconciliation can retag a
+    /// shared InputArg after unboxing; `tp` is otherwise construction-fixed.
+    pub fn set_tp(&self, tp: Type) {
+        unsafe {
+            (*self.ptr.as_ptr()).value.tp = tp;
+        }
+    }
+
     pub fn as_ptr(this: &Self) -> *const InputArg {
         unsafe { std::ptr::addr_of!((*this.ptr.as_ptr()).value) }
     }
@@ -660,14 +668,6 @@ impl std::ops::Deref for InputArgRc {
     type Target = InputArg;
     fn deref(&self) -> &InputArg {
         unsafe { &self.ptr.as_ref().value }
-    }
-}
-
-impl std::ops::DerefMut for InputArgRc {
-    fn deref_mut(&mut self) -> &mut InputArg {
-        // Shared-box mutation, matching a Python InputArg's in-place
-        // `_forwarded` / type updates. Compile is single-threaded.
-        unsafe { &mut (*self.ptr.as_ptr()).value }
     }
 }
 

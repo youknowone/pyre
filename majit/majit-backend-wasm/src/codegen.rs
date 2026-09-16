@@ -4716,11 +4716,7 @@ impl Clone for InlinedBridge {
             external_jump: self.external_jump.clone(),
             outside_loop: self.outside_loop,
             trace_id: self.trace_id,
-            inputargs: self
-                .inputargs
-                .iter()
-                .cloned()
-                .collect(),
+            inputargs: self.inputargs.iter().cloned().collect(),
             ops: self.ops.clone(),
             gc_table_base: self.gc_table_base,
             constants: self.constants.clone(),
@@ -4731,11 +4727,7 @@ impl Clone for InlinedBridge {
 impl Clone for ModuleBuildInputs {
     fn clone(&self) -> Self {
         Self {
-            inputargs: self
-                .inputargs
-                .iter()
-                .cloned()
-                .collect(),
+            inputargs: self.inputargs.iter().cloned().collect(),
             ops: self.ops.clone(),
             inlined_bridges: self.inlined_bridges.clone(),
             constants: self.constants.clone(),
@@ -7725,7 +7717,7 @@ fn build_function(
                     if op.opcode == OpCode::GcLoadIndexedF {
                         match size {
                             4 => {
-                                sink.f32_load(mem64(offset));
+                                sink.f32_load(mem32(offset));
                                 sink.f64_promote_f32();
                             }
                             8 => {
@@ -7764,7 +7756,7 @@ fn build_function(
                     if op.opcode == OpCode::GcLoadF {
                         match size {
                             4 => {
-                                sink.f32_load(mem64(offset));
+                                sink.f32_load(mem32(offset));
                                 sink.f64_promote_f32();
                             }
                             8 => {

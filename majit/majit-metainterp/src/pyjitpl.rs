@@ -1429,7 +1429,10 @@ fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>
 
 /// The reminted InputArg that occupies the assembled loop Vm slot
 /// (`InputArg(1)`). `None` when that slot was not a Ref.
-fn reminted_loop_vm_red(original: &[InputArgRc], reminted: &[majit_ir::InputArgRc]) -> Option<OpRef> {
+fn reminted_loop_vm_red(
+    original: &[InputArgRc],
+    reminted: &[majit_ir::InputArgRc],
+) -> Option<OpRef> {
     let assembled = OpRef::input_arg_typed(1, Type::Ref);
     original.iter().zip(reminted.iter()).find_map(|(old, new)| {
         (old.opref() == assembled && old.tp == Type::Ref).then_some(new.opref())
@@ -11052,8 +11055,8 @@ impl<M: Clone> MetaInterp<M> {
                     OpRef::InputArgRef(i) => (i, Type::Ref),
                     _ => continue,
                 };
-                if let Some(ia) = inputargs.get_mut(idx as usize) {
-                    ia.tp = tp;
+                if let Some(ia) = inputargs.get(idx as usize) {
+                    ia.set_tp(tp);
                 }
             }
         }
