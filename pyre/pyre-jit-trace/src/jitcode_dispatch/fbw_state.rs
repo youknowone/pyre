@@ -27,11 +27,11 @@ use super::*;
 /// per-depth fixtures later consolidated into it, so re-measure before
 /// leaning on it.
 ///
-/// A callee that raises inline is capped separately — at TWO multiframe levels,
-/// keyed off `callee_body_contains_raise` — because its unwind crosses the
-/// suspended intermediate frame through the cross-frame bridge (gh#343 /
-/// gh#467).  A third level abort_trace's `exception_try_call_inlined_callee_raise`
-/// and storms `selfrec_tail_exception_unwind`; see
+/// A callee that raises inline is capped separately — at THREE distinct
+/// multiframe levels, keyed off `callee_body_contains_raise` — because its
+/// unwind crosses suspended intermediate frames through the cross-frame
+/// bridge (gh#343 / gh#467).  A third *copy of the same* `w_code` still
+/// storms `selfrec_tail_exception_unwind`; see
 /// [`fbw_effective_multiframe_depth`].
 ///
 /// A self-recursive callee is bounded instead by
@@ -113,9 +113,8 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
 
 /// True when two live frames share a `w_code`.  Inlining a raising leaf
 /// through two suspended copies of the same intermediate is the
-/// `selfrec_tail_exception_unwind` storm.  A distinct `shape → mid → leaf`
-/// chain is a different failure (`exception_try_call_inlined_callee_raise`
-/// abort_trace) that currently shares the same depth-2 bound.
+/// `selfrec_tail_exception_unwind` storm and stays at the raising depth-2
+/// bound.  A distinct `shape → mid → leaf` chain is admitted to depth 3.
 pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
     let mut seen = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -142,24 +141,18 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 ///
 /// Raising chains keep a shallower local bound because the carrier unwind
 /// crosses suspended frames.  `perform_call` (`pyjitpl.py`) has no such cap:
-/// it always pushes a new `MIFrame`.  A third inlined raising frame is still
-/// blocked here — `b3efabbc8ed` measured `exception_try_call_inlined_callee_raise`
-/// going 3/1/0 → 2/0/3 (three exception-edge bridges abort_trace), and a
-/// third copy of the same `w_code` storms `selfrec_tail_exception_unwind`
-/// (`guard_failures` 937 → 7408).  The second flag is therefore ignored on
-/// the raising path: both the distinct `shape → mid → leaf` chain and the
-/// selfrec storm fail at depth 3.
-///
-/// Convergence: exception-edge bridges for a three-frame raising chain must
-/// compile the way `perform_call` + `finishframe_exception` do.  Until
-/// `exception_try_call_inlined_callee_raise` stays at 3/1/0 (or better) with
-/// this function returning 3, the local bound stays.
+/// it always pushes a new `MIFrame`.  A distinct `shape → mid → leaf` chain
+/// now compiles the exception-edge bridge the way `finishframe_exception`
+/// does (`ChangeFrame` into the catching middle), so that shape is admitted
+/// to depth 3.  A third copy of the same `w_code` still storms
+/// `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408), so the
+/// recursive/duplicate flag stays at 2 on the raising path.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
     recursive_or_duplicate: bool,
 ) -> usize {
     if contains_raise {
-        2
+        if recursive_or_duplicate { 2 } else { 3 }
     } else if recursive_or_duplicate {
         usize::MAX
     } else {
@@ -202,8 +195,8 @@ mod recursion_depth_policy_tests {
     }
 
     #[test]
-    fn non_recursive_raising_keeps_the_carrier_unwind_safety_bound() {
-        assert_eq!(fbw_effective_multiframe_depth(true, false), 2);
+    fn distinct_raising_chain_admits_the_three_frame_exception_edge() {
+        assert_eq!(fbw_effective_multiframe_depth(true, false), 3);
     }
 
     #[test]

@@ -615,10 +615,9 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
 /// BELOW another inlined frame has to cross the suspended intermediate
 /// frame(s) through the cross-frame exception-unwind bridge (gh#343 / gh#467),
 /// so the depth is bounded rather than unbounded: the call site caps a raising
-/// callee at TWO multiframe levels, not at the top level — see
-/// `fbw_effective_multiframe_depth`.  Two levels are green; a third abort_trace's
-/// `exception_try_call_inlined_callee_raise` and takes
-/// `selfrec_tail_exception_unwind`'s `guard_failures` from 937 to 7408.
+/// callee at THREE distinct multiframe levels, not at the top level — see
+/// `fbw_effective_multiframe_depth`.  A third copy of the same `w_code` still
+/// storms `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).
 /// Straight value-returning chains never raise, so they still inline to the
 /// full `fbw_max_multiframe_depth`.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
@@ -6149,16 +6148,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let contains_raise = body_facts.contains_raise;
     // A callee that raises inline needs the cross-frame bridge the carrier
     // drain builds once a guard inside the compiled chain fails.  The drain
-    // walks the paused middle frames between the raising leaf and the root, so
-    // one intermediate frame may sit between the loop and the raise; a middle
-    // that CATCHES is still declined.  Raising depth stays at two for every
-    // shape: a third distinct `shape → mid → leaf` frame abort_trace's
-    // `exception_try_call_inlined_callee_raise` (3/1/0 → 2/0/3, `b3efabbc8ed`),
-    // and a third copy of the same `w_code` storms
-    // `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).
-    // `perform_call` has no such cap; see `fbw_effective_multiframe_depth`
-    // for the convergence condition.  A value-returning chain (no raise)
-    // inlines to the full depth either way.
+    // walks the paused middle frames between the raising leaf and the root
+    // the way `finishframe_exception` does, including `ChangeFrame` into a
+    // middle that catches.  Distinct raising depth is 3; a third copy of the
+    // same `w_code` still storms `selfrec_tail_exception_unwind`
+    // (`guard_failures` 937 → 7408) and stays at 2.  `perform_call` has no
+    // such cap; see `fbw_effective_multiframe_depth`.  A value-returning
+    // chain (no raise) inlines to the full depth either way.
     // Value-returning recursion still keys only on this callee's own
     // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
     // only a raising-chain safety valve: it must not promote an unrelated

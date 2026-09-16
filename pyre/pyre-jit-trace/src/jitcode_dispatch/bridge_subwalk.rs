@@ -1117,6 +1117,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     concrete_callee_frame: usize,
     child_result: Option<OpRef>,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
+    // `finishframe_exception` ChangeFrame: enter this reconstructed frame at
+    // its `catch_exception` target with the bubbled exception already seeded.
+    // `None` is the ordinary resume-at-CALL / `make_result_of_lastop` path.
+    handler_entry: Option<(OpRef, ConcreteValue, usize)>,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
@@ -1509,7 +1513,27 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }
         // As above: the callee bank is a local of this frame.
         let bank_guard = crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
-        let outcome = walk(callee_code, entry, &mut sub_wc);
+        // `pyjitpl.py finishframe_exception`: `frame.pc = target; raise ChangeFrame`.
+        // The interpret loop then continues this frame at the handler. Seed
+        // `last_exc_value` and reconstruct the handler operand stack the same
+        // way the walk-level SubRaise catch and the root `CarrierRaiseSeed`
+        // path do, then start at `catch_target` instead of the CALL resume pc.
+        let walk_entry = if let Some((exc, exc_concrete, catch_target)) = handler_entry {
+            sub_wc.set_last_exc_value(exc, exc_concrete);
+            sub_wc.fbw_mode.class_of_last_exc_is_const = true;
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+            if let Err(error) =
+                record_bridge_handler_entry_traceback(&mut sub_wc, exc, exc_concrete, entry)
+            {
+                drop(bank_guard);
+                return Some(Err(error));
+            }
+            vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
+            catch_target
+        } else {
+            entry
+        };
+        let outcome = walk(callee_code, walk_entry, &mut sub_wc);
         drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
@@ -1608,6 +1632,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         concrete_callee_frame,
         None,
         paused_parent_recipes,
+        None,
     )
 }
 
@@ -1651,5 +1676,52 @@ pub(crate) fn drive_bridge_middle_frame<Sym: WalkSym>(
         concrete_callee_frame,
         Some(child_result),
         paused_parent_recipes,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_bridge_middle_frame_from_handler<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<WalkSession>,
+    root_sym: &Sym,
+    root_pc: usize,
+    middle_pjc: &std::sync::Arc<crate::PyJitCode>,
+    middle_code_key: usize,
+    middle_w_globals: usize,
+    entry: usize,
+    argboxes_r: &[OpRef],
+    argboxes_i: &[OpRef],
+    argboxes_f: &[OpRef],
+    local_oprefs: &[OpRef],
+    local_concretes: &[majit_ir::Value],
+    resumed_stack_oprefs: &[OpRef],
+    resumed_stack_concretes: &[majit_ir::Value],
+    concrete_callee_frame: usize,
+    paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
+    exc: OpRef,
+    exc_concrete: ConcreteValue,
+    catch_target: usize,
+) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
+    drive_bridge_frame_subwalk(
+        ctx,
+        session,
+        root_sym,
+        root_pc,
+        middle_pjc,
+        middle_code_key,
+        middle_w_globals,
+        entry,
+        argboxes_r,
+        argboxes_i,
+        argboxes_f,
+        local_oprefs,
+        local_concretes,
+        resumed_stack_oprefs,
+        resumed_stack_concretes,
+        concrete_callee_frame,
+        None,
+        paused_parent_recipes,
+        Some((exc, exc_concrete, catch_target)),
     )
 }
