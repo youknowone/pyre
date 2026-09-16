@@ -1217,6 +1217,7 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
                 start: Box::new(start.to_resume_source()),
                 length: Box::new(length.to_resume_source()),
             },
+            ResumeVirtualLayoutSummary::Hole => VirtualInfo::Empty,
         }
     }
 }
@@ -1373,6 +1374,7 @@ fn resume_virtual_layout_to_exit_virtual_layout(
                 start: start.to_exit_source(virtual_offset),
                 length: length.to_exit_source(virtual_offset),
             },
+            ResumeVirtualLayoutSummary::Hole => ExitVirtualLayout::Hole,
         }
     }
 }
@@ -1912,14 +1914,7 @@ pub fn virtual_info_from_rd(rd: &majit_ir::RdVirtualInfo) -> VirtualInfo {
                 length,
             }
         }
-        majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
-            descr: None,
-            type_id: 0,
-            known_class: None,
-            fields: vec![],
-            fielddescrs: vec![],
-            descr_size: 0,
-        },
+        majit_ir::RdVirtualInfo::Empty => VirtualInfo::Empty,
     }
 }
 
@@ -2257,6 +2252,7 @@ impl EncodedResumeData {
                         rd_consts,
                     ),
                 },
+                VirtualInfo::Empty => majit_ir::RdVirtualInfo::Empty,
             };
             std::rc::Rc::new(rd)
         }
@@ -3047,6 +3043,7 @@ impl MaterializedVirtual {
                 type_id: 0,
                 fields: Vec::new(),
             },
+            VirtualInfo::Empty => panic!("resume.py: null rd_virtuals[index]"),
         }
     }
 
@@ -4081,18 +4078,10 @@ impl ResumeDataLoopMemo {
         if !virtual_fields.is_empty() {
             // resume.py: length = num_env_virtuals + memo.num_cached_virtuals()
             let length = num_env_virtuals + self.num_cached_virtuals();
-            // TODO: resume.py uses `[None] * length` —
-            // holes are represented as Python `None` in the list. Pyre's
-            // descr-side `rd_virtuals: Arc<[Rc<RdVirtualInfo>]>` (compile.py:855
-            // `_attrs_`) wraps the whole array in Option but the INNER
-            // element type is not itself optional.  We use the
-            // `RdVirtualInfo::Empty` sentinel variant to mark hole slots;
-            // downstream consumers (compile.rs, compiler.rs,
-            // state.rs, eval.rs,
-            // `resume.rs::rd_virtual_to_virtual_info`) match `Empty`
-            // and treat it as `None` equivalent.  Functional parity is
-            // preserved; the structural divergence stays isolated to
-            // this one type.
+            // resume.py `virtuals = [None] * length`. The inner
+            // element is not Option because descr-side `rd_virtuals`
+            // is `Arc<[Rc<RdVirtualInfo>]>`; `RdVirtualInfo::Empty` /
+            // `VirtualInfo::Empty` is that None.
             rd_virtuals.resize(length, std::rc::Rc::new(majit_ir::RdVirtualInfo::Empty));
             // resume.py:493-494: memo.nvirtuals += length; memo.nvholes += length - len(vfieldboxes)
             self.nvirtuals += length;
@@ -7144,19 +7133,8 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
     }
 
     fn is_empty_placeholder(&self) -> bool {
-        // The `RdVirtualInfo::Empty` → `VirtualObj` conversion in
-        // `rd_virtual_to_virtual_info` produces this exact shape.
-        matches!(
-            self,
-            VirtualInfo::VirtualObj {
-                descr: None,
-                type_id: 0,
-                known_class: None,
-                fields,
-                fielddescrs,
-                descr_size: 0,
-            } if fields.is_empty() && fielddescrs.is_empty()
-        )
+        // resume.py `if rd_virtual is not None`
+        matches!(self, VirtualInfo::Empty)
     }
 
     /// resume.py/634/650 allocate(decoder, index)
@@ -7347,6 +7325,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
+            VirtualInfo::Empty => panic!("resume.py: null rd_virtuals[index]"),
             _ => {
                 decoder.virtuals_cache.set_ptr(index, 0);
                 0
