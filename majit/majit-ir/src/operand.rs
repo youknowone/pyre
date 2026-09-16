@@ -465,7 +465,7 @@ impl Operand {
         match self.view() {
             Opnd::None => OpRef::NONE,
             Opnd::Op(op) => op.pos().get(),
-            Opnd::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp),
+            Opnd::InputArg(ia) => OpRef::input_arg_typed(ia.index, ia.tp.get()),
             Opnd::SmallInt(encoded) => OpRef::const_int(small_int_value(encoded)),
             Opnd::SmallWide(id) => match wide_value(id) {
                 Value::Int(v) => OpRef::const_int(v),
@@ -497,7 +497,7 @@ impl Operand {
     pub fn type_(&self) -> Type {
         match self.view() {
             Opnd::Op(op) => op.pos().get().ty().unwrap_or(op.type_),
-            Opnd::InputArg(ia) => ia.tp,
+            Opnd::InputArg(ia) => ia.tp.get(),
             Opnd::SmallInt(_) => Type::Int,
             Opnd::SmallWide(id) => wide_value(id).get_type(),
             Opnd::NullRef => Type::Ref,

@@ -42,7 +42,7 @@
 //!         make_finish_descr(0, vec![Type::Int])));
 //!     // SAFETY: well-formed integer-only IR, configured CPU and fresh token.
 //!     let mut compiled = unsafe {
-//!         CompiledIr::compile(cpu, fresh_token, &[x.fresh_value_copy()],
+//!         CompiledIr::compile(cpu, fresh_token, &[x],
 //!             &[add, finish], ConstMap::default())
 //!     }.expect("backend supports integer addition");
 //!     // SAFETY: no pointers, allocation, or runtime calls in this IR.
@@ -54,7 +54,7 @@
 
 use std::sync::Arc;
 
-use majit_ir::{Const, ConstMap, InputArg, OpRc, Type, Value};
+use majit_ir::{Const, ConstMap, InputArgRc, OpRc, Type, Value};
 
 use crate::{AsmInfo, Backend, BackendError, JitCellToken, RawExecResult};
 
@@ -104,7 +104,7 @@ impl<'backend> CompiledIr<'backend> {
     pub unsafe fn compile(
         backend: &'backend mut dyn Backend,
         token: Arc<JitCellToken>,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         operations: &[OpRc],
         constants: ConstMap<Const>,
     ) -> Result<Self, BackendError> {
@@ -113,12 +113,12 @@ impl<'backend> CompiledIr<'backend> {
                 "eager compilation requires a fresh JitCellToken".into(),
             ));
         }
-        if operations.is_empty() || inputargs.iter().any(|arg| arg.tp == Type::Void) {
+        if operations.is_empty() || inputargs.iter().any(|arg| arg.tp.get() == Type::Void) {
             return Err(BackendError::CompilationFailed(
                 "eager compilation requires nonempty IR and non-void input arguments".into(),
             ));
         }
-        let input_types = inputargs.iter().map(|arg| arg.tp).collect();
+        let input_types = inputargs.iter().map(|arg| arg.tp.get()).collect();
         backend.set_constants_pool(constants);
         let result = backend.compile_loop(inputargs, operations, &token);
         backend.set_constants_pool(ConstMap::default());

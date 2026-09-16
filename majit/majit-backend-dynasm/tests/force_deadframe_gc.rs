@@ -316,8 +316,8 @@ impl Fixture {
         }
 
         let inputargs = vec![
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
         ];
         let r0 = inputargs[0].opref();
         let r1 = inputargs[1].opref();

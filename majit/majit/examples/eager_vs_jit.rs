@@ -16,7 +16,7 @@ use majit::backend::{Backend, JitCellToken, RawExecResult};
 use majit::eager::CompiledIr;
 use majit::ir::descr::make_finish_descr;
 use majit::ir::operand::Operand;
-use majit::ir::{ConstMap, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
+use majit::ir::{ConstMap, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use majit_backend_dynasm::runner::DynasmBackend;
 
 const SAMPLES: usize = 7;
@@ -30,7 +30,7 @@ fn backend() -> DynasmBackend {
     cpu
 }
 
-fn add_ir() -> (Vec<InputArg>, Vec<OpRc>) {
+fn add_ir() -> (Vec<InputArgRc>, Vec<OpRc>) {
     let x = InputArg::new_int_rc(0);
     let y = InputArg::new_int_rc(1);
     let add = OpRc::new(Op::new(
@@ -46,10 +46,7 @@ fn add_ir() -> (Vec<InputArg>, Vec<OpRc>) {
         &[Operand::from_bound_op(&add)],
         make_finish_descr(0, vec![Type::Int]),
     ));
-    (
-        vec![x.fresh_value_copy(), y.fresh_value_copy()],
-        vec![add, finish],
-    )
+    (vec![x, y], vec![add, finish])
 }
 
 fn arguments(i: u64) -> [Value; 2] {

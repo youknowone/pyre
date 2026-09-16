@@ -8973,21 +8973,10 @@ fn read_calldescr(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (CallDe
 /// RPython: fielddescr carries byte offset directly; pyre VableField.index
 /// needs vinfo.static_fields[index].offset resolution.
 ///
-/// Vable scalar word-size invariant: `field_size: size_of::<usize>()`,
-/// `field_type: Ref`, `field_flag: Pointer`, `is_field_signed: false`.
-/// Every vable scalar field in pyre is laid out as a single machine word,
-/// so the synthesized BhDescr can derive these.  The width has to be the
-/// target's word, not a literal 8: the size-dispatching
-/// `Backend::bh_setfield_gc_i` picks its store width from it, and on a
-/// 32-bit target an 8-byte store at `valuestackdepth` runs past the field
-/// and clears the `last_instr` that follows it.  The dynasm / cranelift
-/// `bh_getfield_gc_*`
-/// overrides on this BhDescr therefore read i64 / GcRef / f64 at the
-/// resolved offset without consulting size/sign — equivalent to the
-/// llmodel.py `read_int_at_mem(struct, ofs, 8, False)` call.
-/// Non-word-sized vable fields would require porting RPython's
-/// `unpack_fielddescr_size` ((ofs, size, sign) tuple) into BhDescr +
-/// updating both backends to honor `size`/`sign`.
+/// Copy `field_size` / `field_type` / signedness from
+/// `vinfo.static_fields`.  A `float(f32)` vable scalar is four bytes;
+/// synthesizing a word-sized `Ref` descr here would make
+/// `bh_getfield_gc_f` consume the next field.
 #[inline]
 fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) -> (BhDescr, usize) {
     let (descr, pos) = read_descr(bh, code, pos);
@@ -9005,25 +8994,27 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     } else {
         unsafe { &*bh.virtualizable_info }
     };
-    let offset = vinfo
-        .static_fields
-        .get(field_index)
-        .unwrap_or_else(|| {
-            panic!(
-                "read_descr_vable_field: VableField index {} out of bounds for {} static fields",
-                field_index,
-                vinfo.static_fields.len()
-            )
-        })
-        .offset;
+    let field = vinfo.static_fields.get(field_index).unwrap_or_else(|| {
+        panic!(
+            "read_descr_vable_field: VableField index {} out of bounds for {} static fields",
+            field_index,
+            vinfo.static_fields.len()
+        )
+    });
+    let field_flag = match field.field_type {
+        majit_ir::value::Type::Ref => majit_ir::descr::ArrayFlag::Pointer,
+        majit_ir::value::Type::Float => majit_ir::descr::ArrayFlag::Float,
+        majit_ir::value::Type::Int if field.field_signed => majit_ir::descr::ArrayFlag::Signed,
+        majit_ir::value::Type::Int => majit_ir::descr::ArrayFlag::Unsigned,
+        majit_ir::value::Type::Void => majit_ir::descr::ArrayFlag::Void,
+    };
     (
         BhDescr::Field {
-            offset,
-            // Vable scalar word-size invariant — see fn doc-block.
-            field_size: std::mem::size_of::<usize>(),
-            field_type: majit_ir::value::Type::Ref,
-            field_flag: majit_ir::descr::ArrayFlag::Pointer,
-            is_field_signed: false,
+            offset: field.offset,
+            field_size: field.field_size,
+            field_type: field.field_type,
+            field_flag,
+            is_field_signed: field.field_signed,
             is_immutable: false,
             is_quasi_immutable: false,
             // No parent list, so there is no slot to claim — `None` rather than a

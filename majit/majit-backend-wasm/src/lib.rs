@@ -807,7 +807,7 @@ use failguard::{
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Value};
 
 /// `x86/assembler.py fixup_target_tokens`, called from BOTH `assemble_loop`
 /// (:612) and `assemble_bridge` (:706) — a LABEL assembled inside a bridge is a
@@ -823,7 +823,7 @@ use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRc, Value};
 fn stamp_and_publish_label_targets(
     func_handle: u32,
     frame: codegen::FrameGeometry,
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     bridge_entry_arity: Option<usize>,
 ) -> (Vec<usize>, Vec<usize>) {
@@ -2966,7 +2966,7 @@ impl WasmBackend {
     /// reads the object at its current address. Returns `None` for a trace
     /// with no reference constant, leaving the module byte-identical.
     fn intern_ref_constants(
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: Vec<Op>,
     ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
         let next_pos = codegen::next_value_pos(inputargs, &ops);
@@ -3633,7 +3633,7 @@ unsafe impl Send for WasmBackend {}
 /// out of bounds. The native backends normalize positions before codegen
 /// (dynasm `prepare_ops_for_compile`, cranelift `normalize_ops_for_codegen_simple`);
 /// the wasm backend does the same here.
-fn normalize_ops_for_codegen(inputargs: &[InputArg], ops: &[OpRc]) -> Vec<Op> {
+fn normalize_ops_for_codegen(inputargs: &[InputArgRc], ops: &[OpRc]) -> Vec<Op> {
     let num_inputs = inputargs.len() as u32;
     ops.iter()
         .enumerate()
@@ -4351,7 +4351,7 @@ impl majit_backend::Backend for WasmBackend {
 
     fn compile_loop(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
@@ -4476,7 +4476,7 @@ impl majit_backend::Backend for WasmBackend {
         // those stores, matching a safepoint write.
         let used_label_homes = codegen::label_ref_capture_slots(inputargs, ops);
         let module_inputs = codegen::ModuleBuildInputs {
-            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            inputargs: inputargs.iter().cloned().collect(),
             // Keep these rewritten operations exactly as intern_ref_constants
             // produced them; their LoadFromGcTable immediates share this base.
             ops: ops_owned.clone(),
@@ -4564,7 +4564,7 @@ impl majit_backend::Backend for WasmBackend {
         // whose inputargs outnumber the portal's live values be entered with
         // the short list, so every frame slot past it reads as a zero the
         // prologue then loads as a null Ref.
-        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
 
         let max_output_slots = guard_exits
             .iter()
@@ -4653,7 +4653,7 @@ impl majit_backend::Backend for WasmBackend {
         let compiled = CompiledWasmLoop {
             token_number: token.number,
             trace_id,
-            input_types: inputargs.iter().map(|ia| ia.tp).collect(),
+            input_types: inputargs.iter().map(|ia| ia.tp.get()).collect(),
             func_handle: std::cell::Cell::new(func_handle),
             pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
             compiled_loop_token: token.compiled_loop_token_expect(),
@@ -4816,7 +4816,7 @@ impl majit_backend::Backend for WasmBackend {
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
@@ -5382,7 +5382,7 @@ impl majit_backend::Backend for WasmBackend {
                             external_jump: region_external.clone(),
                             outside_loop,
                             trace_id: self.trace_counter,
-                            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                            inputargs: inputargs.iter().cloned().collect(),
                             ops: ops_owned.clone(),
                             gc_table_base,
                             constants: self.constants.clone(),
@@ -5488,7 +5488,7 @@ impl majit_backend::Backend for WasmBackend {
                 // outside sibling that landed first.
                 outside_loop,
                 trace_id,
-                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                inputargs: inputargs.iter().cloned().collect(),
                 ops: ops_owned.clone(),
                 gc_table_base,
                 constants: self.constants.clone(),
@@ -5519,7 +5519,7 @@ impl majit_backend::Backend for WasmBackend {
         let (bridge_cells_base, bridge_cells_owner) = codegen::alloc_bridge_cells(guard_exit_count);
         let bridge_param_dispatch = bridge_param_dispatch_for(guard_exit_count);
         let module_inputs = codegen::ModuleBuildInputs {
-            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            inputargs: inputargs.iter().cloned().collect(),
             ops: ops_owned.clone(),
             inlined_bridges: Vec::new(),
             constants: self.constants.clone(),
@@ -6776,7 +6776,7 @@ mod tests {
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
-            let inputargs = vec![InputArg::new_int(0)];
+            let inputargs = vec![InputArg::new_int_rc(0)];
             let mut previous = majit_ir::OpRef::input_arg_int(0);
             let mut ops = Vec::new();
             let mut values = Vec::new();

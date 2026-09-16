@@ -23,7 +23,8 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex,
+    TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -505,7 +506,7 @@ pub struct AssemblerARM64<'a> {
     /// preserved (no semantic change, only the lookup cost).
     opref_to_slot: indexmap::IndexMap<OpRef, usize>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
-    inputargs: &'a [InputArg],
+    inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [OpRc],
@@ -778,11 +779,11 @@ impl<'a> AssemblerARM64<'a> {
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
-        inputargs: &'a [InputArg],
+        inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
-        let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::build_op_pos(operations);
+        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
+        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         AssemblerARM64 {
             mc: Assembler::new(0),
             asm_memory_manager,
@@ -1320,7 +1321,7 @@ impl<'a> AssemblerARM64<'a> {
     // assembler.py:543 _call_header — function prologue
     // ----------------------------------------------------------------
 
-    fn setup_input_state(&mut self, inputargs: &[InputArg]) {
+    fn setup_input_state(&mut self, inputargs: &[InputArgRc]) {
         // opref_to_slot stores ABSOLUTE jitframe slot indices so that
         // slot_offset(slot) returns the correct byte offset directly.
         // User position `p` maps to absolute slot `p + JITFRAME_FIXED_SIZE`.
@@ -1377,7 +1378,7 @@ impl<'a> AssemblerARM64<'a> {
     ///   CBZ  w0, continue                ; slowpath: 0 = OK
     ///   ; fallthrough = real overflow → return x29 as jf_ptr
     /// ```
-    fn _call_header(&mut self, inputargs: &[InputArg]) {
+    fn _call_header(&mut self, inputargs: &[InputArgRc]) {
         dynasm!(self.mc ; .arch aarch64
             ; stp x29, x30, [sp, -(CALL_FRAME_SIZE as i32)]!
             ; stp x19, x20, [sp, #16]   // save callee-saved regs
@@ -1877,7 +1878,7 @@ impl<'a> AssemblerARM64<'a> {
     ///
     /// Returns compiled code with fail descriptors and entry point.
     pub fn assemble_loop(mut self) -> Result<CompiledCode, BackendError> {
-        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp.get()).collect();
 
         // assembler.py:537 prepare_loop — set up regalloc
         // For now, simplified: all args in frame slots
@@ -1976,7 +1977,7 @@ impl<'a> AssemblerARM64<'a> {
     /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
         descr: &dyn majit_ir::FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
     ) -> Vec<Loc> {
         let mut locs = Vec::new();
         let gpr_regs = all_gen_regs();
@@ -1997,7 +1998,10 @@ impl<'a> AssemblerARM64<'a> {
             } else {
                 // llsupport/assembler.py:217 — frame slot
                 let slot = pos - JITFRAME_FIXED_SIZE;
-                let tp = inputargs.get(input_i).map(|ia| ia.tp).unwrap_or(Type::Int);
+                let tp = inputargs
+                    .get(input_i)
+                    .map(|ia| ia.tp.get())
+                    .unwrap_or(Type::Int);
                 locs.push(Loc::Frame(crate::regloc::FrameLoc::new(
                     slot,
                     crate::regalloc::get_ebp_ofs(base_ofs, slot),
@@ -2018,11 +2022,14 @@ impl<'a> AssemblerARM64<'a> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] assemble_bridge: input_types={:?} arglocs={:?}",
-                self.inputargs.iter().map(|ia| ia.tp).collect::<Vec<_>>(),
+                self.inputargs
+                    .iter()
+                    .map(|ia| ia.tp.get())
+                    .collect::<Vec<_>>(),
                 arglocs
             );
         }
-        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp.get()).collect();
         self.bridge_input_locs = if arglocs.is_empty() {
             None
         } else {
@@ -2103,7 +2110,7 @@ impl<'a> AssemblerARM64<'a> {
     /// locations, then emits code using those locations. This replaces the
     /// old frame-slot model where every value went through [rbp+offset].
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
-        let inputargs: &'a [InputArg] = self.inputargs;
+        let inputargs: &'a [InputArgRc] = self.inputargs;
         let ops: &'a [OpRc] = self.operations;
         self.short_guard_branch_offsets.clear();
         self.guard_reach_violations.clear();
@@ -7849,10 +7856,10 @@ mod tests {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
 
-        let mut inputargs = vec![InputArg::new_ref(0)];
+        let mut inputargs = vec![InputArg::new_ref_rc(0)];
         let mut values = vec![Value::Ref(obj)];
         let index_operand = if index_in_register {
-            inputargs.push(InputArg::new_int(1));
+            inputargs.push(InputArg::new_int_rc(1));
             values.push(Value::Int(index));
             bound_operand_from_opref(OpRef::input_arg_int(1))
         } else {

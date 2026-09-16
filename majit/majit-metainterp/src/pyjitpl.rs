@@ -406,6 +406,12 @@ impl OptimizationInfoItem for InputArg {
     }
 }
 
+impl OptimizationInfoItem for InputArgRc {
+    fn clear_optimization_info(&self) {
+        self.clear_forwarded();
+    }
+}
+
 /// No direct RPython equivalent — Rust struct carrying data that RPython
 /// passes through internal method calls in handle_guard_failure
 /// (pyjitpl.py:2890). Fields correspond to:
@@ -587,7 +593,7 @@ fn cross_loop_cut_label_jump_null_guard_slot(ops: &[majit_ir::OpRc]) -> Option<u
 /// and never shrink.
 pub(crate) struct CompiledTrace {
     /// Inputargs for this trace, used to recover typed exit layouts during blackhole replay.
-    pub(crate) inputargs: Vec<InputArg>,
+    pub(crate) inputargs: Vec<InputArgRc>,
     /// Optimized ops for blackhole fallback from compiled guard failures.
     pub(crate) ops: Vec<majit_ir::OpRc>,
     /// Typed constant pool paired with `ops` for blackhole fallback.
@@ -842,7 +848,7 @@ fn snapshot_inputarg_for_stack_ptr(
         return None;
     }
     inputargs.iter().find_map(|ia| {
-        (ia.tp == majit_ir::Type::Ref
+        (ia.tp.get() == majit_ir::Type::Ref
             && matches!(ia.get_value(), Some(majit_ir::Value::Ref(g)) if g.0 == addr))
         .then_some(majit_ir::OpRef::input_arg_typed(
             ia.index,
@@ -1115,7 +1121,10 @@ mod byte_snapshot_map_tests {
 
 struct PreparedBridgeTrace {
     ops: Vec<OpRc>,
-    inputargs: Vec<InputArg>,
+    /// compile.py `new_trace.inputargs` — the same InputArg objects the
+    /// iterator minted, handed to the backend after
+    /// `forget_optimization_info`. Not a value-typed copy.
+    inputargs: Vec<InputArgRc>,
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
@@ -1237,7 +1246,7 @@ fn translate_trace_iter_box_map(
 /// positions in place when `strong_count == 1`.
 fn prepare_bridge_trace_from_owned(
     bridge_ops: Vec<majit_ir::OpRc>,
-    bridge_inputargs: &[InputArg],
+    bridge_inputargs: &[InputArgRc],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
@@ -1272,10 +1281,10 @@ fn prepare_bridge_trace_from_owned(
     let cache_size = ((max_pos as usize) + 1).max(bridge_inputargs.len());
     let mut cache: Vec<Option<majit_ir::operand::Operand>> = vec![None; cache_size];
     let mut fresh = bridge_inputarg_base;
-    let reminted_inputargs: Vec<InputArg> = bridge_inputargs
+    let reminted_inputargs: Vec<majit_ir::InputArgRc> = bridge_inputargs
         .iter()
         .map(|arg| {
-            let reminted = InputArg::from_type(arg.tp, fresh);
+            let reminted = InputArg::from_type_rc(arg.tp.get(), fresh);
             fresh += 1;
             if let Some(value) = arg.get_value() {
                 reminted.set_value(value);
@@ -1288,11 +1297,9 @@ fn prepare_bridge_trace_from_owned(
         if p >= cache.len() {
             cache.resize(p + 1, None);
         }
-        let ia = InputArg::from_type_rc(arg.tp, reminted_inputargs[i].index);
-        if let Some(value) = reminted_inputargs[i].get_value() {
-            ia.set_value(value);
-        }
-        cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(&ia));
+        cache[p] = Some(majit_ir::operand::Operand::from_bound_inputarg(
+            &reminted_inputargs[i],
+        ));
     }
     for i in 0..bridge_ops.len() {
         let op = &bridge_ops[i];
@@ -1421,10 +1428,13 @@ fn assert_prepared_cache_bank(where_: &str, opref: OpRef, found_ty: Option<Type>
 
 /// The reminted InputArg that occupies the assembled loop Vm slot
 /// (`InputArg(1)`). `None` when that slot was not a Ref.
-fn reminted_loop_vm_red(original: &[InputArg], reminted: &[InputArg]) -> Option<OpRef> {
+fn reminted_loop_vm_red(
+    original: &[InputArgRc],
+    reminted: &[majit_ir::InputArgRc],
+) -> Option<OpRef> {
     let assembled = OpRef::input_arg_typed(1, Type::Ref);
     original.iter().zip(reminted.iter()).find_map(|(old, new)| {
-        (old.opref() == assembled && old.tp == Type::Ref).then_some(new.opref())
+        (old.opref() == assembled && old.tp.get() == Type::Ref).then_some(new.opref())
     })
 }
 
@@ -1442,8 +1452,8 @@ fn hole_filtered_vm_failarg_index(fail_args: &[majit_ir::operand::Operand]) -> O
 
 fn finish_prepared_bridge(
     ops: Vec<majit_ir::OpRc>,
-    original_inputargs: &[InputArg],
-    inputargs: Vec<InputArg>,
+    original_inputargs: &[InputArgRc],
+    reminted_inputargs: Vec<majit_ir::InputArgRc>,
     cache: Vec<Option<majit_ir::operand::Operand>>,
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
@@ -1468,10 +1478,10 @@ fn finish_prepared_bridge(
         .into_iter()
         .map(|opref| translate_trace_iter_opref(opref, &cache))
         .collect();
-    let bridge_vm_red = reminted_loop_vm_red(original_inputargs, &inputargs);
+    let bridge_vm_red = reminted_loop_vm_red(original_inputargs, &reminted_inputargs);
     PreparedBridgeTrace {
         ops,
-        inputargs,
+        inputargs: reminted_inputargs,
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
@@ -1485,7 +1495,7 @@ fn finish_prepared_bridge(
 
 fn prepare_bridge_trace_for_optimizer<T>(
     bridge_ops: &[T],
-    bridge_inputargs: &[InputArg],
+    bridge_inputargs: &[InputArgRc],
     snapshot_boxes: SnapshotBoxes,
     snapshot_frame_sizes: SnapshotFrameSizes,
     snapshot_vable_boxes: SnapshotBoxes,
@@ -1541,20 +1551,16 @@ where
             dst.set_value(value);
         }
     }
-    let inputargs: Vec<InputArg> = bridge_inputargs
-        .iter()
-        .zip(iter.inputargs.iter())
-        .map(|(arg, ia)| {
-            let reminted = InputArg::from_type(arg.tp, ia.opref().raw());
-            // The inputarg half carries its value for the same reason as the op
-            // loop above: `pyjitpl.py compile_trace` keeps original InputArg and Op
-            // boxes alike.
-            if let Some(value) = arg.get_value() {
-                reminted.set_value(value);
-            }
-            reminted
-        })
-        .collect();
+    for (arg, ia) in bridge_inputargs.iter().zip(iter.inputargs.iter()) {
+        // The inputarg half carries its value for the same reason as the op
+        // loop above: `compile_trace` keeps original InputArg and Op
+        // boxes alike. Reuse the iterator's reminted Rc (`inputarg_from_tp`)
+        // rather than minting a second object for the same index.
+        if let Some(value) = arg.get_value() {
+            ia.set_value(value);
+        }
+    }
+    let reminted_inputargs = iter.inputargs;
     let cache = iter._cache;
     let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
     let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
@@ -1576,10 +1582,10 @@ where
         .into_iter()
         .map(|opref| translate_trace_iter_opref(opref, &cache))
         .collect();
-    let bridge_vm_red = reminted_loop_vm_red(bridge_inputargs, &inputargs);
+    let bridge_vm_red = reminted_loop_vm_red(bridge_inputargs, &reminted_inputargs);
     PreparedBridgeTrace {
         ops,
-        inputargs,
+        inputargs: reminted_inputargs,
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
@@ -1592,9 +1598,9 @@ where
 }
 
 fn normalize_root_loop_entry_contract(
-    inputargs: Vec<InputArg>,
+    inputargs: Vec<InputArgRc>,
     optimized_ops: Vec<majit_ir::OpRc>,
-) -> Result<(Vec<InputArg>, Vec<majit_ir::OpRc>), (usize, usize)> {
+) -> Result<(Vec<InputArgRc>, Vec<majit_ir::OpRc>), (usize, usize)> {
     let last_jump = optimized_ops
         .iter()
         .rev()
@@ -1655,7 +1661,7 @@ fn normalize_root_loop_entry_contract(
 fn densify_root_loop_inputargs(
     args: &[OpRef],
     ops: Vec<majit_ir::OpRc>,
-) -> (Vec<InputArg>, Vec<majit_ir::OpRc>) {
+) -> (Vec<InputArgRc>, Vec<majit_ir::OpRc>) {
     let mut replacements: indexmap::IndexMap<OpRef, majit_ir::InputArgRc> =
         indexmap::IndexMap::new();
     let inputargs = args
@@ -1673,7 +1679,7 @@ fn densify_root_loop_inputargs(
             };
             let dense = InputArgRc::new(InputArg::from_type(tp, position as u32));
             replacements.insert(opref, dense.clone());
-            InputArg::from_type(tp, position as u32)
+            dense
         })
         .collect();
 
@@ -1895,7 +1901,10 @@ pub(crate) struct CarriedFields {
 /// Scanning them mirrors RPython's Box-identity model where every
 /// referenced Box keeps the parent trace alive: any OpRef the trace
 /// touches must be reflected in the high-water mark.
-fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops: &[T]) -> u32 {
+fn compute_next_global_opref<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
+    inputargs: &[A],
+    ops: &[T],
+) -> u32 {
     fn opref_high_water(r: OpRef) -> u32 {
         if r.is_none() || r.is_constant() {
             0
@@ -1905,7 +1914,7 @@ fn compute_next_global_opref<T: AsRef<majit_ir::Op>>(inputargs: &[InputArg], ops
     }
     let from_inputargs = inputargs
         .iter()
-        .map(|ia| ia.index.saturating_add(1))
+        .map(|ia| ia.as_ref().index.saturating_add(1))
         .max()
         .unwrap_or(0);
     let from_ops = ops
@@ -1962,7 +1971,7 @@ pub struct PartialTrace {
     /// separate constants side table.
     pub(crate) ops: Vec<majit_ir::OpRc>,
     /// Inputargs from the partial trace.
-    pub(crate) inputargs: Vec<InputArg>,
+    pub(crate) inputargs: Vec<InputArgRc>,
 }
 
 /// The meta-tracing JIT engine.
@@ -7143,7 +7152,7 @@ impl<M: Clone> MetaInterp<M> {
     /// the compact body LABEL is independent of the entry prefix.
     pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         &self,
-        inputargs: &mut Vec<InputArg>,
+        inputargs: &mut Vec<InputArgRc>,
         ops: &mut Vec<majit_ir::OpRc>,
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
@@ -7900,7 +7909,7 @@ impl<M: Clone> MetaInterp<M> {
             .inputargs()
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
         unroll_opt.trace_inputarg_boxes = preamble_data.base.inputargs().to_vec();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
@@ -8089,7 +8098,7 @@ impl<M: Clone> MetaInterp<M> {
                         // no raw-u32 type side-table propagation is
                         // needed (callers read via `OpRef::ty()`).
                         let inputarg_types: Vec<majit_ir::Type> =
-                            trace.inputargs.iter().map(|ia| ia.tp).collect();
+                            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
                         simple_opt.trace_inputargs =
                             majit_ir::OpRef::inputarg_refs(&inputarg_types);
                         // Move, not clone: keeps the rooted buffers in place so
@@ -8772,7 +8781,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                        inputargs: inputargs.clone(),
                         ops: compiled_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
@@ -9469,7 +9478,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
         ops: Vec<majit_ir::OpRc>,
-        inputargs: Vec<InputArg>,
+        inputargs: Vec<InputArgRc>,
         mut exported_state: crate::optimizeopt::unroll::ExportedState,
     ) {
         if crate::majit_log_enabled() {
@@ -9811,7 +9820,7 @@ impl<M: Clone> MetaInterp<M> {
             .inputargs
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
         unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
         let (
@@ -9906,11 +9915,7 @@ impl<M: Clone> MetaInterp<M> {
         // type side data here: bridge Phase E.2b renamed_inputargs may live in
         // a shifted `[bridge_inputarg_base..)` namespace, exactly like
         // RPython's fresh InputArg object identities.
-        let root_inputargs: Vec<InputArg> = partial
-            .inputargs
-            .iter()
-            .map(InputArg::fresh_value_copy)
-            .collect();
+        let root_inputargs: Vec<InputArgRc> = partial.inputargs.clone();
         let (inputargs, combined_ops) =
             match normalize_root_loop_entry_contract(root_inputargs, combined_ops) {
                 Ok(normalized) => normalized,
@@ -10169,7 +10174,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                        inputargs: inputargs.clone(),
                         ops: combined_ops,
                         constants: compiled_constants_typed.clone(),
                         exit_layouts,
@@ -10289,7 +10294,7 @@ impl<M: Clone> MetaInterp<M> {
         bridge: BridgeTraceInfo,
         green_key: u64,
         loop_jitcell_token: Arc<JitCellToken>,
-        inputargs: Vec<InputArg>,
+        inputargs: Vec<InputArgRc>,
         combined_ops: Vec<majit_ir::OpRc>,
         constants: majit_ir::ConstMap<majit_ir::Value>,
         unroll_opt: &mut crate::optimizeopt::unroll::UnrollOptimizer,
@@ -10831,7 +10836,8 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
-        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        let inputarg_types: Vec<majit_ir::Type> =
+            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
         optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
         // history.py/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself; no raw-u32 type side-table
@@ -11026,7 +11032,7 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         // compile.py `loop.inputargs = loop_info.inputargs`.
-        let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
+        let mut inputargs: Vec<InputArgRc> = trace.inputargs_cloned();
         // Reconcile inputarg types with optimizer's post-unbox types.
         // Pyre starts tracing with Ref values (all Python objects), but
         // the optimizer may unbox Int-typed locals. Guard fail_args carry
@@ -11049,8 +11055,8 @@ impl<M: Clone> MetaInterp<M> {
                     OpRef::InputArgRef(i) => (i, Type::Ref),
                     _ => continue,
                 };
-                if let Some(ia) = inputargs.get_mut(idx as usize) {
-                    ia.tp = tp;
+                if let Some(ia) = inputargs.get(idx as usize) {
+                    ia.set_tp(tp);
                 }
             }
         }
@@ -11140,7 +11146,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                let trace_inputargs_view: Vec<InputArg> = trace.inputargs_cloned();
+                let trace_inputargs_view: Vec<InputArgRc> = trace.inputargs_cloned();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
@@ -11354,7 +11360,8 @@ impl<M: Clone> MetaInterp<M> {
         // `store_final_boxes_in_guard` with nothing to bind it to
         // (`_number_boxes` → `Operand::from_opref` on a position-only ref).
         // Same seeding as the no-unroll retry inside `compile_loop`.
-        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        let inputarg_types: Vec<majit_ir::Type> =
+            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
         optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
 
         let (
@@ -11476,7 +11483,7 @@ impl<M: Clone> MetaInterp<M> {
             .set_next_frame_value_count_fn(self.active_frame_value_count_fn());
 
         // compile.py `loop.inputargs = loop_info.inputargs`.
-        let mut inputargs: Vec<InputArg> = trace.inputargs_cloned();
+        let mut inputargs: Vec<InputArgRc> = trace.inputargs_cloned();
 
         // compile.py:236-245 parity: simple-loop compilation owns a real
         // TargetToken, prepends LABEL(descr=target_token), and patches the
@@ -11591,7 +11598,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 let trace_info = self.backend.compiled_trace_info(token.as_ref(), trace_id);
-                let trace_inputargs_view: Vec<InputArg> = trace.inputargs_cloned();
+                let trace_inputargs_view: Vec<InputArgRc> = trace.inputargs_cloned();
                 compile::enrich_guard_resume_layouts_for_trace(
                     &mut resume_data,
                     &mut exit_layouts,
@@ -13293,7 +13300,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
         }
-        Some(root_trace.inputargs.iter().map(|ia| ia.tp).collect())
+        Some(root_trace.inputargs.iter().map(|ia| ia.tp.get()).collect())
     }
 
     /// Get the pre-allocated token number for a trace being recorded.
@@ -14405,7 +14412,7 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<crate::jitdriver::JitDriverStaticData>,
         orig_vable_ptr_entry: *const u8,
         bridge_ops: &[T],
-        bridge_inputargs: &[majit_ir::InputArg],
+        bridge_inputargs: &[majit_ir::InputArgRc],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -14469,7 +14476,7 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_inputargs.len(),
             );
             for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
-                let value = heap_value_for(ia.tp, raw);
+                let value = heap_value_for(ia.tp.get(), raw);
                 // Stamp the concrete value on the canonical bridge `InputArg`
                 // identity (`history.py *FrontendOp(pos, value)`).
                 ia.set_value(value);
@@ -14514,7 +14521,7 @@ impl<M: Clone> MetaInterp<M> {
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
         // see `opref_type` in `optimizer.rs` (priority-0 variant-tag read).
-        // The legacy `constant_types.insert(arg.index, arg.tp)` was redundant.
+        // The legacy `constant_types.insert(arg.index, arg.tp.get())` was redundant.
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
@@ -14527,7 +14534,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
@@ -14598,7 +14605,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
-                let renamed_inputargs: Vec<InputArg> = es
+                let renamed_inputargs: Vec<InputArgRc> = es
                     .renamed_inputargs
                     .iter()
                     .map(|arg| {
@@ -14613,7 +14620,7 @@ impl<M: Clone> MetaInterp<M> {
                                 opref
                             )
                         });
-                        InputArg::from_type(tp, opref.raw())
+                        InputArgRc::new(InputArg::from_type(tp, opref.raw()))
                     })
                     .collect();
                 // history.py:220/261/307 parity: `partial_trace.operations`
@@ -14626,10 +14633,7 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
-        let mut entry_inputargs: Vec<InputArg> = bridge_inputargs
-            .iter()
-            .map(InputArg::fresh_value_copy)
-            .collect();
+        let mut entry_inputargs: Vec<InputArgRc> = bridge_inputargs.iter().cloned().collect();
         // compile.py -> send_loop_to_backend(..., orig_inputargs):
         // entry bridges are loops installed as an interpreter front door, so
         // they require the same virtualizable-field reload preamble and
@@ -14796,10 +14800,7 @@ impl<M: Clone> MetaInterp<M> {
                 traces.insert(
                     trace_id,
                     CompiledTrace {
-                        inputargs: entry_inputargs
-                            .iter()
-                            .map(InputArg::fresh_value_copy)
-                            .collect(),
+                        inputargs: entry_inputargs.clone(),
                         ops: optimized_ops,
                         constants: compiled_constants_typed,
                         exit_layouts,
@@ -14920,7 +14921,7 @@ impl<M: Clone> MetaInterp<M> {
     /// statically as before.
     fn closing_jump_runtime_boxes<T>(
         bridge_ops: &[T],
-        bridge_inputargs: &[majit_ir::InputArg],
+        bridge_inputargs: &[majit_ir::InputArgRc],
     ) -> Vec<OpRef>
     where
         T: std::borrow::Borrow<majit_ir::Op>,
@@ -14938,7 +14939,7 @@ impl<M: Clone> MetaInterp<M> {
             std::collections::HashMap::new();
         for ia in bridge_inputargs {
             if let Some(v) = ia.get_value() {
-                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp), v);
+                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp.get()), v);
             }
         }
         for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
@@ -15020,7 +15021,7 @@ impl<M: Clone> MetaInterp<M> {
         &self,
         origin_key: u64,
         fail_descr: &dyn majit_ir::FailDescr,
-        reminted: &[InputArg],
+        reminted: &[InputArgRc],
         fallback: Option<OpRef>,
     ) -> Option<OpRef> {
         if !self.second_portal_red_is_grain_vm() {
@@ -15028,8 +15029,8 @@ impl<M: Clone> MetaInterp<M> {
         }
         self.compiled_guard_vm_failarg_index(origin_key, fail_descr)
             .and_then(|idx| reminted.get(idx))
-            .filter(|ia| ia.tp == Type::Ref)
-            .map(InputArg::opref)
+            .filter(|ia| ia.tp.get() == Type::Ref)
+            .map(|ia| ia.opref())
             .or(fallback)
     }
 
@@ -15059,7 +15060,7 @@ impl<M: Clone> MetaInterp<M> {
         fail_index: u32,
         fail_descr: &dyn majit_ir::FailDescr,
         bridge_ops: Vec<majit_ir::OpRc>,
-        bridge_inputargs: &[majit_ir::InputArg],
+        bridge_inputargs: &[majit_ir::InputArgRc],
         bridge_constants: majit_ir::ConstMap<majit_ir::Const>,
         snapshot_boxes: SnapshotBoxes,
         snapshot_frame_sizes: SnapshotFrameSizes,
@@ -15196,7 +15197,7 @@ impl<M: Clone> MetaInterp<M> {
                 // time.
                 let positional_livebox_types: Vec<Type> = Some(fail_descr.fail_arg_types().to_vec())
                     .filter(|types| !types.is_empty())
-                    .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
+                    .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp.get()).collect());
                 // pyjitpl.py `initialize_state_from_guard_failure` removes
                 // None entries before bridgeopt.py receives `liveboxes`.
                 // `fail_arg_types` retains the resume numbering's positional
@@ -15314,10 +15315,7 @@ impl<M: Clone> MetaInterp<M> {
         // matching BridgeCompileData.__init__; optimizer consumers below use
         // `prepared_inputargs`, matching `trace.get_iter().inputargs`.
         let bridge_trace_data = TreeLoop::from_oprc(
-            bridge_inputargs
-                .iter()
-                .map(|arg| InputArgRc::new(arg.fresh_value_copy()))
-                .collect(),
+            bridge_inputargs.iter().cloned().collect(),
             prepared_ops,
             Vec::new(),
         );
@@ -15332,7 +15330,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
         let bridge_inputargs = prepared_inputargs.as_slice();
         let bridge_ops = bridge_trace_data.ops.as_slice();
@@ -15352,7 +15350,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
-        // legacy `constant_types.insert(arg.index, arg.tp)` writes were
+        // legacy `constant_types.insert(arg.index, arg.tp.get())` writes were
         // redundant with `opref_type`'s priority-0 variant-tag read.
         optimizer.snapshot_boxes = snapshot_boxes;
         optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
@@ -15539,7 +15537,7 @@ impl<M: Clone> MetaInterp<M> {
                 // compile.py:1075-1084: new_trace.inputargs = info.renamed_inputargs.
                 // Each renamed OpRef is a typed InputArg{Int,Ref,Float} variant
                 // carrying its type intrinsically (history.py:220 Box.type parity).
-                let renamed_inputargs: Vec<InputArg> = es
+                let renamed_inputargs: Vec<InputArgRc> = es
                     .renamed_inputargs
                     .iter()
                     .map(|arg| {
@@ -15551,7 +15549,7 @@ impl<M: Clone> MetaInterp<M> {
                                 opref
                             )
                         });
-                        InputArg::from_type(tp, opref.raw())
+                        InputArgRc::new(InputArg::from_type(tp, opref.raw()))
                     })
                     .collect();
                 // history.py:220/261/307 parity: `partial_trace.operations`
@@ -25376,9 +25374,9 @@ mod tests {
         // LABEL is a broken contract; the helper must report the missing
         // LABEL as an arity mismatch instead of synthesizing one.
         let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -25406,9 +25404,9 @@ mod tests {
     #[test]
     fn test_normalize_root_loop_entry_contract_rejects_arity_mismatch() {
         let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![mk_op(
             OpCode::Jump,
@@ -25445,7 +25443,7 @@ mod tests {
         );
         let (inputargs, ops) = densify_root_loop_inputargs(&renamed, vec![guard]);
         assert_eq!(
-            inputargs.iter().map(InputArg::opref).collect::<Vec<_>>(),
+            inputargs.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             vec![
                 OpRef::input_arg_ref(0),
                 OpRef::input_arg_int(1),
@@ -25453,7 +25451,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            inputargs.iter().map(|arg| arg.tp).collect::<Vec<_>>(),
+            inputargs.iter().map(|arg| arg.tp.get()).collect::<Vec<_>>(),
             vec![Type::Ref, Type::Int, Type::Ref]
         );
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
@@ -25465,7 +25463,7 @@ mod tests {
 
     #[test]
     fn test_prepare_bridge_trace_for_optimizer_freshens_inputargs_and_snapshots() {
-        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
         let bridge_ops = vec![
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(1)], 2),
             mk_op(
@@ -25525,7 +25523,7 @@ mod tests {
             prepared
                 .inputargs
                 .iter()
-                .map(|arg| (arg.index, arg.tp))
+                .map(|arg| (arg.index, arg.tp.get()))
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
@@ -25600,9 +25598,9 @@ mod tests {
     fn prepare_bridge_remints_assembled_vm_even_when_it_is_not_failarg_one() {
         // Loop fail_args order: frame, Scope, vm (assembled InputArg(1) last).
         let bridge_inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_ref(2),
-            InputArg::new_ref(1),
+            InputArg::new_ref_rc(0),
+            InputArg::new_ref_rc(2),
+            InputArg::new_ref_rc(1),
         ];
         let bridge_ops = vec![mk_op(
             OpCode::Jump,
@@ -25625,7 +25623,7 @@ mod tests {
             prepared
                 .inputargs
                 .iter()
-                .map(|arg| (arg.index, arg.tp))
+                .map(|arg| (arg.index, arg.tp.get()))
                 .collect::<Vec<_>>(),
             vec![(556, Type::Ref), (557, Type::Ref), (558, Type::Ref)]
         );
@@ -25670,7 +25668,7 @@ mod tests {
     /// observed runtime values across the fresh trace iterator.
     #[test]
     fn prepare_bridge_trace_carries_inputarg_runtime_values() {
-        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
         bridge_inputargs[0].set_value(Value::Int(42));
 
         let prepared = prepare_bridge_trace_for_optimizer(
@@ -25699,7 +25697,7 @@ mod tests {
         let token = std::sync::Arc::new(JitCellToken::new(3));
         let start_token = crate::history::TargetToken::new_preamble(0);
         let start_descr = start_token.as_jump_target_descr();
-        let inputargs = [InputArg::new_ref(0), InputArg::new_ref(1)];
+        let inputargs = [InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let ops = vec![
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 2),
             mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
@@ -25722,7 +25720,7 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                inputargs: inputargs.to_vec(),
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
@@ -25770,7 +25768,7 @@ mod tests {
         let token = std::sync::Arc::new(JitCellToken::new(3));
         let start_token = crate::history::TargetToken::new_preamble(0);
         let start_descr = start_token.as_jump_target_descr();
-        let inputargs = [InputArg::new_ref(0), InputArg::new_ref(1)];
+        let inputargs = [InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let ops = vec![
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 2),
             mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
@@ -25793,7 +25791,7 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                inputargs: inputargs.to_vec(),
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants,
                 exit_layouts: crate::FxIndexMap::default(),
@@ -26396,7 +26394,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 30;
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let mut guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -26542,7 +26540,7 @@ mod tests {
     fn attach_procedure_to_interp_entry(
         meta: &mut MetaInterp<()>,
         green_key: u64,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: Vec<Op>,
         constants_typed: majit_ir::ConstMap<majit_ir::Const>,
     ) {
@@ -26593,7 +26591,7 @@ mod tests {
         traces.insert(
             trace_id,
             CompiledTrace {
-                inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+                inputargs: inputargs.to_vec(),
                 ops: ops.into_iter().map(OpRc::new).collect(),
                 constants: constants_typed,
                 exit_layouts,
@@ -26651,7 +26649,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 77;
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let mut guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -26729,7 +26727,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = 88;
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let mut guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -26836,7 +26834,7 @@ mod tests {
         assert_ne!(first_driver, source_driver);
         meta.active_jitdriver_sd = Some(source_driver);
         let green_key = 89;
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let mut guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -26955,7 +26953,7 @@ mod tests {
     fn install_may_force_void_entry(meta: &mut MetaInterp<()>, green_key: u64) {
         may_force_void_values().lock().clear();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             bound_operand(OpRef::int_op(1)),
@@ -28217,7 +28215,7 @@ mod tests {
             .expect("the target loop remains installed")
             .token = std::sync::Arc::downgrade(&stale);
 
-        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0)];
         let bridge_ops = vec![
             mk_op(
                 OpCode::IntAdd,
@@ -28646,7 +28644,7 @@ mod tests {
 
         // Install a simple compiled loop with a guard
         let green_key = 50;
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         // Backend test-fixture quirk (NOT RPython parity): both constants
         // are paired with `constants.insert(100|101, ...)` below; the
         // backend HashMap keys the function-pointer / value literals by

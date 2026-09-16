@@ -17,7 +17,7 @@ use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, JitCellToken};
 // `gc_sync` hands out the concrete collector; the trait must be in scope for
 // its methods to resolve on that type.
 use majit_gc::GcAllocator;
-use majit_ir::{FailDescr, GcRef, InputArg, OpRc, OpRef, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, InputArgRc, OpRc, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
@@ -2054,7 +2054,7 @@ impl DynasmBackend {
     /// constants.
     fn prepare_ops_for_compile(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
     ) -> (Vec<OpRc>, Vec<GcRef>) {
         let num_inputs = inputargs.len() as u32;
@@ -2462,7 +2462,7 @@ impl Backend for DynasmBackend {
 
     fn compile_loop(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
@@ -2477,7 +2477,7 @@ impl Backend for DynasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
-        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;
@@ -2713,7 +2713,7 @@ impl Backend for DynasmBackend {
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
@@ -3956,12 +3956,11 @@ impl Backend for DynasmBackend {
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        let offset = fielddescr.as_offset();
-        // Route through `read_float_at_mem` (`runner.rs` —
-        // `llmodel.py:490-491` parity) so misaligned struct fields use
-        // `read_unaligned`. Direct `*const f64` deref was UB-prone on
-        // misaligned vable float slots.
-        self.read_float_at_mem(struct_ptr, offset as i64)
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        let Some(ptr) = Self::raw_mem_ptr(struct_ptr, offset as i64) else {
+            return 0.0;
+        };
+        unsafe { majit_backend::llmodel::read_float_at_mem_sized(ptr, 0, size) }
     }
 
     /// llmodel.py bh_setfield_gc_f delegates to write_float_at_mem.
@@ -3973,12 +3972,11 @@ impl Backend for DynasmBackend {
         value: f64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
-        // Route through `write_float_at_mem` (`runner.rs` —
-        // `llmodel.py:493-494` parity) so misaligned struct fields use
-        // `write_unaligned`; a direct `*mut f64` deref was UB-prone on
-        // misaligned vable float slots.
-        self.write_float_at_mem(struct_ptr, offset as i64, value);
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        let Some(ptr) = Self::raw_mem_ptr(struct_ptr, offset as i64) else {
+            return;
+        };
+        unsafe { majit_backend::llmodel::write_float_at_mem_sized(ptr, 0, size, value) }
     }
 
     fn compiled_fail_descr_layouts(
@@ -4190,7 +4188,7 @@ mod tests {
         // pyjitpl.py initialize_state_from_guard_failure filters the hole
         // before the history is built, so only the two live boxes reach the
         // backend bridge.
-        let inputargs = [InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = [InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
 
         let locs = Asm::rebuild_faillocs_from_descr(fail_descr, &inputargs);
 
@@ -4385,7 +4383,7 @@ mod tests {
         // nothing to push.  Production reaches this state through
         // `MetaInterp::new`; backend-only tests must invoke this helper.
         backend.attach_default_test_descrs();
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         // Match the typed `InputArg{Ref,Int}` boxes registered by the
         // backend regalloc — variant-aware Eq makes Untyped(N) and
         // InputArg{Ref,Int}(N) distinct keys.
@@ -4405,7 +4403,7 @@ mod tests {
     fn compile_loop_accepts_nonzero_inputarg_indices() {
         let mut backend = DynasmBackend::new();
         backend.attach_default_test_descrs();
-        let inputargs = vec![InputArg::new_int(10), InputArg::new_int(20)];
+        let inputargs = vec![InputArg::new_int_rc(10), InputArg::new_int_rc(20)];
         let ops = vec![
             mk_op(
                 OpCode::IntAdd,
@@ -4527,7 +4525,7 @@ mod tests {
             array_tid,
             Type::Int,
         )));
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             alloc,
@@ -4671,7 +4669,7 @@ mod tests {
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(10000)], 0),
             mk_op(
@@ -4753,7 +4751,7 @@ mod tests {
         register_jitframe_type(&mut gc);
         backend.set_gc_allocator(Box::new(gc));
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(
                 OpCode::CallMallocNurseryVarsizeFrame,
@@ -4810,7 +4808,7 @@ mod tests {
         backend.attach_default_test_descrs();
         backend.set_gc_allocator(Box::new(gc));
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
@@ -4900,7 +4898,7 @@ mod tests {
         backend.attach_default_test_descrs();
         backend.set_gc_allocator(Box::new(gc));
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(100, wrong_vtable as i64);
         backend.set_constants(constants);
@@ -4999,7 +4997,7 @@ mod tests {
         backend.attach_default_test_descrs();
 
         // arg 0 is the cond-call predicate, passed 0 so the call is taken.
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(200, return_int_passthrough as *const () as usize as i64);
         backend.set_constants(constants);
@@ -5066,7 +5064,7 @@ mod tests {
         backend.attach_default_test_descrs();
         backend.set_gc_allocator(Box::new(gc));
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         constants.insert(200, return_ref_passthrough as *const () as usize as i64);
         backend.set_constants(constants);

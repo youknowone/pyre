@@ -4156,7 +4156,7 @@ mod tests {
             majit_ir::OpRef::input_arg_float(2),
         ]);
         let trace = recorder.get_trace();
-        let seen: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp).collect();
+        let seen: Vec<Type> = trace.inputargs.iter().map(|arg| arg.tp.get()).collect();
         assert_eq!(seen, input_types.to_vec());
     }
 

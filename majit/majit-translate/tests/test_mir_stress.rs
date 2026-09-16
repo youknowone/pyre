@@ -13,7 +13,7 @@ use majit_charon_reader::ullbc::{
 // `CallPayload`'s `dest` is the binding site for a Call-terminator local,
 // which the lowering driver writes into `local_var[dest_local]` — so the
 // classifier must treat Call-`dest` blocks as Assign-equivalent.
-use majit_translate::front::mir::{LowerError, lower_fun_decl};
+use majit_translate::front::mir::{LowerContext, LowerError, lower_fun_decl};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -547,6 +547,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
     let mut err_unsupported = 0usize;
     let mut finder_matched = 0usize;
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let context = LowerContext::new(&llbc);
 
     for fd in llbc.iter_local_fns() {
         walked += 1;
@@ -558,7 +559,7 @@ fn classify_uninitialised_local_rpo_vs_loop_carried() {
             skipped_no_body += 1;
             continue;
         };
-        let msg = match lower_fun_decl(&llbc, fd) {
+        let msg = match lower_fun_decl(&context, fd) {
             Ok(_) => {
                 lowered_ok += 1;
                 continue;
@@ -1073,6 +1074,7 @@ fn dump_lowering_signatures() {
         s
     }
 
+    let context = LowerContext::new(&llbc);
     for (idx, fd) in llbc.iter_local_fns().enumerate() {
         if fd.is_global_initializer.is_some() {
             continue;
@@ -1081,7 +1083,7 @@ fn dump_lowering_signatures() {
             continue;
         };
         let name = fd.item_meta.name_path();
-        let hash = match lower_fun_decl(&llbc, fd) {
+        let hash = match lower_fun_decl(&context, fd) {
             Ok(graph) => {
                 let sig = signature(&graph);
                 let mut h = std::collections::hash_map::DefaultHasher::new();

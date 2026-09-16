@@ -11,7 +11,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
+use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, InputArgRc, Op, OpRc, Type, Value};
 
 thread_local! {
     static NULL_MEM_ACCESS: Cell<bool> = const { Cell::new(false) };
@@ -2804,7 +2804,7 @@ pub trait Backend: Send {
     /// interior-mutable so they can be written through the shared reference.
     fn compile_loop(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError>;
@@ -2897,7 +2897,7 @@ pub trait Backend: Send {
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
@@ -3391,17 +3391,16 @@ pub trait Backend: Send {
         GcRef(unsafe { *((struct_ptr as *const u8).add(offset) as *const usize) })
     }
     /// model.py bh_getfield_gc_f(struct, fielddescr) →
-    /// `read_float_at_mem(struct, ofs)`.  Fixed `FLOATSTORAGE`-width
-    /// load at the field offset.  Shared by pyre's raw-memory backends.
+    /// `read_float_at_mem(struct, ofs)`.  Size 8 is `FLOATSTORAGE`;
+    /// size 4 is a jit_interp `float(f32)` field (widen to the float bank).
     fn bh_getfield_gc_f(
         &self,
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        let offset = fielddescr.as_offset();
-        let addr = (struct_ptr as usize).wrapping_add(offset);
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         // SAFETY: see `bh_getfield_gc_i`.
-        unsafe { (addr as *const f64).read_unaligned() }
+        unsafe { crate::llmodel::read_float_at_mem_sized(struct_ptr as usize, offset, size) }
     }
     /// model.py / llmodel.py bh_setfield_gc_i → `write_int_at_mem(struct,
     /// ofs, size, value)`.  Size + sign come from `unpack_fielddescr_size`;
@@ -3436,17 +3435,19 @@ pub trait Backend: Send {
         // This is the barrier `write_ref_at_mem` documents its callers as owing.
         majit_gc::gc_write_barrier(GcRef(struct_ptr as usize));
     }
-    /// model.py / llmodel.py bh_setfield_gc_f → `FLOATSTORAGE`-width
-    /// store at the field offset.
+    /// model.py / llmodel.py bh_setfield_gc_f. Size 8 is `FLOATSTORAGE`;
+    /// size 4 demotes to f32.
     fn bh_setfield_gc_f(
         &self,
         struct_ptr: i64,
         newvalue: f64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
         // SAFETY: see `bh_setfield_gc_i`.
-        unsafe { crate::llmodel::write_float_at_mem(struct_ptr as usize, offset, newvalue) };
+        unsafe {
+            crate::llmodel::write_float_at_mem_sized(struct_ptr as usize, offset, size, newvalue)
+        };
     }
 
     // ── model.py:209-215, 247-253 array operations ──
@@ -4557,17 +4558,16 @@ mod tests {
         let mut info = LoopVersionInfo::new();
         assert!(info.versions.is_empty());
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let ops = vec![Op::new(majit_ir::OpCode::Finish, &[])];
         info.add_version(
             10,
-            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            vec![InputArg::new_int(0), InputArg::new_int(1)],
             ops.clone(),
         );
         assert_eq!(info.versions.len(), 1);
         assert_eq!(info.versions[0].0, 10);
 
-        info.add_version(20, inputargs, ops);
+        info.add_version(20, vec![InputArg::new_int(0), InputArg::new_int(1)], ops);
         assert_eq!(info.versions.len(), 2);
         assert_eq!(info.versions[1].0, 20);
     }
