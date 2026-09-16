@@ -13388,8 +13388,17 @@ fn init_type_type(ns: PyObjectRef) {
             }
         };
         crate::type_methods::arity_no_args(args, "__subclasses__")?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let cls =
+            pyre_object::gc_roots::shadow_stack_get(pyre_object::gc_roots::shadow_stack_len() - 1);
         let subs = unsafe { pyre_object::w_type_get_subclasses(cls, true) };
-        Ok(pyre_object::w_list_new(subs))
+        let base = pyre_object::gc_roots::pin_roots(&subs);
+        Ok(pyre_object::w_list_new(
+            (0..subs.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                .collect(),
+        ))
     });
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(

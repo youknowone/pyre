@@ -980,12 +980,30 @@ pub(crate) fn deque_repeat(
         }
     }
     let ty = unsafe { w_instance_get_type(self_obj) };
-    let list = w_list_new(items);
-    let m = maxlen_obj(self_obj);
+    let items_base = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(items_base, items.len());
+    let list = w_list_new(
+        (0..items.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+            .collect(),
+    );
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(list);
+    let m = maxlen_obj(pyre_object::gc_roots::shadow_stack_get(roots));
     if unsafe { is_none(m) } {
-        crate::call::call_function_impl_result(ty, &[list])
+        crate::call::call_function_impl_result(
+            ty,
+            &[pyre_object::gc_roots::shadow_stack_get(list_slot)],
+        )
     } else {
-        crate::call::call_function_impl_result(ty, &[list, m])
+        let _ = pyre_object::gc_roots::pin_root(m);
+        crate::call::call_function_impl_result(
+            ty,
+            &[
+                pyre_object::gc_roots::shadow_stack_get(list_slot),
+                pyre_object::gc_roots::shadow_stack_get(list_slot + 1),
+            ],
+        )
     }
 }
 
