@@ -273,6 +273,12 @@ const PYRE_ONLY: &[&str] = &[
     "ref_push/r",
     // Raw float store.
     "raw_store_f/iifd",
+    // String walk (`pyjitpl.py opimpl_strlen` / `opimpl_strgetitem`).
+    // Majit's tracer has no `BC_STRLEN` / `BC_STRGETITEM` arms; the
+    // production FBW walker is the one that look-insides startswith.
+    "strlen/r>i",
+    "strgetitem/rc>i",
+    "strgetitem/ri>i",
 ];
 
 /// Keys the encoding names that neither tracer decodes.

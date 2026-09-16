@@ -467,7 +467,7 @@ pub extern "C" fn jit_mapdict_unboxed_read_raw(
 /// Enter a residual leaf's exception into both channels the trailing
 /// `GuardNoException` and the blackhole read, and answer the null a leaf
 /// returns on the raising arm.
-fn publish_leaf_exception(err: &mut pyre_interpreter::PyError) -> i64 {
+pub(crate) fn publish_leaf_exception(err: &mut pyre_interpreter::PyError) -> i64 {
     let exc = err.to_exc_object() as i64;
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc));
     #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]

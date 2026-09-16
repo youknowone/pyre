@@ -9154,6 +9154,31 @@ fn canonical_cond_record_keys_have_walker_arms() {
 }
 
 #[test]
+fn strlen_and_strgetitem_keys_have_walker_arms() {
+    // The startswith/endswith wrapper walk emits these three keys.
+    // UnsupportedOpname here aborts look-inside and leaves the residual
+    // call as a black box (401-guard census).
+    let mut tc = fresh_trace_ctx();
+    let dummy = tc.record_op(majit_ir::OpCode::IntAdd, &[]);
+    for key in ["strlen/r>i", "strgetitem/ri>i", "strgetitem/rc>i"] {
+        let byte = *insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("`{key}` must be in insns table"));
+        let code = [byte, 0, 0, 0, 0, 0, 0, 0];
+        let mut regs_r = [dummy];
+        let mut concrete_r = [ConcreteValue::Null];
+        let mut regs_i = [dummy, dummy];
+        let err = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut regs_i);
+        assert!(
+            err.as_ref()
+                .err()
+                .is_none_or(|e| !matches!(e, DispatchError::UnsupportedOpname { .. })),
+            "{key} must have a walker arm, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
     use majit_translate::codewriter::{call::CallControl, codewriter::CodeWriter};
     use majit_translate::{
