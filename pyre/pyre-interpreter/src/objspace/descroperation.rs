@@ -2204,16 +2204,31 @@ pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     {
         return Ok(clone);
     }
-    let mut items = Vec::with_capacity(len_a + len_b);
+    // `w_list_getitem` boxes on the Range/Integer/Float strategies, and
+    // `w_list_new` itself allocates, so a copy already made would sit
+    // unrooted in a plain `Vec`. Pin both operands and each fetched item
+    // on one bracket, then hand the constructor the live slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ab = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut fetched = 0usize;
     for i in 0..len_a {
-        if let Some(item) = w_list_getitem(a, i as i64) {
-            items.push(item);
+        if let Some(item) = w_list_getitem(pyre_object::gc_roots::shadow_stack_get(ab), i as i64) {
+            let _ = pyre_object::gc_roots::pin_root(item);
+            fetched += 1;
         }
     }
     for i in 0..len_b {
-        if let Some(item) = w_list_getitem(b, i as i64) {
-            items.push(item);
+        if let Some(item) =
+            w_list_getitem(pyre_object::gc_roots::shadow_stack_get(ab + 1), i as i64)
+        {
+            let _ = pyre_object::gc_roots::pin_root(item);
+            fetched += 1;
         }
+    }
+    let mut items = Vec::with_capacity(fetched);
+    for i in 0..fetched {
+        items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
     Ok(w_list_new(items))
 }
@@ -2221,16 +2236,27 @@ pub(crate) unsafe fn list_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 pub(crate) unsafe fn tuple_concat(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let len_a = w_tuple_len(a);
     let len_b = w_tuple_len(b);
-    let mut items = Vec::with_capacity(len_a + len_b);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let ab = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut fetched = 0usize;
     for i in 0..len_a {
-        if let Some(item) = w_tuple_getitem(a, i as i64) {
-            items.push(item);
+        if let Some(item) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(ab), i as i64) {
+            let _ = pyre_object::gc_roots::pin_root(item);
+            fetched += 1;
         }
     }
     for i in 0..len_b {
-        if let Some(item) = w_tuple_getitem(b, i as i64) {
-            items.push(item);
+        if let Some(item) =
+            w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(ab + 1), i as i64)
+        {
+            let _ = pyre_object::gc_roots::pin_root(item);
+            fetched += 1;
         }
+    }
+    let mut items = Vec::with_capacity(fetched);
+    for i in 0..fetched {
+        items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
     Ok(w_tuple_new(items))
 }
