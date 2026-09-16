@@ -98,6 +98,21 @@ pub fn fargs_of(ct: &W_CType) -> Vec<PyObjectRef> {
 /// constants and [`do_call`] unrolls against them.  A variadic call builds
 /// its cif per call and stays opaque, as `call_varargs` does.
 pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    call_from(ct, funcaddr, args_w, 0)
+}
+
+/// `W_CTypeFunc.call` when the gateway left the receiver in `args_w[0]`.
+///
+/// `cdataobj.py call` already receives `args_w` without `self`. The wrapper
+/// is that gateway, so the Python arguments start at `start`. Indexing from
+/// there, rather than `&args[start..]`, keeps `ll_listslice_startonly`
+/// (`rlist.py`) out of the body.
+pub fn call_from(
+    ct: &W_CType,
+    funcaddr: usize,
+    args_w: &[PyObjectRef],
+    start: usize,
+) -> Result<PyObjectRef, PyError> {
     // `self = jit.promote(self)`.
     let ct: &W_CType = unsafe { &*majit_metainterp::jit::promote(ct as *const W_CType) };
     if funcaddr == 0 {
@@ -107,18 +122,19 @@ pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyO
         )));
     }
     let nargs = fargs_len(ct.fargs);
+    let nargs_got = args_w.len().saturating_sub(start);
     if ct.cif_descr != 0 {
-        if args_w.len() != nargs {
+        if nargs_got != nargs {
             return Err(PyError::type_error(format!(
                 "'{}' expects {} arguments, got {}",
                 ct.name(),
                 nargs,
-                args_w.len()
+                nargs_got
             )));
         }
-        return do_call(ct, funcaddr, args_w);
+        return do_call(ct, funcaddr, args_w, start);
     }
-    call_varargs(ct, funcaddr, args_w)
+    call_varargs(ct, funcaddr, args_w, start)
 }
 
 /// `self.fargs` as the object-strategy list `_immutable_fields_ =
@@ -156,17 +172,19 @@ fn call_varargs(
     ct: &W_CType,
     funcaddr: usize,
     args_w: &[PyObjectRef],
+    start: usize,
 ) -> Result<PyObjectRef, PyError> {
     let fargs = fargs_of(ct);
-    if args_w.len() < fargs.len() {
+    let nargs_got = args_w.len().saturating_sub(start);
+    if nargs_got < fargs.len() {
         return Err(PyError::type_error(format!(
             "'{}' expects at least {} arguments, got {}",
             ct.name(),
             fargs.len(),
-            args_w.len()
+            nargs_got
         )));
     }
-    let fvarargs = complete_argtypes(&fargs, args_w)?;
+    let fvarargs = complete_argtypes(&fargs, args_w, start)?;
     let cif = build_cif_descr(&fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
     // `new_ctypefunc_completing_argtypes` builds a fresh function type and
     // calls `_call` on it. The completed tuple is young and is not a field
@@ -174,7 +192,7 @@ fn call_varargs(
     let roots = pyre_object::gc_roots::push_roots();
     let fargs_slot = roots.base();
     let _ = roots.pin_root(pyre_object::tupleobject::w_tuple_new(fvarargs));
-    let result = do_call_fargs(roots.get(fargs_slot), ct.ctitem, cif, funcaddr, args_w);
+    let result = do_call_fargs(roots.get(fargs_slot), ct.ctitem, cif, funcaddr, args_w, start);
     unsafe { free_cif_descr(cif) };
     result
 }
@@ -184,10 +202,13 @@ fn call_varargs(
 fn complete_argtypes(
     fargs: &[PyObjectRef],
     args_w: &[PyObjectRef],
+    start: usize,
 ) -> Result<Vec<PyObjectRef>, PyError> {
-    let mut fvarargs = Vec::with_capacity(args_w.len());
+    let nargs_got = args_w.len().saturating_sub(start);
+    let mut fvarargs = Vec::with_capacity(nargs_got);
     fvarargs.extend_from_slice(fargs);
-    for (i, &w_obj) in args_w.iter().enumerate().skip(fargs.len()) {
+    for i in fargs.len()..nargs_got {
+        let w_obj = args_w[start + i];
         let Some(cdata) = W_CData::from_obj(w_obj) else {
             return Err(PyError::type_error(format!(
                 "argument {} passed in the variadic part needs to be a cdata object (got {})",
@@ -215,13 +236,19 @@ fn complete_argtypes(
 /// argument loop runs `len(self.fargs)` times, a trace constant once the
 /// function type is promoted.
 #[majit_macros::unroll_safe]
-fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+fn do_call(
+    ct: &W_CType,
+    funcaddr: usize,
+    args_w: &[PyObjectRef],
+    start: usize,
+) -> Result<PyObjectRef, PyError> {
     let fresult = ctypeobj::ctype_arg(ct.ctitem)?;
     let cif = ct.cif_descr;
     let args_roots = pyre_object::gc_roots::push_roots();
     let args_slot = args_roots.base();
-    for &w_arg in args_w {
-        let _ = args_roots.pin_root(w_arg);
+    let nargs_got = args_w.len().saturating_sub(start);
+    for i in 0..nargs_got {
+        let _ = args_roots.pin_root(args_w[start + i]);
     }
     let size = unsafe { exchange_size(cif) };
     let buffer = cdataobj::raw_malloc_varsize_char(size);
@@ -233,7 +260,7 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     }
     let mut mustfree_max_plus_1 = 0usize;
     let called = 'body: {
-        for i in 0..args_w.len() {
+        for i in 0..nargs_got {
             let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
             // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The list
             // is `_immutable_fields_ = ['fargs[*]']`, so a promoted function
@@ -275,14 +302,16 @@ fn do_call_fargs(
     cif: usize,
     funcaddr: usize,
     args_w: &[PyObjectRef],
+    start: usize,
 ) -> Result<PyObjectRef, PyError> {
     let fresult = ctypeobj::ctype_arg(w_fresult)?;
     let roots = pyre_object::gc_roots::push_roots();
     let fargs_slot = roots.base();
     let _ = roots.pin_root(w_fargs);
     let args_slot = fargs_slot + 1;
-    for &w_arg in args_w {
-        let _ = roots.pin_root(w_arg);
+    let nargs_got = args_w.len().saturating_sub(start);
+    for i in 0..nargs_got {
+        let _ = roots.pin_root(args_w[start + i]);
     }
     let size = unsafe { exchange_size(cif) };
     let buffer = cdataobj::raw_malloc_varsize_char(size);
@@ -294,7 +323,7 @@ fn do_call_fargs(
     }
     let mut mustfree_max_plus_1 = 0usize;
     let called = 'body: {
-        for i in 0..args_w.len() {
+        for i in 0..nargs_got {
             let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
             let argtype = match ctypeobj::ctype_arg(farg(roots.get(fargs_slot), i)) {
                 Ok(argtype) => argtype,
