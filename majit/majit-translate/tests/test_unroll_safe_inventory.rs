@@ -273,6 +273,19 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "pyframe.py initialize_frame_scopes",
     ),
     ("locals2fast", "pyframe.py locals2fast"),
+    // `pyopcode.py` opcode handlers that unroll a short n-loop.
+    (
+        "validate_check_exc_match_class",
+        "pyopcode.py cmp_exc_match",
+    ),
+    ("swap_values", "pyopcode.py SWAP"),
+    ("make_function", "pyopcode.py MAKE_FUNCTION"),
+    ("build_map", "pyopcode.py BUILD_MAP"),
+    ("build_set", "pyopcode.py BUILD_SET"),
+    ("match_keys", "pyopcode.py MATCH_KEYS"),
+    ("match_class", "pyopcode.py _match_class"),
+    ("unpack_ex", "pyopcode.py UNPACK_EX"),
+    ("build_string", "pyopcode.py BUILD_STRING"),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

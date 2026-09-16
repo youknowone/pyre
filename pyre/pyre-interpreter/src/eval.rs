@@ -1927,6 +1927,10 @@ pub const CANNOT_CATCH_MSG: &str =
 /// its `raise oefmt(...)` becomes a guard; pyre matches the structure
 /// by keeping the raise on the caller side (the BC handler), which
 /// likewise runs outside the JIT-traced bool-returning fast path.
+/// `pyopcode.py cmp_exc_match` is `@jit.unroll_safe` because the
+/// tuple-of-types loop is short and must unroll into the except-match
+/// trace.
+#[majit_macros::unroll_safe]
 pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
     unsafe {
         if pyre_object::is_tuple(exc_type) {
@@ -2709,6 +2713,8 @@ impl SharedOpcodeHandler for PyFrame {
         Ok(PyFrame::peek_at(self, depth))
     }
 
+    /// `pyopcode.py MAKE_FUNCTION` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn make_function(&mut self, code_obj: Self::Value) -> Result<Self::Value, PyError> {
         // `pypy/interpreter/pyopcode.py MAKE_FUNCTION` stamps
         // `func.w_func_globals = self.w_globals` from the running
@@ -2743,6 +2749,8 @@ impl SharedOpcodeHandler for PyFrame {
         Ok(build_tuple_from_refs(items))
     }
 
+    /// `pyopcode.py BUILD_MAP` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn build_map(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
         build_map_from_refs(items)
     }
@@ -3056,6 +3064,8 @@ impl NamespaceOpcodeHandler for PyFrame {
 }
 
 impl StackOpcodeHandler for PyFrame {
+    /// `pyopcode.py SWAP` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn swap_values(&mut self, depth: usize) -> Result<(), PyError> {
         // `pyopcode.py SWAP`, peek/settop element-wise.  A
         // `<[T]>::swap` call hands the locals array to a callee, which the
@@ -5059,6 +5069,8 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // MATCH_KEYS: STACK[-1] = keys tuple, STACK[-2] = subject (neither popped).
+    /// `pyopcode.py MATCH_KEYS` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn match_keys(&mut self) -> Result<(), PyError> {
         let keys = PyFrame::peek_at(self, 0);
         let subject = PyFrame::peek_at(self, 1);
@@ -5070,6 +5082,8 @@ impl OpcodeStepExecutor for PyFrame {
     // MATCH_CLASS count: STACK[-1] = keyword attr-name tuple, STACK[-2] = class,
     // STACK[-3] = subject (all popped). Push the extracted-attrs tuple on a
     // match, else None. `count` is the number of positional sub-patterns.
+    /// `pyopcode.py _match_class` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn match_class(&mut self, count: usize) -> Result<(), PyError> {
         let kwd_attrs = self.pop();
         let cls = self.pop();
@@ -5088,6 +5102,8 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── BuildSet ──
+    /// `pyopcode.py BUILD_SET` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn build_set(&mut self, count: usize) -> Result<(), PyError> {
         // Build as a set-like object backed by __data__ dict.
         let mut items = Vec::with_capacity(count);
@@ -5837,6 +5853,8 @@ impl OpcodeStepExecutor for PyFrame {
     // ── unpack_ex ──
     // PyPy: UNPACK_SEQUENCE with star; CPython: UNPACK_EX
     // `a, *b, c = iterable`
+    /// `pyopcode.py UNPACK_EX` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn unpack_ex(&mut self, args: crate::bytecode::UnpackExArgs) -> Result<(), PyError> {
         let before = args.before as usize;
         let after = args.after as usize;
@@ -5905,6 +5923,8 @@ impl OpcodeStepExecutor for PyFrame {
 
     // ── BuildString (f-string concatenation) ──
     // CPython 3.13: concatenate N string fragments from stack
+    /// `pyopcode.py BUILD_STRING` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn build_string(&mut self, count: usize) -> Result<(), PyError> {
         let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
