@@ -2561,26 +2561,12 @@ where
 
     /// Second portal red is the ExecutionContext (`reds = ['frame', 'ec']`).
     ///
-    /// `state.rs recover_bridge_execution_context`: a bridge resume
-    /// does not restamp `portal_red_refs`, so recover the live EC box
-    /// from registers / concrete match, and only then `const_ref`.
-    /// A residual `getexecutioncontext` would leave a Call after opt.
+    /// `portal_red_refs` was removed (`1e3ebc359ec`); the next snapshot
+    /// reads `registers_r` the way `pyjitpl.py replace_active_box_in_frame`
+    /// does. Recover the live EC box from those registers / a concrete
+    /// match, and only then `const_ref`. A residual `getexecutioncontext`
+    /// would leave a Call after opt.
     fn portal_ec_box(&self, ctx: &mut TraceCtx) -> Option<OpRef> {
-        if let Some(ec) = self
-            .frames
-            .frames
-            .iter()
-            .find(|frame| frame.portal_entered)
-            .or_else(|| {
-                self.frames
-                    .frames
-                    .iter()
-                    .find(|frame| frame.portal_red_refs.len() >= 2)
-            })
-            .and_then(|frame| frame.portal_red_refs.get(1).map(|(_, opref)| *opref))
-        {
-            return Some(ec);
-        }
         let spec = crate::box_trace::exception_trace_residual()?;
         let ec_ptr = (spec.current_ec_ptr)();
         if ec_ptr == 0 {
