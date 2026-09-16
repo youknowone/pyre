@@ -289,6 +289,7 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("call_kw", "pyopcode.py CALL_FUNCTION_KW"),
     ("build_map_from_refs", "pyopcode.py BUILD_MAP pair store"),
     ("match_keys_value", "pyopcode.py MATCH_KEYS"),
+    ("match_class_value", "pyopcode.py _match_class"),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

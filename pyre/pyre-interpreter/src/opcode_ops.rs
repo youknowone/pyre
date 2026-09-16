@@ -484,6 +484,8 @@ pub fn match_keys_value(subject: PyObjectRef, keys: PyObjectRef) -> Result<PyObj
 /// subject matches the class pattern, else `None`.  `count` is the number
 /// of positional sub-patterns; `kwd_attrs` is the keyword attribute-name
 /// tuple.
+/// `pyopcode.py _match_class` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn match_class_value(
     subject: PyObjectRef,
     cls: PyObjectRef,
