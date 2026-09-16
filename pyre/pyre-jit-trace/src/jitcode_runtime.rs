@@ -3678,7 +3678,6 @@ mod tests {
         let expected = [
             "abort/>r",
             "assert_not_none/r",
-            "cast_int_to_float/i>f",
             "cast_int_to_ptr/i>r",
             "check_neg_index/rid>i",
             "gc_load_indexed_f/riiii>f",

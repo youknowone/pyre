@@ -4027,6 +4027,358 @@ fn sub_jitcode_body_by_index_builds_w_list_append() {
 }
 
 #[test]
+fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
+    // intobject.py `_truediv` + `space.newfloat`: the `/` descent walks
+    // `int_truediv`, which looks inside `newfloat`.  `fuse_boxing_alloc`
+    // must have rewritten that constructor to `new_with_vtable` so the
+    // walk records instantiate + setfield, not residual `malloc_typed`.
+    let truediv = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::objspace::descroperation::_truediv",
+    )
+    .expect("_truediv must be a discovered jitcode");
+    let newfloat = crate::jitcode_runtime::pathed_jitcode("pyre_object::floatobject::newfloat")
+        .expect("newfloat must be a discovered jitcode");
+    let truediv_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&truediv.code)
+        .map(|op| op.opname)
+        .collect();
+    let newfloat_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&newfloat.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        truediv_ops.iter().any(|op| *op == "cast_int_to_float"),
+        "_truediv must lower `float(x)` to cast_int_to_float; ops={truediv_ops:?}"
+    );
+    assert!(
+        !truediv_ops
+            .iter()
+            .any(|op| op.starts_with("residual_call_irf")),
+        "_truediv must not residualize sitofp; ops={truediv_ops:?}"
+    );
+    assert!(
+        truediv_ops.iter().any(|op| *op == "new_with_vtable"),
+        "_truediv must box via in-graph new_with_vtable; ops={truediv_ops:?}"
+    );
+    assert!(
+        !truediv_ops.iter().any(|op| op.starts_with("inline_call")),
+        "_truediv must not inline_call newfloat; ops={truediv_ops:?}"
+    );
+    assert!(
+        newfloat_ops.iter().any(|op| *op == "new_with_vtable"),
+        "newfloat must lower to new_with_vtable; ops={newfloat_ops:?}"
+    );
+    assert!(
+        !newfloat_ops
+            .iter()
+            .any(|op| op.contains("residual") || *op == "residual_call"),
+        "fused newfloat must not residualise malloc; ops={newfloat_ops:?}"
+    );
+    assert!(
+        newfloat_ops.len() < 32,
+        "fused newfloat is New+setfields, not malloc_typed; ops={newfloat_ops:?}"
+    );
+    eprintln!("int_truediv {} ops: {truediv_ops:?}", truediv_ops.len());
+    eprintln!("newfloat {} ops: {newfloat_ops:?}", newfloat_ops.len());
+    let dump_calls = |code: &[u8], label: &str| {
+        let mut pc = 0;
+        while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+            if op.opname.contains("call") {
+                let mut cursor = op.pc + 1;
+                let mut descr_idx = None;
+                for c in op.argcodes.chars() {
+                    match c {
+                        'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'L' | 'j' => cursor += 2,
+                        'd' => {
+                            let lo = code[cursor] as u16;
+                            let hi = code[cursor + 1] as u16;
+                            descr_idx = Some((lo | (hi << 8)) as usize);
+                            cursor += 2;
+                        }
+                        'I' | 'R' | 'F' => {
+                            let n = code[cursor] as usize;
+                            cursor += 1 + n;
+                        }
+                        '>' => cursor += 1,
+                        _ => {}
+                    }
+                }
+                let name = descr_idx
+                    .and_then(crate::jitcode_runtime::get_descr_by_index)
+                    .map(|d| match d {
+                        majit_translate::jitcode::BhDescr::JitCode { jitcode_index, .. } => {
+                            crate::jitcode_runtime::get_jitcode_ref_by_index(*jitcode_index)
+                                .map(|jc| format!("jitcode:{}", jc.name))
+                                .unwrap_or_else(|| format!("jitcode_idx:{jitcode_index}"))
+                        }
+                        majit_translate::jitcode::BhDescr::Call { calldescr } => {
+                            format!("call:{calldescr:?}")
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .unwrap_or_else(|| "?".into());
+                eprintln!(
+                    "{label} pc={} {} descr={descr_idx:?} -> {name}",
+                    op.pc, op.key
+                );
+            }
+            pc = op.next_pc;
+        }
+    };
+    dump_calls(&truediv.code, "int_truediv");
+    dump_calls(&newfloat.code, "newfloat");
+    {
+        let mut pc = 0;
+        while let Some(op) = crate::jitcode_runtime::decode_op_at(&truediv.code, pc) {
+            let mut cursor = op.pc + 1;
+            let mut labels = Vec::new();
+            for c in op.argcodes.chars() {
+                match c {
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'd' | 'j' => cursor += 2,
+                    'L' => {
+                        let lo = truediv.code[cursor] as u16;
+                        let hi = truediv.code[cursor + 1] as u16;
+                        labels.push(lo | (hi << 8));
+                        cursor += 2;
+                    }
+                    'I' | 'R' | 'F' => {
+                        let n = truediv.code[cursor] as usize;
+                        cursor += 1 + n;
+                    }
+                    '>' => cursor += 1,
+                    _ => {}
+                }
+            }
+            eprintln!("  [{:>3}] {} labels={labels:?}", op.pc, op.key);
+            pc = op.next_pc;
+        }
+    }
+    let int_value = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::objspace::descroperation::int_value",
+    )
+    .or_else(|| crate::jitcode_runtime::named_jitcode("int_value"))
+    .expect("int_value jitcode");
+    let int_value_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&int_value.code)
+        .map(|op| op.opname)
+        .collect();
+    eprintln!("int_value {} ops: {int_value_ops:?}", int_value_ops.len());
+    dump_calls(&int_value.code, "int_value");
+    for path in [
+        "pyre_object::pyobject::is_bool",
+        "pyre_object::intobject::w_int_get_value",
+        "pyre_object::boolobject::w_bool_get_value",
+        "pyre_object::pyobject::py_type_check",
+    ] {
+        let Some(jc) = crate::jitcode_runtime::pathed_jitcode(path)
+            .or_else(|| crate::jitcode_runtime::named_jitcode(path.rsplit("::").next().unwrap()))
+        else {
+            eprintln!("missing {path}");
+            continue;
+        };
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+        dump_calls(&jc.code, path.rsplit("::").next().unwrap());
+    }
+    assert!(
+        truediv_ops.len() < 80,
+        "_truediv must stay the unboxed leaf, not the dispatcher; ops={truediv_ops:?}"
+    );
+    assert!(
+        !truediv_ops
+            .iter()
+            .any(|op| op.starts_with("inline_call_r_i")),
+        "_truediv takes unboxed ints; no int_value walk; ops={truediv_ops:?}"
+    );
+    {
+        let mut pc = 0;
+        while let Some(op) = crate::jitcode_runtime::decode_op_at(&truediv.code, pc) {
+            if op.opname == "goto" || op.opname.starts_with("goto_if") {
+                let mut cursor = op.pc + 1;
+                for c in op.argcodes.chars() {
+                    match c {
+                        'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'd' | 'j' => cursor += 2,
+                        'L' => {
+                            let lo = truediv.code[cursor] as u16;
+                            let hi = truediv.code[cursor + 1] as u16;
+                            let target = (lo | (hi << 8)) as usize;
+                            assert!(
+                                target >= op.next_pc,
+                                "_truediv must not back-edge ({opname} {pc} → {target}); that CFG hung the helper walk",
+                                opname = op.opname,
+                                pc = op.pc,
+                            );
+                            cursor += 2;
+                        }
+                        'I' | 'R' | 'F' => {
+                            let n = truediv.code[cursor] as usize;
+                            cursor += 1 + n;
+                        }
+                        '>' => cursor += 1,
+                        _ => {}
+                    }
+                }
+            }
+            pc = op.next_pc;
+        }
+    }
+}
+
+#[test]
+fn float_binop_leaves_are_the_pypy_leaf() {
+    // floatobject.py `descr_add` after `_to_float`: `W_FloatObject(x + y)`.
+    // The descent walks `_float_add`, which must contain the fused New.
+    for (path, arith) in [
+        (
+            "pyre_interpreter::objspace::descroperation::_float_add",
+            "float_add",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_sub",
+            "float_sub",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_mul",
+            "float_mul",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_truediv",
+            "float_truediv",
+        ),
+    ] {
+        let jc = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| *op == arith),
+            "{path} must record {arith}; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| *op == "new_with_vtable"),
+            "{path} must box via in-graph new_with_vtable; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("inline_call")),
+            "{path} must not inline_call newfloat; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("residual_call_irf")),
+            "{path} must not residualize the payload; ops={ops:?}"
+        );
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+    }
+}
+
+#[test]
+fn float_cmp_leaves_are_the_pypy_leaf() {
+    // floatobject.py `_compare` after `_to_float`: `space.newbool(x ? y)`.
+    for (path, arith) in [
+        (
+            "pyre_interpreter::objspace::descroperation::_float_lt",
+            "float_lt",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_le",
+            "float_le",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_gt",
+            "float_gt",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_ge",
+            "float_ge",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_eq",
+            "float_eq",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_ne",
+            "float_ne",
+        ),
+    ] {
+        let jc = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        assert!(
+            ops.iter().any(|op| *op == arith),
+            "{path} must record {arith}; ops={ops:?}"
+        );
+        assert!(
+            ops.len() < 32,
+            "{path} must stay the unboxed leaf; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("residual_call_irf")),
+            "{path} must not residualize the payload; ops={ops:?}"
+        );
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+    }
+}
+
+#[test]
+fn unary_neg_leaves_are_the_pypy_leaf() {
+    for (path, arith) in [
+        (
+            "pyre_interpreter::objspace::descroperation::_int_neg",
+            "int_sub",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_neg",
+            "float_neg",
+        ),
+        ("pyre_interpreter::objspace::descroperation::_float_pos", ""),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_invert",
+            "int_invert",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_abs",
+            "float_abs",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_sqrt",
+            "",
+        ),
+        ("pyre_interpreter::objspace::descroperation::_float_sin", ""),
+        ("pyre_interpreter::objspace::descroperation::_float_cos", ""),
+        ("pyre_interpreter::objspace::descroperation::_float_tan", ""),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_abs",
+            "int_sub",
+        ),
+    ] {
+        let jc = crate::jitcode_runtime::pathed_jitcode(path)
+            .unwrap_or_else(|| panic!("{path} must be a discovered jitcode"));
+        let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+            .map(|op| op.opname)
+            .collect();
+        if !arith.is_empty() {
+            assert!(
+                ops.iter().any(|op| *op == arith),
+                "{path} must record {arith}; ops={ops:?}"
+            );
+        }
+        assert!(
+            ops.iter().any(|op| *op == "new_with_vtable"),
+            "{path} must box via in-graph new_with_vtable; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| op.starts_with("inline_call")),
+            "{path} must not inline_call the constructor; ops={ops:?}"
+        );
+        eprintln!("{path} {} ops: {ops:?}", ops.len());
+    }
+}
+
+#[test]
 fn append_journal_rollback_rewinds_length() {
     // #171 journal infra: a walked eager `list.append` grows the
     // concrete list at trace time (the fold records the array-op IR but

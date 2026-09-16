@@ -200,9 +200,67 @@ macro_rules! pm1_plain {
 }
 
 // Trigonometric
-pm1_edom!(sin, "expected a finite input");
-pm1_edom!(cos, "expected a finite input");
-pm1_edom!(tan, "expected a finite input");
+/// `math.sin` after `_get_double`: domain pin, then [`_float_sin`].
+pub fn sin(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "sin() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::sin(val) {
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_SIN,
+        ),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a finite input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
+
+/// `math.cos` after `_get_double`: domain pin, then [`_float_cos`].
+pub fn cos(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "cos() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::cos(val) {
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_COS,
+        ),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a finite input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
+/// `math.tan` after `_get_double`: domain pin, then [`_float_tan`].
+pub fn tan(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "tan() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::tan(val) {
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_TAN,
+        ),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a finite input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
 pm1_edom!(asin, "expected a number in range from -1 up to 1");
 pm1_edom!(acos, "expected a number in range from -1 up to 1");
 pm1!(atan);
@@ -214,12 +272,32 @@ pm1_edom!(acosh, "expected argument value not less than 1");
 pm1_edom!(atanh, "expected a number between -1 and 1");
 
 // Exponential / logarithmic
-pm1_edom!(sqrt, "expected a nonnegative input");
+/// `math.sqrt` after `_get_double`: domain pin, then [`_float_sqrt`].
+pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "sqrt() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::sqrt(val) {
+        Ok(_) => crate::objspace::descroperation::_float_math1(
+            val,
+            crate::objspace::descroperation::FLOAT_MATH1_SQRT,
+        ),
+        Err(pymath::Error::EDOM) => Err(crate::PyError::value_error(format!(
+            "expected a nonnegative input, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(crate::PyError::overflow_error("math range error")),
+    }
+}
 
 static MATH_SQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_LOG_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_COS_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_SIN_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static MATH_TAN_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_FREXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_LDEXP_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static MATH_ISQRT_WRAPPER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -241,6 +319,7 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         ("log", &MATH_LOG_WRAPPER),
         ("cos", &MATH_COS_WRAPPER),
         ("sin", &MATH_SIN_WRAPPER),
+        ("tan", &MATH_TAN_WRAPPER),
         ("frexp", &MATH_FREXP_WRAPPER),
         ("ldexp", &MATH_LDEXP_WRAPPER),
         ("isqrt", &MATH_ISQRT_WRAPPER),
@@ -314,6 +393,10 @@ pub fn is_math_cos_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
     unsafe { math_builtin_wrapper_matches(callable, &MATH_SIN_WRAPPER) }
+}
+
+pub fn is_math_tan_function(callable: PyObjectRef) -> bool {
+    unsafe { math_builtin_wrapper_matches(callable, &MATH_TAN_WRAPPER) }
 }
 
 /// Callable-identity probes used by the meta-trace walker.  As with
@@ -472,7 +555,6 @@ macro_rules! jit_raw2 {
     };
 }
 
-jit_raw1!(jit_math_tan, tan);
 jit_raw1!(jit_math_asin, asin);
 jit_raw1!(jit_math_acos, acos);
 jit_raw1!(jit_math_atan, atan);
@@ -583,12 +665,11 @@ macro_rules! math_fold_table {
     };
 }
 
-/// `sqrt`, `log`, `cos`, `sin` and `fabs` are absent: each has a dedicated
-/// specialization that lowers to a tighter shape (a domain-guarded call with
-/// no result guard, or a single `FloatAbs`).
+/// `sqrt`, `log`, `cos`, `sin`, `tan` and `fabs` are absent: each has a
+/// dedicated specialization that lowers to a tighter shape (a domain-guarded
+/// call with no result guard, or a single `FloatAbs`).
 math_fold_table!(
     MATH_FLOAT1_FOLDS: MathFloat1Fold,
-    "tan" => jit_math_tan,
     "asin" => jit_math_asin,
     "acos" => jit_math_acos,
     "atan" => jit_math_atan,
@@ -684,7 +765,15 @@ pm1_edom!(gamma, "expected a noninteger or positive integer");
 pm1_edom!(lgamma, "expected a noninteger or positive integer");
 
 // Misc
-pm1!(fabs);
+/// `math.fabs` after `_get_double`: the unboxed `_float_abs` leaf.
+pub fn fabs(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(crate::PyError::type_error(
+            "fabs() takes exactly one argument",
+        ));
+    }
+    crate::objspace::descroperation::_float_abs(try_get_double(args[0])?)
+}
 pm1_plain!(ulp);
 
 // ── 2-arg float→float via pymath ─────────────────────────────────────

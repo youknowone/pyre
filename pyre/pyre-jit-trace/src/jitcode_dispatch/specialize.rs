@@ -9672,6 +9672,172 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     Ok(true)
 }
 
+/// intobject.py `_truediv` / `descr_truediv` after the `W_IntObject`
+/// isinstance.  Walking `binary_value_from_tag` for `/` records the
+/// whole `truediv_impl` dispatcher (`bigint_truediv`, dunder lookup)
+/// and hung `listcomp_float_element_regression`.
+const INT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_truediv",
+    commit_label: "int_truediv_commit",
+    call_site_label: "int_truediv_call_site",
+    decline_tag: "INT-TRUEDIV-SUBWALK",
+};
+
+/// floatobject.py `descr_add` / `descr_sub` / `descr_mul` / `descr_div`
+/// after `_to_float`.  Exact float pairs walk these instead of the
+/// `FloatAdd`+`wrapfloat` hand emit.
+const FLOAT_ADD_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_add",
+    commit_label: "float_add_commit",
+    call_site_label: "float_add_call_site",
+    decline_tag: "FLOAT-ADD-SUBWALK",
+};
+
+const FLOAT_SUB_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_sub",
+    commit_label: "float_sub_commit",
+    call_site_label: "float_sub_call_site",
+    decline_tag: "FLOAT-SUB-SUBWALK",
+};
+
+const FLOAT_MUL_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_mul",
+    commit_label: "float_mul_commit",
+    call_site_label: "float_mul_call_site",
+    decline_tag: "FLOAT-MUL-SUBWALK",
+};
+
+const FLOAT_TRUEDIV_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_truediv",
+    commit_label: "float_truediv_commit",
+    call_site_label: "float_truediv_call_site",
+    decline_tag: "FLOAT-TRUEDIV-SUBWALK",
+};
+
+/// floatobject.py `_compare` after `_to_float` for two floats.
+const FLOAT_LT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_lt",
+    commit_label: "float_lt_commit",
+    call_site_label: "float_lt_call_site",
+    decline_tag: "FLOAT-LT-SUBWALK",
+};
+
+const FLOAT_LE_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_le",
+    commit_label: "float_le_commit",
+    call_site_label: "float_le_call_site",
+    decline_tag: "FLOAT-LE-SUBWALK",
+};
+
+const FLOAT_GT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_gt",
+    commit_label: "float_gt_commit",
+    call_site_label: "float_gt_call_site",
+    decline_tag: "FLOAT-GT-SUBWALK",
+};
+
+const FLOAT_GE_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_ge",
+    commit_label: "float_ge_commit",
+    call_site_label: "float_ge_call_site",
+    decline_tag: "FLOAT-GE-SUBWALK",
+};
+
+const FLOAT_EQ_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_eq",
+    commit_label: "float_eq_commit",
+    call_site_label: "float_eq_call_site",
+    decline_tag: "FLOAT-EQ-SUBWALK",
+};
+
+const FLOAT_NE_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_ne",
+    commit_label: "float_ne_commit",
+    call_site_label: "float_ne_call_site",
+    decline_tag: "FLOAT-NE-SUBWALK",
+};
+
+/// intobject.py `descr_neg` after `ovfcheck(-a)`.
+const INT_NEG_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_neg",
+    commit_label: "int_neg_commit",
+    call_site_label: "int_neg_call_site",
+    decline_tag: "INT-NEG-SUBWALK",
+};
+
+/// floatobject.py `descr_neg`.
+const FLOAT_NEG_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_neg",
+    commit_label: "float_neg_commit",
+    call_site_label: "float_neg_call_site",
+    decline_tag: "FLOAT-NEG-SUBWALK",
+};
+
+/// floatobject.py `descr_pos`.
+const FLOAT_POS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_pos",
+    commit_label: "float_pos_commit",
+    call_site_label: "float_pos_call_site",
+    decline_tag: "FLOAT-POS-SUBWALK",
+};
+
+/// ll_math.py `sqrt_nonneg` after the domain pin.
+const FLOAT_SQRT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_sqrt",
+    commit_label: "float_sqrt_commit",
+    call_site_label: "float_sqrt_call_site",
+    decline_tag: "FLOAT-SQRT-SUBWALK",
+};
+
+/// ll_math.py `ll_math_sin` after the finite pin.
+const FLOAT_SIN_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_sin",
+    commit_label: "float_sin_commit",
+    call_site_label: "float_sin_call_site",
+    decline_tag: "FLOAT-SIN-SUBWALK",
+};
+
+/// ll_math.py `ll_math_cos` after the finite pin.
+const FLOAT_COS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_cos",
+    commit_label: "float_cos_commit",
+    call_site_label: "float_cos_call_site",
+    decline_tag: "FLOAT-COS-SUBWALK",
+};
+
+/// ll_math.py `ll_math_tan` after the finite pin.
+const FLOAT_TAN_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_tan",
+    commit_label: "float_tan_commit",
+    call_site_label: "float_tan_call_site",
+    decline_tag: "FLOAT-TAN-SUBWALK",
+};
+
+/// floatobject.py `descr_abs` / `ll_math_fabs`.
+const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_abs",
+    commit_label: "float_abs_commit",
+    call_site_label: "float_abs_call_site",
+    decline_tag: "FLOAT-ABS-SUBWALK",
+};
+
+/// intobject.py `descr_abs` after `ovfcheck`.
+#[allow(dead_code)]
+const INT_ABS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_abs",
+    commit_label: "int_abs_commit",
+    call_site_label: "int_abs_call_site",
+    decline_tag: "INT-ABS-SUBWALK",
+};
+
+/// intobject.py `descr_invert`.
+const INT_INVERT_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_invert",
+    commit_label: "int_invert_commit",
+    call_site_label: "int_invert_call_site",
+    decline_tag: "INT-INVERT-SUBWALK",
+};
+
 pub(crate) fn binary_value_from_tag_jitcode()
 -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
@@ -9835,44 +10001,6 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     if is_py_div && (rb == 0 || (la == i64::MIN && rb == -1)) {
         return Ok(None);
     }
-    // `int / int` is a float (`intobject.py _truediv` → `as_float / as_float`
-    // + `w_float_new`).  Orthodox descent of that body walks `w_float_new`
-    // and does not finish (`listcomp_float_element_regression` hung past
-    // the 20s gate).  Emit the same CastIntToFloat + FloatTrueDiv the float
-    // fold uses.  Wide ints (mantissa overflow) stay on the rbigint arm.
-    if matches!(op, Some(B::TrueDivide | B::InplaceTrueDivide)) {
-        if rb == 0 || (la.unsigned_abs() >> 53) != 0 || (rb.unsigned_abs() >> 53) != 0 {
-            return Ok(None);
-        }
-        let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
-        let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-        let lhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[0], lhs_type, lhs_descr)?;
-        walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(lhs_obj))?;
-        let rhs_raw = walker_unbox_int_typed(ctx, op_pc, r_args[1], rhs_type, rhs_descr)?;
-        walker_guard_exact_w_class(ctx, op_pc, r_args[1], walker_numeric_builtin_class(rhs_obj))?;
-        let lhs_f = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[lhs_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(lhs_f, majit_ir::Value::Float(la as f64));
-        let rhs_f = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[rhs_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(rhs_f, majit_ir::Value::Float(rb as f64));
-        let rhs_zero = walker_float_eq_const(ctx, rhs_f, 0.0, 0);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[rhs_zero])?;
-        let raw = ctx
-            .trace_ctx
-            .record_op(OpCode::FloatTrueDiv, &[lhs_f, rhs_f]);
-        let result_val = (la as f64) / (rb as f64);
-        ctx.trace_ctx
-            .set_opref_concrete(raw, majit_ir::Value::Float(result_val));
-        let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
-        let boxed_ptr = pyre_object::w_float_new(result_val) as usize;
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr)));
-        let _ = (dst, dst_bank);
-        return Ok(Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }));
-    }
     let opcode = match op {
         Some(B::Add | B::InplaceAdd) => OpCode::IntAddOvf,
         Some(B::Subtract | B::InplaceSubtract) => OpCode::IntSubOvf,
@@ -9966,10 +10094,148 @@ pub(crate) fn try_emit_exact_int_binop<Sym: WalkSym>(
     }))
 }
 
+/// Exact builtin `int`/`bool`/`float` `UNARY_NEGATIVE`: walk `_int_neg`
+/// or `_float_neg` instead of [`try_emit_exact_int_uneg`].  `INT_MIN`
+/// declines so the ovf2long arm stays residual.
+pub(crate) fn try_walker_orthodox_unary_neg<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let admitted = unsafe { pyre_object::is_exact_builtin_instance(obj) };
+    if !admitted {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::is_float(obj) } {
+        let x = unsafe { pyre_object::w_float_get_value(obj) };
+        let xa = walker_coerce_dispatching_operand_to_float(
+            ctx, op_pc, r_args[0], obj, false, x, false,
+        )?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[],
+            &[(xa, x)],
+            dst,
+            dst_bank,
+            &FLOAT_NEG_DESCENT,
+        );
+    }
+    if unsafe { !(pyre_object::is_int(obj) || pyre_object::is_bool(obj)) } {
+        return Ok(None);
+    }
+    let x = unsafe { pyre_object::w_int_get_value(obj) };
+    if x.checked_neg().is_none() {
+        return Ok(None);
+    }
+    let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(obj);
+    let xa = walker_unbox_int_typed(ctx, op_pc, r_args[0], type_addr, descr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+    // `_int_neg` is `0.wrapping_sub`; a later `i64::MIN` must deopt to
+    // the ovf2long residual instead of wrapping.
+    walker_guard_int_ne(ctx, op_pc, xa, x, i64::MIN)?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[(xa, x)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &INT_NEG_DESCENT,
+    )
+}
+
+/// Exact builtin `int` `UNARY_INVERT`: walk `_int_invert`.  Bool stays
+/// on `invert`'s deprecation-warning slot.
+pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let admitted = unsafe {
+        pyre_object::is_exact_builtin_instance(obj)
+            && pyre_object::is_int(obj)
+            && !pyre_object::is_bool(obj)
+    };
+    if !admitted {
+        return Ok(None);
+    }
+    let x = unsafe { pyre_object::w_int_get_value(obj) };
+    let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let xa = walker_unbox_int(ctx, op_pc, r_args[0], type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], walker_numeric_builtin_class(obj))?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[(xa, x)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &INT_INVERT_DESCENT,
+    )
+}
+
+/// Exact builtin `float` `UNARY_POSITIVE`: walk `_float_pos`.
+/// Exact `int` stays residual: `_self_unaryop('pos')` is `self.int(space)`
+/// and returns `self`, so a write-through here would be a new fold.
+pub(crate) fn try_walker_orthodox_unary_pos<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || r_args.len() != 1 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::is_float(obj) } {
+        let x = unsafe { pyre_object::w_float_get_value(obj) };
+        let xa = walker_coerce_dispatching_operand_to_float(
+            ctx, op_pc, r_args[0], obj, false, x, false,
+        )?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[],
+            &[(xa, x)],
+            dst,
+            dst_bank,
+            &FLOAT_POS_DESCENT,
+        );
+    }
+    Ok(None)
+}
+
 /// `space.neg` on a concrete exact int or bool: unbox through the operand's
 /// own vtable and emit `IntSubOvf(0, value)`.  `-True` is int `-1`, so the
 /// result is always boxed as int.  `INT_MIN` declines — its negation is the
-/// `2**63` long.
+/// `2**63` long.  Exact operands walk [`try_walker_orthodox_unary_neg`] first.
 pub(crate) fn try_emit_exact_int_uneg<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10154,11 +10420,10 @@ pub(crate) fn try_emit_list_int_getitem<Sym: WalkSym>(
     }))
 }
 
-/// Exact builtin float/int operands at a declined helper CALL: the same
+/// Declined `_float_*` walk at a helper CALL: the same
 /// `FloatAdd`/`FloatSub`/`FloatMul`/`FloatTrueDiv` + `wrapfloat` body
-/// `try_walker_specialize_binary_op_float` records, without a residual
-/// `call_descr`.  `float_loop` / `spectral_norm` / `nbody` otherwise stay
-/// `CallMayForce`.
+/// `try_walker_specialize_binary_op_float` records.  Exact float pairs
+/// and mixed int/float walk [`FLOAT_ADD_DESCENT`] and siblings first.
 pub(crate) fn try_emit_exact_float_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10279,11 +10544,53 @@ const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
 /// `ref_args` pairs each operand box with its concrete object; `int_args`
 /// carries constant-bank operands (an operator tag) the same way.  A body
 /// that raises declines (see the `SubRaise` arm).
+fn walker_guard_int_ne<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw: OpRef,
+    concrete: i64,
+    banned: i64,
+) -> Result<(), DispatchError> {
+    let banned_box = ctx.trace_ctx.const_int(banned);
+    let is_banned = ctx.trace_ctx.record_op(OpCode::IntEq, &[raw, banned_box]);
+    ctx.trace_ctx.set_opref_concrete(
+        is_banned,
+        majit_ir::Value::Int(i64::from(concrete == banned)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_banned])
+}
+
+/// Pin `lo < raw < hi` so a later out-of-range value deopts.
+fn walker_guard_int_open_range<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    raw: OpRef,
+    concrete: i64,
+    lo_exclusive: i64,
+    hi_exclusive: i64,
+) -> Result<(), DispatchError> {
+    let lo = ctx.trace_ctx.const_int(lo_exclusive);
+    let hi = ctx.trace_ctx.const_int(hi_exclusive);
+    let gt_lo = ctx.trace_ctx.record_op(OpCode::IntLt, &[lo, raw]);
+    ctx.trace_ctx.set_opref_concrete(
+        gt_lo,
+        majit_ir::Value::Int(i64::from(lo_exclusive < concrete)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt_lo])?;
+    let lt_hi = ctx.trace_ctx.record_op(OpCode::IntLt, &[raw, hi]);
+    ctx.trace_ctx.set_opref_concrete(
+        lt_hi,
+        majit_ir::Value::Int(i64::from(concrete < hi_exclusive)),
+    );
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[lt_hi])
+}
+
 fn try_walker_orthodox_descent<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     int_args: &[(OpRef, i64)],
     ref_args: &[(OpRef, pyre_object::PyObjectRef)],
+    float_args: &[(OpRef, f64)],
     dst: usize,
     dst_bank: char,
     descent: &HelperDescent,
@@ -10334,6 +10641,11 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
         .iter()
         .map(|&(_, obj)| ConcreteValue::Ref(obj))
         .collect();
+    let float_oprefs: Vec<OpRef> = float_args.iter().map(|&(opref, _)| opref).collect();
+    for &(operand, value) in float_args {
+        ctx.trace_ctx
+            .set_opref_concrete(operand, majit_ir::Value::Float(value));
+    }
 
     let exc_before_subwalk = ctx.last_exc_value();
     let walk = run_orthodox_helper_subwalk(
@@ -10348,7 +10660,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
         &int_concretes,
         &ref_oprefs,
         &ref_concretes,
-        &[],
+        &float_oprefs,
     );
     let (walk_outcome, _walk_start) = match walk {
         // The body reached a helper this build did not lower.  The arms an
@@ -10400,11 +10712,11 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
 /// `a OP b`: descend `binary_value_from_tag` with the operator tag as a
 /// constant.  See [`try_walker_orthodox_descent`].
 ///
-/// Policy: both operands must be concrete exact builtin machine ints (int,
-/// bool).  Exactness keeps the override arms, which call Python, out
-/// of the sub-walk; the numeric restriction keeps out the sequence arms,
-/// whose in-place forms (`list += list`) mutate the receiver before any
-/// later decline could rewind them.
+/// Policy: both operands must be concrete exact builtin machine ints
+/// (int, bool) or exact builtin floats.  Exactness keeps the override
+/// arms, which call Python, out of the sub-walk; the numeric restriction
+/// keeps out the sequence arms, whose in-place forms (`list += list`)
+/// mutate the receiver before any later decline could rewind them.
 ///
 /// An in-place tag is descended as its plain operator.  The body routes
 /// tags 13..=24 through the residual `binary_value` (the `__iadd__` probe
@@ -10460,10 +10772,11 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         Some(B::Multiply | B::InplaceMultiply) => B::Multiply,
         Some(B::FloorDivide | B::InplaceFloorDivide) => B::FloorDivide,
         Some(B::Remainder | B::InplaceRemainder) => B::Remainder,
-        // `int / int` is a float.  The body ends in `w_float_new`, which
-        // this walk does not lower (see the float-admission note below), so
-        // descending it hung `listcomp_float_element_regression`.
-        Some(B::TrueDivide | B::InplaceTrueDivide) => return Ok(None),
+        // intobject.py `_truediv`: unboxed zero/mantissa guards then
+        // `newfloat(float(x)/float(y))`.  Wide ints raise into residual
+        // `int_truediv_ovf2long`, so the helper walk no longer records
+        // `rbigint.truediv`.
+        Some(B::TrueDivide | B::InplaceTrueDivide) => B::TrueDivide,
         Some(B::Lshift | B::InplaceLshift) => B::Lshift,
         Some(B::Rshift | B::InplaceRshift) => B::Rshift,
         Some(B::And | B::InplaceAnd) => B::And,
@@ -10485,26 +10798,141 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         // No `long`: its arms run rbigint, which this build does not lower,
         // so the sub-walk declined every time (137 cuts in one
         // `synth/wasm_ca_trampoline_decline` run, each a rewound trace).
-        // No `float` either: `w_float_new` allocates through a synthetic
-        // transparent `PyObject` constructor with no host symbol, and the
-        // sub-walk declined at it on every float arm (the unary `neg`
-        // descent declines there the same way).
+        // Exact builtin float is admitted: `_float_*` is the unboxed
+        // descr_* leaf (`float_*` + in-graph `new_with_vtable`), so the
+        // walk no longer hits the synthetic `w_float_new` constructor.
         let admitted = unsafe {
             pyre_object::is_exact_builtin_instance(obj)
-                && (pyre_object::is_int(obj) || pyre_object::is_bool(obj))
+                && (pyre_object::is_int(obj)
+                    || pyre_object::is_bool(obj)
+                    || pyre_object::is_float(obj))
         };
         if !admitted {
             return Ok(None);
         }
         *slot = (operand, obj);
     }
-    // A live zero divisor is the raising arm (`try_walker_specialize_binary_op_int_zero_div`).
+    let lhs_is_float = unsafe { pyre_object::is_float(operands[0].1) };
+    let rhs_is_float = unsafe { pyre_object::is_float(operands[1].1) };
+    let all_int = !lhs_is_float
+        && !rhs_is_float
+        && unsafe {
+            (pyre_object::is_int(operands[0].1) || pyre_object::is_bool(operands[0].1))
+                && (pyre_object::is_int(operands[1].1) || pyre_object::is_bool(operands[1].1))
+        };
+    // A live zero divisor is the raising arm (`try_walker_specialize_binary_op_int_zero_div`
+    // / the float TrueDivide raise in `try_walker_specialize_binary_op_float`).
     // Descending the success body would dest-write NULL (`sdiv`/`None`) and
     // compile `checksum +=` against an unbound local.
-    if matches!(plain, B::FloorDivide | B::Remainder)
+    if all_int
+        && matches!(plain, B::FloorDivide | B::Remainder | B::TrueDivide)
         && unsafe { pyre_object::w_int_get_value(operands[1].1) } == 0
     {
         return Ok(None);
+    }
+    // floatobject.py `descr_{add,sub,mul,div}` after `_to_float`: coerce
+    // each operand (float unbox, or int/bool `cast_int_to_float`), then
+    // the unboxed leaf whose graph is `float_*` + `new_with_vtable`.
+    // Mixed int/float is the same leaf (`float_loop` `i * 0.1`,
+    // `spectral_norm` `v[j] / int`).
+    if !all_int {
+        let Some(descent) = (match plain {
+            B::Add => Some(&FLOAT_ADD_DESCENT),
+            B::Subtract => Some(&FLOAT_SUB_DESCENT),
+            B::Multiply => Some(&FLOAT_MUL_DESCENT),
+            B::TrueDivide => Some(&FLOAT_TRUEDIV_DESCENT),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        let x = if lhs_is_float {
+            unsafe { pyre_object::w_float_get_value(operands[0].1) }
+        } else {
+            unsafe { pyre_object::w_int_get_value(operands[0].1) as f64 }
+        };
+        let y = if rhs_is_float {
+            unsafe { pyre_object::w_float_get_value(operands[1].1) }
+        } else {
+            unsafe { pyre_object::w_int_get_value(operands[1].1) as f64 }
+        };
+        if matches!(plain, B::TrueDivide) && y == 0.0 {
+            return Ok(None);
+        }
+        let xa = walker_coerce_dispatching_operand_to_float(
+            ctx,
+            op_pc,
+            operands[0].0,
+            operands[0].1,
+            !lhs_is_float,
+            x,
+            false,
+        )?;
+        let ya = walker_coerce_dispatching_operand_to_float(
+            ctx,
+            op_pc,
+            operands[1].0,
+            operands[1].1,
+            !rhs_is_float,
+            y,
+            false,
+        )?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[],
+            &[(xa, x), (ya, y)],
+            dst,
+            dst_bank,
+            descent,
+        );
+    }
+    // intobject.py `_truediv(space, x, y)` is the unboxed success leaf:
+    // zero, two `cast_int_to_float`, float_truediv, in-graph
+    // `new_with_vtable`.  Wide ints raise into residual
+    // `int_truediv_ovf2long` (`_make_ovf2long`).
+    if matches!(plain, B::TrueDivide) {
+        const MANTISSA_LIM: i64 = 1 << 53;
+        let x = unsafe { pyre_object::w_int_get_value(operands[0].1) };
+        let y = unsafe { pyre_object::w_int_get_value(operands[1].1) };
+        if x <= -MANTISSA_LIM || x >= MANTISSA_LIM || y <= -MANTISSA_LIM || y >= MANTISSA_LIM {
+            return Ok(None);
+        }
+        let type_addr = |obj| {
+            if unsafe { pyre_object::is_bool(obj) } {
+                &pyre_object::pyobject::BOOL_TYPE as *const _ as i64
+            } else {
+                &pyre_object::pyobject::INT_TYPE as *const _ as i64
+            }
+        };
+        let xa = walker_unbox_int(ctx, op_pc, operands[0].0, type_addr(operands[0].1))?;
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            operands[0].0,
+            walker_numeric_builtin_class(operands[0].1),
+        )?;
+        let ya = walker_unbox_int(ctx, op_pc, operands[1].0, type_addr(operands[1].1))?;
+        walker_guard_exact_w_class(
+            ctx,
+            op_pc,
+            operands[1].0,
+            walker_numeric_builtin_class(operands[1].1),
+        )?;
+        // Host-side mantissa check only admits the recording operands.
+        // Later values must deopt into `int_truediv_ovf2long`.
+        walker_guard_int_open_range(ctx, op_pc, xa, x, -MANTISSA_LIM, MANTISSA_LIM)?;
+        walker_guard_int_open_range(ctx, op_pc, ya, y, -MANTISSA_LIM, MANTISSA_LIM)?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[(xa, x), (ya, y)],
+            &[],
+            &[],
+            dst,
+            dst_bank,
+            &INT_TRUEDIV_DESCENT,
+        );
     }
     let tag = if plain_tag == op_tag {
         tag
@@ -10516,6 +10944,7 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         op_pc,
         &[(tag, plain_tag)],
         &operands,
+        &[],
         dst,
         dst_bank,
         &BINARY_OP_DESCENT,
@@ -10570,21 +10999,91 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
             return Ok(None);
         };
         // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker
-        // shadow.
+        // shadow.  Exact builtin float walks `_float_lt` and siblings
+        // (`descr_*` after `_to_float`); mixed int/float does too once
+        // the int is exact as a double (`int_between(-1, i2 >> 48, 1)`).
         let admitted = unsafe {
             pyre_object::is_exact_builtin_instance(obj)
-                && (pyre_object::is_int(obj) || pyre_object::is_bool(obj))
+                && (pyre_object::is_int(obj)
+                    || pyre_object::is_bool(obj)
+                    || pyre_object::is_float(obj))
         };
         if !admitted {
             return Ok(None);
         }
         *slot = (operand, obj);
     }
+    let lhs_is_float = unsafe { pyre_object::is_float(operands[0].1) };
+    let rhs_is_float = unsafe { pyre_object::is_float(operands[1].1) };
+    if lhs_is_float || rhs_is_float {
+        let Some(descent) = (match op_tag {
+            0 => Some(&FLOAT_LT_DESCENT),
+            1 => Some(&FLOAT_LE_DESCENT),
+            2 => Some(&FLOAT_GT_DESCENT),
+            3 => Some(&FLOAT_GE_DESCENT),
+            4 => Some(&FLOAT_EQ_DESCENT),
+            5 => Some(&FLOAT_NE_DESCENT),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if !lhs_is_float {
+            let value = unsafe { pyre_object::w_int_get_value(operands[0].1) };
+            if !int_is_exact_as_float(value) {
+                return Ok(None);
+            }
+        }
+        if !rhs_is_float {
+            let value = unsafe { pyre_object::w_int_get_value(operands[1].1) };
+            if !int_is_exact_as_float(value) {
+                return Ok(None);
+            }
+        }
+        let x = if lhs_is_float {
+            unsafe { pyre_object::w_float_get_value(operands[0].1) }
+        } else {
+            unsafe { pyre_object::w_int_get_value(operands[0].1) as f64 }
+        };
+        let y = if rhs_is_float {
+            unsafe { pyre_object::w_float_get_value(operands[1].1) }
+        } else {
+            unsafe { pyre_object::w_int_get_value(operands[1].1) as f64 }
+        };
+        let xa = walker_coerce_dispatching_operand_to_float(
+            ctx,
+            op_pc,
+            operands[0].0,
+            operands[0].1,
+            !lhs_is_float,
+            x,
+            true,
+        )?;
+        let ya = walker_coerce_dispatching_operand_to_float(
+            ctx,
+            op_pc,
+            operands[1].0,
+            operands[1].1,
+            !rhs_is_float,
+            y,
+            true,
+        )?;
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[],
+            &[],
+            &[(xa, x), (ya, y)],
+            dst,
+            dst_bank,
+            descent,
+        );
+    }
     try_walker_orthodox_descent(
         ctx,
         op_pc,
         &[(tag, op_tag)],
         &operands,
+        &[],
         dst,
         dst_bank,
         &COMPARE_OP_DESCENT,
@@ -14727,6 +15226,18 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if pyre_interpreter::module::math::interp_math::is_math_sqrt_function(callable)
+            && r_args.len() >= 3
+        {
+            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+            if try_walker_orthodox_float_sqrt(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                .is_some()
+            {
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         pyre_interpreter::module::math::interp_math::is_math_sqrt_function(callable).then_some((
             MathFloatDomain::NonNegativeFinite,
@@ -14745,6 +15256,23 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if r_args.len() >= 3 {
+            use pyre_interpreter::module::math::interp_math;
+            let walked = if interp_math::is_math_sin_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                try_walker_orthodox_float_sin(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            } else if interp_math::is_math_cos_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                try_walker_orthodox_float_cos(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            } else {
+                None
+            };
+            if walked.is_some() {
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         use pyre_interpreter::module::math::interp_math;
         if interp_math::is_math_log_function(callable) {
@@ -15243,6 +15771,149 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// Exact builtin float/int `math.fabs` / `abs`: walk `_float_abs`.
+pub(crate) fn try_walker_orthodox_float_abs<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
+        (false, unsafe { pyre_object::w_float_get_value(obj) })
+    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
+    } else {
+        return Ok(None);
+    };
+    let xa =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[],
+        &[(xa, x)],
+        dst,
+        dst_bank,
+        &FLOAT_ABS_DESCENT,
+    )
+}
+
+/// Exact non-negative finite `math.sqrt`: walk `_float_sqrt`.
+pub(crate) fn try_walker_orthodox_float_sqrt<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
+        (false, unsafe { pyre_object::w_float_get_value(obj) })
+    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
+    } else {
+        return Ok(None);
+    };
+    if !x.is_finite() || x < 0.0 {
+        return Ok(None);
+    }
+    let xa =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    MathFloatDomain::NonNegativeFinite.emit_operand_guards(ctx, op_pc, xa)?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[],
+        &[(xa, x)],
+        dst,
+        dst_bank,
+        &FLOAT_SQRT_DESCENT,
+    )
+}
+
+/// Exact finite `math.sin`: walk `_float_sin`.
+pub(crate) fn try_walker_orthodox_float_sin<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_SIN_DESCENT)
+}
+
+/// Exact finite `math.cos`: walk `_float_cos`.
+pub(crate) fn try_walker_orthodox_float_cos<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_COS_DESCENT)
+}
+
+/// Exact finite `math.tan`: walk `_float_tan`.
+pub(crate) fn try_walker_orthodox_float_tan<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_TAN_DESCENT)
+}
+
+fn try_walker_orthodox_float_trig<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::is_exact_builtin_instance(obj) } {
+        return Ok(None);
+    }
+    let (is_int, x) = if unsafe { pyre_object::is_float(obj) } {
+        (false, unsafe { pyre_object::w_float_get_value(obj) })
+    } else if unsafe { pyre_object::is_int(obj) || pyre_object::is_bool(obj) } {
+        (true, unsafe { pyre_object::w_int_get_value(obj) as f64 })
+    } else {
+        return Ok(None);
+    };
+    if !x.is_finite() {
+        return Ok(None);
+    }
+    let xa =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
+    MathFloatDomain::Finite.emit_operand_guards(ctx, op_pc, xa)?;
+    try_walker_orthodox_descent(ctx, op_pc, &[], &[], &[(xa, x)], dst, dst_bank, descent)
+}
+
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
 /// `ll_math_fabs` to a sign mask, so the whole builtin is one `FloatAbs` once
 /// the operand is unboxed, and `fabs` raises for no input, which is why the
@@ -15252,6 +15923,7 @@ pub(crate) fn try_walker_specialize_int_call<Sym: WalkSym>(
 /// screens the authentic result through `fold_finite_float_result`, so
 /// `fabs(inf)` and `fabs(nan)` decline at trace time and keep the residual
 /// even though the sign mask would answer them correctly.
+/// Exact operands walk [`try_walker_orthodox_float_abs`] first.
 pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -15259,6 +15931,18 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if pyre_interpreter::module::math::interp_math::is_math_fabs_function(callable)
+            && r_args.len() >= 3
+        {
+            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+            if try_walker_orthodox_float_abs(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                .is_some()
+            {
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         pyre_interpreter::module::math::interp_math::is_math_fabs_function(callable).then_some((
             MathFloatDomain::Total,
@@ -15527,6 +16211,18 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
+        if pyre_interpreter::module::math::interp_math::is_math_tan_function(callable)
+            && r_args.len() >= 3
+        {
+            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+            if try_walker_orthodox_float_tan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                .is_some()
+            {
+                return Ok(Some(()));
+            }
+        }
+    }
     walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
         pyre_interpreter::module::math::interp_math::math_float1_fold_helper(callable)
             .map(|raw| (MathFloatDomain::ResultFinite, MathFloatEmit::Call1(raw)))

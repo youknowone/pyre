@@ -14153,10 +14153,49 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         && args.len() == 1
         && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
             jc.code.as_ptr() == sub_body.code.as_ptr()
+                && (jc.name == "invert"
+                    || jc.name.ends_with("::invert")
+                    || jc.name.ends_with("::invert_inner"))
+        })
+    {
+        let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(outcome) =
+            super::specialize::try_walker_orthodox_unary_invert(ctx, op.pc, &args, dst, dst_bank)?
+        {
+            return Ok((outcome, op.next_pc));
+        }
+    }
+
+    if dst_bank == 'r'
+        && args.len() == 1
+        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
+            jc.code.as_ptr() == sub_body.code.as_ptr()
+                && (jc.name == "pos"
+                    || jc.name.ends_with("::pos")
+                    || jc.name.ends_with("::pos_inner"))
+        })
+    {
+        let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(outcome) =
+            super::specialize::try_walker_orthodox_unary_pos(ctx, op.pc, &args, dst, dst_bank)?
+        {
+            return Ok((outcome, op.next_pc));
+        }
+    }
+
+    if dst_bank == 'r'
+        && args.len() == 1
+        && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
+            jc.code.as_ptr() == sub_body.code.as_ptr()
                 && (jc.name == "neg" || jc.name.ends_with("::neg"))
         })
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+        if let Some(outcome) = spec_gate(SpecFold::UnaryNeg, || {
+            super::specialize::try_walker_orthodox_unary_neg(ctx, op.pc, &args, dst, dst_bank)
+        })? {
+            return Ok((outcome, op.next_pc));
+        }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
         }) = spec_gate(SpecFold::UnaryNeg, || {

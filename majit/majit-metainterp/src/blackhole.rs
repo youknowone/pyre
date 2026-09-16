@@ -5140,6 +5140,21 @@ mod tests {
             }
         }
 
+        /// `_truediv` emits `cast_int_to_float/i>f` for `float(x)`.  A
+        /// helper subwalk resume must dispatch it; `bhimpl_cast_int_to_float`
+        /// is already wired, only the curated byte was missing.
+        #[test]
+        fn production_bh_builder_wires_cast_int_to_float() {
+            let builder = super::build_inline_call_only_bh_builder();
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            let byte = majit_translate::insns::BC_CAST_INT_TO_FLOAT;
+            let slot = builder.dispatch_table[byte as usize];
+            assert_ne!(
+                slot as usize, placeholder as usize,
+                "`cast_int_to_float/i>f` (byte {byte}) is unwired in the production builder",
+            );
+        }
+
         /// `random.gauss` contains a float-to-int conversion. A guard failure
         /// can resume forward through that byte, so RPython
         /// `blackhole.py setup_insns` must bind the already-ported
@@ -10307,6 +10322,14 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
         (
             "float_truediv/ff>f",
             majit_translate::insns::BC_FLOAT_TRUEDIV,
+        ),
+        // `cast_int_to_float/i>f` — `IntegerRepr.rtype_float` /
+        // `_truediv`'s `float(x)`.  Handler is already wired
+        // (`bhimpl_cast_int_to_float`); the byte was only in the
+        // overlay-only gap until the codewriter started emitting it.
+        (
+            "cast_int_to_float/i>f",
+            majit_translate::insns::BC_CAST_INT_TO_FLOAT,
         ),
         ("float_neg/f>f", majit_translate::insns::BC_FLOAT_NEG),
         ("float_abs/f>f", majit_translate::insns::BC_FLOAT_ABS),

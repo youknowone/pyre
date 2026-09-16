@@ -899,6 +899,78 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     }
 }
 
+/// intobject.py `_truediv(space, x, y)` success body: zero, then
+/// `space.newfloat(float(x)/float(y))`.  The mantissa overflow
+/// (`r_uint(abs(n)) >> DBL_MANT_DIG`) stays in [`int_truediv`]:
+/// putting that diamond here lowers to a backward `goto` and hung
+/// the helper walk.  Charon cannot inline the cross-crate `newfloat`
+/// helper, so the success constructor lives here and
+/// `fuse_boxing_alloc` rewrites `malloc_typed_managed` to
+/// `new_with_vtable`.
+#[inline(never)]
+pub(crate) fn _truediv(x: i64, y: i64) -> PyResult {
+    if y == 0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    let value = (x as f64) / (y as f64);
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: value,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// `descr_truediv`: unbox, then `_truediv`, catching the mantissa
+/// overflow as `_make_ovf2long('truediv')`.  The overflow diamond
+/// cannot live in [`_truediv`]: it lowers to a backward `goto` and
+/// hung the helper walk.
+pub(crate) unsafe fn int_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    let x = int_value(a);
+    let y = int_value(b);
+    const MANTISSA_LIM: i64 = 1 << 53;
+    if x <= -MANTISSA_LIM || x >= MANTISSA_LIM || y <= -MANTISSA_LIM || y >= MANTISSA_LIM {
+        return int_truediv_ovf2long(x, y);
+    }
+    _truediv(x, y)
+}
+
+/// `_make_ovf2long('truediv')`: `W_LongObject.fromint` then
+/// `descr_truediv`. Residual so a `_truediv` walk does not record
+/// `rbigint.truediv`.
+#[majit_macros::dont_look_inside]
+fn int_truediv_ovf2long(va: i64, vb: i64) -> PyResult {
+    let a = BigInt::from(va);
+    let b = BigInt::from(vb);
+    Ok(w_float_new(bigint_truediv(&a, &b)?))
+}
+
+/// longobject.py `_truediv` / mixed long-int.  At least one operand is
+/// `W_LongObject`; machine-int pairs stay in [`int_truediv`].
+unsafe fn long_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    if !is_long(b) && as_float(b) == 0.0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    let a_owned;
+    let va = if is_long(a) {
+        w_long_get_value(a)
+    } else {
+        a_owned = BigInt::from(int_value(a));
+        &a_owned
+    };
+    let b_owned;
+    let vb = if is_long(b) {
+        w_long_get_value(b)
+    } else {
+        b_owned = BigInt::from(int_value(b));
+        &b_owned
+    };
+    Ok(w_float_new(bigint_truediv(va, vb)?))
+}
+
 unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
@@ -1546,12 +1618,71 @@ unsafe fn is_float_pair(a: PyObjectRef, b: PyObjectRef) -> bool {
     a_num && b_num && (is_float(a) || is_float(b))
 }
 
+/// floatobject.py `descr_add` / `descr_sub` / `descr_mul` / `descr_div`
+/// after `_to_float`: `W_FloatObject(self.floatval ? w_rhs.floatval)`.
+/// Charon cannot inline the cross-crate `newfloat`, so the constructor
+/// body lives in each leaf the way it lives in [`_truediv`].
+#[inline(never)]
+pub(crate) fn _float_add(x: f64, y: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x + y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+#[inline(never)]
+pub(crate) fn _float_sub(x: f64, y: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x - y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+#[inline(never)]
+pub(crate) fn _float_mul(x: f64, y: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x * y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+#[inline(never)]
+pub(crate) fn _float_truediv(x: f64, y: f64) -> PyResult {
+    if y == 0.0 {
+        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+    }
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x / y,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
 unsafe fn float_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = as_float(a);
     reject_float_coercion_overflow(a, va)?;
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    Ok(w_float_new(va + vb))
+    _float_add(va, vb)
 }
 
 unsafe fn float_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1559,7 +1690,7 @@ unsafe fn float_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     reject_float_coercion_overflow(a, va)?;
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    Ok(w_float_new(va - vb))
+    _float_sub(va, vb)
 }
 
 unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -1567,18 +1698,15 @@ unsafe fn float_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     reject_float_coercion_overflow(a, va)?;
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    Ok(w_float_new(va * vb))
+    _float_mul(va, vb)
 }
 
 unsafe fn float_truediv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = as_float(b);
     reject_float_coercion_overflow(b, vb)?;
-    if vb == 0.0 {
-        return Err(PyError::zero_division(ZERO_DIVISION_MSG));
-    }
     let va = as_float(a);
     reject_float_coercion_overflow(a, va)?;
-    Ok(w_float_new(va / vb))
+    _float_truediv(va, vb)
 }
 
 /// floatobject.py: descr_floordiv → _divmod_w()[0].
@@ -2562,6 +2690,38 @@ fn do_compare_bigint(f1: f64, b2: &BigInt, op: CompareOp) -> bool {
     }
 }
 
+/// floatobject.py `_compare` after `_to_float` for two floats:
+/// `space.newbool(self.floatval ? w_other.floatval)`.
+#[inline(never)]
+pub(crate) fn _float_lt(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x < y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_le(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x <= y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_gt(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x > y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_ge(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x >= y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_eq(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x == y))
+}
+
+#[inline(never)]
+pub(crate) fn _float_ne(x: f64, y: f64) -> PyResult {
+    Ok(w_bool_from(x != y))
+}
+
 /// floatobject.py `_compare` — the float side of a numeric
 /// comparison.  `w_float` is a float; `w_other` is a float, an int, a bool
 /// or a long.  The relation is evaluated exactly: only an int small enough
@@ -2903,7 +3063,29 @@ pub(crate) unsafe fn complex_abs(a: PyObjectRef) -> PyResult {
     if result.is_infinite() && ar.is_finite() && ai.is_finite() {
         return Err(PyError::overflow_error("absolute value too large"));
     }
-    Ok(w_float_new(result))
+    // Loop-free looked-inside caller of the unboxed float math leaves.
+    // `interp_math::{sqrt,sin,cos}` live under opaque `crate::module`,
+    // the same class as `_float_lt` before [`compare_slot`].
+    _float_math1(result, FLOAT_MATH1_ABS)
+}
+
+pub(crate) const FLOAT_MATH1_ABS: i64 = 0;
+pub(crate) const FLOAT_MATH1_SQRT: i64 = 1;
+pub(crate) const FLOAT_MATH1_SIN: i64 = 2;
+pub(crate) const FLOAT_MATH1_COS: i64 = 3;
+pub(crate) const FLOAT_MATH1_TAN: i64 = 4;
+
+/// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
+/// `inline(never)` keeps every arm in the graph when a caller passes a constant.
+#[inline(never)]
+pub(crate) fn _float_math1(x: f64, kind: i64) -> PyResult {
+    match kind {
+        FLOAT_MATH1_SQRT => _float_sqrt(x),
+        FLOAT_MATH1_SIN => _float_sin(x),
+        FLOAT_MATH1_COS => _float_cos(x),
+        FLOAT_MATH1_TAN => _float_tan(x),
+        _ => _float_abs(x),
+    }
 }
 
 /// Complex equality: `==`/`!=` only (no ordering).  Mixed numeric
@@ -4389,33 +4571,14 @@ pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str)
             if is_float(a) || is_float(b) {
                 return float_truediv(a, b);
             }
-            if !is_long(b) && as_float(b) == 0.0 {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+            // intobject.py `descr_truediv` / `_truediv` first, then
+            // `_make_ovf2long`.  Long operands use longobject.py `_truediv`.
+            if is_int_like(a) && is_int_like(b) {
+                return int_truediv(a, b);
             }
-            // intobject.py `_truediv`: machine ints wider than the
-            // binary64 mantissa deliberately overflow into the rbigint path
-            // so division is rounded once, after exact integer arithmetic.
-            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
-                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
-            if is_long(a) || is_long(b) || wide_int {
-                let a_owned;
-                let va = if is_long(a) {
-                    w_long_get_value(a)
-                } else {
-                    a_owned = BigInt::from(int_value(a));
-                    &a_owned
-                };
-                let b_owned;
-                let vb = if is_long(b) {
-                    w_long_get_value(b)
-                } else {
-                    b_owned = BigInt::from(int_value(b));
-                    &b_owned
-                };
-                let r = bigint_truediv(va, vb)?;
-                return Ok(w_float_new(r));
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_truediv(a, b);
             }
-            return Ok(w_float_new(as_float(a) / as_float(b)));
         }
         if !numeric_override && is_complex_pair(a, b) {
             return complex_truediv(a, b);
@@ -4559,32 +4722,12 @@ pub(crate) fn truediv_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
             if is_float(a) || is_float(b) {
                 return float_truediv(a, b);
             }
-            if !is_long(b) && as_float(b) == 0.0 {
-                return Err(PyError::zero_division(ZERO_DIVISION_MSG));
+            if is_int_like(a) && is_int_like(b) {
+                return int_truediv(a, b);
             }
-            // Match `_truediv`'s overflow-to-rbigint leg for i64 values that
-            // are not exactly representable in a binary64 mantissa.
-            let wide_int = (!is_long(a) && int_value(a).unsigned_abs() >> 53 != 0)
-                || (!is_long(b) && int_value(b).unsigned_abs() >> 53 != 0);
-            if is_long(a) || is_long(b) || wide_int {
-                let a_owned;
-                let va = if is_long(a) {
-                    w_long_get_value(a)
-                } else {
-                    a_owned = BigInt::from(int_value(a));
-                    &a_owned
-                };
-                let b_owned;
-                let vb = if is_long(b) {
-                    w_long_get_value(b)
-                } else {
-                    b_owned = BigInt::from(int_value(b));
-                    &b_owned
-                };
-                let r = bigint_truediv(va, vb)?;
-                return Ok(w_float_new(r));
+            if is_int_or_long(a) && is_int_or_long(b) {
+                return long_truediv(a, b);
             }
-            return Ok(w_float_new(as_float(a) / as_float(b)));
         }
         if is_complex_pair(a, b) {
             return complex_truediv(a, b);
@@ -5830,8 +5973,12 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // The machine-int arm stands alone so that this function has no loop:
     // the codewriter looks inside a loop-free graph only
     // (`policy.py look_inside_graph`), and a traced `int < int` must reach
-    // `int_lt` through here.  Every other layout's comparison, several of
-    // which iterate, lives in [`compare_slot_rest`], a residual on the trace.
+    // `int_lt` through here.  Exact float/float is the same shape
+    // (`_float_lt` after `_to_float`) and must live here too, or the
+    // leaf is only reachable from [`compare_slot_rest`] and never
+    // becomes a jitcode.  Every other layout's comparison, several of
+    // which iterate, lives in [`compare_slot_rest`], a residual on the
+    // trace.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -5841,6 +5988,18 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ge => int_ge(a, b),
                 CompareOp::Eq => int_eq(a, b),
                 CompareOp::Ne => int_ne(a, b),
+            };
+        }
+        if is_float(a) && is_float(b) {
+            let x = w_float_get_value(a);
+            let y = w_float_get_value(b);
+            return match op {
+                CompareOp::Lt => _float_lt(x, y),
+                CompareOp::Le => _float_le(x, y),
+                CompareOp::Gt => _float_gt(x, y),
+                CompareOp::Ge => _float_ge(x, y),
+                CompareOp::Eq => _float_eq(x, y),
+                CompareOp::Ne => _float_ne(x, y),
             };
         }
     }
@@ -5906,6 +6065,9 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             }));
         }
         if is_float_pair(a, b) {
+            // Exact float/float already returned from [`compare_slot`].
+            // Mixed int/long keeps `float_compare` for the mantissa / bigint
+            // arm (`int_between(-1, i2 >> 48, 1)`).
             // `_compare` is a method on the float operand; the int-left order
             // reaches it through the reflected comparison, with the relation
             // reversed.
@@ -6424,7 +6586,7 @@ pub fn pos_inner(a: PyObjectRef) -> PyResult {
             ));
         }
         if is_float(a) {
-            return Ok(w_float_new(w_float_get_value(a)));
+            return _float_pos(w_float_get_value(a));
         }
         if is_complex(a) {
             let (ar, ai) = complex_val(a).unwrap();
@@ -6453,6 +6615,132 @@ fn bad_operand_type(descr: &str, a: PyObjectRef) -> PyError {
         crate::baseobjspace::object_functionstr_type_name(a)
     };
     PyError::type_error(format!("bad operand type for {descr}: '{type_name}'"))
+}
+
+/// intobject.py `descr_neg` after `ovfcheck(-a)`: `wrapint(-a)`.
+/// `INT_MIN` stays in [`neg_inner`]'s ovf2long arm so this graph has
+/// no overflow diamond.
+#[inline(never)]
+pub(crate) fn _int_neg(x: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        // `0 - x`, not `wrapping_neg`: Charon leaves the rustc intrinsic
+        // as `residual_call_ir_i`, while subtraction is `int_sub`.
+        intval: 0i64.wrapping_sub(x),
+    }) as PyObjectRef)
+}
+
+/// floatobject.py `descr_pos`: `W_FloatObject(self.floatval)`.
+#[inline(never)]
+pub(crate) fn _float_pos(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `sqrt_nonneg` after the domain pin: `W_FloatObject(sqrt(x))`.
+#[inline(never)]
+pub(crate) fn _float_sqrt(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.sqrt(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_sin` after the finite pin: `W_FloatObject(sin(x))`.
+#[inline(never)]
+pub(crate) fn _float_sin(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.sin(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_cos` after the finite pin: `W_FloatObject(cos(x))`.
+#[inline(never)]
+pub(crate) fn _float_cos(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.cos(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_tan` after the finite pin: `W_FloatObject(tan(x))`.
+#[inline(never)]
+pub(crate) fn _float_tan(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.tan(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
+#[inline(never)]
+pub(crate) fn _float_abs(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.abs(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// intobject.py `descr_abs` after `ovfcheck(abs(a))`.
+#[inline(never)]
+pub(crate) fn _int_abs(x: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: if x < 0 { 0i64.wrapping_sub(x) } else { x },
+    }) as PyObjectRef)
+}
+
+/// floatobject.py `descr_neg`: `W_FloatObject(-self.floatval)`.
+#[inline(never)]
+pub(crate) fn _float_neg(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: -x,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
 }
 
 /// Unary negation.
@@ -6490,7 +6778,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
             return match v.checked_neg() {
-                Some(r) => Ok(w_int_new(r)),
+                Some(_) => _int_neg(v),
                 None => Ok(pyre_object::longobject::w_long_new_fresh_rbigint_handle(
                     bigint_neg(&BigInt::from(v)),
                 )),
@@ -6502,7 +6790,7 @@ pub fn neg_inner(a: PyObjectRef) -> PyResult {
             ));
         }
         if is_float(a) {
-            return Ok(w_float_new(-w_float_get_value(a)));
+            return _float_neg(w_float_get_value(a));
         }
         if is_complex(a) {
             return complex_neg(a);
@@ -6572,10 +6860,22 @@ pub fn invert(a: PyObjectRef) -> PyResult {
 /// alone.  Every other caller reaches this through [`invert`] and is
 /// unaffected, except `int.__invert__`, which names this body directly
 /// because an unbound slot must not dispatch.
+/// intobject.py `descr_invert`: `wrapint(~self.intval)`.
+#[inline(never)]
+pub(crate) fn _int_invert(x: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: !x,
+    }) as PyObjectRef)
+}
+
 pub fn invert_inner(a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) {
-            return Ok(w_int_new(!int_value(a)));
+            return _int_invert(int_value(a));
         }
         if is_long(a) {
             return Ok(w_long_new(bigint_invert(w_long_get_value(a))));
@@ -7003,6 +7303,22 @@ mod tests {
         let result = truediv_builtin(w_int_new(63_050_394_783_186_940), w_int_new(7)).unwrap();
         unsafe {
             assert_eq!(w_float_get_value(result), 9_007_199_254_740_991.0);
+        }
+    }
+
+    #[test]
+    fn test_int_truediv_leaf_matches_truediv_for_exact_machine_ints() {
+        // intobject.py `_truediv`: both operands fit the binary64 mantissa,
+        // so the leaf is `newfloat(float(x)/float(y))`.
+        unsafe {
+            let direct = int_truediv(w_int_new(7), w_int_new(2)).unwrap();
+            let leaf = _truediv(7, 2).unwrap();
+            let via_builtin = truediv_builtin(w_int_new(7), w_int_new(2)).unwrap();
+            assert_eq!(w_float_get_value(direct), 3.5);
+            assert_eq!(w_float_get_value(leaf), 3.5);
+            assert_eq!(w_float_get_value(via_builtin), 3.5);
+            assert!(int_truediv(w_int_new(1), w_int_new(0)).is_err());
+            assert!(_truediv(1, 0).is_err());
         }
     }
 
