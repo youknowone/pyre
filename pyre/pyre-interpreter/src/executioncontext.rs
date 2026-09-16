@@ -698,6 +698,14 @@ pub fn execution_context_builtin_cache_get(ec: &ExecutionContext) -> PyObjectRef
 /// GETFIELD_GC/SETFIELD_GC lowering of PUSH_EXC_INFO / POP_EXCEPT.
 pub const EC_SYS_EXC_VALUE_OFFSET: usize = std::mem::offset_of!(ExecutionContext, sys_exc_value);
 
+/// Byte offset of `current_gen_or_coroutine` within `ExecutionContext`, for
+/// the JIT lowering of `executioncontext.py sys_exc_info`'s empty-slot arm:
+/// when `sys_exc_operror` is None the function still has to prove the
+/// generator chain is empty before answering None, otherwise it walks
+/// `_get_topmost_exception`.
+pub const EC_CURRENT_GEN_OR_COROUTINE_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, current_gen_or_coroutine);
+
 /// Byte offset of `topframeref` within `ExecutionContext`, for the JIT's
 /// GETFIELD_GC/SETFIELD_GC lowering of [`ExecutionContext::enter`] /
 /// [`ExecutionContext::leave`] at an inlined call.  The traced sequence is

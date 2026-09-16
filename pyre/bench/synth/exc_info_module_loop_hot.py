@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=8
+# pyre-check: spec-folds=sys_exc_info,compare_op_tuple
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame

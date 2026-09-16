@@ -14955,24 +14955,21 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
 
 // ── the generated `math` float folds ──────────────────────────────────
 //
-/// Lower PyPy's `sys.exc_info()` direct path at pyre's generated `CallFn`
-/// boundary.
+/// Lower PyPy's `sys.exc_info()` at pyre's generated `CallFn` boundary.
 ///
 /// Upstream `function.py funccall_valuestack` recognizes
-/// `space._code_of_sys_exc_info`, passes the live frame to
-/// `vm.py exc_info_direct`, and the latter omits traceback slot 2 when the
-/// following bytecode can only observe slots 0/1. Pyre's source-generated
-/// Python CALL is already represented as `bh_call_fn` by the time the
-/// full-body walker sees it, so this is the equivalent seam: pin the exact
-/// BuiltinCode, ask the same look-ahead question using this MIFrame's own red
-/// frame and coordinate, read the handled exception from the live EC red, and
-/// build the same three-item tuple as a virtual aggregate.
+/// `space._code_of_sys_exc_info` and calls `vm.py exc_info_direct`. That
+/// helper still looks inside `exc_info_with_tb` when the following bytecode
+/// can observe traceback slot 2 — it only *omits* the traceback on the
+/// proven `exc_info()[0]` / `[:2]` shapes. A null `sys_exc_operror` is
+/// `executioncontext.py sys_exc_info`: if `current_gen_or_coroutine` is
+/// also None the answer is `(None, None, None)`; a live generator chain
+/// walks `_get_topmost_exception` and stays residual because that graph
+/// contains a loop.
 ///
-/// Only the non-null direct-slot arm is admitted. A null slot may fall through
-/// to `ExecutionContext._get_topmost_exception` via the running generator
-/// chain; keeping that case residual avoids replacing dynamic EC state with
-/// the recording answer. Forms which can observe traceback slot 2 also remain
-/// on the regular wrapper, exactly as `exc_info_direct` requests.
+/// The walker fold uses the same `ec_sys_exc_value_descr` Arc as
+/// PUSH_EXC_INFO / POP_EXCEPT so a handler restore forwards through the
+/// heapcache instead of re-reading a second identity.
 pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -15019,36 +15016,101 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     else {
         decline!("no executing Python coordinate for red frame");
     };
-    if pyre_interpreter::module::sys::vm::exc_info_result_needs_traceback_for_call(
-        unsafe { &*frame },
-        call_py_pc as usize,
-    ) {
-        decline!("bytecode look-ahead requires traceback");
-    }
+    let include_traceback =
+        pyre_interpreter::module::sys::vm::exc_info_result_needs_traceback_for_call(
+            unsafe { &*frame },
+            call_py_pc as usize,
+        );
 
     let concrete_exc = pyre_interpreter::eval::get_current_exception();
-    if concrete_exc.is_null() || unsafe { !pyre_object::is_exception(concrete_exc) } {
-        decline!("direct EC exception slot is null or not an exception");
+    let ec_live = pyre_interpreter::call::getexecutioncontext();
+    let concrete_gen = if ec_live.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*ec_live).current_gen_or_coroutine }
+    };
+    let slot_is_exception =
+        !concrete_exc.is_null() && unsafe { pyre_object::is_exception(concrete_exc) };
+    let gen_is_empty = concrete_gen.is_null() || unsafe { pyre_object::is_none(concrete_gen) };
+    if !slot_is_exception && !gen_is_empty {
+        // `sys_exc_info` walks `_get_topmost_exception` here. That graph
+        // contains a loop, so PyPy's JitPolicy leaves it residual.
+        decline!("generator chain may hide a parked exception");
     }
-    let concrete_class = pyre_interpreter::baseobjspace::exception_getclass(concrete_exc);
-    if concrete_class.is_null() || unsafe { (*concrete_exc).w_class } != concrete_class {
-        // `typedef::type` can obtain a registry class when the physical
-        // exception's w_class is still a generic stub. The direct field read
-        // below cannot reproduce that branch, so leave it to the wrapper.
-        decline!("exception_getclass is not the live w_class field");
+    if !slot_is_exception && !concrete_exc.is_null() {
+        decline!("direct EC exception slot is not an exception");
     }
-    let concrete_layout = unsafe { (*concrete_exc).ob_type } as *const _ as i64;
-    let concrete_tuple = pyre_object::w_tuple_new_array_backed(vec![
-        concrete_class,
-        concrete_exc,
-        pyre_object::w_none(),
-    ]);
-    if concrete_tuple.is_null() {
-        decline!("concrete three-tuple allocation failed");
-    }
+
     let Some(ec) = walker_ensure_execution_context(ctx) else {
         decline!("walk carries no EC red");
     };
+
+    let (concrete_class, kind, concrete_tb, concrete_tb_frame, concrete_tuple, concrete_layout) =
+        if slot_is_exception {
+            let concrete_class = pyre_interpreter::baseobjspace::exception_getclass(concrete_exc);
+            if concrete_class.is_null() || unsafe { (*concrete_exc).w_class } != concrete_class {
+                // `typedef::type` can obtain a registry class when the physical
+                // exception's w_class is still a generic stub. The direct field
+                // read below cannot reproduce that branch, so leave it to the
+                // wrapper.
+                decline!("exception_getclass is not the live w_class field");
+            }
+            let kind =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_kind(concrete_exc) };
+            let (concrete_tb, concrete_tb_frame) = if include_traceback {
+                let tb = unsafe {
+                    pyre_object::interp_exceptions::w_exception_get_traceback(concrete_exc)
+                };
+                if tb.is_null() || unsafe { pyre_object::is_none(tb) } {
+                    (pyre_object::w_none(), std::ptr::null_mut())
+                } else if unsafe { pyre_interpreter::pytraceback::is_pytraceback(tb) } {
+                    let frame =
+                        unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(tb) };
+                    if frame.is_null() {
+                        decline!("traceback fold has no frame");
+                    }
+                    (tb, frame)
+                } else {
+                    decline!("traceback slot is not a PyTraceback");
+                }
+            } else {
+                (pyre_object::w_none(), std::ptr::null_mut())
+            };
+            let concrete_tuple = pyre_object::w_tuple_new_array_backed(vec![
+                concrete_class,
+                concrete_exc,
+                concrete_tb,
+            ]);
+            if concrete_tuple.is_null() {
+                decline!("concrete three-tuple allocation failed");
+            }
+            let concrete_layout = unsafe { (*concrete_exc).ob_type } as *const _ as i64;
+            (
+                concrete_class,
+                Some(kind),
+                concrete_tb,
+                concrete_tb_frame,
+                concrete_tuple,
+                concrete_layout,
+            )
+        } else {
+            let concrete_tuple = pyre_object::w_tuple_new_array_backed(vec![
+                pyre_object::w_none(),
+                pyre_object::w_none(),
+                pyre_object::w_none(),
+            ]);
+            if concrete_tuple.is_null() {
+                decline!("concrete none-tuple allocation failed");
+            }
+            (
+                std::ptr::null_mut(),
+                None,
+                pyre_object::w_none(),
+                std::ptr::null_mut(),
+                concrete_tuple,
+                0,
+            )
+        };
 
     // --- commit: no declines below this point ---
     let callable_op = r_args[0];
@@ -15074,6 +15136,34 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         exc,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_exc as usize)),
     );
+
+    if !slot_is_exception {
+        // `exc_info_with_tb` / `sys_exc_info` empty arm: both the handled
+        // exception and the generator head are None.
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[exc])?;
+        let null_const = ctx.trace_ctx.const_ref(0);
+        ctx.trace_ctx.replace_box(exc, null_const);
+        let gen_head = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[ec],
+            crate::descr::ec_current_gen_or_coroutine_descr(),
+        );
+        ctx.trace_ctx.set_opref_concrete(
+            gen_head,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_gen as usize)),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[gen_head])?;
+        ctx.trace_ctx.replace_box(gen_head, null_const);
+        let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[none, none, none]);
+        ctx.trace_ctx.set_opref_concrete(
+            tuple,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
+        );
+        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', tuple)?;
+        return Ok(Some(()));
+    }
+
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[exc])?;
     walker_guard_class(ctx, op.pc, exc, concrete_layout)?;
 
@@ -15089,8 +15179,52 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         OpCode::GuardValue,
         &[exc_class, expected_class],
     )?;
-    let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
-    let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[exc_class, exc, none]);
+    let tb_op = if include_traceback && !unsafe { pyre_object::is_none(concrete_tb) } {
+        let raw_tb = walker_record_getfield_gc_r_uncached(
+            ctx,
+            exc,
+            crate::descr::w_exception_traceback_descr(kind.expect("handled exception has a kind")),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw_tb])?;
+        ctx.trace_ctx.set_opref_concrete(
+            raw_tb,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_tb as usize)),
+        );
+        // `error.py OperationError.get_traceback` marks the node's frame
+        // escaped so `ExecutionContext.leave` forces its vref. The bit has
+        // to be set by the compiled loop, not only on this walk.
+        let frame_ref = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            raw_tb,
+            crate::descr::pytraceback_frame_descr(),
+        );
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[frame_ref])?;
+        ctx.trace_ctx.set_opref_concrete(
+            frame_ref,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_tb_frame as usize)),
+        );
+        let flags_descr = crate::descr::pyframe_flags_descr();
+        let live_flags =
+            crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame_ref, flags_descr.clone());
+        let escaped_bit = ctx
+            .trace_ctx
+            .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
+        let new_flags = ctx
+            .trace_ctx
+            .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[frame_ref, new_flags],
+            flags_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(frame_ref, flags_descr.index(), new_flags);
+        unsafe { pyre_interpreter::pytraceback::mark_traceback_escaped(concrete_tb) };
+        raw_tb
+    } else {
+        ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
+    };
+    let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[exc_class, exc, tb_op]);
     ctx.trace_ctx.set_opref_concrete(
         tuple,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
@@ -23297,6 +23431,257 @@ pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
     Ok(Some(()))
+}
+
+/// `tupleobject.py W_TupleObject._descr_eq` under
+/// `@jit.look_inside_iff(_unroll_condition_cmp)`: two exact array-backed
+/// tuples whose length is at most `UNROLL_CUTOFF` compare by unrolling
+/// `space.eq_w` on each item.  Only items whose interp-level `eq` cannot
+/// call Python (None / exact int / exact bool) are admitted, so a mid-fold
+/// decline cannot have run user code.  Any other shape stays residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_compare_op_tuple<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    const UNROLL_CUTOFF: usize = 10;
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
+        return Ok(None);
+    }
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::ComparisonOperator;
+    let negate = match cmp_op {
+        ComparisonOperator::Equal => false,
+        ComparisonOperator::NotEqual => true,
+        _ => return Ok(None),
+    };
+    let Some(lhs) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let Some(rhs) = walker_concrete_ref_object(ctx, r_args[1]) else {
+        return Ok(None);
+    };
+    let lhs_is_tuple = unsafe {
+        pyre_object::is_exact_type(lhs, &pyre_object::TUPLE_TYPE)
+            && pyre_object::is_exact_builtin_instance(lhs)
+    };
+    let rhs_is_tuple = unsafe {
+        pyre_object::is_exact_type(rhs, &pyre_object::TUPLE_TYPE)
+            && pyre_object::is_exact_builtin_instance(rhs)
+    };
+    if !lhs_is_tuple || !rhs_is_tuple {
+        return Ok(None);
+    }
+    let lhs_len = unsafe { pyre_object::w_tuple_len(lhs) };
+    let rhs_len = unsafe { pyre_object::w_tuple_len(rhs) };
+    if lhs_len > UNROLL_CUTOFF && rhs_len > UNROLL_CUTOFF {
+        return Ok(None);
+    }
+    let mut item_pairs: Vec<(
+        pyre_object::PyObjectRef,
+        pyre_object::PyObjectRef,
+        TupleItemEq,
+    )> = Vec::new();
+    if lhs_len == rhs_len {
+        for index in 0..lhs_len {
+            let Some(left_item) = (unsafe { pyre_object::w_tuple_getitem(lhs, index as i64) })
+            else {
+                return Ok(None);
+            };
+            let Some(right_item) = (unsafe { pyre_object::w_tuple_getitem(rhs, index as i64) })
+            else {
+                return Ok(None);
+            };
+            let Some(kind) = tuple_item_eq_kind(left_item, right_item) else {
+                return Ok(None);
+            };
+            item_pairs.push((left_item, right_item, kind));
+        }
+    }
+
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
+    let expected = (lhs_len == rhs_len)
+        && item_pairs.iter().all(|(_, _, kind)| match kind {
+            TupleItemEq::None => true,
+            TupleItemEq::Int(a, b) => a == b,
+        });
+    let expected = if negate { !expected } else { expected };
+    let agrees = !boxed_result.is_null()
+        && unsafe { pyre_object::is_bool(boxed_result) }
+        && unsafe { pyre_object::w_bool_get_value(boxed_result) } == expected;
+    if !agrees {
+        return Ok(None);
+    }
+
+    let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
+    let tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
+    walker_guard_class(ctx, op_pc, r_args[0], tuple_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], tuple_class)?;
+    walker_guard_class(ctx, op_pc, r_args[1], tuple_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[1], tuple_class)?;
+
+    let lhs_items = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        r_args[0],
+        crate::descr::tuple_wrappeditems_descr(),
+    );
+    let rhs_items = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        r_args[1],
+        crate::descr::tuple_wrappeditems_descr(),
+    );
+    let lhs_lenbox = crate::state::opimpl_arraylen_gc(
+        ctx.trace_ctx,
+        lhs_items,
+        crate::state::pyobject_gcarray_descr(),
+    );
+    let rhs_lenbox = crate::state::opimpl_arraylen_gc(
+        ctx.trace_ctx,
+        rhs_items,
+        crate::state::pyobject_gcarray_descr(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(lhs_lenbox, majit_ir::Value::Int(lhs_len as i64));
+    ctx.trace_ctx
+        .set_opref_concrete(rhs_lenbox, majit_ir::Value::Int(rhs_len as i64));
+    let lhs_len_const = ctx.trace_ctx.const_int(lhs_len as i64);
+    let rhs_len_const = ctx.trace_ctx.const_int(rhs_len as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[lhs_lenbox, lhs_len_const],
+    )?;
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardValue,
+        &[rhs_lenbox, rhs_len_const],
+    )?;
+
+    let mut truth = ctx.trace_ctx.const_int(i64::from(lhs_len == rhs_len));
+    if lhs_len == rhs_len {
+        for (index, (left_item, right_item, kind)) in item_pairs.iter().enumerate() {
+            let left_op = crate::state::trace_items_block_getitem_value_pure(
+                ctx.trace_ctx,
+                lhs_items,
+                OpRef::ConstInt(index as i64),
+            );
+            let right_op = crate::state::trace_items_block_getitem_value_pure(
+                ctx.trace_ctx,
+                rhs_items,
+                OpRef::ConstInt(index as i64),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                left_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(*left_item as usize)),
+            );
+            ctx.trace_ctx.set_opref_concrete(
+                right_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(*right_item as usize)),
+            );
+            let item_eq = match kind {
+                TupleItemEq::None => {
+                    let eq = ctx.trace_ctx.record_op(OpCode::PtrEq, &[left_op, right_op]);
+                    ctx.trace_ctx
+                        .set_opref_concrete(eq, majit_ir::Value::Int(1));
+                    eq
+                }
+                TupleItemEq::Int(left_i, right_i) => {
+                    let (left_type, left_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(*left_item);
+                    let (right_type, right_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(*right_item);
+                    let left_raw = walker_unbox_int_exact(
+                        ctx,
+                        op_pc,
+                        left_op,
+                        left_type,
+                        left_descr,
+                        walker_numeric_builtin_class(*left_item),
+                    )?;
+                    let right_raw = walker_unbox_int_exact(
+                        ctx,
+                        op_pc,
+                        right_op,
+                        right_type,
+                        right_descr,
+                        walker_numeric_builtin_class(*right_item),
+                    )?;
+                    let eq = ctx
+                        .trace_ctx
+                        .record_op(OpCode::IntEq, &[left_raw, right_raw]);
+                    ctx.trace_ctx.set_opref_concrete(
+                        eq,
+                        majit_ir::Value::Int(i64::from(*left_i == *right_i)),
+                    );
+                    eq
+                }
+            };
+            truth = ctx.trace_ctx.record_op(OpCode::IntAnd, &[truth, item_eq]);
+        }
+    }
+    if negate {
+        let zero = ctx.trace_ctx.const_int(0);
+        truth = ctx.trace_ctx.record_op(OpCode::IntEq, &[truth, zero]);
+    }
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(i64::from(expected)));
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, expected, dst_bank)? {
+        Some(boxed) => boxed,
+        None => {
+            let boxed =
+                crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+            );
+            boxed
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+enum TupleItemEq {
+    None,
+    Int(i64, i64),
+}
+
+fn tuple_item_eq_kind(
+    left: pyre_object::PyObjectRef,
+    right: pyre_object::PyObjectRef,
+) -> Option<TupleItemEq> {
+    let left_none = unsafe { pyre_object::is_none(left) };
+    let right_none = unsafe { pyre_object::is_none(right) };
+    if left_none && right_none {
+        return Some(TupleItemEq::None);
+    }
+    let left_int = unsafe {
+        pyre_object::is_exact_builtin_instance(left)
+            && (pyre_object::is_int(left) || pyre_object::is_bool(left))
+    };
+    let right_int = unsafe {
+        pyre_object::is_exact_builtin_instance(right)
+            && (pyre_object::is_int(right) || pyre_object::is_bool(right))
+    };
+    if left_int && right_int {
+        let left_i = unsafe { pyre_object::w_int_get_value(left) };
+        let right_i = unsafe { pyre_object::w_int_get_value(right) };
+        return Some(TupleItemEq::Int(left_i, right_i));
+    }
+    None
 }
 
 /// Walker-native specialization for `str + str`, the concatenation arm of the

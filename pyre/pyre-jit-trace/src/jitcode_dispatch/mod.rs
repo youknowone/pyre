@@ -5688,21 +5688,6 @@ fn funcptr_concrete_int<Sym: WalkSym>(
     }
 }
 
-fn walk_body_has_exception_handler<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    code: &[u8],
-) -> bool {
-    let jitcode_index = if ctx.is_top_level {
-        ctx.session.borrow().recording_jitcode_index
-    } else {
-        ctx.inline_callee_consts
-            .map_or(-1, |consts| consts.jitcode_index)
-    };
-    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
-        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
-    })
-}
-
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port for residual calls
 /// not completed by [`try_fold_pure_call_via_executor`].  That fast path
 /// handles cannot-raise elidable calls; can-raise elidable calls continue here

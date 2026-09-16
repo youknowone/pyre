@@ -449,6 +449,7 @@ spec_folds! {
     CompareOpLong        => ("compare_op_long",          "residual_call", "-"),
     CompareOpFloat       => ("compare_op_float",         "residual_call", "-"),
     CompareOpStr         => ("compare_op_str",           "residual_call", "-"),
+    CompareOpTuple       => ("compare_op_tuple",         "residual_call", "-"),
     Unpack               => ("unpack",                   "residual_call", "-"),
     SubscrTupleDescent   => ("subscr_tuple_descent",     "specialize",    "subscr"),
     SubscrTuple          => ("subscr_tuple",             "specialize",    "subscr"),
