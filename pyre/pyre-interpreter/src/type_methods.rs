@@ -816,11 +816,21 @@ pub fn list_method_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             return Ok(clone);
         }
         let n = w_list_len(list);
-        let mut items = Vec::with_capacity(n);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let list_slot = pyre_object::gc_roots::pin_roots(&[list]);
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut fetched = 0usize;
         for i in 0..n {
-            if let Some(item) = w_list_getitem(list, i as i64) {
-                items.push(item);
+            if let Some(item) =
+                w_list_getitem(pyre_object::gc_roots::shadow_stack_get(list_slot), i as i64)
+            {
+                let _ = pyre_object::gc_roots::pin_root(item);
+                fetched += 1;
             }
+        }
+        let mut items = Vec::with_capacity(fetched);
+        for i in 0..fetched {
+            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
         }
         Ok(w_list_new(items))
     }
@@ -971,26 +981,43 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let sep = unsafe { pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }
         .to_wtf8_buf();
-    let iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let items: Vec<PyObjectRef> = unsafe {
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    let n_items = unsafe {
+        let iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if is_list(iterable) {
             let n = w_list_len(iterable);
-            (0..n)
-                .filter_map(|i| w_list_getitem(iterable, i as i64))
-                .collect()
+            let mut fetched = 0usize;
+            for i in 0..n {
+                if let Some(item) =
+                    w_list_getitem(pyre_object::gc_roots::shadow_stack_get(base + 1), i as i64)
+                {
+                    let _ = pyre_object::gc_roots::pin_root(item);
+                    fetched += 1;
+                }
+            }
+            fetched
         } else if is_tuple(iterable) {
             let n = w_tuple_len(iterable);
-            (0..n)
-                .filter_map(|i| w_tuple_getitem(iterable, i as i64))
-                .collect()
+            let mut fetched = 0usize;
+            for i in 0..n {
+                if let Some(item) =
+                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(base + 1), i as i64)
+                {
+                    let _ = pyre_object::gc_roots::pin_root(item);
+                    fetched += 1;
+                }
+            }
+            fetched
         } else {
             // `PySequence_Fast(seq, "can only join an iterable")` — the
             // separator's own error, not the iteration protocol's.
-            crate::builtins::sequence_fast(iterable, "can only join an iterable")?
+            let items = crate::builtins::sequence_fast(iterable, "can only join an iterable")?;
+            for item in &items {
+                let _ = pyre_object::gc_roots::pin_root(*item);
+            }
+            items.len()
         }
     };
-    let items_base = pyre_object::gc_roots::publish_roots(&items);
-    pyre_object::gc_roots::normalize_roots(items_base, items.len());
     let item = |i: usize| pyre_object::gc_roots::shadow_stack_get(items_base + i);
     // pypy/objspace/std/unicodeobject.py descr_join — each
     // element must be a str; otherwise TypeError("sequence item N:
@@ -999,7 +1026,7 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     //
     // A single-element join returns that element (unicode_result_unchanged):
     // an exact str unchanged, a str subclass copied to a base str.
-    if items.len() == 1 {
+    if n_items == 1 {
         let item = item(0);
         if unsafe { !is_str(item) } {
             return Err(crate::PyError::type_error(format!(
@@ -1009,7 +1036,7 @@ pub fn str_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
         return Ok(str_result_unchanged(item));
     }
-    let reloaded: Vec<_> = (0..items.len()).map(item).collect();
+    let reloaded: Vec<_> = (0..n_items).map(item).collect();
     str_join_many_items(&sep, &reloaded)
 }
 

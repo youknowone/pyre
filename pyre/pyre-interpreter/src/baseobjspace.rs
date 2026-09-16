@@ -2246,15 +2246,26 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // delegating to IntegerListStrategy, even though slicing is otherwise
         // a read-only operation.
         obj = pyre_object::listobject::w_list_materialize_range(obj);
-        let mut items = Vec::new();
+        // Boxing a Range/Integer/Float element allocates, and so does
+        // `w_list_new`, so pin the receiver and each fetched item on one
+        // bracket before the constructor.
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut fetched = 0usize;
         let mut i = start;
         for n in 0..slicelength {
-            if let Some(v) = w_list_getitem(obj, i) {
-                items.push(v);
+            if let Some(v) = w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
+                let _ = pyre_object::gc_roots::pin_root(v);
+                fetched += 1;
             }
             if n + 1 < slicelength {
                 i += step;
             }
+        }
+        let mut items = Vec::with_capacity(fetched);
+        for j in 0..fetched {
+            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
         }
         return Ok(w_list_new(items));
     }
@@ -2330,15 +2341,23 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        let mut items = Vec::new();
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut fetched = 0usize;
         let mut i = start;
         for n in 0..slicelength {
-            if let Some(v) = w_tuple_getitem(obj, i) {
-                items.push(v);
+            if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
+                let _ = pyre_object::gc_roots::pin_root(v);
+                fetched += 1;
             }
             if n + 1 < slicelength {
                 i += step;
             }
+        }
+        let mut items = Vec::with_capacity(fetched);
+        for j in 0..fetched {
+            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
         }
         return Ok(w_tuple_new(items));
     }

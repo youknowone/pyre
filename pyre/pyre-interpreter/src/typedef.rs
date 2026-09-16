@@ -8830,12 +8830,16 @@ fn init_pytraceback_type(ns: PyObjectRef) {
                         false,
                     )?;
                     crate::type_methods::arity_slot(args, 0)?;
-                    Ok(pyre_object::w_list_new(vec![
-                        pyre_object::w_str_new("tb_frame"),
-                        pyre_object::w_str_new("tb_next"),
-                        pyre_object::w_str_new("tb_lasti"),
-                        pyre_object::w_str_new("tb_lineno"),
-                    ]))
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let names_base = pyre_object::gc_roots::shadow_stack_len();
+                    for name in ["tb_frame", "tb_next", "tb_lasti", "tb_lineno"] {
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(name));
+                    }
+                    Ok(pyre_object::w_list_new(
+                        (0..4)
+                            .map(|i| pyre_object::gc_roots::shadow_stack_get(names_base + i))
+                            .collect(),
+                    ))
                 },
                 1,
             ),

@@ -1247,9 +1247,16 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.tolist")?;
     let obj = args[0];
     let len = unsafe { arr::w_array_len(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..len {
+        let item = array_w_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i, false)?;
+        let _ = pyre_object::gc_roots::pin_root(item);
+    }
     let mut items = Vec::with_capacity(len);
     for i in 0..len {
-        items.push(array_w_getitem(obj, i, false)?);
+        items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
     Ok(pyre_object::w_list_new(items))
 }
