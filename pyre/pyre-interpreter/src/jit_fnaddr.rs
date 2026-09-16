@@ -1745,6 +1745,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::publish_roots",
         pyre_object::gc_roots::publish_roots_jit_abi,
     );
+    // `box_str_constant(&Wtf8)` is two words; the MethodCache key is the
+    // interned str the word-ABI intern returns.
+    cpa2(
+        &mut entries,
+        "pyre_object::unicodeobject::box_str_constant_jit_abi",
+        "pyre_object::box_str_constant_jit_abi",
+        pyre_object::unicodeobject::box_str_constant_jit_abi,
+    );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its
