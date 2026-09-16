@@ -1,5 +1,9 @@
 # pyre-check: max-pypy-ratio=44
 # pyre-check: max-wasm-ratio=5.7
+# Two function-entry comprehension loops (`single_comp`, `pair_comp`); each
+# virtualizes an inner list whose backing is NewArray/NewArrayClear. wasm
+# compiles each as its own module. #1823 fitted 5.7; the topology pin stays
+# so the allowance cannot hide over-tracing.
 # An inlined list comprehension whose LIST_APPEND element is a non-empty nested
 # list (`[[i] …]` / `[[i, i + 1] …]`). The #171 fold virtualizes the inner list,
 # whose separately allocated backing block (NewArray / NewArrayClear) carries no

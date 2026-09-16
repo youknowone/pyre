@@ -30,8 +30,9 @@ use super::*;
 /// A callee that raises inline is capped separately — at TWO multiframe levels,
 /// keyed off `callee_body_contains_raise` — because its unwind crosses the
 /// suspended intermediate frame through the cross-frame bridge (gh#343 /
-/// gh#467); a third level regresses.  See the measurement beside
-/// `effective_multiframe_depth` in `inline_call.rs`.
+/// gh#467).  A third level abort_trace's `exception_try_call_inlined_callee_raise`
+/// and storms `selfrec_tail_exception_unwind`; see
+/// [`fbw_effective_multiframe_depth`].
 ///
 /// A self-recursive callee is bounded instead by
 /// [`fbw_inline_recursion_count`] against `max_unroll_recursion`, mirroring
@@ -110,6 +111,25 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
     frames.iter().any(|frame| frame.w_code == w_code)
 }
 
+/// True when two live frames share a `w_code`.  Inlining a raising leaf
+/// through two suspended copies of the same intermediate is the
+/// `selfrec_tail_exception_unwind` storm.  A distinct `shape → mid → leaf`
+/// chain is a different failure (`exception_try_call_inlined_callee_raise`
+/// abort_trace) that currently shares the same depth-2 bound.
+pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
+    let mut seen = Vec::with_capacity(frames.len());
+    for frame in frames {
+        if frame.w_code == 0 {
+            continue;
+        }
+        if seen.contains(&frame.w_code) {
+            return true;
+        }
+        seen.push(frame.w_code);
+    }
+    false
+}
+
 /// Total inline-stack bound for a callee after its same-greenkey recursion
 /// count has already been checked against the live `max_unroll_recursion`.
 ///
@@ -118,15 +138,29 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
 /// is the sole value-returning recursion bound.  FBW's generic multiframe cap
 /// is a local cost valve for non-recursive call chains and must not silently
 /// turn an upstream value of 7 into an effective 6 when an ambient inline
-/// frame is present.  Raising chains retain their separate depth-two safety
-/// bound because their carrier unwind crosses suspended frames.
+/// frame is present.
+///
+/// Raising chains keep a shallower local bound because the carrier unwind
+/// crosses suspended frames.  `perform_call` (`pyjitpl.py`) has no such cap:
+/// it always pushes a new `MIFrame`.  A third inlined raising frame is still
+/// blocked here — `b3efabbc8ed` measured `exception_try_call_inlined_callee_raise`
+/// going 3/1/0 → 2/0/3 (three exception-edge bridges abort_trace), and a
+/// third copy of the same `w_code` storms `selfrec_tail_exception_unwind`
+/// (`guard_failures` 937 → 7408).  The second flag is therefore ignored on
+/// the raising path: both the distinct `shape → mid → leaf` chain and the
+/// selfrec storm fail at depth 3.
+///
+/// Convergence: exception-edge bridges for a three-frame raising chain must
+/// compile the way `perform_call` + `finishframe_exception` do.  Until
+/// `exception_try_call_inlined_callee_raise` stays at 3/1/0 (or better) with
+/// this function returning 3, the local bound stays.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
-    recursive_portal_present: bool,
+    recursive_or_duplicate: bool,
 ) -> usize {
     if contains_raise {
         2
-    } else if recursive_portal_present {
+    } else if recursive_or_duplicate {
         usize::MAX
     } else {
         fbw_max_multiframe_depth()
@@ -165,6 +199,21 @@ mod recursion_depth_policy_tests {
     #[test]
     fn raising_recursion_keeps_the_carrier_unwind_safety_bound() {
         assert_eq!(fbw_effective_multiframe_depth(true, true), 2);
+    }
+
+    #[test]
+    fn non_recursive_raising_keeps_the_carrier_unwind_safety_bound() {
+        assert_eq!(fbw_effective_multiframe_depth(true, false), 2);
+    }
+
+    #[test]
+    fn duplicate_w_code_on_stack_is_the_selfrec_unroll_shape() {
+        let frames = [frame(7, true), frame(7, true), frame(9, false)];
+        assert!(framestack_has_duplicate_w_code(&frames));
+        assert!(!framestack_has_duplicate_w_code(&[
+            frame(7, true),
+            frame(9, false)
+        ]));
     }
 }
 

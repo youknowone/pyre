@@ -170,13 +170,6 @@ pub struct MIFrame {
     pub parent_snapshot: i64,
     /// pyjitpl.py `self.unroll_iterations = 1`.
     pub unroll_iterations: usize,
-    /// Merge-point Ref reds and the InputArg they were seeded with.
-    ///
-    /// The reserved colour can be overwritten in the walker register
-    /// file (a later store reuses the slot). Snapshots must still name
-    /// the original InputArg so resume dumps a live box, not
-    /// `ConstPtr` of this eval's stack address.
-    pub portal_red_refs: Vec<(u16, OpRef)>,
 }
 
 impl MIFrame {
@@ -226,24 +219,6 @@ impl MIFrame {
             pushed_box: None,
             parent_snapshot: -1,
             unroll_iterations: 1,
-            portal_red_refs: Vec::new(),
-        }
-    }
-
-    /// Entry InputArg still living in this Ref register, if the portal
-    /// seeded one and no later write retired it.
-    fn portal_red_ref_at(&self, idx: usize) -> Option<OpRef> {
-        let idx = u16::try_from(idx).ok()?;
-        self.portal_red_refs
-            .iter()
-            .find_map(|&(reg, opref)| (reg == idx).then_some(opref))
-    }
-
-    /// A later PUT/copy into this register is no longer the portal red
-    /// that was seeded there. Snapshot the live SSA, not the entry InputArg.
-    pub(crate) fn retire_portal_red_ref(&mut self, idx: usize) {
-        if let Ok(reg) = u16::try_from(idx) {
-            self.portal_red_refs.retain(|(r, _)| *r != reg);
         }
     }
 
@@ -353,7 +328,6 @@ impl MIFrame {
         self.pushed_box = None;
         self.parent_snapshot = -1;
         self.unroll_iterations = 1;
-        self.portal_red_refs.clear();
         if let Some(ctx) = ctx {
             self.copy_constants(ctx);
         }
@@ -637,7 +611,6 @@ impl MIFrame {
             let slot = num_regs_r + i;
             self.ref_regs[slot] = Some(ctx.const_ref(value));
             self.ref_values[slot] = Some(value);
-            self.retire_portal_red_ref(slot);
         }
         let num_regs_f = self.jitcode.c_num_regs_f as usize;
         for (i, &value) in self.jitcode.constants_f.iter().enumerate() {
@@ -671,7 +644,6 @@ impl MIFrame {
             self.ref_regs[i] = None;
             self.ref_values[i] = None;
         }
-        self.portal_red_refs.clear();
         self.pushed_box = None;
     }
 
@@ -740,7 +712,6 @@ impl MIFrame {
             JitArgKind::Ref => {
                 self.ref_regs[target_index] = Some(opref);
                 self.ref_values[target_index] = Some(concrete);
-                self.retire_portal_red_ref(target_index);
             }
             JitArgKind::Float => {
                 self.float_regs[target_index] = Some(opref);
@@ -844,7 +815,6 @@ impl MIFrame {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
-                        self.retire_portal_red_ref(index);
                         (None, None, None)
                     }
                     b'f' => {
@@ -877,7 +847,9 @@ impl MIFrame {
         };
 
         // pyjitpl.py:199 `assert ord(self.jitcode.code[pc]) == op_live`.
-        debug_assert_eq!(self.jitcode.code[pc], op_live);
+        // RPython's `assert` survives translation; a debug-only check
+        // lets release decode operand bytes as an `all_liveness` offset.
+        assert_eq!(self.jitcode.code[pc], op_live);
 
         // pyjitpl.py:202-207 — decode offset + per-type lengths.
         let mut offset = decode_offset(&self.jitcode.code, pc + 1);
@@ -940,19 +912,12 @@ impl MIFrame {
                     // pyjitpl.py:186-187 CONST_NULL clearing.
                     OpBox::ConstPtr(0)
                 } else if idx < num_regs_r {
-                    if let Some(portal) = self.portal_red_ref_at(idx) {
-                        register_to_box_ref(
-                            portal,
-                            self.ref_values[idx].unwrap_or(0),
-                            unique_to_box,
-                        )
-                    } else {
-                        let opref = self.ref_regs[idx]
-                            .expect("get_list_of_active_boxes: ref register uninitialized");
-                        let value = self.ref_values[idx]
-                            .expect("get_list_of_active_boxes: ref value uninitialized");
-                        register_to_box_ref(opref, value, unique_to_box)
-                    }
+                    // pyjitpl.py `add_box_to_storage(self.registers_r[index])`
+                    let opref = self.ref_regs[idx]
+                        .expect("get_list_of_active_boxes: ref register uninitialized");
+                    let value = self.ref_values[idx]
+                        .expect("get_list_of_active_boxes: ref value uninitialized");
+                    register_to_box_ref(opref, value, unique_to_box)
                 } else {
                     // pyjitpl.py `copy_constants(..., constants_r, ...,
                     // ConstPtrJitCode)` — constants_r store raw GC
@@ -1034,7 +999,6 @@ impl MIFrame {
                         let opref = OpRef::const_ptr(majit_ir::GcRef::NULL);
                         self.ref_regs[index] = Some(opref);
                         self.ref_values[index] = Some(0);
-                        self.retire_portal_red_ref(index);
                     }
                     b'f' => {
                         let opref = OpRef::const_float(0.0);
@@ -1061,7 +1025,8 @@ impl MIFrame {
         } else {
             self.pc - SIZE_LIVE_OP
         };
-        debug_assert_eq!(self.jitcode.code[pc], op_live);
+        // `get_list_of_active_boxes` asserts `code[pc] == op_live`.
+        assert_eq!(self.jitcode.code[pc], op_live);
 
         let mut offset = decode_offset(&self.jitcode.code, pc + 1);
         let length_i = all_liveness[offset] as u32;
@@ -1191,27 +1156,23 @@ impl MIFrame {
                 let tagged = if Some(idx) == clear_ref_idx {
                     SnapshotTagged::Const(0, Type::Ref)
                 } else if idx < num_regs_r {
-                    if let Some(portal) = self.portal_red_ref_at(idx) {
-                        SnapshotTagged::Box(portal, Type::Ref)
+                    let opref = self.ref_regs[idx].unwrap_or_else(|| panic!(
+                        "get_list_of_active_snapshot_boxes: ref register {idx} uninitialized in {} (pc={}, cursor={}, in_a_call={in_a_call}, after_residual_call={after_residual_call}, refs={:?})",
+                        self.jitcode.name(), self.pc, self.code_cursor, self.ref_regs,
+                    ));
+                    let value = self.ref_values[idx]
+                        .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
+                    if opref.is_constant() {
+                        // history.py `ConstPtr.value` — take the forwarded
+                        // gcref from the inline `OpRef::ConstPtr`, not the
+                        // unforwarded `ref_values` mirror (stale after a move).
+                        let bits = match opref {
+                            OpRef::ConstPtr(gcref) => gcref.0 as i64,
+                            _ => value,
+                        };
+                        SnapshotTagged::Const(bits, Type::Ref)
                     } else {
-                        let opref = self.ref_regs[idx].unwrap_or_else(|| panic!(
-                            "get_list_of_active_snapshot_boxes: ref register {idx} uninitialized in {} (pc={}, cursor={}, in_a_call={in_a_call}, after_residual_call={after_residual_call}, refs={:?})",
-                            self.jitcode.name(), self.pc, self.code_cursor, self.ref_regs,
-                        ));
-                        let value = self.ref_values[idx]
-                            .expect("get_list_of_active_snapshot_boxes: ref value uninitialized");
-                        if opref.is_constant() {
-                            // history.py `ConstPtr.value` — take the forwarded
-                            // gcref from the inline `OpRef::ConstPtr`, not the
-                            // unforwarded `ref_values` mirror (stale after a move).
-                            let bits = match opref {
-                                OpRef::ConstPtr(gcref) => gcref.0 as i64,
-                                _ => value,
-                            };
-                            SnapshotTagged::Const(bits, Type::Ref)
-                        } else {
-                            SnapshotTagged::Box(opref, Type::Ref)
-                        }
+                        SnapshotTagged::Box(opref, Type::Ref)
                     }
                 } else {
                     SnapshotTagged::Const(
@@ -1330,7 +1291,6 @@ impl MIFrame {
                 JitArgKind::Ref => {
                     self.ref_regs[count_r] = Some(*value);
                     self.ref_values[count_r] = Some(*concrete);
-                    self.retire_portal_red_ref(count_r);
                     count_r += 1;
                 }
                 JitArgKind::Float => {
