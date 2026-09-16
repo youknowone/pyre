@@ -223,7 +223,9 @@ pub fn sin(args: &[PyObjectRef]) -> PyResult {
             "expected a finite input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
     }
 }
 
@@ -244,7 +246,9 @@ pub fn cos(args: &[PyObjectRef]) -> PyResult {
             "expected a finite input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
     }
 }
 /// `math.tan` after `_get_double`: domain pin, then [`_float_tan`].
@@ -264,7 +268,9 @@ pub fn tan(args: &[PyObjectRef]) -> PyResult {
             "expected a finite input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
     }
 }
 pm1_edom!(asin, "expected a number in range from -1 up to 1");
@@ -295,7 +301,9 @@ pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
             "expected a nonnegative input, got {}",
             float_repr(val)
         ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error("math range error")),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
     }
 }
 
