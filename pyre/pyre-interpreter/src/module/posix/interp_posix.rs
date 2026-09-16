@@ -644,10 +644,20 @@ fn sched_param_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     )
 ))]
 fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
-    if !crate::baseobjspace::isinstance(w_param, sched_param_seq_type())? {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let param_slot = pyre_object::gc_roots::pin_roots(&[w_param]);
+    if !crate::baseobjspace::isinstance(
+        pyre_object::gc_roots::shadow_stack_get(param_slot),
+        sched_param_seq_type(),
+    )? {
         return Err(crate::PyError::type_error("must have a sched_param object"));
     }
-    let w_priority = crate::baseobjspace::getitem(w_param, pyre_object::w_int_new(0))?;
+    let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
+    let w_priority = crate::baseobjspace::getitem(
+        pyre_object::gc_roots::shadow_stack_get(param_slot),
+        pyre_object::gc_roots::shadow_stack_get(idx_slot),
+    )?;
     let priority = crate::baseobjspace::int_w(w_priority)?;
     i32::try_from(priority)
         .map_err(|_| crate::PyError::overflow_error("sched_priority out of range"))
@@ -7384,11 +7394,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 "getgroups",
                 |_| {
                     let gs = host_getgroups().map_err(|e| io_err(e, ""))?;
-                    let items: Vec<_> = gs
-                        .into_iter()
-                        .map(|g| pyre_object::w_int_new(g as i64))
-                        .collect();
-                    Ok(pyre_object::w_list_new(items))
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for g in gs {
+                        items.push(pyre_object::w_int_new(g as i64));
+                    }
+                    Ok(pyre_object::w_list_new(items.take()))
                 },
                 0,
             ),
@@ -7719,11 +7729,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         if res == -1 {
                             return Err(io_err(std::io::Error::last_os_error(), ""));
                         }
-                        let items: Vec<_> = (0..libc::CPU_SETSIZE as usize)
-                            .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &mask) })
-                            .map(|cpu| pyre_object::w_int_new(cpu as i64))
-                            .collect();
-                        Ok(pyre_object::w_set_from_items(&items))
+                        let mut items = pyre_object::gc_roots::RootedItems::new();
+                        for cpu in 0..libc::CPU_SETSIZE as usize {
+                            if unsafe { libc::CPU_ISSET(cpu, &mask) } {
+                                items.push(pyre_object::w_int_new(cpu as i64));
+                            }
+                        }
+                        Ok(pyre_object::w_set_from_items(&items.take()))
                     },
                     1,
                 ),
@@ -7747,7 +7759,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         let mut mask: libc::cpu_set_t =
                             unsafe { core::mem::zeroed::<libc::cpu_set_t>() };
                         unsafe { libc::CPU_ZERO(&mut mask) };
-                        for item in items {
+                        let _seq_roots = pyre_object::gc_roots::push_roots();
+                        let items_base = pyre_object::gc_roots::pin_roots(&items);
+                        for offset in 0..items.len() {
+                            let item = pyre_object::gc_roots::shadow_stack_get(items_base + offset);
                             if !crate::baseobjspace::isinstance(item, int_type)? {
                                 return Err(crate::PyError::type_error(format!(
                                     "expected an iterator of ints, but iterator yielded <class '{}'>",

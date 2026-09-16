@@ -179,10 +179,12 @@ fn cfuncptr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
+    let cls_slot = pyre_object::gc_roots::pin_roots(args);
     let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
-    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
+    let rest: Vec<_> = (1..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(cls_slot + i))
+        .collect();
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(&rest);
     reject_kwargs(kwargs)?;
     let mut callback = pyre_object::PY_NULL;
     let mut paramflags = pyre_object::PY_NULL;

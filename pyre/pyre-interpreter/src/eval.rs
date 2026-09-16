@@ -3560,15 +3560,23 @@ impl IterOpcodeHandler for PyFrame {
                 // Walk code points through the WTF-8 view so iterating a
                 // surrogateescape / surrogatepass-decoded string yields its
                 // lone surrogates instead of panicking in w_str_get_value.
-                let chars: Vec<pyre_object::PyObjectRef> = pyre_object::w_str_get_wtf8(iter)
-                    .code_points()
-                    .map(|c| {
-                        let mut one = rustpython_wtf8::Wtf8Buf::new();
-                        one.push(c);
-                        pyre_object::w_str_from_wtf8_managed(one)
-                    })
-                    .collect();
-                let len = chars.len();
+                let _roots = pyre_object::gc_roots::push_roots();
+                let iter_slot = pyre_object::gc_roots::pin_roots(&[iter]);
+                let s =
+                    pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(iter_slot))
+                        .to_wtf8_buf();
+                let chars_base = pyre_object::gc_roots::shadow_stack_len();
+                for c in s.code_points() {
+                    let mut one = rustpython_wtf8::Wtf8Buf::new();
+                    one.push(c);
+                    let _ =
+                        pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(one));
+                }
+                let len = pyre_object::gc_roots::shadow_stack_len() - chars_base;
+                let mut chars = Vec::with_capacity(len);
+                for i in 0..len {
+                    chars.push(pyre_object::gc_roots::shadow_stack_get(chars_base + i));
+                }
                 let char_list = pyre_object::w_list_new(chars);
                 let seq_iter = pyre_object::w_seq_iter_new(char_list, len);
                 let tos = self.valuestackdepth - 1;

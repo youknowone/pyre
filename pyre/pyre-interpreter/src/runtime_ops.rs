@@ -621,11 +621,24 @@ pub fn compare_op_from_tag(tag: i64) -> Option<ComparisonOperator> {
 }
 
 pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
-    w_list_new(items.to_vec())
+    // BUILD_LIST pops the elements first, so they live only in this slice
+    // while `w_list_new` allocates. Pin them and hand the constructor the
+    // rewritten slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(items);
+    let live: Vec<PyObjectRef> = (0..items.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect();
+    w_list_new(live)
 }
 
 pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
-    w_tuple_new(items.to_vec())
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(items);
+    let live: Vec<PyObjectRef> = (0..items.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+        .collect();
+    w_tuple_new(live)
 }
 
 /// BUILD_MAP evaluation, shared by the interpreter (`build_map`) and the JIT

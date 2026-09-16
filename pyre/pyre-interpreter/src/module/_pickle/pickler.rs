@@ -1755,22 +1755,26 @@ fn save_bytes(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Resu
             );
         }
         let codecs = import_module("codecs")?;
-        let w_encode = crate::baseobjspace::getattr_str(codecs, "encode")?;
+        let encode_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(crate::baseobjspace::getattr_str(codecs, "encode")?);
+        let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("latin1"));
         let w_decoded = call_meth(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             "decode",
-            &[pyre_object::w_str_new("latin1")],
+            &[pyre_object::gc_roots::shadow_stack_get(enc_slot)],
         )?;
         let dec_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_decoded);
         let w_args = pyre_object::tupleobject::w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(dec_slot),
-            pyre_object::w_str_new("latin1"),
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
         ]);
         return save_reduce(
             ctx,
             buf,
-            &[w_encode, w_args],
+            &[pyre_object::gc_roots::shadow_stack_get(encode_slot), w_args],
             Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
         );
     }

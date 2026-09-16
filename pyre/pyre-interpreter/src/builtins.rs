@@ -2908,10 +2908,13 @@ fn memoryview_index(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let base = pyre_object::gc_roots::pin_roots(&[mv, args[1]]);
     let item_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_none());
+    let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_none());
     for index in start..stop {
+        pyre_object::gc_roots::shadow_stack_set(idx_slot, w_int_new(index));
         let item = memoryview_getitem(&[
             pyre_object::gc_roots::shadow_stack_get(base),
-            w_int_new(index),
+            pyre_object::gc_roots::shadow_stack_get(idx_slot),
         ])?;
         pyre_object::gc_roots::shadow_stack_set(item_slot, item);
         if std::ptr::eq(item, pyre_object::gc_roots::shadow_stack_get(base + 1))
@@ -6513,27 +6516,36 @@ fn type_descr_new_with_metaclass(
                 crate::error::type_name_of(w_namespace_dict)
             )));
         }
-        // `bases` is the caller's tuple and a tuple relocates.  Everything
-        // from here down dispatches through user code -- the namespace
-        // backing's `keys`, the `__mro_entries__` lookups, the namespace copy,
-        // `__set_name__`, `__init_subclass__` -- so the word taken out of
-        // `args` is published once and re-read at each region below instead of
-        // carried across them.
-        let _bases_roots = pyre_object::gc_roots::push_roots();
-        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(bases);
-        let w_ns_backing = unsafe { crate::type_methods::resolve_dict_backing(w_namespace_dict) };
+        // name/bases/dict all relocate. Everything from here down
+        // dispatches through user code -- the namespace backing's `keys`,
+        // the `__mro_entries__` lookups, the namespace copy, `__set_name__`,
+        // `__init_subclass__` -- so the three public arguments are
+        // published once and re-read at each region below.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::pin_roots(&[name_obj, bases, w_namespace_dict]);
+        let bases_slot = name_slot + 1;
+        let namespace_root = name_slot + 2;
+        let name_obj = || pyre_object::gc_roots::shadow_stack_get(name_slot);
+        // Resolve and pin the backing immediately. Later regions dispatch
+        // through user code (`lookup`, metaclass `__new__`) and would
+        // otherwise leave this word unrooted.
+        let backing_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(unsafe {
+            crate::type_methods::resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(
+                namespace_root,
+            ))
+        });
         // typeobject.py `_check_surrogate(space, name)` — reject a lone
         // surrogate in the name before it is read as UTF-8 below.
-        check_surrogate(name_obj)?;
-        for cp in unsafe { pyre_object::w_str_get_wtf8(name_obj) }.code_points() {
+        check_surrogate(name_obj())?;
+        for cp in unsafe { pyre_object::w_str_get_wtf8(name_obj()) }.code_points() {
             if cp.to_u32() == 0 {
                 return Err(crate::PyError::value_error(
                     "type name must not contain null characters",
                 ));
             }
         }
-        let name = crate::baseobjspace::str_utf8_w(name_obj)?;
+        let name = crate::baseobjspace::str_utf8_w(name_obj())?;
 
         // typeobject.py `_create_new_type` — direct three-argument
         // `type()` never performs PEP 560 base rewriting.  A non-type base
@@ -6577,7 +6589,11 @@ fn type_descr_new_with_metaclass(
                     if let Some(w_metaclass) = w_metaclass {
                         // Delegate: call metaclass(name, bases, dict, **kwds)
                         // Pass extra args from the original call
-                        let mut metaclass_args = vec![name_obj, bases, w_namespace_dict];
+                        let mut metaclass_args = vec![
+                            name_obj(),
+                            bases,
+                            pyre_object::gc_roots::shadow_stack_get(namespace_root),
+                        ];
                         if args.len() > 3 {
                             metaclass_args.extend_from_slice(&args[3..]);
                         }
@@ -6594,9 +6610,7 @@ fn type_descr_new_with_metaclass(
         // `w_dict_items` dispatches through `is_module_dict`, so the rare
         // `__build_class__` case where the namespace is a W_ModuleDictObject
         // still walks correctly.
-        let _class_ns_root = pyre_object::gc_roots::push_roots();
-        let namespace_root = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_namespace_dict);
+        //
         // `type.__new__` accepts any `dict` subclass as the namespace
         // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
         // the dict backing so e.g. an `enum._EnumDict` class body is
@@ -6609,8 +6623,9 @@ fn type_descr_new_with_metaclass(
         // side-effecting one an extra time, and dropping the entry outright
         // once that `__hash__` starts raising, since the store surface cannot
         // report an error.
-        let backing_root = pyre_object::gc_roots::shadow_stack_len();
-        let w_ns_backing = pyre_object::gc_roots::pin_root(w_ns_backing);
+        // Name/bases/dict/backing already sit on `_roots`; pin the scratch
+        // clone onto the same set instead of opening a nested bracket.
+        let w_ns_backing = pyre_object::gc_roots::shadow_stack_get(backing_root);
         let class_ns = if w_ns_backing.is_null() {
             pyre_object::w_dict_new()
         } else {
@@ -6619,7 +6634,7 @@ fn type_descr_new_with_metaclass(
             }
         };
         let class_ns_root = pyre_object::gc_roots::shadow_stack_len();
-        let class_ns = pyre_object::gc_roots::pin_root(class_ns);
+        let _ = pyre_object::gc_roots::pin_root(class_ns);
         // type_new_classcell — capture the `__classcell__` cell and keep
         // both explicit class cells out of the new type's `__dict__`
         // (CPython consumes them here rather than storing them).
@@ -6630,7 +6645,6 @@ fn type_descr_new_with_metaclass(
         // can introduce such a key; every later pass installs descriptors
         // under interned names.
         let mut has_non_string_key = false;
-        let w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(namespace_root);
         {
             let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
             let items = unsafe { pyre_object::w_dict_items(class_ns) };
@@ -6783,7 +6797,7 @@ fn type_descr_new_with_metaclass(
                 };
                 let w_namespace_dict = pyre_object::gc_roots::shadow_stack_get(namespace_root);
                 let bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
-                let mut new_args = vec![w_winner, name_obj, bases, w_namespace_dict];
+                let mut new_args = vec![w_winner, name_obj(), bases, w_namespace_dict];
                 if args.len() > 3 {
                     new_args.extend_from_slice(&args[3..]);
                 }
@@ -10733,7 +10747,7 @@ fn exception_group_derive(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 
 fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (message, exceptions) = exception_group_fields(args[0])?;
-    let message = unsafe { pyre_object::w_str_get_wtf8(message) };
+    let message = unsafe { pyre_object::w_str_get_wtf8(message) }.to_wtf8_buf();
     let count = unsafe { pyre_object::w_tuple_len(exceptions) };
     let suffix = if count == 1 { "" } else { "s" };
     // `app_group.py:88-90` interpolates `self.message` into the result, and a
@@ -10742,7 +10756,7 @@ fn exception_group_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // U+FFFD, so `str(group)` answered a different string than `group.message`
     // held -- a loss visible from Python, not only on the way to stderr.
     let mut rendered = Wtf8Buf::with_capacity(message.len() + 32);
-    rendered.push_wtf8(message);
+    rendered.push_wtf8(&message);
     rendered.push_str(&format!(" ({count} sub-exception{suffix})"));
     Ok(pyre_object::w_str_from_wtf8_managed(rendered))
 }
@@ -11390,8 +11404,8 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py:1056-1070 — bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
         if let Some(src) = crate::typedef::buffer_as_bytes_like(obj)? {
-            let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) };
-            let s = String::from_utf8_lossy(data);
+            let data = unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec();
+            let s = String::from_utf8_lossy(&data);
             return parse_int_from_str(obj, &s, 10);
         }
         return Err(crate::PyError::type_error(format!(
@@ -11411,8 +11425,8 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
         // With an explicit base only str / bytes / bytearray are accepted.
         if pyre_object::bytesobject::is_bytes_like(obj) {
-            let data = pyre_object::bytesobject::bytes_like_data(obj);
-            let s = String::from_utf8_lossy(data);
+            let data = pyre_object::bytesobject::bytes_like_data(obj).to_vec();
+            let s = String::from_utf8_lossy(&data);
             return parse_int_from_str(obj, &s, base);
         }
     }
@@ -12334,9 +12348,8 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
 /// order before it is stored; `w_set_add` keeps the `dict_keys_equal`
 /// dedup, and the hash itself is not used for storage.
 pub fn builtin_set_from_items(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let set = pyre_object::w_set_new();
-    builtin_set_add_items(set, items)?;
-    Ok(set)
+    // `w_set_new` can collect before `builtin_set_add_items` pins `items`.
+    builtin_set_add_items_impl(None, items, true)
 }
 
 /// Add each of `items` to `set`, hashing it as it enters.
@@ -12348,7 +12361,7 @@ pub fn builtin_set_add_items(
     set: PyObjectRef,
     items: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    builtin_set_add_items_impl(set, items, true)
+    builtin_set_add_items_impl(Some(set), items, true).map(|_| ())
 }
 
 /// Intersection materializes an operand through PyPy's internal `_newobj`
@@ -12358,28 +12371,28 @@ pub(crate) fn builtin_set_add_items_intersection(
     set: PyObjectRef,
     items: &[PyObjectRef],
 ) -> Result<(), crate::PyError> {
-    builtin_set_add_items_impl(set, items, false)
+    builtin_set_add_items_impl(Some(set), items, false).map(|_| ())
 }
 
 fn builtin_set_add_items_impl(
-    set: PyObjectRef,
+    set: Option<PyObjectRef>,
     items: &[PyObjectRef],
     wrap_hash_error: bool,
-) -> Result<(), crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         // `try_hash_value` may run a user `__hash__` that allocates and
         // triggers a moving minor collection; `set` and every not-yet-added
         // item are rooted for the whole loop and reloaded after each hash,
-        // matching `set_update_value`.
+        // matching `set_update_value`. Mint the empty set only after the
+        // items are published, so `w_set_new` cannot move them first.
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let set = pyre_object::gc_roots::pin_root(set);
-        let item_base = sp + 1;
-        for &item in items {
-            let _ = pyre_object::gc_roots::pin_root(item);
-        }
-        let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
-        for i in 0..item_len {
+        let item_base = pyre_object::gc_roots::pin_roots(items);
+        let set = match set {
+            Some(set) => pyre_object::gc_roots::pin_root(set),
+            None => pyre_object::gc_roots::pin_root(pyre_object::w_set_new()),
+        };
+        let set_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        for i in 0..items.len() {
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             let hash = try_hash_value(item).map_err(|err| {
                 if wrap_hash_error {
@@ -12391,12 +12404,12 @@ fn builtin_set_add_items_impl(
                     err
                 }
             })?;
-            let set = pyre_object::gc_roots::shadow_stack_get(sp);
+            let set = pyre_object::gc_roots::shadow_stack_get(set_slot);
             let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
             pyre_object::w_set_add_hashed_checked(set, item, hash)
                 .map_err(crate::baseobjspace::map_set_update_error)?;
         }
-        Ok(())
+        Ok(pyre_object::gc_roots::shadow_stack_get(set_slot))
     }
 }
 
@@ -16698,7 +16711,7 @@ pub(crate) fn exec_or_eval(
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
-        let key = pyre_object::w_str_new("__builtins__");
+        let key = pyre_object::unicodeobject::intern_str_value("__builtins__");
         if !crate::baseobjspace::contains(w_globals, key)? {
             crate::baseobjspace::setitem(w_globals, key, w_builtin)?;
         }
@@ -16730,7 +16743,7 @@ pub(crate) fn exec_or_eval(
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }
-        let key = pyre_object::w_str_new("__builtins__");
+        let key = pyre_object::unicodeobject::intern_str_value("__builtins__");
         let setdefault = crate::baseobjspace::getattr_str(w_globals, "setdefault")?;
         crate::call_and_check(setdefault, &[key, w_builtin])?;
         Ok(())
@@ -18535,10 +18548,8 @@ pub(crate) fn builtin_filter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(args[0]);
-    let predicate_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(args[1]);
-    let iterable_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let predicate_slot = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let iterable_slot = predicate_slot + 1;
     let func = unsafe { pyre_object::gc_roots::shadow_stack_get(predicate_slot) };
     // `functional.py:921-924` — a None predicate is stored as PY_NULL.
     let w_predicate = if unsafe { pyre_object::is_none(func) } {
@@ -19472,15 +19483,23 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             // host lseek.  Reading their object payloads unchecked made a
             // float such as 0.0 look like offset zero instead of raising
             // TypeError (test_io.IOTest.write_ops).
-            let offset = crate::builtins::space_index_w(args[1])?;
-            let whence = match args.get(2).copied() {
-                Some(value) => crate::baseobjspace::index_c_int_w(value)?,
-                None => 0,
+            let _roots = pyre_object::gc_roots::push_roots();
+            let file_slot = pyre_object::gc_roots::pin_roots(args);
+            let offset = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
+                file_slot + 1,
+            ))?;
+            let whence = if args.len() >= 3 {
+                crate::baseobjspace::index_c_int_w(pyre_object::gc_roots::shadow_stack_get(
+                    file_slot + 2,
+                ))?
+            } else {
+                0
             };
             // CPython 3.14 TextIOWrapper only permits the opaque-cookie
             // forms for current/end-relative seeks; FileIO remains free
             // to use ordinary non-zero offsets.
-            if !file_is_binary(args[0]) && offset != 0 {
+            let file = || pyre_object::gc_roots::shadow_stack_get(file_slot);
+            if !file_is_binary(file()) && offset != 0 {
                 // POSIX/Python's public SEEK_CUR and SEEK_END values are
                 // 1 and 2.  Keep this semantic validation target-neutral;
                 // wasm libc intentionally does not expose lseek constants.
@@ -19495,7 +19514,7 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     ));
                 }
             }
-            if let Some(fd) = file_get_fd(args[0]) {
+            if let Some(fd) = file_get_fd(file()) {
                 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
                 {
                     #[cfg(not(feature = "sandbox"))]
@@ -19523,17 +19542,17 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                     ));
                 }
             }
-            let base = match whence {
+            let origin = match whence {
                 0 => 0,
-                1 => file_get_pos(args[0]) as i64,
-                2 => file_get_data(args[0]).len() as i64,
+                1 => file_get_pos(file()) as i64,
+                2 => file_get_data(file()).len() as i64,
                 _ => return Err(crate::PyError::value_error("invalid whence")),
             };
-            let pos = base
+            let pos = origin
                 .checked_add(offset)
                 .filter(|pos| *pos >= 0)
                 .ok_or_else(|| crate::PyError::value_error("negative seek position"))?;
-            file_set_pos(args[0], pos as usize);
+            file_set_pos(file(), pos as usize);
             Ok(w_int_new(pos))
         }),
     );

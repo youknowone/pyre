@@ -972,20 +972,20 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // bytes pass through, control/high bytes use `\xNN`, and the
             // outer quote prefers `'`, flipping to `"` when the data holds a
             // `'` but no `"`.
-            let data = pyre_object::bytes_like_data(obj);
+            let data = pyre_object::bytes_like_data(obj).to_vec();
             if pyre_object::bytearrayobject::is_bytearray(obj) {
                 // `bytearrayobject.py W_BytearrayObject.descr_repr` differs
                 // from the bytes form: it chooses the same outer quote but
                 // always backslash-escapes an inner `'` (never `"`), so the
                 // shared bytes escaper cannot express it.
-                bytearray_repr_string(data, "bytearray")
+                bytearray_repr_string(&data, "bytearray")
             } else {
-                bytes_repr_string(data)
+                bytes_repr_string(&data)
             }
         } else if pyre_object::is_set_or_frozenset(obj) {
             return set_repr_wtf8(obj);
         } else if std::ptr::eq(tp, &STR_TYPE as *const PyType) {
-            format_wtf8_repr(pyre_object::w_str_get_wtf8(obj))
+            format_wtf8_repr(&pyre_object::w_str_get_wtf8(obj).to_wtf8_buf())
         } else if std::ptr::eq(tp, &NONE_TYPE as *const PyType) {
             "None".to_string()
         } else if std::ptr::eq(

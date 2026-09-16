@@ -1247,9 +1247,16 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.tolist")?;
     let obj = args[0];
     let len = unsafe { arr::w_array_len(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    for i in 0..len {
+        let item = array_w_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i, false)?;
+        let _ = pyre_object::gc_roots::pin_root(item);
+    }
     let mut items = Vec::with_capacity(len);
     for i in 0..len {
-        items.push(array_w_getitem(obj, i, false)?);
+        items.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
     }
     Ok(pyre_object::w_list_new(items))
 }
@@ -1464,8 +1471,16 @@ fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
 fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
     require_array_receiver(args, "tofile", true)?;
     check_arity(args, 2, "array.tofile")?;
-    let w_bytes = array_tobytes_method(&args[..1])?;
-    call_method(args[1], "write", &[w_bytes])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
+    let w_bytes = array_tobytes_method(&[pyre_object::gc_roots::shadow_stack_get(base)])?;
+    let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_bytes);
+    call_method(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        "write",
+        &[pyre_object::gc_roots::shadow_stack_get(bytes_slot)],
+    )?;
     Ok(pyre_object::w_none())
 }
 

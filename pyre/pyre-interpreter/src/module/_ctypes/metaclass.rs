@@ -2202,10 +2202,13 @@ fn array_set_slice(
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_roots(&[obj, value]);
+    let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_none());
     for (i, index) in idxs.into_iter().enumerate() {
+        pyre_object::gc_roots::shadow_stack_set(idx_slot, pyre_object::w_int_new(i as i64));
         let item = crate::baseobjspace::getitem(
             pyre_object::gc_roots::shadow_stack_get(base + 1),
-            pyre_object::w_int_new(i as i64),
+            pyre_object::gc_roots::shadow_stack_get(idx_slot),
         )?;
         let item = pyre_object::gc_roots::pin_root(item);
         array_set_index(
