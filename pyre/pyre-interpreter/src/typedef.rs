@@ -26726,9 +26726,11 @@ fn bytearray_reduce_impl(
         let latin1: String = owned.iter().map(|&b| char::from(b)).collect();
         let text_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&latin1));
+        let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new("latin-1"));
         let args = w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(text_slot),
-            w_str_new("latin-1"),
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
         ]);
         args_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(args);

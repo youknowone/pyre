@@ -771,7 +771,12 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
         let mut nreadahead = 1usize;
         let peek = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         if !peek.is_null() {
-            let readahead = crate::call::call_function_impl_result(peek, &[w_int_new(1)])?;
+            let one_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+            let readahead = crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(sp + 1),
+                &[pyre_object::gc_roots::shadow_stack_get(one_slot)],
+            )?;
             if !unsafe { pyre_object::bytesobject::is_bytes_like(readahead) } {
                 return Err(crate::PyError::os_error(format!(
                     "peek() should have returned a bytes object, not '{}'",
@@ -792,10 +797,12 @@ fn iobase_readline(args: &[PyObjectRef]) -> crate::PyResult {
             }
         }
 
+        let n_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(nreadahead as i64));
         let read = call_method_result(
             pyre_object::gc_roots::shadow_stack_get(sp),
             "read",
-            &[w_int_new(nreadahead as i64)],
+            &[pyre_object::gc_roots::shadow_stack_get(n_slot)],
         )?;
         if !unsafe { pyre_object::bytesobject::is_bytes_like(read) } {
             return Err(crate::PyError::os_error(format!(
@@ -1167,10 +1174,12 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     let mut output = Vec::new();
     loop {
+        let n_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(DEFAULT_BUFFER_SIZE));
         let data = call_method_result(
             pyre_object::gc_roots::shadow_stack_get(sp),
             "read",
-            &[w_int_new(DEFAULT_BUFFER_SIZE)],
+            &[pyre_object::gc_roots::shadow_stack_get(n_slot)],
         )?;
         if unsafe { pyre_object::is_none(data) } {
             if output.is_empty() {

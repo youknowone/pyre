@@ -529,9 +529,11 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                 }) => {
                     let current_deferred = deferred_error.filter(|_| parts.peek().is_none());
                     let key = mapping_key.expect("mapping spec carries a key");
+                    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&key));
                     let value = crate::baseobjspace::getitem(
                         pyre_object::gc_roots::shadow_stack_get(args_slot),
-                        pyre_object::w_bytes_from_bytes(&key),
+                        pyre_object::gc_roots::shadow_stack_get(key_slot),
                     )?;
                     let value = pyre_object::gc_roots::pin_root(value);
                     mapping_star_operands(
