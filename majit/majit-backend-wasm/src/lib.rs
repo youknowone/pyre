@@ -1504,7 +1504,16 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
             _ => None,
         })
         .collect();
-    if tids.is_empty() {
+    let has_rewritten_malloc = ops.iter().any(|op| {
+        matches!(
+            op.opcode,
+            majit_ir::OpCode::CallMallocNursery
+                | majit_ir::OpCode::CallMallocNurseryHeaderless
+                | majit_ir::OpCode::CallMallocNurseryVarsize
+                | majit_ir::OpCode::CallMallocNurseryVarsizeFrame
+        )
+    });
+    if tids.is_empty() && !has_rewritten_malloc {
         return None;
     }
     with_wasm_active_gc(|gc| {
@@ -1518,7 +1527,7 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
             .copied()
             .filter(|&t| gc.type_alloc_is_plain(t))
             .collect();
-        if plain_tids.is_empty() {
+        if plain_tids.is_empty() && !has_rewritten_malloc {
             return None;
         }
         Some(codegen::NurseryAllocParams {
@@ -3215,6 +3224,7 @@ impl WasmBackend {
     /// GC root the collector forwards in place, so the emitted load always
     /// reads the object at its current address. Returns `None` for a trace
     /// with no reference constant, leaving the module byte-identical.
+    #[allow(dead_code)] // constptr-only subset; production uses `rewrite_ops_for_gc`
     fn intern_ref_constants(
         inputargs: &[InputArgRc],
         ops: Vec<Op>,
@@ -3223,6 +3233,88 @@ impl WasmBackend {
         let input_indices: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
         let (ops, gcrefs) =
             majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
+        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
+        codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
+        (ops, table)
+    }
+
+    /// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
+    /// `GcRewriterAssembler`. Native backends run this before assemble.
+    /// Wasm supplies no `jitframe_info`, so `CALL_ASSEMBLER` stays in
+    /// place for the wasm-specific arm; malloc / zero / barrier /
+    /// `GC_LOAD` still come from the shared rewrite.
+    fn gc_rewriter(&self) -> majit_gc::rewrite::GcRewriterImpl {
+        let collector = with_wasm_active_gc(|gc| {
+            (
+                gc.nursery_free_addr(),
+                gc.nursery_top_addr(),
+                gc.max_nursery_object_size(),
+                gc.get_write_barrier_descr(),
+            )
+        });
+        let is_boehm = collector.is_none();
+        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
+            collector.unwrap_or((0, 0, 0, None));
+        majit_gc::rewrite::GcRewriterImpl {
+            nursery_free_addr,
+            nursery_top_addr,
+            max_nursery_size,
+            wb_descr,
+            jitframe_info: None,
+            call_assembler_callee_locs: None,
+            load_supported_factors: &[1],
+            supports_load_effective_address: true,
+            malloc_zero_filled: is_boehm,
+            memcpy_fn: majit_ir::memcpy_fn_addr(),
+            memcpy_descr: majit_ir::make_memcpy_calldescr(),
+            str_descr: codegen::builtin_string_array_descr(majit_ir::OpCode::Newstr)
+                .expect("Newstr must produce a str ArrayDescr"),
+            unicode_descr: codegen::builtin_string_array_descr(majit_ir::OpCode::Newunicode)
+                .expect("Newunicode must produce a unicode ArrayDescr"),
+            str_hash_descr: codegen::builtin_string_hash_field_descr(majit_ir::OpCode::Strhash)
+                .expect("Strhash must produce a str hash FieldDescr"),
+            unicode_hash_descr: codegen::builtin_string_hash_field_descr(
+                majit_ir::OpCode::Unicodehash,
+            )
+            .expect("Unicodehash must produce a unicode hash FieldDescr"),
+            fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
+            fielddescr_tid: (!is_boehm).then(majit_ir::make_tid_field_descr),
+            malloc_array_fn: wasm_jit_alloc_array as *const () as i64,
+            malloc_array_nonstandard_fn: wasm_jit_alloc_array as *const () as i64,
+            malloc_array_oldgen_fn: wasm_jit_alloc_array_oldgen as *const () as i64,
+            malloc_array_nonstandard_oldgen_fn: wasm_jit_alloc_array_oldgen as *const () as i64,
+            malloc_str_fn: wasm_jit_alloc_array as *const () as i64,
+            malloc_unicode_fn: wasm_jit_alloc_array as *const () as i64,
+            malloc_big_fixedsize_fn: wasm_jit_alloc as *const () as i64,
+            malloc_big_fixedsize_oldgen_fn: wasm_jit_alloc_oldgen as *const () as i64,
+            malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+            malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+            malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+            malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
+            standard_array_basesize: std::mem::size_of::<usize>(),
+            standard_array_length_ofs: 0,
+        }
+    }
+
+    /// Run `rewrite.py` then intern the gcref table. Replaces
+    /// [`Self::intern_ref_constants`] on the production compile path.
+    fn rewrite_ops_for_gc(&mut self, ops: Vec<Op>) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
+        use majit_gc::GcRewriter;
+        let boxed: Vec<majit_ir::OpRc> = ops.into_iter().map(majit_ir::OpRc::new).collect();
+        let mut constants = majit_ir::ConstMap::default();
+        for (&k, &v) in &self.constants {
+            constants.insert(k, majit_ir::Const::from_raw_i64(v, majit_ir::Type::Int));
+        }
+        let rewriter = self.gc_rewriter();
+        let (rewritten, new_constants, gcrefs) =
+            rewriter.rewrite_for_gc_with_constants(&boxed, &constants);
+        self.constants.clear();
+        for (k, c) in new_constants {
+            self.constants.insert(k, c.as_raw_i64());
+        }
+        let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
         let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
         let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
         codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
@@ -4795,7 +4887,7 @@ impl majit_backend::Backend for WasmBackend {
         }
         let mut ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         codegen::materialize_unbound_label_args(inputargs, &mut ops_owned);
-        let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
+        let (ops_owned, gc_table) = self.rewrite_ops_for_gc(ops_owned);
         let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
         // Freeze this token's generated frame layout before CA resolution.  A
@@ -4907,7 +4999,7 @@ impl majit_backend::Backend for WasmBackend {
         let used_label_homes = codegen::label_ref_capture_slots(inputargs, ops);
         let module_inputs = codegen::ModuleBuildInputs {
             inputargs: inputargs.iter().cloned().collect(),
-            // Keep these rewritten operations exactly as intern_ref_constants
+            // Keep these rewritten operations exactly as rewrite_ops_for_gc
             // produced them; their LoadFromGcTable immediates share this base.
             ops: ops_owned.clone(),
             inlined_bridges: Vec::new(),
@@ -5263,7 +5355,7 @@ impl majit_backend::Backend for WasmBackend {
         // and `previous_tokens` are unused.
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         // A bridge gets its own table, like `compile_loop`'s.
-        let (ops_owned, gc_table) = Self::intern_ref_constants(inputargs, ops_owned);
+        let (ops_owned, gc_table) = self.rewrite_ops_for_gc(ops_owned);
         let gc_table_base = gc_table.as_ref().map_or(0, |t| t.base_addr() as u32);
         let ops: &[Op] = &ops_owned;
         diag_bump(0); // compile_bridge entered

@@ -3605,7 +3605,15 @@ impl GcRewriter for GcRewriterImpl {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    self.handle_call_assembler(op, &mut st);
+                    // rewrite.py always has jitframe descrs. Wasm lowers
+                    // CALL_ASSEMBLER itself (indirect table + nursery
+                    // frame), so a backend that supplies no
+                    // `jitframe_info` leaves the op in place.
+                    if self.jitframe_info.is_some() {
+                        self.handle_call_assembler(op, &mut st);
+                    } else {
+                        st.emit_maybe_forwarded(&op_rc);
+                    }
                     continue;
                 }
 
