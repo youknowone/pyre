@@ -15128,22 +15128,6 @@ impl<M: Clone> MetaInterp<M> {
         // RPython unroll.py: Optimizer.optimize_bridge()
         // compile.py: isinstance(resumekey, ResumeAtPositionDescr)
         let inline_short_preamble = !fail_descr.is_resume_at_position();
-        // A Grain inner-`for` exhaust JUMP onto the outer loop is the
-        // orthodox close (`compile.py` compile_trace JUMP). The dest
-        // LABEL is the rotated outer *body* until the walk stores the
-        // next item at the outer `IterNext` header (`FOR_ITER`). A
-        // published close that re-enters the body with a stale `p`
-        // disagrees (5000: 638 vs 669). Decline until dest is that
-        // header (`unroll.py:196-200`).
-        if cell_token_key != green_key && self.second_portal_red_is_grain_vm() {
-            if crate::majit_log_enabled() {
-                eprintln!(
-                    "[jit] compile_bridge: decline Grain cross-loop close \
-                     origin={green_key} dest={cell_token_key}"
-                );
-            }
-            return false;
-        }
         // RPython warmspot.py:93 retrace_limit=5: allow bridge to create
         // new target_token specializations when existing body token doesn't
         // match. Without this, bridges fall back to preamble (causing
