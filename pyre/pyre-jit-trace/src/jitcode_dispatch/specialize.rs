@@ -3340,7 +3340,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize);
 
     if name == "f_locals"
-        && (is_inline_frame || is_standard_frame)
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && unsafe {
             (*(concrete_obj as *const pyre_interpreter::PyFrame))
@@ -6208,6 +6207,11 @@ pub(crate) fn try_walker_specialize_store_attr_named<Sym: WalkSym>(
     if !ctx.is_authoritative_executor {
         return Ok(None);
     }
+    // A rewind-admitted BINARY_OP dunder must not commit before its result
+    // is known.  The StoreAttr residual already refuses here; the flattened
+    // `setattr` residual and the `setattr_str` inline_call fold both land
+    // in this helper, so the same refusal has to sit on the write itself.
+    fbw_binop_rewind_refuse_commit(ctx, op_pc, Some(obj))?;
     let (Some(concrete_obj), Some(concrete_value)) = (
         walker_concrete_ref_object(ctx, obj),
         walker_concrete_ref_object(ctx, value),
@@ -20796,11 +20800,15 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>
     // the catch-side `record_inline_exception_context` compensation finds the
     // context unchained and passes this exception to the resolver call, which
     // forces the very allocation this fold exists to keep virtual.
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
+    //
+    // Stamp the recording-time `__context__` as a constant.  A live
+    // `GETFIELD_GC_R(ec, sys_exc_value)` keeps the previous exception
+    // reachable, and two of these raises in one loop chain every
+    // TypeError into a growing list (`type_immutable_reject`).  The
+    // SETFIELD still marks the context chained for the catch-side
+    // compensation.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    let active = ctx.trace_ctx.const_ref(active_concrete as i64);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[new_op, active],
@@ -20811,7 +20819,6 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>
     // registration above stops the compensation from performing, so Python
     // code reached later in this authoritative walk observes the
     // `__context__` the recorded SETFIELD performs on compiled iterations.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
     if !active_concrete.is_null() {
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
@@ -20858,7 +20865,30 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     w_code_ptr: usize,
     name_idx: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor || w_code_ptr == 0 {
+    try_walker_trace_readonly_descr_attr_raise_with_name(
+        ctx,
+        op,
+        obj_op,
+        value_op,
+        w_code_ptr,
+        name_idx,
+        None,
+    )
+}
+
+pub(crate) fn try_walker_trace_readonly_descr_attr_raise_with_name<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    obj_op: OpRef,
+    value_op: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    name_override: Option<&str>,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor {
+        return Ok(None);
+    }
+    if name_override.is_none() && w_code_ptr == 0 {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
@@ -20866,15 +20896,19 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     };
     let concrete_value =
         walker_concrete_ref_object(ctx, value_op).unwrap_or_else(pyre_object::w_none);
-    let name = unsafe {
-        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-        if code_ptr.is_null() {
-            return Ok(None);
-        }
-        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-            Some(n) => n.to_string(),
-            None => return Ok(None),
+    let name = if let Some(name) = name_override {
+        name.to_string()
+    } else {
+        unsafe {
+            let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+            if code_ptr.is_null() {
+                return Ok(None);
+            }
+            let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+            match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
+                Some(n) => n.to_string(),
+                None => return Ok(None),
+            }
         }
     };
     let Some(descr) =
@@ -21042,18 +21076,14 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
 
-    let active = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[ec],
-        crate::descr::ec_sys_exc_value_descr(),
-    );
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
+    let active = ctx.trace_ctx.const_ref(active_concrete as i64);
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[new_op, active],
         crate::descr::w_exception_context_descr(kind),
     );
     fbw_context_chained_insert(new_op);
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
     if !active_concrete.is_null() {
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);

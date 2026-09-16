@@ -5292,10 +5292,11 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     unjournaled_before_subwalk: bool,
     executed_effects_before: usize,
     abort_flush_call_jitcode_coord: Option<(u32, usize)>,
+    allow_effect_delta: bool,
 ) {
     if !is_top_inline
         || unjournaled_before_subwalk
-        || fbw_executed_effect_count() != executed_effects_before
+        || (!allow_effect_delta && fbw_executed_effect_count() != executed_effects_before)
     {
         return;
     }
@@ -8363,7 +8364,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     | DispatchError::LoopBearingCalleeInlineUnsupported { .. }
                     | DispatchError::BranchGuardUnrestorableKeptStackPermanent { .. }
                     | DispatchError::BranchGuardKeptStackUnsupported { .. }
+                    | DispatchError::VableEscapedDuringResidualCall { .. }
             ) {
+                // `sys._getframe` forces the virtualizable; that force is
+                // the escape, not a Python-visible commit.  Re-run the
+                // CALL in the interpreter (`frame_inlined_callee_own_image_regression`).
+                let allow_effect_delta =
+                    matches!(e, DispatchError::VableEscapedDuringResidualCall { .. });
                 latch_abort_call_resume(
                     code,
                     op,
@@ -8373,6 +8380,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     unjournaled_before_subwalk,
                     executed_effects_before,
                     abort_flush_call_jitcode_coord,
+                    allow_effect_delta,
                 );
             }
             return Err(e);
@@ -8412,6 +8420,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         unjournaled_before_subwalk,
                         executed_effects_before,
                         abort_flush_call_jitcode_coord,
+                        false,
                     );
                     return Err(DispatchError::callee_inline_unsupported(op.pc));
                 }
@@ -8456,6 +8465,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                                 unjournaled_before_subwalk,
                                 executed_effects_before,
                                 abort_flush_call_jitcode_coord,
+                                false,
                             );
                             return Err(DispatchError::callee_inline_unsupported(op.pc));
                         }
@@ -8485,6 +8495,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                             unjournaled_before_subwalk,
                             executed_effects_before,
                             abort_flush_call_jitcode_coord,
+                            false,
                         );
                         return Err(DispatchError::callee_inline_unsupported(op.pc));
                     }
@@ -9805,8 +9816,98 @@ pub(crate) fn try_walker_inline_builtin_getattr_property<Sym: WalkSym>(
     )
 }
 
+/// `getattr_str` spelling: the name is already a Rust `&str` from the I-list
+/// slice.  Pin nothing extra — `guard_concrete_int_slice` already ran.
 #[allow(clippy::too_many_arguments)]
-fn try_walker_inline_property_get_named<Sym: WalkSym>(
+fn try_inline_property_get_named_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    descr_index: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    obj: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Ok(setup) = inline_fnaddr_call_setup(ctx, op.pc, descr_index, int_args, ref_args, &[])
+    else {
+        return Ok(None);
+    };
+    let Some(call_descr) = setup.descr.as_call_descr() else {
+        return Ok(None);
+    };
+    try_walker_inline_property_get_named(
+        ctx,
+        op,
+        code,
+        ref_args,
+        call_descr,
+        obj,
+        Wtf8::new(name),
+        dst,
+        dst_bank,
+        None,
+    )
+}
+
+/// 2-arg `getattr(obj, name)` spelling: recover a concrete `str` name.
+#[allow(clippy::too_many_arguments)]
+fn try_inline_property_get_from_name_op<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    descr_index: usize,
+    int_args: &[OpRef],
+    ref_args: &[OpRef],
+    obj: OpRef,
+    name_opref: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+    let Ok(setup) = inline_fnaddr_call_setup(ctx, op.pc, descr_index, int_args, ref_args, &[])
+    else {
+        return Ok(None);
+    };
+    let Some(call_descr) = setup.descr.as_call_descr() else {
+        return Ok(None);
+    };
+    if !name_opref.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_name as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[name_opref, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(name_opref, expected);
+    }
+    try_walker_inline_property_get_named(
+        ctx,
+        op,
+        code,
+        ref_args,
+        call_descr,
+        obj,
+        name,
+        dst,
+        dst_bank,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_property_get_named<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
@@ -14447,6 +14548,16 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+        // Same commit-then-NotImplemented abort as `binary_value_from_tag`:
+        // residualizing the named helper re-executes a committing dunder.
+        let both_user = args.iter().all(|&opref| {
+            walker_concrete_ref_object(ctx, opref).is_some_and(|obj| unsafe {
+                !pyre_object::is_int(obj) && !pyre_object::is_float(obj)
+            })
+        });
+        if both_user {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
     }
 
     // Jitted LOAD_ATTR is `PyFrame::load_attr` → `getattr_str`, not the
@@ -14471,10 +14582,28 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 None
             };
             let folded = if let Some((obj, name_opref)) = getattr_pair {
-                super::specialize::try_fold_inline_getattr(
+                if super::specialize::try_fold_inline_getattr(
                     ctx, op.pc, obj, name_opref, dst, dst_bank,
                 )?
                 .is_some()
+                {
+                    true
+                } else if let Some(inlined) = try_inline_property_get_from_name_op(
+                    ctx,
+                    op,
+                    code,
+                    descr_index,
+                    &[],
+                    &args,
+                    obj,
+                    name_opref,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -14508,6 +14637,24 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             } else if args.len() >= 3 {
                 (args[0], args[1], args[2])
             } else {
+                let obj = args[0];
+                let name_opref = args[1];
+                let unicode_name = walker_concrete_ref_object(ctx, name_opref).and_then(|n| {
+                    unsafe { pyre_object::w_str_get_wtf8(n).as_str().ok() }.map(str::to_string)
+                });
+                if let Some(outcome) =
+                    super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
+                        ctx,
+                        op,
+                        obj,
+                        None,
+                        0,
+                        0,
+                        unicode_name.as_deref(),
+                    )?
+                {
+                    return Ok(outcome);
+                }
                 return finish_getattr_inline_or_residual(
                     ctx,
                     code,
@@ -14534,6 +14681,20 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             {
                 return Ok(outcome);
             }
+            if let Some(outcome) =
+                super::specialize::try_walker_trace_readonly_descr_attr_raise_with_name(
+                    ctx,
+                    op,
+                    obj,
+                    value,
+                    0,
+                    0,
+                    unicode_name.as_deref(),
+                )?
+            {
+                return Ok(outcome);
+            }
+            fbw_binop_rewind_refuse_commit(ctx, op.pc, Some(obj))?;
             let folded = if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
                 && unsafe {
                     pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
@@ -15215,9 +15376,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
         // User instances that declined every fold (commit-then-NotImplemented)
         // must not walk `binary_value_from_tag`: that body records the
-        // dunder's store then snapshots a still-unboxed Ref.  Exact
-        // int/float operands stay on the walk so `i+1` / list indexes
-        // still lower.
+        // dunder's store then snapshots a still-unboxed Ref.  Residualizing
+        // re-executes the committing dunder at record time (`n` becomes N+1).
+        // Abort so the interpreter finishes the iteration once, matching the
+        // rewind refusal `try_walker_inline_user_binop` already took.
         if is_binary_from_tag {
             let both_user = ref_args.iter().all(|&opref| {
                 walker_concrete_ref_object(ctx, opref).is_some_and(|obj| unsafe {
@@ -15225,15 +15387,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 })
             });
             if both_user {
-                return finish_getattr_inline_or_residual(
-                    ctx,
-                    code,
-                    op,
-                    descr_index,
-                    &int_args,
-                    &ref_args,
-                    false,
-                );
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
         }
     }
@@ -15259,17 +15413,53 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             };
             let folded = if let (Some(obj), Some(name)) = (obj, str_name.as_deref()) {
                 guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
-                super::specialize::try_fold_inline_getattr_named(
+                if super::specialize::try_fold_inline_getattr_named(
                     ctx, op.pc, obj, name, dst, dst_bank,
                 )?
                 .is_some()
+                {
+                    true
+                } else if let Some(inlined) = try_inline_property_get_named_str(
+                    ctx,
+                    op,
+                    code,
+                    descr_index,
+                    &int_args,
+                    &ref_args,
+                    obj,
+                    name,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                } else {
+                    false
+                }
             } else if let (Some(obj), Some(&name_opref)) =
                 (obj, ref_args.get(1).filter(|_| ref_args.len() >= 2))
             {
-                super::specialize::try_fold_inline_getattr(
+                if super::specialize::try_fold_inline_getattr(
                     ctx, op.pc, obj, name_opref, dst, dst_bank,
                 )?
                 .is_some()
+                {
+                    true
+                } else if let Some(inlined) = try_inline_property_get_from_name_op(
+                    ctx,
+                    op,
+                    code,
+                    descr_index,
+                    &int_args,
+                    &ref_args,
+                    obj,
+                    name_opref,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                } else {
+                    false
+                }
             } else {
                 false
             };
@@ -15302,8 +15492,8 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             let obj = ref_args.first().copied();
             let value = ref_args.get(1).copied();
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
-            if let (Some(obj), Some(value)) = (obj, value)
-                && let Some(outcome) =
+            if let (Some(obj), Some(value)) = (obj, value) {
+                if let Some(outcome) =
                     super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
                         ctx,
                         op,
@@ -15313,8 +15503,23 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                         0,
                         str_name.as_deref(),
                     )?
-            {
-                return Ok(outcome);
+                {
+                    return Ok(outcome);
+                }
+                if let Some(outcome) =
+                    super::specialize::try_walker_trace_readonly_descr_attr_raise_with_name(
+                        ctx,
+                        op,
+                        obj,
+                        value,
+                        0,
+                        0,
+                        str_name.as_deref(),
+                    )?
+                {
+                    return Ok(outcome);
+                }
+                fbw_binop_rewind_refuse_commit(ctx, op.pc, Some(obj))?;
             }
             let folded =
                 if let (Some(obj), Some(value), Some(name)) = (obj, value, str_name.as_deref()) {
