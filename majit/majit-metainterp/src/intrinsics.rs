@@ -209,6 +209,37 @@ pub fn majit_uint_div(a: i64, b: i64) -> i64 {
     ((a as u64) / (b as u64)) as i64
 }
 
+/// Python-floor `/` over the int bank — `rint.py` `ll_int_py_div`.
+///
+/// Lowers to the `int.py_div` oopspec, which is the call
+/// `optimize_call_int_py_div` expands when the divisor is a constant.
+/// Rust `/` is the other helper (`_ll_2_int_floordiv`) and is not
+/// expanded. Same `b != 0` / no `INT_MIN / -1` precondition as the
+/// unsigned twin.
+#[inline]
+pub fn majit_int_py_div(a: i64, b: i64) -> i64 {
+    let d = a.wrapping_div(b);
+    if (a ^ b) < 0 && d.wrapping_mul(b) != a {
+        d.wrapping_sub(1)
+    } else {
+        d
+    }
+}
+
+/// Python-floor `%` over the int bank — `rint.py` `ll_int_py_mod`.
+///
+/// Lowers to `int.py_mod`, the call `optimize_call_int_py_mod` expands
+/// when the divisor is a constant. See [`majit_int_py_div`].
+#[inline]
+pub fn majit_int_py_mod(a: i64, b: i64) -> i64 {
+    let r = a.wrapping_rem(b);
+    if r != 0 && (r ^ b) < 0 {
+        r.wrapping_add(b)
+    } else {
+        r
+    }
+}
+
 /// Unsigned `%` over the int bank — `rint.py` `ll_uint_py_mod`, lowering to the
 /// `int.umod` oopspec residual call. Carries [`majit_uint_div`]'s `b != 0`
 /// precondition.
