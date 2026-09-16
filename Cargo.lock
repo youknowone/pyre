@@ -2825,6 +2825,7 @@ dependencies = [
  "mimalloc",
  "parking_lot",
  "pyre-interpreter",
+ "pyre-module",
  "pyre-object",
  "rustpython-wtf8",
  "serde",
@@ -2846,10 +2847,26 @@ dependencies = [
 name = "pyre-module"
 version = "0.0.2"
 dependencies = [
+ "ctor",
  "libc",
+ "linkme",
+ "majit-ir",
+ "majit-metainterp",
+ "majit-rlib",
+ "num-complex",
+ "num-traits",
+ "parking_lot",
+ "paste",
+ "pymath",
  "pyre-interpreter",
  "pyre-object",
+ "rustpython-common",
+ "rustpython-compiler",
+ "rustpython-compiler-core",
  "rustpython-host_env",
+ "rustpython-wtf8",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

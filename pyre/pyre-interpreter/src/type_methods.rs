@@ -3361,7 +3361,7 @@ pub(crate) fn clinic_arg_type_name(obj: PyObjectRef) -> String {
     arg_type_name(obj)
 }
 
-pub(crate) fn arg_type_name(obj: PyObjectRef) -> String {
+pub fn arg_type_name(obj: PyObjectRef) -> String {
     if obj.is_null() {
         return "object".to_string();
     }
@@ -4328,7 +4328,7 @@ pub(crate) fn call_registered_decode_error_handler(
 /// [`call_registered_decode_error_handler`] for a multibyte codec, which
 /// resumes in the buffer it started on whatever the handler did to
 /// `exc.object`.  Only the position comes back.
-pub(crate) fn call_registered_multibyte_decode_error_handler(
+pub fn call_registered_multibyte_decode_error_handler(
     err_mode: &str,
     codec: &str,
     data: &[u8],
@@ -4466,7 +4466,7 @@ fn call_decode_error_handler(
 /// Which upstream owns the encode error-handler call, mirroring
 /// [`DecodeResume`] on the decode side.  The two disagree over a handler
 /// position that does not fit the machine integer.
-pub(crate) enum EncodeErrorOwner {
+pub enum EncodeErrorOwner {
     /// `unicode_encode_call_errorhandler` — every codec in `unicodeobject.c`,
     /// including `charmap_encode` and the win32 code-page encoder.
     UnicodeObject,
@@ -4477,7 +4477,7 @@ pub(crate) enum EncodeErrorOwner {
 /// Replacement returned by a custom encode error handler: either a str
 /// (its code points, re-encoded by the codec) or raw bytes (copied
 /// verbatim). interp_codecs.py:69-72 rettype 'u' vs 'b'.
-pub(crate) enum EncodeReplacement {
+pub enum EncodeReplacement {
     Str(Vec<u32>),
     Bytes(Vec<u8>),
 }
@@ -4490,7 +4490,7 @@ pub(crate) enum EncodeReplacement {
 /// its own codec — the utf-* ones raise the ORIGINAL error when a
 /// replacement code point is not encodable — and copies
 /// `EncodeReplacement::Bytes` verbatim.
-pub(crate) fn call_registered_encode_error_handler(
+pub fn call_registered_encode_error_handler(
     err_mode: &str,
     codec: &str,
     source: PyObjectRef,

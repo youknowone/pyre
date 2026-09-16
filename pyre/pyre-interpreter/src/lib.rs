@@ -52,6 +52,10 @@
 //! import machinery (importing.rs), builtin functions (builtins.rs),
 //! type definitions (typedef.rs), and builtin modules (module/).
 
+// So `#[pyre_function]` / `#[pyre_class]` expansions can name
+// `::pyre_interpreter::` from this crate and from `pyre-module`.
+extern crate self as pyre_interpreter;
+
 // ── Bytecode / compiler re-exports (was pyre-bytecode) ──
 pub mod compile;
 pub use compile::*;
@@ -1121,7 +1125,8 @@ pub fn all_immortal_w_class_only_descriptors()
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.
 /// `pyre-object::pyobject::all_subclass_range_aliases` supplies the object
 /// layer; `init_typeobjects` passes both slices to the common numbering
-/// writer.
+/// writer. Extra aliases for types that live in `pyre-module` come from
+/// [`crate::importing::OptionalModuleHooks`].
 pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
     use pyre_object::lltype::PyreClassPyTypeOf;
     use pyre_object::pyobject::subclass_range_alias;
@@ -1136,7 +1141,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         unsafe { &*T::PYTYPE }
     }
 
-    vec![
+    let mut aliases = vec![
         subclass_range_alias(13, &crate::gateway::BUILTIN_CODE_TYPE),
         subclass_range_alias(14, &crate::function::FUNCTION_TYPE),
         subclass_range_alias(14, &crate::function::BUILTIN_FUNCTION_TYPE),
@@ -1165,7 +1170,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         ),
         subclass_range_alias(127, typed::<crate::module::_collections::W_DequeIter>()),
         subclass_range_alias(128, typed::<crate::module::_collections::W_DequeRevIter>()),
-        subclass_range_alias(129, typed::<crate::module::_tokenize::W_TokenizerIter>()),
         subclass_range_alias(
             130,
             typed::<crate::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
@@ -1195,10 +1199,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `_json.Scanner` and `_json.Encoder` extend the append-only managed
-        // payload tail without renumbering an established class.
-        subclass_range_alias(162, typed::<crate::module::_json::W_Scanner>()),
-        subclass_range_alias(163, typed::<crate::module::_json::W_Encoder>()),
         // `_hashlib`'s per-object digest/HMAC contexts follow their Python
         // owners and have sweep-time native-state destructors in build_gc.
         subclass_range_alias(164, typed::<crate::module::_hashlib::W_HashState>()),
@@ -1217,10 +1217,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(169, typed::<crate::module::zlib::W_Compress>()),
         subclass_range_alias(170, typed::<crate::module::zlib::W_Decompress>()),
         subclass_range_alias(171, typed::<crate::module::zlib::W_ZlibDecompressor>()),
-        // `_bz2`'s two stream objects own their libbz2 state and per-object
-        // lock.  Unconditional, so they stay ahead of the target-gated types.
-        subclass_range_alias(172, typed::<crate::module::_bz2::W_BZ2Compressor>()),
-        subclass_range_alias(173, typed::<crate::module::_bz2::W_BZ2Decompressor>()),
         // `_lzma`'s two stream objects own their liblzma coder, unconditional
         // for the same reason.
         subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
@@ -1263,12 +1259,6 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
-        // Windows asyncio's Overlapped owner follows mmap at the native tail.
-        // It is a non-subclassable builtin in Python, but still participates
-        // in the rclass hierarchy because its managed header and retained
-        // buffer/result fields are traced by the ordinary object marker.
-        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(196, typed::<crate::module::_overlapped::W_Overlapped>()),
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.
@@ -1403,7 +1393,11 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             CFFI_FIRST_TYPE_ID + 12,
             typed::<crate::module::_cffi_backend::wrapper::W_FunctionWrapper>(),
         ),
-    ]
+    ];
+    if let Some(hooks) = crate::importing::optional_module_hooks() {
+        aliases.extend((hooks.subclass_range_aliases)());
+    }
+    aliases
 }
 
 /// The rclass hierarchy present in this interpreter configuration.
@@ -1448,12 +1442,19 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
 // installed it: a traceback or warning raised on any interpreter thread has to
 // reach the same embedder, and on wasm32 `std::io::stderr().write_all`
 // discards the bytes outright, so a thread that saw no hook would lose them.
-// Both are plain `fn` pointers, so one atomic word each holds them and the
-// write path takes no lock.
+// Both are plain `fn` pointers, so one atomic word each holds them in
+// `IO_HOOKS` and the write path takes no lock.
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-static PRINT_HOOK: AtomicUsize = AtomicUsize::new(0);
-static STDERR_HOOK: AtomicUsize = AtomicUsize::new(0);
+struct ProcessIoHooks {
+    print: AtomicUsize,
+    stderr: AtomicUsize,
+}
+
+static IO_HOOKS: ProcessIoHooks = ProcessIoHooks {
+    print: AtomicUsize::new(0),
+    stderr: AtomicUsize::new(0),
+};
 
 fn store_hook(slot: &AtomicUsize, hook: fn(&[u8])) {
     slot.store(hook as usize, Ordering::Release);
@@ -1474,13 +1475,13 @@ fn load_hook(slot: &AtomicUsize) -> Option<fn(&[u8])> {
 /// `sys.stdout.buffer` caller made is handed over unmodified; decoding it is
 /// the embedder's decision, not a lossy conversion applied on the way out.
 pub fn set_print_hook(hook: fn(&[u8])) {
-    store_hook(&PRINT_HOOK, hook);
+    store_hook(&IO_HOOKS.print, hook);
 }
 
 /// Offer already-encoded `bytes` to the print hook. Returns whether a hook
 /// consumed them; `false` leaves the caller on its own descriptor path.
 pub fn print_hook_emit_bytes(bytes: &[u8]) -> bool {
-    match load_hook(&PRINT_HOOK) {
+    match load_hook(&IO_HOOKS.print) {
         Some(hook) => {
             hook(bytes);
             true
@@ -1615,13 +1616,13 @@ pub fn print_output(s: &str) {
 /// discards the bytes, so without a hook a traceback simply vanishes. The
 /// stdout twin is [`set_print_hook`].
 pub fn set_stderr_hook(hook: fn(&[u8])) {
-    store_hook(&STDERR_HOOK, hook);
+    store_hook(&IO_HOOKS.stderr, hook);
 }
 
 /// Offer `bytes` to the stderr hook. Returns whether a hook consumed them;
 /// `false` leaves the caller on its own descriptor path.
 pub fn stderr_hook_emit(bytes: &[u8]) -> bool {
-    match load_hook(&STDERR_HOOK) {
+    match load_hook(&IO_HOOKS.stderr) {
         Some(hook) => {
             hook(bytes);
             true

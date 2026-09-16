@@ -1169,7 +1169,7 @@ impl PyError {
 
     /// Rust's OS-error `Display` is `"{strerror} (os error {errno})"`;
     /// recover the bare strerror the way `rposix.strerror` reports it.
-    pub(crate) fn clean_strerror(errno: i32) -> String {
+    pub fn clean_strerror(errno: i32) -> String {
         // `from_raw_os_error` reads its argument as a Win32 code on Windows,
         // where these errnos are the POSIX ones `io_error_posix_errno`
         // translated to, so it would describe an unrelated system error (17 is
@@ -3267,7 +3267,7 @@ fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     render_rooted_exc_object_wtf8(exc_slot)
 }
 
-pub(crate) const MAX_SUGGESTION_CANDIDATES: usize = 750;
+pub const MAX_SUGGESTION_CANDIDATES: usize = 750;
 const MAX_SUGGESTION_STRING_SIZE: usize = 40;
 const SUGGESTION_MOVE_COST: usize = 2;
 const SUGGESTION_CASE_COST: usize = 1;
@@ -3352,7 +3352,7 @@ fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
     result
 }
 
-pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
+pub fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option<String> {
     if candidates.len() >= MAX_SUGGESTION_CANDIDATES {
         return None;
     }
@@ -4592,7 +4592,7 @@ fn format_obj_name(obj: PyObjectRef) -> Wtf8Buf {
 /// The Python-visible type, which is `w_class`; `ob_type` names the storage a
 /// value is laid out as, and a class deriving from a builtin shares its
 /// storage while presenting its own name.
-pub(crate) fn type_name_of(w_obj: PyObjectRef) -> String {
+pub fn type_name_of(w_obj: PyObjectRef) -> String {
     // A tagged int immediate is an exact builtin int; skip the ob_type deref.
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(w_obj) {
         return "int".to_string();

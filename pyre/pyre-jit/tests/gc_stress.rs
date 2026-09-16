@@ -102,13 +102,13 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     // Mirror `pyrex::real_main` startup, then `pyrex::run_source`.
     pyre_interpreter::stack_check::set_recursion_limit(5000)
         .map_err(|_| "set_recursion_limit failed".to_string())?;
+    pyre_module::register();
     init_jit_hooks();
     // Per-worker fresh GC heap: these tests share the process-global GC
     // singleton, so hide any prior test's residue before this one allocates.
     reset_gc_fresh_for_test();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    pyre_module::register();
     importing::init_sys_path(&cwd, cwd.as_os_str());
     // This harness never imports `site`, so perform the post-site `sys.path[0]`
     // insert directly.

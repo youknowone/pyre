@@ -16,10 +16,10 @@ dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 # compile-only placeholders and refuses unless `MAJIT_LLBC_EXTRACTION=1`, so
 # the only build that legitimately drops it is a Charon extraction pass of
 # `pyre-jit` — which is exactly where the host copy was dead weight.
-prepass = ["dep:pyre-interpreter", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir"]
+prepass = ["dep:pyre-interpreter", "dep:pyre-module", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir"]
 # Keep JIT-side module references in lockstep with the interpreter's sandbox
 # build, which drops the modules that reach the OS directly.
-sandbox = ["pyre-interpreter/sandbox"]
+sandbox = ["pyre-interpreter/sandbox", "pyre-module/sandbox"]
 test-support = []
 
 [dependencies]
@@ -28,6 +28,7 @@ bitflags = { workspace = true }
 indexmap = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+pyre-module = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
@@ -58,6 +59,11 @@ majit-ir = { workspace = true }
 majit-translate = { workspace = true, optional = true }
 mimalloc = { version = "0.1", optional = true }
 pyre-interpreter = { workspace = true, features = ["dynasm"], optional = true }
+# Same process as `jit_trace_fnaddrs()`: without this crate the
+# `#[pyre_methods]` wrappers that moved out of the interpreter never
+# join `BUILTIN_WRAPPER_DESCRIPTORS`, and every hot call to those
+# builtins takes the `no jitcode for address` residual.
+pyre-module = { workspace = true, optional = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 bincode = { workspace = true }

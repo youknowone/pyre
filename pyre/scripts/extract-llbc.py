@@ -140,7 +140,15 @@ SPECS: dict[str, CrateSpec] = {
         name="pyre-jit",
         crate_dir=ROOT / "pyre" / "pyre-jit",
         output_name="pyre-jit.ullbc",
-        charon_args=PYRE_RUNTIME_CHARON_ARGS,
+        # `eval.rs` names moved optional types (`_tokenize`, `_json`,
+        # `_bz2`, `math`) through `pyre_module`.  Without the opaque
+        # marker Charon would re-translate those bodies — and the
+        # rustpython_common engines they call — into pyre-jit.ullbc.
+        charon_args=[
+            *PYRE_RUNTIME_CHARON_ARGS,
+            "--opaque",
+            "pyre_module",
+        ],
         # `--no-default-features` drops `prepass` and nothing else (`dynasm` is
         # the other default and is named): `pyre-jit-trace`'s build script
         # then writes its placeholders without build-depending on a host copy

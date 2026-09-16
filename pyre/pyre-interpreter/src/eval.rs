@@ -1422,8 +1422,9 @@ fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     crate::module::thread::walk_thread_roots(visitor);
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     crate::module::_ctypes::cdata::walk_pyobj_container_roots(visitor);
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    crate::module::faulthandler::handler::walk_faulthandler_roots(visitor);
+    if let Some(hooks) = crate::importing::optional_module_hooks() {
+        (hooks.walk_global_roots)(visitor);
+    }
 }
 
 /// Install the interpreter's process-global GC root walker with the majit-gc
@@ -1540,9 +1541,9 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // first `_ast` import without a dirty bit, and the only owner of the
         // classes between one `_ast` module dict and the next.
         crate::module::_ast::moduledef::walk_ast_state_gc(&mut fwd);
-        // `_csvstate.dialects` is published on the first `_csv` import and
-        // fills with young dialect objects afterwards, so it belongs here too.
-        crate::module::_csv::walk_csv_state_gc(&mut fwd);
+        if let Some(hooks) = crate::importing::optional_module_hooks() {
+            (hooks.walk_prebuilt_slots)(&mut fwd);
+        }
     }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;

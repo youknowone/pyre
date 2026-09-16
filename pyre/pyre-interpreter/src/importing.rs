@@ -499,14 +499,32 @@ pub(crate) static BUILTIN_MODULES: LazyLock<Mutex<HashMap<&'static str, BuiltinM
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Optional modules live in `pyre-module` so this crate does not depend on
-/// them. The final binary links both and installs the hook before
-/// [`install_builtin_modules`].
-static OPTIONAL_BUILTIN_MODULES: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+/// them. The final binary links both and installs the hooks once before
+/// [`install_builtin_modules`]. PyPy freezes the same surface at
+/// translation (`ObjSpace.get_builtinmodule_to_install` /
+/// `config.objspace.usemodules`); one write-once record is that boot
+/// install, not four independent caches.
+pub struct OptionalModuleHooks {
+    pub install_modules: fn(),
+    pub walk_global_roots: fn(&mut dyn FnMut(&mut majit_ir::GcRef)),
+    pub walk_prebuilt_slots: fn(&mut dyn FnMut(&mut PyObjectRef)),
+    pub subclass_range_aliases: fn() -> Vec<pyre_object::pyobject::SubclassRangeAlias>,
+    /// Residual addresses whose functions live in `pyre-module` (`ll_math`
+    /// hypot/atan2/…). `jit_trace_fnaddrs` appends these after the
+    /// interpreter-owned table.
+    pub publish_fnaddrs: fn(&mut Vec<(&'static str, i64)>),
+}
 
-/// Install the `pyre-module` registry. Call once from the binary before
+static OPTIONAL_MODULE_HOOKS: std::sync::OnceLock<OptionalModuleHooks> = std::sync::OnceLock::new();
+
+/// Install the `pyre-module` hooks. Call once from the binary before
 /// [`init_sys_path`] / [`install_builtin_modules`].
-pub fn set_optional_builtin_modules(install: fn()) {
-    let _ = OPTIONAL_BUILTIN_MODULES.set(install);
+pub fn set_optional_module_hooks(hooks: OptionalModuleHooks) {
+    let _ = OPTIONAL_MODULE_HOOKS.set(hooks);
+}
+
+pub fn optional_module_hooks() -> Option<&'static OptionalModuleHooks> {
+    OPTIONAL_MODULE_HOOKS.get()
 }
 
 thread_local! {
@@ -664,8 +682,6 @@ pub fn install_builtin_modules() {
     }
 
     // Core pyre modules backed by `interpleveldefs` tables.
-    pyre_install_module!(math);
-    pyre_install_module!(cmath);
     pyre_install_module!(time);
     pyre_install_module!(sys);
     // `moduledef.py applevel_name = '_operator'` — the interp-level table
@@ -689,11 +705,6 @@ pub fn install_builtin_modules() {
     // COM and is therefore present only on an unsandboxed Windows host.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(_wmi);
-    // PyPy's `lib_pypy/_overlapped.py`: asyncio's proactor backend owns one
-    // OVERLAPPED record per operation and reaches the Win32/WinSock calls
-    // through this Windows-only builtin.
-    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    pyre_install_module!(_overlapped);
     // `importlib._bootstrap_external` eagerly `import winreg`s on win32; the
     // module must exist for the import machinery (and `import site`) to start.
     #[cfg(windows)]
@@ -707,8 +718,6 @@ pub fn install_builtin_modules() {
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(winsound);
     pyre_install_module!(_abc);
-    pyre_install_module!(_bisect);
-    pyre_install_module!(_heapq);
 
     // Frozen importlib imports `_stat` while bootstrapping a sandbox that
     // deliberately mounts no stdlib files, so it must stay a builtin.
@@ -717,19 +726,11 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
-    pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
     // PyPy `_codecs/moduledef.py:87-100 Module.__init__` performs this beside
     // MixedModule installation, not inside the translated CodecState ctor.
     crate::module::_codecs::register_builtin_error_handlers();
-    pyre_install_module!(_codecs_cn);
-    pyre_install_module!(_codecs_jp);
-    pyre_install_module!(_codecs_iso2022);
-    pyre_install_module!(_codecs_hk);
-    pyre_install_module!(_codecs_kr);
-    pyre_install_module!(_codecs_tw);
-    pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
     // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a
     // module literally named `posix` does not exist. os.py picks `os.name` and
@@ -745,8 +746,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(errno);
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
-    pyre_install_module!(_opcode);
-    pyre_install_module!(_suggestions);
     pyre_install_module!("_imp"(imp));
 
     // importlib package and its submodules load their real source from disk:
@@ -766,12 +765,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
 
     pyre_install_module!(atexit);
-    // faulthandler installs host signal handlers and writes tracebacks to a raw
-    // fd, neither of which is mediated; like the other host-access modules below
-    // the sandbox interpreter omits it (PyPy keeps it out of default_modules
-    // under translation.sandbox).
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-    pyre_install_module!(faulthandler);
 
     // Host-access modules — network (`_socket`), arbitrary FFI (`_ctypes`),
     // subprocess/`fork`+`exec` (`_posixsubprocess`), shared memory
@@ -797,16 +790,7 @@ pub fn install_builtin_modules() {
         #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(pwd);
 
-        // `host_env` as well as `unix`: both are wholly gated on that pair, so
-        // without it `sys.builtin_module_names` would advertise a module whose
-        // every call raises.
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(resource);
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(fcntl);
         pyre_install_module!(select);
-        #[cfg(unix)]
-        pyre_install_module!(termios);
         // `socket.py`'s module body subclasses `_socket.socket`, so the type
         // has to be there even where nothing can be connected: a target with
         // no host layer publishes it and the numbers, and leaves out the
@@ -823,36 +807,20 @@ pub fn install_builtin_modules() {
             not(target_arch = "wasm32")
         ))]
         pyre_install_module!(_cffi_backend);
-        // Both are POSIX-only upstream, and their callers know it:
-        // `shared_memory.py` and `resource_tracker.py` import `_posixshmem`
-        // only in their `os.name != 'nt'` arm, and `subprocess.py` imports
-        // `_posixsubprocess` only in the `else` of `if _mswindows`.  PyPy's
-        // pypyoption drops `_posixsubprocess` from `working_modules` on
-        // win32 and builds `_posixshmem` as a cffi shim that Windows never
-        // gets.  Registering an empty module here instead flips availability
-        // probes such as `test_audit`'s `import_module("_posixsubprocess")`
-        // from skip to run.
-        #[cfg(unix)]
-        pyre_install_module!(_posixsubprocess);
-        pyre_install_module!(_multiprocessing);
     }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
     pyre_install_module!(_pypy_generic_alias);
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
-    pyre_install_module!(binascii);
     pyre_install_module!(marshal);
     pyre_install_module!(zlib);
-    pyre_install_module!(_bz2);
     pyre_install_module!(_lsprof);
     pyre_install_module!(_lzma);
     pyre_install_module!(_typing);
-    pyre_install_module!(_template);
     pyre_install_module!(_hashlib);
     pyre_install_module!(gc);
     pyre_install_module!(unicodedata);
-    pyre_install_module!(pyexpat);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub
@@ -866,17 +834,8 @@ pub fn install_builtin_modules() {
         crate::module::array::init_array_module,
         crate::module::array::startup_array_module,
     );
-    register_builtin_module("_csv", crate::module::_csv::init);
     register_builtin_module("_queue", crate::module::_queue::init);
-    register_builtin_module("_statistics", crate::module::_statistics::init);
     register_builtin_module("_types", crate::module::_types::init);
-    register_builtin_module("_json", crate::module::_json::init);
-    register_builtin_module("_tokenize", crate::module::_tokenize::init);
-    // `_scproxy` is built only on macOS, and `urllib.request` reaches it only
-    // under `sys.platform == 'darwin'`. Registering it anywhere else puts a
-    // name in `sys.builtin_module_names` that no host has.
-    #[cfg(target_os = "macos")]
-    register_builtin_module("_scproxy", init_scproxy);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
     register_builtin_module("_sysconfig", init_sysconfig_stub);
@@ -885,8 +844,8 @@ pub fn install_builtin_modules() {
     // `_init_non_posix` and never names this module.
     #[cfg(not(windows))]
     register_builtin_module("_sysconfigdata", init_sysconfigdata);
-    if let Some(install) = OPTIONAL_BUILTIN_MODULES.get() {
-        install();
+    if let Some(hooks) = optional_module_hooks() {
+        (hooks.install_modules)();
     }
 }
 
@@ -1588,40 +1547,6 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ns,
         "_get_object_traceback",
         crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
-    );
-    Ok(())
-}
-
-/// `_scproxy` — the macOS SystemConfiguration proxy probe that
-/// `urllib.request.getproxies_macosx_sysconf` / `proxy_bypass_macosx_sysconf`
-/// import.  Report "no system proxy configured" so the import succeeds and
-/// proxy resolution yields an empty mapping.
-#[cfg(target_os = "macos")]
-fn init_scproxy(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
-        "_get_proxies",
-        crate::make_builtin_function("_get_proxies", |_| Ok(pyre_object::w_dict_new())),
-    );
-    crate::module_ns_store(
-        ns,
-        "_get_proxy_settings",
-        crate::make_builtin_function("_get_proxy_settings", |_| {
-            // The `dict` moves across the allocations each store makes.
-            let roots = pyre_object::gc_roots::push_roots();
-            let d_slot = roots.base();
-            let _ = roots.pin_root(pyre_object::w_dict_new());
-            unsafe {
-                let w_key = pyre_object::w_str_new("exclude_simple");
-                let w_value = pyre_object::w_bool_from(false);
-                pyre_object::w_dict_store(roots.get(d_slot), w_key, w_value);
-                let key_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = roots.pin_root(pyre_object::w_str_new("exceptions"));
-                let w_value = pyre_object::w_list_new(Vec::new());
-                pyre_object::w_dict_store(roots.get(d_slot), roots.get(key_slot), w_value);
-            }
-            Ok(roots.get(d_slot))
-        }),
     );
     Ok(())
 }

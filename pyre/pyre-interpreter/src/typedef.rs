@@ -3532,7 +3532,7 @@ fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 ///
 /// `__self__` is the owning type, stamped at type-finalisation by
 /// [`stamp_new_descr_self`] because the type does not exist yet here.
-pub(crate) fn make_new_descr(
+pub fn make_new_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
     crate::gateway::make_builtin_function_as_builtin("__new__", func)
@@ -3560,7 +3560,7 @@ pub(crate) fn make_new_descr_with_signature(
 /// [`make_new_descr`] optionally carrying a `Signature`: `Some` binds keyword
 /// arguments by name before the constructor runs; `None` (a variadic
 /// whole-args `__new__`) keeps the positional-only carrier.
-pub(crate) fn make_new_descr_maybe_sig(
+pub fn make_new_descr_maybe_sig(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
     signature: Option<crate::gateway::Signature>,
 ) -> PyObjectRef {
@@ -4805,7 +4805,7 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// `hasuserdel`, so tagging must precede registration. Registering an
 /// instance whose type has no `__del__` is a no-op, the hook gates on
 /// `hasuserdel` exactly as upstream does.
-pub(crate) fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
+pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
     unsafe { store_subclass_tag(obj, sub) };
     pyre_object::gc_hook::maybe_register_finalizer(obj);
     obj
@@ -12272,7 +12272,7 @@ fn make_getset_descriptor(getter: pyre_object::PyObjectRef) -> pyre_object::PyOb
 /// descriptor's `name` (so `dict_descr.__name__` is `"__dict__"`,
 /// `weakref_descr.__name__` is `"__weakref__"`, etc.) — without this
 /// pyre's descriptors would all surface as `"<generic property>"`.
-pub(crate) fn make_getset_descriptor_named(
+pub fn make_getset_descriptor_named(
     getter: pyre_object::PyObjectRef,
     name: &str,
 ) -> pyre_object::PyObjectRef {
@@ -21350,7 +21350,7 @@ static __majit_wrap_float_descr_as_integer_ratio_target: crate::gateway::Builtin
     };
 
 #[derive(Copy, Clone)]
-pub(crate) enum FloatToIntMode {
+pub enum FloatToIntMode {
     Trunc,
     Floor,
     Ceil,
@@ -21360,7 +21360,7 @@ pub(crate) enum FloatToIntMode {
 /// NaN → ValueError, ±inf → OverflowError; finite values are reduced
 /// to int and materialised through the BigInt path so values outside
 /// i64 range produce a long rather than saturating.
-pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate::PyError> {
+pub fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef, crate::PyError> {
     if v.is_nan() {
         return Err(crate::PyError::value_error(
             "cannot convert float NaN to integer",
@@ -23733,9 +23733,7 @@ fn bytes_method_rstrip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 /// bytes / bytearray methods accept any buffer argument the way
 /// `space.buffer_w(w_obj, space.BUF_SIMPLE)` does upstream, without treating a
 /// memoryview as bytes-like elsewhere.
-pub(crate) fn buffer_as_bytes_like(
-    obj: PyObjectRef,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
     if let Some(target) = crate::module::__pypy__::interp_buffer::forwarded_exporter(obj) {
         return buffer_as_bytes_like(target?);
     }
@@ -23789,7 +23787,7 @@ pub(crate) fn buffer_as_bytes_like(
 /// An operand a bytes method consumes as one byte run is refused when its
 /// export is strided; only the `BUF_FULL_RO` request the `bytes()` /
 /// `bytearray()` constructors make linearises such a source.
-pub(crate) fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
+pub fn require_contiguous_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
     unsafe {
         if pyre_object::memoryview::is_w_memoryview(obj) {
             crate::builtins::memoryview_check_released(obj)?;
@@ -25427,7 +25425,7 @@ pub(crate) fn utf8_decode_error_from(bytes: &[u8], pos: usize) -> crate::PyError
     unicode_decode_error("utf-8", bytes, start, end.min(bytes.len()), reason)
 }
 
-pub(crate) fn unicode_decode_error(
+pub fn unicode_decode_error(
     encoding: &str,
     data: &[u8],
     start: usize,
@@ -25473,7 +25471,7 @@ pub(crate) fn unicode_decode_error(
 /// `pyparse.py recode_to_utf8` takes this same encode, and it is strict:
 /// a lone surrogate has no UTF-8 spelling, so the text is reported rather than
 /// silently rewritten with U+FFFD.
-pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
+pub fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
     if let Ok(s) = text.as_str() {
         return Ok(s.to_owned());
     }
@@ -25497,7 +25495,7 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
 /// `W_UnicodeEncodeError.descr_init` (interp_exceptions.py) so the
 /// caught exception carries the full attribute set, not just a message.
 /// `.object` holds the whole str; `start`/`end` index code points into it.
-pub(crate) fn unicode_encode_error(
+pub fn unicode_encode_error(
     encoding: &str,
     w_object: PyObjectRef,
     start: i64,
@@ -26043,7 +26041,7 @@ fn unicode_check_encoding_errors(encoding: &str, errors: &str) -> Result<(), cra
 
 /// Decode `data` under `encoding`/`errors` into a WTF-8 string, dispatching on
 /// the codec name the same way `bytes.decode` does.
-pub(crate) fn decode_bytes_to_wtf8(
+pub fn decode_bytes_to_wtf8(
     data: &[u8],
     encoding: &str,
     errors: &str,
