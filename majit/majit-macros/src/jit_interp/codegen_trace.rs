@@ -564,6 +564,17 @@ pub(crate) fn local_init_has_side_effect(local: &syn::Local) -> bool {
     expr_has_pre_merge_side_effect(&init.expr)
 }
 
+/// Dispatch portals skip an unlowerable prefix `let` so the machine still
+/// installs (`jit_interp_macro_init_is_opaque` `pick!`). Matchless portals
+/// have no opcode arms to degrade, so [`local_init_has_side_effect`] still
+/// compile-errors on unrecognized macros.
+pub(crate) fn local_init_has_mutating_effect(local: &syn::Local) -> bool {
+    let Some(init) = &local.init else {
+        return false;
+    };
+    expr_has_mutating_effect(&init.expr)
+}
+
 fn expr_is_tracing_hint_call(func: &syn::Expr) -> bool {
     is_promote_call_path(func)
         || is_assert_not_none_call_path(func)
@@ -582,10 +593,19 @@ fn path_ends_with(path: &syn::Path, name: &str) -> bool {
     path.segments.last().is_some_and(|seg| seg.ident == name)
 }
 
+fn expr_has_mutating_effect(expr: &syn::Expr) -> bool {
+    expr_has_pre_merge_effect(expr, false)
+}
+
 fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
+    expr_has_pre_merge_effect(expr, true)
+}
+
+fn expr_has_pre_merge_effect(expr: &syn::Expr, reject_macros: bool) -> bool {
     use syn::visit::Visit;
     struct Finder {
         hit: bool,
+        reject_macros: bool,
     }
     impl<'ast> Visit<'ast> for Finder {
         fn visit_expr_assign(&mut self, _: &'ast syn::ExprAssign) {
@@ -603,9 +623,11 @@ fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
         }
         fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
             // syn::visit treats a macro body as opaque, so `tick!(state)`
-            // would otherwise look side-effect-free. Reject unrecognized
-            // expression macros; tracing hints stay allowed.
-            if !expr_is_tracing_hint_macro(node) {
+            // would otherwise look side-effect-free. Matchless portals
+            // reject unrecognized expression macros; tracing hints stay
+            // allowed. Dispatch bind_pre_merge skips them so `pick!`
+            // still installs the machine.
+            if self.reject_macros && !expr_is_tracing_hint_macro(node) {
                 self.hit = true;
             }
             syn::visit::visit_expr_macro(self, node);
@@ -648,7 +670,10 @@ fn expr_has_pre_merge_side_effect(expr: &syn::Expr) -> bool {
             syn::visit::visit_expr_binary(self, node);
         }
     }
-    let mut finder = Finder { hit: false };
+    let mut finder = Finder {
+        hit: false,
+        reject_macros,
+    };
     finder.visit_expr(expr);
     finder.hit
 }

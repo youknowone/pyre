@@ -767,7 +767,7 @@ pub(super) fn bind_pre_merge_point_stmts(
             // prefix-only and can be skipped — `jit_merge_point` is
             // the compiled header.
             if lowerer.lower_local(local).is_none()
-                && crate::jit_interp::codegen_trace::local_init_has_side_effect(local)
+                && crate::jit_interp::codegen_trace::local_init_has_mutating_effect(local)
             {
                 return None;
             }
