@@ -33,7 +33,7 @@ gc_stress = ["majit-gc/gc_stress"]
 # Keep JIT-side module references in lockstep with the interpreter's sandbox
 # surface.  In particular, native networking modules such as `_ssl` are
 # compiled out of pyre-interpreter under this feature.
-sandbox = ["pyre-interpreter/sandbox", "pyre-jit-trace/sandbox"]
+sandbox = ["pyre-interpreter/sandbox", "pyre-jit-trace/sandbox", "pyre-module/sandbox"]
 # Select the host binding for the wasm backend (only meaningful on
 # wasm32). `wasm-web` instantiates JIT traces through the browser
 # `WebAssembly` API; `wasm-host` through plain wasm imports a native
@@ -47,6 +47,7 @@ indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+pyre-module = { workspace = true }
 num-traits = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }

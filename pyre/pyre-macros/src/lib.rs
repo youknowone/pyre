@@ -15,7 +15,7 @@
 //!
 //! ```ignore
 //! fn stack_effect(args: &[pyre_object::PyObjectRef])
-//!     -> Result<pyre_object::PyObjectRef, crate::PyError>
+//!     -> Result<pyre_object::PyObjectRef, ::pyre_interpreter::PyError>
 //! {
 //!     let opcode: i64 = unsafe { pyre_object::w_int_get_value(args[0]) };
 //!     Ok(pyre_object::w_int_new(__stack_effect_user(opcode)))
@@ -38,7 +38,7 @@
 //! * `bool` — `w_bool_from`.
 //! * `String` — `w_str_new_managed`.
 //! * `pyre_object::PyObjectRef` — passthrough.
-//! * `Result<T, crate::PyError>` — `?`-propagated, then `T` wrapped.
+//! * `Result<T, ::pyre_interpreter::PyError>` — `?`-propagated, then `T` wrapped.
 //! * `()` — `w_none()`.
 
 use proc_macro::TokenStream;
@@ -127,20 +127,20 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let req_lits = param_required.iter().map(|b| quote! { #b });
         let fn_name_str = user_name.to_string();
         quote! {
-            let __pyre_has_kwargs = crate::builtins::has_builtin_kwargs(args);
+            let __pyre_has_kwargs = ::pyre_interpreter::builtins::has_builtin_kwargs(args);
             // `bind_kwargs_to_signature` pads `args` out to the full
             // parameter count with PY_NULL, so keyword-only slots and absent
             // optionals would otherwise be counted as positional.  PY_NULL is
             // never a real argument, so the leading non-null run is the true
             // positional count on both the bound and the raw path.
             let __pyre_positional_count =
-                crate::builtins::leading_non_null_count(crate::builtins::split_builtin_kwargs(args).0);
+                ::pyre_interpreter::builtins::leading_non_null_count(::pyre_interpreter::builtins::split_builtin_kwargs(args).0);
             const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
             const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
             let __pyre_bound_args;
             let args: &[::pyre_object::PyObjectRef] =
                 if __pyre_has_kwargs {
-                    __pyre_bound_args = crate::builtins::bind_builtin_kwargs(
+                    __pyre_bound_args = ::pyre_interpreter::builtins::bind_builtin_kwargs(
                         args,
                         __PYRE_PARAM_NAMES,
                         __PYRE_PARAM_REQUIRED,
@@ -192,19 +192,19 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 if __pyre_positional_count > #total as i64
                     && args.len() != __PYRE_PARAM_NAMES.len()
                 {
-                    return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
+                    return ::std::result::Result::Err(::pyre_interpreter::PyError::type_error(#too_many));
                 }
             }
         } else {
             quote! {
                 if __pyre_positional_count > #total as i64 {
-                    return ::std::result::Result::Err(crate::PyError::type_error(#too_many));
+                    return ::std::result::Result::Err(::pyre_interpreter::PyError::type_error(#too_many));
                 }
             }
         };
         quote! {
             if __pyre_positional_count < #required as i64 {
-                return ::std::result::Result::Err(crate::PyError::type_error(#too_few));
+                return ::std::result::Result::Err(::pyre_interpreter::PyError::type_error(#too_few));
             }
             #too_many_guard
         }
@@ -237,7 +237,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let wrapper = quote! {
         #vis fn #user_name(
             args: &[::pyre_object::PyObjectRef],
-        ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
+        ) -> ::std::result::Result<::pyre_object::PyObjectRef, ::pyre_interpreter::PyError> {
             #kwargs_preamble
             #count_preamble
             #(#unwrap_stmts)*
@@ -298,14 +298,14 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         quote! { ::std::option::Option::None }
     } else {
         quote! {
-            let mut __b = crate::SignatureBuilder::default();
+            let mut __b = ::pyre_interpreter::SignatureBuilder::default();
             #(#sig_stmts)*
             ::std::option::Option::Some(__b.signature())
         }
     };
     let sig_fn = quote! {
         #[allow(dead_code)]
-        #vis fn #sig_fn_name() -> ::std::option::Option<crate::Signature> {
+        #vis fn #sig_fn_name() -> ::std::option::Option<::pyre_interpreter::Signature> {
             #sig_body
         }
     };
@@ -320,7 +320,7 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let arity_fn_name = format_ident!("{}_pyre_arity", user_name);
     let natural_arity =
         if has_varargs || has_kw_markers || param_required.iter().any(|required| !required) {
-            quote! { crate::HOPELESS }
+            quote! { ::pyre_interpreter::HOPELESS }
         } else {
             let n = param_positional
                 .iter()
@@ -406,7 +406,7 @@ fn unwrap_arg(
                 {
                     if #idx >= args.len() || args[#idx].is_null() {
                         return ::std::result::Result::Err(
-                            crate::PyError::type_error(#missing_err)
+                            ::pyre_interpreter::PyError::type_error(#missing_err)
                         );
                     }
                     #unwrap
@@ -496,7 +496,7 @@ fn typed_alias(
                     let __a = args[#idx];
                     if !unsafe { #check(__a) } {
                         return ::std::result::Result::Err(
-                            crate::PyError::type_error(format!(
+                            ::pyre_interpreter::PyError::type_error(format!(
                                 "argument {} must be {}", #idx, #name
                             )),
                         );
@@ -520,7 +520,7 @@ fn typed_alias(
         "PyFrozenSet" => passthrough(quote! { ::pyre_object::is_frozenset }),
         "PyPath" => (
             quote! { ::std::vec::Vec<u8> },
-            quote! { crate::gateway::fsencode_bytes_w(args[#idx])? },
+            quote! { ::pyre_interpreter::gateway::fsencode_bytes_w(args[#idx])? },
         ),
         "PyIndex" => (
             // Mirrors PyPy `space.getindex_w(w_obj, None)`: consults
@@ -529,7 +529,7 @@ fn typed_alias(
             // TypeError when the object has no `__index__` and is not
             // already int-like.
             quote! { i64 },
-            quote! { crate::baseobjspace::getindex_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::getindex_w(args[#idx])? },
         ),
         "PyIndexInt" => (
             // CPython 3.14 Argument Clinic `int` parameters that accept the
@@ -538,7 +538,7 @@ fn typed_alias(
             // huge bigint to i64::{MIN,MAX}.
             quote! { i64 },
             quote! {
-                crate::baseobjspace::index_int_w_preserve_negative(args[#idx])?
+                ::pyre_interpreter::baseobjspace::index_int_w_preserve_negative(args[#idx])?
             },
         ),
         "PyIndexCInt" => (
@@ -547,42 +547,42 @@ fn typed_alias(
             // does not serve: its converter reaches the value through
             // `__int__` first, which the index protocol does not.
             quote! { i32 },
-            quote! { crate::baseobjspace::index_c_int_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::index_c_int_w(args[#idx])? },
         ),
         // Integer aliases — route through the `space.gateway_nonnegint_w`
         // / `space.c_*_w` converters in baseobjspace.rs so the range / sign
         // checks and their exception messages live in one place.
         "PyNonNegInt" => (
             quote! { i64 },
-            quote! { crate::baseobjspace::gateway_nonnegint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::gateway_nonnegint_w(args[#idx])? },
         ),
         "PyCInt" => (
             quote! { i32 },
-            quote! { crate::baseobjspace::c_int_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_int_w(args[#idx])? },
         ),
         "PyCUInt" => (
             quote! { u32 },
-            quote! { crate::baseobjspace::c_uint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_uint_w(args[#idx])? },
         ),
         "PyCShort" => (
             quote! { i16 },
-            quote! { crate::baseobjspace::c_short_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_short_w(args[#idx])? },
         ),
         "PyCUShort" => (
             quote! { u16 },
-            quote! { crate::baseobjspace::c_ushort_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_ushort_w(args[#idx])? },
         ),
         "PyCUidT" => (
             quote! { u32 },
-            quote! { crate::baseobjspace::c_uid_t_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_uid_t_w(args[#idx])? },
         ),
         "PyTruncatedInt" => (
             quote! { i64 },
-            quote! { crate::baseobjspace::truncatedint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::truncatedint_w(args[#idx])? },
         ),
         "PyText0" => (
             quote! { &'static str },
-            quote! { crate::baseobjspace::text0_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::text0_w(args[#idx])? },
         ),
         "PyBytes0" => (
             // space.bytes0_w — bytes_w plus a rejection of embedded NUL.
@@ -591,7 +591,7 @@ fn typed_alias(
                 {
                     if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
                         return ::std::result::Result::Err(
-                            crate::PyError::type_error(
+                            ::pyre_interpreter::PyError::type_error(
                                 format!("argument {} must be bytes-like", #idx)
                             )
                         );
@@ -599,7 +599,7 @@ fn typed_alias(
                     let __b = unsafe { ::pyre_object::bytesobject::bytes_like_data(args[#idx]) };
                     if __b.contains(&0) {
                         return ::std::result::Result::Err(
-                            crate::PyError::value_error(
+                            ::pyre_interpreter::PyError::value_error(
                                 "embedded null byte".to_string()
                             )
                         );
@@ -616,7 +616,7 @@ fn typed_alias(
                 if unsafe { ::pyre_object::is_none(args[#idx]) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(crate::gateway::fsencode_bytes_w(args[#idx])?)
+                    ::std::option::Option::Some(::pyre_interpreter::gateway::fsencode_bytes_w(args[#idx])?)
                 }
             },
         ),
@@ -625,11 +625,11 @@ fn typed_alias(
         // utf8 buffer, differing only in the TypeError message they raise.
         "PyUnicode" => (
             quote! { &'static str },
-            quote! { crate::baseobjspace::realunicode_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::realunicode_w(args[#idx])? },
         ),
         "PyUtf8" => (
             quote! { &'static str },
-            quote! { crate::baseobjspace::utf8_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::utf8_w(args[#idx])? },
         ),
         "PyTextOrNone" => (
             // space.text_or_none_w — None passes through, otherwise text_w.
@@ -638,7 +638,7 @@ fn typed_alias(
                 if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(crate::baseobjspace::text_w(args[#idx])?)
+                    ::std::option::Option::Some(::pyre_interpreter::baseobjspace::text_w(args[#idx])?)
                 }
             },
         ),
@@ -649,17 +649,17 @@ fn typed_alias(
                 if args[#idx].is_null() || unsafe { ::pyre_object::is_none(args[#idx]) } {
                     ::std::option::Option::None
                 } else {
-                    ::std::option::Option::Some(crate::baseobjspace::text0_w(args[#idx])?)
+                    ::std::option::Option::Some(::pyre_interpreter::baseobjspace::text0_w(args[#idx])?)
                 }
             },
         ),
         "PyBufferStr" => (
             quote! { ::std::vec::Vec<u8> },
-            quote! { crate::baseobjspace::charbuf_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::charbuf_w(args[#idx])? },
         ),
         "PyCNonNegInt" => (
             quote! { i32 },
-            quote! { crate::baseobjspace::c_nonnegint_w(args[#idx])? },
+            quote! { ::pyre_interpreter::baseobjspace::c_nonnegint_w(args[#idx])? },
         ),
         _ => return None,
     })
@@ -702,7 +702,7 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
                     {
                         if !unsafe { ::pyre_object::bytesobject::is_bytes_like(args[#idx]) } {
                             return ::std::result::Result::Err(
-                                crate::PyError::type_error(
+                                ::pyre_interpreter::PyError::type_error(
                                     format!("argument {} must be bytes-like", #idx)
                                 )
                             );
@@ -719,7 +719,7 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
             && path_is_ident(&p.path, "str")
         {
             return Ok(quote! {
-                crate::baseobjspace::str_utf8_w(args[#idx])?
+                ::pyre_interpreter::baseobjspace::str_utf8_w(args[#idx])?
             });
         }
     }
@@ -901,7 +901,7 @@ fn wrap_return(
         ReturnType::Type(_, t) => &**t,
     };
 
-    // `Result<T, crate::PyError>` — propagate via `?`, then wrap T.
+    // `Result<T, ::pyre_interpreter::PyError>` — propagate via `?`, then wrap T.
     if let Some(inner) = result_pyerror_inner(ty) {
         let wrap = wrap_value_expr(inner, quote! { __pyre_v })?;
         return Ok(quote! {
@@ -982,7 +982,7 @@ fn wrap_value_expr(
                         return Ok(quote! {
                             ::pyre_object::w_list_new(
                                 (#value).into_iter()
-                                    .map(<_ as crate::PywrapKind>::into_py)
+                                    .map(<_ as ::pyre_interpreter::PywrapKind>::into_py)
                                     .collect()
                             )
                         });
@@ -1045,7 +1045,7 @@ fn path_is_ident(p: &syn::Path, name: &str) -> bool {
     p.segments.len() == 1 && p.segments[0].ident == name
 }
 
-/// If `ty` is `Result<T, crate::PyError>` (or `PyError` short form), return `&T`.
+/// If `ty` is `Result<T, ::pyre_interpreter::PyError>` (or `PyError` short form), return `&T`.
 fn result_pyerror_inner(ty: &Type) -> Option<&Type> {
     let ty = unwrap_type_group(ty);
     let Type::Path(p) = ty else { return None };
@@ -1935,14 +1935,14 @@ fn expand_pyre_methods(
                 // becomes an aggregate and a `call_once` in every wrapper.
                 let recv_check = quote! {
                     if args.len() < #needed || args[#self_idx].is_null() {
-                        return crate::gateway::receiver_mismatch(
+                        return ::pyre_interpreter::gateway::receiver_mismatch(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                             #descr_name,
                             ::std::option::Option::None,
                         );
                     }
                     if <#self_ty>::from_obj(args[#self_idx]).is_none() {
-                        return crate::gateway::receiver_mismatch(
+                        return ::pyre_interpreter::gateway::receiver_mismatch(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                             #descr_name,
                             ::std::option::Option::Some(args[#self_idx]),
@@ -1951,7 +1951,7 @@ fn expand_pyre_methods(
                 };
                 let preamble = quote! {
                     if args.len() < #needed {
-                        return crate::gateway::receiver_mismatch(
+                        return ::pyre_interpreter::gateway::receiver_mismatch(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                             #descr_name,
                             ::std::option::Option::None,
@@ -1960,7 +1960,7 @@ fn expand_pyre_methods(
                     let __pyre_self = match <#self_ty>::from_obj(args[#self_idx]) {
                         ::std::option::Option::Some(s) => #bind_self,
                         ::std::option::Option::None => {
-                            return crate::gateway::receiver_mismatch(
+                            return ::pyre_interpreter::gateway::receiver_mismatch(
                                 <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                                 #descr_name,
                                 ::std::option::Option::Some(args[#self_idx]),
@@ -2089,7 +2089,7 @@ fn expand_pyre_methods(
                     // that distinguishes CALL_KW's marker from surplus
                     // positional arguments.
                     if args.len() != #expected_total {
-                        return crate::gateway::method_noarg_failure(
+                        return ::pyre_interpreter::gateway::method_noarg_failure(
                             args,
                             #arity_name,
                             #receiver_slots as i64,
@@ -2111,7 +2111,7 @@ fn expand_pyre_methods(
                     // dict to peel.  PY_NULL is never a real argument, so the
                     // leading non-null run is the true positional count on both
                     // the keyword-bound and the raw positional path.
-                    let __pyre_positional_count = crate::builtins::leading_non_null_count(args);
+                    let __pyre_positional_count = ::pyre_interpreter::builtins::leading_non_null_count(args);
                 }
             }
         };
@@ -2180,7 +2180,7 @@ fn expand_pyre_methods(
                 let expected_min = receiver_slots + visible_required;
                 let too_few = if visible_required == visible_max {
                     quote! {
-                        crate::gateway::method_arity_failure(
+                        ::pyre_interpreter::gateway::method_arity_failure(
                             #arity_name,
                             #expected,
                             __pyre_user_positional_count,
@@ -2188,7 +2188,7 @@ fn expand_pyre_methods(
                     }
                 } else {
                     quote! {
-                        crate::gateway::method_min_arity_failure(
+                        ::pyre_interpreter::gateway::method_min_arity_failure(
                             #arity_name,
                             #visible_required as i64,
                             __pyre_user_positional_count,
@@ -2210,7 +2210,7 @@ fn expand_pyre_methods(
                         return #too_few;
                     }
                     if __pyre_positional_count > #expected_total as i64 {
-                        return crate::gateway::method_arity_failure(
+                        return ::pyre_interpreter::gateway::method_arity_failure(
                             #arity_name,
                             #expected,
                             __pyre_user_positional_count,
@@ -2251,7 +2251,7 @@ fn expand_pyre_methods(
                 if !__pyre_obj.is_null() {
                     let __pyre_cls = ::pyre_object::gc_roots::shadow_stack_get(__pyre_cls_slot);
                     if !__pyre_cls.is_null() && unsafe { ::pyre_object::is_type(__pyre_cls) } {
-                        let __pyre_static_tp = crate::typedef::gettypefor(
+                        let __pyre_static_tp = ::pyre_interpreter::typedef::gettypefor(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
                         );
                         let __pyre_same_tp = match __pyre_static_tp {
@@ -2281,7 +2281,7 @@ fn expand_pyre_methods(
             #[allow(non_snake_case)]
             pub fn #wrapper_name(
                 args: &[::pyre_object::PyObjectRef],
-            ) -> ::std::result::Result<::pyre_object::PyObjectRef, crate::PyError> {
+            ) -> ::std::result::Result<::pyre_object::PyObjectRef, ::pyre_interpreter::PyError> {
                 #recv_check
                 #kwargs_preamble
                 #arity_preamble
@@ -2296,10 +2296,10 @@ fn expand_pyre_methods(
         });
         wrappers.push(quote! {
             #[cfg(not(target_arch = "wasm32"))]
-            #[::linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+            #[::linkme::distributed_slice(::pyre_interpreter::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
             #[allow(non_upper_case_globals)]
-            static #wrapper_target_name: crate::gateway::BuiltinWrapperDescriptor =
-                crate::gateway::BuiltinWrapperDescriptor {
+            static #wrapper_target_name: ::pyre_interpreter::gateway::BuiltinWrapperDescriptor =
+                ::pyre_interpreter::gateway::BuiltinWrapperDescriptor {
                     path: concat!(module_path!(), "::", stringify!(#wrapper_name)),
                     func: #wrapper_name,
                 };
@@ -2323,7 +2323,7 @@ fn expand_pyre_methods(
             quote! { ::std::option::Option::None }
         } else {
             quote! {
-                let mut __b = crate::SignatureBuilder::default();
+                let mut __b = ::pyre_interpreter::SignatureBuilder::default();
                 #sig_receiver
                 #(#sig_stmts)*
                 ::std::option::Option::Some(__b.signature())
@@ -2346,7 +2346,7 @@ fn expand_pyre_methods(
             parts.push("/".to_string());
             let text_signature = format!("({})", parts.join(", "));
             quote! {
-                crate::gateway::make_builtin_function_with_text_signature_and_sig(
+                ::pyre_interpreter::gateway::make_builtin_function_with_text_signature_and_sig(
                     #py_name,
                     #wrapper_name,
                     #text_signature,
@@ -2355,7 +2355,7 @@ fn expand_pyre_methods(
             }
         } else {
             quote! {
-                crate::make_builtin_function_maybe_sig(
+                ::pyre_interpreter::make_builtin_function_maybe_sig(
                     #py_name,
                     #wrapper_name,
                     #method_sig,
@@ -2375,7 +2375,7 @@ fn expand_pyre_methods(
             MethodKind::Static if py_name == "__new__" => {
                 registrations.push(quote! {
                     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, #py_name,
-                        crate::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig)) };
+                        ::pyre_interpreter::typedef::make_new_descr_maybe_sig(#wrapper_name, #method_sig)) };
                 });
             }
             MethodKind::Static => {
@@ -2431,7 +2431,7 @@ fn expand_pyre_methods(
     for prop in &properties {
         let prop_name = &prop.name;
         let accessor_expr = |slot: &Option<syn::Ident>| match slot {
-            Some(id) => quote! { crate::make_builtin_function(#prop_name, #id) },
+            Some(id) => quote! { ::pyre_interpreter::make_builtin_function(#prop_name, #id) },
             None => quote! { ::pyre_object::PY_NULL },
         };
         let fget_expr = accessor_expr(&prop.fget);
@@ -2475,7 +2475,7 @@ fn expand_pyre_methods(
             unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 "__weakref__",
-                crate::typedef::make_weakref_descr(::pyre_object::PY_NULL),
+                ::pyre_interpreter::typedef::make_weakref_descr(::pyre_object::PY_NULL),
             ) };
         });
     }
@@ -2517,7 +2517,7 @@ fn expand_pyre_methods(
     // supplies the parent type; absent it, the class inherits `object`.
     let base_expr = match &attrs.base {
         Some(e) => quote! { #e },
-        None => quote! { crate::typedef::w_object() },
+        None => quote! { ::pyre_interpreter::typedef::w_object() },
     };
     let set_type_text_signature = match &attrs.text_signature {
         Some(signature) => quote! {
@@ -2534,7 +2534,7 @@ fn expand_pyre_methods(
             // duplicating Python type identity per thread.
             static CELL: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new();
             *CELL.get_or_init(|| {
-                    let tp = crate::typedef::make_builtin_type_with_layout(
+                    let tp = ::pyre_interpreter::typedef::make_builtin_type_with_layout(
                         <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYNAME,
                         |ns| { #(#registrations)* },
                         #base_expr,

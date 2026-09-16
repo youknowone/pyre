@@ -872,6 +872,10 @@ fn real_main(binary_name: &str) {
         std::process::exit(2);
     }
 
+    // Optional-module rclass aliases must be installed before the collector
+    // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
+    pyre_module::register();
+
     if !is_interact {
         // Eagerly install pyre-jit's hooks into pyre-interpreter so that
         // sys.settrace / set_jit_param routing is live from the very first
@@ -891,7 +895,6 @@ fn real_main(binary_name: &str) {
 
     // Record `-S` before the first `import sys` so `sys.flags.no_site`
     // reflects whether site initialization was skipped.
-    pyre_module::register();
     importing::set_no_site(no_site);
     importing::set_runtime_flags(&flags);
 

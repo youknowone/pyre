@@ -100,7 +100,7 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
 /// pyre's generic `Py_buffer` carrier is shared by every consumer, keeping the
 /// boolean beside the owning object field preserves the same single-owner
 /// shape without an address-keyed side table.
-pub(crate) unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
+pub unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             pyre_object::bytearrayobject::w_bytearray_exports_incref(obj);
@@ -128,7 +128,7 @@ pub(crate) unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
 /// # Safety
 /// `obj` must still be the exporter paired with a successful (`true`)
 /// acquisition, and the pair must be released exactly once.
-pub(crate) unsafe fn buffer_export_decref(obj: PyObjectRef) {
+pub unsafe fn buffer_export_decref(obj: PyObjectRef) {
     unsafe {
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             pyre_object::bytearrayobject::w_bytearray_exports_decref(obj);
@@ -864,7 +864,7 @@ fn w_memoryview_new_with_flags_impl(
 
 /// `_check_released` — every accessing method rejects a released view with
 /// `ValueError` before touching the (logically dropped) backing.
-pub(crate) unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), crate::PyError> {
+pub unsafe fn memoryview_check_released(mv: PyObjectRef) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::memoryview::w_memoryview_released(mv) } {
         return Err(crate::PyError::value_error(
             "operation forbidden on released memoryview object",
@@ -2735,7 +2735,7 @@ fn memoryview_is_f_contiguous(shape: &[i64], strides: &[i64], itemsize: i64, len
 
 /// `(c_contiguous, f_contiguous)` for a view, from `_init_flags` /
 /// `PyBuffer_isContiguous`.  A 0-dim (scalar) view is both.
-pub(crate) unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
+pub unsafe fn memoryview_contiguity(mv: PyObjectRef) -> (bool, bool) {
     use pyre_object::memoryview::*;
     unsafe {
         let ndim = w_memoryview_ndim(mv);
@@ -5430,7 +5430,7 @@ static __majit_wrap_builtin_abs_target: crate::gateway::BuiltinWrapperDescriptor
 /// Signature/unwrap_spec gateway is not yet ported; once it routes builtin
 /// kwargs through `Arguments::_match_signature` into named slots, this helper
 /// and the `__pyre_kw__` marker can be removed.
-pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
+pub fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Option<PyObjectRef>) {
     if !args.is_empty() {
         let last = args[args.len() - 1];
         // The marker dict stores an unforgeable sentinel under `__pyre_kw__`
@@ -5456,7 +5456,7 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// every `__majit_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
 #[majit_macros::unroll_safe]
-pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
+pub fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
     // PyPy `argument.py:_match_signature` keeps `num_args`, `upfront`, and
     // every derived argument count as ordinary RPython Signed values.  Rust
     // slice indexing needs `usize`, but that is an indexing adapter, not the
@@ -5484,7 +5484,7 @@ pub fn builtin_kwargs_marker_dict(last: PyObjectRef) -> bool {
 /// True when the kwargs dict from [`split_builtin_kwargs`] carries a real
 /// keyword (any entry other than the `__pyre_kw__` marker).  An empty
 /// `**{}` therefore reports `false`.
-pub(crate) fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
+pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
     real_kwarg_count(kwargs) > 0
 }
 
@@ -5526,7 +5526,7 @@ pub(crate) fn builtin_kwarg_entries(kwargs: Option<PyObjectRef>) -> Vec<(Wtf8Buf
 /// Look up a single keyword argument from the kwargs dict produced by
 /// `split_builtin_kwargs`. Returns `None` when no kwargs dict is present
 /// or the requested key is absent.
-pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObjectRef> {
+pub fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObjectRef> {
     let dict = kwargs?;
     unsafe { pyre_object::w_dict_getitem_str(dict, name) }
 }
@@ -5543,7 +5543,7 @@ pub(crate) fn kwarg_get(kwargs: Option<PyObjectRef>, name: &str) -> Option<PyObj
 /// ("min", "zip_longest", ...).  The `__pyre_kw__` marker entry the
 /// gateway appends is filtered out; it is an implementation detail of
 /// the kwargs encoding, not a user-visible argument.
-pub(crate) fn kwarg_reject_unknown(
+pub fn kwarg_reject_unknown(
     kwargs: Option<PyObjectRef>,
     allowed: &[&str],
     fn_name: &str,
@@ -5596,7 +5596,7 @@ pub(crate) fn bind_pos_or_kw(
 
 /// `true` when the last argument is the `__pyre_kw__`-tagged dict the
 /// CALL_KW builtin dispatch appends — i.e. the call carried keywords.
-pub(crate) fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
+pub fn has_builtin_kwargs(args: &[PyObjectRef]) -> bool {
     if args.is_empty() {
         return false;
     }
@@ -5702,7 +5702,7 @@ pub(crate) fn clinic_arity(
 // signature and argument count in the same way; without the hint the JIT
 // policy residualizes this gateway step and cannot descend into the builtin.
 #[majit_macros::unroll_safe]
-pub(crate) fn bind_builtin_kwargs(
+pub fn bind_builtin_kwargs(
     args: &[PyObjectRef],
     names: &[&str],
     required: &[bool],
@@ -5920,7 +5920,7 @@ pub(crate) fn kwarg_reject_duplicate(
 /// directly and falls through to looking up `__index__` on the
 /// object's type, mirroring PyPy's `lookup_in_type` pass before
 /// raising `TypeError`.
-pub(crate) fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+pub fn space_index_w(obj: PyObjectRef) -> Result<i64, crate::PyError> {
     // Read the machine-word value of a bool / int / long object, raising
     // OverflowError when a bigint does not fit. Returns `None` for anything
     // else so the caller can fall through to the `__index__` lookup / error.
@@ -9001,7 +9001,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 /// in a trailing marker dict, so remove it before constructing `args_w`.
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
-        pub(crate) fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
             let (positional, _) = split_builtin_kwargs(rest);
@@ -9314,7 +9314,7 @@ fn install_exception_getsets(ns: PyObjectRef, class_name: &str) {
 }
 
 /// Build a builtin exception type with the given name, base, and __new__ wrapper.
-pub(crate) fn make_exc_type(
+pub fn make_exc_type(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
@@ -9337,7 +9337,7 @@ pub(crate) fn make_exc_type(
 /// slot: `ssl.SSLError`, `_csv.Error` and `_ctypes.COMError` come from a type
 /// spec that names its own `basicsize`, and a spec that does adds no managed
 /// weakref.  Those three keep [`make_exc_type`] / [`make_exc_type_with_init`].
-pub(crate) fn new_exception_class(
+pub fn new_exception_class(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     base: PyObjectRef,
@@ -11316,7 +11316,7 @@ fn builtin_ascii(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// PyPy's space.get_and_call_function returns normally or raises;
 /// pyre's call_function stashes errors as PY_NULL. This helper
 /// recovers stashed errors as Result.
-pub(crate) fn call_and_check(
+pub fn call_and_check(
     method: PyObjectRef,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -11796,7 +11796,7 @@ pub(crate) fn builtin_float_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, 
 /// read, and an inherited `int.__float__` has to reproduce it: the exactness
 /// gates on the coercion entry points send a subclass to a `__float__` lookup,
 /// and this is what that lookup resolves to.
-pub(crate) fn int_payload_as_f64(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
+pub fn int_payload_as_f64(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
     unsafe {
         // `is_int` is true for a bool (`BOOL_TYPE`), so test `is_bool` first.
         if is_bool(obj) {
@@ -12147,7 +12147,7 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(w_tuple_new(collect_iterable(obj)?))
 }
 
-pub(crate) fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `list.__new__` is positional-only, so any keyword is a TypeError
     // (an empty `**{}` is not a keyword and is allowed).
     let (args, kwargs) = split_builtin_kwargs(args);
@@ -18944,7 +18944,7 @@ pub(crate) fn builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 /// `listobject.py descr_sort` — the shared body of `list.sort` and
 /// `sorted`.  `list_slot` is a shadow-stack slot holding the list, because a
 /// key call or a comparison dunder can collect and move it.
-pub(crate) fn sort_list_in_place(
+pub fn sort_list_in_place(
     list_slot: usize,
     key_fn: Option<PyObjectRef>,
     reverse: bool,
@@ -20142,7 +20142,7 @@ impl Drop for WritableBuffer {
 ///
 /// Every readable exporter pyre has: bytes / bytearray, a live mmap, an
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
-pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
+pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
         #[cfg(all(
             feature = "host_env",
@@ -20196,7 +20196,7 @@ pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], c
 
 /// `space.acquire_writebuf` for FileIO.readinto.  These are pyre's native
 /// writable exporters; a memoryview contributes its exact contiguous window.
-pub(crate) unsafe fn fileio_writebuf(
+pub unsafe fn fileio_writebuf(
     obj: PyObjectRef,
 ) -> Result<(&'static mut [u8], PyObjectRef, bool), crate::PyError> {
     fn type_error(obj: PyObjectRef) -> crate::PyError {
@@ -20719,7 +20719,7 @@ pub(crate) fn fd_read_into(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
 /// (`module/mod.rs`'s `pub mod signal` is `cfg`-gated off), and no caller
 /// survives the same gate there.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn eintr_retry_with(
+pub fn eintr_retry_with(
     e: std::io::Error,
     wrap: impl FnOnce(std::io::Error) -> crate::PyError,
 ) -> Result<(), crate::PyError> {
@@ -23243,7 +23243,7 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
 ///
 /// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
 /// components; an instance is asked for `__complex__` then `__float__`.
-pub(crate) fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
+pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_exact_type(obj, &COMPLEX_TYPE) {

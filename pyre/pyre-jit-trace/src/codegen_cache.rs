@@ -26,8 +26,9 @@ use std::path::{Path, PathBuf};
 ///
 /// Their sources are not hashed into the codegen cache key: a source-only
 /// edit is either refused by `fail_if_llbc_stale` or already rekeys via the
-/// artefact bytes. `pyre-interpreter` is also a build-dep, but only so the
-/// script can sample the live fnaddr / static tables; those functions are
+/// artefact bytes. `pyre-interpreter` and `pyre-module` are also build-deps,
+/// but only so the script can sample the live fnaddr / static tables
+/// (including wrappers that moved into `pyre-module`); those functions are
 /// added as single files through [`interpreter_fn_calls`], not as a tree.
 ///
 /// Order is the production hash/load order. Changing it rekeys the cache.

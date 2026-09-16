@@ -1,0 +1,894 @@
+//! termios implementation — PyPy: pypy/module/termios/interp_termios.py
+//!
+//! Verbatim move of the inline block previously in importing.rs.  Both
+//! the host_env real impl and the no-host_env stub are renamed to
+//! `register_module` so moduledef::init can call a single name.
+
+/// `interp_termios.py convert_error` — every termios syscall
+/// failure is raised as the cached module exception `termios.error`
+/// (`wrap_oserror(space, e, w_exception_class=w_error)`), not a bare
+/// `OSError`, so `except termios.error` catches it.  Mirrors
+/// `_socket`'s `socket_converted_error`: build an instance of the
+/// registered `termios.error` class (falling back to `OSError` before
+/// the module finishes installing) and stamp it onto the `PyError`.
+#[cfg(all(unix, feature = "host_env"))]
+fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
+    // `wrap_oserror` spells the message with the platform's `strerror` alone;
+    // `PyErr_SetFromErrno` does the same.  Neither names the syscall that
+    // failed, and neither carries Rust's `(os error N)` tail, which would
+    // repeat the code the first argument already holds.
+    let message = pyre_interpreter::PyError::clean_strerror(errno);
+    let cls = pyre_interpreter::builtins::lookup_exc_class("termios.error")
+        .or_else(|| pyre_interpreter::builtins::lookup_exc_class("OSError"))
+        .expect("OSError must be installed");
+    let args = vec![
+        cls,
+        pyre_object::w_int_new(errno as i64),
+        pyre_object::w_str_new_managed(&message),
+    ];
+    let exc = pyre_interpreter::builtins::exc_exception_new(&args)
+        .expect("exc_exception_new is infallible for str/int args");
+    let mut err = pyre_interpreter::PyError::os_error(message);
+    err.exc_object = exc;
+    err
+}
+
+/// _termios module — PyPy: pypy/module/termios/.
+///
+/// `tcgetattr(fd)` returns the 7-list `[iflag, oflag, cflag, lflag,
+/// ispeed, ospeed, [cc_chars]]`.  `tcsetattr(fd, when, attrs)` takes the
+/// same shape and writes it back via `termios::Termios`.  The simpler
+/// `tcdrain` / `tcflush` / `tcflow` / `tcsendbreak` / `cfgetispeed` /
+/// `cfgetospeed` calls are direct wrappers.  All constants come from
+/// `rustpython_host_env::termios::*` so the values match the platform.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    use rustpython_host_env::termios as host_termios;
+
+    fn make_cc_bytes(cc: &[libc::cc_t]) -> pyre_object::PyObjectRef {
+        // Each cc[i] becomes a 1-byte bytes object (CPython does the same).
+        let items: Vec<_> = cc
+            .iter()
+            .map(|&b| pyre_object::bytesobject::w_bytes_from_bytes(&[b]))
+            .collect();
+        pyre_object::w_list_new(items)
+    }
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcgetattr",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcgetattr",
+            |args| {
+                if args.is_empty() {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "tcgetattr() requires 1 argument",
+                    ));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                let t = host_termios::tcgetattr(fd)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                let ispeed = host_termios::cfgetispeed(&t);
+                let ospeed = host_termios::cfgetospeed(&t);
+                let _roots = pyre_object::gc_roots::push_roots();
+                let cc_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(make_cc_bytes(&t.c_cc[..]));
+                // interp_termios.py:53 — in noncanonical mode VMIN/VTIME are
+                // single-byte counters, surfaced as ints rather than bytes.
+                if (t.c_lflag & libc::ICANON) == 0 {
+                    let vmin = libc::VMIN;
+                    let vtime = libc::VTIME;
+                    let vmin_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        t.c_cc[vmin] as i64,
+                    ));
+                    let vtime_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        t.c_cc[vtime] as i64,
+                    ));
+                    unsafe {
+                        pyre_object::w_list_setitem(
+                            pyre_object::gc_roots::shadow_stack_get(cc_slot),
+                            vmin as i64,
+                            pyre_object::gc_roots::shadow_stack_get(vmin_slot),
+                        );
+                        pyre_object::w_list_setitem(
+                            pyre_object::gc_roots::shadow_stack_get(cc_slot),
+                            vtime as i64,
+                            pyre_object::gc_roots::shadow_stack_get(vtime_slot),
+                        );
+                    }
+                }
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(t.c_iflag as i64));
+                fields.push(pyre_object::w_int_new(t.c_oflag as i64));
+                fields.push(pyre_object::w_int_new(t.c_cflag as i64));
+                fields.push(pyre_object::w_int_new(t.c_lflag as i64));
+                fields.push(pyre_object::w_int_new(ispeed as i64));
+                fields.push(pyre_object::w_int_new(ospeed as i64));
+                fields.push(pyre_object::gc_roots::shadow_stack_get(cc_slot));
+                Ok(pyre_object::w_list_new(fields.take()))
+            },
+            1,
+        ),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcsetattr",
+        pyre_interpreter::make_builtin_function("tcsetattr", |args| {
+            if args.len() < 3 {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "tcsetattr() requires 3 arguments",
+                ));
+            }
+            let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+            // `@unwrap_spec(when=int)`.
+            let when = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+            // interp_termios.py:24-27 — arg 3 must be a 7-element list,
+            // unpacked via space.unpackiterable.
+            let attrs = args[2];
+            if !unsafe { pyre_object::is_list(attrs) }
+                || unsafe { pyre_object::w_list_len(attrs) } != 7
+            {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "tcsetattr, arg 3: must be 7 element list",
+                ));
+            }
+            let fields = pyre_interpreter::baseobjspace::unpackiterable(attrs, 7)?;
+            let iflag = pyre_interpreter::baseobjspace::int_w(fields[0])? as libc::tcflag_t;
+            let oflag = pyre_interpreter::baseobjspace::int_w(fields[1])? as libc::tcflag_t;
+            let cflag = pyre_interpreter::baseobjspace::int_w(fields[2])? as libc::tcflag_t;
+            let lflag = pyre_interpreter::baseobjspace::int_w(fields[3])? as libc::tcflag_t;
+            let ispeed = pyre_interpreter::baseobjspace::int_w(fields[4])? as libc::speed_t;
+            let ospeed = pyre_interpreter::baseobjspace::int_w(fields[5])? as libc::speed_t;
+            let cc_obj = fields[6];
+
+            // Start from the current settings so we preserve any platform-private fields.
+            let mut t = host_termios::tcgetattr(fd)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+            t.c_iflag = iflag;
+            t.c_oflag = oflag;
+            t.c_cflag = cflag;
+            t.c_lflag = lflag;
+            host_termios::cfsetispeed(&mut t, ispeed)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+            host_termios::cfsetospeed(&mut t, ospeed)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+
+            // interp_termios.py:30-33 — c_cc is any iterable; an int element
+            // goes through bytes([x]) (range 0..=255), a bytes element keeps
+            // its first byte.
+            let cc_items = pyre_interpreter::baseobjspace::unpackiterable(cc_obj, -1)?;
+            let nccs = t.c_cc.len();
+            for (i, &item) in cc_items.iter().enumerate() {
+                if i >= nccs {
+                    break;
+                }
+                let byte = unsafe {
+                    if pyre_object::is_int(item) {
+                        let v = pyre_object::w_int_get_value(item);
+                        if !(0..=255).contains(&v) {
+                            return Err(pyre_interpreter::PyError::value_error(
+                                "bytes must be in range(0, 256)",
+                            ));
+                        }
+                        v as libc::cc_t
+                    } else if pyre_object::bytesobject::is_bytes_like(item) {
+                        let data = pyre_object::bytesobject::bytes_like_data(item);
+                        if data.is_empty() {
+                            0
+                        } else {
+                            data[0] as libc::cc_t
+                        }
+                    } else {
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "tcsetattr: c_cc element must be int or bytes",
+                        ));
+                    }
+                };
+                t.c_cc[i] = byte;
+            }
+            host_termios::tcsetattr(fd, when, &t)
+                .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+            Ok(pyre_object::w_none())
+        }),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcsendbreak",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcsendbreak",
+            |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "tcsendbreak() requires 2 arguments",
+                    ));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                // `@unwrap_spec(duration=int)`.
+                let dur = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+                host_termios::tcsendbreak(fd, dur)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcdrain",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcdrain",
+            |args| {
+                if args.is_empty() {
+                    return Err(pyre_interpreter::PyError::type_error("tcdrain() requires 1 argument"));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                host_termios::tcdrain(fd)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                Ok(pyre_object::w_none())
+            },
+            1,
+        ),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcflush",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcflush",
+            |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error("tcflush() requires 2 arguments"));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                // `@unwrap_spec(queue=int)`.
+                let q = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+                host_termios::tcflush(fd, q)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcflow",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcflow",
+            |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error("tcflow() requires 2 arguments"));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                // `@unwrap_spec(action=int)`.
+                let action = pyre_interpreter::baseobjspace::int_w(args[1])? as i32;
+                host_termios::tcflow(fd, action)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcgetwinsize",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcgetwinsize",
+            |args| {
+                if args.is_empty() {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "tcgetwinsize() requires 1 argument",
+                    ));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                let (rows, cols) = host_termios::tcgetwinsize(fd)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                // PyPy `interp_termios.tcgetwinsize` returns
+                // `(ws_row, ws_col)`.
+                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                fields.push(pyre_object::w_int_new(rows as i64));
+                fields.push(pyre_object::w_int_new(cols as i64));
+                Ok(pyre_object::w_tuple_new(fields.take()))
+            },
+            1,
+        ),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "tcsetwinsize",
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcsetwinsize",
+            |args| {
+                if args.len() < 2 {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "tcsetwinsize() requires 2 arguments",
+                    ));
+                }
+                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+                // `interp_termios.py:110-114` — argument 2 must be a
+                // 2-sequence (any iterable); a length mismatch (ValueError
+                // from unpackiterable) is reported as a TypeError.
+                let winsz = pyre_interpreter::baseobjspace::unpackiterable(args[1], 2).map_err(|e| {
+                    if e.kind == pyre_interpreter::PyErrorKind::ValueError {
+                        pyre_interpreter::PyError::type_error("tcsetwinsize: argument 2 must be a 2-sequence")
+                    } else {
+                        e
+                    }
+                })?;
+                let rows = pyre_interpreter::baseobjspace::int_w(winsz[0])?;
+                let cols = pyre_interpreter::baseobjspace::int_w(winsz[1])?;
+                // PyPy `interp_termios.tcsetwinsize` performs this overflow
+                // guard before setting the window size.
+                let rows = u16::try_from(rows)
+                    .map_err(|_| pyre_interpreter::PyError::overflow_error("winsize value(s) out of range"))?;
+                let cols = u16::try_from(cols)
+                    .map_err(|_| pyre_interpreter::PyError::overflow_error("winsize value(s) out of range"))?;
+                // `host_termios::tcsetwinsize` performs the same initial
+                // TIOCGWINSZ that `interp_termios.tcsetwinsize` does,
+                // preserving `ws_xpixel` / `ws_ypixel` across the set.
+                host_termios::tcsetwinsize(fd, rows, cols)
+                    .map_err(|e| termios_converted_error(e.raw_os_error().unwrap_or(0)))?;
+                Ok(pyre_object::w_none())
+            },
+            2,
+        ),
+    );
+
+    // ── Constants ──
+    pyre_interpreter::module_ns_store(ns, "B0", pyre_object::w_int_new(host_termios::B0 as i64));
+    pyre_interpreter::module_ns_store(ns, "B50", pyre_object::w_int_new(host_termios::B50 as i64));
+    pyre_interpreter::module_ns_store(ns, "B75", pyre_object::w_int_new(host_termios::B75 as i64));
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B110",
+        pyre_object::w_int_new(host_termios::B110 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B134",
+        pyre_object::w_int_new(host_termios::B134 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B150",
+        pyre_object::w_int_new(host_termios::B150 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B200",
+        pyre_object::w_int_new(host_termios::B200 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B300",
+        pyre_object::w_int_new(host_termios::B300 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B600",
+        pyre_object::w_int_new(host_termios::B600 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B1200",
+        pyre_object::w_int_new(host_termios::B1200 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B1800",
+        pyre_object::w_int_new(host_termios::B1800 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B2400",
+        pyre_object::w_int_new(host_termios::B2400 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B4800",
+        pyre_object::w_int_new(host_termios::B4800 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B9600",
+        pyre_object::w_int_new(host_termios::B9600 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B19200",
+        pyre_object::w_int_new(host_termios::B19200 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B38400",
+        pyre_object::w_int_new(host_termios::B38400 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B57600",
+        pyre_object::w_int_new(host_termios::B57600 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B115200",
+        pyre_object::w_int_new(host_termios::B115200 as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "B230400",
+        pyre_object::w_int_new(host_termios::B230400 as i64),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "BRKINT",
+        pyre_object::w_int_new(host_termios::BRKINT as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "CLOCAL",
+        pyre_object::w_int_new(host_termios::CLOCAL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "CREAD",
+        pyre_object::w_int_new(host_termios::CREAD as i64),
+    );
+    pyre_interpreter::module_ns_store(ns, "CS5", pyre_object::w_int_new(host_termios::CS5 as i64));
+    pyre_interpreter::module_ns_store(ns, "CS6", pyre_object::w_int_new(host_termios::CS6 as i64));
+    pyre_interpreter::module_ns_store(ns, "CS7", pyre_object::w_int_new(host_termios::CS7 as i64));
+    pyre_interpreter::module_ns_store(ns, "CS8", pyre_object::w_int_new(host_termios::CS8 as i64));
+    pyre_interpreter::module_ns_store(
+        ns,
+        "CSIZE",
+        pyre_object::w_int_new(host_termios::CSIZE as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "CSTOPB",
+        pyre_object::w_int_new(host_termios::CSTOPB as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ECHO",
+        pyre_object::w_int_new(host_termios::ECHO as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ECHOE",
+        pyre_object::w_int_new(host_termios::ECHOE as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ECHOK",
+        pyre_object::w_int_new(host_termios::ECHOK as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ECHONL",
+        pyre_object::w_int_new(host_termios::ECHONL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "HUPCL",
+        pyre_object::w_int_new(host_termios::HUPCL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ICANON",
+        pyre_object::w_int_new(host_termios::ICANON as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ICRNL",
+        pyre_object::w_int_new(host_termios::ICRNL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IEXTEN",
+        pyre_object::w_int_new(host_termios::IEXTEN as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IGNBRK",
+        pyre_object::w_int_new(host_termios::IGNBRK as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IGNCR",
+        pyre_object::w_int_new(host_termios::IGNCR as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IGNPAR",
+        pyre_object::w_int_new(host_termios::IGNPAR as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "INLCR",
+        pyre_object::w_int_new(host_termios::INLCR as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "INPCK",
+        pyre_object::w_int_new(host_termios::INPCK as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ISIG",
+        pyre_object::w_int_new(host_termios::ISIG as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ISTRIP",
+        pyre_object::w_int_new(host_termios::ISTRIP as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IXANY",
+        pyre_object::w_int_new(host_termios::IXANY as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IXOFF",
+        pyre_object::w_int_new(host_termios::IXOFF as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "IXON",
+        pyre_object::w_int_new(host_termios::IXON as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "NOFLSH",
+        pyre_object::w_int_new(host_termios::NOFLSH as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "OCRNL",
+        pyre_object::w_int_new(host_termios::OCRNL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ONLCR",
+        pyre_object::w_int_new(host_termios::ONLCR as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ONLRET",
+        pyre_object::w_int_new(host_termios::ONLRET as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "ONOCR",
+        pyre_object::w_int_new(host_termios::ONOCR as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "OPOST",
+        pyre_object::w_int_new(host_termios::OPOST as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "PARENB",
+        pyre_object::w_int_new(host_termios::PARENB as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "PARMRK",
+        pyre_object::w_int_new(host_termios::PARMRK as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "PARODD",
+        pyre_object::w_int_new(host_termios::PARODD as i64),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCIFLUSH",
+        pyre_object::w_int_new(host_termios::TCIFLUSH as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCOFLUSH",
+        pyre_object::w_int_new(host_termios::TCOFLUSH as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCIOFLUSH",
+        pyre_object::w_int_new(host_termios::TCIOFLUSH as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCIOFF",
+        pyre_object::w_int_new(host_termios::TCIOFF as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCION",
+        pyre_object::w_int_new(host_termios::TCION as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCOOFF",
+        pyre_object::w_int_new(host_termios::TCOOFF as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCOON",
+        pyre_object::w_int_new(host_termios::TCOON as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCSANOW",
+        pyre_object::w_int_new(host_termios::TCSANOW as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCSADRAIN",
+        pyre_object::w_int_new(host_termios::TCSADRAIN as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TCSAFLUSH",
+        pyre_object::w_int_new(host_termios::TCSAFLUSH as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "TOSTOP",
+        pyre_object::w_int_new(host_termios::TOSTOP as i64),
+    );
+
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VEOF",
+        pyre_object::w_int_new(host_termios::VEOF as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VEOL",
+        pyre_object::w_int_new(host_termios::VEOL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VERASE",
+        pyre_object::w_int_new(host_termios::VERASE as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VINTR",
+        pyre_object::w_int_new(host_termios::VINTR as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VKILL",
+        pyre_object::w_int_new(host_termios::VKILL as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VMIN",
+        pyre_object::w_int_new(host_termios::VMIN as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VQUIT",
+        pyre_object::w_int_new(host_termios::VQUIT as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VSTART",
+        pyre_object::w_int_new(host_termios::VSTART as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VSTOP",
+        pyre_object::w_int_new(host_termios::VSTOP as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VSUSP",
+        pyre_object::w_int_new(host_termios::VSUSP as i64),
+    );
+    pyre_interpreter::module_ns_store(
+        ns,
+        "VTIME",
+        pyre_object::w_int_new(host_termios::VTIME as i64),
+    );
+
+    // `rtermios.CONSTANT_NAMES` names most of these and `rffi_platform`
+    // keeps whichever the platform defines, but `host_env::termios`
+    // re-exports only a subset of them.  `Modules/termios.c` publishes
+    // every one darwin defines, so they are read straight from `libc`
+    // here; the twenty-five `libc` has no constant for are spelled out
+    // with the value `<sys/termios.h>` / `<sys/ttydefaults.h>` /
+    // `<sys/ttycom.h>` gives.
+    #[cfg(target_vendor = "apple")]
+    {
+        macro_rules! tc {
+            ($name:literal, $val:expr) => {
+                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+            };
+        }
+        // `c_iflag` bits.
+        tc!("IMAXBEL", libc::IMAXBEL);
+        tc!("IUTF8", libc::IUTF8);
+
+        // `c_oflag` bits and the delay masks they select with.
+        tc!("OFILL", libc::OFILL);
+        tc!("OFDEL", libc::OFDEL);
+        tc!("ONOEOT", libc::ONOEOT);
+        tc!("OXTABS", libc::OXTABS);
+        tc!("NLDLY", libc::NLDLY);
+        tc!("CRDLY", libc::CRDLY);
+        tc!("TABDLY", libc::TABDLY);
+        tc!("BSDLY", libc::BSDLY);
+        tc!("VTDLY", libc::VTDLY);
+        tc!("FFDLY", libc::FFDLY);
+
+        // Delay values.  `<sys/termios.h>` defines `NL2` / `NL3` without a
+        // matching `libc` constant.
+        tc!("NL0", libc::NL0);
+        tc!("NL1", libc::NL1);
+        tc!("NL2", 0x200);
+        tc!("NL3", 0x300);
+        tc!("CR0", libc::CR0);
+        tc!("CR1", libc::CR1);
+        tc!("CR2", libc::CR2);
+        tc!("CR3", libc::CR3);
+        tc!("TAB0", libc::TAB0);
+        tc!("TAB1", libc::TAB1);
+        tc!("TAB2", libc::TAB2);
+        tc!("TAB3", libc::TAB3);
+        tc!("BS0", libc::BS0);
+        tc!("BS1", libc::BS1);
+        tc!("VT0", libc::VT0);
+        tc!("VT1", libc::VT1);
+        tc!("FF0", libc::FF0);
+        tc!("FF1", libc::FF1);
+
+        // `c_cflag` bits.  The `_OFLOW` / `_IFLOW` spellings name the same bits
+        // as `CRTSCTS` and its two halves.
+        tc!("CRTSCTS", libc::CRTSCTS);
+        tc!("CCTS_OFLOW", 0x10000);
+        tc!("CRTS_IFLOW", 0x20000);
+        tc!("CDTR_IFLOW", 0x40000);
+        tc!("CDSR_OFLOW", 0x80000);
+        tc!("CCAR_OFLOW", 0x100000);
+        tc!("MDMBUF", libc::MDMBUF);
+        tc!("CIGNORE", libc::CIGNORE);
+
+        // `c_lflag` bits.
+        tc!("ECHOCTL", libc::ECHOCTL);
+        tc!("ECHOPRT", libc::ECHOPRT);
+        tc!("ECHOKE", libc::ECHOKE);
+        tc!("FLUSHO", libc::FLUSHO);
+        tc!("PENDIN", libc::PENDIN);
+        tc!("ALTWERASE", libc::ALTWERASE);
+        tc!("EXTPROC", libc::EXTPROC);
+        tc!("NOKERNINFO", libc::NOKERNINFO);
+
+        // `c_cc` length and the indices `rtermios` does not name.
+        tc!("NCCS", libc::NCCS);
+        tc!("VEOL2", libc::VEOL2);
+        tc!("VWERASE", libc::VWERASE);
+        tc!("VREPRINT", libc::VREPRINT);
+        tc!("VDISCARD", libc::VDISCARD);
+        tc!("VLNEXT", libc::VLNEXT);
+        tc!("VSTATUS", libc::VSTATUS);
+        tc!("VDSUSP", libc::VDSUSP);
+
+        // `<sys/ttydefaults.h>` — the default `c_cc` values, each a `CTRL()`
+        // of its letter, so `libc` carries none of them.
+        tc!("CEOF", 4);
+        tc!("CEOL", 255);
+        tc!("CEOT", 4);
+        tc!("CERASE", 127);
+        tc!("CINTR", 3);
+        tc!("CKILL", 21);
+        tc!("CQUIT", 28);
+        tc!("CSUSP", 26);
+        tc!("CDSUSP", 25);
+        tc!("CSTART", 17);
+        tc!("CSTOP", 19);
+        tc!("CWERASE", 23);
+        tc!("CLNEXT", 22);
+        tc!("CRPRNT", 18);
+        tc!("CFLUSH", 15);
+
+        // Baud rates.
+        tc!("B7200", libc::B7200);
+        tc!("B14400", libc::B14400);
+        tc!("B28800", libc::B28800);
+        tc!("B76800", libc::B76800);
+        tc!("EXTA", libc::EXTA);
+        tc!("EXTB", libc::EXTB);
+
+        // `tcsetattr` action flag.
+        tc!("TCSASOFT", 16);
+
+        // Terminal ioctls.  `TIOCGSIZE` / `TIOCSSIZE` are the `<sys/ttycom.h>`
+        // aliases for the winsize pair.
+        tc!("TIOCSTI", libc::TIOCSTI);
+        tc!("TIOCGWINSZ", libc::TIOCGWINSZ);
+        tc!("TIOCSWINSZ", libc::TIOCSWINSZ);
+        tc!("TIOCGSIZE", 0x40087468);
+        tc!("TIOCSSIZE", 0x80087467);
+        tc!("TIOCGPGRP", libc::TIOCGPGRP);
+        tc!("TIOCSPGRP", libc::TIOCSPGRP);
+        tc!("TIOCGETD", libc::TIOCGETD);
+        tc!("TIOCSETD", libc::TIOCSETD);
+        tc!("TIOCNOTTY", libc::TIOCNOTTY);
+        tc!("TIOCSCTTY", libc::TIOCSCTTY);
+        tc!("TIOCEXCL", libc::TIOCEXCL);
+        tc!("TIOCNXCL", libc::TIOCNXCL);
+        tc!("TIOCCONS", libc::TIOCCONS);
+        tc!("TIOCOUTQ", libc::TIOCOUTQ);
+        tc!("TIOCPKT", libc::TIOCPKT);
+
+        // Modem-line bits for `TIOCMGET` / `TIOCMSET`.
+        tc!("TIOCMGET", libc::TIOCMGET);
+        tc!("TIOCMSET", libc::TIOCMSET);
+        tc!("TIOCMBIS", libc::TIOCMBIS);
+        tc!("TIOCMBIC", libc::TIOCMBIC);
+        tc!("TIOCM_LE", libc::TIOCM_LE);
+        tc!("TIOCM_DTR", libc::TIOCM_DTR);
+        tc!("TIOCM_RTS", libc::TIOCM_RTS);
+        tc!("TIOCM_ST", libc::TIOCM_ST);
+        tc!("TIOCM_SR", libc::TIOCM_SR);
+        tc!("TIOCM_CTS", libc::TIOCM_CTS);
+        tc!("TIOCM_CAR", libc::TIOCM_CAR);
+        tc!("TIOCM_CD", libc::TIOCM_CD);
+        tc!("TIOCM_RNG", libc::TIOCM_RNG);
+        tc!("TIOCM_RI", libc::TIOCM_RI);
+        tc!("TIOCM_DSR", libc::TIOCM_DSR);
+
+        // `TIOCPKT` mode bits.
+        tc!("TIOCPKT_DATA", libc::TIOCPKT_DATA);
+        tc!("TIOCPKT_FLUSHREAD", libc::TIOCPKT_FLUSHREAD);
+        tc!("TIOCPKT_FLUSHWRITE", libc::TIOCPKT_FLUSHWRITE);
+        tc!("TIOCPKT_STOP", libc::TIOCPKT_STOP);
+        tc!("TIOCPKT_START", libc::TIOCPKT_START);
+        tc!("TIOCPKT_NOSTOP", libc::TIOCPKT_NOSTOP);
+        tc!("TIOCPKT_DOSTOP", libc::TIOCPKT_DOSTOP);
+
+        // File ioctls `Modules/termios.c` publishes beside the terminal ones.
+        tc!("FIONREAD", libc::FIONREAD);
+        tc!("FIONBIO", libc::FIONBIO);
+        tc!("FIOASYNC", libc::FIOASYNC);
+        tc!("FIOCLEX", libc::FIOCLEX);
+        tc!("FIONCLEX", libc::FIONCLEX);
+
+        // The `c_cc` value that switches a control character off.  It is
+        // `0xff` on the BSDs and `'\0'` on linux, so it is answered here
+        // rather than beside the `V*` indices above.
+        tc!("_POSIX_VDISABLE", libc::_POSIX_VDISABLE);
+    }
+
+    // `interp_termios.py Cache.__init__`:
+    //   self.w_error = space.new_exception_class("termios.error")
+    // `new_exception_class` with no bases derives from `Exception`, so
+    // `termios.error` is not an OSError subclass; `convert_error` still names
+    // it as the class to raise, which is what `except termios.error` catches.
+    let w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
+        .expect("Exception must be installed before termios init");
+    let w_error = pyre_interpreter::builtins::new_exception_class(
+        "termios.error",
+        pyre_interpreter::builtins::exc_exception_new,
+        w_exception,
+    );
+    pyre_interpreter::module_ns_store(ns, "error", w_error);
+    Ok(())
+}
+
+#[cfg(not(all(unix, feature = "host_env")))]
+pub fn register_module(_ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    Ok(())
+}
