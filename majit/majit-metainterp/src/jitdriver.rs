@@ -2328,6 +2328,22 @@ impl<S: JitState> JitDriver<S> {
         self.meta.mainjitcode_of(self.portal_jd_index?)
     }
 
+    /// `call.py grab_initial_jitcodes` for a portal the build-time table
+    /// already holds. Production never goes through the macro frontend's
+    /// `register_dispatch_jitcode`; the extracted portal is `jd.mainjitcode`.
+    pub fn install_extracted_portal_jitcode(
+        &mut self,
+        jitcode: std::sync::Arc<crate::jitcode::JitCode>,
+    ) {
+        let portal_jd_index = self.index().unwrap_or(0);
+        jitcode.set_jitdriver_sd(portal_jd_index);
+        self.meta
+            .jitdriver_sd_mut(portal_jd_index)
+            .expect("install_extracted_portal_jitcode: jitdrivers_sd slot is vacant")
+            .mainjitcode = Some(jitcode);
+        self.portal_jd_index = Some(portal_jd_index);
+    }
+
     /// Point the per-thread state-field store back at this driver, reusing what
     /// [`Self::register_dispatch_jitcode`] already built.
     ///

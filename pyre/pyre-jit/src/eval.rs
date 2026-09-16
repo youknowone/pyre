@@ -5630,6 +5630,15 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
     d.meta_interp_mut().register_jitdriver_sd(jd);
+    // call.py grab_initial_jitcodes: `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
+    // Production never calls `register_dispatch_jitcode`; without this the
+    // portal interpret seeds an empty framestack.
+    if let Some(canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode() {
+        let jitcode = std::sync::Arc::new(majit_metainterp::JitCode::from_canonical(
+            (*canonical).clone(),
+        ));
+        d.install_extracted_portal_jitcode(jitcode);
+    }
     // baseobjspace.py `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
     // unknown-length unpack loop `unpackiterable_portal`. Registered
