@@ -2096,6 +2096,95 @@ pub extern "C" fn wasm_jit_alloc_array_oldgen(
     oom_signal_if_zero(obj)
 }
 
+/// rewrite.py `gen_malloc_array` standard arm:
+/// `CALL_R(malloc_array_fn, itemsize, typeid, length)`.
+/// [`wasm_jit_alloc_array`] is the NewArray trampoline ABI
+/// `(type_id, base_size, item_size, length, len_offset)`.
+pub extern "C" fn wasm_malloc_array(item_size: i64, type_id: i64, num_elem: i64) -> i64 {
+    wasm_jit_alloc_array(
+        type_id,
+        std::mem::size_of::<usize>() as i64,
+        item_size,
+        num_elem,
+        0,
+    )
+}
+
+/// rewrite.py `gen_malloc_array` nonstandard arm:
+/// `CALL_R(fn, basesize, itemsize, lengthofs, typeid, length)`.
+pub extern "C" fn wasm_malloc_array_nonstandard(
+    base_size: i64,
+    item_size: i64,
+    length_ofs: i64,
+    type_id: i64,
+    num_elem: i64,
+) -> i64 {
+    wasm_jit_alloc_array(type_id, base_size, item_size, num_elem, length_ofs)
+}
+
+/// Old-generation twin of [`wasm_malloc_array`], selected by
+/// `gen_malloc_array` for a `non_moving` array descr.
+pub extern "C" fn wasm_malloc_array_oldgen(item_size: i64, type_id: i64, num_elem: i64) -> i64 {
+    wasm_jit_alloc_array_oldgen(
+        type_id,
+        std::mem::size_of::<usize>() as i64,
+        item_size,
+        num_elem,
+        0,
+    )
+}
+
+/// Old-generation twin of [`wasm_malloc_array_nonstandard`].
+pub extern "C" fn wasm_malloc_array_nonstandard_oldgen(
+    base_size: i64,
+    item_size: i64,
+    length_ofs: i64,
+    type_id: i64,
+    num_elem: i64,
+) -> i64 {
+    wasm_jit_alloc_array_oldgen(type_id, base_size, item_size, num_elem, length_ofs)
+}
+
+/// rewrite.py `gen_malloc_str`: `CALL_R(malloc_str_fn, type_id, length)`.
+/// Layout matches `codegen::BUILTIN_STR_TOKEN_BASE_SIZE` /
+/// `codegen::BUILTIN_STRING_LEN_OFFSET`.
+pub extern "C" fn wasm_malloc_str(type_id: i64, length: i64) -> i64 {
+    wasm_jit_alloc_array(
+        type_id,
+        (2 * std::mem::size_of::<usize>() + 1) as i64,
+        1,
+        length,
+        std::mem::size_of::<usize>() as i64,
+    )
+}
+
+/// rewrite.py `gen_malloc_unicode`: `CALL_R(malloc_unicode_fn, type_id, length)`.
+/// Layout matches `codegen::BUILTIN_UNICODE_TOKEN_BASE_SIZE` /
+/// `codegen::BUILTIN_STRING_LEN_OFFSET`.
+pub extern "C" fn wasm_malloc_unicode(type_id: i64, length: i64) -> i64 {
+    wasm_jit_alloc_array(
+        type_id,
+        (2 * std::mem::size_of::<usize>()) as i64,
+        4,
+        length,
+        std::mem::size_of::<usize>() as i64,
+    )
+}
+
+/// rewrite.py `gen_malloc_fixedsize` / gc.py `malloc_big_fixedsize(size, tid)`.
+/// The CALL_R size is `payload + GcHeader::SIZE`; [`wasm_jit_alloc`] takes
+/// `(type_id, payload_size)`.
+pub extern "C" fn wasm_malloc_big_fixedsize(size: i64, type_id: i64) -> i64 {
+    let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
+    wasm_jit_alloc(type_id, payload as i64)
+}
+
+/// `malloc_big_fixedsize` old-generation twin for a `non_moving` size descr.
+pub extern "C" fn wasm_malloc_big_fixedsize_oldgen(size: i64, type_id: i64) -> i64 {
+    let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
+    wasm_jit_alloc_oldgen(type_id, payload as i64)
+}
+
 /// Exact guest-side implementation for the JIT IR's `FloatMod`. Keeping this
 /// in the interpreter module avoids both an incorrect arithmetic expansion
 /// (wasm has no remainder instruction) and a guest→host→guest call.
@@ -3280,14 +3369,15 @@ impl WasmBackend {
             .expect("Unicodehash must produce a unicode hash FieldDescr"),
             fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
             fielddescr_tid: (!is_boehm).then(majit_ir::make_tid_field_descr),
-            malloc_array_fn: wasm_jit_alloc_array as *const () as i64,
-            malloc_array_nonstandard_fn: wasm_jit_alloc_array as *const () as i64,
-            malloc_array_oldgen_fn: wasm_jit_alloc_array_oldgen as *const () as i64,
-            malloc_array_nonstandard_oldgen_fn: wasm_jit_alloc_array_oldgen as *const () as i64,
-            malloc_str_fn: wasm_jit_alloc_array as *const () as i64,
-            malloc_unicode_fn: wasm_jit_alloc_array as *const () as i64,
-            malloc_big_fixedsize_fn: wasm_jit_alloc as *const () as i64,
-            malloc_big_fixedsize_oldgen_fn: wasm_jit_alloc_oldgen as *const () as i64,
+            malloc_array_fn: wasm_malloc_array as *const () as i64,
+            malloc_array_nonstandard_fn: wasm_malloc_array_nonstandard as *const () as i64,
+            malloc_array_oldgen_fn: wasm_malloc_array_oldgen as *const () as i64,
+            malloc_array_nonstandard_oldgen_fn: wasm_malloc_array_nonstandard_oldgen as *const ()
+                as i64,
+            malloc_str_fn: wasm_malloc_str as *const () as i64,
+            malloc_unicode_fn: wasm_malloc_unicode as *const () as i64,
+            malloc_big_fixedsize_fn: wasm_malloc_big_fixedsize as *const () as i64,
+            malloc_big_fixedsize_oldgen_fn: wasm_malloc_big_fixedsize_oldgen as *const () as i64,
             malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
             malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
             malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
@@ -7045,6 +7135,41 @@ mod tests {
         let _gc_box = install_gc_box(Box::new(gc));
         assert_eq!(wasm_jit_alloc_headerless(-1), 0);
         assert_eq!(wasm_jit_alloc_headerless(0), 0);
+    }
+
+    #[test]
+    fn gc_rewriter_registers_rewrite_abi_malloc_wrappers() {
+        let backend = WasmBackend::new();
+        let rewriter = backend.gc_rewriter();
+        assert_eq!(
+            rewriter.malloc_array_fn,
+            wasm_malloc_array as *const () as i64
+        );
+        assert_eq!(
+            rewriter.malloc_array_nonstandard_fn,
+            wasm_malloc_array_nonstandard as *const () as i64
+        );
+        assert_eq!(
+            rewriter.malloc_array_oldgen_fn,
+            wasm_malloc_array_oldgen as *const () as i64
+        );
+        assert_eq!(
+            rewriter.malloc_array_nonstandard_oldgen_fn,
+            wasm_malloc_array_nonstandard_oldgen as *const () as i64
+        );
+        assert_eq!(rewriter.malloc_str_fn, wasm_malloc_str as *const () as i64);
+        assert_eq!(
+            rewriter.malloc_unicode_fn,
+            wasm_malloc_unicode as *const () as i64
+        );
+        assert_eq!(
+            rewriter.malloc_big_fixedsize_fn,
+            wasm_malloc_big_fixedsize as *const () as i64
+        );
+        assert_eq!(
+            rewriter.malloc_big_fixedsize_oldgen_fn,
+            wasm_malloc_big_fixedsize_oldgen as *const () as i64
+        );
     }
 
     #[test]
