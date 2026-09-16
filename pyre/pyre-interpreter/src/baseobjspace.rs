@@ -21868,15 +21868,17 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             crate::builtins::bytearray_check_exports(obj)?;
             if is_slice(index) {
                 let (rs, rp, st) = {
-                    // Rooted for the components' `__index__` calls; a
-                    // bytearray does not move, so this is liveness alone.
+                    // Each slice component runs `__index__`; a nursery
+                    // bytearray moves under that callback.
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let _ = pyre_object::gc_roots::pin_root(obj);
-                    crate::sliceobject::slice_unpack(
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let unpacked = crate::sliceobject::slice_unpack(
                         w_slice_get_start(index),
                         w_slice_get_stop(index),
                         w_slice_get_step(index),
-                    )?
+                    )?;
+                    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    unpacked
                 };
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, stop, step, slicelength) =
@@ -21915,8 +21917,10 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             }
             let i = {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let _ = pyre_object::gc_roots::pin_root(obj);
-                subscript_index_w("bytearray", index)?
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                let i = subscript_index_w("bytearray", index)?;
+                obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                i
             };
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };
