@@ -2627,7 +2627,6 @@ impl PendingInline {
 #[cfg(target_arch = "wasm32")]
 impl PendingInline {
     fn set_dispatch_withdrawn(&self, withdrawn: bool) {
-<<<<<<< HEAD
         // The trip helper runs in the guest. Do not expect/index: a
         // missing owner or out-of-range fail index must leave
         // must_compile alone rather than abort the loop.
