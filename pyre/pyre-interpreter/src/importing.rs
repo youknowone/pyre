@@ -5310,10 +5310,22 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if dict.is_null() {
         return None;
     }
-    let w_spec = dict_getitem_str_no_callback(dict, "__spec__")??;
-    if w_spec.is_null() || unsafe { pyre_object::is_none(w_spec) } {
-        return None;
-    }
+    let w_spec = match dict_getitem_str_no_callback(dict, "__spec__")? {
+        None => {
+            // Dict miss is `getattr` `AttributeError` only when the type
+            // does not still bind `__spec__`.
+            if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__spec__") }.is_some() {
+                return None;
+            }
+            return None;
+        }
+        Some(spec) if spec.is_null() || unsafe { pyre_object::is_none(spec) } => {
+            // `getattr(None, "_initializing")` is `AttributeError`;
+            // `_gcd_import` then treats the module as initialized.
+            return Some(w_module);
+        }
+        Some(spec) => spec,
+    };
     let spec_type = unsafe { (*w_spec).w_class };
     if unsafe { crate::baseobjspace::getattribute_if_not_from_object(spec_type) }.is_some() {
         return None;
@@ -5364,6 +5376,35 @@ fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<P
         None
     } else {
         Some(hit)
+    }
+}
+
+/// `interp___import__` `space.findattr(w_mod, "__path__")` without hooks.
+/// `None` is hooky (decline the residual). `Some(false)` is not a package
+/// (`findattr` missed or returned `None`). `Some(true)` is a package and
+/// needs `_handle_fromlist`.
+pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
+    let w_type = unsafe { (*w_module).w_class };
+    if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, "__path__") } {
+        return None;
+    }
+    let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
+    if dict.is_null() {
+        return None;
+    }
+    match dict_getitem_str_no_callback(dict, "__path__")? {
+        None => {
+            if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__path__") }.is_some() {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Some(path) if path.is_null() || unsafe { pyre_object::is_none(path) } => Some(false),
+        Some(_) => Some(true),
     }
 }
 
@@ -7260,6 +7301,36 @@ mod tests {
             sys_module_if_initialized("import_cache_nondescript_mod").is_none(),
             "getattr would bind the type-level _initializing; the residual must decline"
         );
+    }
+
+    #[test]
+    fn import_cache_probe_accepts_none_spec_as_initialized() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_none_spec_mod");
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", pyre_object::w_none()) };
+        set_sys_module("import_cache_none_spec_mod", module);
+        assert!(
+            sys_module_if_initialized("import_cache_none_spec_mod").is_some(),
+            "_gcd_import treats getattr(None, '_initializing') as initialized"
+        );
+    }
+
+    #[test]
+    fn import_cache_path_probe_sees_dict_path_as_package() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_pkg_mod");
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe {
+            pyre_object::w_dict_setitem_str(dict, "__path__", pyre_object::w_list_new_empty())
+        };
+        assert_eq!(module_is_package_no_callback(module), Some(true));
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__path__", pyre_object::w_none()) };
+        assert_eq!(module_is_package_no_callback(module), Some(false));
+        unsafe { pyre_object::w_dict_delitem_str(dict, "__path__") };
+        assert_eq!(module_is_package_no_callback(module), Some(false));
     }
 
     #[test]

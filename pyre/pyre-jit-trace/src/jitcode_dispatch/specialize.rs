@@ -17272,10 +17272,20 @@ extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
 
 fn import_cached_lookup(name: &str, fromlist_empty: bool) -> Option<pyre_object::PyObjectRef> {
     let leaf = pyre_interpreter::importing::sys_module_if_initialized(name)?;
-    if fromlist_empty && let Some(dot) = name.find('.') {
-        return pyre_interpreter::importing::sys_module_if_initialized(&name[..dot]);
+    if fromlist_empty {
+        if let Some(dot) = name.find('.') {
+            return pyre_interpreter::importing::sys_module_if_initialized(&name[..dot]);
+        }
+        return Some(leaf);
     }
-    Some(leaf)
+    // `interp___import__` else-arm: a fromlist on a non-package returns
+    // the cached module.  Recheck `__path__` here (`findattr`) so a later
+    // package conversion is a residual miss, not a baked "not a package".
+    if pyre_interpreter::importing::module_is_package_no_callback(leaf)? {
+        None
+    } else {
+        Some(leaf)
+    }
 }
 
 /// Cached absolute `import name` / `from name import ...` on a module already
@@ -17289,11 +17299,12 @@ fn import_cached_lookup(name: &str, fromlist_empty: bool) -> Option<pyre_object:
 /// and `GuardValue`s the module observed at record time.  A replaced or
 /// deleted entry side-exits to the original `IMPORT_NAME`.
 ///
-/// A non-empty fromlist is declined: `interp___import__` rechecks
-/// `__path__` on every call and may run `_handle_fromlist`.  Baking the
-/// trace-time "not a package" answer would miss a later `__path__`.
-/// Relative imports, a non-zero level, a rebound `__import__`, or a
-/// cache miss also decline (SAFE).
+/// A non-empty exact-tuple fromlist is admitted only when the cached
+/// module is not a package: `interp___import__` then returns `w_mod`.
+/// `__path__` is re-probed on every residual call (hook-free `findattr`)
+/// so a later package conversion misses instead of baking "not a package".
+/// A package, a hooky `__path__`, a relative import, a non-zero level, a
+/// rebound `__import__`, or a cache miss decline (SAFE).
 pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -17366,9 +17377,6 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     let fromlist_empty = w_fromlist.is_null()
         || unsafe { pyre_object::is_none(w_fromlist) }
         || unsafe { pyre_object::w_tuple_len(w_fromlist) == 0 };
-    if !fromlist_empty {
-        return Ok(None);
-    }
     // Record-time probe: dict-only, no Python hooks.  FastPathGiveUp and
     // hook-shaped objects decline so the generic importer (CallMayForce)
     // runs once.
