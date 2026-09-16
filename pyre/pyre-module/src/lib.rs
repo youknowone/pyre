@@ -767,6 +767,26 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             "pyre_module::module::_cffi_backend::cdataobj::raw_free",
             cdataobj::raw_free as *const (),
         );
+        // When the frontend inlines `raw_malloc_varsize_char` / `raw_free`
+        // the residual names the C leaf (`libc::unix::malloc`). Bind those
+        // paths to the same helpers so the descent scan does not see a
+        // symbolic hash (`support.py _ll_1_raw_malloc_varsize`).
+        single(
+            entries,
+            "libc::unix::malloc",
+            cdataobj::raw_malloc_varsize_char as *const (),
+        );
+        single(
+            entries,
+            "libc::malloc",
+            cdataobj::raw_malloc_varsize_char as *const (),
+        );
+        single(
+            entries,
+            "libc::unix::free",
+            cdataobj::raw_free as *const (),
+        );
+        single(entries, "libc::free", cdataobj::raw_free as *const ());
         single(
             entries,
             "pyre_interpreter::module::_cffi_backend::cerrno::errno_before",
