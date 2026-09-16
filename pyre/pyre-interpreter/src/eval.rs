@@ -5816,6 +5816,8 @@ impl OpcodeStepExecutor for PyFrame {
     /// Keyword resolution happens HERE (before frame creation) so the
     /// JIT eval loop sees correctly-positioned locals. PyPy does this
     /// in Arguments.parse_into_scope before the frame executes.
+    /// `pyopcode.py CALL_FUNCTION_KW` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn call_kw(&mut self, nargs: usize) -> Result<(), PyError> {
         let kwarg_names = self.pop();
         let mut args = Vec::with_capacity(nargs);
