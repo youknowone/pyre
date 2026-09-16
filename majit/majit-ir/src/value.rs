@@ -3,6 +3,7 @@
 /// Translated from rpython/jit/metainterp/history.py.
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::cell::Cell;
 
 /// The type of a value in the JIT IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -398,7 +399,7 @@ impl Const {
 /// there is no Box-side mirror.
 #[derive(Debug)]
 pub struct InputArg {
-    pub tp: Type,
+    pub tp: Cell<Type>,
     /// Index in the inputargs list.
     pub index: u32,
     /// `resoperation.py AbstractInputArg._forwarded` parity slot —
@@ -430,14 +431,14 @@ impl PartialEq for InputArg {
     /// `(tp, index)` tuple equality. `_forwarded` is mutable per-op
     /// state and excluded from identity comparison.
     fn eq(&self, other: &Self) -> bool {
-        self.tp == other.tp && self.index == other.index
+        self.tp.get() == other.tp.get() && self.index == other.index
     }
 }
 
 impl InputArg {
     pub fn new_int(index: u32) -> Self {
         InputArg {
-            tp: Type::Int,
+            tp: Cell::new(Type::Int),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -446,7 +447,7 @@ impl InputArg {
 
     pub fn new_ref(index: u32) -> Self {
         InputArg {
-            tp: Type::Ref,
+            tp: Cell::new(Type::Ref),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -455,7 +456,7 @@ impl InputArg {
 
     pub fn new_float(index: u32) -> Self {
         InputArg {
-            tp: Type::Float,
+            tp: Cell::new(Type::Float),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -471,7 +472,7 @@ impl InputArg {
             "InputArg::from_type: Type::Void is not a valid input-arg type",
         );
         InputArg {
-            tp,
+            tp: Cell::new(tp),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -520,7 +521,7 @@ impl InputArg {
     /// that construction so call sites do not reach for the raw `.index`
     /// field directly.
     pub fn opref(&self) -> crate::resoperation::OpRef {
-        crate::resoperation::OpRef::input_arg_typed(self.index, self.tp)
+        crate::resoperation::OpRef::input_arg_typed(self.index, self.tp.get())
     }
 }
 
@@ -606,9 +607,7 @@ impl InputArgRc {
     /// Update the box type in place. Fail-arg reconciliation can retag a
     /// shared InputArg after unboxing; `tp` is otherwise construction-fixed.
     pub fn set_tp(&self, tp: Type) {
-        unsafe {
-            (*self.ptr.as_ptr()).value.tp = tp;
-        }
+        self.tp.set(tp);
     }
 
     pub fn as_ptr(this: &Self) -> *const InputArg {

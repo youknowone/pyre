@@ -300,7 +300,7 @@ where
         start_fresh: u32,
     ) -> Self {
         let inputarg_types: Vec<majit_ir::Type> =
-            inputargs.iter().map(|arg| arg.as_ref().tp).collect();
+            inputargs.iter().map(|arg| arg.as_ref().tp.get()).collect();
         let inputarg_positions: Vec<OpRef> =
             inputargs.iter().map(|arg| arg.as_ref().opref()).collect();
         Self::new_with_input_layout(
@@ -758,12 +758,12 @@ impl<'a> ByteTraceIter<'a> {
         let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
         // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
-        // self.trace.inputargs]` — type comes from each `InputArg.tp`.
+        // self.trace.inputargs]` — type comes from each `InputArg.tp.get()`.
         let inputargs: Vec<majit_ir::InputArgRc> = trace
             .inputargs
             .iter()
             .map(|ia| {
-                let r = InputArg::from_type_rc(ia.tp, _fresh);
+                let r = InputArg::from_type_rc(ia.tp.get(), _fresh);
                 _fresh += 1;
                 r
             })
@@ -1702,7 +1702,7 @@ impl Trace {
 
     /// Inputarg types in loop-header order.
     pub fn inputarg_types(&self) -> Vec<Type> {
-        self.inputargs.iter().map(|ia| ia.tp).collect()
+        self.inputargs.iter().map(|ia| ia.tp.get()).collect()
     }
 
     /// history.py `length`: number of non-inputarg ops recorded so far.

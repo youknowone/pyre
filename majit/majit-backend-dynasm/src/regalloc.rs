@@ -1920,7 +1920,7 @@ impl<'a> RegAlloc<'a> {
         self._set_initial_bindings(inputargs);
         // Free input variables that are dead at position 0
         for iarg in inputargs {
-            let tp = iarg.tp;
+            let tp = iarg.tp.get();
             let opref = iarg.opref();
             if tp == Type::Float {
                 self.xrm
@@ -2022,7 +2022,9 @@ impl<'a> RegAlloc<'a> {
     fn _set_initial_bindings(&mut self, inputargs: &[InputArgRc]) {
         for iarg in inputargs {
             let opref = iarg.opref();
-            let _loc = self.fm.get_new_loc(opref, iarg.tp, &mut self.longevity);
+            let _loc = self
+                .fm
+                .get_new_loc(opref, iarg.tp.get(), &mut self.longevity);
         }
     }
 
@@ -2033,7 +2035,7 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
             let v = iarg.opref();
-            let tp = iarg.tp;
+            let tp = iarg.tp.get();
             match loc {
                 Loc::Reg(reg) => {
                     if tp == Type::Float {
@@ -2079,7 +2081,7 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:321
         for iarg in inputargs {
             let opref = iarg.opref();
-            self.possibly_free_var(opref, iarg.tp);
+            self.possibly_free_var(opref, iarg.tp.get());
         }
         // x86/regalloc.py:322
         self.fm.finish_binding();
@@ -2597,7 +2599,7 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:400-401 free inputargs
         for iarg in inputargs {
             let opref = iarg.opref();
-            self.possibly_free_var(opref, iarg.tp);
+            self.possibly_free_var(opref, iarg.tp.get());
         }
 
         output

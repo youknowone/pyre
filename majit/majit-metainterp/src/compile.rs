@@ -758,7 +758,7 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>, A: AsRef<InputArg>>(
         } else if let Some(types) = op.get_fail_arg_types() {
             types.to_vec()
         } else {
-            inputargs.iter().map(|arg| arg.as_ref().tp).collect()
+            inputargs.iter().map(|arg| arg.as_ref().tp.get()).collect()
         };
         // Both resume-layout consumers below decode the same guard-owned
         // `rd_numb`. RPython keeps one numbering stream on the descr and its
@@ -1678,7 +1678,7 @@ pub(crate) fn enrich_resume_layout_with_trace_metadata<A: AsRef<InputArg>>(
         None => true,
     };
     if needs_slot_types && inputargs.len() == innermost.slot_layouts.len() {
-        innermost.slot_types = Some(inputargs.iter().map(|arg| arg.as_ref().tp).collect());
+        innermost.slot_types = Some(inputargs.iter().map(|arg| arg.as_ref().tp.get()).collect());
     }
 }
 
@@ -2151,7 +2151,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             Type::Void => panic!("virtualizable static field {fi} has Void type"),
         };
         let old_opref =
-            OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
+            OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp.get());
         let new_opref = OpRef::op_typed(next_opref, field.field_type);
         next_opref += 1;
         let mut op = Op::new(opcode, std::slice::from_ref(&vable_box));
@@ -2299,7 +2299,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             let const_opref = OpRef::const_int(index as i64);
 
             let old_opref =
-                OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp);
+                OpRef::input_arg_typed(expanded_inputargs[i].index, expanded_inputargs[i].tp.get());
             let new_opref = OpRef::op_typed(next_opref, vinfo.array_fields[ai].item_type);
             next_opref += 1;
             let mut elem_op = Op::new(

@@ -5580,7 +5580,7 @@ fn build_ref_root_slots(
         }
     }
     for input in inputargs {
-        if input.tp == Type::Ref
+        if input.tp.get() == Type::Ref
             && !force_tokens.contains(&input.index)
             && used_inputargs.contains(&input.index)
             && seen.insert(input.index)
@@ -5588,11 +5588,15 @@ fn build_ref_root_slots(
             if majit_ir::debug::have_debug_prints() {
                 majit_ir::debug::log_one(
                     "jit-backend",
-                    &format!("ref-root inputarg idx={} tp={:?}", input.index, input.tp),
+                    &format!(
+                        "ref-root inputarg idx={} tp={:?}",
+                        input.index,
+                        input.tp.get()
+                    ),
                 );
             }
             slots.push((input.index, slots.len()));
-        } else if input.tp == Type::Ref
+        } else if input.tp.get() == Type::Ref
             && !used_inputargs.contains(&input.index)
             && std::env::var_os("MAJIT_LOG").is_some()
         {
@@ -9985,7 +9989,7 @@ impl CraneliftBackend {
         };
         let mut defined_ref_vars: IndexSet<u32> = inputargs
             .iter()
-            .filter(|input| input.tp == Type::Ref && !force_tokens.contains(&input.index))
+            .filter(|input| input.tp.get() == Type::Ref && !force_tokens.contains(&input.index))
             .map(|input| input.index)
             .collect();
         let mut synced_ref_vars: IndexSet<u32> = IndexSet::new();
@@ -16063,7 +16067,7 @@ impl CraneliftBackend {
 
         let trace_info = CompiledTraceInfo {
             trace_id,
-            input_types: inputargs.iter().map(|arg| arg.tp).collect(),
+            input_types: inputargs.iter().map(|arg| arg.tp.get()).collect(),
             header_pc,
             source_guard: None,
         };
@@ -16279,7 +16283,7 @@ fn counter_slot_for(inputargs: &[InputArgRc], ops: &[Op]) -> Option<usize> {
                 .unwrap_or_else(|| {
                     inputargs
                         .iter()
-                        .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
+                        .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
                         .collect()
                 });
             counter_value_spill(op, &fail_args).is_some()
@@ -16450,7 +16454,7 @@ fn collect_guards(
             // InputArg, so mint a typed OpRef per entry.
             let refs: Vec<OpRef> = inputargs
                 .iter()
-                .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
+                .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
                 .collect();
             let fb_descr_arc = op.getdescr();
             let types = resolve_fail_arg_types(
@@ -17208,7 +17212,7 @@ fn collect_terminal_exit_layouts(
                 trace_id,
                 trace_info: Some(CompiledTraceInfo {
                     trace_id,
-                    input_types: inputargs.iter().map(|arg| arg.tp).collect(),
+                    input_types: inputargs.iter().map(|arg| arg.tp.get()).collect(),
                     header_pc,
                     source_guard: None,
                 }),
@@ -17288,7 +17292,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // boundary; backend stages do not depend on `_forwarded` sharing).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;

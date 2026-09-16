@@ -849,7 +849,7 @@ fn snapshot_inputarg_for_stack_ptr(
         return None;
     }
     inputargs.iter().find_map(|ia| {
-        (ia.tp == majit_ir::Type::Ref
+        (ia.tp.get() == majit_ir::Type::Ref
             && matches!(ia.get_value(), Some(majit_ir::Value::Ref(g)) if g.0 == addr))
         .then_some(majit_ir::OpRef::input_arg_typed(
             ia.index,
@@ -1285,7 +1285,7 @@ fn prepare_bridge_trace_from_owned(
     let reminted_inputargs: Vec<majit_ir::InputArgRc> = bridge_inputargs
         .iter()
         .map(|arg| {
-            let reminted = InputArg::from_type_rc(arg.tp, fresh);
+            let reminted = InputArg::from_type_rc(arg.tp.get(), fresh);
             fresh += 1;
             if let Some(value) = arg.get_value() {
                 reminted.set_value(value);
@@ -1435,7 +1435,7 @@ fn reminted_loop_vm_red(
 ) -> Option<OpRef> {
     let assembled = OpRef::input_arg_typed(1, Type::Ref);
     original.iter().zip(reminted.iter()).find_map(|(old, new)| {
-        (old.opref() == assembled && old.tp == Type::Ref).then_some(new.opref())
+        (old.opref() == assembled && old.tp.get() == Type::Ref).then_some(new.opref())
     })
 }
 
@@ -7910,7 +7910,7 @@ impl<M: Clone> MetaInterp<M> {
             .inputargs()
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
         unroll_opt.trace_inputarg_boxes = preamble_data.base.inputargs().to_vec();
         // resume.py parity: convert tracing-time snapshots to flat OpRef
@@ -8099,7 +8099,7 @@ impl<M: Clone> MetaInterp<M> {
                         // no raw-u32 type side-table propagation is
                         // needed (callers read via `OpRef::ty()`).
                         let inputarg_types: Vec<majit_ir::Type> =
-                            trace.inputargs.iter().map(|ia| ia.tp).collect();
+                            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
                         simple_opt.trace_inputargs =
                             majit_ir::OpRef::inputarg_refs(&inputarg_types);
                         // Move, not clone: keeps the rooted buffers in place so
@@ -9821,7 +9821,7 @@ impl<M: Clone> MetaInterp<M> {
             .inputargs
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
         unroll_opt.trace_inputarg_boxes = trace.inputargs.clone();
         let (
@@ -10837,7 +10837,8 @@ impl<M: Clone> MetaInterp<M> {
         // history.py:_make_op parity: every InputArg carries its type
         // from the recorder. Propagate those raw recorder types to the
         // optimizer without further reconciliation.
-        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        let inputarg_types: Vec<majit_ir::Type> =
+            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
         optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
         // history.py/261/307 — `Const.type` / `InputArg.type` are
         // intrinsic on the box itself; no raw-u32 type side-table
@@ -11360,7 +11361,8 @@ impl<M: Clone> MetaInterp<M> {
         // `store_final_boxes_in_guard` with nothing to bind it to
         // (`_number_boxes` → `Operand::from_opref` on a position-only ref).
         // Same seeding as the no-unroll retry inside `compile_loop`.
-        let inputarg_types: Vec<majit_ir::Type> = trace.inputargs.iter().map(|ia| ia.tp).collect();
+        let inputarg_types: Vec<majit_ir::Type> =
+            trace.inputargs.iter().map(|ia| ia.tp.get()).collect();
         optimizer.trace_inputargs = majit_ir::OpRef::inputarg_refs(&inputarg_types);
 
         let (
@@ -13299,7 +13301,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
         }
-        Some(root_trace.inputargs.iter().map(|ia| ia.tp).collect())
+        Some(root_trace.inputargs.iter().map(|ia| ia.tp.get()).collect())
     }
 
     /// Get the pre-allocated token number for a trace being recorded.
@@ -14475,7 +14477,7 @@ impl<M: Clone> MetaInterp<M> {
                 bridge_inputargs.len(),
             );
             for (ia, &raw) in bridge_inputargs.iter().zip(frontend_boxes.iter()) {
-                let value = heap_value_for(ia.tp, raw);
+                let value = heap_value_for(ia.tp.get(), raw);
                 // Stamp the concrete value on the canonical bridge `InputArg`
                 // identity (`history.py *FrontendOp(pos, value)`).
                 ia.set_value(value);
@@ -14520,7 +14522,7 @@ impl<M: Clone> MetaInterp<M> {
         // bridge_inputargs already carry their type via the typed `InputArg`
         // variant + `OpRef::input_arg_typed(index, tp)` reconstruction;
         // see `opref_type` in `optimizer.rs` (priority-0 variant-tag read).
-        // The legacy `constant_types.insert(arg.index, arg.tp)` was redundant.
+        // The legacy `constant_types.insert(arg.index, arg.tp.get())` was redundant.
         optimizer.snapshot_boxes = prepared.snapshot_boxes;
         optimizer.snapshot_frame_sizes = prepared.snapshot_frame_sizes;
         optimizer.snapshot_vable_boxes = prepared.snapshot_vable_boxes;
@@ -14533,7 +14535,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.trace_inputargs = bridge_inputargs
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
@@ -14938,7 +14940,7 @@ impl<M: Clone> MetaInterp<M> {
             std::collections::HashMap::new();
         for ia in bridge_inputargs {
             if let Some(v) = ia.get_value() {
-                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp), v);
+                concrete.insert(OpRef::input_arg_typed(ia.index, ia.tp.get()), v);
             }
         }
         for op in bridge_ops.iter().map(std::borrow::Borrow::borrow) {
@@ -15028,7 +15030,7 @@ impl<M: Clone> MetaInterp<M> {
         }
         self.compiled_guard_vm_failarg_index(origin_key, fail_descr)
             .and_then(|idx| reminted.get(idx))
-            .filter(|ia| ia.tp == Type::Ref)
+            .filter(|ia| ia.tp.get() == Type::Ref)
             .map(|ia| ia.opref())
             .or(fallback)
     }
@@ -15196,7 +15198,7 @@ impl<M: Clone> MetaInterp<M> {
                 // time.
                 let positional_livebox_types: Vec<Type> = Some(fail_descr.fail_arg_types().to_vec())
                     .filter(|types| !types.is_empty())
-                    .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp).collect());
+                    .unwrap_or_else(|| bridge_inputargs.iter().map(|ia| ia.tp.get()).collect());
                 // pyjitpl.py `initialize_state_from_guard_failure` removes
                 // None entries before bridgeopt.py receives `liveboxes`.
                 // `fail_arg_types` retains the resume numbering's positional
@@ -15329,7 +15331,7 @@ impl<M: Clone> MetaInterp<M> {
         let bridge_inputarg_types: Vec<majit_ir::OpRef> = prepared_inputargs
             .iter()
             .enumerate()
-            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp))
+            .map(|(i, ia)| majit_ir::OpRef::input_arg_typed(i as u32, ia.tp.get()))
             .collect();
         let bridge_inputargs = prepared_inputargs.as_slice();
         let bridge_ops = bridge_trace_data.ops.as_slice();
@@ -15349,7 +15351,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.call_pure_results = bridge_call_pure_results;
         // history.py InputArg.type parity: each `InputArg` carries its type
         // in the typed OpRef variant tag (`OpRef::input_arg_typed`); the
-        // legacy `constant_types.insert(arg.index, arg.tp)` writes were
+        // legacy `constant_types.insert(arg.index, arg.tp.get())` writes were
         // redundant with `opref_type`'s priority-0 variant-tag read.
         optimizer.snapshot_boxes = snapshot_boxes;
         optimizer.snapshot_frame_sizes = snapshot_frame_sizes;
@@ -25450,7 +25452,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            inputargs.iter().map(|arg| arg.tp).collect::<Vec<_>>(),
+            inputargs.iter().map(|arg| arg.tp.get()).collect::<Vec<_>>(),
             vec![Type::Ref, Type::Int, Type::Ref]
         );
         assert_eq!(ops[0].arg(0).to_opref(), OpRef::input_arg_ref(0));
@@ -25522,7 +25524,7 @@ mod tests {
             prepared
                 .inputargs
                 .iter()
-                .map(|arg| (arg.index, arg.tp))
+                .map(|arg| (arg.index, arg.tp.get()))
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
@@ -25622,7 +25624,7 @@ mod tests {
             prepared
                 .inputargs
                 .iter()
-                .map(|arg| (arg.index, arg.tp))
+                .map(|arg| (arg.index, arg.tp.get()))
                 .collect::<Vec<_>>(),
             vec![(556, Type::Ref), (557, Type::Ref), (558, Type::Ref)]
         );

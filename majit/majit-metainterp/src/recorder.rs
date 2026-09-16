@@ -370,7 +370,7 @@ impl Trace {
         let n = self.inputargs.len() as u32;
         let mut trb = TraceRecordBuffer::new(n, metainterp_sd);
         for ia in &self.inputargs {
-            trb.record_input_arg(ia.tp);
+            trb.record_input_arg(ia.tp.get());
         }
         self.unique_to_box = (0..n).collect();
         // Bridge traces are tens of ops; grow the maps once instead of
@@ -438,14 +438,14 @@ impl Trace {
     fn box_index_to_opref(&self, box_index: u32, box_to_unique: &[u32]) -> OpRef {
         let n = self.inputargs.len() as u32;
         if box_index < n {
-            return OpRef::input_arg_typed(box_index, self.inputargs[box_index as usize].tp);
+            return OpRef::input_arg_typed(box_index, self.inputargs[box_index as usize].tp.get());
         }
         let unique = *box_to_unique.get(box_index as usize).unwrap_or(&u32::MAX);
         if unique == u32::MAX {
             panic!("decode snapshot: TAGBOX({box_index}) has no unique OpRef");
         }
         if unique < n {
-            return OpRef::input_arg_typed(unique, self.inputargs[unique as usize].tp);
+            return OpRef::input_arg_typed(unique, self.inputargs[unique as usize].tp.get());
         }
         let slot = &self.slots[(unique - n) as usize];
         OpRef::op_typed(unique, slot.opcode.result_type())
@@ -1458,7 +1458,7 @@ impl Trace {
 
     /// Input argument types in loop-header order.
     pub fn inputarg_types(&self) -> Vec<Type> {
-        self.inputargs.iter().map(|arg| arg.tp).collect()
+        self.inputargs.iter().map(|arg| arg.tp.get()).collect()
     }
 
     /// Number of guards recorded so far.
@@ -1898,9 +1898,9 @@ mod tests {
 
         let trace = rec.get_trace();
         assert_eq!(trace.num_inputargs(), 3);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
     }
 
     #[test]
@@ -2220,8 +2220,8 @@ mod tests {
 
         let trace = rec.get_trace();
         assert_eq!(trace.num_inputargs(), 2);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Int);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Int);
     }
 
     #[test]
@@ -2614,10 +2614,10 @@ mod tests {
         rec.close_loop(&[add, f0, r0, i1]);
 
         let trace = rec.get_trace();
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Float);
-        assert_eq!(trace.inputargs[2].tp, Type::Ref);
-        assert_eq!(trace.inputargs[3].tp, Type::Int);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Float);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[3].tp.get(), Type::Int);
     }
 
     #[test]

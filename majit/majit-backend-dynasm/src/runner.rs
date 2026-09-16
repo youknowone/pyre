@@ -2477,7 +2477,7 @@ impl Backend for DynasmBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
-        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;
         let header_pc = self.next_header_pc;

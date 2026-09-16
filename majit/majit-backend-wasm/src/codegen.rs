@@ -219,7 +219,7 @@ impl ValueLocals {
                 &mut id_types,
                 &mut has_authoritative_type,
                 ia.index,
-                if ia.tp == Type::Float {
+                if ia.tp.get() == Type::Float {
                     ValType::F64
                 } else {
                     ValType::I64
@@ -1137,6 +1137,50 @@ fn field_is_float_from_descr(op: &Op) -> bool {
     }
 }
 
+fn emit_float_load(
+    sink: &mut PeepSink<'_, '_>,
+    offset: u64,
+    size: usize,
+) -> Result<(), BackendError> {
+    match size {
+        4 => {
+            sink.f32_load(mem32(offset));
+            sink.f64_promote_f32();
+        }
+        8 => {
+            sink.f64_load(mem64(offset));
+        }
+        other => {
+            return Err(BackendError::Unsupported(format!(
+                "wasm codegen: float load has size {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn emit_float_store(
+    sink: &mut PeepSink<'_, '_>,
+    offset: u64,
+    size: usize,
+) -> Result<(), BackendError> {
+    match size {
+        4 => {
+            sink.f32_demote_f64();
+            sink.f32_store(mem32(offset));
+        }
+        8 => {
+            sink.f64_store(mem64(offset));
+        }
+        other => {
+            return Err(BackendError::Unsupported(format!(
+                "wasm codegen: float store has size {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `(item_size, is_signed)` from an op's ArrayDescr. An array op always carries
 /// an ArrayDescr; a missing one is an invariant violation, so panic.
 fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
@@ -1287,7 +1331,7 @@ impl RefValues {
     fn collect(inputargs: &[InputArgRc], ops: &[Op]) -> Self {
         let mut by_id = Vec::new();
         for ia in inputargs {
-            if ia.tp == Type::Ref {
+            if ia.tp.get() == Type::Ref {
                 Self::mark(&mut by_id, ia.index);
             }
         }
@@ -1352,7 +1396,7 @@ impl RefHomes {
         let mut by_id = Vec::new();
         let mut next = 0u32;
         for ia in inputargs {
-            if ia.tp == Type::Ref && liveness.live_across_any(ia.index, &collect_positions) {
+            if ia.tp.get() == Type::Ref && liveness.live_across_any(ia.index, &collect_positions) {
                 Self::assign(&mut by_id, &mut next, ia.index);
             }
         }
@@ -4829,7 +4873,7 @@ fn rebase_region_value_ids(
     let inputargs: Vec<InputArgRc> = bridge
         .inputargs
         .iter()
-        .map(|ia| InputArgRc::new(InputArg::from_type(ia.tp, ia.index + offset)))
+        .map(|ia| InputArgRc::new(InputArg::from_type(ia.tp.get(), ia.index + offset)))
         .collect();
     // `Op::clone` gives the copy its own arg/failarg slots, but the operands in
     // them keep pointing at the region's original producers, whose `pos` this
@@ -7487,11 +7531,7 @@ fn build_function(
                 let field_offset = field_offset_from_descr(op);
                 if field_is_float_from_descr(op) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(1).to_opref());
-                    sink.f64_store(MemArg {
-                        offset: field_offset,
-                        align: 3,
-                        memory_index: 0,
-                    });
+                    emit_float_store(&mut sink, field_offset, field_size_sign_from_descr(op).0)?;
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref()); // value
                     let size = setfield_store_size_from_descr(op);
@@ -7506,11 +7546,7 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
-                    sink.f64_load(MemArg {
-                        offset: field_offset,
-                        align: 3,
-                        memory_index: 0,
-                    });
+                    emit_float_load(&mut sink, field_offset, field_size_sign_from_descr(op).0)?;
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -7551,7 +7587,7 @@ fn build_function(
                 let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     let base_size = emit_array_addr(&mut sink, constants, value_types, op);
-                    sink.f64_load(mem64(base_size));
+                    emit_float_load(&mut sink, base_size, array_item_access_size_sign(op).0)?;
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -7572,7 +7608,7 @@ fn build_function(
                 let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    sink.f64_store(mem64(base_size));
+                    emit_float_store(&mut sink, base_size, array_item_access_size_sign(op).0)?;
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref()); // value
                     // A Ref item is pointer-width (4 bytes on wasm32). Storing a
@@ -7610,7 +7646,7 @@ fn build_function(
                     // from — so it picks the load the same way the three
                     // `Getarrayitem` arms do.
                     if op.opcode == OpCode::GetinteriorfieldGcF {
-                        sink.f64_load(mem64(base));
+                        emit_float_load(&mut sink, base, field.field_size)?;
                     } else {
                         let (size, signed) = field.access_size_sign();
                         emit_sized_int_load(&mut sink, base, size, signed);
@@ -7646,7 +7682,7 @@ fn build_function(
                 );
                 if field.is_float {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    sink.f64_store(mem64(base));
+                    emit_float_store(&mut sink, base, field.field_size)?;
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                     emit_sized_int_store(&mut sink, base, field.access_size_sign().0);
@@ -7788,9 +7824,15 @@ fn build_function(
                     op.arg(0).to_opref(),
                     op.arg(1).to_opref(),
                 );
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                 let (size, _) = gc_rewrite_access_size(op, constants, 3)?;
-                emit_sized_int_store(&mut sink, offset, size);
+                let val = op.arg(2).to_opref();
+                if size == 4 && value_types.ty(val.raw()) == ValType::F64 {
+                    emit_resolve_f64(&mut sink, constants, value_types, val);
+                    emit_float_store(&mut sink, offset, size)?;
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, val);
+                    emit_sized_int_store(&mut sink, offset, size);
+                }
             }
             OpCode::GcStoreIndexed => {
                 if op.num_args() < 6 {
@@ -7801,9 +7843,15 @@ fn build_function(
                     ));
                 }
                 let offset = emit_gc_indexed_addr(&mut sink, constants, value_types, op, 3, 4)?;
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
                 let (size, _) = gc_rewrite_access_size(op, constants, 5)?;
-                emit_sized_int_store(&mut sink, offset, size);
+                let val = op.arg(2).to_opref();
+                if size == 4 && value_types.ty(val.raw()) == ValType::F64 {
+                    emit_resolve_f64(&mut sink, constants, value_types, val);
+                    emit_float_store(&mut sink, offset, size)?;
+                } else {
+                    emit_resolve(&mut sink, constants, value_types, val);
+                    emit_sized_int_store(&mut sink, offset, size);
+                }
             }
 
             // ── Raw memory access ──

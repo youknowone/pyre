@@ -4817,7 +4817,7 @@ impl majit_backend::Backend for WasmBackend {
         // whose inputargs outnumber the portal's live values be entered with
         // the short list, so every frame slot past it reads as a zero the
         // prologue then loads as a null Ref.
-        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
 
         let max_output_slots = guard_exits
             .iter()
@@ -4906,7 +4906,7 @@ impl majit_backend::Backend for WasmBackend {
         let compiled = CompiledWasmLoop {
             token_number: token.number,
             trace_id,
-            input_types: inputargs.iter().map(|ia| ia.tp).collect(),
+            input_types: inputargs.iter().map(|ia| ia.tp.get()).collect(),
             func_handle: std::cell::Cell::new(func_handle),
             pending_wasm_bytes: std::cell::RefCell::new(defer_host_compile.then_some(wasm_bytes)),
             compiled_loop_token: token.compiled_loop_token_expect(),
