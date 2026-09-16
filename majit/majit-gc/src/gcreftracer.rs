@@ -96,10 +96,11 @@ unsafe impl Sync for GcTable {}
 /// `CompiledLoopToken.asmmemmgr_gcreftracers` (parity
 /// `gcreftracers.append(tracer)`, `x86/assembler.py`); the registry keeps
 /// only a `Weak`, and a `Weak` that stops upgrading is the whole of
-/// deregistration. No `free_loop` clears `asmmemmgr_gcreftracers`, and
-/// nothing dispatches `Backend::free_loop` at all — the release is `Arc`
-/// drop, driven by the memory manager retiring a token in
-/// `try_to_free_some_loops`.
+/// deregistration. `JitCellToken::drop` calls
+/// `CompiledLoopToken::free_loop_and_bridges` (`llmodel.py`), which
+/// clears `asmmemmgr_gcreftracers`; `CompiledLoopToken::drop` then
+/// bumps `total_freed_*`. The memory manager retiring a token from
+/// `alive_loops` is what starts that drop.
 ///
 /// That drop is not always the CLT's. On cranelift a bridge's table is
 /// pinned a second time by every `BridgeData` that can dispatch to the
