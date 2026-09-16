@@ -15213,6 +15213,29 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
+        // User instances that declined every fold (commit-then-NotImplemented)
+        // must not walk `binary_value_from_tag`: that body records the
+        // dunder's store then snapshots a still-unboxed Ref.  Exact
+        // int/float operands stay on the walk so `i+1` / list indexes
+        // still lower.
+        if is_binary_from_tag {
+            let both_user = ref_args.iter().all(|&opref| {
+                walker_concrete_ref_object(ctx, opref).is_some_and(|obj| unsafe {
+                    !pyre_object::is_int(obj) && !pyre_object::is_float(obj)
+                })
+            });
+            if both_user {
+                return finish_getattr_inline_or_residual(
+                    ctx,
+                    code,
+                    op,
+                    descr_index,
+                    &int_args,
+                    &ref_args,
+                    false,
+                );
+            }
+        }
     }
 
     // `getattr_str` / `getattr_str_impl` / `load_attr` take the name as a
@@ -15326,6 +15349,36 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 &int_args,
                 &ref_args,
                 folded,
+            );
+        }
+        if super::specialize::name_leaf_is(callee, "delattr")
+            || super::specialize::name_leaf_is(callee, "delattr_str")
+            || super::specialize::jitcode_leaf_is(sub_index, "delattr")
+            || super::specialize::jitcode_leaf_is(sub_index, "delattr_str")
+            || super::specialize::jitcode_is_pathed(
+                sub_index,
+                &sub_body,
+                "pyre_interpreter::baseobjspace::delattr_str",
+            )
+        {
+            let obj = ref_args.first().copied();
+            let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
+            if let Some(obj) = obj
+                && let Some(outcome) =
+                    super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
+                        ctx, op, obj, None, 0, 0, str_name.as_deref(),
+                    )?
+            {
+                return Ok(outcome);
+            }
+            return finish_getattr_inline_or_residual(
+                ctx,
+                code,
+                op,
+                descr_index,
+                &int_args,
+                &ref_args,
+                false,
             );
         }
     }

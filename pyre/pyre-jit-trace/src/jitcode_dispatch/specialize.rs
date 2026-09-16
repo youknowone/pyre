@@ -9970,7 +9970,10 @@ pub(crate) fn name_is_frame_load_attr(name: &str) -> bool {
 }
 
 pub(crate) fn name_is_setattr_family(name: &str) -> bool {
-    name_leaf_is(name, "setattr") || name_leaf_is(name, "setattr_str")
+    name_leaf_is(name, "setattr")
+        || name_leaf_is(name, "setattr_str")
+        || name_leaf_is(name, "delattr")
+        || name_leaf_is(name, "delattr_str")
 }
 
 pub(crate) fn name_is_setitem_family(name: &str) -> bool {
@@ -21781,20 +21784,8 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // GET_ITER pops the iterable, then calls `space.iter`.  The inline_call
-    // arg may be a graph-shadow box with no concrete; the just-popped
-    // vable slot (`vstack_last_ref`) still names the live range.
-    let mut range_op = r_args[0];
-    if walker_concrete_ref_object(ctx, range_op).is_none() {
-        let last = ctx.frame_state.borrow().vstack_last_ref;
-        if last != OpRef::NONE && walker_concrete_ref_object(ctx, last).is_some() {
-            range_op = last;
-        }
-    }
+    let range_op = r_args[0];
     let Some(range_obj) = walker_concrete_ref_object(ctx, range_op) else {
-        if fbw_debug_abort_enabled() {
-            eprintln!("[decline-why] GET-ITER-NO-CONCRETE pc={op_pc}");
-        }
         return Ok(None);
     };
 
