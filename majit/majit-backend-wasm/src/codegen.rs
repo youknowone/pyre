@@ -4867,7 +4867,6 @@ fn emit_nursery_ptr_increment(
     sink.i64_extend_i32_u();
 }
 
-
 /// `__indirect_function_table` indices of the allocation helpers a compiled
 /// trace calls for `New*` / `NewArray*`.
 ///
