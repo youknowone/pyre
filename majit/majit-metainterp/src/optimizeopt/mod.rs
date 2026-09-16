@@ -2347,7 +2347,7 @@ impl OptContext {
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         let pos = pos as u32;
         match self.inputarg_refs.get(&pos) {
-            Some(ia) if ia.tp == tp && ia.index == pos => {}
+            Some(ia) if ia.tp.get() == tp && ia.index == pos => {}
             _ => {
                 self.inputarg_refs.insert(
                     pos,
@@ -12270,7 +12270,7 @@ mod opt_box_env_tests {
             .bound_inputarg()
             .expect("empty InputArg* slot lazy-materialised the wrong host kind");
         assert_eq!(ia.index, 0);
-        assert_eq!(ia.tp, majit_ir::Type::Int);
+        assert_eq!(ia.tp.get(), majit_ir::Type::Int);
 
         // Re-entering must resolve to the same canonical `_forwarded`
         // host (`resoperation.py AbstractInputArg._forwarded`) —

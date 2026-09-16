@@ -629,7 +629,7 @@ impl TreeLoop {
 
     /// Get the input arg types.
     pub fn inputarg_types(&self) -> Vec<majit_ir::Type> {
-        self.inputargs.iter().map(|ia| ia.tp).collect()
+        self.inputargs.iter().map(|ia| ia.tp.get()).collect()
     }
 
     /// opencoder.py Trace.get_iter() — produce a TraceIterator over
@@ -671,7 +671,7 @@ impl TreeLoop {
         let mut op_positions: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
         // history.py:564-565: inputargs must not contain constants
         for ia in &self.inputargs {
-            let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp);
+            let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp.get());
             if ia_ref.is_constant() {
                 return false;
             }
@@ -1086,7 +1086,7 @@ impl TreeLoop {
                 remap.insert(r, const_opref);
             } else {
                 // No pool constant available: fall back to new inputarg.
-                let tp = self.inputargs[r.raw() as usize].tp;
+                let tp = self.inputargs[r.raw() as usize].tp.get();
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit][cut-escape] original inputarg {:?} (tp={:?}) not in \
@@ -1399,9 +1399,9 @@ mod tests {
             InputArg::new_float(2),
         ];
         let trace = TreeLoop::new(inputargs, vec![]);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
     }
 
     // History / TreeLoop parity tests
@@ -1517,9 +1517,9 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.num_inputargs(), 3);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
         assert!(trace.is_loop());
     }
 
@@ -2491,8 +2491,8 @@ mod tests {
         let trace = rec.get_trace();
 
         assert_eq!(trace.num_inputargs(), 2);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Int);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Int);
 
         assert_eq!(trace.num_ops(), 3);
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
@@ -2572,9 +2572,9 @@ mod tests {
         rec.close_loop(&[i1, r0, f0]);
 
         let trace = rec.get_trace();
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
         assert!(trace.is_loop());
     }
 

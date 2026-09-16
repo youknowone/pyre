@@ -1878,7 +1878,7 @@ impl<'a> AssemblerARM64<'a> {
     ///
     /// Returns compiled code with fail descriptors and entry point.
     pub fn assemble_loop(mut self) -> Result<CompiledCode, BackendError> {
-        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp.get()).collect();
 
         // assembler.py:537 prepare_loop — set up regalloc
         // For now, simplified: all args in frame slots
@@ -1998,7 +1998,10 @@ impl<'a> AssemblerARM64<'a> {
             } else {
                 // llsupport/assembler.py:217 — frame slot
                 let slot = pos - JITFRAME_FIXED_SIZE;
-                let tp = inputargs.get(input_i).map(|ia| ia.tp).unwrap_or(Type::Int);
+                let tp = inputargs
+                    .get(input_i)
+                    .map(|ia| ia.tp.get())
+                    .unwrap_or(Type::Int);
                 locs.push(Loc::Frame(crate::regloc::FrameLoc::new(
                     slot,
                     crate::regalloc::get_ebp_ofs(base_ofs, slot),
@@ -2019,11 +2022,14 @@ impl<'a> AssemblerARM64<'a> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] assemble_bridge: input_types={:?} arglocs={:?}",
-                self.inputargs.iter().map(|ia| ia.tp).collect::<Vec<_>>(),
+                self.inputargs
+                    .iter()
+                    .map(|ia| ia.tp.get())
+                    .collect::<Vec<_>>(),
                 arglocs
             );
         }
-        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp.get()).collect();
         self.bridge_input_locs = if arglocs.is_empty() {
             None
         } else {

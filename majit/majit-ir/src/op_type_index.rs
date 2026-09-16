@@ -158,9 +158,9 @@ impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
                     "OpTypeIndex: raw inputarg index {} bound to inputargs[{}] {:?} and inputargs[{}] {:?} — backend uniqueness violated",
                     arg.index,
                     prev,
-                    inputargs[prev as usize].as_ref().tp,
+                    inputargs[prev as usize].as_ref().tp.get(),
                     idx,
-                    arg.tp,
+                    arg.tp.get(),
                 );
             }
         }
@@ -269,7 +269,7 @@ impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
     /// same OpRef with a different type.
     pub fn inputarg_type(&self, opref: OpRef) -> Option<Type> {
         let idx = self.inputarg_pos.get(opref.raw())?;
-        Some(self.inputargs[idx].as_ref().tp)
+        Some(self.inputargs[idx].as_ref().tp.get())
     }
 
     /// Raw-keyed companion of `inputarg_type`. Used by callers that hold
@@ -279,6 +279,6 @@ impl<'a, T: AsRef<Op>, A: AsRef<InputArg>> OpTypeIndex<'a, T, A> {
     /// inputarg base) internally, so the round-trip carries no information.
     pub fn inputarg_type_raw(&self, raw: u32) -> Option<Type> {
         let idx = self.inputarg_pos.get(raw)?;
-        Some(self.inputargs[idx].as_ref().tp)
+        Some(self.inputargs[idx].as_ref().tp.get())
     }
 }

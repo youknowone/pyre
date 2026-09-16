@@ -280,7 +280,7 @@ impl VarMemo {
     }
 
     fn inputarg(&mut self, arg: &InputArg) -> String {
-        let kind = match arg.tp {
+        let kind = match arg.tp.get() {
             Type::Int => b'i',
             Type::Ref => b'p',
             Type::Float => b'f',

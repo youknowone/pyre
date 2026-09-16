@@ -113,12 +113,12 @@ impl<'backend> CompiledIr<'backend> {
                 "eager compilation requires a fresh JitCellToken".into(),
             ));
         }
-        if operations.is_empty() || inputargs.iter().any(|arg| arg.tp == Type::Void) {
+        if operations.is_empty() || inputargs.iter().any(|arg| arg.tp.get() == Type::Void) {
             return Err(BackendError::CompilationFailed(
                 "eager compilation requires nonempty IR and non-void input arguments".into(),
             ));
         }
-        let input_types = inputargs.iter().map(|arg| arg.tp).collect();
+        let input_types = inputargs.iter().map(|arg| arg.tp.get()).collect();
         backend.set_constants_pool(constants);
         let result = backend.compile_loop(inputargs, operations, &token);
         backend.set_constants_pool(ConstMap::default());
