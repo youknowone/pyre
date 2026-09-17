@@ -803,6 +803,14 @@ impl BlackholeInterpreter {
         self.state_field_layout = StateFieldLayout::default();
     }
 
+    /// Fold a byte-interpreted inline callee's residual flag onto the caller
+    /// before [`Self::reset_for_inline_reuse`] clears it.
+    fn fold_called_residual_from(&self, callee: &Self) {
+        if callee.called_residual.get() {
+            self.called_residual.set(true);
+        }
+    }
+
     /// Copy the builder-shared context fields from `parent` onto `self`.
     /// Mirrors `BlackholeInterpBuilder::acquire_interp` in this file
     /// — the same 6 fields that builder→interp normally propagates.
@@ -13555,6 +13563,7 @@ fn interpret_unresolved_inline_call(
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(post_p)
     };
+    bh.fold_called_residual_from(&callee);
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
@@ -14415,12 +14424,7 @@ fn handler_inline_call_nested_ext(
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(p)
     };
-    // `reset_for_inline_reuse` clears the callee flag. Fold it onto the
-    // caller first so `guard_may_bridge` still sees a residual that ran
-    // inside this byte-interpreted inline callee.
-    if callee.called_residual.get() {
-        bh.called_residual.set(true);
-    }
+    bh.fold_called_residual_from(&callee);
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
