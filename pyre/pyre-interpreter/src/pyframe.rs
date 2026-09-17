@@ -6425,7 +6425,7 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
             for element in elements {
                 items.push(pyobject_from_constant(element));
             }
-            crate::runtime_ops::build_tuple_from_refs(&items.take())
+            pyre_object::w_tuple_new_stable(items.take())
         }
         // `load_const_value`'s `Slice` arm (`pyopcode.rs`) — recurse over
         // `[start, stop, step]` before invoking `slice_constant` (`eval.rs`).

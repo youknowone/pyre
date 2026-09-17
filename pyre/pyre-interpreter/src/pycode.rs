@@ -984,6 +984,15 @@ fn walk_co_consts_arrays(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         if *slot == 0 {
             continue;
         }
+        // Nursery-debug rotation recycles an unforwarded table. Visiting
+        // that corpse as a `FixedObjectArray` hands poison words to
+        // `drag_out_root` (`invalid type_id` on a nursery extra-area).
+        let live = pyre_object::gc_hook::try_gc_live_object_address(*slot as *mut u8);
+        if live.is_null() {
+            *slot = 0;
+            continue;
+        }
+        *slot = live as usize;
         visitor(unsafe { &mut *(slot as *mut usize as *mut majit_ir::GcRef) });
         let array = *slot as *mut FixedObjectArray;
         if array.is_null() {
@@ -1207,7 +1216,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
 /// of that young list.
 unsafe fn alloc_co_consts_array(len: usize) -> *mut FixedObjectArray {
     let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
-    let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
+    let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
         pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
         payload,
     );
@@ -3286,17 +3295,18 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     }
     let existing = unsafe { (&*table)[idx] };
     if !existing.is_null() {
-        // `getconstant_w` reads a GCREF field the collector rewrites in
-        // place. A nursery copy leaves a forwarding stub; follow it and
-        // publish the survivor so the next read does not take the stub.
-        let live =
-            pyre_object::gc_hook::try_gc_current_object_address(existing as *mut u8) as PyObjectRef;
-        if !live.is_null() && live != existing {
-            let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
-            unsafe { (&mut *table).set_ref(idx, live) };
+        // Follow a nursery forwarding stub, and reject a recycled
+        // nursery-debug fill (`try_gc_current_object_address` leaves
+        // those unchanged). A dead slot falls through to realize again.
+        let live = pyre_object::gc_hook::try_gc_live_object_address(existing as *mut u8)
+            as PyObjectRef;
+        if !live.is_null() {
+            if live != existing {
+                let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
+                unsafe { (&mut *table).set_ref(idx, live) };
+            }
             return live;
         }
-        return existing;
     }
 
     let realized = match &constants[idx] {

@@ -323,7 +323,18 @@ pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
 /// Residualized for the same GC-allocator reason as `w_tuple_new`.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
-    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
+    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false, false)
+}
+
+/// Code-constant tuples live as long as the owning `PyCode`, which is
+/// born old-gen. Allocate the header the same way so a missed
+/// remembered-set scan cannot recycle a `fromlist` / nested const.
+#[majit_macros::dont_look_inside]
+pub fn w_tuple_new_stable(items: Vec<PyObjectRef>) -> PyObjectRef {
+    if items.is_empty() {
+        return w_empty_tuple();
+    }
+    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false, true)
 }
 
 /// Build the array-backed layout used by a tuple user subclass. This is the
@@ -334,13 +345,14 @@ pub fn w_tuple_subclass_new_array_backed(
     items: Vec<PyObjectRef>,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    w_tuple_new_array_backed_impl(items, w_class, true)
+    w_tuple_new_array_backed_impl(items, w_class, true, false)
 }
 
 fn w_tuple_new_array_backed_impl(
     items: Vec<PyObjectRef>,
     w_class: PyObjectRef,
     user_layout: bool,
+    stable: bool,
 ) -> PyObjectRef {
     if !user_layout && items.is_empty() {
         return w_empty_tuple();
@@ -385,7 +397,11 @@ fn w_tuple_new_array_backed_impl(
     } else {
         (W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(type_id, object_size);
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable_raw(type_id, object_size)
+    } else {
+        crate::gc_hook::try_gc_alloc_nursery_raw(type_id, object_size)
+    };
     // The freshly allocated tuple header is itself a translated livevar across
     // the items-block allocation and the write barrier below, and the nursery
     // allocator's block moves, so publishing it is what keeps the address this
