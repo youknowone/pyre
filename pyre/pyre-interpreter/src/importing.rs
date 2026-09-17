@@ -6708,6 +6708,28 @@ pub(crate) fn is_spec_uninitialized_submodule(
     )
 }
 
+/// Exact `importlib._bootstrap.ModuleSpec` (not a subclass).  That class's
+/// `has_location` is the `_set_fileattr` field (`_bootstrap.py has_location`);
+/// a subclass or a custom spec object must go through the public name.
+fn is_exact_stdlib_module_spec(w_spec: PyObjectRef) -> bool {
+    let Some(bootstrap) =
+        get_sys_module("importlib._bootstrap").or_else(|| get_sys_module("_frozen_importlib"))
+    else {
+        return false;
+    };
+    let dict = unsafe { pyre_object::w_module_get_w_dict(bootstrap) };
+    if dict.is_null() {
+        return false;
+    }
+    let Some(Some(spec_type)) = dict_getitem_str_no_callback(dict, "ModuleSpec") else {
+        return false;
+    };
+    if spec_type.is_null() {
+        return false;
+    }
+    unsafe { (*w_spec).w_class == spec_type }
+}
+
 /// `_PyModuleSpec_GetFileOrigin` — the spec's file origin: its `origin` string
 /// when `has_location` is truthy and `origin` is a string, otherwise None.  A
 /// missing `has_location` / `origin`, or a falsey `has_location`, yields None;
@@ -6716,17 +6738,23 @@ pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef
     if unsafe { pyre_object::is_none(w_spec) } {
         return Ok(None);
     }
-    // `ModuleSpec.has_location` is the `_set_fileattr` field
-    // (`_bootstrap.py has_location`).  Reading the property name would
-    // enter that one-line Python getter on every failed `IMPORT_FROM`,
-    // and the getter then compiles as a map-specialized function-entry
-    // whose map guard fails across specs.  `_PyModuleSpec_GetFileOrigin`
-    // uses `GetOptionalAttr(has_location)`; on the stdlib `ModuleSpec`
-    // that is this field, including `spec.has_location = False`.
+    // `_PyModuleSpec_GetFileOrigin` uses `GetOptionalAttr(has_location)`.
+    // On the exact stdlib `ModuleSpec` that is the `_set_fileattr` field
+    // (`_bootstrap.py has_location`), including `spec.has_location = False`.
+    // Reading the property name on that class enters the one-line Python
+    // getter on every failed `IMPORT_FROM`, and the getter compiles as a
+    // map-specialized function-entry whose map guard fails across specs.
+    // A custom spec or a `ModuleSpec` subclass that overrides the property
+    // must still see the public name.
+    let location_attr = if is_exact_stdlib_module_spec(w_spec) {
+        "_set_fileattr"
+    } else {
+        "has_location"
+    };
     let _scope = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_spec = pyre_object::gc_roots::pin_root(w_spec);
-    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "_set_fileattr") {
+    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, location_attr) {
         Ok(v) => v,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(None),
         Err(e) => return Err(e),
@@ -7336,6 +7364,44 @@ mod tests {
         assert_eq!(module_is_package_no_callback(module), Some(true));
         unsafe { pyre_object::w_dict_delitem_str(dict, "__path__") };
         assert_eq!(module_is_package_no_callback(module), Some(false));
+    }
+
+    #[test]
+    fn spec_file_origin_reads_public_has_location_on_custom_spec() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let spec_cls = crate::typedef::make_builtin_type("CustomFileOriginSpec", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        let spec = pyre_object::objectobject::w_instance_new(spec_cls);
+        crate::baseobjspace::setattr_str(spec, "has_location", pyre_object::w_bool_from(true))
+            .unwrap();
+        crate::baseobjspace::setattr_str(spec, "origin", pyre_object::w_str_new("keyword.py"))
+            .unwrap();
+        let origin = spec_file_origin(spec)
+            .unwrap()
+            .expect("public has_location");
+        assert!(unsafe { pyre_object::is_str(origin) });
+        assert_eq!(
+            unsafe { pyre_object::w_str_get_value(origin) },
+            "keyword.py"
+        );
+    }
+
+    #[test]
+    fn spec_file_origin_ignores_set_fileattr_on_custom_spec() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let spec_cls = crate::typedef::make_builtin_type("CustomSetFileattrSpec", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        let spec = pyre_object::objectobject::w_instance_new(spec_cls);
+        crate::baseobjspace::setattr_str(spec, "_set_fileattr", pyre_object::w_bool_from(true))
+            .unwrap();
+        crate::baseobjspace::setattr_str(spec, "origin", pyre_object::w_str_new("keyword.py"))
+            .unwrap();
+        assert!(
+            spec_file_origin(spec).unwrap().is_none(),
+            "a non-ModuleSpec must not take the _set_fileattr shortcut"
+        );
     }
 
     #[test]
