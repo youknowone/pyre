@@ -2193,64 +2193,28 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
         _ => None,
     };
-    if let Some(mut result) = subwalk_result {
-        // Depth-N: after the deepest callee returns cleanly, drive each paused
-        // middle frame forward from second-deepest (recipes[len-2]) out to the
-        // outermost (recipes[0]), delivering each callee's result into its
-        // caller's residual-call return register (make_result_of_lastop) and
-        // rebinding `result` to that caller's own return.  Any non-portable
-        // middle shape yields `None` and drops to the journal-rollback abort
-        // epilogue below, which restores what it journaled and no more; the
-        // declines that can be taken before the callee runs belong above this
-        // point, not here.
+    if let Some(result) = subwalk_result {
+        // Depth-N: after the deepest callee returns cleanly, `finishframe`
+        // each paused middle (`make_result_of_lastop` + walk). A middle that
+        // then raises is `finishframe_exception` over the remaining shallower
+        // frames, not a drain abort — `recur` continues into `check(0)` after
+        // an earlier child returns.
         let n = carrier.recipes.len();
-        let mut middles_ok = true;
-        for i in (0..n.saturating_sub(1)).rev() {
-            // recipes[i]'s paused parents are the shallower frames
-            // recipes[..i] (the root sits above them all).
-            match drive_middle_frame_and_thread(
-                ctx,
-                &session,
-                sym,
-                root_pc,
-                root_ec,
-                root_ec_box,
-                root_frame_box,
-                &carrier.recipes[i],
-                &carrier.recipes[..i],
-                result,
-            ) {
-                Some(mid_result) => result = mid_result,
-                None => {
-                    middles_ok = false;
-                    break;
-                }
-            }
-        }
-        if middles_ok {
-            if inject_root_call_result(sym, root_pc, result) {
-                crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
-                let root_py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(
-                    carrier.root_jitcode_index,
-                    root_pc as i32,
-                ) as usize;
-                // The sub-walks above already applied each frame's eager stores
-                // and journaled them; hand those journals to the root walk so its
-                // epilogue settles them exactly once.
-                let action =
-                    full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
-                // That epilogue is not guaranteed to run: `full_body_walk_trace`
-                // has declines ahead of it and `run_perfn_walk` has its own
-                // early exits, none of which touch a journal. Whatever the root
-                // walk did not settle is the sub-walks' own unclaimed entries,
-                // and a discarded trace's guard replay needs them unwound.
-                // Sound unconditionally because both settles drain: after a
-                // committed or rolled-back epilogue every log is already empty
-                // and this is a no-op.
-                crate::jitcode_dispatch::fbw_store_journal_rollback();
-                return action;
-            }
-            crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
+        if let Some(action) = drive_middles_finishframe(
+            ctx,
+            &session,
+            sym,
+            w_code,
+            root_pc,
+            cf_addr,
+            root_ec,
+            root_ec_box,
+            root_frame_box,
+            carrier,
+            &carrier.recipes[..n.saturating_sub(1)],
+            result,
+        ) {
+            return action;
         }
     }
 
@@ -2289,6 +2253,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 root_ec_box,
                 root_frame_box,
                 carrier,
+                &carrier.recipes[..n.saturating_sub(1)],
                 exc,
                 exc_concrete,
             ) {
@@ -2424,7 +2389,66 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     p2_drain_abort()
 }
 
-/// `pyjitpl.py finishframe_exception` over the paused carrier middles.
+/// `pyjitpl.py finishframe` over paused carrier middles after a callee
+/// `SubReturn`. Deepest-first: deliver `result` into each middle and walk it.
+/// A middle `SubReturn` continues this walk. A middle `SubRaise` is
+/// `finishframe_exception` over the remaining shallower frames. Exhausting
+/// the middles compiles the root from the outermost result.
+#[allow(clippy::too_many_arguments)]
+fn drive_middles_finishframe<Sym: WalkSym>(
+    ctx: &mut TraceCtx,
+    session: &std::cell::RefCell<crate::jitcode_dispatch::WalkSession>,
+    sym: &mut Sym,
+    w_code: *const (),
+    root_pc: usize,
+    cf_addr: usize,
+    root_ec: *const pyre_interpreter::PyExecutionContext,
+    root_ec_box: majit_ir::OpRef,
+    root_frame_box: majit_ir::OpRef,
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+    middles: &[majit_metainterp::ReconstructRecipe],
+    mut result: majit_ir::OpRef,
+) -> Option<TraceAction> {
+    for i in (0..middles.len()).rev() {
+        match drive_middle_frame_and_thread(
+            ctx,
+            session,
+            sym,
+            root_pc,
+            root_ec,
+            root_ec_box,
+            root_frame_box,
+            &middles[i],
+            &middles[..i],
+            result,
+        ) {
+            Some(Ok(mid_result)) => result = mid_result,
+            Some(Err((exc, exc_concrete))) => {
+                crate::jitcode_dispatch::census_record("P2Drain::MiddleFinishframeException");
+                return drive_carrier_finishframe_exception(
+                    ctx,
+                    session,
+                    sym,
+                    w_code,
+                    root_pc,
+                    cf_addr,
+                    root_ec,
+                    root_ec_box,
+                    root_frame_box,
+                    carrier,
+                    &middles[..i],
+                    exc,
+                    exc_concrete,
+                );
+            }
+            None => return None,
+        }
+    }
+    compile_root_from_carrier_result(ctx, sym, w_code, root_pc, cf_addr, carrier, result)
+}
+
+/// `pyjitpl.py finishframe_exception` over `middles` (a prefix of the
+/// paused carrier recipes; deepest last).
 ///
 /// Deepest-first: skip `descr_call` tails, `popframe` a middle with no
 /// `catch_exception`, and `ChangeFrame` into the first middle that has one.
@@ -2443,11 +2467,10 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     root_ec_box: majit_ir::OpRef,
     root_frame_box: majit_ir::OpRef,
     carrier: &majit_metainterp::BridgeInlineCarrier,
+    middles: &[majit_metainterp::ReconstructRecipe],
     mut exc: majit_ir::OpRef,
     mut exc_concrete: crate::state::ConcreteValue,
 ) -> Option<TraceAction> {
-    let n = carrier.recipes.len();
-    let middles = &carrier.recipes[..n.saturating_sub(1)];
     // Reject a missing jitcode before any `carrier_ec_leave`: the leave is
     // concrete, and a mid-chain decline after a pop would leave `topframeref`
     // one level short for the abort epilogue's blackhole replay.
@@ -2487,33 +2510,20 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 exc_concrete,
                 catch_target,
             ) {
-                Some(Ok(mut result)) => {
-                    let mut middles_ok = true;
-                    for j in (0..i).rev() {
-                        match drive_middle_frame_and_thread(
-                            ctx,
-                            session,
-                            sym,
-                            root_pc,
-                            root_ec,
-                            root_ec_box,
-                            root_frame_box,
-                            &middles[j],
-                            &carrier.recipes[..j],
-                            result,
-                        ) {
-                            Some(mid_result) => result = mid_result,
-                            None => {
-                                middles_ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    if !middles_ok {
-                        return None;
-                    }
-                    return compile_root_from_carrier_result(
-                        ctx, sym, w_code, root_pc, cf_addr, carrier, result,
+                Some(Ok(result)) => {
+                    return drive_middles_finishframe(
+                        ctx,
+                        session,
+                        sym,
+                        w_code,
+                        root_pc,
+                        cf_addr,
+                        root_ec,
+                        root_ec_box,
+                        root_frame_box,
+                        carrier,
+                        &middles[..i],
+                        result,
                     );
                 }
                 Some(Err((new_exc, new_concrete))) => {
@@ -2676,17 +2686,20 @@ fn drive_middle_frame_from_handler<Sym: WalkSym>(
 
 /// Middle-frame drive for the DEFAULT drain: reconstruct one paused middle frame
 /// (`middle`), deliver its callee's `child_result` into its residual-call return
-/// register (`make_result_of_lastop`), and walk it forward to its own
-/// `SubReturn`.  `paused_parents` are the frames shallower than `middle` (root
-/// sits above them) so its in-callee guard snapshots encode the full paused
-/// chain.  Returns the middle's result on a clean return, or `None` on any
+/// register (`make_result_of_lastop`), and walk it forward.  `paused_parents`
+/// are the frames shallower than `middle` (root sits above them) so its
+/// in-callee guard snapshots encode the full paused chain.
+///
+/// `Some(Ok)` is `finishframe` (`SubReturn`). `Some(Err)` is a raise from
+/// this frame after the child returned — `finishframe_exception` from here
+/// (`popframe` already happened via `carrier_ec_leave`). `None` is a
 /// non-portable shape (recording a `P2Drain::*` census) so the caller falls
 /// through to the drain's journal-rollback abort epilogue.
 ///
 /// The failure arms do NOT cut/reset the journal here: the drain's epilogue
 /// rolls it back (every driven frame's eager stores) for the blackhole replay,
-/// so a reset would leave those stores double-applied.  Mirrors resume.py:
-/// 1049-1056 `finishframe` delivering the child result into the parent's dst.
+/// so a reset would leave those stores double-applied.  Mirrors resume.py
+/// `finishframe` delivering the child result into the parent's dst.
 #[allow(clippy::too_many_arguments)]
 fn drive_middle_frame_and_thread<Sym: WalkSym>(
     ctx: &mut TraceCtx,
@@ -2699,7 +2712,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
     middle: &majit_metainterp::ReconstructRecipe,
     paused_parents: &[majit_metainterp::ReconstructRecipe],
     child_result: majit_ir::OpRef,
-) -> Option<majit_ir::OpRef> {
+) -> Option<Result<majit_ir::OpRef, (majit_ir::OpRef, crate::state::ConcreteValue)>> {
     let is_being_profiled = session.borrow().is_being_profiled;
     // `descr_call`'s tail: no frame to reconstruct and no bytecode to walk.
     // Discarding the child's result and answering with the instance IS its
@@ -2728,7 +2741,7 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
             return None;
         }
         crate::jitcode_dispatch::census_record("P2Drain::CtorTailSubstitute");
-        return Some(instance);
+        return Some(Ok(instance));
     }
     let Some((pending, middle_argboxes_r)) = crate::state::setup_reconstructed_callee_frame(
         ctx,
@@ -2798,9 +2811,28 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
                 result: Some(mid_result),
             },
             _,
-        ))) => Some(mid_result),
-        _ => {
+        ))) => Some(Ok(mid_result)),
+        Some(Ok((
+            crate::jitcode_dispatch::DispatchOutcome::SubRaise {
+                exc: raised,
+                exc_concrete: raised_concrete,
+            },
+            _,
+        ))) => Some(Err((raised, raised_concrete))),
+        Some(Ok((crate::jitcode_dispatch::DispatchOutcome::SubReturn { result: None }, _))) => {
+            crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveVoid");
+            None
+        }
+        Some(Err(_)) => {
+            crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveErr");
+            None
+        }
+        Some(Ok(_)) => {
             crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveFailed");
+            None
+        }
+        None => {
+            crate::jitcode_dispatch::census_record("P2Drain::MiddleDriveNone");
             None
         }
     }

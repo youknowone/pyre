@@ -6150,11 +6150,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // drain builds once a guard inside the compiled chain fails.  The drain
     // walks the paused middle frames between the raising leaf and the root
     // the way `finishframe_exception` does, including `ChangeFrame` into a
-    // middle that catches.  Distinct raising depth is 3; a third copy of the
-    // same `w_code` still storms `selfrec_tail_exception_unwind`
-    // (`guard_failures` 937 → 7408) and stays at 2.  `perform_call` has no
-    // such cap; see `fbw_effective_multiframe_depth`.  A value-returning
-    // chain (no raise) inlines to the full depth either way.
+    // middle that catches and `finishframe_exception` from a middle that
+    // raises after `finishframe`.  Distinct raising depth is 3; recursive
+    // / duplicate raising is unbounded here (`max_unroll_recursion` is the
+    // sole remaining bound).  `perform_call` has no such cap; see
+    // `fbw_effective_multiframe_depth`.  A value-returning chain (no raise)
+    // inlines to the full depth either way.
     // Value-returning recursion still keys only on this callee's own
     // greenkey (`_opimpl_recursive_call`).  The duplicate-w_code bit is
     // only a raising-chain safety valve: it must not promote an unrelated

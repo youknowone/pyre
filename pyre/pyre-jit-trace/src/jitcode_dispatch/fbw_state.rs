@@ -30,9 +30,10 @@ use super::*;
 /// A callee that raises inline is capped separately — at THREE distinct
 /// multiframe levels, keyed off `callee_body_contains_raise` — because its
 /// unwind crosses suspended intermediate frames through the cross-frame
-/// bridge (gh#343 / gh#467).  A third *copy of the same* `w_code` still
-/// storms `selfrec_tail_exception_unwind`; see
-/// [`fbw_effective_multiframe_depth`].
+/// bridge (gh#343 / gh#467).  Recursive / duplicate raising used to sit at
+/// 2 while the carrier treated a middle `SubRaise` as a drain abort; the
+/// drain now continues `finishframe_exception` there, so that bound matches
+/// value-returning recursion (`max_unroll_recursion` only).
 ///
 /// A self-recursive callee is bounded instead by
 /// [`fbw_inline_recursion_count`] against `max_unroll_recursion`, mirroring
@@ -111,10 +112,11 @@ fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
     frames.iter().any(|frame| frame.w_code == w_code)
 }
 
-/// True when two live frames share a `w_code`.  Inlining a raising leaf
-/// through two suspended copies of the same intermediate is the
-/// `selfrec_tail_exception_unwind` storm and stays at the raising depth-2
-/// bound.  A distinct `shape → mid → leaf` chain is admitted to depth 3.
+/// True when two live frames share a `w_code`.  Used with
+/// [`fbw_effective_multiframe_depth`] so a raising leaf through two
+/// copies of the same intermediate is classified as recursive/duplicate
+/// (then bounded only by `max_unroll_recursion`) rather than as a
+/// distinct three-frame chain.
 pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
     let mut seen = Vec::with_capacity(frames.len());
     for frame in frames {
@@ -139,20 +141,25 @@ pub(crate) fn framestack_has_duplicate_w_code(frames: &[InlineFrame]) -> bool {
 /// turn an upstream value of 7 into an effective 6 when an ambient inline
 /// frame is present.
 ///
-/// Raising chains keep a shallower local bound because the carrier unwind
-/// crosses suspended frames.  `perform_call` (`pyjitpl.py`) has no such cap:
-/// it always pushes a new `MIFrame`.  A distinct `shape → mid → leaf` chain
-/// now compiles the exception-edge bridge the way `finishframe_exception`
-/// does (`ChangeFrame` into the catching middle), so that shape is admitted
-/// to depth 3.  A third copy of the same `w_code` still storms
-/// `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408), so the
-/// recursive/duplicate flag stays at 2 on the raising path.
+/// Raising chains keep a shallower local bound on a *distinct* call chain
+/// because the carrier unwind crosses suspended frames.  `perform_call`
+/// (`pyjitpl.py`) has no such cap: it always pushes a new `MIFrame`.  A
+/// distinct `shape → mid → leaf` chain compiles the exception-edge bridge
+/// the way `finishframe_exception` does (`ChangeFrame` into the catching
+/// middle), so that shape is admitted to depth 3.  Recursive / duplicate
+/// raising is bounded only by `max_unroll_recursion`, the same as
+/// value-returning recursion: a middle `SubRaise` after `finishframe` is
+/// `finishframe_exception` over the remaining shallower frames.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
     recursive_or_duplicate: bool,
 ) -> usize {
     if contains_raise {
-        if recursive_or_duplicate { 2 } else { 3 }
+        if recursive_or_duplicate {
+            usize::MAX
+        } else {
+            3
+        }
     } else if recursive_or_duplicate {
         usize::MAX
     } else {
@@ -190,8 +197,8 @@ mod recursion_depth_policy_tests {
     }
 
     #[test]
-    fn raising_recursion_keeps_the_carrier_unwind_safety_bound() {
-        assert_eq!(fbw_effective_multiframe_depth(true, true), 2);
+    fn raising_recursion_is_bounded_only_by_max_unroll_recursion() {
+        assert_eq!(fbw_effective_multiframe_depth(true, true), usize::MAX);
     }
 
     #[test]
