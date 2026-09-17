@@ -615,8 +615,10 @@ jobs:
       # Two invocations: `--tests` is cargo-wide and would drop
       # majit-backend-cranelift's `--lib` compiler tests if combined.
       run: |
-        cargo test --no-run --no-default-features --features cranelift \
-          -p majit-backend-cranelift
+        # `--features cranelift` belongs on metainterp (it selects the
+        # backend). majit-backend-cranelift has no such feature, so naming
+        # it beside `-p majit-backend-cranelift` is a cargo error.
+        cargo test --no-run -p majit-backend-cranelift
         cargo test --no-run --no-default-features --features cranelift \
           -p majit-metainterp --tests
 
@@ -636,8 +638,7 @@ jobs:
       # single failure where there may be more, which costs a round trip per
       # hidden sibling.
       run: |
-        cargo test --no-fail-fast --no-default-features --features cranelift \
-          -p majit-backend-cranelift
+        cargo test --no-fail-fast -p majit-backend-cranelift
         cargo test --no-fail-fast --no-default-features --features cranelift \
           -p majit-metainterp --tests
         # The two label-selector tests set PYRE_CL_NO_CLOSING_JUMP, a
