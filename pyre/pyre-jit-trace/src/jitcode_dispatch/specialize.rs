@@ -7371,12 +7371,19 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
     }
 
     for (item, concrete) in items {
-        if item.is_constant() {
-            continue;
-        }
         let expected = ctx.trace_ctx.const_ref(concrete as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[item, expected])?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(item, expected);
+        if !item.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[item, expected],
+            )?;
+            ctx.trace_ctx.heap_cache_mut().replace_box(item, expected);
+        }
+        if unsafe { pyre_object::is_type(concrete) } {
+            walker_pin_type_version_tag(ctx, op_pc, expected)?;
+        }
     }
     Ok(true)
 }
@@ -7472,6 +7479,9 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(match_op, expected);
+        if unsafe { pyre_object::is_type(match_type) } {
+            walker_pin_type_version_tag(ctx, op_pc, expected)?;
+        }
     }
     // Pin the exception's Python-level class, the value the match walked the
     // MRO of. `GuardClass` alone cannot do it: every exception of one
@@ -7524,6 +7534,11 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
                 .replace_box(w_class_op, expected);
         }
     }
+    // `A.__bases__ = (B,)` changes `exception_match` without touching
+    // the instance's `w_class`.  The isinstance fold pins the same
+    // quasi-immutable tag (`walker_pin_type_version_tag`).
+    let exc_class_const = ctx.trace_ctx.const_ref(exc_class as i64);
+    walker_pin_type_version_tag(ctx, op_pc, exc_class_const)?;
 
     // The match is a constant at trace time: emit the immortal bool singleton
     // as a `const_ref`.  The following `is_true` (the `except` clause's
