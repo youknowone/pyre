@@ -276,7 +276,7 @@ fn refresh_forwarded_const_ref(
 fn fold_recorded_jump_args(
     args: Vec<OpRef>,
     inputarg_boxes: &[majit_ir::InputArgRc],
-    recorded_ops: &[Op],
+    recorded_ops: &[OpRc],
 ) -> Vec<OpRef> {
     args.into_iter()
         .map(|arg| {
@@ -811,7 +811,8 @@ impl UnrollOptimizer {
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
     ) -> (Vec<majit_ir::OpRc>, usize) {
-        self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
+        let ops_rc: Vec<OpRc> = ops.iter().cloned().map(OpRc::new).collect();
+        self.optimize_trace_with_constants_and_inputs_vable(&ops_rc, constants, num_inputs, None)
             .expect("optimize_trace_with_constants_and_inputs: unexpected InvalidLoop")
     }
 
@@ -824,7 +825,7 @@ impl UnrollOptimizer {
     /// Assembly: [preamble_no_jump] + Label(label_args) + [body_with_jump].
     pub(crate) fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
-        ops: &[Op],
+        ops: &[OpRc],
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
@@ -845,7 +846,7 @@ impl UnrollOptimizer {
     /// still has the Phase 1 results for retrace_needed.
     pub(crate) fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
-        ops: &[Op],
+        ops: &[OpRc],
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
@@ -7606,9 +7607,9 @@ mod tests {
             let backup = source.clone();
             let mut unroll = UnrollOptimizer::new();
             unroll.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[Type::Int]);
-            unroll.phase2_input_ops_seed = Some(canonical);
+            unroll.phase2_input_ops_seed = Some(canonical.clone());
             let result = unroll.optimize_trace_with_constants_and_inputs_vable_out(
-                &source,
+                &canonical,
                 &mut majit_ir::ConstMap::default(),
                 1,
                 None,
@@ -7653,6 +7654,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 1);
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut constants = majit_ir::ConstMap::default();
         let mut phase1_out = None;
 
@@ -7688,7 +7690,7 @@ mod tests {
         );
         add.pos().set(OpRef::int_op(1));
         add.set_value(Value::Int(73));
-        let folded = fold_recorded_jump_args(vec![OpRef::int_op(1)], &[], &[add]);
+        let folded = fold_recorded_jump_args(vec![OpRef::int_op(1)], &[], &[OpRc::new(add)]);
         assert_eq!(
             folded[0],
             OpRef::const_int(73),

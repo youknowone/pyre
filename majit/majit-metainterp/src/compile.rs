@@ -552,6 +552,7 @@ impl<'a> BridgeCompileData<'a> {
 }
 
 /// `compile.py` `class UnrolledLoopData(CompileData)`.
+#[allow(dead_code)]
 pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     #[allow(dead_code)]
@@ -564,6 +565,7 @@ pub struct UnrolledLoopData<'a> {
     pub enable_opts: &'a [String],
 }
 
+#[allow(dead_code)]
 impl<'a> UnrolledLoopData<'a> {
     pub fn new(
         trace: &'a TreeLoop,

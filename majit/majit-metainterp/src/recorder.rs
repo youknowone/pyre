@@ -866,6 +866,108 @@ impl Trace {
         ops
     }
 
+    /// opencoder.py `Trace.get_iter()` for `optimize_bridge`: one
+    /// `ByteTraceIter` walk with the hole-filtered live inputargs and
+    /// `start_fresh = bridge_inputarg_base`. Overlay FrontendSlot
+    /// fail_args / resume / concrete — the byte stream does not carry
+    /// them. The unique-keyed cache rewrites snapshot / runtime boxes.
+    pub(crate) fn get_iter_for_optimizer(
+        &self,
+        live_inputargs: &[InputArg],
+        start_fresh: u32,
+    ) -> Option<(Vec<OpRc>, Vec<InputArg>, Vec<Option<Operand>>)> {
+        let trb = self.trb.as_ref()?;
+        let mut iter = crate::opencoder::ByteTraceIter::new_with_inputargs(
+            trb,
+            trb._start as usize,
+            trb._pos,
+            live_inputargs,
+            start_fresh,
+        );
+        let mut ops = Vec::with_capacity(self.slots.len());
+        while let Some(op) = iter.next() {
+            ops.push(op);
+        }
+        debug_assert_eq!(ops.len(), self.slots.len());
+
+        let reminted_inputargs: Vec<InputArg> = live_inputargs
+            .iter()
+            .zip(iter.inputargs.iter())
+            .map(|(src, ia)| {
+                let reminted = InputArg::from_type(src.tp, ia.opref().raw());
+                if let Some(value) = src.get_value() {
+                    reminted.set_value(value);
+                }
+                reminted
+            })
+            .collect();
+
+        let mut max_unique = 0u32;
+        for ia in live_inputargs {
+            max_unique = max_unique.max(ia.opref().raw());
+        }
+        for slot in &self.slots {
+            max_unique = max_unique.max(slot.unique);
+        }
+        let mut unique_cache: Vec<Option<Operand>> = vec![None; (max_unique as usize) + 1];
+
+        for (src, reminted) in live_inputargs.iter().zip(reminted_inputargs.iter()) {
+            let p = src.opref().raw() as usize;
+            if p >= unique_cache.len() {
+                unique_cache.resize(p + 1, None);
+            }
+            let ia = InputArg::from_type_rc(src.tp, reminted.index);
+            if let Some(value) = reminted.get_value() {
+                ia.set_value(value);
+            }
+            unique_cache[p] = Some(Operand::from_bound_inputarg(&ia));
+        }
+
+        for (op, slot) in ops.iter().zip(self.slots.iter()) {
+            if let Some(v) = slot.concrete.get() {
+                op.set_value(v);
+            }
+            if let Some(d) = slot.descr.clone() {
+                op.setdescr(d);
+            }
+            op.set_rd_resume_position(slot.resume.get());
+            if let Some(ref types) = slot.fail_arg_types {
+                op.set_fail_arg_types(types.clone());
+            }
+            if slot.opcode.result_type() != Type::Void {
+                let p = slot.unique as usize;
+                if p >= unique_cache.len() {
+                    unique_cache.resize(p + 1, None);
+                }
+                unique_cache[p] = Some(Operand::from_bound_op(op));
+            }
+        }
+
+        for (op, slot) in ops.iter().zip(self.slots.iter()) {
+            let Some(ref fail) = slot.fail_args else {
+                continue;
+            };
+            let boxed: majit_ir::resoperation::OpArgVec = fail
+                .iter()
+                .copied()
+                .map(|r| self.operand_from_unique_cache(r, &unique_cache))
+                .collect();
+            op.setfailargs(boxed);
+        }
+
+        Some((ops, reminted_inputargs, unique_cache))
+    }
+
+    fn operand_from_unique_cache(&self, r: OpRef, cache: &[Option<Operand>]) -> Operand {
+        if r.is_constant() || r.is_none() {
+            return Operand::from_opref(r);
+        }
+        cache
+            .get(r.raw() as usize)
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| Operand::from_opref(r))
+    }
+
     fn operand_from_materialized(&self, r: OpRef, ops: &[OpRc]) -> Operand {
         if r.is_constant() {
             return Operand::from_opref(r);
@@ -1982,6 +2084,53 @@ mod tests {
         assert_eq!(ops[1].pos().get(), g0);
         assert_eq!(ops[1].rd_resume_position(), 7);
         assert_eq!(ops[2].opcode, OpCode::Jump);
+    }
+
+    #[test]
+    fn get_iter_for_optimizer_remints_live_fail_args_once() {
+        // compile_bridge get_iter: hole-filtered live inputargs remint
+        // densely; fail_args / resume come from the slot overlay, not a
+        // second materialize_ops + remint walk.
+        let mut rec =
+            Trace::with_input_layout(&[Type::Int, Type::Ref, Type::Int], &[true, false, true]);
+        rec.attach_byte_buffer(std::sync::Arc::new(crate::MetaInterpStaticData::new()));
+        let add = rec.record_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(2)],
+        );
+        rec.record_guard_with_fail_args(
+            OpCode::GuardTrue,
+            &[add],
+            None,
+            &[OpRef::input_arg_int(0), add],
+        );
+        rec.set_last_op_resume_position(4);
+        rec.close_loop(&[add]);
+        let live = rec.live_inputargs_cloned();
+        let (ops, reminted, cache) = rec
+            .get_iter_for_optimizer(&live, 1000)
+            .expect("byte buffer");
+        assert_eq!(
+            reminted
+                .iter()
+                .map(|arg| (arg.index, arg.tp))
+                .collect::<Vec<_>>(),
+            vec![(1000, Type::Int), (1001, Type::Int)]
+        );
+        assert_eq!(ops[0].opcode, OpCode::IntAdd);
+        assert_eq!(ops[1].opcode, OpCode::GuardTrue);
+        assert_eq!(ops[1].rd_resume_position(), 4);
+        let fail = ops[1].guard_fail_args().expect("fail_args overlay");
+        assert_eq!(fail[0].to_opref(), OpRef::input_arg_int(1000));
+        assert_eq!(fail[1].to_opref(), ops[0].pos().get());
+        assert_eq!(
+            cache[0].as_ref().map(|a| a.to_opref()),
+            Some(OpRef::input_arg_int(1000))
+        );
+        assert_eq!(
+            cache[2].as_ref().map(|a| a.to_opref()),
+            Some(OpRef::input_arg_int(1001))
+        );
     }
 
     #[test]

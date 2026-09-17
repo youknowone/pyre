@@ -1471,17 +1471,19 @@ fn prepare_bridge_from_byte_recorder(
     bridge_inputarg_base: u32,
 ) -> Option<PreparedBridgeTrace> {
     // unroll.py `optimize_bridge` `trace = trace.get_iter()`.
-    // compile.py compile_trace leaves the JUMP on the live buffer until
-    // this walk. `materialize_ops` is that cls() walk (unique positions,
-    // slot fail_args, recorder inputarg identity). The fresh-iterator
-    // rename is `prepare_bridge_trace_from_owned`, the same remint the
-    // Vec-recorder path uses — a unique-keyed cache built from
-    // ByteTraceIter's fresh positions alone types a hole-filtered Int as
-    // a reserved Ref (`make_equal_to` Box.type on compile_bridge).
-    let ops = recorder.materialize_ops();
-    Some(prepare_bridge_trace_from_owned(
+    // One ByteTraceIter walk remints the hole-filtered live inputargs
+    // (`History.set_inputargs`) at `bridge_inputarg_base` and `cls()`s
+    // each op. A reserved-prefix remint types a hole-filtered Int as
+    // the dead Ref (`make_equal_to` Box.type on compile_bridge).
+    #[cfg(feature = "jit-audits")]
+    next_audit_prepare_generation();
+    let (ops, reminted_inputargs, cache) =
+        recorder.get_iter_for_optimizer(bridge_inputargs, bridge_inputarg_base)?;
+    Some(finish_prepared_bridge(
         ops,
         bridge_inputargs,
+        reminted_inputargs,
+        cache,
         snapshot_boxes,
         snapshot_frame_sizes,
         snapshot_vable_boxes,
@@ -1489,7 +1491,6 @@ fn prepare_bridge_from_byte_recorder(
         snapshot_frame_pcs,
         pending_bridge_rd,
         runtime_boxes,
-        bridge_inputarg_base,
     ))
 }
 
@@ -7818,25 +7819,20 @@ impl<M: Clone> MetaInterp<M> {
             compile::PreambleCompileData::new(&trace, jump_args, &call_pure_results, enable_opts);
         let trace_snapshots = preamble_data.base.snapshots();
 
-        // Materialize Vec<Op> from the trace's `Vec<OpRc>` so the
-        // optimizer's `&[Op]` surface gets owned data. The deep-clone
-        // mirrors PyPy's `cls()` fresh ResOperation per iteration —
-        // optimizer mutations don't leak into TreeLoop.ops identity.
-        let trace_ops: Vec<Op> = preamble_data
-            .base
-            .operations()
-            .iter()
-            .map(|rc| (**rc).clone())
-            .collect();
+        // unroll.py `optimize_preamble(trace.get_iter())` mints a fresh
+        // ResOperation per `next()`. The recorder `OpRc` slice is that
+        // source; UnrollOptimizer's TraceIterator does the `cls()`.
+        // Do not clone every Op here — that was a second materialize.
+        let trace_ops = preamble_data.base.operations();
         if crate::majit_log_enabled() {
             eprintln!("--- trace (before opt) --- [{} ops]", trace_ops.len());
             if trace_ops.len() <= 10000 {
-                eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+                eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
             } else {
                 eprintln!("  [trace too large for full dump, showing op counts]");
                 let mut counts: indexmap::IndexMap<majit_ir::OpCode, usize> =
                     indexmap::IndexMap::new();
-                for op in &trace_ops {
+                for op in trace_ops {
                     *counts.entry(op.opcode).or_insert(0) += 1;
                 }
                 let mut sorted: Vec<_> = counts.into_iter().collect();
@@ -9754,28 +9750,17 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         let partial_ops_before = partial.ops.len();
-        let trace_ops: Vec<Op> = {
-            let loop_data = compile::UnrolledLoopData::new(
-                &trace,
-                &loop_jitcell_token,
-                &start_state,
-                &call_pure_results,
-                self.warm_state.get_enable_opts(),
-            );
-            loop_data
-                .base
-                .operations()
-                .iter()
-                .map(|rc| (**rc).clone())
-                .collect()
-        };
+        // unroll.py `optimize_peeled_loop(trace.get_iter())` mints a fresh
+        // ResOperation per `next()`. The recorder `OpRc` slice is that
+        // source; UnrollOptimizer's TraceIterator does the `cls()`.
+        let trace_ops = trace.ops.as_slice();
         // `num_combined_ops` below counts the saved partial preamble plus the
         // retrace body, so the before/after compile-stat slice must do the same.
         let num_ops_before = partial_ops_before + trace_ops.len();
 
         if crate::majit_log_enabled() {
             eprintln!("--- retrace body (before opt) ---");
-            eprint!("{}", majit_ir::format_trace(&trace_ops, &constants));
+            eprint!("{}", majit_ir::format_trace(trace_ops, &constants));
         }
 
         // compile.py: optimize using UnrolledLoopData with start_state.
@@ -9926,7 +9911,7 @@ impl<M: Clone> MetaInterp<M> {
         );
         let optimize_start = Instant::now();
         let optimize_result = unroll_opt.optimize_trace_with_constants_and_inputs_vable(
-            &trace_ops,
+            trace_ops,
             &mut constants,
             trace.inputargs.len(),
             vable_config,
