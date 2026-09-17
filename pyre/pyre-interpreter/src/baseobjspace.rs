@@ -5393,6 +5393,8 @@ pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRe
 }
 
 /// Check whether `exc_type` matches `check_class`, including tuple/list class inputs.
+/// `baseobjspace.py exception_match` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool {
     let (exc_type, check_class) = (exc_type, check_class);
     if unsafe { is_none(check_class) || is_none(exc_type) } {

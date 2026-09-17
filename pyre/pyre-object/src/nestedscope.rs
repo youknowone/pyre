@@ -174,9 +174,12 @@ pub unsafe fn is_cell(obj: PyObjectRef) -> bool {
 
 /// Get the value stored in a cell.
 ///
+/// `nestedscope.py Cell._elidable_get` is `@jit.elidable`.
+///
 /// # Safety
 /// `obj` must point to a valid `Cell`.
 #[inline]
+#[majit_macros::elidable]
 pub unsafe fn w_cell_get(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const Cell)).contents }
 }

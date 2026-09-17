@@ -295,6 +295,7 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "validate_check_eg_match_class",
         "pyopcode.py check_except_star_type_valid",
     ),
+    ("exception_match", "baseobjspace.py exception_match"),
     // `rlib/jit.py look_inside_iff.inner` does `func = unroll_safe(func)`.
     // Harvested names are the inlined originals (`_orig_*`), not the
     // dispatch wrappers.
