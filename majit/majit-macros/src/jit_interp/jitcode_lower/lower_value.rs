@@ -3484,10 +3484,15 @@ mod tests {
 
         #[test]
         fn majit_int_py_div_records_the_expandable_oopspec() {
-            let (lowerer, out) = lower("majit_int_py_div(a, b)", |l| {
-                l.bindings.insert("a".into(), binding(1, BindingKind::Int));
-                l.bindings.insert("b".into(), binding(2, BindingKind::Int));
-            });
+            let mut lowerer = Lowerer::new(None);
+            lowerer
+                .bindings
+                .insert("a".into(), binding(1, BindingKind::Int));
+            lowerer
+                .bindings
+                .insert("b".into(), binding(2, BindingKind::Int));
+            let expr: Expr = syn::parse_str("majit_int_py_div(a, b)").expect("parse call");
+            let out = lowerer.lower_value_expr(&expr);
             assert!(out.is_some());
             let text = emitted(&lowerer);
             assert!(
