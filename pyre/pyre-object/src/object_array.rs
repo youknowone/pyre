@@ -545,7 +545,20 @@ unsafe fn try_alloc_items_block_gc(cap: usize) -> Option<*mut ItemsBlock> {
             && !raw.is_null()
         {
             let block = raw as *mut ItemsBlock;
-            unsafe { (*block).capacity = cap };
+            unsafe {
+                // IncrementalMiniMark does not zero-fill. Publish
+                // `capacity` only after the payload is NULL: the type-9
+                // walker traces `items[0..capacity]` as soon as this
+                // block is a root, and callers `pin_root` it before
+                // `try_gc_owns_object`. Zeroing the whole payload first
+                // leaves a 0 length header so a concurrent walk cannot
+                // follow dirty nursery words
+                // (`rlist.py` `_ll_list_resize_hint_really` mallocs
+                // through `gc_malloc_array`, which leaves GCREF slots
+                // NULL).
+                std::ptr::write_bytes(raw, 0, payload);
+                (*block).capacity = cap;
+            }
             return Some(block);
         }
     }
