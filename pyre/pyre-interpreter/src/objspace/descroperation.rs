@@ -3158,6 +3158,7 @@ pub const FLOAT_MATH1_SQRT: i64 = 1;
 pub const FLOAT_MATH1_SIN: i64 = 2;
 pub const FLOAT_MATH1_COS: i64 = 3;
 pub const FLOAT_MATH1_TAN: i64 = 4;
+pub const FLOAT_MATH1_ATAN: i64 = 5;
 
 /// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
@@ -3168,6 +3169,7 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_SIN => _float_sin(x),
         FLOAT_MATH1_COS => _float_cos(x),
         FLOAT_MATH1_TAN => _float_tan(x),
+        FLOAT_MATH1_ATAN => _float_atan(x),
         _ => _float_abs(x),
     }
 }
@@ -6736,6 +6738,20 @@ pub(crate) fn _float_tan(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.tan(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_atan`: `W_FloatObject(atan(x))`.
+#[inline(never)]
+pub(crate) fn _float_atan(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.atan(),
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)

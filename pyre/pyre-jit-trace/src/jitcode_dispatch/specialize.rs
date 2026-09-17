@@ -9828,6 +9828,14 @@ const FLOAT_TAN_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-TAN-SUBWALK",
 };
 
+/// ll_math.py `ll_math_atan`.
+const FLOAT_ATAN_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_float_atan",
+    commit_label: "float_atan_commit",
+    call_site_label: "float_atan_call_site",
+    decline_tag: "FLOAT-ATAN-SUBWALK",
+};
+
 /// floatobject.py `descr_abs` / `ll_math_fabs`.
 const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_abs",
@@ -16031,6 +16039,18 @@ pub(crate) fn try_walker_orthodox_float_tan<Sym: WalkSym>(
     try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_TAN_DESCENT)
 }
 
+/// Exact `math.atan`: walk `_float_atan`.
+pub(crate) fn try_walker_orthodox_float_atan<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_ATAN_DESCENT)
+}
+
 fn try_walker_orthodox_float_trig<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -16360,14 +16380,22 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
-        if pyre_module::module::math::interp_math::is_math_tan_function(callable)
-            && r_args.len() >= 3
-        {
-            walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-            if try_walker_orthodox_float_tan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                .is_some()
-            {
-                return Ok(Some(()));
+        if r_args.len() >= 3 {
+            use pyre_module::module::math::interp_math;
+            if interp_math::is_math_tan_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                if try_walker_orthodox_float_tan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                    .is_some()
+                {
+                    return Ok(Some(()));
+                }
+            } else if interp_math::is_math_atan_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                if try_walker_orthodox_float_atan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+                    .is_some()
+                {
+                    return Ok(Some(()));
+                }
             }
         }
     }

@@ -275,7 +275,27 @@ pub fn tan(args: &[PyObjectRef]) -> PyResult {
 }
 pm1_edom!(asin, "expected a number in range from -1 up to 1");
 pm1_edom!(acos, "expected a number in range from -1 up to 1");
-pm1!(atan);
+/// `math.atan` after `_get_double`: [`_float_atan`].
+pub fn atan(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "atan() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::atan(val) {
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
+            val,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_ATAN,
+        ),
+        Err(pymath::Error::EDOM) => {
+            Err(pyre_interpreter::PyError::value_error("math domain error"))
+        }
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
+}
 pm1!(sinh);
 pm1!(cosh);
 pm1!(tanh);
@@ -318,6 +338,7 @@ struct MathBuiltinWrappers {
     cos: usize,
     sin: usize,
     tan: usize,
+    atan: usize,
     frexp: usize,
     ldexp: usize,
     isqrt: usize,
@@ -352,6 +373,7 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         cos: math_wrapper_addr(ns, "cos"),
         sin: math_wrapper_addr(ns, "sin"),
         tan: math_wrapper_addr(ns, "tan"),
+        atan: math_wrapper_addr(ns, "atan"),
         frexp: math_wrapper_addr(ns, "frexp"),
         ldexp: math_wrapper_addr(ns, "ldexp"),
         isqrt: math_wrapper_addr(ns, "isqrt"),
@@ -414,6 +436,10 @@ pub fn is_math_sin_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_tan_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.tan)
+}
+
+pub fn is_math_atan_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.atan)
 }
 
 /// Callable-identity probes used by the meta-trace walker.  As with
@@ -574,7 +600,7 @@ macro_rules! jit_raw2 {
 
 jit_raw1!(jit_math_asin, asin);
 jit_raw1!(jit_math_acos, acos);
-jit_raw1!(jit_math_atan, atan);
+
 jit_raw1!(jit_math_sinh, sinh);
 jit_raw1!(jit_math_cosh, cosh);
 jit_raw1!(jit_math_tanh, tanh);
@@ -729,14 +755,12 @@ macro_rules! math_fold_table {
     };
 }
 
-/// `sqrt`, `log`, `cos`, `sin`, `tan` and `fabs` are absent: each has a
-/// dedicated specialization that lowers to a tighter shape (a domain-guarded
-/// call with no result guard, or a single `FloatAbs`).
+/// `sqrt`, `log`, `cos`, `sin`, `tan`, `atan` and `fabs` are absent: each
+/// has a dedicated specialization that lowers to a tighter shape.
 math_fold_table!(
     MATH_FLOAT1_FOLDS: MathFloat1Fold,
     "asin" => jit_math_asin,
     "acos" => jit_math_acos,
-    "atan" => jit_math_atan,
     "sinh" => jit_math_sinh,
     "cosh" => jit_math_cosh,
     "tanh" => jit_math_tanh,
