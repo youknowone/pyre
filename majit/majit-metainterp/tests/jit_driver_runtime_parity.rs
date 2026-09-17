@@ -1563,8 +1563,8 @@ fn declarative_driver_preserves_typed_red_inputargs_on_trace_start() {
         .finish_trace_for_parity(&typed_inputarg_sym(&[Type::Ref, Type::Float]))
         .expect("trace should be finishable for parity");
     assert_eq!(trace.inputargs.len(), 2);
-    assert_eq!(trace.inputargs[0].tp, Type::Ref);
-    assert_eq!(trace.inputargs[1].tp, Type::Float);
+    assert_eq!(trace.inputargs[0].tp.get(), Type::Ref);
+    assert_eq!(trace.inputargs[1].tp.get(), Type::Float);
 }
 
 #[test]

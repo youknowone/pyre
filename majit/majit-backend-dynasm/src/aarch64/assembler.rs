@@ -3098,16 +3098,6 @@ impl<'a> AssemblerARM64<'a> {
                         arglocs.len(),
                     ),
                 };
-                let val_reg = match value_loc {
-                    Loc::Reg(r) => *r,
-                    Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                        self.emit_mov_imm64(16, i.value);
-                        crate::regloc::RegLoc::new(16, false)
-                    }
-                    other => {
-                        panic!("GcStore value_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
-                    }
-                };
                 let base = match base_loc {
                     Loc::Reg(r) => r,
                     other => panic!(
@@ -3120,6 +3110,21 @@ impl<'a> AssemblerARM64<'a> {
                     other => panic!(
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
+                };
+                let val_reg = match value_loc {
+                    Loc::Reg(r) => *r,
+                    Loc::ImmedFloat(i) if size == 4 => {
+                        self.emit_mov_imm64(16, i.value);
+                        dynasm!(self.mc ; .arch aarch64 ; fmov D(14), X(16));
+                        crate::regloc::RegLoc::new(14, true)
+                    }
+                    Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                        self.emit_mov_imm64(16, i.value);
+                        crate::regloc::RegLoc::new(16, false)
+                    }
+                    other => {
+                        panic!("GcStore value_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
+                    }
                 };
                 if crate::majit_log_enabled()
                     && let Loc::Immed(i) | Loc::ImmedFloat(i) = ofs_loc

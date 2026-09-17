@@ -3732,6 +3732,14 @@ impl<'a> Assembler386<'a> {
                     Loc::Reg(val) => {
                         self.emit_op_gcstore_regalloc(base, ofs_loc, val, size);
                     }
+                    Loc::ImmedFloat(val_imm) if size == 4 => {
+                        let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
+                        let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov Rq(gpr), QWORD val_imm.value
+                            ; movq Rx(xmm.value), Rq(gpr));
+                        self.emit_op_gcstore_regalloc(base, ofs_loc, &xmm, size);
+                    }
                     Loc::Immed(val_imm) | Loc::ImmedFloat(val_imm) => {
                         self.emit_op_gcstore_imm_regalloc(base, ofs_loc, val_imm.value, size);
                     }
@@ -3784,6 +3792,12 @@ impl<'a> Assembler386<'a> {
                     macro_rules! emit_store_scaled {
                         ($scale:tt) => {{
                             match value_loc {
+                                Loc::Reg(val) if val.is_xmm && size == 4 => {
+                                    let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                                    dynasm!(self.mc ; .arch x64
+                                        ; cvtsd2ss Rx(scratch), Rx(val.value)
+                                        ; movss [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(scratch));
+                                }
                                 Loc::Reg(val) if val.is_xmm => {
                                     dynasm!(self.mc ; .arch x64
                                         ; movsd [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(val.value));
@@ -3798,6 +3812,15 @@ impl<'a> Assembler386<'a> {
                                     _ => dynasm!(self.mc ; .arch x64
                                         ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(val.value)),
                                 },
+                                Loc::ImmedFloat(i) if size == 4 => {
+                                    let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
+                                    let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                                    dynasm!(self.mc ; .arch x64
+                                        ; mov Rq(gpr), QWORD i.value
+                                        ; movq Rx(xmm), Rq(gpr)
+                                        ; cvtsd2ss Rx(xmm), Rx(xmm)
+                                        ; movss [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(xmm));
+                                }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                                     dynasm!(self.mc ; .arch x64
