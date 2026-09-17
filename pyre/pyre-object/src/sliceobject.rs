@@ -20,6 +20,21 @@ pub const SLICE_STOP_OFFSET: usize = std::mem::offset_of!(W_SliceObject, stop);
 pub const SLICE_STEP_OFFSET: usize = std::mem::offset_of!(W_SliceObject, step);
 
 pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
+    w_slice_new_in(start, stop, step, false)
+}
+
+/// Code-constant slices live as long as the owning `PyCode`
+/// (`pycode.py` `_immutable_fields_ = ["co_consts_w[*]"]`).
+pub fn w_slice_new_stable(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> PyObjectRef {
+    w_slice_new_in(start, stop, step, true)
+}
+
+fn w_slice_new_in(
+    start: PyObjectRef,
+    stop: PyObjectRef,
+    step: PyObjectRef,
+    stable: bool,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
     // three bounds across the GC malloc and re-read their relocated
     // addresses afterwards (a minor collection inside the malloc may move
@@ -35,7 +50,11 @@ pub fn w_slice_new(start: PyObjectRef, stop: PyObjectRef, step: PyObjectRef) -> 
         ob_type: &SLICE_TYPE as *const PyType,
         w_class: get_instantiate(&SLICE_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE);
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable_raw(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE)
+    } else {
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_SLICE_GC_TYPE_ID, W_SLICE_OBJECT_SIZE)
+    };
     let start = crate::gc_roots::shadow_stack_get(save_point);
     let stop = crate::gc_roots::shadow_stack_get(save_point + 1);
     let step = crate::gc_roots::shadow_stack_get(save_point + 2);

@@ -115,6 +115,22 @@ pub fn w_float_gc_alloc(value: f64) -> *mut PyObject {
     raw as PyObjectRef
 }
 
+/// Code-constant floats live as long as the owning `PyCode`
+/// (`pycode.py` `_immutable_fields_ = ["co_consts_w[*]"]`).
+#[majit_macros::dont_look_inside]
+pub fn w_float_new_stable(value: f64) -> PyObjectRef {
+    let obj = W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: value,
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    };
+    crate::lltype::malloc_typed_stable(obj) as PyObjectRef
+}
+
 /// Allocate a `W_FloatObject` for a `float` subclass instance, on the
 /// managed heap so it can be reclaimed.
 ///

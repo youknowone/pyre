@@ -6387,12 +6387,12 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         ConstantData::Integer { value } => {
             let value = crate::compiler_bigint_to_rbigint(value);
             match value.toint() {
-                Ok(value) => pyre_object::intobject::w_int_new(value),
-                Err(_) => pyre_object::longobject::w_long_new(value),
+                Ok(value) => pyre_object::intobject::w_int_new_stable(value),
+                Err(_) => pyre_object::longobject::w_long_new_stable(value),
             }
         }
         // `eval.rs` `float_constant`.
-        ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
+        ConstantData::Float { value } => pyre_object::floatobject::w_float_new_stable(*value),
         // `eval.rs` `bool_constant` — bools must surface as
         // W_BoolObject (`is space.w_True/w_False`), not W_IntObject.
         ConstantData::Boolean { value } => pyre_object::w_bool_from(*value),
@@ -6400,7 +6400,7 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         // matching `space.newtext` per `unicodeobject.py wrapunicode`.
         ConstantData::Str { value } => pyre_object::unicodeobject::box_str_constant(value),
         // `eval.rs` `bytes_constant`.
-        ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
+        ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes_stable(value),
         // Reached only for a code constant nested inside a container constant;
         // top-level `LOAD_CONST` routes through `co_consts_w` in `bh_load_const_fn`
         // so the blackhole shares the interpreter's wrapper.  The exceptions are
@@ -6438,7 +6438,11 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
             let _ = roots.pin_root(pyobject_from_constant(&elements[0]));
             let _ = roots.pin_root(pyobject_from_constant(&elements[1]));
             let _ = roots.pin_root(pyobject_from_constant(&elements[2]));
-            pyre_object::w_slice_new(roots.get(base), roots.get(base + 1), roots.get(base + 2))
+            pyre_object::w_slice_new_stable(
+                roots.get(base),
+                roots.get(base + 1),
+                roots.get(base + 2),
+            )
         }
         // `load_const_value`'s `Frozenset` arm (`pyopcode.rs`) — recurse +
         // delegate to `frozenset_constant` (`eval.rs`).

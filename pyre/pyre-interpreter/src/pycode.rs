@@ -3307,8 +3307,8 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         // Follow a nursery forwarding stub, and reject a recycled
         // nursery-debug fill (`try_gc_current_object_address` leaves
         // those unchanged). A dead slot falls through to realize again.
-        let live = pyre_object::gc_hook::try_gc_live_object_address(existing as *mut u8)
-            as PyObjectRef;
+        let live =
+            pyre_object::gc_hook::try_gc_live_object_address(existing as *mut u8) as PyObjectRef;
         if !live.is_null() {
             if live != existing {
                 let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };

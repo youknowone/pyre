@@ -216,6 +216,14 @@ pub fn w_long_new(value: BigInt) -> PyObjectRef {
     w_long_from_raw(alloc_bigint_nursery(value))
 }
 
+/// Code-constant longs: wrapper and digit array both old-gen, matching
+/// `pycode.py` `_immutable_fields_ = ["co_consts_w[*]"]` on an old-gen
+/// `PyCode`.
+#[majit_macros::dont_look_inside]
+pub fn w_long_new_stable(value: BigInt) -> PyObjectRef {
+    w_long_from_raw(alloc_bigint_stable(value))
+}
+
 /// Wrap a fresh rbigint handle without canonicalizing a shallow copy whose
 /// digit array happens to belong to a prebuilt value.
 #[majit_macros::dont_look_inside]
