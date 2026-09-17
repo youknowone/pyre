@@ -2246,15 +2246,26 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // delegating to IntegerListStrategy, even though slicing is otherwise
         // a read-only operation.
         obj = pyre_object::listobject::w_list_materialize_range(obj);
-        let mut items = Vec::new();
+        // Boxing a Range/Integer/Float element allocates, and so does
+        // `w_list_new`, so pin the receiver and each fetched item on one
+        // bracket before the constructor.
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut fetched = 0usize;
         let mut i = start;
         for n in 0..slicelength {
-            if let Some(v) = w_list_getitem(obj, i) {
-                items.push(v);
+            if let Some(v) = w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
+                let _ = pyre_object::gc_roots::pin_root(v);
+                fetched += 1;
             }
             if n + 1 < slicelength {
                 i += step;
             }
+        }
+        let mut items = Vec::with_capacity(fetched);
+        for j in 0..fetched {
+            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
         }
         return Ok(w_list_new(items));
     }
@@ -2330,15 +2341,23 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         };
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        let mut items = Vec::new();
+        let _item_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let items_base = pyre_object::gc_roots::shadow_stack_len();
+        let mut fetched = 0usize;
         let mut i = start;
         for n in 0..slicelength {
-            if let Some(v) = w_tuple_getitem(obj, i) {
-                items.push(v);
+            if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
+                let _ = pyre_object::gc_roots::pin_root(v);
+                fetched += 1;
             }
             if n + 1 < slicelength {
                 i += step;
             }
+        }
+        let mut items = Vec::with_capacity(fetched);
+        for j in 0..fetched {
+            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
         }
         return Ok(w_tuple_new(items));
     }
@@ -8191,9 +8210,19 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     // The callable is reached through `getattr(type, '__annotate__')`, so an
     // annotation-free class picks up the `__annotate_func__ = None` entry
     // `type_get_annotate` stamps on the miss.
-    let annotate_fn = type_get_annotate(obj)?;
-    let annotations = if callable_w(annotate_fn) {
-        let value = crate::call::call_function_impl_result(annotate_fn, &[w_int_new(1)])?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let annotate_fn = type_get_annotate(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotate_fn);
+    let annotations = if callable_w(pyre_object::gc_roots::shadow_stack_get(annotate_slot)) {
+        let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(1));
+        let value = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(annotate_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(idx_slot)],
+        )?;
         if !unsafe { is_dict(value) } {
             return Err(PyError::type_error(format!(
                 "__annotate__ returned non-dict of type '{}'",
@@ -8204,8 +8233,14 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     } else {
         pyre_object::w_dict_new()
     };
-    crate::type_dict_store(obj, "__annotations_cache__", annotations);
-    pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    crate::type_dict_store(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "__annotations_cache__",
+        annotations,
+    );
+    pyre_object::gc_hook::try_gc_write_barrier(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut u8
+    );
     Ok(annotations)
 }
 
@@ -17471,7 +17506,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 pyre_object::w_tuple_getitem(seq, idx)
             } else if pyre_object::is_generic_alias(seq) {
                 if idx == 0 {
-                    Some(crate::_pypy_generic_alias::make_starred(seq)?)
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(obj);
+                    let starred = crate::_pypy_generic_alias::make_starred(seq)?;
+                    let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                        as *mut pyre_object::W_SeqIterObject;
+                    (*p).index += 1;
+                    return Ok(starred);
                 } else {
                     None
                 }
@@ -17479,14 +17521,32 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // Box the idx-th code point as a one-character str,
                 // reading the WTF-8 view so a lone surrogate is yielded
                 // instead of panicking.
-                pyre_object::w_str_codepoint_at(seq, idx as usize)
-                    .map(|cp| pyre_object::unicodeobject::w_str_from_codepoint(cp.to_u32()))
+                let _roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(obj);
+                let item = pyre_object::w_str_codepoint_at(seq, idx as usize)
+                    .map(|cp| pyre_object::unicodeobject::w_str_from_codepoint(cp.to_u32()));
+                if let Some(v) = item {
+                    let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                        as *mut pyre_object::W_SeqIterObject;
+                    (*p).index += 1;
+                    return Ok(v);
+                }
+                None
             } else if pyre_object::bytesobject::is_bytes_like(seq) {
                 // Each item is the byte's ordinal, read from the live buffer.
                 if (idx as usize) < pyre_object::bytesobject::bytes_like_len(seq) {
-                    Some(w_int_new(
-                        pyre_object::bytesobject::bytes_like_getitem(seq, idx as usize) as i64,
-                    ))
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(obj);
+                    let item = w_int_new(pyre_object::bytesobject::bytes_like_getitem(
+                        seq,
+                        idx as usize,
+                    ) as i64);
+                    let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                        as *mut pyre_object::W_SeqIterObject;
+                    (*p).index += 1;
+                    return Ok(item);
                 } else {
                     None
                 }
@@ -17518,7 +17578,14 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _roots = pyre_object::gc_roots::push_roots();
                 let _ = pyre_object::gc_roots::pin_root(obj);
                 let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                match getitem(seq, w_int_new(idx)) {
+                let seq_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(seq);
+                let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_int_new(idx));
+                match getitem(
+                    pyre_object::gc_roots::shadow_stack_get(seq_slot),
+                    pyre_object::gc_roots::shadow_stack_get(idx_slot),
+                ) {
                     Ok(v) => {
                         let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
                             as *mut pyre_object::W_SeqIterObject;

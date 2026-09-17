@@ -374,19 +374,33 @@ fn ga_mro_entries(args: &[PyObjectRef]) -> crate::PyResult {
 fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let items_raw = args.get(1).copied().unwrap_or_else(w_none);
-    let items = if unsafe { is_tuple(items_raw) } {
-        items_raw
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(self_);
+    let items_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(items_raw);
+    let items = if unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(items_slot)) } {
+        pyre_object::gc_roots::shadow_stack_get(items_slot)
     } else {
-        w_tuple_new(vec![items_raw])
+        w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(items_slot)])
     };
+    let items_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(items);
+    let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let params = unsafe { w_generic_alias_get_parameters(self_) };
     let ga_args = unsafe { w_generic_alias_get_args(self_) };
-    let newargs = subs_parameters(self_, ga_args, params, items)?;
+    let newargs = subs_parameters(
+        self_,
+        ga_args,
+        params,
+        pyre_object::gc_roots::shadow_stack_get(items_slot),
+    )?;
+    let self_ = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let res = make_generic_alias(
         unsafe { w_generic_alias_get_origin(self_) },
         w_tuple_new(newargs),
     )?;
-    if unsafe { w_generic_alias_get_unpacked(self_) } {
+    if unsafe { w_generic_alias_get_unpacked(pyre_object::gc_roots::shadow_stack_get(self_slot)) } {
         unsafe { w_generic_alias_set_unpacked(res, true) };
     }
     Ok(res)
@@ -450,8 +464,17 @@ fn unpack_args(items: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         let do_unpack = if unsafe { pyre_object::is_none(subargs) } {
             false
         } else {
-            let ends_ellipsis = crate::baseobjspace::is_true(subargs)? && {
-                let last = crate::baseobjspace::getitem(subargs, w_int_new(-1))?;
+            let subargs_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(subargs);
+            let ends_ellipsis = crate::baseobjspace::is_true(
+                pyre_object::gc_roots::shadow_stack_get(subargs_slot),
+            )? && {
+                let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_int_new(-1));
+                let last = crate::baseobjspace::getitem(
+                    pyre_object::gc_roots::shadow_stack_get(subargs_slot),
+                    pyre_object::gc_roots::shadow_stack_get(idx_slot),
+                )?;
                 unsafe { is_ellipsis(last) }
             };
             !ends_ellipsis

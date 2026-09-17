@@ -1646,7 +1646,7 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
                 }
             }
         }
-        let start_key = pyre_object::w_str_new("start");
+        let start_key = pyre_object::unicodeobject::intern_str_value("start");
         let start =
             unsafe { pyre_object::w_dict_lookup(kwargs, start_key) }.unwrap_or(w_int_new(1));
         (&args[..args.len() - 1], start)
@@ -1663,9 +1663,10 @@ pub fn prod(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let acc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(start);
-    let items = pyre_interpreter::builtins::collect_iterable(positional[0])?;
+    let acc_slot = pyre_object::gc_roots::pin_roots(&[start, positional[0]]);
+    let items = pyre_interpreter::builtins::collect_iterable(
+        pyre_object::gc_roots::shadow_stack_get(acc_slot + 1),
+    )?;
     // `collect_iterable` returns unrooted pointers. Publish the whole
     // slice before any forwarding query; a per-item `pin_root` is a
     // safepoint that can move the still-unpinned tail.

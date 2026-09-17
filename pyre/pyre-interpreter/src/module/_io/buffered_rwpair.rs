@@ -81,22 +81,24 @@ impl W_BufferedRWPair {
         let _ = pyre_object::gc_roots::pin_root(w_reader);
         let _ = pyre_object::gc_roots::pin_root(w_writer);
         let input_sp = pyre_object::gc_roots::shadow_stack_len() - 2;
-        let reader_size = w_int_new(buffer_size);
+        let reader_size_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(buffer_size));
         let reader = crate::call::call_function_impl_result(
             super::buffered::type_object(),
             &[
                 pyre_object::gc_roots::shadow_stack_get(input_sp),
-                reader_size,
+                pyre_object::gc_roots::shadow_stack_get(reader_size_slot),
             ],
         )?;
         let _ = pyre_object::gc_roots::pin_root(reader);
         let reader_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let writer_size = w_int_new(buffer_size);
+        let writer_size_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(buffer_size));
         let writer = crate::call::call_function_impl_result(
             super::buffered_writer::type_object(),
             &[
                 pyre_object::gc_roots::shadow_stack_get(input_sp + 1),
-                writer_size,
+                pyre_object::gc_roots::shadow_stack_get(writer_size_slot),
             ],
         )?;
         self.w_reader = pyre_object::gc_roots::shadow_stack_get(reader_slot);

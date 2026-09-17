@@ -360,7 +360,12 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
                 value,
                 majit_metainterp::jit::we_are_jitted(),
             );
-            return Ok(pyre_object::w_tuple_new(items));
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&items);
+            let live: Vec<PyObjectRef> = (0..items.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                .collect();
+            return Ok(pyre_object::w_tuple_new(live));
         }
     }
     Err(PyError::type_error("expected list for list_to_tuple"))

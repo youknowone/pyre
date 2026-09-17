@@ -449,7 +449,7 @@ pub(crate) fn getattribute_dotted_obj(
     let base = pyre_object::gc_roots::pin_roots(&[obj, w_qualname]);
     let mut cur_slot = base;
     let qualname_slot = base + 1;
-    let w_dot = pyre_object::w_str_new(".");
+    let w_dot = pyre_object::unicodeobject::intern_str_value(".");
     let _ = pyre_object::gc_roots::pin_root(w_dot);
     let dot_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_parts = call_meth(

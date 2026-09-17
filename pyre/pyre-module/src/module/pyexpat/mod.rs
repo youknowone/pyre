@@ -1819,11 +1819,24 @@ mod xmlparser_class {
                 // arbitrary Python runs in between.  One liveness pin; a method
                 // does not move, so the local stays current.
                 let roots = pyre_object::gc_roots::push_roots();
+                let self_slot = roots.base();
+                let _ = roots.pin_root(self_obj);
                 let read = pyre_interpreter::baseobjspace::getattr_str(file, "read")?;
                 let read = roots.pin_root(read);
+                let size_slot = self_slot + 2;
+                let _ = roots.pin_root(w_int_new(2048));
+                let data_slot = self_slot + 3;
+                let _ = roots.pin_root(w_none());
+                let eof_slot = self_slot + 4;
+                let _ = roots.pin_root(w_bool_from(false));
                 let mut result = w_int_new(1);
                 loop {
-                    let data = pyre_interpreter::call::call_function_impl_result(read, &[w_int_new(2048)])?;
+                    let data = pyre_interpreter::call::call_function_impl_result(
+                        read,
+                        &[roots.get(size_slot)],
+                    )?;
+                    roots.set(data_slot, data);
+                    let data = roots.get(data_slot);
                     let eof = if unsafe { is_str(data) } {
                         unsafe { w_str_get_value(data).is_empty() }
                     } else if unsafe { pyre_object::bytesobject::is_bytes_like(data) } {
@@ -1831,7 +1844,8 @@ mod xmlparser_class {
                     } else {
                         false
                     };
-                    result = parse_impl(self_obj, data, w_bool_from(eof))?;
+                    roots.set(eof_slot, w_bool_from(eof));
+                    result = parse_impl(roots.get(self_slot), roots.get(data_slot), roots.get(eof_slot))?;
                     if eof {
                         return Ok(result);
                     }

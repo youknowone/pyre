@@ -26,14 +26,18 @@ pub(super) fn make_blocking_error() -> crate::PyError {
     // The message is a per-call string; mint it collectable and pin it
     // across the constructor, which allocates the exception object.
     let _roots = pyre_object::gc_roots::push_roots();
-    let errno = w_int_new(0);
+    let errno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     let msg_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(
         "read could not complete without blocking",
     ));
     match crate::call::call_function_impl_result(
         blocking,
-        &[errno, pyre_object::gc_roots::shadow_stack_get(msg_slot)],
+        &[
+            pyre_object::gc_roots::shadow_stack_get(errno_slot),
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+        ],
     ) {
         Ok(value) => unsafe { crate::PyError::from_exc_object(value) },
         Err(error) => error,

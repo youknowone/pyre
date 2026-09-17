@@ -870,14 +870,14 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
             use rustpython_common::format::{FormatPart, FormatString, FromTemplate};
 
             let arg = require_string_module_str(args)?;
-            let body = unsafe { pyre_object::w_str_get_wtf8(arg) };
-            let parsed = FormatString::from_str(body)
+            let body = unsafe { pyre_object::w_str_get_wtf8(arg) }.to_wtf8_buf();
+            let parsed = FormatString::from_str(&body)
                 .map_err(|_| crate::PyError::value_error("bad format string"))?;
 
-            // Every tuple, and every string inside it, is freshly allocated and
-            // the next allocation can collect, so each is pinned as it arrives;
-            // the conversion is built last so the pin order is the element order.
-            let mut tuples = pyre_object::gc_roots::RootedItems::new();
+            // Every tuple, and every string inside it, is a nursery object
+            // and the next mint can collect, so they all sit on one bracket.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut tuple_slots = Vec::new();
             let mut pending: Option<Wtf8Buf> = None;
             for part in parsed.format_parts {
                 match part {
@@ -888,38 +888,47 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                         format_spec,
                     } => {
                         let literal = pending.take().unwrap_or_default();
-                        // The tuple's own bracket closes before `tuples` takes
-                        // it: both address the same shadow stack, so an inner
-                        // set still open holds the slots the outer one claims.
-                        let entry = {
-                            let mut fields = pyre_object::gc_roots::RootedItems::new();
-                            fields.push(pyre_object::w_str_from_wtf8_managed(literal));
-                            fields.push(pyre_object::w_str_from_wtf8_managed(field_name));
-                            fields.push(pyre_object::w_str_from_wtf8_managed(format_spec));
-                            fields.push(match conversion_spec {
-                                Some(c) => {
-                                    pyre_object::w_str_new_managed(&c.to_char_lossy().to_string())
-                                }
-                                None => pyre_object::w_none(),
-                            });
-                            pyre_object::w_tuple_new(fields.take())
+                        let lit = pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(literal),
+                        );
+                        let field = pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(field_name),
+                        );
+                        let spec = pyre_object::gc_roots::pin_root(
+                            pyre_object::w_str_from_wtf8_managed(format_spec),
+                        );
+                        let conv = match conversion_spec {
+                            Some(c) => pyre_object::gc_roots::pin_root(
+                                pyre_object::w_str_new_managed(&c.to_char_lossy().to_string()),
+                            ),
+                            None => pyre_object::w_none(),
                         };
-                        tuples.push(entry);
+                        let slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
+                            lit, field, spec, conv,
+                        ]));
+                        tuple_slots.push(slot);
                     }
                 }
             }
             if let Some(text) = pending {
-                let entry = {
-                    let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_str_from_wtf8_managed(text));
-                    fields.push(pyre_object::w_none());
-                    fields.push(pyre_object::w_none());
-                    fields.push(pyre_object::w_none());
-                    pyre_object::w_tuple_new(fields.take())
-                };
-                tuples.push(entry);
+                let lit =
+                    pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(text));
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
+                    lit,
+                    pyre_object::w_none(),
+                    pyre_object::w_none(),
+                    pyre_object::w_none(),
+                ]));
+                tuple_slots.push(slot);
             }
-            Ok(pyre_object::w_list_new(tuples.take()))
+            Ok(pyre_object::w_list_new(
+                tuple_slots
+                    .into_iter()
+                    .map(pyre_object::gc_roots::shadow_stack_get)
+                    .collect(),
+            ))
         }),
     );
     crate::module_ns_store(
@@ -929,8 +938,8 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
             use rustpython_common::format::{FieldName, FieldNamePart, FieldType};
 
             let arg = require_string_module_str(args)?;
-            let body = unsafe { pyre_object::w_str_get_wtf8(arg) };
-            let FieldName { field_type, parts } = FieldName::parse(body)
+            let body = unsafe { pyre_object::w_str_get_wtf8(arg) }.to_wtf8_buf();
+            let FieldName { field_type, parts } = FieldName::parse(&body)
                 .map_err(|_| crate::PyError::value_error("bad field name"))?;
 
             let first = match field_type {
@@ -938,38 +947,47 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 FieldType::Index(n) => pyre_object::w_int_new(n as i64),
                 FieldType::Keyword(s) => pyre_object::w_str_from_wtf8_managed(s),
             };
-            // `first` is a young managed str or int; pin it across the parts
-            // below, which allocate, and reload it for the result tuple.
-            let roots = pyre_object::gc_roots::push_roots();
-            let first_slot = roots.base();
-            let _ = roots.pin_root(first);
+            // `first` is a young managed str or int; pin it and every part
+            // tuple on one bracket. Reload `first` for the result tuple.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let first_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(first);
             let rest_list = {
-                let mut rest = pyre_object::gc_roots::RootedItems::new();
+                let mut rest_slots = Vec::new();
                 for part in parts {
-                    let entry = {
-                        let mut fields = pyre_object::gc_roots::RootedItems::new();
-                        match part {
-                            FieldNamePart::Attribute(s) => {
-                                fields.push(pyre_object::w_bool_from(true));
-                                fields.push(pyre_object::w_str_from_wtf8_managed(s));
-                            }
-                            FieldNamePart::Index(n) => {
-                                fields.push(pyre_object::w_bool_from(false));
-                                fields.push(pyre_object::w_int_new(n as i64));
-                            }
-                            FieldNamePart::StringIndex(s) => {
-                                fields.push(pyre_object::w_bool_from(false));
-                                fields.push(pyre_object::w_str_from_wtf8_managed(s));
-                            }
-                        }
-                        pyre_object::w_tuple_new(fields.take())
+                    let (flag, value) = match part {
+                        FieldNamePart::Attribute(s) => (
+                            pyre_object::w_bool_from(true),
+                            pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+                                s,
+                            )),
+                        ),
+                        FieldNamePart::Index(n) => (
+                            pyre_object::w_bool_from(false),
+                            pyre_object::gc_roots::pin_root(pyre_object::w_int_new(n as i64)),
+                        ),
+                        FieldNamePart::StringIndex(s) => (
+                            pyre_object::w_bool_from(false),
+                            pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
+                                s,
+                            )),
+                        ),
                     };
-                    rest.push(entry);
+                    let slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
+                        flag, value,
+                    ]));
+                    rest_slots.push(slot);
                 }
-                pyre_object::w_list_new(rest.take())
+                pyre_object::w_list_new(
+                    rest_slots
+                        .into_iter()
+                        .map(pyre_object::gc_roots::shadow_stack_get)
+                        .collect(),
+                )
             };
             let rest_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = roots.pin_root(rest_list);
+            let _ = pyre_object::gc_roots::pin_root(rest_list);
             Ok(pyre_object::w_tuple_new(vec![
                 pyre_object::gc_roots::shadow_stack_get(first_slot),
                 pyre_object::gc_roots::shadow_stack_get(rest_slot),
@@ -6204,7 +6222,7 @@ fn handle_fromlist(
         // `__all__` is expanded once; a name inside it that is itself `*` is an
         // ordinary name, not a second expansion.
         let star_slot = shadow_stack_len();
-        let _ = pin_root(pyre_object::w_str_new("*"));
+        let _ = pin_root(pyre_object::unicodeobject::intern_str_value("*"));
         if crate::baseobjspace::eq_w(shadow_stack_get(x_slot), shadow_stack_get(star_slot))? {
             if !recursive
                 && let Some(w_all) =

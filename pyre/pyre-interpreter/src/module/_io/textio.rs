@@ -631,7 +631,16 @@ impl W_TextIOWrapper {
             super::call_method_result(self.w_encoder, "reset", &[])?;
             self.encoding_start_of_stream = true;
         } else {
-            super::call_method_result(self.w_encoder, "setstate", &[w_int_new(0)])?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let encoder_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(self.w_encoder);
+            let state_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+            super::call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(encoder_slot),
+                "setstate",
+                &[pyre_object::gc_roots::shadow_stack_get(state_slot)],
+            )?;
             self.encoding_start_of_stream = false;
         }
         Ok(())
@@ -655,7 +664,18 @@ impl W_TextIOWrapper {
         };
         let chunk_size = (self.chunk_size as usize).max(scaled_hint);
         let method = if self.has_read1 { "read1" } else { "read" };
-        let input = self.call_buffer(method, &[w_int_new(chunk_size as i64)])?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.w_buffer);
+        let decoder_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(self.w_decoder);
+        let size_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(chunk_size as i64));
+        let input = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+            method,
+            &[pyre_object::gc_roots::shadow_stack_get(size_slot)],
+        )?;
         if unsafe { pyre_object::is_none(input) } {
             return Err(super::buffered::make_blocking_error());
         }
@@ -668,9 +688,20 @@ impl W_TextIOWrapper {
             })?;
         let nbytes = input_bytes.len();
         let eof = nbytes == 0;
-        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&input_bytes);
-        let decoded =
-            super::call_method_result(self.w_decoder, "decode", &[bytes, w_bool_from(eof)])?;
+        let bytes_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::bytesobject::w_bytes_from_bytes(
+            &input_bytes,
+        ));
+        let eof_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_bool_from(eof));
+        let decoded = super::call_method_result(
+            pyre_object::gc_roots::shadow_stack_get(decoder_slot),
+            "decode",
+            &[
+                pyre_object::gc_roots::shadow_stack_get(bytes_slot),
+                pyre_object::gc_roots::shadow_stack_get(eof_slot),
+            ],
+        )?;
         self.decoded.set(decoded)?;
         let nchars = self.decoded.ulen;
         if nchars > 0 {
@@ -828,7 +859,16 @@ impl W_TextIOWrapper {
                 && crate::builtins::space_index_w(w_position).unwrap_or(0) != 0
             {
                 self.encoding_start_of_stream = false;
-                let _ = super::call_method_result(self.w_encoder, "setstate", &[w_int_new(0)]);
+                let _roots = pyre_object::gc_roots::push_roots();
+                let encoder_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(self.w_encoder);
+                let state_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+                let _ = super::call_method_result(
+                    pyre_object::gc_roots::shadow_stack_get(encoder_slot),
+                    "setstate",
+                    &[pyre_object::gc_roots::shadow_stack_get(state_slot)],
+                );
             }
         }
     }
@@ -1679,8 +1719,17 @@ impl W_TextIOWrapper {
         }
 
         if position_cookie.chars_to_skip != 0 {
-            let chunk =
-                self.call_buffer("read", &[w_int_new(position_cookie.bytes_to_feed as i64)])?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let buffer_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(self.w_buffer);
+            let size_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ =
+                pyre_object::gc_roots::pin_root(w_int_new(position_cookie.bytes_to_feed as i64));
+            let chunk = super::call_method_result(
+                pyre_object::gc_roots::shadow_stack_get(buffer_slot),
+                "read",
+                &[pyre_object::gc_roots::shadow_stack_get(size_slot)],
+            )?;
             if unsafe { !pyre_object::bytesobject::is_bytes(chunk) } {
                 return Err(crate::PyError::type_error(format!(
                     "underlying read() should have returned a bytes object, not '{}'",
