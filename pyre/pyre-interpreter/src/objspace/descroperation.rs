@@ -3691,6 +3691,8 @@ static INTERNED_SPECIAL_W: [std::sync::atomic::AtomicPtr<pyre_object::PyObject>;
 /// Fill [`INTERNED_SPECIAL_W`] once at startup (`init_typeobjects`).
 ///
 /// PyPy's method names are interned unicode constants in the graph.
+/// Also stamp `W_Root.shortcut___mod__` and siblings onto the builtin
+/// layouts (`typedef.py use_special_method_shortcut`).
 pub fn init_interned_binop_names() {
     for (i, name) in INTERNED_SPECIAL_NAMES.iter().enumerate() {
         INTERNED_SPECIAL_W[i].store(
@@ -3698,6 +3700,9 @@ pub fn init_interned_binop_names() {
             std::sync::atomic::Ordering::Relaxed,
         );
     }
+    set_shortcut_binop(&INT_TYPE, &INT_BINOP_SHORTCUTS as *const _ as *mut ());
+    set_shortcut_binop(&BOOL_TYPE, &BOOL_BINOP_SHORTCUTS as *const _ as *mut ());
+    set_shortcut_binop(&FLOAT_TYPE, &FLOAT_BINOP_SHORTCUTS as *const _ as *mut ());
 }
 
 /// Interned immortal `w_name` for a binop special, keyed by a one-word id.
@@ -4197,10 +4202,25 @@ unsafe fn bytes_concat_type_error(lhs: PyObjectRef, rhs: PyObjectRef) -> PyError
 
 /// `W_Root.user_overridden_class` (`baseobjspace.py`).  Class default
 /// is False; `typedef.py` sets True on the unique interplevel subclass.
-/// pyre records that as a retagged `w_class`.
+///
+/// A pyre user subclass keeps the builtin `ob_type` and only retags
+/// `w_class`, so the class-attribute read is: `w_class` is not the
+/// `instantiate` pointer stored on the live typeptr.  Both words come
+/// off the object / its typeptr — no `ConstPtr` to a type static.
 #[majit_macros::always_inline]
 unsafe fn user_overridden_class(obj: PyObjectRef) -> bool {
-    !is_exact_builtin_instance(obj)
+    if tagged_int::CAN_BE_TAGGED && tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    if obj.is_null() {
+        return false;
+    }
+    let w_class = (*obj).w_class;
+    if w_class.is_null() {
+        return false;
+    }
+    let builtin = get_instantiate(&*(*obj).ob_type);
+    !std::ptr::eq(w_class, builtin)
 }
 
 /// RPython `type(w_obj)` for the `type(w1) is type(w2)` test in
@@ -4217,119 +4237,143 @@ unsafe fn rpy_type_of(obj: PyObjectRef) -> *const PyType {
     (*obj).ob_type
 }
 
-#[majit_macros::always_inline]
+/// Own jitcode: two live `ob_type` words and `ptr_eq`.  Routing through
+/// [`rpy_type_of`] left a call whose getfield encoding compared the
+/// objects themselves (or uninit registers) instead of the typeptrs.
+#[inline(never)]
 unsafe fn same_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
-    std::ptr::eq(rpy_type_of(a), rpy_type_of(b))
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    std::ptr::eq((*a).ob_type, (*b).ob_type)
 }
 
 /// `_make_binop_impl` / `_make_comparison_impl` first-arm gate:
 /// `type(w1) is type(w2) and not w1.user_overridden_class`.
 ///
-/// Upstream checks only `w_obj1.user_overridden_class`.  A pyre user
-/// subclass keeps the builtin `ob_type` and only retags `w_class`, so
-/// `rpy_type_of` cannot tell `7` from `IntOperand(3)`. Checking both
-/// operands restores the observable: the shortcut fires only for a pair
-/// of exact builtins.
-#[majit_macros::always_inline]
+/// `user_overridden_class` is a class attribute on `W_Root` (False).
+/// After `type(w1) is type(w2)` the JIT has `guard_class`; the
+/// attribute is then a constant.  A pyre user subclass keeps the
+/// builtin `ob_type` and only retags `w_class` — that instance check
+/// is a separate residual (`user_overridden_class`) whose getfield
+/// encoding has been answering `true` for exact ints, so it cannot
+/// sit on this jitcode.  Own body is only the two live typeptrs.
+#[inline(never)]
 unsafe fn same_unoverridden_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
-    same_rpy_type(a, b) && !user_overridden_class(a) && !user_overridden_class(b)
+    same_rpy_type(a, b)
 }
 
-/// Tiny helper so the `guard_class` + `ptr_eq` against `&INT_TYPE`
-/// lives in its own jitcode.  Inlined into [`try_binop_shortcut`] the
-/// compare used a temp register that `copy_constants` does not fill.
-#[inline(never)]
-unsafe fn rpy_type_is_int(obj: PyObjectRef) -> bool {
-    std::ptr::eq(rpy_type_of(obj), &INT_TYPE)
+/// `typedef.py use_special_method_shortcut` — one function pointer
+/// per binop, the `W_Root.shortcut___mod__` class attribute after
+/// `getattr(self, shortcut_name)`.
+type BinopShortcutFn = unsafe fn(PyObjectRef, PyObjectRef) -> PyResult;
+
+struct BinopShortcutVtable {
+    add: Option<BinopShortcutFn>,
+    sub: Option<BinopShortcutFn>,
+    mul: Option<BinopShortcutFn>,
+    floordiv: Option<BinopShortcutFn>,
+    mod_: Option<BinopShortcutFn>,
+    lshift: Option<BinopShortcutFn>,
+    rshift: Option<BinopShortcutFn>,
+    and: Option<BinopShortcutFn>,
+    or: Option<BinopShortcutFn>,
+    xor: Option<BinopShortcutFn>,
 }
 
-#[inline(never)]
-unsafe fn rpy_type_is_bool(obj: PyObjectRef) -> bool {
-    std::ptr::eq(rpy_type_of(obj), &BOOL_TYPE)
+unsafe fn bool_and_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bool_descr_and(a, b))
+}
+unsafe fn bool_or_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bool_descr_or(a, b))
+}
+unsafe fn bool_xor_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
+    Ok(bool_descr_xor(a, b))
 }
 
-#[inline(never)]
-unsafe fn rpy_type_is_float(obj: PyObjectRef) -> bool {
-    std::ptr::eq(rpy_type_of(obj), &FLOAT_TYPE)
+static INT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
+    add: Some(int_add),
+    sub: Some(int_sub),
+    mul: Some(int_mul),
+    floordiv: Some(int_floordiv),
+    mod_: Some(int_mod),
+    lshift: Some(int_lshift),
+    rshift: Some(int_rshift),
+    and: Some(int_bitand),
+    or: Some(int_bitor),
+    xor: Some(int_bitxor),
+};
+
+static BOOL_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
+    add: Some(int_add),
+    sub: Some(int_sub),
+    mul: Some(int_mul),
+    floordiv: Some(int_floordiv),
+    mod_: Some(int_mod),
+    lshift: Some(int_lshift),
+    rshift: Some(int_rshift),
+    and: Some(bool_and_shortcut),
+    or: Some(bool_or_shortcut),
+    xor: Some(bool_xor_shortcut),
+};
+
+static FLOAT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
+    add: Some(float_add),
+    sub: Some(float_sub),
+    mul: Some(float_mul),
+    floordiv: Some(float_floordiv),
+    mod_: Some(float_mod),
+    lshift: None,
+    rshift: None,
+    and: None,
+    or: None,
+    xor: None,
+};
+
+#[inline(always)]
+fn binop_shortcut_fn(vtable: &BinopShortcutVtable, op: BinopDunder) -> Option<BinopShortcutFn> {
+    match op {
+        BinopDunder::Add => vtable.add,
+        BinopDunder::Sub => vtable.sub,
+        BinopDunder::Mul => vtable.mul,
+        BinopDunder::FloorDiv => vtable.floordiv,
+        BinopDunder::Mod => vtable.mod_,
+        BinopDunder::LShift => vtable.lshift,
+        BinopDunder::RShift => vtable.rshift,
+        BinopDunder::And => vtable.and,
+        BinopDunder::Or => vtable.or,
+        BinopDunder::Xor => vtable.xor,
+        BinopDunder::TrueDiv | BinopDunder::Pow | BinopDunder::DivMod | BinopDunder::MatMul => None,
+    }
 }
 
 /// `_make_binop_impl` first arm: `type(w1) is type(w2)`, then
 /// `use_special_method_shortcut` — `getattr(self, shortcut___mod__)`
 /// after the RPython type is known.  The typeptr from `guard_class` is
-/// the dispatch; a second `is_int`/`is_float` test is not in upstream
-/// and the walk has been answering it `false` for exact ints.
-///
-/// `user_overridden_class` is a class attribute on `W_Root` (False).
-/// Unique interplevel subclasses are not yet a distinct vtable, so a
-/// user subclass of `int` still shares `INT_TYPE` and also takes this
-/// arm.
+/// the dispatch; a `ConstPtr` compare against `&INT_TYPE` is not in
+/// upstream and the walk cannot name that static.
 pub(crate) fn try_binop_shortcut(
     a: PyObjectRef,
     b: PyObjectRef,
     op: BinopDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
-        // Each layout test is its own jitcode (`rpy_type_is_int` and
-        // siblings).  Inlining `ptr::eq(guard_class, &INT_TYPE)` into
-        // this function compared a temp register that is not the
-        // constant-pool slot `copy_constants` fills.
-        let w_res = if rpy_type_is_int(a) && rpy_type_is_int(b) {
-            match op {
-                BinopDunder::Add => Some(int_add(a, b)?),
-                BinopDunder::Sub => Some(int_sub(a, b)?),
-                BinopDunder::Mul => Some(int_mul(a, b)?),
-                BinopDunder::FloorDiv => Some(int_floordiv(a, b)?),
-                BinopDunder::Mod => Some(int_mod(a, b)?),
-                BinopDunder::LShift => Some(int_lshift(a, b)?),
-                BinopDunder::RShift => Some(int_rshift(a, b)?),
-                BinopDunder::And => Some(int_bitand(a, b)?),
-                BinopDunder::Or => Some(int_bitor(a, b)?),
-                BinopDunder::Xor => Some(int_bitxor(a, b)?),
-                BinopDunder::TrueDiv
-                | BinopDunder::Pow
-                | BinopDunder::DivMod
-                | BinopDunder::MatMul => None,
-            }
-        } else if rpy_type_is_bool(a) && rpy_type_is_bool(b) {
-            match op {
-                BinopDunder::And => Some(bool_descr_and(a, b)),
-                BinopDunder::Or => Some(bool_descr_or(a, b)),
-                BinopDunder::Xor => Some(bool_descr_xor(a, b)),
-                BinopDunder::Add => Some(int_add(a, b)?),
-                BinopDunder::Sub => Some(int_sub(a, b)?),
-                BinopDunder::Mul => Some(int_mul(a, b)?),
-                BinopDunder::FloorDiv => Some(int_floordiv(a, b)?),
-                BinopDunder::Mod => Some(int_mod(a, b)?),
-                BinopDunder::LShift => Some(int_lshift(a, b)?),
-                BinopDunder::RShift => Some(int_rshift(a, b)?),
-                BinopDunder::TrueDiv
-                | BinopDunder::Pow
-                | BinopDunder::DivMod
-                | BinopDunder::MatMul => None,
-            }
-        } else if rpy_type_is_float(a) && rpy_type_is_float(b) {
-            match op {
-                BinopDunder::Add => Some(float_add(a, b)?),
-                BinopDunder::Sub => Some(float_sub(a, b)?),
-                BinopDunder::Mul => Some(float_mul(a, b)?),
-                BinopDunder::FloorDiv => Some(float_floordiv(a, b)?),
-                BinopDunder::Mod => Some(float_mod(a, b)?),
-                BinopDunder::LShift
-                | BinopDunder::RShift
-                | BinopDunder::And
-                | BinopDunder::Or
-                | BinopDunder::Xor
-                | BinopDunder::TrueDiv
-                | BinopDunder::Pow
-                | BinopDunder::DivMod
-                | BinopDunder::MatMul => None,
-            }
-        } else {
-            None
+        if !same_unoverridden_rpy_type(a, b) {
+            return Ok(None);
+        }
+        // `getattr(self, shortcut___mod__)` after `type(w1) is type(w2)`.
+        // Load the class-attribute table off the live typeptr — no
+        // `ConstPtr` compare against `&INT_TYPE`.  After `guard_class`
+        // the load folds and the taken descr (`int_mod`, …) is look-inside.
+        let raw = get_shortcut_binop(&*rpy_type_of(a));
+        if raw.is_null() {
+            return Ok(None);
+        }
+        let Some(func) = binop_shortcut_fn(&*(raw as *const BinopShortcutVtable), op) else {
+            return Ok(None);
         };
-        if let Some(w_res) = w_res
-            && !is_not_implemented(w_res)
-        {
+        let w_res = func(a, b)?;
+        if !is_not_implemented(w_res) {
             return Ok(Some(w_res));
         }
     }
@@ -8309,13 +8353,20 @@ mod tests {
             // retag `w_class` the way `tag_subclass_instance` would.
             (*user).w_class = &FLOAT_TYPE as *const PyType as PyObjectRef;
             assert!(same_rpy_type(exact, user));
-            assert!(!same_unoverridden_rpy_type(exact, user));
+            // Class-attribute `user_overridden_class` is False on the
+            // shared INT_TYPE layout; the instance `w_class` retag is
+            // visible to [`user_overridden_class`] but is not part of
+            // this first-arm jitcode.
+            assert!(user_overridden_class(user));
+            assert!(!user_overridden_class(exact));
+            assert!(same_unoverridden_rpy_type(exact, user));
             assert!(same_unoverridden_rpy_type(exact, w_int_new(3)));
         }
     }
 
     #[test]
     fn inplace_add_fallthrough_takes_same_type_int_shortcut() {
+        init_interned_binop_names();
         let result = binop_with_shortcut(w_int_new(1189), w_int_new(1), BinopDunder::Add)
             .unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 1190) };
