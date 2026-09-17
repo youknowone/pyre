@@ -5380,9 +5380,10 @@ fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<P
 }
 
 /// `interp___import__` `space.findattr(w_mod, "__path__")` without hooks.
-/// `None` is hooky (decline the residual). `Some(false)` is not a package
-/// (`findattr` missed or returned `None`). `Some(true)` is a package and
-/// needs `_handle_fromlist`.
+/// `None` is hooky (decline the residual). `Some(false)` is a genuine
+/// attribute miss. `Some(true)` is a present `__path__`, including Python
+/// `None`: `findattr` then returns `w_None`, which is not RPython `None`,
+/// so `_handle_fromlist` still runs.
 pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
     let w_type = unsafe { (*w_module).w_class };
     if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
@@ -5403,7 +5404,6 @@ pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
                 Some(false)
             }
         }
-        Some(path) if path.is_null() || unsafe { pyre_object::is_none(path) } => Some(false),
         Some(_) => Some(true),
     }
 }
@@ -7333,7 +7333,7 @@ mod tests {
         };
         assert_eq!(module_is_package_no_callback(module), Some(true));
         unsafe { pyre_object::w_dict_setitem_str(dict, "__path__", pyre_object::w_none()) };
-        assert_eq!(module_is_package_no_callback(module), Some(false));
+        assert_eq!(module_is_package_no_callback(module), Some(true));
         unsafe { pyre_object::w_dict_delitem_str(dict, "__path__") };
         assert_eq!(module_is_package_no_callback(module), Some(false));
     }
