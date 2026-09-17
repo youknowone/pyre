@@ -12164,14 +12164,35 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             return Ok(obj);
         }
         if is_exact_list(obj) {
-            let n = w_list_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_list_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_tuple_new(items));
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let n = w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let mut item_slots = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                if let Some(item) =
+                    w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i as i64)
+                {
+                    item_slots.push(pyre_object::gc_roots::shadow_stack_len());
+                    let _ = pyre_object::gc_roots::pin_root(item);
+                }
+            }
+            return Ok(w_tuple_new(
+                item_slots
+                    .into_iter()
+                    .map(pyre_object::gc_roots::shadow_stack_get)
+                    .collect(),
+            ));
         }
     }
-    Ok(w_tuple_new(collect_iterable(obj)?))
+    let items = collect_iterable(obj)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&items);
+    Ok(w_tuple_new(
+        (0..items.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect(),
+    ))
 }
 
 pub fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -18423,8 +18444,13 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
         if pyre_object::is_w_range(obj) {
             // `descr_hash` — `hash((length, start|None, step|None))` so two
             // ranges denoting the same sequence hash equally.
-            let w_len = pyre_object::w_range_length(obj);
-            let (start, _stop, step) = pyre_object::w_range_fields(obj);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let w_len =
+                pyre_object::w_range_length(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let (start, _stop, step) =
+                pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let len_b = pyre_object::range_obj_to_bigint(w_len);
             let none = w_none();
             let (a, b) = if len_b == BigInt::from(0) {
@@ -18434,7 +18460,12 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             } else {
                 (start, step)
             };
-            let tup = pyre_object::w_tuple_new(vec![w_len, a, b]);
+            let field_base = pyre_object::gc_roots::pin_roots(&[w_len, a, b]);
+            let tup = pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(field_base),
+                pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+                pyre_object::gc_roots::shadow_stack_get(field_base + 2),
+            ]);
             return hash_value(tup);
         }
         if pyre_object::is_generic_alias(obj) {

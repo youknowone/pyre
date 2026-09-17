@@ -10565,10 +10565,23 @@ fn init_tuple_type(ns: PyObjectRef) {
                 |args| {
                     let tuple =
                         crate::type_methods::require_tuple_receiver(args, "__getnewargs__", true)?;
-                    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(tuple) };
-                    Ok(pyre_object::w_tuple_new(vec![pyre_object::w_tuple_new(
-                        items,
-                    )]))
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(tuple);
+                    let items = unsafe {
+                        pyre_object::w_tuple_items_copy_as_vec(
+                            pyre_object::gc_roots::shadow_stack_get(tuple_slot),
+                        )
+                    };
+                    let base = pyre_object::gc_roots::pin_roots(&items);
+                    let live: Vec<PyObjectRef> = (0..items.len())
+                        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                        .collect();
+                    let inner_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(live));
+                    Ok(pyre_object::w_tuple_new(vec![
+                        pyre_object::gc_roots::shadow_stack_get(inner_slot),
+                    ]))
                 },
                 1,
             ),

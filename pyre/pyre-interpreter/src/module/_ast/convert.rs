@@ -447,35 +447,41 @@ impl ObjectConverter {
             }
             return Ok(());
         }
-        if !self.is_node(object, "AST")? {
+        let _node_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(object);
+        if !self.is_node(pyre_object::gc_roots::shadow_stack_get(obj_slot), "AST")? {
             return Ok(());
         }
         for (line_field, column_field) in
             [("lineno", "col_offset"), ("end_lineno", "end_col_offset")]
         {
-            if let Some(value) = self.optional_field(object, line_field)?
-                && let Ok(line) = self.obj_to_int(value)
+            if let Some(value) = self.optional_field(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                line_field,
+            )? && let Ok(line) = self.obj_to_int(value)
                 && line > 0
             {
                 extent.0 = extent.0.max(line as usize);
             }
-            if let Some(value) = self.optional_field(object, column_field)?
-                && let Ok(column) = self.obj_to_int(value)
+            if let Some(value) = self.optional_field(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                column_field,
+            )? && let Ok(column) = self.obj_to_int(value)
                 && column > 0
             {
                 extent.1 = extent.1.max(column as usize);
             }
         }
-        let Some(fields) = self.optional_field(object, "_fields")? else {
+        let Some(fields) =
+            self.optional_field(pyre_object::gc_roots::shadow_stack_get(obj_slot), "_fields")?
+        else {
             return Ok(());
         };
         if !unsafe { pyre_object::is_tuple(fields) } {
             return Ok(());
         }
         let names = unsafe { pyre_object::w_tuple_items_copy_as_vec(fields) };
-        let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(object);
         let name_base = pyre_object::gc_roots::pin_roots(&names);
         for index in 0..names.len() {
             let name = pyre_object::gc_roots::shadow_stack_get(name_base + index);

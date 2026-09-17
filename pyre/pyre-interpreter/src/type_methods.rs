@@ -6424,14 +6424,19 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     let base = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
     let s = unsafe { w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(base)) }.to_wtf8_buf();
     let table = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     let mut result = Wtf8Buf::with_capacity(s.len());
     unsafe {
         for cp in s.code_points() {
-            let key = w_int_new(cp.to_u32() as i64);
+            pyre_object::gc_roots::shadow_stack_set(key_slot, w_int_new(cp.to_u32() as i64));
             // `unicode_translate` clears any LookupError the lookup raises
             // and keeps the character, so a table that indexes rather than
             // maps (a str, a list) leaves unmapped code points alone.
-            let found = match crate::baseobjspace::finditem(table(), key) {
+            let found = match crate::baseobjspace::finditem(
+                table(),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+            ) {
                 Ok(found) => found,
                 Err(e)
                     if matches!(

@@ -1003,15 +1003,31 @@ fn encode_with_name(
     let errors = codec_errors_arg(fname, 2, errors)?;
     // PyPy `make_encoder_wrapper`: convert to unicode, call unicodehelper
     // encoder, return `(bytes, unicode_length)`.
-    let encode_method = crate::baseobjspace::getattr_str(w_obj, "encode")?;
     let _roots = pyre_object::gc_roots::push_roots();
-    let encode_method = pyre_object::gc_roots::pin_root(encode_method);
-    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
-    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
-    let encoded = crate::call::call_function_impl_result(encode_method, &[w_encoding, w_errors])?;
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let encode_method = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "encode",
+    )?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(encode_method);
+    let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let encoded = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
+            pyre_object::gc_roots::shadow_stack_get(err_slot),
+        ],
+    )?;
     Ok(rooted_tuple()
         .arg(encoded)
-        .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
+        .arg(w_int_new(unsafe {
+            pyre_object::w_str_len(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        } as i64))
         .finish())
 }
 
@@ -1033,10 +1049,19 @@ fn decode_with_name(
     let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&data));
     let decode_method =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "decode")?;
-    let decode_method = pyre_object::gc_roots::pin_root(decode_method);
-    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
-    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
-    let decoded = crate::call::call_function_impl_result(decode_method, &[w_encoding, w_errors])?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(decode_method);
+    let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let decoded = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
+            pyre_object::gc_roots::shadow_stack_get(err_slot),
+        ],
+    )?;
     Ok(rooted_tuple()
         .arg(decoded)
         .arg(w_int_new(consumed as i64))
