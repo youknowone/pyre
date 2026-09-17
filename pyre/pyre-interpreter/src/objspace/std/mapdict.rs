@@ -532,90 +532,15 @@ unsafe fn is_generated_user_layout_family(obj: PyObjectRef) -> bool {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-#[inline]
-unsafe fn is_ssl_mapdict_layout(obj: PyObjectRef) -> bool {
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    unsafe {
-        pyre_object::py_type_check(
-            obj,
-            &*<crate::module::_ssl::W_SSLContext as PyreClassPyTypeOf>::PYTYPE,
-        ) || pyre_object::py_type_check(
-            obj,
-            &*<crate::module::_ssl::W_MemoryBIO as PyreClassPyTypeOf>::PYTYPE,
-        )
-    }
-}
-
-#[cfg(not(all(not(target_arch = "wasm32"), not(feature = "sandbox"))))]
-#[inline]
-unsafe fn is_ssl_mapdict_layout(_obj: PyObjectRef) -> bool {
-    false
-}
-
-#[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-#[inline]
-unsafe fn is_mmap_mapdict_layout(obj: PyObjectRef) -> bool {
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    unsafe {
-        pyre_object::py_type_check(
-            obj,
-            &*<crate::module::mmap::W_MMap as PyreClassPyTypeOf>::PYTYPE,
-        )
-    }
-}
-
-#[cfg(not(all(any(unix, windows), not(feature = "sandbox"))))]
-#[inline]
-unsafe fn is_mmap_mapdict_layout(_obj: PyObjectRef) -> bool {
-    false
-}
-
-#[inline]
-unsafe fn is_zlib_mapdict_layout(obj: PyObjectRef) -> bool {
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    unsafe {
-        pyre_object::py_type_check(
-            obj,
-            &*<crate::module::zlib::W_Compress as PyreClassPyTypeOf>::PYTYPE,
-        ) || pyre_object::py_type_check(
-            obj,
-            &*<crate::module::zlib::W_Decompress as PyreClassPyTypeOf>::PYTYPE,
-        ) || pyre_object::py_type_check(
-            obj,
-            &*<crate::module::zlib::W_ZlibDecompressor as PyreClassPyTypeOf>::PYTYPE,
-        )
-    }
-}
-
-#[inline]
-unsafe fn is_lsprof_mapdict_layout(obj: PyObjectRef) -> bool {
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    unsafe {
-        pyre_object::py_type_check(
-            obj,
-            &*<crate::module::_lsprof::W_Profiler as PyreClassPyTypeOf>::PYTYPE,
-        )
-    }
-}
-
-#[inline]
-unsafe fn is_queue_mapdict_layout(obj: PyObjectRef) -> bool {
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    unsafe {
-        pyre_object::py_type_check(
-            obj,
-            &*<crate::module::_queue::W_SimpleQueue as PyreClassPyTypeOf>::PYTYPE,
-        )
-    }
-}
-
 /// Whether `obj`'s physical allocation carries the slots supplied by
-/// `MapdictStorageMixin` (`mapdict.py, 905-910`). Ordinary instances
-/// and `_random.Random` keep the historical prefix. The generated tuple/int/str
-/// user layouts append the mixin after their unchanged builtin base payload
-/// (`typedef.py:174-227`) whether or not the class routes attributes through a
-/// dict; a `__slots__`-only native subclass is the case that separates the two.
+/// `MapdictStorageMixin` (`mapdict.py` `import_from_mixin` /
+/// `typedef._getusercls`). The storage class (`ob_type` / typeptr)
+/// records that mixin; `mapdict.py` never names zlib / `_lsprof` /
+/// `_queue` / `_ssl`. Ordinary `W_ObjectObject` instances share
+/// `INSTANCE_TYPE`, which carries the same bit. The generated
+/// tuple/int/str user layouts append the mixin after the builtin
+/// payload (`typedef.py` `_getusercls`) and are identified by those
+/// user type ids.
 ///
 /// # Safety
 /// `obj` must be null or a live object reference.
@@ -627,14 +552,7 @@ pub unsafe fn has_mapdict_layout(obj: PyObjectRef) -> bool {
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         return false;
     }
-    if (unsafe { pyre_object::is_instance(obj) })
-        || unsafe { pyre_object::py_type_check(obj, &crate::module::_random::RANDOM_TYPE) }
-        || unsafe { is_ssl_mapdict_layout(obj) }
-        || unsafe { is_mmap_mapdict_layout(obj) }
-        || unsafe { is_zlib_mapdict_layout(obj) }
-        || unsafe { is_lsprof_mapdict_layout(obj) }
-        || unsafe { is_queue_mapdict_layout(obj) }
-    {
+    if unsafe { pyre_object::pytype_has_mapdict_mixin(obj) } {
         return true;
     }
     if !unsafe { is_generated_user_layout_family(obj) } {
@@ -7157,6 +7075,20 @@ mod tests {
             instance_walk_boxed_storage(obj_ref, &mut |slot| seen.push(*slot));
             assert!(seen.contains(&v1), "x value not walked by custom trace");
             assert!(seen.contains(&v2), "y value not walked by custom trace");
+        }
+    }
+
+    #[test]
+    fn storage_class_mapdict_mixin_bit_admits_layout() {
+        use pyre_object::lltype::PyreClassPyTypeOf;
+        assert!(pyre_object::INSTANCE_TYPE.has_mapdict_mixin);
+        assert!(crate::module::zlib::W_Compress::HAS_MAPDICT_MIXIN);
+        assert!(crate::module::_lsprof::W_Profiler::HAS_MAPDICT_MIXIN);
+        assert!(crate::module::_queue::W_SimpleQueue::HAS_MAPDICT_MIXIN);
+        assert!(!pyre_object::INT_TYPE.has_mapdict_mixin);
+        unsafe {
+            let obj = pyre_object::w_instance_new(pyre_object::PY_NULL);
+            assert!(has_mapdict_layout(obj));
         }
     }
 

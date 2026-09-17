@@ -50,6 +50,11 @@ pub struct PyType {
     /// this cached pointer to set `w_class` at allocation time.
     /// Null until `init_typeobjects()` runs.
     pub instantiate: AtomicPtr<PyObject>,
+    /// Instances of this storage class carry `MapdictStorageMixin`
+    /// (`mapdict.py` `import_from_mixin` / `typedef._getusercls`).
+    /// The bit lives on the typeptr, the RPython class, not on a
+    /// caller-side type whitelist.
+    pub has_mapdict_mixin: bool,
 }
 
 /// Common header for all Python objects.
@@ -119,11 +124,21 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 /// Construct a PyType with zeroed subclass ranges.
 /// Ranges are assigned at init time by `assign_subclass_range()`.
 pub const fn new_pytype(name: &'static str) -> PyType {
+    new_pytype_kind(name, false)
+}
+
+/// [`new_pytype`] for a storage class that imported `MapdictStorageMixin`.
+pub const fn new_pytype_with_mapdict_mixin(name: &'static str) -> PyType {
+    new_pytype_kind(name, true)
+}
+
+const fn new_pytype_kind(name: &'static str, has_mapdict_mixin: bool) -> PyType {
     PyType {
         subclassrange_min: AtomicI64::new(0),
         subclassrange_max: AtomicI64::new(0),
         name,
         instantiate: AtomicPtr::new(std::ptr::null_mut()),
+        has_mapdict_mixin,
     }
 }
 
@@ -151,6 +166,16 @@ pub fn set_instantiate(tp: &PyType, w_typeobject: PyObjectRef) {
 #[inline]
 pub fn get_instantiate(tp: &PyType) -> PyObjectRef {
     tp.instantiate.load(Ordering::Relaxed)
+}
+
+/// Whether `obj`'s storage class imported `MapdictStorageMixin`.
+///
+/// # Safety
+/// `obj` must be a live object with a valid `ob_type`.
+#[inline]
+pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
+    let tp = unsafe { (*obj).ob_type };
+    !tp.is_null() && unsafe { (*tp).has_mapdict_mixin }
 }
 
 /// True when `obj`'s Python class is exactly the builtin type for its
@@ -288,7 +313,7 @@ pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
 pub static MODULE_TYPE: PyType = new_pytype("module");
 pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
 pub static TYPE_TYPE: PyType = new_pytype("type");
-pub static INSTANCE_TYPE: PyType = new_pytype("object");
+pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin("object");
 
 /// Field offset of `ob_type` within PyObject, for JIT field access.
 pub const OB_TYPE_OFFSET: usize = std::mem::offset_of!(PyObject, ob_type);
