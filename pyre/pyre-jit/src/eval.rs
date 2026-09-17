@@ -860,20 +860,18 @@ unsafe fn mmap_destructor(obj_addr: usize) {
 }
 
 unsafe fn zlib_compress_destructor(obj_addr: usize) {
-    unsafe {
-        pyre_interpreter::module::zlib::w_compress_dealloc(obj_addr as pyre_object::PyObjectRef)
-    };
+    unsafe { pyre_module::module::zlib::w_compress_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
 
 unsafe fn zlib_decompress_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::zlib::w_decompress_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::zlib::w_decompress_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::zlib::w_zdecompress_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::zlib::w_zdecompress_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -907,15 +905,13 @@ unsafe fn lzma_decompressor_destructor(obj_addr: usize) {
 
 unsafe fn lsprof_profiler_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_lsprof::w_profiler_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_lsprof::w_profiler_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_queue::w_simplequeue_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_queue::w_simplequeue_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -1072,13 +1068,13 @@ unsafe fn zlib_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
 /// inline payload offsets.
 unsafe fn lsprof_profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    unsafe { pyre_interpreter::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
+    unsafe { pyre_module::module::_lsprof::w_profiler_custom_trace(obj_addr, f) };
 }
 
 /// `_queue.SimpleQueue` is subclassable and owns a FIFO of Python objects.
 unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    unsafe { pyre_interpreter::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
+    unsafe { pyre_module::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
 }
 
 /// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
@@ -4083,17 +4079,17 @@ fn build_gc() -> Box<MiniMarkGC> {
     // before target-gated DirEntry/SSL/mmap so their ids agree on wasm/native.
     for (descr, destructor) in [
         (
-            <pyre_interpreter::module::zlib::W_Compress
+            <pyre_module::module::zlib::W_Compress
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             zlib_compress_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::zlib::W_Decompress
+            <pyre_module::module::zlib::W_Decompress
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             zlib_decompress_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::zlib::W_ZlibDecompressor
+            <pyre_module::module::zlib::W_ZlibDecompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             zlib_zdecompress_destructor as majit_gc::trace::DestructorFn,
         ),
@@ -4168,7 +4164,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // two stats result objects hold their code and call-list references in
     // inline fields and are not instantiable, so they register like any other
     // rclass owner.
-    let profiler_descr = <pyre_interpreter::module::_lsprof::W_Profiler
+    let profiler_descr = <pyre_module::module::_lsprof::W_Profiler
         as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let profiler_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
@@ -4193,19 +4189,19 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_lsprof::W_StatsEntry
+        <pyre_module::module::_lsprof::W_StatsEntry
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_lsprof::W_StatsSubEntry
+        <pyre_module::module::_lsprof::W_StatsSubEntry
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
 
     // `_queue.SimpleQueue` is unconditional, so it registers ahead of the
     // target-gated `posix` rclasses below and keeps one id on every target.
-    let simplequeue_descr = <pyre_interpreter::module::_queue::W_SimpleQueue
+    let simplequeue_descr = <pyre_module::module::_queue::W_SimpleQueue
         as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
     let simplequeue_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(

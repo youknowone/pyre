@@ -5749,7 +5749,7 @@ pub(crate) fn check_new_subtype(
 /// `ValueError`'s does not match, where the wrapper's own criterion — the
 /// `tp_new` the most-derived static base carries — finds both answering
 /// `BaseException.__new__` and allows it.
-pub(crate) fn check_user_subclass(
+pub fn check_user_subclass(
     w_self: PyObjectRef,
     w_subtype: PyObjectRef,
 ) -> Result<(), crate::PyError> {

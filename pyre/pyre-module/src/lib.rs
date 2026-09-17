@@ -38,6 +38,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_codecs_tw", module::_codecs_tw::init);
     pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
     pyre_interpreter::importing::register_builtin_module("_json", module::_json::init);
+    pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
     pyre_interpreter::importing::register_builtin_module(
         "_immutables_map",
         module::_immutables_map::init,
@@ -61,6 +62,7 @@ pub fn install_optional_modules() {
         "_posixsubprocess",
         module::_posixsubprocess::init,
     );
+    pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
     pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
     pyre_interpreter::importing::register_builtin_module(
         "_suggestions",
@@ -93,6 +95,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
+    pyre_interpreter::importing::register_builtin_module("zlib", module::zlib::init);
 }
 
 /// Install [`install_optional_modules`] as the interpreter's optional-module hook.
@@ -327,6 +330,18 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         subclass_range_alias(163, typed::<module::_json::W_Encoder>()),
         subclass_range_alias(172, typed::<module::_bz2::W_BZ2Compressor>()),
         subclass_range_alias(173, typed::<module::_bz2::W_BZ2Decompressor>()),
+        // PyPy zlib stream wrappers own their native stream and lock directly.
+        // Keep these unconditional entries ahead of target-gated native types.
+        subclass_range_alias(169, typed::<module::zlib::W_Compress>()),
+        subclass_range_alias(170, typed::<module::zlib::W_Decompress>()),
+        subclass_range_alias(171, typed::<module::zlib::W_ZlibDecompressor>()),
+        // `_lsprof`'s profiler and stats result owners are unconditional.
+        subclass_range_alias(176, typed::<module::_lsprof::W_Profiler>()),
+        subclass_range_alias(177, typed::<module::_lsprof::W_StatsEntry>()),
+        subclass_range_alias(178, typed::<module::_lsprof::W_StatsSubEntry>()),
+        // `_queue.SimpleQueue` is unconditional and carries a native FIFO, so
+        // it closes the ungated aliases ahead of the target-gated ones.
+        subclass_range_alias(179, typed::<module::_queue::W_SimpleQueue>()),
     ];
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(
@@ -372,6 +387,18 @@ mod tests {
                 "pyre_module::module::_bz2::compressor_methods::__majit_wrap___new__"
             ),
             "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_lsprof_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_lsprof::profiler_methods::__majit_wrap___new__"
+            ),
+            "moved _lsprof #[pyre_methods] wrappers must publish residual fnaddrs",
         );
     }
 

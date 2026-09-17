@@ -27,6 +27,8 @@ pub mod _immutables_map;
 #[allow(non_snake_case)]
 pub mod _json;
 #[allow(non_snake_case)]
+pub mod _lsprof;
+#[allow(non_snake_case)]
 pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]
@@ -42,6 +44,8 @@ pub mod _posixshmem;
 #[allow(non_snake_case)]
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixsubprocess;
+#[allow(non_snake_case)]
+pub mod _queue;
 #[allow(non_snake_case)]
 #[cfg(target_os = "macos")]
 pub mod _scproxy;
@@ -74,3 +78,4 @@ pub mod resource;
 pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod termios;
+pub mod zlib;

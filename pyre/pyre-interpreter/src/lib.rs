@@ -1212,22 +1212,11 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(167, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
         subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
-        // PyPy zlib stream wrappers own their native stream and lock directly.
-        // Keep these unconditional entries ahead of target-gated native types.
-        subclass_range_alias(169, typed::<crate::module::zlib::W_Compress>()),
-        subclass_range_alias(170, typed::<crate::module::zlib::W_Decompress>()),
-        subclass_range_alias(171, typed::<crate::module::zlib::W_ZlibDecompressor>()),
-        // `_lzma`'s two stream objects own their liblzma coder, unconditional
-        // for the same reason.
+        // zlib / `_lsprof` / `_queue` aliases live on the optional-module
+        // hook (ids 169-171, 176-179). `_lzma`'s two stream objects own
+        // their liblzma coder, unconditional for the same reason.
         subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
         subclass_range_alias(175, typed::<crate::module::_lzma::W_LZMADecompressor>()),
-        // `_lsprof`'s profiler and stats result owners are unconditional.
-        subclass_range_alias(176, typed::<crate::module::_lsprof::W_Profiler>()),
-        subclass_range_alias(177, typed::<crate::module::_lsprof::W_StatsEntry>()),
-        subclass_range_alias(178, typed::<crate::module::_lsprof::W_StatsSubEntry>()),
-        // `_queue.SimpleQueue` is unconditional and carries a native FIFO, so
-        // it closes the ungated aliases ahead of the target-gated ones.
-        subclass_range_alias(179, typed::<crate::module::_queue::W_SimpleQueue>()),
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they close the ungated block ahead of the
