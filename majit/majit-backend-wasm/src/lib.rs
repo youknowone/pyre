@@ -1172,14 +1172,20 @@ pub(crate) mod gc_box {
         if !majit_gc::gc_box_installed() {
             return None;
         }
-        WASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
-            // SAFETY: `guard` holds the borrow for the whole `f` call and
-            // these are non-reentrant top-level trampolines, so the reborrow
-            // is exclusive and outlives `f`.
-            Some(f(unsafe { &mut *raw }))
-        })
+        // `try_with`: `WasmFrameData::drop` and hook trampolines can run
+        // while this thread's locals are already being destroyed. cranelift
+        // `gc_box::clear` / `CA_DISPATCH_TABLE` use the same seam.
+        WASM_ACTIVE_GC
+            .try_with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
+                // SAFETY: `guard` holds the borrow for the whole `f` call and
+                // these are non-reentrant top-level trampolines, so the reborrow
+                // is exclusive and outlives `f`.
+                Some(f(unsafe { &mut *raw }))
+            })
+            .ok()
+            .flatten()
     }
 
     /// Read-only access that tolerates being reached from inside a collection:
@@ -1189,18 +1195,27 @@ pub(crate) mod gc_box {
         if !majit_gc::gc_box_installed() {
             return None;
         }
-        WASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+        match WASM_ACTIVE_GC.try_with(|cell| match cell.try_borrow() {
             Ok(guard) => guard.0.as_deref().map(f),
             // SAFETY: the mirror is published and cleared under the same
             // borrow as the box itself, so a non-null value points at the
             // live allocator, and this query only reads it.
-            Err(_) => WASM_ACTIVE_GC_RAW.with(|raw| raw.get().map(|p| f(unsafe { &*p }))),
-        })
+            Err(_) => WASM_ACTIVE_GC_RAW
+                .try_with(|raw| raw.get().map(|p| f(unsafe { &*p })))
+                .ok()
+                .flatten(),
+        }) {
+            Ok(r) => r,
+            Err(_) => None,
+        }
     }
 
     /// Whether this thread holds a box at all.
     pub(super) fn present() -> bool {
-        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().0.is_some())
+        majit_gc::gc_box_installed()
+            && WASM_ACTIVE_GC
+                .try_with(|cell| cell.borrow().0.is_some())
+                .unwrap_or(false)
     }
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
@@ -1245,6 +1260,18 @@ pub(crate) mod gc_box {
         if live == generation && generation != 0 {
             clear();
         }
+    }
+
+    /// Drop this thread's box and clear the raw mirror.
+    ///
+    /// The box goes first so reentrant ownership queries issued from its drop
+    /// body still resolve old-heap addresses through the mirror. `try_with`
+    /// because this is also the process-exit path.
+    pub(super) fn clear() {
+        let _ = WASM_ACTIVE_GC.try_with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        let _ = WASM_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
     }
 }
 
@@ -1378,6 +1405,19 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     let generation = gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
     ActiveGcBox { generation }
+}
+
+/// Drop the active wasm GC box. Callers must go through this helper rather
+/// than reaching the thread-local directly, otherwise the raw mirror used by
+/// `wasm_gc_owns_object`'s reentrant fallback would be left pointing at
+/// freed memory. Matches dynasm/cranelift `clear_gc_allocator`.
+///
+/// Root hooks are withdrawn too: a later `WasmFrameData` drop with a
+/// leftover MiniMark would otherwise treat a test `GcRef` token as a heap
+/// pointer. `install_gc_box` reinstalls the hooks.
+pub fn clear_gc_allocator() {
+    gc_box::clear();
+    majit_gc::set_active_root_hooks(None, None);
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
@@ -7297,6 +7337,7 @@ mod tests {
 
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
+        let _gc = ActiveGcGuard;
 
         let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
         assert_eq!(resolved, Some(int_tid));
@@ -7321,6 +7362,7 @@ mod tests {
         unsafe { *(root.0 as *mut u64) = 0xA11C_E701 };
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
+        let _gc = ActiveGcGuard;
 
         let constant = majit_ir::Op::new(
             majit_ir::OpCode::SameAsR,

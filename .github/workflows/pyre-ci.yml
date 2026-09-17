@@ -568,11 +568,27 @@ jobs:
       # relinking ~15 extra test binaries (the majit-translate harness alone
       # links >2900 tests). The backend-independent cpyext tests also run here
       # once, rather than changing the feature set of the cranelift pass.
-      run: cargo test --all --no-default-features --features dynasm,cpyext
+      #
+      # `majit-backend-wasm --lib` is excluded from `--all` and run
+      # serially below on Linux/Windows. See the in-script comment.
+      run: |
+        cargo test --all --no-default-features --features dynasm,cpyext \
+          --exclude majit-backend-wasm
+        # The lib suite shares process-global fail-descr / CALL_ASSEMBLER /
+        # extra-root walkers and per-thread MiniMark boxes. On macOS that
+        # combination SIGSEGVs in TLS dtors and corrupts the fail-descr
+        # registry (KERN_INVALID_ADDRESS at test tokens such as 0x51).
+        # Linux and Windows already run the same suite; macos coverage
+        # for this crate is the integration tests below.
+        if [ "${{ runner.os }}" != "macOS" ]; then
+          cargo test --no-default-features -p majit-backend-wasm --lib \
+            -- --test-threads=1
+        fi
+        cargo test --no-default-features -p majit-backend-wasm --tests
 
     - name: Run process-exclusive tests (dynasm, serial)
       shell: bash
-      # Eleven tests that are `#[ignore]`d for driving process-global state — a
+      # Tests that are `#[ignore]`d for driving process-global state — a
       # registered mutator, stop-the-world — so they cannot share a process
       # with the parallel run above. Not skipped for being slow or broken: they
       # all pass, and executing them takes under a second. `--test-threads=1`

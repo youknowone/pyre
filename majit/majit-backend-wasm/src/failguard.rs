@@ -470,6 +470,10 @@ mod tests {
         let _serialized = super::lock_cpu();
         use majit_backend::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
 
+        // A leftover MiniMark box would treat `GcRef(0x51)` as a heap
+        // pointer and rewrite `jf_savedata` when the snapshot's root is
+        // dropped.
+        crate::clear_gc_allocator();
         let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
         frame.attach_origin_jf(jf);
