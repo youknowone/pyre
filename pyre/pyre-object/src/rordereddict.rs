@@ -180,15 +180,15 @@ impl<'a, K, V> LiveIterMut<'a, K, V> {
         }
     }
 
-    fn entry_at(&mut self, i: usize) -> Option<(&'a mut K, &'a mut V)> {
+    fn entry_at(&mut self, i: usize) -> Option<(&'a K, &'a mut V)> {
         debug_assert!(i < self.len);
         let e = unsafe { &mut *self.entries.add(i) };
-        e.as_mut().map(|e| (&mut e.key, &mut e.value))
+        e.as_mut().map(|e| (&e.key, &mut e.value))
     }
 }
 
 impl<'a, K, V> Iterator for LiveIterMut<'a, K, V> {
-    type Item = (&'a mut K, &'a mut V);
+    type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<Self::Item> {
         while self.front < self.back {
             let i = self.front;

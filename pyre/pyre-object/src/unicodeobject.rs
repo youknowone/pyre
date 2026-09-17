@@ -1371,7 +1371,6 @@ pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
 }
 
 #[majit_macros::elidable]
-#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
 pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
     let a = a as PyObjectRef;
     let b = b as PyObjectRef;

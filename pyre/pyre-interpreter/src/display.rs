@@ -304,7 +304,7 @@ pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
 }
 
 fn repr_active() -> Option<&'static std::cell::RefCell<Vec<PyObjectRef>>> {
-    let ec = crate::call::getexecutioncontext();
+    let ec = crate::call::ensure_executioncontext();
     if ec.is_null() {
         return None;
     }
@@ -317,10 +317,7 @@ fn repr_active() -> Option<&'static std::cell::RefCell<Vec<PyObjectRef>>> {
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
     let Some(active) = repr_active() else {
-        // No set to record in. This is a first enter, not a recursive
-        // one: PyPy's `get_objects_in_repr` creates the EC on demand
-        // and never treats a missing EC as "already in repr".
-        return true;
+        return false;
     };
     let mut active = active.borrow_mut();
     if active.contains(&obj) {

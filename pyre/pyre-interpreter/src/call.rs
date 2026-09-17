@@ -695,6 +695,30 @@ pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
     take_last_exec_ctx()
 }
 
+/// `baseobjspace.py getexecutioncontext` untranslated path: if the
+/// threadlocals slot is empty, `enter_thread` / `createexecutioncontext`
+/// installs one. Used by `repr_enter` so a missing EC is not treated
+/// as "already in repr" and is not a silent first-enter without a set.
+pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
+    let existing = take_last_exec_ctx();
+    if !existing.is_null() {
+        return existing;
+    }
+    thread_local! {
+        static FALLBACK_EC: std::cell::RefCell<Option<std::rc::Rc<crate::PyExecutionContext>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    FALLBACK_EC.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(std::rc::Rc::new(crate::PyExecutionContext::default()));
+        }
+        let ptr = std::rc::Rc::as_ptr(guard.as_ref().unwrap());
+        set_last_exec_ctx(ptr);
+        ptr
+    })
+}
+
 /// Guard that temporarily forces all nested calls to use the plain
 /// interpreter, bypassing eval_with_jit. Used by force_fn to avoid
 /// re-entering compiled code from blackhole execution.

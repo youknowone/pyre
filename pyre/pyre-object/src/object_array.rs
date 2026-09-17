@@ -11,9 +11,11 @@ pub(crate) fn length_cell(n: usize) -> AtomicUsize {
     AtomicUsize::new(n)
 }
 
-/// `rstr.py` `AbstractStringRepr.ll_strcmp`.
+/// `rstr.py` `AbstractStringRepr.ll_strcmp` body. No `stroruni.cmp`
+/// oopspec: that hint belongs on a function whose first argument is
+/// `Ptr(STR)` / `Ptr(UNICODE)`. A byte-slice helper is `Other` and
+/// `_handle_stroruni_call` panics.
 #[majit_macros::elidable]
-#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
 pub(crate) fn ll_chars_strcmp(left: &[u8], right: &[u8]) -> isize {
     let cmplen = left.len().min(right.len());
     let left_p = left.as_ptr();

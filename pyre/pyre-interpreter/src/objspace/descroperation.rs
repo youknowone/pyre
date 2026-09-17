@@ -2574,9 +2574,9 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
 
 /// `rstr.py` `AbstractStringRepr.ll_strcmp`. Bytewise prefix, then
 /// length. Indexing is `ll_getitem_nonneg` (`as_ptr().add`), not
-/// `slice::cmp` / `Vec::index`.
+/// `slice::cmp` / `Vec::index`. No `stroruni.cmp` oopspec: the first
+/// argument is a byte slice, not `Ptr(STR)` / `Ptr(UNICODE)`.
 #[majit_macros::elidable]
-#[majit_macros::oopspec("stroruni.cmp(s1, s2)")]
 fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
     let cmplen = left.len().min(right.len());
     let left_p = left.as_ptr();
