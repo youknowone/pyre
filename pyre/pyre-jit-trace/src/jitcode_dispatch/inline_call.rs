@@ -12121,6 +12121,25 @@ pub(super) fn user_binop_forward_dunder(
 /// priority is preserved; a traced `NotImplemented` result guards and deopts
 /// to the generic dispatcher.
 #[allow(clippy::too_many_arguments)]
+/// True when every operand is a heap-type instance.  Builtin str/tuple/list
+/// are not heaptypes; only a Python dunder can commit then return
+/// NotImplemented.
+fn both_operands_are_heaptype<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    args: &[OpRef],
+) -> bool {
+    args.iter().all(|&opref| {
+        walker_concrete_ref_object(ctx, opref).is_some_and(|obj| unsafe {
+            if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj)
+            {
+                return false;
+            }
+            let w_class = (*obj).w_class;
+            !w_class.is_null() && pyre_object::typeobject::w_type_is_heaptype(w_class)
+        })
+    })
+}
+
 pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -14537,14 +14556,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         {
             return Ok(inlined);
         }
-        // Same commit-then-NotImplemented abort as `binary_value_from_tag`:
-        // residualizing the named helper re-executes a committing dunder.
-        let both_user = args.iter().all(|&opref| {
-            walker_concrete_ref_object(ctx, opref).is_some_and(|obj| unsafe {
-                !pyre_object::is_int(obj) && !pyre_object::is_float(obj)
-            })
-        });
-        if both_user {
+        // Same commit-then-NotImplemented abort as `binary_value_from_tag`.
+        if both_operands_are_heaptype(ctx, &args) {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
     }
@@ -15390,15 +15403,8 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         // re-executes the committing dunder at record time (`n` becomes N+1).
         // Abort so the interpreter finishes the iteration once, matching the
         // rewind refusal `try_walker_inline_user_binop` already took.
-        if is_binary_from_tag {
-            let both_user = ref_args.iter().all(|&opref| {
-                walker_concrete_ref_object(ctx, opref).is_some_and(|obj| unsafe {
-                    !pyre_object::is_int(obj) && !pyre_object::is_float(obj)
-                })
-            });
-            if both_user {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            }
+        if is_binary_from_tag && both_operands_are_heaptype(ctx, &ref_args) {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
     }
 

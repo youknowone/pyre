@@ -3339,7 +3339,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let is_standard_frame = ctx.trace_ctx.standard_virtualizable_box() == Some(obj)
         && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize);
 
+    // Fold the walk's own frame (portal red or inlined callee, including
+    // `sys._getframe(0)` of that callee).  A traceback node's `tb_frame`
+    // is the same concrete portal under a GETFIELD box — residualize so
+    // the proxy reads the heap after `except` binds `e`.
+    let is_owned_inline_concrete = inline_frame != 0 && concrete_obj as usize == inline_frame;
     if name == "f_locals"
+        && (is_inline_frame || is_standard_frame || is_owned_inline_concrete)
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && unsafe {
             (*(concrete_obj as *const pyre_interpreter::PyFrame))
