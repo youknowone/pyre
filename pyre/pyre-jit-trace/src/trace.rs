@@ -7225,7 +7225,7 @@ mod tests {
     #[test]
     fn nested_exception_roots_keep_outer_carriers_and_children() {
         use majit_ir::OpRef;
-        use pyre_object::interp_exceptions::{ExcKind, W_BaseException, w_exception_new_empty};
+        use pyre_object::interp_exceptions::{ExcKind, W_ExceptionExtended, w_exception_new_empty};
         pyre_interpreter::typedef::init_typeobjects();
         let _pins = pyre_object::gc_roots::push_roots();
         let outer_exc =
@@ -7244,7 +7244,7 @@ mod tests {
         outer.last_exc_value.set(outer_exc);
         inner.last_exc_value.set(inner_exc);
         unsafe {
-            (*(outer_exc as *mut W_BaseException)).w_object = child;
+            (*(outer_exc as *mut W_ExceptionExtended)).w_object = child;
         }
         let outer_roots = super::TraceRoots::enter(&outer);
         let inner_roots = super::TraceRoots::enter(&inner);
@@ -7259,7 +7259,7 @@ mod tests {
         assert!(seen.contains(&(inner_exc as usize)));
         assert!(seen.contains(&(child as usize)));
         assert_eq!(
-            unsafe { (*(outer_exc as *const W_BaseException)).w_object },
+            unsafe { (*(outer_exc as *const W_ExceptionExtended)).w_object },
             replacement
         );
         drop(inner_roots);

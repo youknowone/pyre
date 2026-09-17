@@ -517,10 +517,12 @@ pub unsafe fn walk_raw_code_roots(
 /// `w_traceback` / `w_context` / `w_cause`, `w_dict`, … are ordinary GC-managed
 /// objects, so when an exception is the only holder of those children (a caught
 /// `except X as e` bound to a frame local) a collection sweeps them and a
-/// later `e.args` / `e.errno` reads freed memory. Visit every
-/// `W_BASE_EXCEPTION_GC_PTR_OFFSETS` slot in place, the same shape
-/// `walk_raw_function_roots` / `walk_raw_getset_roots` use for Box/`malloc_typed`
-/// -held children. No-op for non-exception values.
+/// later `e.args` / `e.errno` reads freed memory. Visit every GC pointer
+/// slot of the instance layout in place — slim
+/// `W_BASE_EXCEPTION_GC_PTR_OFFSETS`, or
+/// `W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS` for extra-field kinds —
+/// the same shape `walk_raw_function_roots` / `walk_raw_getset_roots`
+/// use for Box/`malloc_typed`-held children. No-op for non-exception values.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -535,7 +537,14 @@ pub unsafe fn walk_raw_exception_roots(
         // Positive predicate (see `walk_raw_getset_roots`): `!is_exception`
         // over a cross-crate bool is `UnaryNotUnknownOperand` to the annotator.
         if pyre_object::interp_exceptions::is_exception(value) {
-            for &offset in pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS.iter() {
+            let kind = pyre_object::interp_exceptions::w_exception_get_kind(value);
+            let offsets: &[usize] =
+                if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
+                    &pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
+                } else {
+                    &pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS
+                };
+            for &offset in offsets {
                 let slot = (value as usize + offset) as *mut PyObjectRef;
                 visitor(&mut *(slot as *mut majit_ir::GcRef));
             }

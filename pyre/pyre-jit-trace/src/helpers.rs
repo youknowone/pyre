@@ -1221,7 +1221,8 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// Emit inline rlist.py LIST creation for exception `args_w`.
 ///
 /// Two mallocs (`ll_newlist`): the LIST header and the `GcArray(OBJECTPTR)`
-/// items block.  Empty lists keep `items` null.
+/// items block. `ll_newlist` always mallocs the items array, including
+/// `length == 0`.
 pub fn emit_rlist_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     let list = ctx.record_op_with_descr(OpCode::New, &[], crate::descr::rlist_size_descr());
     ctx.heap_cache_mut().new_object(list);
@@ -1229,24 +1230,22 @@ pub fn emit_rlist_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     let length_descr = crate::descr::rlist_length_descr();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], length_descr.clone());
     ctx.heapcache_setfield_cached(list, length_descr.index(), len_ref);
-    if !items.is_empty() {
-        let cap_ref = ctx.const_int(items.len() as i64);
-        let array_descr = crate::state::pyobject_gcarray_descr();
-        let items_block =
-            ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr.clone());
-        ctx.heap_cache_mut().new_array(items_block, cap_ref, true);
-        for (i, &item) in items.iter().enumerate() {
-            let idx = ctx.const_int(i as i64);
-            crate::state::trace_items_block_setitem_value(ctx, items_block, idx, item);
-        }
-        let items_descr = crate::descr::rlist_items_descr();
-        ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[list, items_block],
-            items_descr.clone(),
-        );
-        ctx.heapcache_setfield_cached(list, items_descr.index(), items_block);
+    let cap_ref = ctx.const_int(items.len() as i64);
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let items_block =
+        ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr.clone());
+    ctx.heap_cache_mut().new_array(items_block, cap_ref, true);
+    for (i, &item) in items.iter().enumerate() {
+        let idx = ctx.const_int(i as i64);
+        crate::state::trace_items_block_setitem_value(ctx, items_block, idx, item);
     }
+    let items_descr = crate::descr::rlist_items_descr();
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[list, items_block],
+        items_descr.clone(),
+    );
+    ctx.heapcache_setfield_cached(list, items_descr.index(), items_block);
     list
 }
 

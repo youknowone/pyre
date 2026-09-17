@@ -251,7 +251,7 @@ impl ExcKind {
 }
 
 /// Layout: `[ob_header | kind: ExcKind | args_w | w_cause | w_context |
-/// w_traceback | suppress_context | w_dict]`.
+/// w_traceback | suppress_context | w_dict | w_weakreflifeline]`.
 ///
 /// Matches `interp_exceptions.py W_BaseException` and every
 /// `_new_exception` class that adds no instance fields (`W_ValueError`,
@@ -267,8 +267,8 @@ impl ExcKind {
 ///
 /// PyPy keeps `args_w` as an RPython list and rebuilds the tuple on
 /// every read (`descr_getargs: return space.newtuple(self.args_w)`).
-/// Pyre matches that shape — the slot points at a `W_ListObject`
-/// (RPython list ↔ pyre `W_ListObject` parity); `w_exception_get_args`
+/// Pyre matches that shape — the slot points at an [`RList`]
+/// (`rlist.py` LIST); `w_exception_get_args`
 /// builds a fresh `W_TupleObject` from the list on every call, and
 /// `w_exception_set_args` coerces the incoming iterable via `fixedview`
 /// semantics into a brand-new list (`self.args_w = space.fixedview(w_newargs)`).
@@ -304,6 +304,12 @@ pub struct W_BaseException {
     /// Extra attributes (`e.note = ...`, PEP 678 `__notes__`) live
     /// here.
     pub w_dict: PyObjectRef,
+    /// Per-object weakref lifeline. Builtin exception classes are
+    /// weakrefable (`weakref.ref(ValueError(1))`), as are user
+    /// subclasses and `new_exception_class` module exceptions. The
+    /// slot lives on this slim prefix so a fieldless instance can
+    /// hold it without the extended layout.
+    pub w_weakreflifeline: PyObjectRef,
 }
 
 /// Extra-field subclasses of `W_BaseException`.
@@ -437,11 +443,6 @@ pub struct W_ExceptionExtended {
     /// reproduces the constructor-time spelling, which a later mutation of
     /// `args` must not change; `PY_NULL` selects the derive-from-args path.
     pub w_group_exceptions_repr: PyObjectRef,
-    /// Per-object weakref lifeline.  PyPy's app-level
-    /// `W_ExceptionGroup(W_BaseExceptionGroup, W_Exception)` acquires the
-    /// ordinary heap-type weakref slot even though `W_BaseExceptionGroup`
-    /// itself is not weakrefable.
-    pub w_weakreflifeline: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);
@@ -494,8 +495,7 @@ pub const EXC_W_GROUP_EXCEPTIONS_OFFSET: usize =
     std::mem::offset_of!(W_ExceptionExtended, w_group_exceptions);
 pub const EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET: usize =
     std::mem::offset_of!(W_ExceptionExtended, w_group_exceptions_repr);
-pub const EXC_W_WEAKREF_OFFSET: usize =
-    std::mem::offset_of!(W_ExceptionExtended, w_weakreflifeline);
+pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_weakreflifeline);
 
 /// The pointer slots a traced construction emit must reproduce itself.
 ///
@@ -562,12 +562,13 @@ pub unsafe fn w_exception_traced_construction_slots(obj: PyObjectRef) -> Vec<(us
 
 /// GC pointer slots on the slim [`W_BaseException`] layout
 /// (`interp_exceptions.py W_BaseException` class defaults).
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 5] = [
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 6] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
     EXC_W_TRACEBACK_OFFSET,
     EXC_W_DICT_OFFSET,
+    EXC_W_WEAKREF_OFFSET,
 ];
 
 /// GC pointer slots on [`W_ExceptionExtended`] — the slim base plus every
@@ -843,6 +844,7 @@ fn w_exception_base_defaults(kind: ExcKind) -> W_BaseException {
         w_traceback: PY_NULL,
         suppress_context: false,
         w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
     }
 }
 
@@ -881,7 +883,6 @@ fn w_exception_new_empty_extended_impl(kind: ExcKind, immortal: bool) -> PyObjec
         w_group_message: PY_NULL,
         w_group_exceptions: PY_NULL,
         w_group_exceptions_repr: PY_NULL,
-        w_weakreflifeline: PY_NULL,
     };
     if !immortal {
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(
@@ -1002,7 +1003,8 @@ pub fn w_exception_args_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 }
 
 /// rlist.py `ll_newlist` — allocate a LIST and copy `items` into its
-/// `GcArray(OBJECTPTR)` body.
+/// `GcArray(OBJECTPTR)` body. `ll_newlist` always mallocs the items
+/// array, including `length == 0`.
 #[majit_macros::dont_look_inside]
 pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
@@ -1014,11 +1016,9 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let rooted: Vec<PyObjectRef> = (0..n)
         .map(|i| crate::gc_roots::shadow_stack_get(items_base + i))
         .collect();
-    let block = if n == 0 {
-        std::ptr::null_mut()
-    } else {
-        unsafe { crate::object_array::alloc_list_items_block_gc(&rooted) }
-    };
+    // Exact-size `malloc(LIST.items.TO, length)`, including 0.
+    // `alloc_list_items_block_gc` would clamp empty to `cap.max(1)`.
+    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(&rooted) };
     let value = RList {
         length: n as i64,
         items: block,
@@ -1228,15 +1228,15 @@ pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     }
 }
 
-/// Read the per-exception weakref lifeline.  Only `ExceptionGroup`'s type
-/// advertises this storage; keeping it on the flattened exception payload
-/// matches the object-owned lifeline used by PyPy heap instances.
+/// Read the per-exception weakref lifeline. Builtin exceptions and
+/// their subclasses keep this slot on the slim [`W_BaseException`]
+/// prefix so a fieldless instance can be weakrefable.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_getweakref(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_ExceptionExtended)).w_weakreflifeline }
+    unsafe { (*(obj as *const W_BaseException)).w_weakreflifeline }
 }
 
 /// Store the per-exception weakref lifeline and remember an old-to-young edge.
@@ -1246,7 +1246,7 @@ pub unsafe fn w_exception_getweakref(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_ExceptionExtended)).w_weakreflifeline = lifeline;
+        (*(obj as *mut W_BaseException)).w_weakreflifeline = lifeline;
         exception_write_barrier(obj);
     }
 }
@@ -2610,6 +2610,11 @@ mod tests {
             unsafe { crate::intobject::w_int_get_value(rlist_getitem(list, 1)) },
             8
         );
-        assert_eq!(unsafe { rlist_len(rlist_new(Vec::new())) }, 0);
+        let empty = rlist_new(Vec::new());
+        assert_eq!(unsafe { rlist_len(empty) }, 0);
+        assert!(
+            !unsafe { (*(empty as *const RList)).items }.is_null(),
+            "ll_newlist mallocs a 0-length items array"
+        );
     }
 }

@@ -25000,6 +25000,15 @@ pub(crate) fn try_walker_specialize_compare_op_tuple<Sym: WalkSym>(
     if !lhs_is_tuple || !rhs_is_tuple {
         return Ok(None);
     }
+    // `is_exact_type(..., TUPLE_TYPE)` is true for SPECIALISED_TUPLE_II/OO
+    // (distinct ob_type, canonical tuple w_class). This lowering reads
+    // `W_TupleObject.wrappeditems` after GuardClass TUPLE_TYPE, so a
+    // specialised pair would side-exit. Stay residual for those.
+    if unsafe { pyre_object::specialisedtupleobject::is_specialised_tuple(lhs) }
+        || unsafe { pyre_object::specialisedtupleobject::is_specialised_tuple(rhs) }
+    {
+        return Ok(None);
+    }
     let lhs_len = unsafe { pyre_object::w_tuple_len(lhs) };
     let rhs_len = unsafe { pyre_object::w_tuple_len(rhs) };
     if lhs_len > UNROLL_CUTOFF && rhs_len > UNROLL_CUTOFF {
