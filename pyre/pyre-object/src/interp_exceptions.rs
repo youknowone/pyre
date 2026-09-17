@@ -1019,14 +1019,30 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     // Exact-size `malloc(LIST.items.TO, length)`, including 0.
     // `alloc_list_items_block_gc` would clamp empty to `cap.max(1)`.
     let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(&rooted) };
-    let value = RList {
-        length: n as i64,
-        items: block,
+    // `alloc_tuple_items_block_gc` roots the block only inside its own
+    // frame, which it pops on return. The header malloc below is a
+    // safepoint, so pin the block here and reload it after — the same
+    // shape `w_tuple_new_array_backed` uses across its struct alloc.
+    let block_slot = if block.is_null() {
+        None
+    } else {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+        Some(slot)
+    };
+    let reload_block = || -> *mut crate::object_array::ItemsBlock {
+        block_slot
+            .map(crate::gc_roots::shadow_stack_get)
+            .unwrap_or(std::ptr::null_mut()) as *mut crate::object_array::ItemsBlock
     };
     let tid = rlist_gc_type_id();
     if tid != 0 {
         let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, RLIST_SIZE);
         if !raw.is_null() {
+            let value = RList {
+                length: n as i64,
+                items: reload_block(),
+            };
             unsafe {
                 std::ptr::write(raw as *mut RList, value);
             }
@@ -1034,6 +1050,10 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
             return raw as PyObjectRef;
         }
     }
+    let value = RList {
+        length: n as i64,
+        items: reload_block(),
+    };
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
 
