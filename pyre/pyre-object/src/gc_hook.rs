@@ -728,6 +728,13 @@ pub fn try_gc_live_object_address(addr: *mut u8) -> *mut u8 {
         if tid_and_flags == NURSERY_POISON_WORD || unsafe { (*hdr).is_forwarded() } {
             return std::ptr::null_mut();
         }
+        // After a nursery-debug reuse an evacuated address can land
+        // sixteen bytes inside a new object. That interior's "header"
+        // is a payload word, so `type_id` is the low half of a pointer
+        // (`>= types.len()`), not a registered tid.
+        if !majit_gc::gc_type_id_is_registered(unsafe { (*hdr).type_id() }) {
+            return std::ptr::null_mut();
+        }
     }
     live
 }

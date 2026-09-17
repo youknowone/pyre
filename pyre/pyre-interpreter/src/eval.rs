@@ -499,6 +499,28 @@ pub unsafe fn walk_enrolled_code_roots(
 
 const WALK_RAW_CODE_NEST_LIMIT: u32 = 64;
 
+/// Visit `slot` only when it names a live object start. Nursery-debug
+/// rotation can leave an unforwarded const whose address now sits inside
+/// a new object; `is_in_nursery` is true and `copy_nursery_object` then
+/// panics on the payload word's `type_id`. Returns whether the slot is
+/// still a live object the caller may load as a `PyCode`.
+fn visit_live_object_slot(
+    slot: &mut PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) -> bool {
+    if majit_gc::gc_is_nursery_object(*slot as usize) {
+        let live = pyre_object::gc_hook::try_gc_live_object_address(*slot as *mut u8);
+        if live.is_null() {
+            return false;
+        }
+        if live as PyObjectRef != *slot {
+            *slot = live as PyObjectRef;
+        }
+    }
+    visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+    true
+}
+
 unsafe fn walk_raw_code_roots_inner(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -530,7 +552,13 @@ unsafe fn walk_raw_code_roots_inner(
                 if slot.is_null() {
                     continue;
                 }
-                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+                // A recycled nursery word is not an object start.
+                // `drag_out_root` treats `is_in_nursery` as a range
+                // check (`incminimark.py _trace_drag_out`); handing it
+                // an interior panics with `invalid type_id`.
+                if !visit_live_object_slot(slot, visitor) {
+                    continue;
+                }
                 let child = *slot;
                 // PyPy's `PyCode` is a young `W_Root`; the mark worklist
                 // copies then scans a nested code reached through

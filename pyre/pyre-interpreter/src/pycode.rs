@@ -1002,6 +1002,15 @@ fn walk_co_consts_arrays(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             if item.is_null() {
                 continue;
             }
+            if majit_gc::gc_is_nursery_object(*item as usize) {
+                let live = pyre_object::gc_hook::try_gc_live_object_address(*item as *mut u8);
+                if live.is_null() {
+                    continue;
+                }
+                if live as PyObjectRef != *item {
+                    *item = live as PyObjectRef;
+                }
+            }
             visitor(unsafe { &mut *(item as *mut PyObjectRef as *mut majit_ir::GcRef) });
         }
     }
