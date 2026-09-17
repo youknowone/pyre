@@ -11,7 +11,8 @@
 use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
     dealloc_list_items_block, gc_int_array_gc_type_id, grow_list_items_block_gc,
-    items_block_capacity, items_block_items_base, typed_items_block_items_base,
+    grow_typed_items_block, items_block_capacity, items_block_items_base,
+    typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -2295,6 +2296,12 @@ pub fn ll_list_int_set_len(l: &mut W_ListObject, n: usize) {
     l.int_items.set_len(n);
 }
 
+/// `_ll_list_resize_hint_really` `l.items = newitems` for Integer storage.
+#[majit_macros::oopspec("list.int_set_items(l, items)")]
+pub fn ll_list_int_set_items(l: &mut W_ListObject, items: *mut TypedItemsBlock) {
+    l.int_items.block = items;
+}
+
 /// `rlist.py _ll_list_resize_hint_really` for Integer storage.
 ///
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
@@ -2312,10 +2319,20 @@ fn ll_list_int_resize_hint_really_iff(
 #[majit_macros::look_inside_iff(ll_list_int_resize_hint_really_iff)]
 pub unsafe fn ll_list_int_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
     let list = &mut *(obj as *mut W_ListObject);
-    if overallocate {
-        list.int_items.grow(newsize);
-    } else if newsize > list.int_items.heap_capacity() {
-        list.int_items.grow(newsize);
+    if overallocate || newsize > list.int_items.heap_capacity() {
+        // rlist.py `_ll_list_resize_hint_really`: malloc then `l.items = newitems`.
+        let extra = if newsize < 9 { 3 } else { 6 };
+        let target_cap = newsize
+            .saturating_add(extra)
+            .saturating_add(newsize >> 3)
+            .max(crate::int_array::INT_ARRAY_INLINE_CAP);
+        let newitems = grow_typed_items_block(
+            list.int_items.block,
+            target_cap,
+            list.int_items.len(),
+            gc_int_array_gc_type_id(),
+        );
+        ll_list_int_set_items(list, newitems);
     }
 }
 

@@ -6862,6 +6862,25 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            "list.int_set_items" => {
+                let l = args.first()?.clone();
+                let items = args.get(1)?.clone();
+                (
+                    "list.int_set_items → setfield_gc_r(int_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "int_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(items),
+                            ty: ValueType::Ref(None),
+                        },
+                    }],
+                )
+            }
             // Float-strategy storage leaves, mirroring the Integer leaves
             // but addressing `float_items.{len,block}` and holding
             // unboxed `f64` scalars — the element store lowers to
@@ -19494,6 +19513,50 @@ mod tests {
                 assert_eq!(field.name, "int_items.len");
                 assert_eq!(value.as_variable(), Some(&n));
                 assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.int_set_items(l, items)` lowers to `setfield_gc_r(l,
+    /// int_items.block)` (`rlist.py` `l.items = newitems`).
+    #[test]
+    fn handle_list_call_int_set_items_lowers_to_block_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_int_set_items");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let items = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.int_set_items",
+                &op,
+                &[l.clone(), items.clone()],
+                &mut graph,
+                "list_int_set_items",
+            )
+            .expect("list.int_set_items must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "int_items.block");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert_eq!(value.as_variable(), Some(&items));
+                assert!(matches!(ty, ValueType::Ref(_)));
             }
             other => panic!("expected FieldWrite, got {other:?}"),
         }
