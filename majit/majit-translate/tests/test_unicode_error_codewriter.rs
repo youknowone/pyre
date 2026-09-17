@@ -4,7 +4,7 @@
 
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
-use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
+use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
 use majit_translate::model::{CallTarget, OpKind, ValueType};
 
 #[test]
@@ -24,7 +24,8 @@ fn unicode_translate_error_borrow_chain_is_value_lowered() {
             f.item_meta.name_path() == "pyre_interpreter::display::unicode_translate_error_str"
         })
         .expect("unicode_translate_error_str exists in interpreter LLBC");
-    let graph = lower_fun_decl_with_static_addrs(&llbc, declaration, HostStaticAddrs::default())
+    let context = LowerContext::new(&llbc);
+    let graph = lower_fun_decl_with_static_addrs(&context, declaration, HostStaticAddrs::default())
         .expect("lower unicode_translate_error_str, not reject the graph");
     let mut borrowed_integer_reads = 0;
     for op in graph.blocks.iter().flat_map(|block| &block.operations) {

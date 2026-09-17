@@ -287,7 +287,7 @@ fn fold_recorded_jump_args(
                 _ => None,
             };
             if let Some(inputarg_box) = inputarg_index.and_then(|i| inputarg_boxes.get(i))
-                && Some(inputarg_box.tp) == arg.ty()
+                && Some(inputarg_box.tp.get()) == arg.ty()
                 && let Some(value) = inputarg_box.get_value()
                 && !matches!(value, Value::Void)
             {
@@ -356,7 +356,7 @@ pub struct UnrollOptimizer {
     /// Phase 1's finalized ExportedState, retained across the Phase 2 run
     /// so the caller of `optimize_trace_*` can consult the renamed inputarg
     /// types that the optimizer decided on. RPython does not need this
-    /// (Box.type is intrinsic), but majit's `InputArg.tp` side table is
+    /// (Box.type is intrinsic), but majit's `InputArg.tp.get()` side table is
     /// otherwise disconnected from the optimizer's reduced LABEL.
     pub final_exported_state: Option<ExportedState>,
     /// Compact TargetToken LABEL source positions in the full Phase-1
@@ -999,9 +999,10 @@ impl UnrollOptimizer {
             // source changes; `_forwarded` writes are untouched. No
             // forwarding yet at Phase 1 setup, so the seed is trivially the
             // authoritative source here.
-            if let Some(seed) = &self.phase2_input_ops_seed {
-                opt_p1.explicit_input_ops_seed = Some(seed.clone());
-            }
+            // The iterator's reminted ops carry the `inputarg_from_tp`
+            // InputArg Rcs. Seed them so `ensure_inputarg_bindings`
+            // reuses those objects instead of minting a second host.
+            opt_p1.explicit_input_ops_seed = Some(p1_ops_in.clone());
             let p1_ops =
                 opt_p1.run_optimize_from_inputs(&p1_ops_in, &mut consts_p1, num_inputs, false)?;
             merge_quasi_immutable_deps(
@@ -3546,7 +3547,7 @@ impl OptUnroll {
                 let idx = ia_opref.raw() as usize;
                 let want_ty = ia_opref.ty().unwrap_or(majit_ir::Type::Void);
                 if let Some(rc) = ctx.inputarg_refs.get(&(idx as u32)).cloned()
-                    && rc.tp == want_ty
+                    && rc.tp.get() == want_ty
                     && rc.index == idx as u32
                 {
                     return rc;

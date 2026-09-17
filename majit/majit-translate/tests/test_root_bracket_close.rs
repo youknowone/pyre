@@ -31,7 +31,7 @@
 
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{PlaceKind, SwitchTargets, TermKind, TyRef, Unstructured};
-use majit_translate::front::mir::{erased_root_bracket_guards, lower_fun_decl};
+use majit_translate::front::mir::{LowerContext, erased_root_bracket_guards, lower_fun_decl};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 use std::sync::OnceLock;
 
@@ -68,12 +68,13 @@ fn interpreter_llbc() -> Option<&'static Llbc> {
 }
 
 fn lower_named(llbc: &Llbc, leaf: &str) -> FunctionGraph {
+    let context = LowerContext::new(llbc);
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
         .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
-    lower_fun_decl(llbc, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
+    lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
 }
 
 /// Count calls whose path ends with `leaf`, over every block of the graph.
@@ -141,6 +142,7 @@ fn bracket_closes_in_the_cffi_call_path() {
 fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
     let Some(llbc) = object_llbc() else { return };
     let mut bodies = 0usize;
+    let context = LowerContext::new(llbc);
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
@@ -157,7 +159,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
             continue;
         }
         bodies += 1;
-        let Ok(graph) = lower_fun_decl(llbc, fd) else {
+        let Ok(graph) = lower_fun_decl(&context, fd) else {
             continue;
         };
         assert!(
@@ -211,6 +213,7 @@ fn opener_blocks(llbc: &Llbc, body: &Unstructured) -> std::collections::HashMap<
 fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
     let Some(llbc) = object_llbc() else { return };
     let mut dropping = 0usize;
+    let context = LowerContext::new(llbc);
     let mut left_open: Vec<String> = Vec::new();
     let mut moved_out = 0usize;
     for fd in llbc.iter_local_fns() {
@@ -221,7 +224,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
             continue;
         }
         dropping += 1;
-        let Ok(graph) = lower_fun_decl(llbc, fd) else {
+        let Ok(graph) = lower_fun_decl(&context, fd) else {
             continue;
         };
         if calls_to(&graph, "root_scope_close") > 0 {
@@ -306,9 +309,18 @@ fn ty_is_root_scope(llbc: &Llbc, ty: &TyRef) -> bool {
 /// for this to prove anything.
 #[test]
 fn nearly_every_dropped_bracket_closes() {
-    let (mut bodies, mut closed) = (0usize, 0usize);
-    let mut short: Vec<String> = Vec::new();
-    for llbc in [object_llbc(), interpreter_llbc()].into_iter().flatten() {
+    // Derive metadata once per program and share each context across workers.
+    let programs: Vec<_> = [object_llbc(), interpreter_llbc()]
+        .into_iter()
+        .flatten()
+        .map(|llbc| (llbc, LowerContext::new(llbc)))
+        .collect();
+    let mut work: Vec<(
+        &LowerContext<'_>,
+        &majit_charon_reader::ullbc::FunDecl,
+        usize,
+    )> = Vec::new();
+    for (llbc, context) in &programs {
         for fd in llbc.iter_local_fns() {
             let Some(body) = fd.unstructured() else {
                 continue;
@@ -317,17 +329,43 @@ fn nearly_every_dropped_bracket_closes() {
             if want == 0 {
                 continue;
             }
-            bodies += 1;
-            let Ok(graph) = lower_fun_decl(llbc, fd) else {
-                continue;
-            };
-            if reachable_closes(&graph) >= want {
-                closed += 1;
-            } else {
-                short.push(fd.item_meta.name_path().to_string());
-            }
+            work.push((context, fd, want));
         }
     }
+    let bodies = work.len();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(work.len().max(1));
+    let chunk = work.len().div_ceil(threads).max(1);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = work
+            .chunks(chunk)
+            .map(|slice| {
+                scope.spawn(move || {
+                    let mut closed = 0usize;
+                    let mut short = Vec::new();
+                    for &(context, fd, want) in slice {
+                        let Ok(graph) = lower_fun_decl(context, fd) else {
+                            continue;
+                        };
+                        if reachable_closes(&graph) >= want {
+                            closed += 1;
+                        } else {
+                            short.push(fd.item_meta.name_path().to_string());
+                        }
+                    }
+                    (closed, short)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("census worker"))
+            .collect::<Vec<_>>()
+    });
+    let closed: usize = results.iter().map(|(c, _)| *c).sum();
+    let short: Vec<String> = results.into_iter().flat_map(|(_, s)| s).collect();
     assert!(
         bodies > 100,
         "only {bodies} bodies drop a surviving guard; the artefact looks wrong, so \

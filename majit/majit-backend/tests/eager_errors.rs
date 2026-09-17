@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use majit_backend::eager::CompiledIr;
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
-use majit_ir::{Const, ConstMap, DescrRef, FailDescr, GcRef, InputArg, Op, OpCode, OpRc, Value};
+use majit_ir::{Const, ConstMap, DescrRef, FailDescr, GcRef, InputArgRc, Op, OpCode, OpRc, Value};
 
 #[derive(Default)]
 struct RejectingBackend {
@@ -45,7 +45,7 @@ impl Backend for RejectingBackend {
     }
     fn compile_loop(
         &mut self,
-        _: &[InputArg],
+        _: &[InputArgRc],
         _: &[OpRc],
         _: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
@@ -62,7 +62,7 @@ impl Backend for RejectingBackend {
     fn compile_bridge(
         &mut self,
         _: &dyn FailDescr,
-        _: &[InputArg],
+        _: &[InputArgRc],
         _: &[OpRc],
         _: &JitCellToken,
         _: &[Arc<JitCellToken>],

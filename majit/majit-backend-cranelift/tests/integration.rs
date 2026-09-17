@@ -10,16 +10,13 @@ use majit_backend::{
 use majit_backend_cranelift::{CraneliftBackend, force_token_to_dead_frame, jit_exc_raise};
 use majit_ir::test_support::{RecordedTrace, Trace};
 use majit_ir::{
-    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value,
+    ArrayDescr, Descr, DescrRef, FieldDescr, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef,
+    Type, Value,
 };
 
-/// Materialize owned input arguments for backend APIs that do not traffic in
-/// the recorder's shared input identities.
-fn inputargs_view(t: &RecordedTrace) -> Vec<InputArg> {
-    t.inputargs
-        .iter()
-        .map(|rc| (**rc).fresh_value_copy())
-        .collect()
+/// The recorder's inputarg identities, cloned as handles (same boxes).
+fn inputargs_view(t: &RecordedTrace) -> Vec<InputArgRc> {
+    t.inputargs.clone()
 }
 
 fn magic_numbers(m: i64) -> (u64, u32) {
@@ -2291,7 +2288,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
 fn test_call_assembler_callee_guard_failure_frame_stack() {
     // Compile a callee trace with a guard that fails:
     //   input(x) -> cmp = x > 10 -> guard_true(cmp) -> finish(x)
-    let callee_inputargs = vec![InputArg::new_int(0)];
+    let callee_inputargs = vec![InputArg::new_int_rc(0)];
     let mut callee_ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
         Op::new(

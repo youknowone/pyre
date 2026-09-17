@@ -524,11 +524,8 @@ impl TreeLoop {
         !opref.is_none() && !opref.is_constant()
     }
 
-    pub fn inputargs_cloned(&self) -> Vec<InputArg> {
-        self.inputargs
-            .iter()
-            .map(|rc| (**rc).fresh_value_copy())
-            .collect()
+    pub fn inputargs_cloned(&self) -> Vec<InputArgRc> {
+        self.inputargs.clone()
     }
 
     /// Create a new trace from input arguments and operations.
@@ -632,7 +629,7 @@ impl TreeLoop {
 
     /// Get the input arg types.
     pub fn inputarg_types(&self) -> Vec<majit_ir::Type> {
-        self.inputargs.iter().map(|ia| ia.tp).collect()
+        self.inputargs.iter().map(|ia| ia.tp.get()).collect()
     }
 
     /// opencoder.py Trace.get_iter() — produce a TraceIterator over
@@ -674,7 +671,7 @@ impl TreeLoop {
         let mut op_positions: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
         // history.py:564-565: inputargs must not contain constants
         for ia in &self.inputargs {
-            let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp);
+            let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp.get());
             if ia_ref.is_constant() {
                 return false;
             }
@@ -1089,7 +1086,7 @@ impl TreeLoop {
                 remap.insert(r, const_opref);
             } else {
                 // No pool constant available: fall back to new inputarg.
-                let tp = self.inputargs[r.raw() as usize].tp;
+                let tp = self.inputargs[r.raw() as usize].tp.get();
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit][cut-escape] original inputarg {:?} (tp={:?}) not in \
@@ -1402,9 +1399,9 @@ mod tests {
             InputArg::new_float(2),
         ];
         let trace = TreeLoop::new(inputargs, vec![]);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
     }
 
     // History / TreeLoop parity tests
@@ -1480,10 +1477,8 @@ mod tests {
     #[test]
     fn test_trace_loop_vs_finish_exclusive() {
         // A trace cannot be both a loop and finished.
-        let inputargs = vec![InputArg::new_int(0)];
-
         let loop_trace = TreeLoop::new(
-            inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            vec![InputArg::new_int(0)],
             vec![
                 Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
                 Op::new(OpCode::Jump, &[iop_box(1)]),
@@ -1493,7 +1488,7 @@ mod tests {
         assert!(!loop_trace.is_finished());
 
         let finish_trace = TreeLoop::new(
-            inputargs,
+            vec![InputArg::new_int(0)],
             vec![
                 Op::new(OpCode::IntAdd, &[iarg_box(0), iarg_box(0)]),
                 Op::new(OpCode::Finish, &[iop_box(1)]),
@@ -1522,9 +1517,9 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         assert_eq!(trace.num_inputargs(), 3);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
         assert!(trace.is_loop());
     }
 
@@ -2496,8 +2491,8 @@ mod tests {
         let trace = rec.get_trace();
 
         assert_eq!(trace.num_inputargs(), 2);
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Int);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Int);
 
         assert_eq!(trace.num_ops(), 3);
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
@@ -2577,9 +2572,9 @@ mod tests {
         rec.close_loop(&[i1, r0, f0]);
 
         let trace = rec.get_trace();
-        assert_eq!(trace.inputargs[0].tp, Type::Int);
-        assert_eq!(trace.inputargs[1].tp, Type::Ref);
-        assert_eq!(trace.inputargs[2].tp, Type::Float);
+        assert_eq!(trace.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(trace.inputargs[1].tp.get(), Type::Ref);
+        assert_eq!(trace.inputargs[2].tp.get(), Type::Float);
         assert!(trace.is_loop());
     }
 

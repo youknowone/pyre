@@ -135,7 +135,8 @@ pub fn lower_function_with_static_addrs(
     let fd = llbc
         .local_fn(function_name)
         .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
-    lower_fun_decl_with_static_addrs(llbc, fd, static_addrs)
+    let context = LowerContext::new(llbc);
+    lower_fun_decl_with_static_addrs(&context, fd, static_addrs)
 }
 
 /// Merge functions and metadata from a slice of LLBCs into one
@@ -2395,8 +2396,11 @@ pub(crate) fn harden_duplicate_leaf_metadata(
 }
 
 /// Lower a single Charon [`FunDecl`] to a [`FunctionGraph`].
-pub fn lower_fun_decl(llbc: &Llbc, fd: &FunDecl) -> Result<FunctionGraph, LowerError> {
-    lower_fun_decl_with_static_addrs(llbc, fd, crate::HostStaticAddrs::default())
+pub fn lower_fun_decl(
+    context: &LowerContext<'_>,
+    fd: &FunDecl,
+) -> Result<FunctionGraph, LowerError> {
+    lower_fun_decl_with_static_addrs(context, fd, crate::HostStaticAddrs::default())
 }
 
 /// Whether the framestate-threaded lowering runs for acyclic bodies.
@@ -2409,18 +2413,33 @@ fn framestate_enabled() -> bool {
     )
 }
 
+/// Per-program owner of derived lowering metadata (`translator.py TranslationContext`).
+/// Callers share this context across declarations from the borrowed program.
+pub struct LowerContext<'a> {
+    llbc: &'a Llbc,
+    struct_field_attrs: std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: std::collections::HashSet<String>,
+}
+
+impl<'a> LowerContext<'a> {
+    /// Derive the program's lowering metadata once for this context.
+    pub fn new(llbc: &'a Llbc) -> Self {
+        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+        Self {
+            llbc,
+            struct_field_attrs,
+            dont_look_inside: dont_look_inside_set_of(llbc),
+        }
+    }
+}
+
 pub fn lower_fun_decl_with_static_addrs(
-    llbc: &Llbc,
+    context: &LowerContext<'_>,
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
+    let llbc = context.llbc;
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
-        // Derive the struct field-layout map the boxing-alloc fusion reads
-        // (`fuse_boxing_alloc`).  The whole-program build lowers each function
-        // through the `_with_attrs` variant with a single precomputed map; this
-        // stand-alone entry (used by the reader / tests) derives it per call from
-        // the same source of truth so the fusion fires identically.
-        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
         let jitdriver_receiver_roots =
             crate::codewriter::jtransform::default_jitdriver_receiver_roots();
         lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
@@ -2428,7 +2447,8 @@ pub fn lower_fun_decl_with_static_addrs(
             fd,
             static_addrs,
             &jitdriver_receiver_roots,
-            &struct_field_attrs,
+            &context.struct_field_attrs,
+            &context.dont_look_inside,
         )
     })
 }
@@ -2508,12 +2528,14 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
 ) -> Result<FunctionGraph, LowerError> {
     let jitdriver_receiver_roots =
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    let dont_look_inside = dont_look_inside_set_of(llbc);
     lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         llbc,
         fd,
         static_addrs,
         &jitdriver_receiver_roots,
         struct_field_attrs,
+        &dont_look_inside,
     )
 }
 
@@ -2523,6 +2545,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -2530,13 +2553,6 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
-    // Standalone entry (the reader / tests / on-demand `GraphBodyProvider`):
-    // harvest the residual marker set from this LLBC so the call-target
-    // builder makes the SAME Method-hint decline the whole-program loop makes.
-    // The hot whole-program path passes its precomputed set directly to
-    // `lower_unstructured_with_static_addrs_and_attrs`, so this per-call
-    // harvest is only paid on the standalone paths.
-    let dont_look_inside = dont_look_inside_set_of(llbc);
     let builder_mode = graph_has_builder_accumulator(llbc, &u);
     lower_unstructured_with_static_addrs_and_attrs(
         llbc,
@@ -30420,7 +30436,8 @@ mod tests {
             .iter_local_fns()
             .find(|fd| fd.item_meta.name_path().ends_with("::genrand32"))
             .expect("_random::Random::genrand32 in interpreter LLBC");
-        let graph = super::lower_fun_decl(&llbc, fd).expect("lower Random::genrand32");
+        let context = super::LowerContext::new(&llbc);
+        let graph = super::lower_fun_decl(&context, fd).expect("lower Random::genrand32");
 
         let mut reads = 0usize;
         let mut writes = 0usize;
@@ -30466,7 +30483,8 @@ mod tests {
             .iter_local_fns()
             .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
             .expect("_random::__majit_wrap_random");
-        let graph = super::lower_fun_decl(&llbc, fd).expect("lower wrapper");
+        let context = super::LowerContext::new(&llbc);
+        let graph = super::lower_fun_decl(&context, fd).expect("lower wrapper");
         let receiver = graph
             .blocks
             .iter()
@@ -32617,10 +32635,11 @@ mod tests {
         // survive, and the existing GC reference must flow to
         // `w_long_from_raw`.
         let mut boxed_handlers = 0usize;
+        let context = super::LowerContext::new(&llbc);
         for fd in llbc.iter_local_fns().filter(|fd| {
             fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
         }) {
-            let graph = super::lower_fun_decl(&llbc, fd)
+            let graph = super::lower_fun_decl(&context, fd)
                 .unwrap_or_else(|e| panic!("lower {}: {e:?}", fd.item_meta.name_path()));
             let calls: Vec<&[String]> = graph
                 .blocks

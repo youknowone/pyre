@@ -32,8 +32,8 @@ use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
 use majit_gc::{GcAllocator, GcRewriter};
 use majit_ir::{
-    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, OopSpecIndex, Op,
-    OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
+    AccumInfo, CallDescr, DescrRef, EffectInfo, FailDescr, GcRef, InputArg, InputArgRc,
+    OopSpecIndex, Op, OpCode, OpRc, OpRef, OpTypeIndex, Type, Value,
 };
 
 mod slice_x2_probe {
@@ -4858,7 +4858,7 @@ fn op_dereferences_first_arg(opcode: majit_ir::OpCode) -> bool {
 }
 
 fn validate_oprefs_for_compile(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &majit_ir::ConstMap<majit_ir::Const>,
 ) -> Result<(), BackendError> {
@@ -5126,7 +5126,7 @@ fn expected_call_assembler_result_kind(call_descr: &dyn CallDescr) -> Result<u64
     }
 }
 
-fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> IndexSet<u32> {
+fn build_known_values_set(inputargs: &[InputArgRc], ops: &[Op]) -> IndexSet<u32> {
     let mut known = IndexSet::new();
     for input in inputargs {
         known.insert(input.index);
@@ -5158,7 +5158,7 @@ fn build_used_vars_set(ops: &[Op]) -> IndexSet<u32> {
     used
 }
 
-fn build_force_token_set(_inputargs: &[InputArg], _ops: &[Op]) -> IndexSet<u32> {
+fn build_force_token_set(_inputargs: &[InputArgRc], _ops: &[Op]) -> IndexSet<u32> {
     // FORCE_TOKEN is a GCREF to the active JITFRAME
     // (`virtualizable.py:315-318`, `resoperation.py:1090`). Keep its in-frame
     // copies in the ordinary Ref root set so moving collectors update them.
@@ -5184,7 +5184,7 @@ fn build_force_token_set(_inputargs: &[InputArg], _ops: &[Op]) -> IndexSet<u32> 
 /// fallback in `resolve_fail_arg_types`.
 fn build_type_overrides(
     ops: &[Op],
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
 ) -> (IndexMap<u32, Type>, IndexMap<u32, usize>) {
     let mut overrides: IndexMap<u32, Type> = IndexMap::new();
     let mut op_def_positions: IndexMap<u32, usize> = IndexMap::new();
@@ -5281,7 +5281,7 @@ fn build_type_overrides(
 
 #[inline]
 fn lookup_type_at(
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     opref: OpRef,
     op_index: usize,
@@ -5519,9 +5519,9 @@ fn nonref_demoted_positions(
 }
 
 fn build_ref_root_slots(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     force_tokens: &IndexSet<u32>,
 ) -> Result<Vec<(u32, usize)>, BackendError> {
@@ -5580,7 +5580,7 @@ fn build_ref_root_slots(
         }
     }
     for input in inputargs {
-        if input.tp == Type::Ref
+        if input.tp.get() == Type::Ref
             && !force_tokens.contains(&input.index)
             && used_inputargs.contains(&input.index)
             && seen.insert(input.index)
@@ -5588,11 +5588,15 @@ fn build_ref_root_slots(
             if majit_ir::debug::have_debug_prints() {
                 majit_ir::debug::log_one(
                     "jit-backend",
-                    &format!("ref-root inputarg idx={} tp={:?}", input.index, input.tp),
+                    &format!(
+                        "ref-root inputarg idx={} tp={:?}",
+                        input.index,
+                        input.tp.get()
+                    ),
                 );
             }
             slots.push((input.index, slots.len()));
-        } else if input.tp == Type::Ref
+        } else if input.tp.get() == Type::Ref
             && !used_inputargs.contains(&input.index)
             && std::env::var_os("MAJIT_LOG").is_some()
         {
@@ -5634,7 +5638,7 @@ fn build_ref_root_slots(
 /// Debug-only: this reports, it does not compensate.
 fn log_internal_jump_type_mismatches(
     ops: &[Op],
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
 ) {
     // Key by `descr_identity` (Arc allocation address) per `history.py:477`
@@ -5691,7 +5695,7 @@ fn log_internal_jump_type_mismatches(
 }
 
 /// Simple normalization: assign sequential pos to ops without pos.
-fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<Op> {
+fn normalize_ops_for_codegen_simple(inputargs: &[InputArgRc], ops: &[Op]) -> Vec<Op> {
     let num_inputs = inputargs.len() as u32;
     ops.iter()
         .enumerate()
@@ -5926,7 +5930,7 @@ fn resolve_rewriter_immediate_i64(
 }
 
 fn type_for_opref(
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     known_values: &IndexSet<u32>,
     opcode: OpCode,
@@ -5969,16 +5973,22 @@ fn emit_load_from_addr(
     let heap_flags = MemFlagsData::new();
     match value_type {
         Type::Float => {
-            if size != 8 {
-                return Err(unsupported_semantics(
+            match size {
+                4 => {
+                    let raw = builder.ins().load(cl_types::F32, heap_flags, addr, 0);
+                    Ok(builder.ins().fpromote(cl_types::F64, raw))
+                }
+                8 => {
+                    // Return the natural F64 so a Float-result variable (declared
+                    // F64) receives it without a GPR round-trip; callers feeding a
+                    // boxed I64 slot coerce at their own boundary.
+                    Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
+                }
+                _ => Err(unsupported_semantics(
                     opcode,
-                    "float memory operations currently require 8-byte values",
-                ));
+                    "float memory operations require 4- or 8-byte values",
+                )),
             }
-            // Return the natural F64 so a Float-result variable (declared
-            // F64) receives it without a GPR round-trip; callers feeding a
-            // boxed I64 slot coerce at their own boundary.
-            Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
         }
         Type::Int | Type::Ref => {
             // Adaptation, not parity.  Upstream's reference bank is one word by
@@ -6033,14 +6043,24 @@ fn emit_store_to_addr(
 ) -> Result<(), BackendError> {
     match value_type {
         Type::Float => {
-            if size != 8 {
-                return Err(unsupported_semantics(
-                    opcode,
-                    "float memory operations currently require 8-byte values",
-                ));
-            }
             let fval = coerce_ty(builder, value, cl_types::F64);
-            builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
+            match size {
+                4 => {
+                    let f32val = builder.ins().fdemote(cl_types::F32, fval);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), f32val, addr, 0);
+                }
+                8 => {
+                    builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
+                }
+                _ => {
+                    return Err(unsupported_semantics(
+                        opcode,
+                        "float memory operations require 4- or 8-byte values",
+                    ));
+                }
+            }
         }
         Type::Int | Type::Ref => {
             // Same adaptation as the load path above, and for the same reason.
@@ -8717,7 +8737,7 @@ fn patch_terminal_exit_recovery_layout(
 
 fn infer_fail_arg_types(
     fail_arg_refs: &[OpRef],
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     op_index: usize,
 ) -> Result<Vec<Type>, BackendError> {
@@ -8758,7 +8778,7 @@ fn infer_fail_arg_types(
 fn resolve_fail_arg_types(
     fail_arg_refs: &[OpRef],
     fd: Option<&dyn majit_ir::descr::FailDescr>,
-    type_index: &OpTypeIndex<'_>,
+    type_index: &OpTypeIndex<'_, Op, InputArgRc>,
     overrides: &IndexMap<u32, Type>,
     op_def_positions: &IndexMap<u32, usize>,
     guard_op_index: usize,
@@ -9342,7 +9362,7 @@ impl CraneliftBackend {
 
     fn prepare_ops_for_compile(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[Op],
         constants: &majit_ir::ConstMap<majit_ir::Const>,
     ) -> (Vec<Op>, Vec<GcRef>) {
@@ -9636,7 +9656,7 @@ impl CraneliftBackend {
 
     fn do_compile(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[Op],
         invalidation_flag_ptr: Option<usize>,
         source_guard: Option<(u64, u32)>,
@@ -9969,7 +9989,7 @@ impl CraneliftBackend {
         };
         let mut defined_ref_vars: IndexSet<u32> = inputargs
             .iter()
-            .filter(|input| input.tp == Type::Ref && !force_tokens.contains(&input.index))
+            .filter(|input| input.tp.get() == Type::Ref && !force_tokens.contains(&input.index))
             .map(|input| input.index)
             .collect();
         let mut synced_ref_vars: IndexSet<u32> = IndexSet::new();
@@ -16047,7 +16067,7 @@ impl CraneliftBackend {
 
         let trace_info = CompiledTraceInfo {
             trace_id,
-            input_types: inputargs.iter().map(|arg| arg.tp).collect(),
+            input_types: inputargs.iter().map(|arg| arg.tp.get()).collect(),
             header_pc,
             source_guard: None,
         };
@@ -16254,7 +16274,7 @@ fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
 /// still ahead of the ref roots, which `emit_body` places at
 /// `max_output_slots`. Reserving it is what makes `max_output_slots` one wider
 /// than the exits alone require.
-fn counter_slot_for(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
+fn counter_slot_for(inputargs: &[InputArgRc], ops: &[Op]) -> Option<usize> {
     let needs = ops.iter().any(|op| {
         op.opcode == OpCode::GuardValue && {
             let fail_args: Vec<OpRef> = op
@@ -16263,7 +16283,7 @@ fn counter_slot_for(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
                 .unwrap_or_else(|| {
                     inputargs
                         .iter()
-                        .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
+                        .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
                         .collect()
                 });
             counter_value_spill(op, &fail_args).is_some()
@@ -16272,7 +16292,7 @@ fn counter_slot_for(inputargs: &[InputArg], ops: &[Op]) -> Option<usize> {
     needs.then(|| precompute_max_output_slots(inputargs, ops))
 }
 
-fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+fn precompute_max_output_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     // x86/regalloc.py:1273 / aarch64/regalloc.py:276 line-by-line: a JUMP
     // whose descr targets a same-function Label with matching arity is an
     // internal jump (no fail args); otherwise external and contributes
@@ -16325,7 +16345,7 @@ fn precompute_max_output_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
 
 fn collect_guards(
     ops: &[Op],
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     counter_slot: Option<usize>,
     fail_descrs: &mut Vec<DescrRef>,
     fail_descr_cells: &mut Vec<Box<majit_ir::FailDescrCell>>,
@@ -16434,7 +16454,7 @@ fn collect_guards(
             // InputArg, so mint a typed OpRef per entry.
             let refs: Vec<OpRef> = inputargs
                 .iter()
-                .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp))
+                .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
                 .collect();
             let fb_descr_arc = op.getdescr();
             let types = resolve_fail_arg_types(
@@ -17157,7 +17177,7 @@ fn collect_guards(
 
 fn collect_terminal_exit_layouts(
     ops: &[Op],
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     trace_id: u64,
     header_pc: u64,
     source_guard: Option<(u64, u32)>,
@@ -17192,7 +17212,7 @@ fn collect_terminal_exit_layouts(
                 trace_id,
                 trace_info: Some(CompiledTraceInfo {
                     trace_id,
-                    input_types: inputargs.iter().map(|arg| arg.tp).collect(),
+                    input_types: inputargs.iter().map(|arg| arg.tp.get()).collect(),
                     header_pc,
                     source_guard: None,
                 }),
@@ -17250,7 +17270,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn compile_loop(
         &mut self,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         token: &JitCellToken,
     ) -> Result<AsmInfo, BackendError> {
@@ -17272,7 +17292,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // boundary; backend stages do not depend on `_forwarded` sharing).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
         let ops: &[Op] = &ops_owned;
-        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp).collect());
+        token.set_inputarg_types(inputargs.iter().map(|ia| ia.tp.get()).collect());
         // Pass the address of the invalidation flag so GUARD_NOT_INVALIDATED
         // can load from it at runtime.
         let flag_ptr = Arc::as_ptr(&token.invalidated) as *const AtomicBool as usize;
@@ -17392,7 +17412,7 @@ impl majit_backend::Backend for CraneliftBackend {
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
         ops: &[OpRc],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
@@ -18896,11 +18916,10 @@ impl majit_backend::Backend for CraneliftBackend {
         struct_ptr: i64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        let offset = fielddescr.as_offset();
-        // Route through `read_float_at_mem` (`compiler.rs` —
-        // `llmodel.py:490-491` parity) for the same `read_unaligned`
-        // safety guarantee as the dynasm sibling.
-        self.read_float_at_mem(struct_ptr, offset as i64)
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        unsafe {
+            majit_backend::llmodel::read_float_at_mem_sized(struct_ptr as usize, offset, size)
+        }
     }
 
     /// llmodel.py bh_setfield_gc_f delegates to write_float_at_mem.
@@ -18912,8 +18931,15 @@ impl majit_backend::Backend for CraneliftBackend {
         value: f64,
         fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
-        let offset = fielddescr.as_offset();
-        self.write_float_at_mem(struct_ptr, offset as i64, value);
+        let (offset, size, _) = fielddescr.unpack_fielddescr_size();
+        unsafe {
+            majit_backend::llmodel::write_float_at_mem_sized(
+                struct_ptr as usize,
+                offset,
+                size,
+                value,
+            )
+        }
     }
 
     /// llsupport/gc.py GcLLDescr_framework
@@ -19645,7 +19671,7 @@ mod tests {
     }
 
     fn assert_compile_unsupported(
-        inputargs: Vec<InputArg>,
+        inputargs: Vec<InputArgRc>,
         ops: Vec<majit_ir::OpRc>,
         token_number: u64,
         opcode: OpCode,
@@ -19672,7 +19698,7 @@ mod tests {
     fn test_count_to_million() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         // resoperation.py `InputArgInt.type = 'i'` parity: Label /
         // IntAdd / Jump args that reference the inputarg slot are
         // `InputArgInt` boxes, not `IntOp` results. The op-position
@@ -19809,7 +19835,7 @@ mod tests {
 
         let token = JitCellToken::new(1700);
         backend
-            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
+            .compile_loop(&[InputArg::new_ref_rc(0)], &ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -19874,7 +19900,7 @@ mod tests {
 
         let token = JitCellToken::new(1710);
         backend
-            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
+            .compile_loop(&[InputArg::new_ref_rc(0)], &ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -19923,7 +19949,11 @@ mod tests {
 
         let token = JitCellToken::new(1703);
         backend
-            .compile_loop(&[InputArg::new_ref(0), InputArg::new_int(1)], &ops, &token)
+            .compile_loop(
+                &[InputArg::new_ref_rc(0), InputArg::new_int_rc(1)],
+                &ops,
+                &token,
+            )
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root), Value::Int(2)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -19976,7 +20006,7 @@ mod tests {
 
         let token = JitCellToken::new(1701);
         backend
-            .compile_loop(&[InputArg::new_ref(0)], &ops, &token)
+            .compile_loop(&[InputArg::new_ref_rc(0)], &ops, &token)
             .unwrap();
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
         let moved = backend.get_ref_value(&frame, 0);
@@ -20012,7 +20042,7 @@ mod tests {
         ]);
         let exit_guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(3)], OpRef::NONE.raw());
         exit_guard.setfailargs(smallvec::smallvec![rb(carried)]);
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], carried.raw()),
             entry_guard,
@@ -20086,7 +20116,7 @@ mod tests {
     fn bridge_closing_onto_its_owner_is_patched_not_reemitted() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1_500_290);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
 
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
@@ -20196,7 +20226,7 @@ mod tests {
         backend
             .compile_bridge(
                 region_descr,
-                &[InputArg::new_int(0), InputArg::new_int(1)],
+                &[InputArg::new_int_rc(0), InputArg::new_int_rc(1)],
                 &finish,
                 &token,
                 &[],
@@ -20219,7 +20249,7 @@ mod tests {
     fn patch_jump_leaves_sibling_bridge_in_place() {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1_500_294);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let i = OpRef::input_arg_int(0);
         let s = OpRef::input_arg_int(1);
         let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
@@ -20328,7 +20358,7 @@ mod tests {
         unsafe { *(root.0 as *mut u64) = 0xB12D_6001 };
         let mut backend = backend_with_gc(gc);
         let label = make_label_descr(1_500_292);
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let reference = OpRef::input_arg_ref(0);
         let counter = OpRef::input_arg_int(1);
         let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
@@ -20402,7 +20432,7 @@ mod tests {
         unsafe { *(root.0 as *mut u64) = 0xD30F_0004 };
         let mut backend = backend_with_gc(gc);
         let label = make_label_descr(1_500_293);
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let counter = OpRef::input_arg_int(0);
         let reference = OpRef::ref_op(1);
         let constant = mk_op(OpCode::SameAsR, &[OpRef::const_ptr(root)], reference.raw());
@@ -20482,7 +20512,7 @@ mod tests {
         ]);
         let bridge_guard = mk_op(OpCode::GuardFalse, &[OpRef::int_op(103)], OpRef::NONE.raw());
         bridge_guard.setfailargs(smallvec::smallvec![rb(carried), rb(next)]);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let root_ops = vec![
             mk_op(OpCode::SameAsI, &[OpRef::input_arg_int(0)], carried.raw()),
             mk_op_with_descr(
@@ -20535,7 +20565,7 @@ mod tests {
         let guard_descr =
             get_latest_descr_from_deadframe(&failed).expect("bridge guard should fail");
 
-        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let bridge_increment = 100;
         let mut bridge_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         bridge_constants.insert(100, bridge_increment);
@@ -20621,7 +20651,7 @@ mod tests {
     fn guard_value_parks_its_operand_past_every_exits_fail_args() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ia0 = OpRef::input_arg_int(0);
         // Two fail args, and it holds: this exit is never taken, it only makes
         // the trace's value area two slots wide.
@@ -20688,7 +20718,7 @@ mod tests {
     fn test_simple_add_finish() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20714,7 +20744,7 @@ mod tests {
     fn test_finish_preserves_float_and_ref_types() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_ref(1)];
+        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_ref_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20740,7 +20770,7 @@ mod tests {
     fn test_int_sub() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20766,7 +20796,7 @@ mod tests {
     fn test_int_mul() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20792,7 +20822,7 @@ mod tests {
     fn test_int_floor_div() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20818,7 +20848,7 @@ mod tests {
     fn test_bitwise_ops() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20860,7 +20890,7 @@ mod tests {
     fn test_shift_ops() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20903,7 +20933,7 @@ mod tests {
     fn test_comparisons() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -20970,7 +21000,7 @@ mod tests {
     fn test_guard_false() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -21007,11 +21037,11 @@ mod tests {
         // optimizer-owned virtual state, while the visible loop contract is the
         // terminal JUMP arity. This must still compile.
         let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
-            InputArg::new_int(3),
-            InputArg::new_int(4),
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
+            InputArg::new_int_rc(3),
+            InputArg::new_int_rc(4),
         ];
         let ops = vec![
             mk_op(
@@ -21038,7 +21068,7 @@ mod tests {
     fn test_fail_descr() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -21061,7 +21091,7 @@ mod tests {
     fn test_compiled_fail_descr_layouts_include_backend_recovery_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
         let guard = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -21114,7 +21144,7 @@ mod tests {
         // the recovery layout under test is built from a Ref and an Int that
         // sit at swapped positions rather than from a straight-through
         // backedge.
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21168,7 +21198,7 @@ mod tests {
     fn test_compiled_terminal_exit_layouts_include_backend_finish_recovery_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_ref(1)];
+        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_ref_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21222,7 +21252,7 @@ mod tests {
     fn test_update_terminal_exit_recovery_layout_patches_compiled_terminal_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(OpCode::Jump, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
@@ -21264,7 +21294,7 @@ mod tests {
     fn test_compiled_trace_layout_queries_find_attached_bridge_by_trace_id() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -21286,7 +21316,7 @@ mod tests {
         let token = JitCellToken::new(8012);
         backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
 
-        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0)];
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -21357,7 +21387,7 @@ mod tests {
     fn test_compiled_bridge_recovery_layouts_inherit_source_guard_caller_frames() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -21494,7 +21524,7 @@ mod tests {
     fn test_nested_bridge_compilation_uses_source_trace_fail_descr_tree() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let root_guard = mk_op(
             OpCode::GuardFalse,
             &[OpRef::input_arg_int(0)],
@@ -21711,7 +21741,7 @@ mod tests {
     fn test_sum_loop() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21754,7 +21784,7 @@ mod tests {
     fn test_multi_output_finish() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21804,7 +21834,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Int);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21844,7 +21874,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int, Type::Int], Type::Int);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21892,7 +21922,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -21929,7 +21959,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Float, Type::Float], Type::Float);
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_float(1)];
+        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_float_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -21970,7 +22000,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Int);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -22019,7 +22049,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let call_void = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -22073,7 +22103,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
@@ -22121,7 +22151,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 1);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
@@ -22162,7 +22192,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
@@ -22213,7 +22243,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
@@ -22268,7 +22298,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardException, &[OpRef::int_op(101)], 3);
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
@@ -22340,7 +22370,7 @@ mod tests {
         let mut backend = backend_with_gc(gc);
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let ops = vec![
@@ -22384,7 +22414,7 @@ mod tests {
     fn test_same_as_r() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 1),
@@ -22402,7 +22432,7 @@ mod tests {
     fn test_same_as_f() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0)];
+        let inputargs = vec![InputArg::new_float_rc(0)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22429,7 +22459,7 @@ mod tests {
         // into would disagree on the same operands.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_float(1)];
+        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_float_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22473,7 +22503,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22526,7 +22556,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22580,7 +22610,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Int);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22625,7 +22655,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Int], Type::Int);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -22679,7 +22709,7 @@ mod tests {
             let mut backend = CraneliftBackend::new();
             let descr = make_call_descr(vec![Type::Ref], Type::Ref);
 
-            let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+            let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
             let ops = vec![
                 mk_op(
                     OpCode::Label,
@@ -22721,7 +22751,7 @@ mod tests {
     fn test_guard_nonnull() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -22750,7 +22780,7 @@ mod tests {
     fn test_guard_isnull_passes() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -22776,7 +22806,7 @@ mod tests {
     fn test_guard_isnull_fails() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -22802,7 +22832,7 @@ mod tests {
     fn test_guard_value() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -23066,7 +23096,7 @@ mod tests {
     fn test_float_comparisons() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_float(1)];
+        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_float_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23134,7 +23164,7 @@ mod tests {
     fn test_float_comparisons_equal() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_float(1)];
+        let inputargs = vec![InputArg::new_float_rc(0), InputArg::new_float_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23193,7 +23223,7 @@ mod tests {
         // The field is at offset 8, size 8, type Int.
         let fd = make_field_descr(8, 8, Type::Int, true);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], 1, fd),
@@ -23217,7 +23247,7 @@ mod tests {
 
         let fd = make_field_descr(8, 8, Type::Int, true);
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23254,7 +23284,7 @@ mod tests {
         // i32 field at offset 0, signed
         let fd = make_field_descr(0, 4, Type::Int, true);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], 1, fd),
@@ -23283,7 +23313,7 @@ mod tests {
         // Array: base_size=16 (header), item_size=8, items are i64
         let ad = make_array_descr(16, 8, Type::Int, None);
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23319,9 +23349,9 @@ mod tests {
         let ad = make_array_descr(16, 8, Type::Int, None);
 
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -23371,7 +23401,7 @@ mod tests {
         // Array with length at offset 8 (second i64 in header)
         let ad = make_array_descr(16, 8, Type::Int, Some(8));
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], 1, ad),
@@ -23396,7 +23426,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(9001);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -23427,7 +23457,7 @@ mod tests {
         let start_descr = make_label_descr(76_100);
         let loop_descr = make_label_descr(76_101);
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op_with_descr(
                 OpCode::Label,
@@ -23465,7 +23495,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         backend.set_vtable_offset(Some(0));
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -23508,7 +23538,7 @@ mod tests {
     fn test_int_add_ovf_no_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23538,7 +23568,7 @@ mod tests {
     fn test_int_add_ovf_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23567,7 +23597,7 @@ mod tests {
     fn test_int_sub_ovf_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23596,7 +23626,7 @@ mod tests {
     fn test_int_sub_ovf_no_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23625,7 +23655,7 @@ mod tests {
     fn test_int_mul_ovf_no_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23654,7 +23684,7 @@ mod tests {
     fn test_int_mul_ovf_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23683,7 +23713,7 @@ mod tests {
     fn test_guard_overflow() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23724,7 +23754,7 @@ mod tests {
         // f64 field at offset 0
         let fd = make_field_descr(0, 8, Type::Float, false);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::GetfieldGcF, &[OpRef::input_arg_ref(0)], 1, fd),
@@ -23753,7 +23783,7 @@ mod tests {
         // Ref field at offset 8
         let fd = make_field_descr(8, 8, Type::Ref, false);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(OpCode::GetfieldGcR, &[OpRef::input_arg_ref(0)], 1, fd),
@@ -23778,7 +23808,7 @@ mod tests {
 
         let fd = make_field_descr(0, 8, Type::Int, true);
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23814,9 +23844,9 @@ mod tests {
         let ad = make_array_descr(0, 8, Type::Int, None);
 
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -23864,7 +23894,7 @@ mod tests {
     fn test_gc_load_i_signed_itemsize() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -23900,7 +23930,7 @@ mod tests {
     fn test_gc_load_indexed_r_uses_scale_and_base_offset() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23941,7 +23971,7 @@ mod tests {
     fn test_gc_store_four_arg_form_stores_ref_value() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_ref(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -23986,9 +24016,9 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -24054,7 +24084,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let ad = make_array_descr_with_signedness(0, 1, Type::Int, false, None);
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -24085,7 +24115,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let ad = make_array_descr(0, 8, Type::Float, None);
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_float(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_float_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -24139,9 +24169,9 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -24181,7 +24211,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let id = make_interior_field_descr(8, 16, Type::Int, 4, 4, Type::Int, true);
-        let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -24216,9 +24246,9 @@ mod tests {
 
         let id = make_interior_field_descr(8, 16, Type::Int, 8, 8, Type::Int, true);
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -24279,7 +24309,7 @@ mod tests {
         // bridge and return x + 100 instead of falling back.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -24311,7 +24341,7 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 0), -5);
 
         // Now compile a bridge for guard 0: bridge takes x, returns x + 100
-        let bridge_inputargs = vec![InputArg::new_int(0)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0)];
         let bridge_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -24369,7 +24399,7 @@ mod tests {
         // Verify that guard failures are counted.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -24419,7 +24449,7 @@ mod tests {
         // those values as inputs.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -24457,7 +24487,7 @@ mod tests {
         assert_eq!(backend.get_int_value(&frame, 1), 42); // y
 
         // Compile bridge that takes the fail_args (x, y) and returns x + y + 1000
-        let bridge_inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let bridge_inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let bridge_ops = vec![
             mk_op(
                 OpCode::Label,
@@ -24512,9 +24542,9 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_float(1),
-            InputArg::new_ref(2),
+            InputArg::new_int_rc(0),
+            InputArg::new_float_rc(1),
+            InputArg::new_ref_rc(2),
         ];
         let guard_op = mk_op(
             OpCode::GuardTrue,
@@ -24559,7 +24589,7 @@ mod tests {
     #[test]
     fn test_guard_fail_args_leave_none_holes_unwritten() {
         let mut backend = CraneliftBackend::new();
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -24593,7 +24623,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let ad = make_array_descr(16, 4, Type::Int, None);
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -24643,9 +24673,9 @@ mod tests {
 
         let ad = make_array_descr(8, 4, Type::Int, None);
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op(
@@ -24707,7 +24737,7 @@ mod tests {
     fn test_unsupported_void_opcode_errors() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(OpCode::CallMayForceN, &[], OpRef::NONE.raw()),
@@ -24733,7 +24763,7 @@ mod tests {
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
@@ -24790,7 +24820,7 @@ mod tests {
     #[test]
     fn test_guard_not_forced_2_preserves_overlapping_failarg_sources() {
         let mut backend = CraneliftBackend::new();
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
@@ -24824,7 +24854,7 @@ mod tests {
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Void);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
@@ -24892,7 +24922,7 @@ mod tests {
         // assertion; any intervening op (here, a SameAsI between the call
         // and its guard) must be rejected at compile time.
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
@@ -24944,7 +24974,7 @@ mod tests {
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
@@ -25000,7 +25030,7 @@ mod tests {
 
         let mut backend = CraneliftBackend::new();
         let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Float);
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.raw());
         guard_op.setfailargs(smallvec::smallvec![
             rb(OpRef::input_arg_int(1)),
@@ -25058,7 +25088,7 @@ mod tests {
     fn test_call_assembler_i_executes_finish_only_target() {
         let mut backend = make_call_assembler_backend();
 
-        let callee_inputargs = vec![InputArg::new_int(0)];
+        let callee_inputargs = vec![InputArg::new_int_rc(0)];
         let callee_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(
@@ -25077,7 +25107,7 @@ mod tests {
             .compile_loop(&callee_inputargs, &callee_ops, &callee_token)
             .unwrap();
 
-        let caller_inputargs = vec![InputArg::new_int(0)];
+        let caller_inputargs = vec![InputArg::new_int_rc(0)];
         let caller_ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -25103,7 +25133,7 @@ mod tests {
     fn test_call_assembler_requires_gc_runtime_for_rewrite_parity() {
         let mut backend = CraneliftBackend::new();
         let callee_token = JitCellToken::new(1_500_352);
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -25129,7 +25159,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1_500_260);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
@@ -25201,7 +25231,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
         let loop_descr = make_label_descr(1_500_259);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
@@ -25273,9 +25303,9 @@ mod tests {
         let int_field = make_field_descr(0, 8, Type::Int, true);
 
         let inputargs = vec![
-            InputArg::new_ref(0),
-            InputArg::new_int(1),
-            InputArg::new_ref(2),
+            InputArg::new_ref_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_ref_rc(2),
         ];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![
@@ -25374,7 +25404,7 @@ mod tests {
         let start_descr = make_label_descr(1_500_265);
         let body_descr = make_label_descr(1_500_266);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
@@ -25457,7 +25487,7 @@ mod tests {
         let middle_descr = make_label_descr(1_500_269);
         let final_descr = make_label_descr(1_500_270);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
@@ -25568,7 +25598,7 @@ mod tests {
         let middle_descr = make_label_descr(1_500_281);
         let final_descr = make_label_descr(1_500_282);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(1)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
         let root_ops = vec![
@@ -25684,7 +25714,7 @@ mod tests {
         let start_descr = make_label_descr(1_500_290);
         let final_descr = make_label_descr(1_500_291);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let guard = mk_op(OpCode::GuardTrue, &[OpRef::int_op(2)], OpRef::NONE.raw());
         guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
         let root_ops = vec![
@@ -25771,9 +25801,9 @@ mod tests {
         let body_descr = make_label_descr(1_500_361);
 
         let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_int(1),
-            InputArg::new_int(2),
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
         ];
         let ops = vec![
             mk_op_with_descr(
@@ -25829,7 +25859,7 @@ mod tests {
         let cases = vec![
             (
                 OpCode::CallMallocNursery,
-                vec![InputArg::new_int(0)],
+                vec![InputArg::new_int_rc(0)],
                 vec![OpRef::input_arg_ref(0)],
                 1,
                 "configured GC runtime",
@@ -25837,9 +25867,9 @@ mod tests {
             (
                 OpCode::CallMallocNurseryVarsize,
                 vec![
-                    InputArg::new_int(0),
-                    InputArg::new_int(1),
-                    InputArg::new_int(2),
+                    InputArg::new_int_rc(0),
+                    InputArg::new_int_rc(1),
+                    InputArg::new_int_rc(2),
                 ],
                 vec![
                     OpRef::input_arg_ref(0),
@@ -25851,21 +25881,21 @@ mod tests {
             ),
             (
                 OpCode::CallMallocNurseryVarsizeFrame,
-                vec![InputArg::new_int(0)],
+                vec![InputArg::new_int_rc(0)],
                 vec![OpRef::input_arg_ref(0)],
                 1,
                 "configured GC runtime",
             ),
             (
                 OpCode::CondCallGcWb,
-                vec![InputArg::new_ref(0)],
+                vec![InputArg::new_ref_rc(0)],
                 vec![OpRef::input_arg_ref(0)],
                 OpRef::NONE.raw(),
                 "configured GC runtime",
             ),
             (
                 OpCode::CondCallGcWbArray,
-                vec![InputArg::new_ref(0), InputArg::new_int(1)],
+                vec![InputArg::new_ref_rc(0), InputArg::new_int_rc(1)],
                 vec![OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
                 OpRef::NONE.raw(),
                 "configured GC runtime",
@@ -26012,7 +26042,7 @@ mod tests {
         backend.set_constants(consts);
 
         let ad = make_array_descr(16, 8, Type::Int, Some(0));
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
@@ -26080,7 +26110,7 @@ mod tests {
         consts.insert(10002, 7_i64);
         backend.set_constants(consts);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -26123,7 +26153,7 @@ mod tests {
         let obj = majit_gc::GcAllocator::alloc_oldgen_typed(&mut gc, 0, 16);
         let mut backend = backend_with_gc(gc);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -26321,7 +26351,7 @@ mod tests {
         let mut backend = backend_with_gc(gc);
         let ref_fd = make_field_descr(0, 8, Type::Ref, false);
         let int_fd = make_field_descr(0, 8, Type::Int, true);
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(OpCode::CallMallocNursery, &[OpRef::int_op(16)], 1),
@@ -26513,7 +26543,7 @@ mod tests {
     fn test_strhash_without_descr_reads_cached_hash_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             OpRc::new(Op::new(oc, &bx))
@@ -26559,7 +26589,7 @@ mod tests {
     fn test_unicodehash_without_descr_reads_cached_hash_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let op = |oc, args: &[OpRef]| {
             let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
             OpRc::new(Op::new(oc, &bx))
@@ -26617,7 +26647,7 @@ mod tests {
         let mut backend = backend_with_gc(gc);
 
         let descr = make_call_descr(vec![Type::Int], Type::Int);
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -26674,7 +26704,7 @@ mod tests {
         let mut backend = backend_with_gc(gc);
 
         let descr = make_call_descr(vec![Type::Int], Type::Void);
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op_with_descr(
@@ -26728,7 +26758,7 @@ mod tests {
 
         let mut backend = backend_with_gc(gc);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -26787,7 +26817,7 @@ mod tests {
 
         let mut backend = backend_with_gc(gc);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -26865,7 +26895,7 @@ mod tests {
 
         let mut backend = backend_with_gc(gc);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -26927,7 +26957,7 @@ mod tests {
         let root = gc.alloc_with_type(0, 16);
         let mut backend = backend_with_gc(gc);
 
-        let inputargs = vec![InputArg::new_ref(0)];
+        let inputargs = vec![InputArg::new_ref_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_ref(0)], OpRef::NONE.raw()),
             mk_op(
@@ -26962,7 +26992,7 @@ mod tests {
         // has not been invalidated.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -26993,7 +27023,7 @@ mod tests {
         // the compiled code should side-exit through the guard's fail path.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
 
         // Build a guard with explicit fail_args so we can inspect them.
         let guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
@@ -27046,7 +27076,7 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         // Loop: i = i + 1; guard_not_invalidated; guard i < limit; jump
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos().set(OpRef::int_op(OpRef::NONE.raw()));
@@ -27096,7 +27126,7 @@ mod tests {
         // Verify that Backend::invalidate_loop() properly sets the flag.
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
 
         let guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
         guard_inv.pos().set(OpRef::int_op(OpRef::NONE.raw()));
@@ -27142,7 +27172,7 @@ mod tests {
     fn test_all_guards_have_recovery_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
         let guard1 = mk_op(
             OpCode::GuardTrue,
             &[OpRef::input_arg_int(0)],
@@ -27208,9 +27238,9 @@ mod tests {
         let mut backend = CraneliftBackend::new();
 
         let inputargs = vec![
-            InputArg::new_int(0),
-            InputArg::new_ref(1),
-            InputArg::new_float(2),
+            InputArg::new_int_rc(0),
+            InputArg::new_ref_rc(1),
+            InputArg::new_float_rc(2),
         ];
         let guard = mk_op(
             OpCode::GuardTrue,
@@ -27274,7 +27304,7 @@ mod tests {
         constants.insert(101, 7i64);
         backend.set_constants(constants);
 
-        let inputargs = vec![InputArg::new_int(0)];
+        let inputargs = vec![InputArg::new_int_rc(0)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
             mk_op(

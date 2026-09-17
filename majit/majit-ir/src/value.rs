@@ -3,6 +3,7 @@
 /// Translated from rpython/jit/metainterp/history.py.
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::cell::Cell;
 
 /// The type of a value in the JIT IR.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -398,7 +399,7 @@ impl Const {
 /// there is no Box-side mirror.
 #[derive(Debug)]
 pub struct InputArg {
-    pub tp: Type,
+    pub tp: Cell<Type>,
     /// Index in the inputargs list.
     pub index: u32,
     /// `resoperation.py AbstractInputArg._forwarded` parity slot —
@@ -417,31 +418,9 @@ pub struct InputArg {
     pub value: std::cell::Cell<Option<Value>>,
 }
 
-impl InputArg {
-    /// Produce a fresh-identity `InputArg` from this one. The
-    /// `_forwarded` slot (`resoperation.py:700
-    /// AbstractInputArg._forwarded`) is per-instance mutable state tied
-    /// to that identity and resets to `Forwarded::None` for the new
-    /// object, mirroring RPython where every `InputArgInt(pos) /
-    /// InputArgFloat(pos) / InputArgRef(pos)` instantiation yields a
-    /// fresh Python object with `_forwarded = None`.
-    ///
-    /// `InputArg` deliberately is **not** `Clone`. Identity-shared
-    /// cloning (preserving the `_forwarded` slot) must go through
-    /// [`InputArgRc`](crate::value::InputArgRc) (`Rc::clone`); call this
-    /// helper only at boundaries where a value-typed `InputArg` is
-    /// intentionally being detached from its origin (e.g. backend input
-    /// list materialization).
-    pub fn fresh_value_copy(&self) -> Self {
-        InputArg {
-            tp: self.tp,
-            index: self.index,
-            forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
-            // A new InputArg object has no payload yet
-            // (`resoperation.py InputArgInt/Float/Ref`). Remint that
-            // must keep stack bits uses the original box, not this copy.
-            value: std::cell::Cell::new(None),
-        }
+impl AsRef<InputArg> for InputArg {
+    fn as_ref(&self) -> &InputArg {
+        self
     }
 }
 
@@ -452,14 +431,14 @@ impl PartialEq for InputArg {
     /// `(tp, index)` tuple equality. `_forwarded` is mutable per-op
     /// state and excluded from identity comparison.
     fn eq(&self, other: &Self) -> bool {
-        self.tp == other.tp && self.index == other.index
+        self.tp.get() == other.tp.get() && self.index == other.index
     }
 }
 
 impl InputArg {
     pub fn new_int(index: u32) -> Self {
         InputArg {
-            tp: Type::Int,
+            tp: Cell::new(Type::Int),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -468,7 +447,7 @@ impl InputArg {
 
     pub fn new_ref(index: u32) -> Self {
         InputArg {
-            tp: Type::Ref,
+            tp: Cell::new(Type::Ref),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -477,7 +456,7 @@ impl InputArg {
 
     pub fn new_float(index: u32) -> Self {
         InputArg {
-            tp: Type::Float,
+            tp: Cell::new(Type::Float),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -493,7 +472,7 @@ impl InputArg {
             "InputArg::from_type: Type::Void is not a valid input-arg type",
         );
         InputArg {
-            tp,
+            tp: Cell::new(tp),
             index,
             forwarded: crate::resoperation::ForwardedSlot::new(crate::forwarding::Forwarded::None),
             value: std::cell::Cell::new(None),
@@ -542,7 +521,7 @@ impl InputArg {
     /// that construction so call sites do not reach for the raw `.index`
     /// field directly.
     pub fn opref(&self) -> crate::resoperation::OpRef {
-        crate::resoperation::OpRef::input_arg_typed(self.index, self.tp)
+        crate::resoperation::OpRef::input_arg_typed(self.index, self.tp.get())
     }
 }
 
@@ -623,6 +602,16 @@ impl InputArgRc {
 
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr == other.ptr
+    }
+
+    /// Update the box type in place. Fail-arg reconciliation can retag a
+    /// shared InputArg after unboxing; `tp` is otherwise construction-fixed.
+    pub fn set_tp(&self, tp: Type) {
+        assert!(
+            tp != Type::Void,
+            "InputArg::set_tp: Type::Void is not a valid input-arg type",
+        );
+        self.tp.set(tp);
     }
 
     pub fn as_ptr(this: &Self) -> *const InputArg {

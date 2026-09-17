@@ -2796,7 +2796,7 @@ impl majit_backend::Backend for AllocTestCpu {
     }
     fn compile_loop(
         &mut self,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _token: &majit_backend::JitCellToken,
     ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
@@ -2805,7 +2805,7 @@ impl majit_backend::Backend for AllocTestCpu {
     fn compile_bridge(
         &mut self,
         _fail_descr: &dyn majit_ir::FailDescr,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _original_token: &majit_backend::JitCellToken,
         _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],
@@ -14492,7 +14492,7 @@ struct PureArrayTestCpu;
 impl majit_backend::Backend for PureArrayTestCpu {
     fn compile_loop(
         &mut self,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _token: &majit_backend::JitCellToken,
     ) -> Result<majit_backend::AsmInfo, majit_backend::BackendError> {
@@ -14501,7 +14501,7 @@ impl majit_backend::Backend for PureArrayTestCpu {
     fn compile_bridge(
         &mut self,
         _fail_descr: &dyn majit_ir::FailDescr,
-        _inputargs: &[majit_ir::InputArg],
+        _inputargs: &[majit_ir::InputArgRc],
         _ops: &[majit_ir::OpRc],
         _original_token: &majit_backend::JitCellToken,
         _previous_tokens: &[std::sync::Arc<majit_backend::JitCellToken>],

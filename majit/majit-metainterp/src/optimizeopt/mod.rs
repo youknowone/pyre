@@ -1496,25 +1496,10 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // resume.py:202 box.get_box_replacement() as a box OBJECT. The canonical
         // host is the producer Op / InputArg, so two reaches of one logical box
         // return the same producer Rc (ptr_eq) — the #160 livebox dedup key.
-        // `get_box_replacement_operand_opt` carries the debug-build tripwire that
-        // the native Operand walk agrees with the legacy forwarding form on presence and
-        // identity, so the resume-numbering path validates the forwarding→Operand
-        // equivalence across the corpus. The fallback PANICS on a producerless
-        // position (the position-only Operand variant was dropped), the armed
-        // hazard-5 tripwire: a non-Const numbering key with no findable producer
-        // would otherwise mint a fresh, non-ptr_eq box and corrupt the livebox
-        // dedup. #157 drained these fires to zero across the corpus.
         if opref.is_none() {
             return Operand::None;
         }
-        if self.ctx.is_vm_red_name(opref) {
-            // `resolve_to_operand` follows `_forwarded` onto a Scope.
-            // Numbering must key the LiveboxMap by the assembled Vm name.
-            return Operand::bound_from_opref(opref);
-        }
-        self.ctx
-            .get_box_replacement_operand_opt(opref)
-            .unwrap_or_else(|| Operand::from_opref(self.ctx.get_replacement_opref(opref)))
+        self.ctx.get_box_replacement_operand(opref)
     }
 
     fn get_box_replacement_not_const(&self, opref: OpRef) -> OpRef {
@@ -2299,6 +2284,23 @@ impl OptContext {
     /// op.set_forwarded(newop)`, `OptUnroll.import_state`). Idempotent — re-running
     /// re-mirrors each slot to the same `InputArgRc`.
     pub(crate) fn ensure_inputarg_bindings(&mut self) {
+        // Reuse a reminted / recorder InputArg already in `input_ops`
+        // (`inputarg_from_tp` / `history.inputargs`) so the mint below
+        // does not create a second object for the same index.
+        for op in &self.input_ops {
+            for arg in op.getarglist() {
+                if let Some(ia) = arg.bound_inputarg() {
+                    self.inputarg_refs.entry(ia.index).or_insert(ia);
+                }
+            }
+            if let Some(failargs) = op.guard_fail_args() {
+                for arg in failargs {
+                    if let Some(ia) = arg.bound_inputarg() {
+                        self.inputarg_refs.entry(ia.index).or_insert(ia);
+                    }
+                }
+            }
+        }
         // Derive the materialized InputArg positions from `ctx` state.
         // The InputArg positions are exactly the
         // canonical/inherited set (`self.inputargs` = `optimizer.py
@@ -2345,7 +2347,7 @@ impl OptContext {
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         let pos = pos as u32;
         match self.inputarg_refs.get(&pos) {
-            Some(ia) if ia.tp == tp && ia.index == pos => {}
+            Some(ia) if ia.tp.get() == tp && ia.index == pos => {}
             _ => {
                 self.inputarg_refs.insert(
                     pos,
@@ -2739,6 +2741,26 @@ impl OptContext {
         // `live_synthetics` — the collision-safe stores `find_producer_op`
         // consults.
         for op in ops {
+            // Bridge / Phase-2 reminted InputArgs live on the op
+            // (`inputarg_from_tp`). `inputarg_base != 0` is that reminted
+            // namespace; reuse those Rcs instead of the stand-in
+            // `ensure_inputarg_bindings` just minted. `inputarg_base == 0`
+            // keeps test fixtures that seed `inputarg_refs` separately
+            // from per-call `bound_arg` mints.
+            if self.inputarg_base != 0 {
+                for arg in op.getarglist() {
+                    if let Some(ia) = arg.bound_inputarg() {
+                        self.inputarg_refs.insert(ia.index, ia);
+                    }
+                }
+                if let Some(failargs) = op.guard_fail_args() {
+                    for arg in failargs {
+                        if let Some(ia) = arg.bound_inputarg() {
+                            self.inputarg_refs.insert(ia.index, ia);
+                        }
+                    }
+                }
+            }
             let pos = op.pos().get();
             if pos.is_none() || pos.is_constant() {
                 continue;
@@ -3615,17 +3637,29 @@ impl OptContext {
     /// private `Rc` is invisible to `find_producer_op`; a forwarding chain
     /// ending on it leaves guard resume numbering with no producer to bind.
     ///
-    /// Only a genuinely unbound position is filled. An already-registered host
-    /// is the one every other chain resolves through, and overwriting it with a
-    /// foreign Phase-1 `Rc` would split one position across two boxes.
+    /// For Op hosts, only a genuinely unbound position is filled. An
+    /// already-registered Op is the one every other chain resolves
+    /// through, and overwriting it with a foreign Phase-1 `Rc` would
+    /// split one position across two boxes. The InputArg branch below
+    /// is the exception: it overwrites `inputarg_refs` so the carried
+    /// box replaces the stand-in.
     pub(crate) fn register_carried_host(&mut self, o: &Operand) {
         let pos = o.to_opref();
-        if pos.is_none() || pos.is_constant() || self.resolve_to_operand(pos).is_some() {
+        if pos.is_none() || pos.is_constant() {
             return;
         }
+        // A carried InputArg is the first object for that index
+        // (`inputarg_from_tp` / `history.inputargs`). Replace the
+        // `ensure_inputarg_bindings` stand-in so `_forwarded` and
+        // `resolve_to_operand` name the same Rc.
         if let Some(ia) = o.bound_inputarg() {
             self.inputarg_refs.insert(ia.index, ia);
-        } else if let Some(op) = o.bound_op() {
+            return;
+        }
+        if self.resolve_to_operand(pos).is_some() {
+            return;
+        }
+        if let Some(op) = o.bound_op() {
             self.install_canonical_producer(&op);
         }
     }
@@ -5341,9 +5375,10 @@ impl OptContext {
     ///
     /// Total, like the operand sibling [`Operand::get_box_replacement`]
     /// (returns the position-only operand on a miss) and
-    /// `get_box_replacement` (resoperation.py returns `op` itself when the
-    /// `_forwarded` chain is empty). A position that resolves to neither a
-    /// producer `Op`, an `inputarg_refs` slot, nor a Const falls back to
+    /// `resoperation.py get_box_replacement` (returns the last
+    /// `AbstractResOpOrInputArg` before `None` / Info / a rejected Const).
+    /// A position that resolves to neither a producer `Op`, an
+    /// `inputarg_refs` slot, nor a Const falls back to
     /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
     /// the same `pos` (`to_opref` byte-identical) rather than panicking. Every
     /// value-bearing op-arg position has a findable producer, so the fallback
@@ -9862,6 +9897,21 @@ mod boxref_forwarding_tests {
         ));
     }
 
+    #[test]
+    fn replacement_operand_walks_to_the_forwarded_terminal() {
+        let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
+        let foreign = InputArgRc::new(majit_ir::InputArg::from_type(Type::Int, 1));
+        b0.set_forwarded_inputarg(&foreign);
+
+        let resolved = ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int));
+        assert!(majit_ir::InputArgRc::ptr_eq(
+            &resolved
+                .bound_inputarg()
+                .expect("walked terminal carries bound InputArg"),
+            &foreign,
+        ));
+    }
+
     /// Forward-reference dup-materialization regression: a
     /// consumer that binds its operand to a position's stand-in BEFORE the
     /// producer at that position is emitted must, after the producer emits,
@@ -12216,7 +12266,7 @@ mod opt_box_env_tests {
             .bound_inputarg()
             .expect("empty InputArg* slot lazy-materialised the wrong host kind");
         assert_eq!(ia.index, 0);
-        assert_eq!(ia.tp, majit_ir::Type::Int);
+        assert_eq!(ia.tp.get(), majit_ir::Type::Int);
 
         // Re-entering must resolve to the same canonical `_forwarded`
         // host (`resoperation.py AbstractInputArg._forwarded`) —

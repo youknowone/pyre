@@ -23,7 +23,8 @@ use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
 
 use majit_backend::{AsmMemoryManager, BackendError, JitCellToken};
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArg, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex,
+    TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -845,7 +846,7 @@ pub struct Assembler386<'a> {
     /// Maps OpRef → jitframe slot index.
     opref_to_slot: IndexMap<OpRef, usize>,
     /// Trace inputargs — borrowed for `opref_type` lookups.
-    inputargs: &'a [InputArg],
+    inputargs: &'a [InputArgRc],
     /// Trace operations — borrowed for `opref_type` lookups (reads
     /// `op.type_` directly, RPython `box.type` parity).
     operations: &'a [OpRc],
@@ -1118,11 +1119,11 @@ impl<'a> Assembler386<'a> {
         cpu_handle: crate::guard::CpuDescrHandle,
         malloc_slowpath_fixed: usize,
         malloc_slowpath_headerless: usize,
-        inputargs: &'a [InputArg],
+        inputargs: &'a [InputArgRc],
         operations: &'a [OpRc],
     ) -> Self {
-        let inputarg_pos = OpTypeIndex::<Op>::build_inputarg_pos(inputargs);
-        let op_pos = OpTypeIndex::build_op_pos(operations);
+        let inputarg_pos = OpTypeIndex::<OpRc, InputArgRc>::build_inputarg_pos(inputargs);
+        let op_pos = OpTypeIndex::<OpRc, InputArgRc>::build_op_pos(operations);
         Assembler386 {
             mc: Assembler::new(0),
             asm_memory_manager,
@@ -1538,7 +1539,7 @@ impl<'a> Assembler386<'a> {
 
     // assembler.py:543 _call_header — function prologue
 
-    fn setup_input_state(&mut self, inputargs: &[InputArg]) {
+    fn setup_input_state(&mut self, inputargs: &[InputArgRc]) {
         // opref_to_slot stores ABSOLUTE jitframe slot indices so that
         // slot_offset(slot) returns the correct byte offset directly.
         // User position `p` maps to absolute slot `p + JITFRAME_FIXED_SIZE`.
@@ -1586,7 +1587,7 @@ impl<'a> Assembler386<'a> {
     ///   JZ   continue              ; slowpath: 0 = OK
     ///   ; fallthrough = real overflow → return rbp as jf_ptr
     /// ```
-    fn _call_header(&mut self, inputargs: &[InputArg]) {
+    fn _call_header(&mut self, inputargs: &[InputArgRc]) {
         // x86/assembler.py _call_header parity. PyPy reserves the
         // whole frame in a single `SUB esp, FRAME_FIXED_SIZE * WORD` and
         // stores `CALLEE_SAVE_REGISTERS` plus `ebp` at fixed offsets.
@@ -2459,7 +2460,7 @@ impl<'a> Assembler386<'a> {
     ///
     /// Returns compiled code with fail descriptors and entry point.
     pub fn assemble_loop(mut self) -> Result<CompiledCode, BackendError> {
-        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp.get()).collect();
 
         // assembler.py:537 prepare_loop — set up regalloc
         // For now, simplified: all args in frame slots
@@ -2559,7 +2560,7 @@ impl<'a> Assembler386<'a> {
     /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
         descr: &dyn majit_ir::FailDescr,
-        inputargs: &[InputArg],
+        inputargs: &[InputArgRc],
     ) -> Vec<Loc> {
         let mut locs = Vec::new();
         let gpr_regs = crate::x86::regalloc::ALL_CORE_REGS;
@@ -2580,7 +2581,10 @@ impl<'a> Assembler386<'a> {
             } else {
                 // llsupport/assembler.py:217 — frame slot
                 let slot = pos - JITFRAME_FIXED_SIZE;
-                let tp = inputargs.get(input_i).map(|ia| ia.tp).unwrap_or(Type::Int);
+                let tp = inputargs
+                    .get(input_i)
+                    .map(|ia| ia.tp.get())
+                    .unwrap_or(Type::Int);
                 locs.push(Loc::Frame(crate::regloc::FrameLoc::new(
                     slot,
                     crate::regalloc::get_ebp_ofs(base_ofs, slot),
@@ -2598,7 +2602,7 @@ impl<'a> Assembler386<'a> {
         fail_descr: &dyn FailDescr,
         arglocs: &[Loc],
     ) -> Result<CompiledCode, BackendError> {
-        self.input_types = self.inputargs.iter().map(|ia| ia.tp).collect();
+        self.input_types = self.inputargs.iter().map(|ia| ia.tp.get()).collect();
         self.bridge_input_locs = if arglocs.is_empty() {
             None
         } else {
@@ -2680,7 +2684,7 @@ impl<'a> Assembler386<'a> {
     /// locations, then emits code using those locations. This replaces the
     /// old frame-slot model where every value went through [rbp+offset].
     fn _assemble(&mut self, emit_prologue: bool) -> Result<(), BackendError> {
-        let inputargs: &'a [InputArg] = self.inputargs;
+        let inputargs: &'a [InputArgRc] = self.inputargs;
         let ops: &'a [OpRc] = self.operations;
         self.unrelocated_jump_target = None;
         if emit_prologue {
@@ -3728,6 +3732,14 @@ impl<'a> Assembler386<'a> {
                     Loc::Reg(val) => {
                         self.emit_op_gcstore_regalloc(base, ofs_loc, val, size);
                     }
+                    Loc::ImmedFloat(val_imm) if size == 4 => {
+                        let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
+                        let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov Rq(gpr), QWORD val_imm.value
+                            ; movq Rx(xmm.value), Rq(gpr));
+                        self.emit_op_gcstore_regalloc(base, ofs_loc, &xmm, size);
+                    }
                     Loc::Immed(val_imm) | Loc::ImmedFloat(val_imm) => {
                         self.emit_op_gcstore_imm_regalloc(base, ofs_loc, val_imm.value, size);
                     }
@@ -3780,6 +3792,12 @@ impl<'a> Assembler386<'a> {
                     macro_rules! emit_store_scaled {
                         ($scale:tt) => {{
                             match value_loc {
+                                Loc::Reg(val) if val.is_xmm && size == 4 => {
+                                    let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                                    dynasm!(self.mc ; .arch x64
+                                        ; cvtsd2ss Rx(scratch), Rx(val.value)
+                                        ; movss [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(scratch));
+                                }
                                 Loc::Reg(val) if val.is_xmm => {
                                     dynasm!(self.mc ; .arch x64
                                         ; movsd [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(val.value));
@@ -3794,6 +3812,15 @@ impl<'a> Assembler386<'a> {
                                     _ => dynasm!(self.mc ; .arch x64
                                         ; mov [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rq(val.value)),
                                 },
+                                Loc::ImmedFloat(i) if size == 4 => {
+                                    let gpr = crate::regloc::X86_64_SCRATCH_REG.value;
+                                    let xmm = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                                    dynasm!(self.mc ; .arch x64
+                                        ; mov Rq(gpr), QWORD i.value
+                                        ; movq Rx(xmm), Rq(gpr)
+                                        ; cvtsd2ss Rx(xmm), Rx(xmm)
+                                        ; movss [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset], Rx(xmm));
+                                }
                                 Loc::Immed(i) | Loc::ImmedFloat(i) => {
                                     let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                                     dynasm!(self.mc ; .arch x64
@@ -6861,7 +6888,14 @@ impl<'a> Assembler386<'a> {
         signed: bool,
     ) {
         if dst.is_xmm {
-            if let Some(r) = ofs_reg {
+            if size == 4 {
+                if let Some(r) = ofs_reg {
+                    dynasm!(self.mc ; .arch x64 ; movss Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; movss Rx(dst.value), [Rq(base.value) + ofs]);
+                }
+                dynasm!(self.mc ; .arch x64 ; cvtss2sd Rx(dst.value), Rx(dst.value));
+            } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
             } else {
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
@@ -7046,7 +7080,15 @@ impl<'a> Assembler386<'a> {
         size: usize,
     ) {
         if val.is_xmm {
-            if let Some(r) = ofs_reg {
+            if size == 4 {
+                let scratch = crate::regloc::X86_64_XMM_SCRATCH_REG.value;
+                dynasm!(self.mc ; .arch x64 ; cvtsd2ss Rx(scratch), Rx(val.value));
+                if let Some(r) = ofs_reg {
+                    dynasm!(self.mc ; .arch x64 ; movss [Rq(base.value) + Rq(r.value)], Rx(scratch));
+                } else {
+                    dynasm!(self.mc ; .arch x64 ; movss [Rq(base.value) + ofs], Rx(scratch));
+                }
+            } else if let Some(r) = ofs_reg {
                 dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + Rq(r.value)], Rx(val.value));
             } else {
                 dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(val.value));

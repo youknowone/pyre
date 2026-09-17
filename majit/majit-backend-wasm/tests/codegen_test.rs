@@ -9,7 +9,9 @@ use std::process::Command;
 
 use majit_backend_wasm::codegen;
 use majit_ir::operand::Operand;
-use majit_ir::{EffectInfo, InputArg, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type};
+use majit_ir::{
+    EffectInfo, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type,
+};
 use smallvec::smallvec;
 use wasmi::{Engine, Linker, Memory, MemoryType, Module, Store, Table, TableType, Val, ValType};
 
@@ -588,7 +590,7 @@ fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
 /// tests assert on. `vtable_offset` and `gc_info` stay explicit because a
 /// few tests vary them.
 fn build_module(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     vtable_offset: Option<usize>,
@@ -605,7 +607,7 @@ fn build_module(
 }
 
 fn build_module_with_frame(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     vtable_offset: Option<usize>,
@@ -625,7 +627,7 @@ fn build_module_with_frame(
 
 #[allow(clippy::too_many_arguments)]
 fn build_module_with_ca(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     vtable_offset: Option<usize>,
@@ -634,7 +636,7 @@ fn build_module_with_ca(
     ca: codegen::CaParams,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: constants.clone(),
@@ -666,7 +668,7 @@ fn build_module_with_ca(
 /// `build_module` with the most common variant: entry vtable_offset `Some(0)`
 /// and a default (disabled) `GuardGcTypeInfo`.
 fn build_module_default(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
@@ -740,8 +742,8 @@ fn module_shape(bytes: &[u8]) -> (Vec<(usize, usize)>, Vec<u32>, HashMap<String,
 #[test]
 fn sparse_value_ids_declare_only_addressable_value_locals() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         make_op(
@@ -773,7 +775,7 @@ fn sparse_value_ids_declare_only_addressable_value_locals() {
 
 #[test]
 fn same_as_reuses_its_source_local() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::SameAsI,
@@ -799,7 +801,7 @@ fn same_as_reuses_its_source_local() {
 
 #[test]
 fn same_as_does_not_alias_a_mutable_label_local() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
         make_op(
@@ -829,7 +831,7 @@ fn same_as_before_label_defines_a_fresh_label_arg() {
     // Peeled header: preamble produces v1, SameAs copies it into the
     // LABEL-arg box, fall-through then reads that box. Without the
     // SameAs the backend declines (see the next test).
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::IntAdd,
@@ -855,7 +857,7 @@ fn unbound_read_without_a_producer_declines() {
     // A LABEL arg with no producer is a peeled-header live-in and is
     // defined at the LABEL. A Finish that reads a never-written box
     // is not; that local would stay the zero wasm initializes it to.
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::IntAdd,
@@ -866,7 +868,7 @@ fn unbound_read_without_a_producer_declines() {
     ];
 
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -934,7 +936,7 @@ fn unbound_pool_float_operand_declares_an_f64_local() {
 /// parameters (`consider_label`); they must not trip unbound-pool decline.
 #[test]
 fn label_livein_inputarg_is_defined_at_the_label() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let live_in = OpRef::input_arg_int(101);
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
@@ -958,7 +960,7 @@ fn label_livein_inputarg_is_defined_at_the_label() {
 /// `label_ref_phi_without_a_producer_declines`.
 #[test]
 fn label_livein_inputarg_ref_is_defined_at_the_label() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let live_in = OpRef::input_arg_ref(101);
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
@@ -980,7 +982,7 @@ fn label_livein_inputarg_ref_is_defined_at_the_label() {
 /// so the local read as the zero wasm initializes it to.
 #[test]
 fn label_livein_pool_const_is_seeded_in_prologue() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let live_in = OpRef::input_arg_int(101);
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0)), rb(live_in)]),
@@ -1048,12 +1050,12 @@ fn direct_write_barrier_call_count(bytes: &[u8], target: i32) -> usize {
 }
 
 fn build_module_with_write_barrier_target(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     write_barrier_target: i64,
 ) -> Vec<u8> {
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -1107,7 +1109,7 @@ fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residu
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type(Type::Ref, 0)],
+        &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         WB_TARGET,
     );
@@ -1160,8 +1162,8 @@ fn write_barrier_elision_keeps_one_barrier_per_base() {
     new_store_b.setdescr(pointer_field.clone());
     let allocated = build_module_with_write_barrier_target(
         &[
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Ref, 1),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
         ],
         &[new_obj, new_store_a, new_store_b, finish.clone()],
         WB_TARGET,
@@ -1186,9 +1188,9 @@ fn write_barrier_elision_keeps_one_barrier_per_base() {
     live_store_b.setdescr(pointer_field);
     let repeated_livein = build_module_with_write_barrier_target(
         &[
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Ref, 1),
-            InputArg::from_type(Type::Ref, 2),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
+            InputArg::from_type_rc(Type::Ref, 2),
         ],
         &[live_store_a, live_store_b, finish],
         WB_TARGET,
@@ -1226,9 +1228,9 @@ fn write_barrier_elision_follows_same_as_r_base() {
 
     let bytes = build_module_with_write_barrier_target(
         &[
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Ref, 1),
-            InputArg::from_type(Type::Ref, 2),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Ref, 1),
+            InputArg::from_type_rc(Type::Ref, 2),
         ],
         &[
             store_before_alias,
@@ -1253,8 +1255,8 @@ fn execute_ovf_trace_with_guard(
     b: i64,
 ) -> (i64, i64) {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let guard = Op::new(guard_opcode, &[]);
     guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
@@ -1319,7 +1321,7 @@ fn execute_ovf_trace(opcode: OpCode, a: i64, b: i64) -> (i64, i64) {
 /// folded-bound form instead of the sign-comparison one. `const_first` puts
 /// it on the left, which only addition accepts.
 fn execute_ovf_trace_const(opcode: OpCode, a: i64, c: i64, const_first: bool) -> (i64, i64) {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let guard = Op::new(OpCode::GuardNoOverflow, &[]);
     guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
@@ -1436,8 +1438,8 @@ fn test_int_sub_ovf_guards_overflow() {
 #[test]
 fn test_int_mul_ovf_fuses_its_adjacent_overflow_guard() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let guard = Op::new(OpCode::GuardNoOverflow, &[]);
     guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
@@ -1523,8 +1525,8 @@ fn test_int_mul_ovf_guards_overflow() {
 #[test]
 fn test_int_mul_ovf_emits_signed32_fast_path_and_full_width_fallback() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let guard = Op::new(OpCode::GuardNoOverflow, &[]);
     guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
@@ -1566,8 +1568,8 @@ fn test_int_mul_ovf_emits_signed32_fast_path_and_full_width_fallback() {
 #[test]
 fn test_guard_fail_args_spill_in_their_own_failure_arms() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let first_guard = Op::new(OpCode::GuardTrue, &[rb(OpRef::input_arg_int(0))]);
     first_guard.setfailargs(smallvec![
@@ -1628,8 +1630,8 @@ fn test_guard_fail_args_spill_in_their_own_failure_arms() {
 #[test]
 fn test_fused_integer_guard_true_uses_inverse_comparison_directly() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let compare = make_op(
         OpCode::IntLt,
@@ -1671,9 +1673,9 @@ fn test_fused_integer_guard_true_uses_inverse_comparison_directly() {
 fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
     const FAIL_INDEX_BASE: u32 = 37;
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
-        InputArg::from_type(Type::Float, 2),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Float, 2),
     ];
     let fail_args = smallvec![
         rb(OpRef::input_arg_ref(1)),
@@ -1686,7 +1688,7 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
     finish.setfailargs(fail_args);
     let ops = [guard, finish];
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -1767,7 +1769,7 @@ fn test_guard_overflow_uses_pending_flag() {
 
 #[test]
 fn test_empty_trace() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![{
         let op = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
         op.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
@@ -1841,7 +1843,7 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
     const CELL_INDEX: u32 = 2;
     const THRESHOLD: u64 = 3;
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::IntAdd,
@@ -1945,12 +1947,12 @@ fn a_deferred_merge_trips_once_at_its_threshold() {
 /// and the regions merged into it vary between them, so a new field lands here
 /// once instead of at each call site.
 fn inline_region_inputs(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: Vec<Op>,
     inlined_bridges: Vec<codegen::InlinedBridge>,
 ) -> codegen::ModuleBuildInputs {
     codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges,
         constants: indexmap::IndexMap::new(),
@@ -1978,7 +1980,7 @@ fn inline_region_inputs(
 
 #[test]
 fn inlined_bridge_without_owner_loop_label_declines() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let guard = make_guard(
         OpCode::GuardTrue,
         &[OpRef::input_arg_int(0)],
@@ -1993,7 +1995,7 @@ fn inlined_bridge_without_owner_loop_label_declines() {
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
-            inputargs: vec![InputArg::from_type(Type::Int, 1)],
+            inputargs: vec![InputArg::from_type_rc(Type::Int, 1)],
             ops: vec![Op::new(OpCode::Finish, &[])],
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
@@ -2086,8 +2088,8 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
         ca: codegen::CaParams,
     ) -> Result<Vec<u8>, majit_backend::BackendError> {
         let inputargs = vec![
-            InputArg::from_type(Type::Int, 0),
-            InputArg::from_type(Type::Int, 1),
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Int, 1),
         ];
         let owner_ops = vec![
             Op::new(
@@ -2110,7 +2112,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             ),
         ];
         let inputs = codegen::ModuleBuildInputs {
-            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            inputargs: inputargs.to_vec(),
             ops: owner_ops,
             inlined_bridges: vec![codegen::InlinedBridge {
                 external_jump: None,
@@ -2118,8 +2120,8 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
                 outside_loop: false,
                 trace_id: 7,
                 inputargs: vec![
-                    InputArg::from_type(Type::Int, 40),
-                    InputArg::from_type(Type::Int, 41),
+                    InputArg::from_type_rc(Type::Int, 40),
+                    InputArg::from_type_rc(Type::Int, 41),
                 ],
                 ops: region_ops,
                 gc_table_base: 0,
@@ -2225,7 +2227,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
 fn call_assembler_accepts_float_and_void_result_locals() {
     fn build(opcode: OpCode, result: OpRef, input_type: Type) -> Vec<u8> {
         let token = 0x5a5a_u64;
-        let inputargs = vec![InputArg::from_type(input_type, 0)];
+        let inputargs = vec![InputArg::from_type_rc(input_type, 0)];
         let call = make_op(opcode, &[OpRef::input_arg_typed(0, input_type)], result);
         call.setdescr(std::sync::Arc::new(TargetTokenCallDescr {
             arg_types: vec![input_type],
@@ -2302,7 +2304,7 @@ fn call_assembler_accepts_float_and_void_result_locals() {
 fn call_assembler_inlines_malloc_cond_varsize_frame() {
     let token = 0x5a5a_u64;
     let nursery_free = 0x1000_u32;
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let call = make_op(
         OpCode::CallAssemblerI,
         &[OpRef::input_arg_int(0)],
@@ -2399,7 +2401,7 @@ fn call_assembler_inlines_malloc_cond_varsize_frame() {
 /// CALL_ASSEMBLER is wasted work (`fib_recursive`).
 #[test]
 fn entry_prologue_does_not_null_unmarked_home_padding() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))])];
     let frame = codegen::FrameGeometry::compact(64, 128, 2);
     let home_fill_bytes = (frame.home_slots as i32) * 8;
@@ -2466,7 +2468,7 @@ fn call_assembler_pop_reads_callee_gnf2_from_snapshot() {
     fn build(with_caller_gnf2: bool) -> Vec<u8> {
         let token = 0x5a5a_u64;
         let ca_pop_fn_ptr = 0x77_i64;
-        let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         let call = make_op(
             OpCode::CallAssemblerI,
             &[OpRef::input_arg_int(0)],
@@ -2662,8 +2664,8 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
         owner_constants: indexmap::IndexMap<u32, i64>,
     ) -> Result<Vec<u8>, majit_backend::BackendError> {
         let inputargs = vec![
-            InputArg::from_type(Type::Int, 0),
-            InputArg::from_type(Type::Int, 1),
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Int, 1),
         ];
         // `int_op(base + 3)` has no producing op: it is a folded value that
         // only the region's own constant pool binds, so the merge has to move
@@ -2688,7 +2690,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             ),
         ];
         let inputs = codegen::ModuleBuildInputs {
-            inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+            inputargs: inputargs.to_vec(),
             ops: owner_ops(),
             inlined_bridges: vec![codegen::InlinedBridge {
                 external_jump: None,
@@ -2696,8 +2698,8 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
                 outside_loop: false,
                 trace_id: 7,
                 inputargs: vec![
-                    InputArg::from_type(Type::Int, base),
-                    InputArg::from_type(Type::Int, base + 1),
+                    InputArg::from_type_rc(Type::Int, base),
+                    InputArg::from_type_rc(Type::Int, base + 1),
                 ],
                 ops: region_ops,
                 gc_table_base: 0,
@@ -2761,8 +2763,8 @@ fn test_int_add_loop() {
     // Label(i, sum) -> IntAdd(sum, i) -> IntAdd(i, 1) -> IntLt(i, 100)
     // -> GuardTrue -> Jump(new_i, new_sum)
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0), // i
-        InputArg::from_type(Type::Int, 1), // sum
+        InputArg::from_type_rc(Type::Int, 0), // i
+        InputArg::from_type_rc(Type::Int, 1), // sum
     ];
 
     let const_1 = OpRef::const_int(1);
@@ -2808,8 +2810,8 @@ fn label_int_phi_without_a_producer_still_compiles() {
     // A body LABEL can carry a virtualstate int box the peel never wrote.
     // Treating that id as unbound declined every wasm loop.
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
@@ -2861,8 +2863,8 @@ fn label_ref_phi_without_a_producer_declines() {
     // A residual virtualizable Ref on the LABEL is not a phi wasm can
     // bind to a local. Compiling it stores null on failarg writeback.
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![
@@ -2888,7 +2890,7 @@ fn label_ref_phi_without_a_producer_declines() {
         Op::new(OpCode::Jump, &[rb(OpRef::int_op(2)), rb(OpRef::ref_op(85))]),
     ];
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants,
@@ -2925,8 +2927,8 @@ fn label_ref_phi_without_a_producer_declines() {
 #[test]
 fn compute_home_gcmap_simple_loop_is_valid() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
@@ -2962,7 +2964,7 @@ fn compute_home_gcmap_simple_loop_is_valid() {
     ca.compute_home_gcmap = true;
     let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: constants.clone(),
@@ -2994,8 +2996,8 @@ fn compute_home_gcmap_simple_loop_is_valid() {
 #[test]
 fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
@@ -3032,7 +3034,7 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
     ca.ca_reload_fn_ptr = 1;
     let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants,
@@ -3069,8 +3071,8 @@ fn home_gcmap_union_call_validates_on_a_reload_only_residual_family() {
 #[test]
 fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
@@ -3106,7 +3108,7 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
     ca.ca_reload_fn_ptr = 1;
     let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -3161,8 +3163,8 @@ fn home_gcmap_publish_pointer_eq_guards_the_union_call() {
 #[test]
 fn reemit_nulls_grown_label_homes_and_builds() {
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_ref(0))]),
@@ -3180,7 +3182,7 @@ fn reemit_nulls_grown_label_homes_and_builds() {
     ca.home_gcmap_min_labels = 0;
     let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -3218,8 +3220,8 @@ fn reemit_nulls_grown_label_homes_and_builds() {
 #[test]
 fn label_arg_import_hole_is_not_an_unbound_read() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let const_1 = OpRef::const_int(1);
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -3242,7 +3244,7 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
     ca.compute_home_gcmap = true;
     let frame = codegen::FrameGeometry::compact(64, 128 + 2, 2);
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: constants.clone(),
@@ -3274,7 +3276,7 @@ fn label_arg_import_hole_is_not_an_unbound_read() {
 /// A real read of an unbound hole (not a LABEL phi name) is still declined.
 #[test]
 fn unbound_non_label_read_of_import_hole_is_declined() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let ops = vec![make_op(
         OpCode::IntAdd,
@@ -3282,7 +3284,7 @@ fn unbound_non_label_read_of_import_hole_is_declined() {
         OpRef::int_op(200),
     )];
     let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: constants.clone(),
@@ -3326,7 +3328,7 @@ fn test_folded_producer_value_seeds_unbound_local() {
     let folded = Operand::from_bound_op(&producer);
     folded.set_forwarded_const(majit_ir::Const::Int(7));
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let add = Op::new(OpCode::IntAdd, &[folded, rb(OpRef::input_arg_int(0))]);
     add.pos().set(OpRef::int_op(1));
     let ops = vec![add, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
@@ -3349,7 +3351,7 @@ fn test_folded_producer_ref_is_interned() {
     let folded = Operand::from_bound_op(&producer);
     folded.set_forwarded_const(majit_ir::Const::Ref(majit_ir::GcRef(0x1000)));
 
-    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let same = Op::new(OpCode::SameAsR, &[folded]);
     same.pos().set(OpRef::ref_op(1));
     let ops = vec![same, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))])];
@@ -3376,8 +3378,8 @@ fn test_stray_label_inputarg_is_seeded() {
     // Loop LABEL / JUMP carry an InputArg that is not in the token input
     // list (peeled fallthrough leftover). Must compile, not decline.
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let ops = vec![
         Op::new(
@@ -3412,8 +3414,8 @@ fn test_external_jump_leftover_inputarg_declines() {
     // A leftover InputArg on a JUMP that does not land on a LABEL in this
     // stream is a live transfer. Seeding 0 would hand the target null.
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let jump = Op::new(
         OpCode::Jump,
@@ -3440,7 +3442,7 @@ fn test_external_jump_leftover_inputarg_declines() {
     ];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
         constants,
@@ -3481,8 +3483,8 @@ fn test_stray_failarg_ref_declines() {
     // live-in has no producer. #1780 treats LABEL args as defined;
     // a snapshot-only leftover is still a null identity at deopt.
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let guard = make_guard(
         OpCode::GuardTrue,
@@ -3506,7 +3508,7 @@ fn test_stray_failarg_ref_declines() {
     ];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
         constants,
@@ -3568,7 +3570,7 @@ fn test_force_arm_accepts_constptr_failarg() {
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type(Type::Ref, 0)],
+        &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
     );
@@ -3621,7 +3623,7 @@ fn test_force_arm_rematerializes_constptr_from_gc_table() {
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type(Type::Ref, 0)],
+        &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
     );
@@ -3671,7 +3673,7 @@ fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type(Type::Ref, 0)],
+        &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
     );
@@ -3711,10 +3713,10 @@ fn test_inputarg_observation_is_not_a_folded_scalar() {
         add,
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]),
     ];
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let err = match codegen::build_wasm_module(&codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
         constants,
@@ -3752,8 +3754,8 @@ fn test_inputarg_observation_is_not_a_folded_scalar() {
 #[test]
 fn test_float_ops() {
     let inputargs = vec![
-        InputArg::from_type(Type::Float, 0),
-        InputArg::from_type(Type::Float, 1),
+        InputArg::from_type_rc(Type::Float, 0),
+        InputArg::from_type_rc(Type::Float, 1),
     ];
 
     let ops = vec![
@@ -3799,7 +3801,7 @@ fn test_float_ops() {
 
 #[test]
 fn test_call_generates_import() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     let func_ptr = OpRef::const_int(42); // fake func_ptr
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -3992,7 +3994,7 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
 
 #[test]
 fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         void_call(vec![], &[], 0),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
@@ -4011,8 +4013,8 @@ fn test_nullary_true_void_call_uses_indirect_call_without_drop() {
 #[test]
 fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let ops = vec![
         void_call(
@@ -4051,9 +4053,9 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
     // pointer, and an eight-byte write over four-byte items clobbers the next.
     let descr: majit_ir::DescrRef = Arc::new(SimpleArrayDescr::new(0, 16, 8, 71, Type::Ref));
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Ref, 2),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
     ];
     let get = make_op(
         OpCode::GetarrayitemGcR,
@@ -4094,7 +4096,7 @@ fn an_allocation_is_followed_by_a_memory_error_check() {
     use majit_ir::descr::SimpleSizeDescr;
     use std::sync::Arc;
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
     new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
     let ops = vec![
@@ -4127,9 +4129,9 @@ fn test_true_void_family_does_not_shift_new_call_type() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Ref, 1),
-        InputArg::from_type(Type::Int, 2),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 2),
     ];
     let new_op = make_op(OpCode::New, &[], OpRef::ref_op(3));
     new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
@@ -4174,9 +4176,9 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Ref, 1),
-        InputArg::from_type(Type::Int, 2),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 2),
     ];
     let new_op = make_op(OpCode::New, &[], OpRef::ref_op(3));
     new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
@@ -4219,8 +4221,8 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
 #[test]
 fn test_true_void_float_arg_call_keeps_trampoline() {
     let inputargs = vec![
-        InputArg::from_type(Type::Float, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Float, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
@@ -4243,8 +4245,8 @@ fn test_true_void_float_arg_call_keeps_trampoline() {
 #[test]
 fn test_vouched_true_void_float_arg_call_lowers_in_module() {
     let inputargs = vec![
-        InputArg::from_type(Type::Float, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Float, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         void_call(vec![Type::Float], &[OpRef::input_arg_float(0)], 0),
@@ -4288,8 +4290,8 @@ fn test_vouching_a_uniform_word_callee_emits_the_same_module() {
         (vec![Type::Int], vec![OpRef::input_arg_int(0)], 8),
     ];
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     for (arg_types, args, result_size) in shapes {
         let build = || {
@@ -4317,7 +4319,7 @@ fn test_vouching_a_uniform_word_callee_emits_the_same_module() {
 
 #[test]
 fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], 8),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
@@ -4349,7 +4351,7 @@ fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
 /// backend's own host takes.
 #[test]
 fn test_frame_reload_is_emitted_only_when_a_reload_helper_is_published() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], 8),
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
@@ -4389,7 +4391,7 @@ fn test_frame_reload_is_emitted_only_when_a_reload_helper_is_published() {
 
 #[test]
 fn test_true_void_type_index_accounts_for_trampoline_type() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::CallI,
@@ -4412,8 +4414,8 @@ fn test_true_void_type_index_accounts_for_trampoline_type() {
 #[test]
 fn test_guard_types() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
 
     let ops = vec![
@@ -4480,7 +4482,7 @@ fn test_guard_types() {
 /// covered by global_quasiimmut_invalidation.py; this pins the emitted load.
 #[test]
 fn test_guard_not_invalidated_loads_runtime_flag() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let guard = Op::new(OpCode::GuardNotInvalidated, &[]);
     guard.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
     let ops = vec![
@@ -4489,7 +4491,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
     ];
     let constants = indexmap::IndexMap::new();
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: constants.clone(),
@@ -4541,7 +4543,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
 /// slots. Validates the emitted bytecode is well-formed (stack-balanced).
 #[test]
 fn test_exception_guards() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
@@ -4575,7 +4577,7 @@ fn test_exception_guards() {
 /// classptr — no `mem32[obj + 0]` read, no classptr→typeid lookup.
 #[test]
 fn test_guard_gc_type_uses_immediate_typeid() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     // Inline-Const carrying the immediate typeid 0x42
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -4629,7 +4631,7 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
 /// runs; the resulting module must validate as legal wasm.
 #[test]
 fn test_guard_is_object_lowers_to_typeinfo_test() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     let ops = vec![
         Op::new(OpCode::Label, &[rb(OpRef::input_arg_int(0))]),
@@ -4661,7 +4663,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
 /// lowering runs to completion.
 #[test]
 fn test_guard_subclass_lowers_to_subclassrange_check() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     // model.py `cls_of_box()` returns `ConstInt(ptr2int(typeptr))` —
     // the emitted guard-class operand is the vtable address carried as a raw
@@ -4697,7 +4699,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
 
 #[test]
 fn test_sameas_and_conversions() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
 
     let ops = vec![
         make_op(
@@ -4752,8 +4754,8 @@ fn test_sameas_and_conversions() {
 #[test]
 fn test_overflow_ops() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
 
     let ops = vec![
@@ -4797,7 +4799,7 @@ fn test_single_label_peeled_loop_validates() {
     // skip dispatch (block $exit / $past_loader / $skip_preamble + br_if, with
     // the preamble at br-depth 2 and the body at 1). This validates the new
     // control-flow nesting and br depths via wasmparser.
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)]; // i
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)]; // i
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -4845,7 +4847,7 @@ fn test_single_label_peeled_loop_validates() {
 /// where the trace puts it and leaves that decision to the optimizer.
 #[test]
 fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::IntAdd,
@@ -4872,7 +4874,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
     ];
     let gc_table_base = 4096;
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.iter().cloned().collect(),
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -4958,7 +4960,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
 /// collecting back edge — cranelift `resolve_failarg_opref`.
 #[test]
 fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::LoadFromGcTable,
@@ -4985,7 +4987,7 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
     ];
     let gc_table_base = 4096;
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -5063,8 +5065,8 @@ fn preamble_gc_table_failarg_is_reloaded_inside_the_loop() {
 #[test]
 fn test_peeled_label_captures_missing_ref_livein_in_frozen_frame() {
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         make_op(
@@ -5123,7 +5125,7 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
     // `loop` is). This proves the wrapper + br depths stay valid for a
     // multi-label source — the case `compile_bridge` newly accepts when a
     // loop-closing bridge targets that last label.
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)]; // i
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)]; // i
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -5174,7 +5176,7 @@ fn test_multi_label_peeled_resumes_at_last_label_validates() {
 /// turn every such call into a trap rather than a decline.
 #[test]
 fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let const_1 = OpRef::const_int(1);
     let const_100 = OpRef::const_int(100);
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
@@ -5263,7 +5265,7 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
 /// `br_table` arm, which runs before any parameter is read.
 #[test]
 fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let const_1 = OpRef::const_int(1);
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
 
@@ -5312,7 +5314,7 @@ fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
 
 /// `build_module_default` for a trace that closes into another module.
 fn build_external_jump_module(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     constants: &indexmap::IndexMap<u32, i64>,
     external_jump_slot: u32,
@@ -5320,7 +5322,7 @@ fn build_external_jump_module(
     external_jump_wide_slot: u32,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.to_vec(),
         inlined_bridges: Vec::new(),
         constants: constants.clone(),
@@ -5385,7 +5387,7 @@ fn test_non_last_label_backedge_validates() {
     // LABEL followed by a narrower peeled header, while the closing JUMP
     // targets the earlier entry label.  The LABEL/JUMP descr identity, not
     // source position, is the loop target and determines the parallel move.
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
     let wide_descr = majit_ir::make_loop_target_descr(10, false);
     let narrow_descr = majit_ir::make_loop_target_descr(11, false);
@@ -5547,7 +5549,7 @@ fn build_owner_with_region_closing_at(
         region_jump,
     ];
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let inputs = inline_region_inputs(
         &inputargs,
         ops,
@@ -5556,7 +5558,7 @@ fn build_owner_with_region_closing_at(
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
-            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: region_ops,
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
@@ -5720,9 +5722,9 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
     }
     region_ops.push(region_jump);
 
-    let mut inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let mut inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     if with_ref {
-        inputargs.push(InputArg::from_type(Type::Ref, 6));
+        inputargs.push(InputArg::from_type_rc(Type::Ref, 6));
     }
     let inputs = inline_region_inputs(
         &inputargs,
@@ -5734,11 +5736,11 @@ fn run_non_header_region_repro(with_ref: bool) -> (i64, i64, i64) {
             trace_id: 1,
             inputargs: if with_ref {
                 vec![
-                    InputArg::from_type(Type::Int, 10),
-                    InputArg::from_type(Type::Ref, 13),
+                    InputArg::from_type_rc(Type::Int, 10),
+                    InputArg::from_type_rc(Type::Ref, 13),
                 ]
             } else {
-                vec![InputArg::from_type(Type::Int, 10)]
+                vec![InputArg::from_type_rc(Type::Int, 10)]
             },
             ops: region_ops,
             gc_table_base: 0,
@@ -5806,7 +5808,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
         finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
 
         let inputs = codegen::ModuleBuildInputs {
-            inputargs: vec![InputArg::from_type(Type::Int, 0)],
+            inputargs: vec![InputArg::from_type_rc(Type::Int, 0)],
             ops: vec![new_op, new_array_op, finish],
             inlined_bridges: Vec::new(),
             constants: indexmap::IndexMap::new(),
@@ -5948,10 +5950,10 @@ fn host_gni_bridge_ops(label_descr: &std::sync::Arc<dyn majit_ir::Descr>) -> Vec
     ops
 }
 
-fn host_bridge_inputargs() -> Vec<InputArg> {
+fn host_bridge_inputargs() -> Vec<InputArgRc> {
     vec![
-        InputArg::from_type(Type::Int, 40),
-        InputArg::from_type(Type::Int, 41),
+        InputArg::from_type_rc(Type::Int, 40),
+        InputArg::from_type_rc(Type::Int, 41),
     ]
 }
 
@@ -5960,10 +5962,10 @@ fn host_bridge_inputargs() -> Vec<InputArg> {
 /// single-threaded wasm host guarantees and a parallel test runner does not.
 static HOST_COMPILE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-fn host_loop_inputargs() -> Vec<InputArg> {
+fn host_loop_inputargs() -> Vec<InputArgRc> {
     vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ]
 }
 
@@ -6313,7 +6315,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
         region_jump,
     ];
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let inputs = inline_region_inputs(
         &inputargs,
         ops,
@@ -6322,7 +6324,7 @@ fn run_non_header_capture_repro() -> (i64, i64, i64) {
             source_fail_index: 0,
             outside_loop: false,
             trace_id: 1,
-            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: region_ops,
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
@@ -6430,7 +6432,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
         region_b_jump,
     ];
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let inputs = inline_region_inputs(
         &inputargs,
         ops,
@@ -6440,7 +6442,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 source_fail_index: 0,
                 outside_loop: false,
                 trace_id: 1,
-                inputargs: vec![InputArg::from_type(Type::Int, 10)],
+                inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
                 ops: region_a,
                 gc_table_base: 0,
                 constants: indexmap::IndexMap::new(),
@@ -6450,7 +6452,7 @@ fn run_two_non_header_regions_repro() -> (i64, i64, i64) {
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 2,
-                inputargs: vec![InputArg::from_type(Type::Int, 20)],
+                inputargs: vec![InputArg::from_type_rc(Type::Int, 20)],
                 ops: region_b,
                 gc_table_base: 0,
                 constants: indexmap::IndexMap::new(),
@@ -6593,7 +6595,7 @@ fn preamble_region_inputs() -> codegen::ModuleBuildInputs {
         region_jump,
     ];
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     inline_region_inputs(
         &inputargs,
         ops,
@@ -6602,7 +6604,7 @@ fn preamble_region_inputs() -> codegen::ModuleBuildInputs {
             source_fail_index: 0,
             outside_loop: true,
             trace_id: 1,
-            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: region_ops,
             gc_table_base: 0,
             constants: indexmap::IndexMap::new(),
@@ -6661,7 +6663,7 @@ fn a_preamble_guard_is_classified_apart_from_a_loop_body_one() {
         jump,
     ];
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let inputs = inline_region_inputs(&inputargs, ops, vec![]);
     assert!(codegen::source_guard_precedes_loop_label(&inputs.ops, 0));
     assert!(!codegen::source_guard_precedes_loop_label(&inputs.ops, 1));
@@ -6772,7 +6774,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
         region_b_jump,
     ];
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let inputs = inline_region_inputs(
         &inputargs,
         ops,
@@ -6782,7 +6784,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 source_fail_index: 1,
                 outside_loop: false,
                 trace_id: 2,
-                inputargs: vec![InputArg::from_type(Type::Int, 20)],
+                inputargs: vec![InputArg::from_type_rc(Type::Int, 20)],
                 ops: region_b,
                 gc_table_base: 0,
                 constants: indexmap::IndexMap::new(),
@@ -6792,7 +6794,7 @@ fn run_mixed_region_families_repro() -> (i64, i64, i64) {
                 source_fail_index: 0,
                 outside_loop: true,
                 trace_id: 1,
-                inputargs: vec![InputArg::from_type(Type::Int, 10)],
+                inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
                 ops: region_a,
                 gc_table_base: 0,
                 constants: indexmap::IndexMap::new(),
@@ -6870,14 +6872,14 @@ fn a_preamble_region_closing_at_a_label_past_its_guard_declines() {
         &[earlier_jump]
     ));
     let inputs = inline_region_inputs(
-        &vec![InputArg::from_type(Type::Int, 0)],
+        &vec![InputArg::from_type_rc(Type::Int, 0)],
         ops,
         vec![codegen::InlinedBridge {
             external_jump: None,
             source_fail_index: 0,
             outside_loop: true,
             trace_id: 1,
-            inputargs: vec![InputArg::from_type(Type::Int, 10)],
+            inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
             ops: vec![
                 make_op(
                     OpCode::IntAdd,
@@ -7050,12 +7052,12 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
     ];
 
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 6),
-        InputArg::from_type(Type::Ref, 7),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 6),
+        InputArg::from_type_rc(Type::Ref, 7),
     ];
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
             external_jump: None,
@@ -7063,9 +7065,9 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
             outside_loop: false,
             trace_id: 1,
             inputargs: vec![
-                InputArg::from_type(Type::Int, 10),
-                InputArg::from_type(Type::Ref, 13),
-                InputArg::from_type(Type::Ref, 16),
+                InputArg::from_type_rc(Type::Int, 10),
+                InputArg::from_type_rc(Type::Ref, 13),
+                InputArg::from_type_rc(Type::Ref, 16),
             ],
             ops: region_ops,
             gc_table_base: 0,
@@ -7249,11 +7251,11 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
     region_ops.push(region_jump);
 
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 6),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 6),
     ];
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops,
         inlined_bridges: vec![codegen::InlinedBridge {
             external_jump: None,
@@ -7261,8 +7263,8 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
             outside_loop: false,
             trace_id: 1,
             inputargs: vec![
-                InputArg::from_type(Type::Int, 10),
-                InputArg::from_type(Type::Ref, 13),
+                InputArg::from_type_rc(Type::Int, 10),
+                InputArg::from_type_rc(Type::Ref, 13),
             ],
             ops: region_ops,
             gc_table_base: 0,
@@ -7392,7 +7394,7 @@ fn guard_value_parks_its_operand_past_every_exits_fail_args() {
     // fail args" would put the word in slot 1, which is the GUARD_TRUE's
     // second fail argument — a slot another exit reads back as a fail value.
     // The slot is one per trace, past every exit's fail args.
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::IntAdd,
@@ -7520,7 +7522,9 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
         (false, Some(17)),
         (true, None),
     ] {
-        let inputargs: Vec<_> = (0..3).map(|i| InputArg::from_type(Type::Int, i)).collect();
+        let inputargs: Vec<_> = (0..3)
+            .map(|i| InputArg::from_type_rc(Type::Int, i))
+            .collect();
         let mut failargs = vec![OpRef::NONE; 100];
         failargs[17] = OpRef::input_arg_int(2);
         failargs[99] = OpRef::input_arg_int(1);
@@ -7631,7 +7635,7 @@ fn sparse_resume_positions_use_compact_exit_and_force_locations() {
 /// conditional reservation would make the second one slot wider than the first.
 #[test]
 fn a_counterless_trace_reserves_the_slot_a_bridge_may_need() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     // Shared prefix: three values, a two-fail-arg exit, and a FINISH.
     let common = vec![
         make_op(
@@ -7732,12 +7736,12 @@ fn wb_helpers_without_cards() -> codegen::WriteBarrierHelpers {
 }
 
 fn build_module_with_barrier_helpers(
-    inputargs: &[InputArg],
+    inputargs: &[InputArgRc],
     ops: &[Op],
     wb: codegen::WriteBarrierHelpers,
 ) -> Vec<u8> {
     let inputs = codegen::ModuleBuildInputs {
-        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        inputargs: inputargs.to_vec(),
         ops: ops.to_vec(),
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -7781,15 +7785,15 @@ fn ref_array_store(
     op
 }
 
-fn two_ref_array_stores() -> (Vec<InputArg>, Vec<Op>) {
+fn two_ref_array_stores() -> (Vec<InputArgRc>, Vec<Op>) {
     use majit_ir::descr::SimpleArrayDescr;
     use std::sync::Arc;
     let descr = Arc::new(SimpleArrayDescr::new(1, 16, 8, 55, Type::Ref));
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Ref, 2),
-        InputArg::from_type(Type::Ref, 3),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
+        InputArg::from_type_rc(Type::Ref, 3),
     ];
     let ops = vec![
         ref_array_store(&descr, OpRef::input_arg_int(1), OpRef::input_arg_ref(2)),
@@ -7864,10 +7868,10 @@ fn a_remembered_base_suppresses_a_later_array_barrier() {
     );
     field.setdescr(Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false)));
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Ref, 2),
-        InputArg::from_type(Type::Ref, 3),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
+        InputArg::from_type_rc(Type::Ref, 3),
     ];
     let ops = vec![
         field,
@@ -7922,10 +7926,10 @@ fn a_statically_short_array_takes_the_plain_barrier() {
             op
         };
         let inputargs = vec![
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Int, 1),
-            InputArg::from_type(Type::Ref, 2),
-            InputArg::from_type(Type::Ref, 3),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Int, 1),
+            InputArg::from_type_rc(Type::Ref, 2),
+            InputArg::from_type_rc(Type::Ref, 3),
         ];
         let ops = vec![
             new,
@@ -7995,8 +7999,8 @@ fn array_get_bytes(item_size: usize, index: OpRef) -> Vec<u8> {
     );
     get.setdescr(descr);
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
     let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
@@ -8082,9 +8086,9 @@ fn interior_field_ops_compile() {
     raw.setdescr(interior(8));
 
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Int, 2),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
     ];
     let ops = vec![
         set,
@@ -8119,8 +8123,8 @@ fn count_operators(bytes: &[u8], mut f: impl FnMut(&wasmparser::Operator<'_>)) {
 #[test]
 fn cond_call_value_tests_its_value_and_calls_arg_one() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         make_op(
@@ -8156,7 +8160,7 @@ fn cond_call_value_tests_its_value_and_calls_arg_one() {
 #[test]
 fn guard_nonnull_class_also_tests_for_null() {
     let build = |opcode: OpCode| {
-        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+        let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
         let ops = vec![
             make_guard(
                 opcode,
@@ -8196,7 +8200,7 @@ fn call_release_gil_takes_its_callee_from_arg_one() {
     use majit_ir::descr::SimpleCallDescr;
     use std::sync::Arc;
 
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let call = make_op(
         OpCode::CallReleaseGilI,
         &[
@@ -8243,8 +8247,8 @@ fn raw_load_f_loads_a_double() {
 
     let descr = Arc::new(SimpleArrayDescr::new(1, 0, 8, 55, Type::Float));
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let load = make_op(
         OpCode::RawLoadF,
@@ -8271,7 +8275,7 @@ fn raw_load_const_offset_uses_memarg_displacement() {
 
     const OFFSET: u64 = 24;
     let descr = Arc::new(SimpleArrayDescr::new(1, 0, 8, 55, Type::Int));
-    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Ref, 0)];
     let load = make_op(
         OpCode::RawLoadI,
         &[OpRef::input_arg_ref(0), OpRef::const_int(OFFSET as i64)],
@@ -8303,9 +8307,9 @@ fn raw_load_const_offset_uses_memarg_displacement() {
 #[test]
 fn int_between_is_two_signed_comparisons() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Int, 2),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
     ];
     let ops = vec![
         make_op(
@@ -8334,8 +8338,8 @@ fn int_between_is_two_signed_comparisons() {
 #[test]
 fn float_mod_uses_a_guest_side_typed_helper() {
     let inputargs = vec![
-        InputArg::from_type(Type::Float, 0),
-        InputArg::from_type(Type::Float, 1),
+        InputArg::from_type_rc(Type::Float, 0),
+        InputArg::from_type_rc(Type::Float, 1),
     ];
     let ops = vec![
         make_op(
@@ -8363,7 +8367,7 @@ fn float_mod_uses_a_guest_side_typed_helper() {
 
 #[test]
 fn check_memory_error_keeps_the_non_null_path_compiled() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     let ops = vec![
         make_op(
             OpCode::CheckMemoryError,
@@ -8386,8 +8390,8 @@ fn check_memory_error_keeps_the_non_null_path_compiled() {
 #[test]
 fn same_as_and_load_effective_address_do_not_decline() {
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         make_op(
@@ -8450,8 +8454,8 @@ fn execute_simple_trace(bytes: &[u8], inputs: &[i64]) -> i64 {
 #[test]
 fn int_signext_accepts_a_runtime_width() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         make_op(
@@ -8480,7 +8484,7 @@ fn int_signext_accepts_a_runtime_width() {
 
 #[test]
 fn singlefloat_casts_round_trip_through_wasm_f32() {
-    let inputargs = vec![InputArg::from_type(Type::Float, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Float, 0)];
     let ops = vec![
         make_op(
             OpCode::CastFloatToSinglefloat,
@@ -8515,9 +8519,9 @@ fn singlefloat_casts_round_trip_through_wasm_f32() {
 #[test]
 fn gc_rewrite_bare_load_store_execute_with_dynamic_offset() {
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Int, 2),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
     ];
     let ops = vec![
         make_op(
@@ -8549,9 +8553,9 @@ fn gc_rewrite_bare_load_store_execute_with_dynamic_offset() {
 #[test]
 fn gc_rewrite_indexed_load_store_execute() {
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
-        InputArg::from_type(Type::Int, 2),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 2),
     ];
     let ops = vec![
         make_op(
@@ -8590,8 +8594,8 @@ fn zero_array_uses_memory_fill_for_the_rewriter_range() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let store = make_op(
         OpCode::GcStore,
@@ -8649,8 +8653,8 @@ fn zero_array_uses_memory_fill_for_the_rewriter_range() {
 #[test]
 fn cond_call_reload_sits_on_the_arm_that_called() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Ref, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
     ];
     let ops = vec![
         make_op(
@@ -8707,8 +8711,8 @@ fn cond_call_reload_sits_on_the_arm_that_called() {
 #[test]
 fn cond_call_n_emits_predicate_and_trampoline() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![
         make_op(
@@ -8744,8 +8748,8 @@ fn descr_proven_cond_call_n_uses_direct_table_call() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let call = make_op(
         OpCode::CondCallN,
@@ -8789,8 +8793,8 @@ fn descr_proven_cond_call_value_uses_direct_table_call() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let call = make_op(
         OpCode::CondCallValueI,
@@ -8835,7 +8839,7 @@ fn descr_proven_cond_call_value_uses_direct_table_call() {
 /// code and neither may cost the trace its compile.
 #[test]
 fn debug_and_record_metadata_opcodes_compile_instead_of_declining() {
-    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
     for opcode in [OpCode::JitDebug, OpCode::RecordKnownResult] {
         let ops = vec![
             make_op(opcode, &[OpRef::input_arg_int(0)], OpRef::NONE),
@@ -8852,8 +8856,8 @@ fn fused_cond_call_n_consumes_the_comparison_i32() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let compare = make_op(
         OpCode::IntLt,
@@ -8911,8 +8915,8 @@ fn fused_cond_call_value_consumes_the_comparison_i32() {
     use std::sync::Arc;
 
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let compare = make_op(
         OpCode::IntEq,
@@ -8966,8 +8970,8 @@ fn fused_cond_call_value_consumes_the_comparison_i32() {
 #[test]
 fn fused_guard_isnull_uses_the_comparison_directly() {
     let inputargs = vec![
-        InputArg::from_type(Type::Int, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     let compare = make_op(
         OpCode::IntEq,
@@ -9015,7 +9019,7 @@ fn threadlocalref_get_lowers_through_the_tls_helper() {
             ],
             vec![],
         );
-        inputs.inputargs = vec![InputArg::from_type(Type::Int, 0)];
+        inputs.inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         inputs.alloc.threadlocal_fn_ptr = 0x66;
         let (bytes, _, _, _) =
             codegen::build_wasm_module(&inputs).expect("ThreadlocalrefGet should lower");
@@ -9066,8 +9070,8 @@ fn cond_call_materializes_a_condition_reused_as_an_argument_or_callee() {
         )));
         let (bytes, _) = build_module_default(
             &[
-                InputArg::from_type(Type::Int, 0),
-                InputArg::from_type(Type::Int, 1),
+                InputArg::from_type_rc(Type::Int, 0),
+                InputArg::from_type_rc(Type::Int, 1),
             ],
             &[compare, call, Op::new(OpCode::Finish, &[])],
             &indexmap::IndexMap::new(),
@@ -9100,7 +9104,7 @@ fn unlowered_virtual_refs_and_errno_calls_decline() {
             },
         );
         let inputs = inline_region_inputs(
-            &[InputArg::from_type(Type::Ref, 0)],
+            &[InputArg::from_type_rc(Type::Ref, 0)],
             vec![op, Op::new(OpCode::Finish, &[])],
             vec![],
         );
@@ -9116,7 +9120,7 @@ fn unlowered_virtual_refs_and_errno_calls_decline() {
             OpRef::int_op(1),
         );
         let inputs = inline_region_inputs(
-            &[InputArg::from_type(Type::Int, 0)],
+            &[InputArg::from_type_rc(Type::Int, 0)],
             vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])],
             vec![],
         );
@@ -9227,7 +9231,7 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
     let mut plain_tids = std::collections::HashSet::new();
     plain_tids.insert(plain_tid);
     codegen::ModuleBuildInputs {
-        inputargs: vec![InputArg::from_type(Type::Int, 0)],
+        inputargs: vec![InputArg::from_type_rc(Type::Int, 0)],
         ops,
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
@@ -9365,7 +9369,7 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
         source_fail_index: 0,
         outside_loop: false,
         trace_id: 1,
-        inputargs: vec![InputArg::from_type(Type::Int, 10)],
+        inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
         ops: vec![plain_new(11, 53), region_finish],
         gc_table_base: 0,
         constants: indexmap::IndexMap::new(),
@@ -9423,8 +9427,8 @@ fn setfield_between_news_keeps_one_nursery_bump() {
         53,
     );
     inputs.inputargs = vec![
-        InputArg::from_type(Type::Ref, 0),
-        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
     ];
     inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
@@ -9714,8 +9718,8 @@ fn inline_nursery_new_keeps_the_barrier_at_the_slow_path_join() {
     plain_tids.insert(53);
     let inputs = codegen::ModuleBuildInputs {
         inputargs: vec![
-            InputArg::from_type(Type::Ref, 0),
-            InputArg::from_type(Type::Int, 2),
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Int, 2),
         ],
         ops: vec![new_op, store, finish],
         inlined_bridges: Vec::new(),
@@ -9790,7 +9794,7 @@ fn a_constant_fail_arg_in_a_force_bracket_is_published_as_a_literal() {
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_ref(0))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type(Type::Ref, 0)],
+        &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
     );

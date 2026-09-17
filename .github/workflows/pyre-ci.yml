@@ -612,27 +612,35 @@ jobs:
     - name: Build test binaries (cranelift)
       shell: bash
       # Keep this package list identical to the cranelift test step below.
+      # Two invocations: `--tests` is cargo-wide and would drop
+      # majit-backend-cranelift's `--lib` compiler tests if combined.
       run: |
+        # `--features cranelift` belongs on metainterp (it selects the
+        # backend). majit-backend-cranelift has no such feature, so naming
+        # it beside `-p majit-backend-cranelift` is a cargo error.
+        cargo test --no-run -p majit-backend-cranelift
         cargo test --no-run --no-default-features --features cranelift \
-          -p majit-metainterp -p majit-backend-cranelift
+          -p majit-metainterp --tests
 
     - name: Run cargo tests (cranelift)
       shell: bash
       # This is a separate step so GitHub reports and reruns the backend passes
       # independently. Steps remain in one job, in order, so this pass starts
       # only after dynasm finishes and reuses that pass's Cargo target cache.
-      # Exercise the cranelift backend and the metainterp's backend-selection
-      # path. The dynasm pass above already covers the rest of the workspace;
-      # rebuilding the pyre stack and every example with a second backend adds
-      # substantial compile and link cost without covering backend code that
-      # these two crates do not already exercise.
+      # Exercise the cranelift backend and the metainterp integration tests
+      # that actually compile (jit_interp_*, vable blackhole, …). The dynasm
+      # pass already ran optimizeopt/resume/blackhole `--lib` unit tests and
+      # every other workspace crate; re-running those under cranelift only
+      # reproduced the same results while linking the metainterp unit harness.
+      # `--tests` is integration targets only, not `--lib`.
       # `--no-fail-fast` because these are several separate test binaries:
       # without it cargo stops at the first one that fails and the run names a
       # single failure where there may be more, which costs a round trip per
       # hidden sibling.
       run: |
+        cargo test --no-fail-fast -p majit-backend-cranelift
         cargo test --no-fail-fast --no-default-features --features cranelift \
-          -p majit-metainterp -p majit-backend-cranelift
+          -p majit-metainterp --tests
         # The two label-selector tests set PYRE_CL_NO_CLOSING_JUMP, a
         # process-global env var read while compiling, so they are `#[ignore]`d
         # out of the parallel run above and need a serial process of their own.

@@ -12,7 +12,7 @@ use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
-use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
+use majit_translate::front::mir::{LowerContext, lower_fun_decl_with_static_addrs};
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
 use majit_translate::{
     CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs, VirtualizableFieldDescriptor,
@@ -31,7 +31,7 @@ fn interpreter_llbc() -> Option<Llbc> {
     Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
 }
 
-fn lower_named(llbc: &Llbc, leaf: &str) -> FunctionGraph {
+fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionGraph {
     let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
@@ -51,14 +51,16 @@ fn lower_named(llbc: &Llbc, leaf: &str) -> FunctionGraph {
         },
         ..Default::default()
     };
-    lower_fun_decl_with_static_addrs(llbc, fd, static_addrs)
+    lower_fun_decl_with_static_addrs(context, fd, static_addrs)
         .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
 }
 
 /// Lower `pyframe::<Impl>::fast2locals` out of the shipped LLBC, or `None`
 /// when the artefact is absent so the tests degrade to a skip.
 fn lower_fast2locals() -> Option<FunctionGraph> {
-    Some(lower_named(&interpreter_llbc()?, "fast2locals"))
+    let llbc = interpreter_llbc()?;
+    let context = LowerContext::new(&llbc);
+    Some(lower_named(&llbc, &context, "fast2locals"))
 }
 
 fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
@@ -87,7 +89,8 @@ fn the_access_directly_marker_folds_out_of_the_type_lookup() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let graph = lower_named(&llbc, "typedef::type");
+    let context = LowerContext::new(&llbc);
+    let graph = lower_named(&llbc, &context, "typedef::type");
     assert!(
         call_leafs(&graph)
             .iter()
@@ -105,8 +108,13 @@ fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
-    let gateway = lower_named(&llbc, "__majit_wrap_descr_typecheck_fget_getdictscope");
-    let method = lower_named(&llbc, "fget_getdictscope");
+    let context = LowerContext::new(&llbc);
+    let gateway = lower_named(
+        &llbc,
+        &context,
+        "__majit_wrap_descr_typecheck_fget_getdictscope",
+    );
+    let method = lower_named(&llbc, &context, "fget_getdictscope");
     assert!(
         call_leafs(&gateway)
             .iter()
@@ -150,6 +158,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
+    let context = LowerContext::new(&llbc);
     for leaf in [
         "__majit_wrap_descr_typecheck_get_w_globals",
         "__majit_wrap_descr_typecheck_fget_f_lasti",
@@ -163,7 +172,7 @@ fn every_redirected_frame_getter_carries_a_deletable_force() {
         "__majit_wrap_descr_typecheck_fget_f_trace_opcodes",
         "__majit_wrap_descr_typecheck_fset_f_trace_opcodes",
     ] {
-        let gateway = lower_named(&llbc, leaf);
+        let gateway = lower_named(&llbc, &context, leaf);
         let before = call_leafs(&gateway);
         assert!(
             before
@@ -201,13 +210,14 @@ fn the_gateways_outside_the_redirected_set_carry_no_force() {
     let Some(llbc) = interpreter_llbc() else {
         return;
     };
+    let context = LowerContext::new(&llbc);
     for leaf in [
         "__majit_wrap_descr_typecheck_fget_f_code",
         "__majit_wrap_descr_typecheck_fget_f_back",
         "__majit_wrap_descr_typecheck_fget_f_builtins",
         "__majit_wrap_descr_typecheck_get_generator",
     ] {
-        let gateway = lower_named(&llbc, leaf);
+        let gateway = lower_named(&llbc, &context, leaf);
         let before = call_leafs(&gateway);
         assert!(
             before
