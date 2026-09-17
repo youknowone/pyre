@@ -19936,44 +19936,17 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         .replace_box(cls_ref, cls_const);
 
     let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
-    let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(args_list) {
-        let type_const = ctx.trace_ctx.const_int(list_type);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardClass,
-            &[args_list, type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(args_list, list_type);
-    }
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        args_list,
-        crate::descr::list_strategy_descr(),
-    );
-    let object_strategy = ctx
-        .trace_ctx
-        .const_int(pyre_object::listobject::ListStrategy::Object as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op.pc,
-        OpCode::GuardValue,
-        &[strategy, object_strategy],
-    )?;
     let length = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         args_list,
-        crate::descr::list_length_descr(),
+        crate::descr::rlist_length_descr(),
     );
     let len_const = ctx.trace_ctx.const_int(args_len as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[length, len_const])?;
     let block = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         args_list,
-        crate::descr::list_items_descr(),
+        crate::descr::rlist_items_descr(),
     );
     let mut items = Vec::with_capacity(args_len);
     for index in 0..args_len {
