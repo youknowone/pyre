@@ -3159,6 +3159,9 @@ pub const FLOAT_MATH1_SIN: i64 = 2;
 pub const FLOAT_MATH1_COS: i64 = 3;
 pub const FLOAT_MATH1_TAN: i64 = 4;
 pub const FLOAT_MATH1_ATAN: i64 = 5;
+pub const FLOAT_MATH1_EXP: i64 = 6;
+pub const FLOAT_MATH1_LOG1P: i64 = 7;
+pub const FLOAT_MATH1_ASIN: i64 = 8;
 
 /// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
@@ -3170,6 +3173,9 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_COS => _float_cos(x),
         FLOAT_MATH1_TAN => _float_tan(x),
         FLOAT_MATH1_ATAN => _float_atan(x),
+        FLOAT_MATH1_EXP => _float_exp(x),
+        FLOAT_MATH1_LOG1P => _float_log1p(x),
+        FLOAT_MATH1_ASIN => _float_asin(x),
         _ => _float_abs(x),
     }
 }
@@ -6752,6 +6758,48 @@ pub(crate) fn _float_atan(x: f64) -> PyResult {
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.atan(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_exp` after the overflow pin: `W_FloatObject(exp(x))`.
+#[inline(never)]
+pub(crate) fn _float_exp(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.exp(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_log1p` after `x > -1`: `W_FloatObject(log1p(x))`.
+#[inline(never)]
+pub(crate) fn _float_log1p(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.ln_1p(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_asin` after the `[-1, 1]` pin: `W_FloatObject(asin(x))`.
+#[inline(never)]
+pub(crate) fn _float_asin(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.asin(),
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)

@@ -273,7 +273,28 @@ pub fn tan(args: &[PyObjectRef]) -> PyResult {
         )),
     }
 }
-pm1_edom!(asin, "expected a number in range from -1 up to 1");
+/// `math.asin` after `_get_double`: domain pin, then [`_float_asin`].
+pub fn asin(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "asin() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::asin(val) {
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
+            val,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_ASIN,
+        ),
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
+            "expected a number in range from -1 up to 1, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
+}
 pm1_edom!(acos, "expected a number in range from -1 up to 1");
 /// `math.atan` after `_get_double`: [`_float_atan`].
 pub fn atan(args: &[PyObjectRef]) -> PyResult {
@@ -339,6 +360,9 @@ struct MathBuiltinWrappers {
     sin: usize,
     tan: usize,
     atan: usize,
+    exp: usize,
+    log1p: usize,
+    asin: usize,
     frexp: usize,
     ldexp: usize,
     isqrt: usize,
@@ -374,6 +398,9 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         sin: math_wrapper_addr(ns, "sin"),
         tan: math_wrapper_addr(ns, "tan"),
         atan: math_wrapper_addr(ns, "atan"),
+        exp: math_wrapper_addr(ns, "exp"),
+        log1p: math_wrapper_addr(ns, "log1p"),
+        asin: math_wrapper_addr(ns, "asin"),
         frexp: math_wrapper_addr(ns, "frexp"),
         ldexp: math_wrapper_addr(ns, "ldexp"),
         isqrt: math_wrapper_addr(ns, "isqrt"),
@@ -440,6 +467,18 @@ pub fn is_math_tan_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_atan_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.atan)
+}
+
+pub fn is_math_exp_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.exp)
+}
+
+pub fn is_math_log1p_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.log1p)
+}
+
+pub fn is_math_asin_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.asin)
 }
 
 /// Callable-identity probes used by the meta-trace walker.  As with
@@ -598,7 +637,6 @@ macro_rules! jit_raw2 {
     };
 }
 
-jit_raw1!(jit_math_asin, asin);
 jit_raw1!(jit_math_acos, acos);
 
 jit_raw1!(jit_math_sinh, sinh);
@@ -608,10 +646,8 @@ jit_raw1!(jit_math_asinh, asinh);
 jit_raw1!(jit_math_acosh, acosh);
 jit_raw1!(jit_math_atanh, atanh);
 jit_raw1!(jit_math_cbrt, cbrt);
-jit_raw1!(jit_math_exp, exp);
 jit_raw1!(jit_math_exp2, exp2);
 jit_raw1!(jit_math_expm1, expm1);
-jit_raw1!(jit_math_log1p, log1p);
 jit_raw1!(jit_math_erf, erf);
 jit_raw1!(jit_math_erfc, erfc);
 jit_raw1!(jit_math_gamma, gamma);
@@ -755,11 +791,10 @@ macro_rules! math_fold_table {
     };
 }
 
-/// `sqrt`, `log`, `cos`, `sin`, `tan`, `atan` and `fabs` are absent: each
-/// has a dedicated specialization that lowers to a tighter shape.
+/// Dedicated leaves (`sqrt`, `log`, `cos`, `sin`, `tan`, `atan`, `exp`,
+/// `log1p`, `asin`, `fabs`) are absent from this table.
 math_fold_table!(
     MATH_FLOAT1_FOLDS: MathFloat1Fold,
-    "asin" => jit_math_asin,
     "acos" => jit_math_acos,
     "sinh" => jit_math_sinh,
     "cosh" => jit_math_cosh,
@@ -768,10 +803,8 @@ math_fold_table!(
     "acosh" => jit_math_acosh,
     "atanh" => jit_math_atanh,
     "cbrt" => jit_math_cbrt,
-    "exp" => jit_math_exp,
     "exp2" => jit_math_exp2,
     "expm1" => jit_math_expm1,
-    "log1p" => jit_math_log1p,
     "erf" => jit_math_erf,
     "erfc" => jit_math_erfc,
     "gamma" => jit_math_gamma,
@@ -841,10 +874,51 @@ pub fn math_float_fold_helper_addrs() -> Vec<i64> {
 }
 
 pm1!(cbrt);
-pm1!(exp);
+/// `math.exp` after `_get_double`: overflow pin, then [`_float_exp`].
+pub fn exp(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "exp() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::exp(val) {
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
+            val,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_EXP,
+        ),
+        Err(pymath::Error::EDOM) => {
+            Err(pyre_interpreter::PyError::value_error("math domain error"))
+        }
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
+}
 pm1!(exp2);
 pm1!(expm1);
-pm1_edom!(log1p, "expected argument value > -1");
+/// `math.log1p` after `_get_double`: domain pin, then [`_float_log1p`].
+pub fn log1p(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "log1p() takes exactly one argument",
+        ));
+    }
+    let val = try_get_double(args[0])?;
+    match pymath::math::log1p(val) {
+        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
+            val,
+            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_LOG1P,
+        ),
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
+            "expected argument value > -1, got {}",
+            float_repr(val)
+        ))),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
+}
 
 // Gamma / error
 pm1!(erf);
