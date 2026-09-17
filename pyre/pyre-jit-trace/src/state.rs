@@ -3853,7 +3853,9 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     // Also publish the same Arc under the codewriter ARRAY identity so
     // `resolve_array_tid(path_hash(OBJECT_REF_GCARRAY_TYPE_ID))` finds
     // tid 9 (`cpu.arraydescrof(ARRAY)` / `descr.py get_array_descr`).
-    majit_ir::descr_registry::register_keyed_array(
+    // Force-insert: `register_keyed_array` is first-wins, and an earlier
+    // analyzer mint under this key would otherwise keep a different tid.
+    majit_ir::descr_registry::force_register_keyed_array(
         majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(
             majit_translate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID,
         )),
