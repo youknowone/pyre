@@ -160,6 +160,10 @@ pub mod pycode;
 pub mod pyopcode;
 pub mod pytraceback;
 pub mod reduce_protocol;
+/// Host socket layer — `rpython/rlib/_rsocket_rffi.py`.
+/// Signal uses this rlib API, not `pypy.module._socket`.
+#[cfg(any(unix, windows))]
+pub mod rsocket_rffi;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod sliceobject;

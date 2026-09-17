@@ -956,7 +956,7 @@ pub unsafe fn inet_ntop(
 /// `inet_pton`'s two failures, which it reports through different channels: a
 /// negative return leaves `EAFNOSUPPORT` behind, a zero says the string was
 /// read and rejected.
-pub(crate) enum PtonError {
+pub enum PtonError {
     /// A family with no parser behind it.
     Family(i32),
     /// An address this family's parser refused.
