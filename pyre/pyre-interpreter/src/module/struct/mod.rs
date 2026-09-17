@@ -730,6 +730,89 @@ fn unpack_slow(this: &W_Struct, w_str: PyObjectRef) -> Result<PyObjectRef, crate
     do_unpack(fmt, buf)
 }
 
+/// `BuiltinCode.func` for `Struct.pack`.
+///
+/// The generated `#[pyre_methods]` wrapper `inline_call`s the method, and
+/// that call is an effect, so `pack_slow`'s `dont_look_inside` would sit
+/// after an effect.  The walk is spelled here, the way
+/// `__majit_wrap_str_descr_startswith` spells `rstring_prefix_eq`.
+pub fn __majit_wrap_struct_pack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(this) = W_Struct::from_obj(args.get(0).copied().unwrap_or(PY_NULL)) else {
+        return Err(crate::PyError::type_error(
+            "descriptor 'pack' for 'Struct' objects doesn't apply to a 'object' object",
+        ));
+    };
+    if this.size >= 0 && args.len() == 2 {
+        let value = args[1];
+        if unsafe { is_int(value) } {
+            let format = majit_metainterp::jit::promote_string(this.format);
+            // Field load, not `w_str_get_value`: the surrogate panic is an
+            // effect and would put `pack_slow` after one.
+            let fmt = unsafe { w_str_get_wtf8(format) };
+            if let Some((4, true, false)) = simple_int_format!(fmt) {
+                let v = unsafe { w_int_get_value(value) };
+                if v >= -2147483648 && v <= 2147483647 {
+                    let b0 = v as u8;
+                    let b1 = (v >> 8) as u8;
+                    let b2 = (v >> 16) as u8;
+                    let b3 = (v >> 24) as u8;
+                    return Ok(jit_w_bytes_from_u8x4(b0, b1, b2, b3));
+                }
+            }
+        }
+    }
+    pack_slow(this, args)
+}
+
+/// `BuiltinCode.func` for `Struct.unpack`.
+pub fn __majit_wrap_struct_unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "unpack() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let Some(this) = W_Struct::from_obj(args[0]) else {
+        return Err(crate::PyError::type_error(
+            "descriptor 'unpack' for 'Struct' objects doesn't apply to a 'object' object",
+        ));
+    };
+    let w_str = args[1];
+    if this.size >= 0 {
+        let format = majit_metainterp::jit::promote_string(this.format);
+        let fmt = unsafe { w_str_get_wtf8(format) };
+        if let Some((4, true, false)) = simple_int_format!(fmt) {
+            if unsafe { bytesobject::is_bytes(w_str) } && unsafe { w_bytes_len(w_str) } == 4 {
+                let b0 = unsafe { jit_w_bytes_getitem(w_str, 0) } as i64;
+                let b1 = unsafe { jit_w_bytes_getitem(w_str, 1) } as i64;
+                let b2 = unsafe { jit_w_bytes_getitem(w_str, 2) } as i64;
+                let b3 = unsafe { jit_w_bytes_getitem(w_str, 3) } as i64;
+                let v = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+                return Ok(jit_w_tuple1(w_int_new(v as i32 as i64)));
+            }
+        }
+    }
+    unpack_slow(this, w_str)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_struct_pack: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_struct_pack)),
+        func: __majit_wrap_struct_pack,
+    };
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_struct_unpack: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(module_path!(), "::", stringify!(__majit_wrap_struct_unpack)),
+        func: __majit_wrap_struct_unpack,
+    };
+
 fn do_pack_iff(format: &str, _values: &[PyObjectRef]) -> bool {
     majit_rlib::jit::isconstant(format)
 }
@@ -1371,27 +1454,7 @@ impl W_Struct {
     /// an `intval` range check, and `w_bytes_from_bytes`.  Repeat counts,
     /// `__index__`, and `struct.error` stay in [`pack_slow`].
     fn pack(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        // startswith shape: the residual is only the tail, after the
-        // exact-int / little-endian-`i` checks.  Those checks must stay
-        // effect-free (`is_str` in `descr_startswith`).
-        if self.size >= 0 && args.len() == 2 {
-            let value = args[1];
-            if unsafe { is_int(value) } {
-                let format = majit_metainterp::jit::promote_string(self.format);
-                let fmt = unsafe { w_str_get_value(format) };
-                if let Some((4, true, false)) = simple_int_format!(fmt) {
-                    let v = unsafe { w_int_get_value(value) };
-                    if v >= -2147483648 && v <= 2147483647 {
-                        let b0 = v as u8;
-                        let b1 = (v >> 8) as u8;
-                        let b2 = (v >> 16) as u8;
-                        let b3 = (v >> 24) as u8;
-                        return Ok(w_bytes_from_bytes(&[b0, b1, b2, b3]));
-                    }
-                }
-            }
-        }
-        pack_slow(self, args)
+        __majit_wrap_struct_pack(args)
     }
 
     /// `interp_struct.py descr_unpack` —
@@ -1904,6 +1967,16 @@ crate::py_module! {
             // spelling; `W_Struct` carries no JIT or immutability hint over
             // the weakref lifeline.
             pyre_object::w_type_set_weakrefable(struct_type, true);
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                struct_dict,
+                "pack",
+                crate::make_builtin_function("pack", __majit_wrap_struct_pack),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                struct_dict,
+                "unpack",
+                crate::make_builtin_function("unpack", __majit_wrap_struct_unpack),
+            );
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 struct_dict,
                 "pack_into",

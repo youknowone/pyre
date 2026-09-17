@@ -1574,11 +1574,8 @@ fn str_prefix_match_slow(
         (args.len() >= 4).then_some(base + 3),
     )?
     else {
-        return validate_prefix_arg(
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-            method,
-        )
-        .map(|()| w_bool_from(false));
+        return validate_prefix_arg(pyre_object::gc_roots::shadow_stack_get(base + 1), method)
+            .map(|()| w_bool_from(false));
     };
     str_prefix_match(
         &slice,

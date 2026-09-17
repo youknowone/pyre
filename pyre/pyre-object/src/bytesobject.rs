@@ -318,6 +318,16 @@ pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     build_bytes(bytes.len(), alloc_bytes_block(bytes))
 }
 
+/// Word-ABI residual of [`w_bytes_from_bytes`] for a 4-byte payload.
+///
+/// `&[u8]` is two words, so `ResidualSlot` rejects `w_bytes_from_bytes` and
+/// the walk would abort on a symbolic hash.  Four `u8` arguments are one
+/// word each.
+#[majit_macros::dont_look_inside]
+pub fn jit_w_bytes_from_u8x4(b0: u8, b1: u8, b2: u8, b3: u8) -> PyObjectRef {
+    w_bytes_from_bytes(&[b0, b1, b2, b3])
+}
+
 /// Wrap `data`, the block the bytes were copied into, in its `W_BytesObject`.
 fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
     // `build_list_storage` (listobject.rs) states the rule the block obeys:
@@ -527,6 +537,16 @@ pub unsafe fn w_bytes_dec_ctypes_keepalive_refs(obj: PyObjectRef) {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe { w_bytes_data(obj)[index] }
+}
+
+/// Word-ABI residual of [`w_bytes_getitem`].
+///
+/// A compiled `w_bytes_data(obj)[i]` loads `W_BytesObject.len`, not the
+/// `BytesBlock` payload.  Residualising the index keeps the payload read
+/// in the helper.
+#[majit_macros::dont_look_inside]
+pub unsafe fn jit_w_bytes_getitem(obj: PyObjectRef, index: usize) -> u8 {
+    unsafe { w_bytes_getitem(obj, index) }
 }
 
 /// Get a reference to the internal data.
