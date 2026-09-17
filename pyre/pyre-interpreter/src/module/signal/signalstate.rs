@@ -461,7 +461,7 @@ fn install_handler(signum: i32, handler: libc::sighandler_t) -> bool {
 /// is the code returned alongside the result.
 #[cfg(all(windows, not(feature = "sandbox")))]
 fn wakeup_send(fd: i32, byte: &u8) -> (isize, i32) {
-    use crate::module::_socket::rsocket_rffi as rffi;
+    use crate::rsocket_rffi as rffi;
     let res = unsafe {
         rffi::send(
             rffi::socket_from_i64(i64::from(fd)),
@@ -527,7 +527,7 @@ fn write_wakeup_byte(signum: libc::c_int) {
 fn wakeup_error_is_interrupted(code: i32, use_send: bool) -> bool {
     match use_send {
         #[cfg(not(feature = "sandbox"))]
-        true => crate::module::_socket::rsocket_rffi::error_is_interrupted(code),
+        true => crate::rsocket_rffi::error_is_interrupted(code),
         #[cfg(feature = "sandbox")]
         true => false,
         false => code == libc::EINTR,
@@ -539,7 +539,7 @@ fn wakeup_error_is_interrupted(code: i32, use_send: bool) -> bool {
 fn wakeup_error_is_full(code: i32, use_send: bool) -> bool {
     match use_send {
         #[cfg(not(feature = "sandbox"))]
-        true => code == crate::module::_socket::rsocket_rffi::WSAEWOULDBLOCK,
+        true => code == crate::rsocket_rffi::WSAEWOULDBLOCK,
         #[cfg(feature = "sandbox")]
         true => false,
         false => code == libc::EAGAIN || code == libc::EWOULDBLOCK,

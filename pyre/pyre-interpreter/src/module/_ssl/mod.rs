@@ -1815,13 +1815,13 @@ mod ssl_socket_methods {
     /// caller, which re-enters here and has to resume where it stopped.
     fn pump(
         backend: *mut pyre_native::ssl::TlsConnection,
-        fd: crate::module::_socket::rsocket_rffi::Socket,
+        fd: crate::rsocket_rffi::Socket,
         buf: &mut [u8],
         goal: PumpGoal,
         record: &mut RecordCursor,
     ) -> PumpExit {
         use crate::module::_socket::interp_socket::{socket_recv_raw, socket_send_raw};
-        use crate::module::_socket::rsocket_rffi::error_is_interrupted;
+        use crate::rsocket_rffi::error_is_interrupted;
 
         let _blocked = crate::module::thread::before_external_block();
         // The shutdown exchange stops at a record boundary.  What follows the
@@ -1910,11 +1910,11 @@ mod ssl_socket_methods {
     /// the `TimeoutError` `wait_for_data` raises.
     fn wait_for_transport(
         transport: PyObjectRef,
-        fd: crate::module::_socket::rsocket_rffi::Socket,
+        fd: crate::rsocket_rffi::Socket,
         write: bool,
         code: i32,
     ) -> Result<bool, crate::PyError> {
-        if !crate::module::_socket::rsocket_rffi::error_is_would_block(code) {
+        if !crate::rsocket_rffi::error_is_would_block(code) {
             return Ok(false);
         }
         crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, write)
@@ -1997,8 +1997,7 @@ mod ssl_socket_methods {
     /// every record as it is seen.
     fn pump_transport(
         socket: &W_SSLSocket,
-    ) -> Result<Option<(PyObjectRef, crate::module::_socket::rsocket_rffi::Socket)>, crate::PyError>
-    {
+    ) -> Result<Option<(PyObjectRef, crate::rsocket_rffi::Socket)>, crate::PyError> {
         if !unsafe { is_none(socket.incoming) } || !unsafe { is_none(socket.outgoing) } {
             return Ok(None);
         }

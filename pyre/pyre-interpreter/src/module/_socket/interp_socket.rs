@@ -11,7 +11,7 @@
 /// one set of names over libc and WinSock, so the bodies below name a single
 /// API.
 #[cfg(any(unix, windows))]
-use super::rsocket_rffi as rffi;
+use crate::rsocket_rffi as rffi;
 /// The same names again where there is no host layer to reach them through:
 /// the four address converters are arithmetic over the spelling, so they are
 /// written out rather than called, and the entry points below cannot tell.
