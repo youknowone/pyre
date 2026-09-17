@@ -4832,12 +4832,13 @@ impl<M: Clone> MetaInterp<M> {
             }
             virtualizable_ptr = majit_gc::shadow_stack::get(root).0 as *mut u8;
             majit_gc::shadow_stack::pop_to(root);
-            if let Some(ctx) = self.tracing.as_mut() {
-                ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
-            }
+            // Both `force_start_tracing` and `setup_tracing` call this
+            // before `self.tracing = Some(ctx)`. Write the forwarded
+            // pointer onto the ctx being initialized, not the empty slot.
+            ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
             // `initial_inputarg_consts` was copied from `live_values` before
-            // this force. `ctx` is not in `self.tracing` yet, so
-            // `walk_active_trace_refs` cannot forward those ConstPtrs.
+            // this force. `walk_active_trace_refs` cannot forward those
+            // ConstPtrs until `self.tracing` is assigned.
             // `orig_vable_ptr_from_trace_ctx` reads that slot first.
             let vable_const_index = ctx
                 .driver_descriptor()
