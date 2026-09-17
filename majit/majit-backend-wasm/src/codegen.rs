@@ -8264,11 +8264,34 @@ fn build_function(
             }
 
             // ── Conditional calls ──
-            OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                // No-op: the wasm backend does not consume the explicit
-                // COND_CALL_GC_WB / COND_CALL_GC_WB_ARRAY barrier ops. It emits
-                // the write barrier inline at each ref-store instead
-                // (`write_barrier_base` + `emit_write_barrier`).
+            OpCode::CondCallGcWb => {
+                // rewrite.py `gen_write_barrier`: one-arg COND_CALL_GC_WB
+                // before the lowered GC_STORE. The SETFIELD_GC arm never
+                // sees that store, so the barrier has to run here.
+                emit_write_barrier(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    jit_call_idx,
+                    residual_type_base,
+                    wb,
+                    op.arg(0).to_opref(),
+                    None,
+                );
+            }
+            OpCode::CondCallGcWbArray => {
+                // rewrite.py `gen_write_barrier_array` large arm:
+                // COND_CALL_GC_WB_ARRAY(base, index).
+                emit_write_barrier(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    jit_call_idx,
+                    residual_type_base,
+                    wb,
+                    op.arg(0).to_opref(),
+                    Some(op.arg(1).to_opref()),
+                );
             }
             OpCode::CondCallN => {
                 // x86/assembler.py `genop_discard_cond_call`: TEST cond; JZ
