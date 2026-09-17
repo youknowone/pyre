@@ -1911,7 +1911,12 @@ impl<'a> RegAlloc<'a> {
         self.jump_target_descr = None;
         self.final_jump_args = None;
         self.final_jump_op_position = -1;
-        self.j2_ops = crate::j2plan::TracePlan::lower_ops(self.operations);
+        // aarch64/assembler.py `_walk_operations` / x86/regalloc.py
+        // `walk_operations` dispatch on the live ResOp. Materializing a
+        // `Vec<LirOp>` here cloned every op (and every guard's fail_args
+        // SmallVec) before the walk; lower one op on the stack instead.
+        // Tests that inject a replacement plan still write `j2_ops`.
+        self.j2_ops.clear();
         // x86/regalloc.py:191 X86RegisterHints().add_hints(longevity, inputargs, operations)
         //
         // Strict parity: upstream `rpython/jit/backend/x86/reghint.py`
@@ -2627,15 +2632,16 @@ impl<'a> RegAlloc<'a> {
             );
 
             // x86/regalloc.py:390 dispatch to consider_* method.
-            // The dynasm backend now enters through the j2-style lowered
-            // operation. The legacy opcode dispatch below is only a guard
-            // rail if `_prepare` did not produce a matching plan entry.
+            // Tests may inject a replacement `j2_ops` plan; production
+            // lowers one op on the stack, matching the upstream walk
+            // that never materializes a parallel IR.
             if let Some(j2_op) = j2_ops.get(i) {
                 self._dispatch_j2(j2_op, op, i, &mut output);
                 self._free_j2_op_vars(j2_op, op);
             } else {
-                self._dispatch_legacy(op, i, &mut output);
-                self._free_op_vars(op);
+                let j2_op = crate::j2plan::lower_op(op);
+                self._dispatch_j2(&j2_op, op, i, &mut output);
+                self._free_j2_op_vars(&j2_op, op);
             }
         }
 
@@ -6912,9 +6918,9 @@ mod tests {
         let ops = rcs(ops);
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
-        ra.j2_ops[0] = crate::j2plan::LirOp::Finish {
+        ra.j2_ops = vec![crate::j2plan::LirOp::Finish {
             args: vec![i0].into(),
-        };
+        }];
 
         let ra_ops = ra.walk_operations();
         let dispatched = ra_ops.iter().find_map(|ra_op| match ra_op {
@@ -6963,11 +6969,11 @@ mod tests {
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
-        ra.j2_ops[0] = crate::j2plan::LirOp::IntUnary {
+        ra.j2_ops = vec![crate::j2plan::LirOp::IntUnary {
             kind: crate::j2plan::IntUnaryKind::IsTrue,
             dst: i2,
             arg: i1,
-        };
+        }];
 
         let ra_ops = ra.walk_operations();
         let move_src = ra_ops.iter().find_map(|ra_op| {
@@ -7065,11 +7071,11 @@ mod tests {
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
-        ra.j2_ops[0] = crate::j2plan::LirOp::Guard {
+        ra.j2_ops = vec![crate::j2plan::LirOp::Guard {
             kind: crate::j2plan::GuardKind::True,
             args: vec![i1].into(),
             fail_args: vec![].into(),
-        };
+        }];
 
         let ra_ops = ra.walk_operations();
         assert!(
@@ -7102,7 +7108,7 @@ mod tests {
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
-        ra.j2_ops[0] = crate::j2plan::LirOp::Load {
+        ra.j2_ops = vec![crate::j2plan::LirOp::Load {
             kind: crate::j2plan::LoadKind::Gc,
             dst: i2,
             base: i1,
@@ -7110,7 +7116,7 @@ mod tests {
             index: None,
             scale: None,
             size: Some(c8),
-        };
+        }];
 
         let ra_ops = ra.walk_operations();
         assert!(
@@ -7146,7 +7152,7 @@ mod tests {
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Ref);
-        ra.j2_ops[0] = crate::j2plan::LirOp::Store {
+        ra.j2_ops = vec![crate::j2plan::LirOp::Store {
             kind: crate::j2plan::StoreKind::Gc,
             base: i1,
             offset: Some(c0),
@@ -7154,7 +7160,7 @@ mod tests {
             scale: None,
             value: i2,
             size: Some(c8),
-        };
+        }];
 
         let ra_ops = ra.walk_operations();
         assert!(
@@ -7185,12 +7191,12 @@ mod tests {
         let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
         ra.prepare_loop();
         let expected_argloc = ra.loc(i1, Type::Int);
-        ra.j2_ops[0] = crate::j2plan::LirOp::Opcode {
+        ra.j2_ops = vec![crate::j2plan::LirOp::Opcode {
             opcode: OpCode::SameAsI,
             dst: Some(i2),
             args: vec![i1].into(),
             fail_args: vec![].into(),
-        };
+        }];
 
         let ra_ops = ra.walk_operations();
         assert!(

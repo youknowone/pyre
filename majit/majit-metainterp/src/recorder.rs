@@ -29,8 +29,11 @@ struct FrontendSlot {
     opcode: OpCode,
     descr: Option<DescrRef>,
     resume: Cell<i32>,
-    fail_args: Option<Vec<OpRef>>,
-    fail_arg_types: Option<Vec<Type>>,
+    /// Boxed so the production `None` arm is one word. `history.py`
+    /// FrontendOp does not carry fail_args; `store_final_boxes` writes
+    /// them on the materialized guard.
+    fail_args: Option<Box<Vec<OpRef>>>,
+    fail_arg_types: Option<Box<Vec<Type>>>,
     concrete: Cell<Option<Value>>,
     /// First operand, only for `GetfieldGcR` recovery while the `Op`
     /// does not yet exist. `history.py FrontendOp` does not store args;
@@ -781,7 +784,7 @@ impl Trace {
             opcode,
             descr,
             resume: Cell::new(-1),
-            fail_args: fail_args.map(|a| a.to_vec()),
+            fail_args: fail_args.map(|a| Box::new(a.to_vec())),
             fail_arg_types: None,
             concrete: Cell::new(None),
             first_arg,
@@ -845,7 +848,7 @@ impl Trace {
                 }
                 op.set_rd_resume_position(slot.resume.get());
                 if let Some(ref types) = slot.fail_arg_types {
-                    op.set_fail_arg_types(types.clone());
+                    op.set_fail_arg_types(types.as_slice().to_vec());
                 }
             }
         }
@@ -932,7 +935,7 @@ impl Trace {
             }
             op.set_rd_resume_position(slot.resume.get());
             if let Some(ref types) = slot.fail_arg_types {
-                op.set_fail_arg_types(types.clone());
+                op.set_fail_arg_types(types.as_slice().to_vec());
             }
             if slot.opcode.result_type() != Type::Void {
                 let p = slot.unique as usize;
@@ -1375,7 +1378,7 @@ impl Trace {
             .rev()
             .find(|s| s.unique == opref.raw())
         {
-            slot.fail_args = Some(fail_args.to_vec());
+            slot.fail_args = Some(Box::new(fail_args.to_vec()));
             return;
         }
         let boxed_fail_args = self.box_args(fail_args).iter().cloned().collect();
@@ -1394,7 +1397,7 @@ impl Trace {
     /// pyjitpl.py generate_guard parity).
     pub fn set_last_op_fail_arg_types(&mut self, types: Vec<Type>) {
         if let Some(slot) = self.last_slot_mut() {
-            slot.fail_arg_types = Some(types);
+            slot.fail_arg_types = Some(Box::new(types));
             return;
         }
         if let Some(op) = self.ops.last() {

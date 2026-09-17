@@ -920,18 +920,13 @@ impl ShortBoxes {
         if self.boxes_in_production.contains(&okey) {
             return None;
         }
-        // shortpreamble.py add_op_to_short calls methods on the dict
-        // value. Take it out so we do not clone a CompoundOp (64 B) just
-        // to break the potential_ops borrow. Restore at the same
-        // OrderedDict index. A recursive lookup of this key hits
-        // boxes_in_production first.
-        let idx = self.potential_ops.get_index_of(&okey)?;
-        let (okey, candidate) = self.potential_ops.shift_remove_index(idx)?;
+        // shortpreamble.py add_op_to_short / produce_arg:
+        // `self.potential_ops[op]` looks the entry up and leaves the
+        // OrderedDict in place. Cloning the value is the port of that
+        // lookup; shift_remove + shift_insert was O(N) per candidate.
+        let candidate = self.potential_ops.get(&okey)?.clone();
         self.boxes_in_production.insert(okey.clone());
         let produced = candidate.add_op_to_short(self, ctx);
-        let restore_at = idx.min(self.potential_ops.len());
-        self.potential_ops
-            .shift_insert(restore_at, okey.clone(), candidate);
         self.boxes_in_production.swap_remove(&okey);
         let produced = produced?;
         self.produced_short_boxes.insert(okey, produced.clone());
@@ -1112,17 +1107,11 @@ impl ShortBoxes {
             same_as_source: None,
         };
         // shortpreamble.py add_potential_op: `CompoundOp(op, pop, prev_op)`
-        // stores the new leaf and a reference to the previous dict value.
-        // `pop` is always a PreambleOp; boxing it was a 64 B alloc per
-        // collision on the regex and/or compile path.
-        if let Some(idx) = self.potential_ops.get_index_of(&key) {
-            let (old_key, prev) = self
-                .potential_ops
-                .shift_remove_index(idx)
-                .expect("index from get_index_of");
-            self.potential_ops.shift_insert(
-                idx,
-                old_key,
+        // overwrites the OrderedDict value in place. `IndexMap::insert` on
+        // an existing key does the same without shifting later entries.
+        if let Some(prev) = self.potential_ops.get(&key).cloned() {
+            self.potential_ops.insert(
+                key,
                 PotentialShortOp::Compound(CompoundOp {
                     res: result,
                     one: pop,

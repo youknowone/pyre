@@ -4982,6 +4982,15 @@ impl<'a> Transformer<'a> {
         // not a bare leaf — a user function named `cast_int_to_ptr` is
         // an ordinary call (`pointer_cast_function_names_do_not_alias`).
         if let CallTarget::FunctionPath { segments } = target {
+            // `current_gc_ref` is the residual stand-in for the GC
+            // transform's livevar reload (`rgc` rewrites the same box
+            // in place). A new SSA box here lets heap CSE keep the
+            // pre-reload `int_items.block` while setitem writes through
+            // the reloaded box, and the optimizer reorders the later
+            // getitem onto the uninitialized NewArray.
+            if segments.last().is_some_and(|s| s == "current_gc_ref") && args.len() == 1 {
+                return RewriteResult::Identity(args[0].clone());
+            }
             if is_lltype_cast_path(segments, "cast_opaque_ptr") && args.len() == 1 {
                 return RewriteResult::Identity(args[0].clone());
             }
@@ -6448,6 +6457,9 @@ impl<'a> Transformer<'a> {
         graph: &mut FunctionGraph,
     ) -> Option<RewriteResult> {
         match oopspec_name {
+            // The JIT-visible form of a GC-transform livevar reload:
+            // the same box, not a residual that mints a second identity.
+            "rgc.identity" => args.first().cloned().map(RewriteResult::Identity),
             "rgc.ll_shrink_array" => {
                 // The residual's funcaddr resolves through `fnaddr_for_target`.
                 // The helper graph named `ll_shrink_array` is an identity stub
@@ -6985,6 +6997,25 @@ impl<'a> Transformer<'a> {
                             ),
                             value: crate::model::LinkArg::Value(n),
                             ty: ValueType::Int,
+                        },
+                    }],
+                )
+            }
+            "list.float_set_items" => {
+                let l = args.first()?.clone();
+                let items = args.get(1)?.clone();
+                (
+                    "list.float_set_items → setfield_gc_r(float_items.block)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::FieldWrite {
+                            base: l,
+                            field: FieldDescriptor::new(
+                                "float_items.block",
+                                Some(LIST_OWNER.to_string()),
+                            ),
+                            value: crate::model::LinkArg::Value(items),
+                            ty: ValueType::Ref(None),
                         },
                     }],
                 )
@@ -19745,6 +19776,50 @@ mod tests {
                 assert_eq!(field.name, "float_items.len");
                 assert_eq!(value.as_variable(), Some(&n));
                 assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("expected FieldWrite, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, None);
+    }
+
+    /// `list.float_set_items(l, items)` lowers to `setfield_gc_r(l,
+    /// float_items.block)` (`rlist.py` `l.items = newitems`).
+    #[test]
+    fn handle_list_call_float_set_items_lowers_to_block_field_write() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_float_set_items");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let items = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.float_set_items",
+                &op,
+                &[l.clone(), items.clone()],
+                &mut graph,
+                "list_float_set_items",
+            )
+            .expect("list.float_set_items must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                assert_eq!(base, &l);
+                assert_eq!(field.name, "float_items.block");
+                assert_eq!(field.owner_root.as_deref(), Some("W_ListObject"));
+                assert_eq!(value.as_variable(), Some(&items));
+                assert!(matches!(ty, ValueType::Ref(_)));
             }
             other => panic!("expected FieldWrite, got {other:?}"),
         }

@@ -226,7 +226,7 @@ impl fmt::Display for TracePlanSummary<'_> {
     }
 }
 
-fn lower_op(op: &Op) -> LirOp {
+pub(crate) fn lower_op(op: &Op) -> LirOp {
     match op.opcode {
         OpCode::Label => LirOp::Label {
             args: op.with_arglist(|args| args.iter().map(|a| a.to_opref()).collect()),
