@@ -11138,16 +11138,12 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 /// `function.rs::getcode`.
 #[inline]
 pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
-    if majit_metainterp::jit::we_are_jitted() {
-        if !pyre_object::w_type_is_cpython_immutabletype(w_type) {
-            // Heap types can still be mutated; read the live field (the
-            // caller promotes the result).
-            return pyre_object::typeobject::w_type_get_version_tag(w_type);
-        }
-        // Prebuilt objects cannot get their version_tag changed.
-        return _pure_version_tag(w_type);
+    // typeobject.py `version_tag`: `if not we_are_jitted() or self.is_heaptype()`.
+    if !majit_metainterp::jit::we_are_jitted() || pyre_object::w_type_is_heaptype(w_type) {
+        return pyre_object::typeobject::w_type_get_version_tag(w_type);
     }
-    pyre_object::typeobject::w_type_get_version_tag(w_type)
+    // Prebuilt objects cannot get their version_tag changed.
+    _pure_version_tag(w_type)
 }
 
 /// `typeobject.py _pure_lookup_where_with_method_cache` — the
@@ -11419,6 +11415,35 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
         name.as_ptr() as i64,
         name.len() as i64,
     ) as PyObjectRef;
+    lookup_where_with_method_cache_w(w_type, w_name, version_tag)
+}
+
+/// MethodCache lookup whose name is already an interned str (`w_name`).
+///
+/// PyPy's `lookup_where_with_method_cache(self, name)` takes a Python
+/// string.  The residual ABI cannot pass `&str`, so callers that already
+/// hold an interned immortal enter here and never residualize `str::as_ptr`.
+pub(crate) unsafe fn lookup_where_interned(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    if w_type.is_null() || !is_type(w_type) || w_name.is_null() {
+        return None;
+    }
+    let _ = majit_metainterp::jit::promote(w_type);
+    let version_tag = w_type_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    lookup_where_with_method_cache_w(w_type, w_name, version_tag)
+}
+
+/// JIT-facing MethodCache lookup whose name is already an interned str.
+pub(crate) unsafe fn lookup_where_with_method_cache_w(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+    version_tag: u64,
+) -> Option<(PyObjectRef, PyObjectRef)> {
     let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     if w_value.is_null() {
         None
