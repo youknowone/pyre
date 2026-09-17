@@ -13478,16 +13478,9 @@ impl<'a> Lowering<'a> {
         is_get && callsite_or_generic_index_is_scalar(reg, index_ty, self.llbc)
     }
 
-    /// ARRAY identity proof for the scalar-index `<[T]>::get` rewrite.
-    ///
-    /// This is the `get` counterpart of the `Index::index` element gate: a
-    /// scalar carries an element spelling so the descr computes its exact
-    /// stride; a thin pointer is already one word and needs no identity. Any
-    /// other inline Rust aggregate declines — including a string or tuple
-    /// element, which is one GC pointer only inside a list the translation
-    /// builds, never inside the host slice this call reads.
-    /// The outer `Option` is the proof, while the inner one is the optional
-    /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
+    /// `true` when `reg` is `core::slice::<Impl>::first` or `last`.
+    /// Those share `get`'s `T` generic, so this gates the
+    /// `slice_get_element` walk.
     fn is_slice_first_or_last_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -13500,6 +13493,16 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// ARRAY identity proof for the scalar-index `<[T]>::get` rewrite.
+    ///
+    /// This is the `get` counterpart of the `Index::index` element gate: a
+    /// scalar carries an element spelling so the descr computes its exact
+    /// stride; a thin pointer is already one word and needs no identity. Any
+    /// other inline Rust aggregate declines — including a string or tuple
+    /// element, which is one GC pointer only inside a list the translation
+    /// builds, never inside the host slice this call reads.
+    /// The outer `Option` is the proof, while the inner one is the optional
+    /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
     fn slice_get_element(&self, reg: &RegularCall) -> Option<(ValueType, Option<String>)> {
         let element_ty = reg
             .generics
