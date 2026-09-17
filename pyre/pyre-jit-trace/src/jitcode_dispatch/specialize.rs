@@ -20801,14 +20801,17 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>
     // context unchained and passes this exception to the resolver call, which
     // forces the very allocation this fold exists to keep virtual.
     //
-    // Stamp the recording-time `__context__` as a constant.  A live
-    // `GETFIELD_GC_R(ec, sys_exc_value)` keeps the previous exception
-    // reachable, and two of these raises in one loop chain every
-    // TypeError into a growing list (`type_immutable_reject`).  The
-    // SETFIELD still marks the context chained for the catch-side
-    // compensation.
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    let active = ctx.trace_ctx.const_ref(active_concrete as i64);
+    // `error.py OperationError.record_context` reads `ec.sys_exc_info()`.
+    // A ConstPtr of the recording-time active exception aliases the
+    // previous raise's NewWithVtable in this loop and keeps both
+    // allocations live; the GETFIELD is the same word PUSH_EXC_INFO /
+    // POP_EXCEPT write (`ec_sys_exc_value_descr`), so a completed except
+    // answers NULL and both TypeErrors DCE.
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[new_op, active],
@@ -20819,6 +20822,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>
     // registration above stops the compensation from performing, so Python
     // code reached later in this authoritative walk observes the
     // `__context__` the recorded SETFIELD performs on compiled iterations.
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
     if !active_concrete.is_null() {
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
@@ -20866,13 +20870,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     name_idx: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     try_walker_trace_readonly_descr_attr_raise_with_name(
-        ctx,
-        op,
-        obj_op,
-        value_op,
-        w_code_ptr,
-        name_idx,
-        None,
+        ctx, op, obj_op, value_op, w_code_ptr, name_idx, None,
     )
 }
 

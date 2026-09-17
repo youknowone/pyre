@@ -69,6 +69,18 @@ static SETATTR_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
         })
     });
 
+/// Two-Ref `space.delattr` residuals (`bh_delattr_fn` /
+/// `jit_baseobjspace_delattr`).  Flatten's 2-arg `delattr` HLOp fallback
+/// tags them `None`, so the `DeleteAttr` helper arm never sees them.
+static DELATTR_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("baseobjspace::delattr")
+                || name.ends_with("jit_baseobjspace_delattr")
+                || name.ends_with("bh_delattr_fn")
+        })
+    });
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -7384,6 +7396,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                             .heap_cache_mut()
                             .replace_box(r_args[1], name_const);
                     }
+                    // `typeobject.py setdictvalue` / `deldictvalue` raise
+                    // TypeError on a non-heap type before any mapdict write.
+                    // The 4-arg `StoreAttr` residual tries this fold first;
+                    // flatten's 3-arg `setattr` residual must too.
+                    if let Some(outcome) = try_walker_trace_immutable_type_attr_raise_with_name(
+                        ctx,
+                        op,
+                        r_args[0],
+                        Some(r_args[2]),
+                        0,
+                        0,
+                        Some(name),
+                    )? {
+                        return Ok(outcome);
+                    }
                     if matches!(
                         spec_gate_store_attr(|| {
                             try_walker_specialize_store_attr_named(
@@ -7395,9 +7422,46 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                         if dst_bank == 'r' {
                             let none_ptr = pyre_object::w_none();
                             let none = ctx.trace_ctx.const_ref(none_ptr as i64);
-                            write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, none)?;
+                            write_ref_reg_keep_tos(
+                                ctx,
+                                op.pc,
+                                dst,
+                                none,
+                                ConcreteValue::Ref(none_ptr),
+                            )?;
                         }
                         return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
+            }
+        }
+    }
+
+    // Flatten's 2-arg `delattr` HLOp residual (`obj, name`) is tagged
+    // `None`, not `DeleteAttr`.  Fold the immutable-type raise here.
+    if ctx.is_authoritative_executor && r_args.len() == 2 {
+        let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        if func_addr != 0 && DELATTR_FNADDRS.contains(&func_addr) {
+            if let Some(concrete_name) = walker_concrete_ref_object(ctx, r_args[1])
+                && unsafe {
+                    pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
+                }
+            {
+                let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
+                if let Ok(name) = name.as_str() {
+                    if let Some(outcome) = try_walker_trace_immutable_type_attr_raise_with_name(
+                        ctx,
+                        op,
+                        r_args[0],
+                        None,
+                        0,
+                        0,
+                        Some(name),
+                    )? {
+                        return Ok(outcome);
                     }
                 }
             }

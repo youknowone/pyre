@@ -9893,16 +9893,7 @@ fn try_inline_property_get_from_name_op<Sym: WalkSym>(
             .replace_box(name_opref, expected);
     }
     try_walker_inline_property_get_named(
-        ctx,
-        op,
-        code,
-        ref_args,
-        call_descr,
-        obj,
-        name,
-        dst,
-        dst_bank,
-        None,
+        ctx, op, code, ref_args, call_descr, obj, name, dst, dst_bank, None,
     )
 }
 
@@ -13031,12 +13022,13 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     // when the caller is already an inline_subwalk (an inlined Python
     // function).  Only the exact-int `*_inner` helpers stay walkable
     // there; residualizing those makes `compare_op_descent` decline.
-    let is_bounded_inner = super::specialize::jitcode_leaf_is(sub_index, "compare_value_from_tag_inner")
-        || super::specialize::jitcode_leaf_is(sub_index, "binary_value_from_tag_inner")
-        || callee.as_deref().is_some_and(|n| {
-            super::specialize::name_leaf_is(n, "compare_value_from_tag_inner")
-                || super::specialize::name_leaf_is(n, "binary_value_from_tag_inner")
-        });
+    let is_bounded_inner =
+        super::specialize::jitcode_leaf_is(sub_index, "compare_value_from_tag_inner")
+            || super::specialize::jitcode_leaf_is(sub_index, "binary_value_from_tag_inner")
+            || callee.as_deref().is_some_and(|n| {
+                super::specialize::name_leaf_is(n, "compare_value_from_tag_inner")
+                    || super::specialize::name_leaf_is(n, "binary_value_from_tag_inner")
+            });
     let is_unbounded = callee
         .as_deref()
         .is_some_and(super::specialize::name_is_unbounded_helper_body)
@@ -14381,9 +14373,7 @@ fn guard_concrete_int_slice<Sym: WalkSym>(
             majit_ir::OpCode::GuardValue,
             &[*opref, expected],
         )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(*opref, expected);
+        ctx.trace_ctx.heap_cache_mut().replace_box(*opref, expected);
     }
     Ok(())
 }
@@ -14736,7 +14726,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 let dst = code[op.pc + 1 + 2 + arg_width] as usize;
                 let none_ptr = pyre_object::w_none();
                 let none = ctx.trace_ctx.const_ref(none_ptr as i64);
-                write_ref_reg(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
+                write_ref_reg_keep_tos(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
             }
             return finish_getattr_inline_or_residual(
                 ctx,
@@ -14772,7 +14762,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 let dst = code[op.pc + 1 + 2 + arg_width] as usize;
                 let none_ptr = pyre_object::w_none();
                 let none = ctx.trace_ctx.const_ref(none_ptr as i64);
-                write_ref_reg(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
+                write_ref_reg_keep_tos(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
             }
             return finish_getattr_inline_or_residual(
                 ctx,
@@ -15544,7 +15534,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
                 let none_ptr = pyre_object::w_none();
                 let none = ctx.trace_ctx.const_ref(none_ptr as i64);
-                write_ref_reg(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
+                write_ref_reg_keep_tos(ctx, op.pc, dst, none, ConcreteValue::Ref(none_ptr))?;
             }
             return finish_getattr_inline_or_residual(
                 ctx,
@@ -15571,7 +15561,13 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             if let Some(obj) = obj
                 && let Some(outcome) =
                     super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
-                        ctx, op, obj, None, 0, 0, str_name.as_deref(),
+                        ctx,
+                        op,
+                        obj,
+                        None,
+                        0,
+                        0,
+                        str_name.as_deref(),
                     )?
             {
                 return Ok(outcome);

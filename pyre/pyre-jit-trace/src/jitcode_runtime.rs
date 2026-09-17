@@ -559,7 +559,6 @@ pub fn list_getitem_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
-
 /// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
 /// graph key the codewriter allocated it under and cached process-wide.
 pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {

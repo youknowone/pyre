@@ -11166,14 +11166,15 @@ impl CodeWriter {
                         Instruction::GetIter => {
                             let _iterable_reg = emit_popvalue_ref!(current_depth, py_pc);
                             let iterable_value = pop_ref_or_fresh(&mut current_state, &mut graph);
-                            let iter_value = super::flow::FlowValue::from(emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "iter",
-                                vec![iterable_value.into()],
-                                Kind::Ref,
-                                py_pc as i64,
-                            ));
+                            let iter_value =
+                                super::flow::FlowValue::from(emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "iter",
+                                    vec![iterable_value.into()],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                ));
                             // Physically write the iterator into its value-stack
                             // slot (`pyframe.py pushvalue` →
                             // `setarrayitem_vable_r` via `jtransform.py:1898
