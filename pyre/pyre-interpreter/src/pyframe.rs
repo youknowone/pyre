@@ -3902,7 +3902,11 @@ impl PyFrame {
     /// (ValueError "code object received a closure with an unexpected
     /// number of free variables") so callers can surface them through
     /// PyPy's OperationError-equivalent path instead of panicking.
+    /// `pyframe.py initialize_frame_scopes` is `@jit.unroll_safe`.
+    /// The cell/freevar loop is the reason: without the hint the
+    /// whole function is one residual.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn initialize_frame_scopes(
         &mut self,
         outer_func: PyObjectRef,
@@ -4534,6 +4538,10 @@ impl PyFrame {
     }
 
     /// PyPy-compatible pop-values helper.
+    /// `pyframe.py popvalues` is `@jit.unroll_safe`. The return is a
+    /// `Vec` (two residual words); until that ABI exists, looking
+    /// inside residualizes a one-slot pointer and the length is
+    /// garbage. Keep the loop residual.
     #[inline]
     pub fn popvalues(&mut self, n: usize) -> Vec<PyObjectRef> {
         let mut out = vec![PY_NULL; n];
@@ -4546,12 +4554,13 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `popvalues_mutable`.
+    /// Same residual-ABI constraint as `popvalues`.
     #[inline]
     pub fn popvalues_mutable(&mut self, n: usize) -> Vec<PyObjectRef> {
         self.popvalues(n)
     }
 
-    /// pyframe.py peekvalues
+    /// pyframe.py peekvalues. Same residual-ABI constraint as `popvalues`.
     #[inline]
     pub fn peekvalues(&self, n: usize) -> Vec<PyObjectRef> {
         let base = self.valuestackdepth - n;
@@ -4575,9 +4584,11 @@ impl PyFrame {
         values_w
     }
 
-    /// pyframe.py dropvalues
+    /// pyframe.py dropvalues — `@jit.unroll_safe`, and `n` is promoted.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn dropvalues(&mut self, n: usize) {
+        let n = majit_metainterp::jit::promote(n);
         let finaldepth = self.valuestackdepth - n;
         self.assert_stack_index(finaldepth);
         while self.valuestackdepth > finaldepth {
@@ -4588,7 +4599,9 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `pushrevvalues`.
+    /// `pyframe.py pushrevvalues` is `@jit.unroll_safe`.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn pushrevvalues(&mut self, _n: usize, values_w: &[PyObjectRef]) {
         let n = if _n == 0 { values_w.len() } else { _n };
         assert!(n <= values_w.len());
@@ -4600,11 +4613,20 @@ impl PyFrame {
     }
 
     /// PyPy-compatible `dupvalues`.
+    /// `pyframe.py dupvalues` is `@jit.unroll_safe` and peeks one
+    /// slot at a time (`peekvalue(delta)`), not `peekvalues`.
     #[inline]
+    #[majit_macros::unroll_safe]
     pub fn dupvalues(&mut self, n: usize) {
-        let values = self.peekvalues(n);
-        for value in values {
-            self.push(value);
+        if n == 0 {
+            return;
+        }
+        let delta = n - 1;
+        let mut remaining = n;
+        while remaining > 0 {
+            remaining -= 1;
+            let w_value = self.peekvalue(delta);
+            self.push(w_value);
         }
     }
 
@@ -5670,6 +5692,8 @@ impl PyFrame {
     /// locals mapping back into the fastlocals.  Reads each varname / cellvar
     /// / freevar from the mapping via `space.finditem_str` (KeyError →
     /// missing); a frame with no locals bound has nothing to copy.
+    /// `pyframe.py locals2fast` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     pub fn locals2fast(&mut self, skip_free_vars: bool) -> Result<(), crate::PyError> {
         // `pyframe.py:589` binds `w_locals` once, ahead of both loops, and
         // every `space.finditem_str` below reads that one binding.  It
@@ -5710,18 +5734,9 @@ impl PyFrame {
             }
         }
 
-        let pure_cells: Vec<&_> = code
-            .cellvars
-            .iter()
-            .filter(|c| {
-                let cs: &str = c.as_ref();
-                !code.varnames.iter().any(|v| {
-                    let vs: &str = v.as_ref();
-                    vs == cs
-                })
-            })
-            .collect();
-        let npure = pure_cells.len();
+        // Same positional band as `fast2locals`: a filtered `Vec` would
+        // residualize iterator adapters under `unroll_safe`.
+        let npure = npure_cellvars(code);
         let include_freevars = code.flags.contains(CodeFlags::OPTIMIZED) && !skip_free_vars;
         let freevarnames_len = if include_freevars {
             npure + code.freevars.len()
@@ -5730,7 +5745,7 @@ impl PyFrame {
         };
         for i in 0..freevarnames_len {
             let name: &str = if i < npure {
-                pure_cells[i].as_ref()
+                code.cellvars[nth_pure_cellvar_index(code, i)].as_ref()
             } else {
                 code.freevars[i - npure].as_ref()
             };

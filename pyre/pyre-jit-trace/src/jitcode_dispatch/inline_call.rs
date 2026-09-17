@@ -6766,8 +6766,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `code?` matches `function.py getcode()` but Linux `test_uuid`
         // SIGSEGV's with the marker: after `test_UUID` warms the JIT,
         // `jit_bigint_int_eq` treats a small int as `*const BigInt`.
-        // Comparing known class before skipping GuardClass was not
-        // enough; the live field read stays.
         walker_guard_function_field(
             ctx,
             op.pc,

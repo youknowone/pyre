@@ -1389,6 +1389,10 @@ impl ExecutionContext {
     ///         self._trace(frame, 'opcode', self.space.w_None)
     ///     d.instr_prev_plus_one = frame.last_instr + 1
     /// ```
+    /// `executioncontext.py run_trace_func` is `@jit.unroll_safe`.
+    /// This body has no loop, so `look_inside_graph` already admits it;
+    /// the hint matches the upstream decorator.
+    #[majit_macros::unroll_safe]
     pub fn run_trace_func(&mut self, frame: *mut PyFrame) -> Result<(), crate::PyError> {
         if frame.is_null() {
             return Ok(());

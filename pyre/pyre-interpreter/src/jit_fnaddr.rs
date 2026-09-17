@@ -2564,6 +2564,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pycode::w_code_const",
         crate::pycode::w_code_const,
     );
+    // `pycode.py lookup_exceptiontable` is `@jit.elidable`. The wrapper
+    // returns a packed i64 so the residual ABI is one word.
+    cpa2(
+        &mut entries,
+        "pyre_interpreter::pycode::w_code_lookup_exceptiontable",
+        "pyre_interpreter::w_code_lookup_exceptiontable",
+        crate::pycode::w_code_lookup_exceptiontable_jit_abi,
+    );
     // `compare` residualizes its `compare_slot` tail: the slot body reads two
     // `&[u8]` through `core::slice::cmp`, which has no LLBC, so the source lift
     // fails and the whole callee becomes a residual. What was missing is only
