@@ -416,6 +416,7 @@ pub fn init_subclass_ranges() {
 ///
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
+    crate::objspace::descroperation::init_interned_binop_names();
     // The object-space store site can see that a `locals_cells_stack_w` array
     // has already moved, but not who still points at it; this crate owns the
     // frame chain, so it supplies the holder scan.

@@ -2163,6 +2163,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::_pure_version_tag",
         pure_version_tag,
     );
+    // typeobject.py `self._version_tag` — the Acquire reader inside
+    // `_pure_version_tag`'s `@elidable_promote` original.  Unregistered it
+    // is a symbolic hash and interpret aborts before the MethodCache.
+    upa1(
+        &mut entries,
+        "pyre_object::typeobject::w_type_get_version_tag",
+        "pyre_object::w_type_get_version_tag",
+        pyre_object::typeobject::w_type_get_version_tag,
+    );
     let pure_lookup_where_with_method_cache: extern "C" fn(i64, i64, i64) -> i64 =
         crate::baseobjspace::__majit_call_target__pure_lookup_where_with_method_cache;
     cpa3(
