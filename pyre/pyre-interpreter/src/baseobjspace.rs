@@ -14454,10 +14454,9 @@ pub unsafe fn exception_attr_slot_fold(
         if stored.is_null() {
             return None;
         }
-        // `w_exception_get_args` accepts a legacy tuple-backed slot, but the
-        // walker decomposition below reads `W_ListObject` fields and therefore
-        // only mirrors the canonical list storage produced by current setters.
-        if slot == ExceptionAttrSlot::Args && !unsafe { pyre_object::is_list(stored) } {
+        // `args_w` is an rlist.py LIST (`rlist_len` / `rlist_getitem`), not a
+        // Python list. Non-null storage is the canonical setter shape.
+        if slot == ExceptionAttrSlot::Args && stored.is_null() {
             return None;
         }
     }
