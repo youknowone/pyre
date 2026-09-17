@@ -146,15 +146,20 @@ pub(super) fn with_replace_frames<Sym: WalkSym, R>(
         registers_f: ctx.registers_f,
         frame_state: &ctx.frame_state,
     };
-    // SAFETY: `data` is the walk-local ReplaceData, live until the
-    // matching `clear_replace_frames` below.
+    // SAFETY: `data` is the walk-local ReplaceData, live until
+    // `ClearReplaceFrames` drops (normal return or unwind).
     unsafe {
         ctx.trace_ctx
             .set_replace_frames(Some(walk), &raw mut data as *mut ());
     }
-    let result = f(ctx);
-    ctx.trace_ctx.clear_replace_frames();
-    result
+    struct ClearReplaceFrames(*mut TraceCtx);
+    impl Drop for ClearReplaceFrames {
+        fn drop(&mut self) {
+            unsafe { (*self.0).clear_replace_frames() };
+        }
+    }
+    let _clear = ClearReplaceFrames(ctx.trace_ctx);
+    f(ctx)
 }
 
 /// `pyjitpl.py MetaInterp.replace_box`: promotion updates the recording

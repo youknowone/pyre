@@ -3942,6 +3942,13 @@ where
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
+        struct ClearReplaceFrames(*mut TraceCtx);
+        impl Drop for ClearReplaceFrames {
+            fn drop(&mut self) {
+                unsafe { (*self.0).clear_replace_frames() };
+            }
+        }
+        let _clear = ClearReplaceFrames(ctx);
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {

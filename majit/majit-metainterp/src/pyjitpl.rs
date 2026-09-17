@@ -6650,9 +6650,14 @@ impl<M: Clone> MetaInterp<M> {
             .as_mut()
             .expect("vable op requires active tracing");
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
-        let result = f(ctx);
-        ctx.clear_replace_frames();
-        result
+        struct ClearReplaceFrames(*mut TraceCtx);
+        impl Drop for ClearReplaceFrames {
+            fn drop(&mut self) {
+                unsafe { (*self.0).clear_replace_frames() };
+            }
+        }
+        let _clear = ClearReplaceFrames(ctx);
+        f(ctx)
     }
 
     /// `vable_struct_ptr` is the live struct pointer for the
