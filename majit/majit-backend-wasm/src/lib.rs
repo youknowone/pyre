@@ -6744,6 +6744,7 @@ mod tests {
 
     #[test]
     fn headerless_helper_rejects_non_positive_size() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let gc = MiniMarkGC::new();
         install_gc_box(Box::new(gc));
         assert_eq!(wasm_jit_alloc_headerless(-1), 0);
@@ -6752,6 +6753,7 @@ mod tests {
 
     #[test]
     fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{JitFrame, jitframe_type_info};
         use majit_gc::GcAllocator;
 
@@ -7127,6 +7129,7 @@ mod tests {
     /// vtable→type_id mapping.
     #[test]
     fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let mut gc = MiniMarkGC::new();
         let int_tid = gc.register_type(TypeInfo::simple(16));
         let int_vtable: usize = 0x3333_4400;
@@ -7205,6 +7208,7 @@ mod tests {
     /// side works so the feeders can be built.
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_FRAME_OFS, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
@@ -7275,6 +7279,7 @@ mod tests {
     /// homes and a recycled nursery address is left in a gcmap slot.
     #[test]
     fn oldgen_jitframe_must_be_remembered_before_host_pop() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
