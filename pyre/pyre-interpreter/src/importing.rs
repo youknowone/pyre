@@ -6716,12 +6716,17 @@ pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef
     if unsafe { pyre_object::is_none(w_spec) } {
         return Ok(None);
     }
-    // `has_location` is a property whose getter runs Python and allocates, so
-    // pin the spec and read it back before the `origin` lookup.
+    // `ModuleSpec.has_location` is the `_set_fileattr` field
+    // (`_bootstrap.py has_location`).  Reading the property name would
+    // enter that one-line Python getter on every failed `IMPORT_FROM`,
+    // and the getter then compiles as a map-specialized function-entry
+    // whose map guard fails across specs.  `_PyModuleSpec_GetFileOrigin`
+    // uses `GetOptionalAttr(has_location)`; on the stdlib `ModuleSpec`
+    // that is this field, including `spec.has_location = False`.
     let _scope = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_spec = pyre_object::gc_roots::pin_root(w_spec);
-    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "has_location") {
+    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "_set_fileattr") {
         Ok(v) => v,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(None),
         Err(e) => return Err(e),
