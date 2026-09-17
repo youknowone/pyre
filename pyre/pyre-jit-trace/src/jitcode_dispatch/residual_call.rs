@@ -50,6 +50,110 @@ static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Has
 static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
 
+/// Void `list_write_barrier` only. [`is_list_write_barrier`] also matches
+/// `prepare_list_ref_store` / `current_gc_ref`, which return the list or
+/// value and must not be recorded as void `CondCallGcWb`.
+static VOID_LIST_WRITE_BARRIER_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("::listobject::list_write_barrier")
+                || name == "pyre_object::list_write_barrier"
+        })
+    });
+
+/// Object-strategy in-place store: write-barrier plus the relocated value.
+static PREPARE_LIST_REF_STORE_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("::listobject::prepare_list_ref_store")
+                || name == "pyre_object::prepare_list_ref_store"
+        })
+    });
+
+/// Post-safepoint reload residual. Identity after `CondCallGcWb`.
+static CURRENT_GC_REF_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("::listobject::current_gc_ref") || name == "pyre_object::current_gc_ref"
+        })
+    });
+
+fn residual_funcptr_addr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+) -> Option<usize> {
+    ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+        majit_ir::Value::Int(n) => Some(n as usize),
+        _ => None,
+    })
+}
+
+/// Record the list write-barrier residual as `rewrite.py gen_write_barrier`
+/// would: `CondCallGcWb` on the list, not a `CallN`/`CallR` every append.
+///
+/// `prepare_list_ref_store` still returns the value — only the barrier half
+/// becomes `CondCallGcWb`. `current_gc_ref` after that barrier is identity
+/// (`CondCallGcWb` is a header-flag check, not a moving collection). After a
+/// real collecting residual the reload stays a `Call*`.
+///
+/// Returns `(recorded, rewrote)`. `rewrote` skips `_record_helper_varargs`
+/// heapcache invalidation (`COND_CALL_GC_WB` is not a call).
+fn record_list_write_barrier_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+    allboxes: &[OpRef],
+    call_opcode: OpCode,
+    descr: DescrRef,
+) -> (OpRef, bool) {
+    let Some(addr) = residual_funcptr_addr(ctx, funcptr) else {
+        return (
+            ctx.trace_ctx
+                .record_op_with_descr(call_opcode, allboxes, descr),
+            false,
+        );
+    };
+    let addr_i = addr as i64;
+    if VOID_LIST_WRITE_BARRIER_FNADDRS.contains(&addr_i) {
+        let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        return (
+            ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]),
+            true,
+        );
+    }
+    if PREPARE_LIST_REF_STORE_FNADDRS.contains(&addr_i) {
+        let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        let _wb = ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]);
+        // Executor stamps the (possibly relocated) value onto this box.
+        let value_op = *allboxes.get(2).unwrap_or(&allboxes[0]);
+        return (value_op, true);
+    }
+    if CURRENT_GC_REF_FNADDRS.contains(&addr_i) && last_non_guard_is_cond_call_gc_wb(ctx) {
+        let obj_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        return (obj_op, true);
+    }
+    (
+        ctx.trace_ctx
+            .record_op_with_descr(call_opcode, allboxes, descr),
+        false,
+    )
+}
+
+/// `CondCallGcWb` cannot raise, but the residual it replaced may have been
+/// classified `can_raise` and already grown a `GuardNoException`. Skip those
+/// when deciding whether the preceding barrier was a moving safepoint.
+fn last_non_guard_is_cond_call_gc_wb<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    for op in ctx.trace_ctx.ops().iter().rev() {
+        match op.opcode {
+            OpCode::GuardNoException | OpCode::GuardNotForced | OpCode::GuardException => {
+                continue;
+            }
+            OpCode::CondCallGcWb => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -8343,21 +8447,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
         }
-        // Always record `list_write_barrier` on the Object strategy's in-place
-        // append arm.  Dropping it in favour of the backend's
-        // `COND_CALL_GC_WB_ARRAY` on the block's `setarrayitem` is unsound: a
-        // guard-failure bridge that re-materializes the items block appends into
-        // it without that array barrier ever firing, so an `old -> young` slot
-        // store leaves the block off the remembered set.  A later minor frees
-        // the still-referenced young element and the collector then reads a
-        // freed (poison) header.  The list barrier remembers the enclosing
-        // `W_ListObject`, whose trace reaches every slot, and keeps them alive.
+        // `list_write_barrier` is pyre's stand-in for the write barrier
+        // RPython's GC transform inserts.  `pyjitpl.py` never records
+        // `ll_writebarrier` as a call (`executor.py` skips `COND_CALL_GC_WB`);
+        // `rewrite.py gen_write_barrier` emits `COND_CALL_GC_WB` after
+        // optimize.  A residual `CallN` every Object-strategy append is the
+        // slow path of that barrier.  Record `CondCallGcWb` on the list
+        // instead: the fast path is a header-flag check, and remembering the
+        // `W_ListObject` still lets its custom tracer reach every slot
+        // (`list_append_write_barrier_gc`, including `MAJIT_GC_ITEMSBLOCK=0`).
+        // The helper still executes concretely below.
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
         let patch_pos = ctx.trace_ctx.get_trace_position();
-        let recorded = ctx
-            .trace_ctx
-            .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        let (recorded, is_list_wb) =
+            record_list_write_barrier_residual(ctx, funcptr, &allboxes, call_opcode, descr.clone());
 
         // `MIFrame.execute_varargs(pure=True)` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,
@@ -8453,8 +8557,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // (`CallLoopinvariant*`/`CallPure*`/`Call*`) match the
         // `_record_helper_varargs` invocation that runs inside
         // upstream's `executor.execute_varargs(opnum, ...)`.
-        ctx.trace_ctx
-            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        // `COND_CALL_GC_WB` is not a call (`resoperation.py`); the
+        // rewrite-inserted form never goes through `_record_helper_varargs`.
+        if !is_list_wb {
+            ctx.trace_ctx
+                .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        }
         // pyjitpl.py execute_varargs: `make_result_of_lastop(op)`
         // runs BEFORE `handle_possible_exception()` precisely "because we need
         // the box to show up in get_list_of_active_boxes()".  Write the dst
@@ -8492,7 +8600,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // (keyed on the guard opcode) so the
         // optimizer's `store_final_boxes_in_guard` finds a
         // `rd_resume_position` advanced *past* the call.
-        if can_raise {
+        // `COND_CALL_GC_WB` cannot raise (`resoperation.py`).
+        if can_raise && !is_list_wb {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // `handle_possible_exception` routes
@@ -10011,9 +10120,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
         let patch_pos = ctx.trace_ctx.get_trace_position();
-        let recorded = ctx
-            .trace_ctx
-            .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        let (recorded, is_list_wb) =
+            record_list_write_barrier_residual(ctx, funcptr, &allboxes, call_opcode, descr.clone());
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
@@ -10084,8 +10192,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.  Same invalidation semantics; only the
         // arglist construction differs (boxes2 = i_args ++ r_args).
-        ctx.trace_ctx
-            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        // `COND_CALL_GC_WB` is not a call (`resoperation.py`).
+        if !is_list_wb {
+            ctx.trace_ctx
+                .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        }
         // pyjitpl.py _opimpl_residual_call*: result writeback runs
         // BEFORE handle_possible_exception().  See
         // `dispatch_residual_call_iRd_kind` for the full citation.
@@ -10094,7 +10205,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
-        if can_raise {
+        if can_raise && !is_list_wb {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // pyjitpl.py `handle_possible_exception`

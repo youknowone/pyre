@@ -2534,6 +2534,57 @@ pub fn ll_list_obj_getitem_fast(l: &W_ListObject, index: usize) -> PyObjectRef {
     }
 }
 
+/// `rlist.py _ll_list_resize_hint_really` for Object storage.
+///
+/// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+fn ll_list_obj_resize_hint_really_iff(
+    obj: PyObjectRef,
+    newsize: usize,
+    _overallocate: bool,
+) -> bool {
+    unsafe {
+        let cap = ll_list_obj_capacity(&*(obj as *const W_ListObject));
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
+    }
+}
+
+#[majit_macros::look_inside_iff(ll_list_obj_resize_hint_really_iff)]
+pub unsafe fn ll_list_obj_resize_hint_really(obj: PyObjectRef, newsize: usize, overallocate: bool) {
+    if overallocate {
+        let _ = W_ListObject::object_grow(obj, newsize);
+    } else {
+        let list = &*(obj as *const W_ListObject);
+        if newsize > ll_list_obj_capacity(list) {
+            let _ = W_ListObject::object_grow(obj, newsize);
+        }
+    }
+}
+
+/// `rlist.py _ll_list_resize_ge` for Object storage.
+///
+/// `cond = len(l.items) < newsize`; a constant pair inlines the realloc,
+/// otherwise `jit.conditional_call` keeps the fast path bridge-free.
+pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
+    let list = &*(obj as *const W_ListObject);
+    let allocated = ll_list_obj_capacity(list);
+    let cond = allocated < newsize;
+    if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
+        if cond {
+            ll_list_obj_resize_hint_really(obj, newsize, true);
+        }
+    } else {
+        majit_rlib::jit::conditional_call3(
+            cond,
+            ll_list_obj_resize_hint_really,
+            obj,
+            newsize,
+            true,
+        );
+    }
+    let list = &mut *(obj as *mut W_ListObject);
+    ll_list_obj_set_len(list, newsize);
+}
+
 /// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
 /// known-in-bounds index (the spare-capacity append's element write).
 /// The element is a GC pointer, but — unlike the runtime helper that once
