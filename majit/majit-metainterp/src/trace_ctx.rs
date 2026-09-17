@@ -326,7 +326,7 @@ pub struct TraceCtx {
     /// Lengths of each virtualizable array field, needed for flat index computation.
     virtualizable_array_lengths: Option<Vec<usize>>,
     /// Live virtualizable heap pointer (pyjitpl.py:3446 write_boxes target).
-    /// Mirrored from `MetaInterp::vable_ptr` at trace/bridge-entry.  Used by
+    /// Mirrored from `MetaInterp::pending_vable_ptr` at trace/bridge-entry.  Used by
     /// `synchronize_virtualizable` to write `virtualizable_values` back to
     /// the live PyFrame after every standard vable setfield / setarrayitem
     /// (virtualizable.py write_boxes parity). `None` disables the
@@ -2906,7 +2906,7 @@ impl TraceCtx {
 
     // (synchronize_virtualizable helper follows)
 
-    /// Mirror of `MetaInterp::vable_ptr` used by `synchronize_virtualizable`.
+    /// Mirror of the host seed / `virtualizable_heap_ptr` used by `synchronize_virtualizable`.
     /// Callers set this at trace/bridge-entry so writes to
     /// `virtualizable_values` can propagate to the live PyFrame without
     /// routing back through MetaInterp (pyjitpl.py write_boxes target).
@@ -3258,7 +3258,7 @@ impl TraceCtx {
             return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
-        // `MetaInterp::vable_ptr`, which the JitState pins for the trace
+        // `virtualizable_heap_ptr`, which the JitState pins for the trace
         // session's lifetime. `write_all_boxes` uses typed offsets derived
         // from the same VirtualizableInfo used at the matching heap read.
         unsafe {
@@ -3399,7 +3399,7 @@ impl TraceCtx {
         for array_index in 0..array_count {
             // Live length: pyjitpl.py:3446 mirror via vinfo.get_array_length.
             // Safety: heap_ptr is cached at trace/bridge entry from
-            // MetaInterp::vable_ptr; the live PyFrame lifetime spans the
+            // virtualizable_heap_ptr; the live PyFrame lifetime spans the
             // trace session.
             let len = unsafe { info.get_array_length(heap_ptr, array_index) };
             if cursor + len > values.len() {
@@ -3971,7 +3971,7 @@ impl TraceCtx {
         self.virtualizable_array_lengths.as_deref()
     }
 
-    /// Live virtualizable heap pointer (`MetaInterp::vable_ptr` mirror).
+    /// Live virtualizable heap pointer (`virtualizable_heap_ptr` / sync target).
     /// `vinfo.unwrap_virtualizable_box(virtualizable_box)` analogue for
     /// callers that need the concrete object behind
     /// `standard_virtualizable_box()` — e.g. the
