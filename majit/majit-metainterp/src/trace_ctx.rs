@@ -1417,11 +1417,9 @@ impl TraceCtx {
         self.replace_frames = None;
     }
 
-    /// `fielddescr.get_vinfo()` including the codewriter
-    /// `vable_static_field_descr` / `vable_array_field_descr` singletons,
-    /// which implement only `Descr`. Resolve them through the live
-    /// vinfo's identity map to the finalize_arc FieldDescr that holds
-    /// the Weak backref (`vinfo is fielddescr.get_vinfo()`).
+    /// `fielddescr.get_vinfo()`. Codewriter emits the vinfo's own
+    /// FieldDescr (`pyframe_static_field_descr`), which already holds
+    /// the Weak backref.
     fn vinfo_from_fielddescr(
         &self,
         fielddescr: &DescrRef,
@@ -4534,9 +4532,9 @@ impl TraceCtx {
         self.is_nonstandard_virtualizable(pc, vable_opref, fielddescr, concrete)
     }
 
-    /// Resolve a `setfield_vable`/`getfield_vable` static field descr (the
-    /// `vable_static_field_descr(idx)` singleton, or the vinfo's own
-    /// `SimpleFieldDescr`) to the parent-struct-layout `FieldDescr` for
+    /// Resolve a `setfield_vable`/`getfield_vable` static field descr
+    /// (the vinfo's `static_field_descrs[idx]`) to the parent-struct-layout
+    /// `FieldDescr` for
     /// recording a real heap op on a NONSTANDARD virtualizable.
     ///
     /// A nonstandard virtualizable can be a force-materialized inline-callee
@@ -4947,9 +4945,8 @@ impl TraceCtx {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
             // (pyjitpl.py:973-988).
             //
-            // The codewriter emits the `vable_static_field_descr(idx)`
-            // singleton (a `VableStaticFieldDescr`, index-only, no parent
-            // SizeDescr) for `setfield_vable`. On the STANDARD virtualizable
+            // The codewriter emits the vinfo's `static_field_descrs[idx]`
+            // for `setfield_vable`. On the STANDARD virtualizable
             // path below this descr is only used as the virtualizable-boxes
             // index, never recorded. On the NONSTANDARD path the field write
             // is recorded as a real `SetfieldGc` — and a nonstandard frame can
