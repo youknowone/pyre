@@ -4790,6 +4790,14 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::rbuilder::set_stringpiece_gc_type_id(stringpiece_tid);
     let _ = pyre_jit_trace::descr::stringpiece_size_descr();
 
+    // rlist.py LIST for exception args_w — length + items pointer.
+    let rlist_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        pyre_object::interp_exceptions::RLIST_SIZE,
+        vec![pyre_object::interp_exceptions::RLIST_ITEMS_OFFSET],
+    ));
+    pyre_object::interp_exceptions::set_rlist_gc_type_id(rlist_tid);
+    let _ = pyre_jit_trace::descr::rlist_size_descr();
+
     // gateway.py interp2app is an internal prebuilt W_Root, not an
     // app-level builtin type. Trace its Code reference like the hidden
     // WeakrefLifeline above. This is the tail of fixed layouts, BEFORE

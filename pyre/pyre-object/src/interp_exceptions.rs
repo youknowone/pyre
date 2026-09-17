@@ -628,6 +628,39 @@ pub fn exception_extended_gc_type_id() -> u32 {
     W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// rlist.py `LIST = GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))`.
+///
+/// Interp-level `list of W_Root` used for `W_BaseException.args_w`.  Not a
+/// Python `list`: no `ob_type` / strategy / typed unbox storage.
+#[repr(C)]
+pub struct RList {
+    pub length: i64,
+    pub items: *mut crate::object_array::ItemsBlock,
+}
+
+pub const RLIST_SIZE: usize = std::mem::size_of::<RList>();
+pub const RLIST_LENGTH_OFFSET: usize = std::mem::offset_of!(RList, length);
+pub const RLIST_ITEMS_OFFSET: usize = std::mem::offset_of!(RList, items);
+
+static RLIST_GC_TYPE_ID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_rlist_gc_type_id(tid: u32) {
+    debug_assert_ne!(tid, 0, "0 is the unpublished sentinel");
+    RLIST_GC_TYPE_ID_CELL.store(tid, std::sync::atomic::Ordering::Release);
+}
+
+#[majit_macros::dont_look_inside]
+pub fn rlist_gc_type_id() -> u32 {
+    RLIST_GC_TYPE_ID_CELL.load(std::sync::atomic::Ordering::Acquire)
+}
+
+impl crate::lltype::GcType for RList {
+    fn type_id() -> u32 {
+        rlist_gc_type_id()
+    }
+    const SIZE: usize = RLIST_SIZE;
+}
+
 /// Record an old→young edge when a `W_BaseException` slot
 /// (`W_BASE_EXCEPTION_GC_PTR_OFFSETS`) is overwritten after allocation.
 /// No-op while the exception still lives in the nursery; once it is
@@ -955,52 +988,78 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
             return crate::tupleobject::w_tuple_new(Vec::new());
         }
         // PyPy: `space.newtuple(self.args_w)`.  `args_w` is an
-        // RPython list (pyre: `W_ListObject`); flatten its items into
-        // a freshly-allocated tuple.
-        let items: Vec<PyObjectRef> = if crate::pyobject::is_list(stored) {
-            let len = crate::listobject::w_list_len(stored) as i64;
-            let mut items = Vec::with_capacity(len as usize);
-            for i in 0..len {
-                items.push(
-                    crate::listobject::w_list_getitem(stored, i)
-                        .unwrap_or(crate::pyobject::PY_NULL),
-                );
-            }
-            items
-        } else if crate::pyobject::is_tuple(stored) {
-            // Legacy compat — pre-list storage path; treat as already
-            // a sequence and rebuild the tuple identically.
-            let len = crate::tupleobject::w_tuple_len(stored) as i64;
-            let mut items = Vec::with_capacity(len as usize);
-            for i in 0..len {
-                items.push(
-                    crate::tupleobject::w_tuple_getitem(stored, i)
-                        .unwrap_or(crate::pyobject::PY_NULL),
-                );
-            }
-            items
-        } else {
-            Vec::new()
-        };
-        crate::tupleobject::w_tuple_new(items)
+        // RPython list (`rlist.py` LIST).
+        crate::tupleobject::w_tuple_new(rlist_items(stored))
     }
 }
 
 /// Build the `args_w` storage list for an exception.
 ///
 /// `interp_exceptions.py` declares `args_w = []` — an RPython
-/// `list of W_Root`, i.e. a plain array of object pointers.  List
-/// *strategies* are a `W_ListObject` feature of the app-level list type
-/// (`objspace/std/listobject.py`) and have no counterpart in an RPython
-/// list, so `args_w` must never take the unboxed `Integer` / `Float`
-/// representation `w_list_new` would pick for `ValueError(7)`, nor the
-/// `Empty` one it picks for `ValueError()`.
-///
-/// Beyond parity this is what keeps the slot readable: the `args` load
-/// fold walks the object items block directly, and declines on any other
-/// strategy, leaving `e.args` as a residual `getattr` call.
+/// `list of W_Root` (`rlist.py` LIST: length + `Ptr(GcArray(OBJECTPTR))`).
 pub fn w_exception_args_new(items: Vec<PyObjectRef>) -> PyObjectRef {
-    crate::listobject::w_list_new_object(items)
+    rlist_new(items)
+}
+
+/// rlist.py `ll_newlist` — allocate a LIST and copy `items` into its
+/// `GcArray(OBJECTPTR)` body.
+#[majit_macros::dont_look_inside]
+pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let items_base = crate::gc_roots::shadow_stack_len();
+    for &item in &items {
+        let _ = crate::gc_roots::pin_root(item);
+    }
+    let n = items.len();
+    let rooted: Vec<PyObjectRef> = (0..n)
+        .map(|i| crate::gc_roots::shadow_stack_get(items_base + i))
+        .collect();
+    let block = if n == 0 {
+        std::ptr::null_mut()
+    } else {
+        unsafe { crate::object_array::alloc_list_items_block_gc(&rooted) }
+    };
+    let value = RList {
+        length: n as i64,
+        items: block,
+    };
+    let tid = rlist_gc_type_id();
+    if tid != 0 {
+        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, RLIST_SIZE);
+        if !raw.is_null() {
+            unsafe {
+                std::ptr::write(raw as *mut RList, value);
+            }
+            crate::gc_hook::try_gc_write_barrier(raw);
+            return raw as PyObjectRef;
+        }
+    }
+    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
+/// rlist.py `ll_length`.
+#[inline]
+pub unsafe fn rlist_len(list: PyObjectRef) -> usize {
+    if list.is_null() {
+        return 0;
+    }
+    unsafe { (*(list as *const RList)).length.max(0) as usize }
+}
+
+/// rlist.py `ll_getitem_fast` for a known-in-bounds index.
+#[inline]
+pub unsafe fn rlist_getitem(list: PyObjectRef, index: usize) -> PyObjectRef {
+    let list = unsafe { &*(list as *const RList) };
+    debug_assert!(index < list.length.max(0) as usize);
+    let base = unsafe { crate::object_array::items_block_items_base(list.items) };
+    unsafe { *base.add(index) }
+}
+
+fn rlist_items(list: PyObjectRef) -> Vec<PyObjectRef> {
+    let len = unsafe { rlist_len(list) };
+    (0..len)
+        .map(|i| unsafe { rlist_getitem(list, i) })
+        .collect()
 }
 
 /// Raw `args_w` storage for JIT field mirrors.  Unlike
@@ -1024,11 +1083,7 @@ pub unsafe fn w_exception_get_args_storage(obj: PyObjectRef) -> PyObjectRef {
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// Stores a `W_ListObject` carrying the constructor / setter items.
-/// Callers (`baseobjspace::coerce_to_list_for_args`) pre-flatten any
-/// iterable into a list via `space.fixedview` semantics so the slot
-/// always holds a list — matching PyPy's `args_w: list of W_Root`
-/// type.
+/// Stores the rlist.py LIST `space.fixedview` produced.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -2537,5 +2592,24 @@ mod tests {
             W_EXCEPTION_EXTENDED_SIZE > W_BASE_EXCEPTION_SIZE,
             "extended layout must be larger than the slim base"
         );
+        assert_eq!(RLIST_SIZE, 16);
+        assert_eq!(RLIST_ITEMS_OFFSET, 8);
+    }
+
+    #[test]
+    fn rlist_new_roundtrip() {
+        let a = crate::intobject::w_int_new(7);
+        let b = crate::intobject::w_int_new(8);
+        let list = rlist_new(vec![a, b]);
+        assert_eq!(unsafe { rlist_len(list) }, 2);
+        assert_eq!(
+            unsafe { crate::intobject::w_int_get_value(rlist_getitem(list, 0)) },
+            7
+        );
+        assert_eq!(
+            unsafe { crate::intobject::w_int_get_value(rlist_getitem(list, 1)) },
+            8
+        );
+        assert_eq!(unsafe { rlist_len(rlist_new(Vec::new())) }, 0);
     }
 }

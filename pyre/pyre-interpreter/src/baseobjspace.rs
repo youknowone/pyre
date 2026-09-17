@@ -14472,10 +14472,8 @@ pub unsafe fn exception_attr_slot_fold(
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// `space.fixedview` materialises any iterable into a RPython list
-/// of `W_Root`; pyre stores `args_w` as a `W_ListObject` so the
-/// getter (`w_exception_get_args`) can build a fresh tuple per read
-/// (matching `descr_getargs: return space.newtuple(self.args_w)`).
+/// `space.fixedview` materialises any iterable into an RPython list
+/// of `W_Root` (`rlist.py` LIST).
 unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if value.is_null() {
         return Ok(pyre_object::interp_exceptions::w_exception_args_new(vec![]));
