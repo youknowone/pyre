@@ -1011,15 +1011,17 @@ impl PyError {
                 pyre_object::gc_roots::shadow_stack_get(base),
             )
         };
-        if storage.is_null() || unsafe { !pyre_object::is_list(storage) } {
+        if storage.is_null() || unsafe { pyre_object::interp_exceptions::rlist_len(storage) } < 2 {
             return;
         }
-        let Some(w_msg) = (unsafe { pyre_object::w_list_getitem(storage, 0) }) else {
+        let w_msg = unsafe { pyre_object::interp_exceptions::rlist_getitem(storage, 0) };
+        if w_msg.is_null() {
             return;
-        };
-        let Some(details) = (unsafe { pyre_object::w_list_getitem(storage, 1) }) else {
+        }
+        let details = unsafe { pyre_object::interp_exceptions::rlist_getitem(storage, 1) };
+        if details.is_null() {
             return;
-        };
+        }
         if unsafe { !pyre_object::is_tuple(details) || pyre_object::w_tuple_len(details) < 6 } {
             return;
         }

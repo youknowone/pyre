@@ -34,15 +34,14 @@ fn walker_recorded_builtin_raise_is_supported(
         return false;
     }
     let args_storage = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
-    if args_storage.is_null() || unsafe { !pyre_object::is_list(args_storage) } {
-        return false;
+    if args_storage.is_null() {
+        return true;
     }
-    let args_len = unsafe { pyre_object::w_list_len(args_storage) };
+    let args_len = unsafe { pyre_object::interp_exceptions::rlist_len(args_storage) };
     (0..args_len).all(|index| {
-        let Some(arg) = (unsafe { pyre_object::w_list_getitem(args_storage, index as i64) }) else {
-            return false;
-        };
-        unsafe { pyre_object::is_str(arg) && pyre_object::is_exact_builtin_instance(arg) }
+        let arg = unsafe { pyre_object::interp_exceptions::rlist_getitem(args_storage, index) };
+        !arg.is_null()
+            && unsafe { pyre_object::is_str(arg) && pyre_object::is_exact_builtin_instance(arg) }
     })
 }
 
@@ -21500,11 +21499,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     }
     let stored_args =
         unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(concrete_self) };
-    if stored_args.is_null() || !unsafe { pyre_object::is_list(stored_args) } {
-        return Ok(None);
-    }
-    let list = unsafe { &*(stored_args as *const pyre_object::listobject::W_ListObject) };
-    if list.strategy != pyre_object::listobject::ListStrategy::Object {
+    if stored_args.is_null() {
         return Ok(None);
     }
     // `descr_reduce` does `space.newtuple(self.args_w)` then
@@ -21513,11 +21508,10 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     // array-backed shape for an arity the runtime specialises leaves
     // `len(r)` guarding a vtable this trace never builds
     // (`emit_specialised_tuple_oo_inline`).
-    let args_len = unsafe { pyre_object::w_list_len(stored_args) };
+    let args_len = unsafe { pyre_object::interp_exceptions::rlist_len(stored_args) };
     let mut concrete_items = Vec::with_capacity(args_len);
     for index in 0..args_len {
-        let item = unsafe { pyre_object::w_list_getitem(stored_args, index as i64) }
-            .unwrap_or(pyre_object::PY_NULL);
+        let item = unsafe { pyre_object::interp_exceptions::rlist_getitem(stored_args, index) };
         if item.is_null() {
             return Ok(None);
         }

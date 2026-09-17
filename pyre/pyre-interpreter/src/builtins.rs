@@ -7390,15 +7390,17 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bool {
     unsafe {
         let stored = pyre_object::interp_exceptions::w_exception_get_args_storage(w_self);
-        if stored.is_null() || !pyre_object::is_list(stored) {
-            return false;
+        if stored.is_null() {
+            return positional.is_empty();
         }
-        if pyre_object::w_list_len(stored) != positional.len() {
+        if pyre_object::interp_exceptions::rlist_len(stored) != positional.len() {
             return false;
         }
         positional.iter().enumerate().all(|(i, &item)| {
-            pyre_object::w_list_getitem(stored, i as i64)
-                .is_some_and(|held| std::ptr::eq(held, item))
+            std::ptr::eq(
+                pyre_object::interp_exceptions::rlist_getitem(stored, i),
+                item,
+            )
         })
     }
 }
@@ -9106,23 +9108,21 @@ fn base_exception_str_method(args: &[PyObjectRef]) -> crate::PyResult {
     let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(obj) };
     let len = if stored.is_null() {
         0
-    } else if unsafe { pyre_object::is_list(stored) } {
-        unsafe { pyre_object::w_list_len(stored) }
-    } else if unsafe { pyre_object::is_tuple(stored) } {
-        unsafe { pyre_object::w_tuple_len(stored) }
     } else {
-        0
+        unsafe { pyre_object::interp_exceptions::rlist_len(stored) }
     };
     if len == 0 {
         return Ok(w_str_new(""));
     }
     if len == 1 {
-        let first = if unsafe { pyre_object::is_list(stored) } {
-            unsafe { pyre_object::w_list_getitem(stored, 0) }
-        } else {
-            unsafe { pyre_object::w_tuple_getitem(stored, 0) }
-        }
-        .unwrap_or(pyre_object::PY_NULL);
+        let first = {
+            let item = unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 0) };
+            if item.is_null() {
+                pyre_object::PY_NULL
+            } else {
+                item
+            }
+        };
         let _ = pyre_object::gc_roots::pin_root(first);
         let first_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         return builtin_str(&[pyre_object::gc_roots::shadow_stack_get(first_slot)]);
@@ -23811,7 +23811,10 @@ mod tests {
 
         let exc = exc_exception_new(&[cls, kwargs]).unwrap();
         let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
-        assert_eq!(unsafe { pyre_object::w_list_len(stored) }, 0);
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored) },
+            0
+        );
     }
 
     #[test]
