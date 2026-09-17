@@ -15508,6 +15508,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             let obj = ref_args.first().copied();
             let value = ref_args.get(1).copied();
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
+            if str_name.is_some() {
+                guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
+            }
             if let (Some(obj), Some(value)) = (obj, value) {
                 if let Some(outcome) =
                     super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
@@ -15539,7 +15542,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             }
             let folded =
                 if let (Some(obj), Some(value), Some(name)) = (obj, value, str_name.as_deref()) {
-                    guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
                     matches!(
                         spec_gate_store_attr(|| {
                             super::specialize::fold_store_attr_named(
@@ -15588,6 +15590,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         {
             let obj = ref_args.first().copied();
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
+            if str_name.is_some() {
+                guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
+            }
             if let Some(obj) = obj
                 && let Some(outcome) =
                     super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(

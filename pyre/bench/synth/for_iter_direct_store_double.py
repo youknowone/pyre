@@ -21,7 +21,7 @@ def set_trace_limit(n):
 # directly (~20 operations), where the opaque `for_iter_next` residual it
 # replaced was one.  At 40 the walk reached its ceiling inside the header and
 # never saw the `STORE_ATTR` this fixture is about.
-set_trace_limit(120)
+set_trace_limit(60)
 
 errs = list(map(lambda i: OSError(1, str(i)), range(20000)))
 
