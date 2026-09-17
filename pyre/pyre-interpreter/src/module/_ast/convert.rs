@@ -423,18 +423,26 @@ impl ObjectConverter {
     /// and must not reject a tree the converter would go on to accept.
     fn scan_extent(&mut self, object: PyObjectRef, extent: &mut (usize, usize)) -> AstResult<()> {
         if unsafe { pyre_object::is_list(object) } {
-            for item in unsafe {
+            let items = unsafe {
                 pyre_object::w_list_items_copy_as_vec_mode(
                     object,
                     majit_metainterp::jit::we_are_jitted(),
                 )
-            } {
+            };
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&items);
+            for index in 0..items.len() {
+                let item = pyre_object::gc_roots::shadow_stack_get(base + index);
                 self.recurse(|this| this.scan_extent(item, extent))?;
             }
             return Ok(());
         }
         if unsafe { pyre_object::is_tuple(object) } {
-            for item in unsafe { pyre_object::w_tuple_items_copy_as_vec(object) } {
+            let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(object) };
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&items);
+            for index in 0..items.len() {
+                let item = pyre_object::gc_roots::shadow_stack_get(base + index);
                 self.recurse(|this| this.scan_extent(item, extent))?;
             }
             return Ok(());
@@ -464,7 +472,13 @@ impl ObjectConverter {
         if !unsafe { pyre_object::is_tuple(fields) } {
             return Ok(());
         }
-        for name in unsafe { pyre_object::w_tuple_items_copy_as_vec(fields) } {
+        let names = unsafe { pyre_object::w_tuple_items_copy_as_vec(fields) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(object);
+        let name_base = pyre_object::gc_roots::pin_roots(&names);
+        for index in 0..names.len() {
+            let name = pyre_object::gc_roots::shadow_stack_get(name_base + index);
             if !unsafe { pyre_object::is_str(name) } {
                 continue;
             }
@@ -473,7 +487,9 @@ impl ObjectConverter {
                 continue;
             };
             let name = name.to_string();
-            if let Some(value) = self.optional_field(object, &name)? {
+            if let Some(value) =
+                self.optional_field(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?
+            {
                 self.recurse(|this| this.scan_extent(value, extent))?;
             }
         }

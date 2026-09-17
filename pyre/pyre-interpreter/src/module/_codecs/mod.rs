@@ -1635,17 +1635,25 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py charmap_build`: build a dict mapping
     // each Unicode codepoint in `chars` to its ordinal position.
     let chars = unsafe { w_str_get_wtf8(chars) }.to_wtf8_buf();
-    let w_charmap = w_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+    let val_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     for (num, cp) in chars.code_points().enumerate() {
+        pyre_object::gc_roots::shadow_stack_set(key_slot, w_int_new(cp.to_u32() as i64));
+        pyre_object::gc_roots::shadow_stack_set(val_slot, w_int_new(num as i64));
         unsafe {
             pyre_object::dictmultiobject::w_dict_store(
-                w_charmap,
-                w_int_new(cp.to_u32() as i64),
-                w_int_new(num as i64),
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(val_slot),
             );
         }
     }
-    Ok(w_charmap)
+    Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
 }
 
 /// The `errors` argument the code page entry points share: `None` is

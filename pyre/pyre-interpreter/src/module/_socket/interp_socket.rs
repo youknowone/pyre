@@ -1673,17 +1673,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let _roots = pyre_object::gc_roots::push_roots();
                     let mut pair_slots = Vec::with_capacity(interfaces.len());
                     for (index, name) in interfaces {
-                        let idx = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        let idx_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                             index as i64,
                         ));
                         // Interface names are OS bytes: preserve fsencode/fsdecode
                         // round trips, including non-UTF-8 names.
-                        let decoded = pyre_object::gc_roots::pin_root(
+                        let decoded_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
                             crate::gateway::fsdecode_filename_bytes(&name),
                         );
                         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                            idx, decoded,
+                            pyre_object::gc_roots::shadow_stack_get(idx_slot),
+                            pyre_object::gc_roots::shadow_stack_get(decoded_slot),
                         ]));
                         pair_slots.push(pair_slot);
                     }
@@ -2403,25 +2406,32 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         &mut storage as *mut _ as *mut u8,
                         copy_len,
                     );
-                    let family = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                    let family_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                         ai.ai_family as i64,
                     ));
-                    let socktype = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                    let socktype_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                         ai.ai_socktype as i64,
                     ));
-                    let protocol = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                    let protocol_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                         ai.ai_protocol as i64,
                     ));
-                    let canon = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
-                        &canon,
-                    ));
-                    let addr = pyre_object::gc_roots::pin_root(unpack_inet_addr(
+                    let canon_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&canon));
+                    let addr_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(unpack_inet_addr(
                         &storage,
                         copy_len as rffi::SockLen,
                     ));
                     let entry_slot = pyre_object::gc_roots::shadow_stack_len();
                     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                        family, socktype, protocol, canon, addr,
+                        pyre_object::gc_roots::shadow_stack_get(family_slot),
+                        pyre_object::gc_roots::shadow_stack_get(socktype_slot),
+                        pyre_object::gc_roots::shadow_stack_get(protocol_slot),
+                        pyre_object::gc_roots::shadow_stack_get(canon_slot),
+                        pyre_object::gc_roots::shadow_stack_get(addr_slot),
                     ]));
                     entry_slots.push(entry_slot);
                     cur = ai.ai_next;
@@ -5208,18 +5218,23 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         let available = control_end - data_start;
                         let payload_len = (total - hdr_size).min(available);
                         let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                        let level = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        let level_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                             header.cmsg_level as i64,
                         ));
-                        let cmsg_type = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                             header.cmsg_type as i64,
                         ));
-                        let data = pyre_object::gc_roots::pin_root(
+                        let data_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
                             pyre_object::bytesobject::w_bytes_from_bytes(&payload),
                         );
                         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                            level, cmsg_type, data,
+                            pyre_object::gc_roots::shadow_stack_get(level_slot),
+                            pyre_object::gc_roots::shadow_stack_get(type_slot),
+                            pyre_object::gc_roots::shadow_stack_get(data_slot),
                         ]));
                         anc_slots.push(pair_slot);
                         cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
@@ -5385,18 +5400,23 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         let available = control_end - data_start;
                         let payload_len = (total - hdr_size).min(available);
                         let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                        let level = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        let level_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                             header.cmsg_level as i64,
                         ));
-                        let cmsg_type = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
+                        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
                             header.cmsg_type as i64,
                         ));
-                        let data = pyre_object::gc_roots::pin_root(
+                        let data_slot = pyre_object::gc_roots::shadow_stack_len();
+                        let _ = pyre_object::gc_roots::pin_root(
                             pyre_object::bytesobject::w_bytes_from_bytes(&payload),
                         );
                         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
                         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                            level, cmsg_type, data,
+                            pyre_object::gc_roots::shadow_stack_get(level_slot),
+                            pyre_object::gc_roots::shadow_stack_get(type_slot),
+                            pyre_object::gc_roots::shadow_stack_get(data_slot),
                         ]));
                         anc_slots.push(pair_slot);
                         cmsg = libc::CMSG_NXTHDR(&msg, cmsg);

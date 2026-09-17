@@ -1782,16 +1782,27 @@ fn names_tuple(names: &[String]) -> PyObjectRef {
 }
 
 fn constants_tuple(obj: PyObjectRef, code: &crate::CodeObject) -> PyObjectRef {
-    let mut constants = Vec::with_capacity(code.constants.len());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let mut slots = Vec::with_capacity(code.constants.len());
     for (index, constant) in crate::pyframe::code_constants(code).iter().enumerate() {
-        let value = unsafe { w_code_const(obj, index) };
-        constants.push(if value.is_null() {
+        let value =
+            unsafe { w_code_const(pyre_object::gc_roots::shadow_stack_get(obj_slot), index) };
+        let value = if value.is_null() {
             crate::pyframe::pyobject_from_constant(constant)
         } else {
             value
-        });
+        };
+        slots.push(pyre_object::gc_roots::shadow_stack_len());
+        let _ = pyre_object::gc_roots::pin_root(value);
     }
-    w_tuple_new(constants)
+    w_tuple_new(
+        slots
+            .into_iter()
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .collect(),
+    )
 }
 
 fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {

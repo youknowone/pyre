@@ -5834,12 +5834,12 @@ pub fn str_method_center(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let _roots = pyre_object::gc_roots::push_roots();
     let recv_slot = pyre_object::gc_roots::pin_roots(args);
     let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
-    let reloaded: Vec<_> = (0..args.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
-        .collect();
     let width =
         crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
             .max(0) as usize;
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
     let fillchar = pad_fillchar(&reloaded, "center")?;
     let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
     let s_len = unsafe { pyre_object::w_str_len(recv()) };
@@ -5864,12 +5864,12 @@ pub fn str_method_ljust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let _roots = pyre_object::gc_roots::push_roots();
     let recv_slot = pyre_object::gc_roots::pin_roots(args);
     let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
-    let reloaded: Vec<_> = (0..args.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
-        .collect();
     let width =
         crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
             .max(0) as usize;
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
     let fillchar = pad_fillchar(&reloaded, "ljust")?;
     let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
     let s_len = unsafe { pyre_object::w_str_len(recv()) };
@@ -5890,12 +5890,12 @@ pub fn str_method_rjust(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     let _roots = pyre_object::gc_roots::push_roots();
     let recv_slot = pyre_object::gc_roots::pin_roots(args);
     let recv = || pyre_object::gc_roots::shadow_stack_get(recv_slot);
-    let reloaded: Vec<_> = (0..args.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
-        .collect();
     let width =
         crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(recv_slot + 1))?
             .max(0) as usize;
+    let reloaded: Vec<_> = (0..args.len())
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(recv_slot + i))
+        .collect();
     let fillchar = pad_fillchar(&reloaded, "rjust")?;
     let s = unsafe { w_str_get_wtf8(recv()) }.to_wtf8_buf();
     let s_len = unsafe { pyre_object::w_str_len(recv()) };

@@ -1941,10 +1941,15 @@ fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut pair_slots = Vec::with_capacity(n);
     for gi in 0..n {
         let (start, end) = unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
-        let start_obj = pyre_object::gc_roots::pin_root(w_int_new(start));
-        let end_obj = pyre_object::gc_roots::pin_root(w_int_new(end));
+        let start_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(start));
+        let end_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_int_new(end));
         let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![start_obj, end_obj]));
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(start_slot),
+            pyre_object::gc_roots::shadow_stack_get(end_slot),
+        ]));
         pair_slots.push(pair_slot);
     }
     Ok(w_tuple_new(

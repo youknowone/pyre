@@ -25379,7 +25379,8 @@ pub(crate) fn bytes_method_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         if crate::baseobjspace::len_w(sep_obj)? != 1 {
             return Err(sep_length_error());
         }
-        // `__len__` can collect; copy the separator off the object after it.
+        // `__len__` can collect; copy the separator off the reloaded object.
+        let sep_obj = pyre_object::gc_roots::shadow_stack_get(recv_slot + sep_idx.unwrap());
         let sep_owned: Vec<u8> = if unsafe { pyre_object::is_str(sep_obj) } {
             // A lone surrogate is a length-1 separator with no UTF-8
             // spelling, so the ASCII test reads the WTF-8 payload; demanding
