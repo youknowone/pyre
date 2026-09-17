@@ -1410,7 +1410,15 @@ pub fn trace_bytecode<Sym: WalkSym>(
             concrete_frame.get_is_being_profiled(),
         ))
     {
-        let action = full_body_walk_trace(ctx, sym, w_code, start_pc, cf_addr, WalkJournals::Reset);
+        let action = full_body_walk_trace(
+            ctx,
+            sym,
+            w_code,
+            start_pc,
+            cf_addr,
+            WalkJournals::Reset,
+            None,
+        );
         finish_trace_namespace_dependency(meta);
         return (action, concrete_frame);
     }
@@ -2471,15 +2479,41 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     mut exc: majit_ir::OpRef,
     mut exc_concrete: crate::state::ConcreteValue,
 ) -> Option<TraceAction> {
-    // Reject a missing jitcode before any `carrier_ec_leave`: the leave is
-    // concrete, and a mid-chain decline after a pop would leave `topframeref`
-    // one level short for the abort epilogue's blackhole replay.
+    // Decline before any `carrier_ec_leave`: the leave is concrete, and a
+    // mid-chain decline after a pop would leave `topframeref` one level
+    // short for the abort epilogue's blackhole replay. Catching middles
+    // also preflight the recipe layout and resume entry that
+    // `drive_middle_frame_from_handler` would otherwise reject after
+    // deeper uncatching frames have already been popped.
     for middle in middles {
         if middle.return_substitute.is_some() {
             continue;
         }
-        if crate::state::pyjitcode_for_code(middle.code_ptr).is_none() {
+        let Some(middle_pjc) = crate::state::pyjitcode_for_code(middle.code_ptr) else {
             crate::jitcode_dispatch::census_record("P2Drain::NoMiddlePjc");
+            return None;
+        };
+        if carrier_catch_target(
+            middle_pjc.jitcode.code.as_slice(),
+            middle.jitcode_pc as usize,
+            "middle",
+        )
+        .is_none()
+        {
+            continue;
+        }
+        if !crate::state::reconstructed_callee_recipe_is_portable(middle) {
+            crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
+            return None;
+        }
+        if select_recipe_entry(
+            middle.jitcode_index,
+            middle_pjc.jitcode.index() as i32,
+            middle.jitcode_pc,
+        )
+        .is_none()
+        {
+            crate::jitcode_dispatch::census_record("P2Drain::NoMiddleEntry");
             return None;
         }
     }
@@ -2542,11 +2576,6 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
         }
     }
     let catch_target = carrier_root_catch_target(sym, root_pc);
-    crate::jitcode_dispatch::set_carrier_raise_seed(crate::jitcode_dispatch::CarrierRaiseSeed {
-        exc,
-        exc_concrete,
-        catch_target,
-    });
     crate::jitcode_dispatch::census_record(if catch_target.is_some() {
         "P2Drain::CompileRootRaise"
     } else {
@@ -2555,8 +2584,19 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
     let root_py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(carrier.root_jitcode_index, root_pc as i32)
             as usize;
-    let action = full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
-    let _ = crate::jitcode_dispatch::take_carrier_raise_seed();
+    let action = full_body_walk_trace(
+        ctx,
+        sym,
+        w_code,
+        root_py_pc,
+        cf_addr,
+        WalkJournals::Keep,
+        Some(crate::jitcode_dispatch::CarrierRaiseSeed {
+            exc,
+            exc_concrete,
+            catch_target,
+        }),
+    );
     crate::jitcode_dispatch::fbw_store_journal_rollback();
     Some(action)
 }
@@ -2578,7 +2618,15 @@ fn compile_root_from_carrier_result<Sym: WalkSym>(
     let root_py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(carrier.root_jitcode_index, root_pc as i32)
             as usize;
-    let action = full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
+    let action = full_body_walk_trace(
+        ctx,
+        sym,
+        w_code,
+        root_py_pc,
+        cf_addr,
+        WalkJournals::Keep,
+        None,
+    );
     crate::jitcode_dispatch::fbw_store_journal_rollback();
     Some(action)
 }
@@ -4203,9 +4251,11 @@ fn run_perfn_walk<Sym: WalkSym>(
     cf_addr: usize,
     is_being_profiled: bool,
     authoritative: bool,
+    carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
 ) -> Option<(usize, usize, PerfnWalkResult)> {
     let session = std::cell::RefCell::new(crate::jitcode_dispatch::WalkSession {
         is_being_profiled,
+        carrier_raise_seed,
         ..Default::default()
     });
     let _session_roots = crate::jitcode_dispatch::WalkSessionRoots::new(&session);
@@ -5940,6 +5990,7 @@ fn probe_walk_perfn_jitcode<Sym: WalkSym>(
         cf_addr,
         is_being_profiled,
         authoritative,
+        None,
     ) else {
         return;
     };
@@ -6634,6 +6685,7 @@ fn full_body_walk_trace<Sym: WalkSym>(
     start_pc: usize,
     cf_addr: usize,
     journals: WalkJournals,
+    carrier_raise_seed: Option<crate::jitcode_dispatch::CarrierRaiseSeed>,
 ) -> TraceAction {
     let is_being_profiled = crate::driver::frame_is_being_profiled(cf_addr);
     // #125: decline up front when a loop body carries an `abort_permanent`
@@ -6752,7 +6804,16 @@ fn full_body_walk_trace<Sym: WalkSym>(
             start_pc,
         );
     }
-    let walk_result = run_perfn_walk(ctx, sym, w_code, start_pc, cf_addr, is_being_profiled, true);
+    let walk_result = run_perfn_walk(
+        ctx,
+        sym,
+        w_code,
+        start_pc,
+        cf_addr,
+        is_being_profiled,
+        true,
+        carrier_raise_seed,
+    );
     // A guard snapshot emitted during the walk may have hit a resume
     // coordinate the jitcode resume markers cannot encode (#124/#130) and requested
     // an abort (`state::request_trace_abort`).  The walker does not poll the

@@ -15235,6 +15235,28 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// Returns `(pending, argboxes_r)`; `None` when the callee body/layout is
 /// unavailable.  Records the vable ops into `ctx` in trace order, so the
 /// caller must invoke this at the point the callee frame is reconstructed.
+/// Recipe checks [`setup_reconstructed_callee_frame`] applies before it
+/// allocates a concrete `PyFrame`. The carrier drain uses this so a
+/// catching middle that cannot be reconstructed declines before any
+/// `carrier_ec_leave` shortens `topframeref`.
+pub(crate) fn reconstructed_callee_recipe_is_portable(recipe: &ReconstructRecipe) -> bool {
+    let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+    if raw_code.is_null() {
+        return false;
+    }
+    let code_ref = unsafe { &*raw_code };
+    let (stack_base, _frame_array_size) = callee_layout_for_call_assembler(code_ref);
+    let valuestackdepth = recipe.valuestackdepth;
+    if recipe.nlocals != stack_base
+        || recipe.registers_r.len() < valuestackdepth
+        || stack_base > valuestackdepth
+    {
+        return false;
+    }
+    let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
+    frame_reg != u16::MAX && ec_reg != u16::MAX
+}
+
 pub(crate) fn setup_reconstructed_callee_frame(
     ctx: &mut TraceCtx,
     is_being_profiled: bool,
@@ -15243,25 +15265,15 @@ pub(crate) fn setup_reconstructed_callee_frame(
     ec_box: OpRef,
     parent_frames: Vec<ResumeFrameState>,
 ) -> Option<(PendingInlineFrame, Vec<OpRef>)> {
-    let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
-    if raw_code.is_null() {
+    if !reconstructed_callee_recipe_is_portable(recipe) {
         return None;
     }
+    let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
     let code_ref = unsafe { &*raw_code };
     let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
     let nlocals = code_ref.varnames.len();
     let valuestackdepth = recipe.valuestackdepth;
-    if recipe.nlocals != stack_base
-        || recipe.registers_r.len() < valuestackdepth
-        || stack_base > valuestackdepth
-    {
-        return None;
-    }
-
     let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
-    if frame_reg == u16::MAX || ec_reg == u16::MAX {
-        return None;
-    }
 
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
