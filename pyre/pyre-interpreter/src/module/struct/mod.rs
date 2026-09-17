@@ -1513,12 +1513,14 @@ impl W_Struct {
     }
 
     /// `_struct.Struct.__repr__` — `Struct('<format>')`.
-    /// Residual: PyPy `W_Struct` has no `descr_repr`; format! is host.
-    #[majit_macros::dont_look_inside]
-    fn __repr__(&self) -> Result<String, crate::PyError> {
+    /// CPython observable; PyPy `W_Struct.typedef` has no `descr_repr`.
+    /// Built with `str` concat so the wrap is look-inside (`format` is
+    /// `_immutable_fields_`).
+    fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
-        let fmt = unsafe { w_str_get_value(self.format) };
-        Ok(format!("Struct('{fmt}')"))
+        let left = w_str_new("Struct('");
+        let right = w_str_new("')");
+        Ok(unsafe { w_str_concat(w_str_concat(left, self.format), right) })
     }
 
     /// CPython 3.14 `_struct.c:s_sizeof` — the dynamic instance prefix plus
