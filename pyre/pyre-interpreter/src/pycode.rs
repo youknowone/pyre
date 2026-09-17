@@ -7,8 +7,8 @@
 use pyre_object::nestedscope::CellFamily;
 use pyre_object::pyobject::*;
 use pyre_object::{
-    w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new, w_str_new,
-    w_str_new_managed, w_tuple_new, FixedObjectArray,
+    FixedObjectArray, w_bool_from, w_bool_get_value, w_int_new, w_list_new, w_seq_iter_new,
+    w_str_new, w_str_new_managed, w_tuple_new,
 };
 use rustpython_compiler_core::SourceLocation;
 use rustpython_compiler_core::bytecode::PyCodeLocationInfoKind;
@@ -1206,8 +1206,7 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
 /// and `walk_raw_code_roots` visiting the array pointer is the copy+scan
 /// of that young list.
 unsafe fn alloc_co_consts_array(len: usize) -> *mut FixedObjectArray {
-    let payload =
-        pyre_object::FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
+    let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
     let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
         pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
         payload,
@@ -1819,7 +1818,11 @@ unsafe fn w_code_copy_const_slots(dst: PyObjectRef, src: PyObjectRef) {
     if dst_code.co_consts_w.is_null() || src_code.co_consts_w.is_null() {
         return;
     }
-    let n = unsafe { (&*dst_code.co_consts_w).len().min((&*src_code.co_consts_w).len()) };
+    let n = unsafe {
+        (&*dst_code.co_consts_w)
+            .len()
+            .min((&*src_code.co_consts_w).len())
+    };
     for index in 0..n {
         let src_table = unsafe { (*(roots.get(root_base + 1) as *const PyCode)).co_consts_w };
         let value = unsafe { (&*src_table)[index] };
@@ -3286,8 +3289,8 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         // `getconstant_w` reads a GCREF field the collector rewrites in
         // place. A nursery copy leaves a forwarding stub; follow it and
         // publish the survivor so the next read does not take the stub.
-        let live = pyre_object::gc_hook::try_gc_current_object_address(existing as *mut u8)
-            as PyObjectRef;
+        let live =
+            pyre_object::gc_hook::try_gc_current_object_address(existing as *mut u8) as PyObjectRef;
         if !live.is_null() && live != existing {
             let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
             unsafe { (&mut *table).set_ref(idx, live) };
@@ -4324,8 +4327,8 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
             // `alloc_mro_block_gc` no-hook fallback is a bare `std::alloc`
             // block (no collector header).
             let len = unsafe { (&*array).len };
-            let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
-                + len * std::mem::size_of::<PyObjectRef>();
+            let payload =
+                pyre_object::FIXED_ARRAY_ITEMS_OFFSET + len * std::mem::size_of::<PyObjectRef>();
             if let Ok(layout) = std::alloc::Layout::from_size_align(
                 payload,
                 std::mem::align_of::<FixedObjectArray>(),

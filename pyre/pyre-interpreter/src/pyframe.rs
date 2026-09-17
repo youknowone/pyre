@@ -1916,10 +1916,14 @@ unsafe fn clone_debugdata_ptr(
         if ptr.is_null() {
             std::ptr::null_mut()
         } else if allocation == FrameLocalsArrayAllocation::OldGenGc {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ptr as pyre_object::PyObjectRef);
             let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                 FRAME_DEBUG_DATA_GC_TYPE_ID,
                 std::mem::size_of::<FrameDebugData>(),
             );
+            let ptr = pyre_object::gc_roots::shadow_stack_get(src_slot) as *mut FrameDebugData;
             if !raw.is_null() {
                 std::ptr::write(raw as *mut FrameDebugData, (*ptr).clone());
                 // The clone may carry young locals / trace callback refs.
