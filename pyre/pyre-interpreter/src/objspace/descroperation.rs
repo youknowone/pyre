@@ -4235,6 +4235,24 @@ unsafe fn same_unoverridden_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
     same_rpy_type(a, b) && !user_overridden_class(a) && !user_overridden_class(b)
 }
 
+/// Tiny helper so the `guard_class` + `ptr_eq` against `&INT_TYPE`
+/// lives in its own jitcode.  Inlined into [`try_binop_shortcut`] the
+/// compare used a temp register that `copy_constants` does not fill.
+#[inline(never)]
+unsafe fn rpy_type_is_int(obj: PyObjectRef) -> bool {
+    std::ptr::eq(rpy_type_of(obj), &INT_TYPE)
+}
+
+#[inline(never)]
+unsafe fn rpy_type_is_bool(obj: PyObjectRef) -> bool {
+    std::ptr::eq(rpy_type_of(obj), &BOOL_TYPE)
+}
+
+#[inline(never)]
+unsafe fn rpy_type_is_float(obj: PyObjectRef) -> bool {
+    std::ptr::eq(rpy_type_of(obj), &FLOAT_TYPE)
+}
+
 /// `_make_binop_impl` first arm: `type(w1) is type(w2)`, then
 /// `use_special_method_shortcut` — `getattr(self, shortcut___mod__)`
 /// after the RPython type is known.  The typeptr from `guard_class` is
@@ -4251,15 +4269,11 @@ pub(crate) fn try_binop_shortcut(
     op: BinopDunder,
 ) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
-        // `type(w1) is type(w2)` specialized per builtin layout: each
-        // operand's `guard_class` is compared to the type static
-        // (ConstPtr), not to the other operand.  SSA-vs-SSA `ptr::eq`
-        // on two typeptrs becomes `instance_ptr_eq` and the walk has
-        // been taking the false arm for two exact ints.
-        let w_typ1 = rpy_type_of(a);
-        let w_typ2 = rpy_type_of(b);
-        let w_res = if std::ptr::eq(w_typ1, &INT_TYPE) && std::ptr::eq(w_typ2, &INT_TYPE)
-        {
+        // Each layout test is its own jitcode (`rpy_type_is_int` and
+        // siblings).  Inlining `ptr::eq(guard_class, &INT_TYPE)` into
+        // this function compared a temp register that is not the
+        // constant-pool slot `copy_constants` fills.
+        let w_res = if rpy_type_is_int(a) && rpy_type_is_int(b) {
             match op {
                 BinopDunder::Add => Some(int_add(a, b)?),
                 BinopDunder::Sub => Some(int_sub(a, b)?),
@@ -4276,8 +4290,7 @@ pub(crate) fn try_binop_shortcut(
                 | BinopDunder::DivMod
                 | BinopDunder::MatMul => None,
             }
-        } else if std::ptr::eq(w_typ1, &BOOL_TYPE) && std::ptr::eq(w_typ2, &BOOL_TYPE)
-        {
+        } else if rpy_type_is_bool(a) && rpy_type_is_bool(b) {
             match op {
                 BinopDunder::And => Some(bool_descr_and(a, b)),
                 BinopDunder::Or => Some(bool_descr_or(a, b)),
@@ -4294,8 +4307,7 @@ pub(crate) fn try_binop_shortcut(
                 | BinopDunder::DivMod
                 | BinopDunder::MatMul => None,
             }
-        } else if std::ptr::eq(w_typ1, &FLOAT_TYPE) && std::ptr::eq(w_typ2, &FLOAT_TYPE)
-        {
+        } else if rpy_type_is_float(a) && rpy_type_is_float(b) {
             match op {
                 BinopDunder::Add => Some(float_add(a, b)?),
                 BinopDunder::Sub => Some(float_sub(a, b)?),
