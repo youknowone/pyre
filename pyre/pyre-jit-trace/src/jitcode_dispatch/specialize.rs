@@ -4491,10 +4491,12 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    try_walker_specialize_load_type_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
+    fold_load_type_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
 }
 
-pub(crate) fn try_walker_specialize_load_type_attr_named<Sym: WalkSym>(
+/// Same fold as [`try_walker_specialize_load_type_attr`] once the name is a
+/// `&str` — generated `getattr` / `getattr_str` already resolved it.
+pub(crate) fn fold_load_type_attr_named<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
@@ -4586,10 +4588,12 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    try_walker_specialize_load_bound_method_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
+    fold_load_bound_method_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
 }
 
-pub(crate) fn try_walker_specialize_load_bound_method_attr_named<Sym: WalkSym>(
+/// Same fold as [`try_walker_specialize_load_bound_method_attr`] once the
+/// name is a `&str`.
+pub(crate) fn fold_load_bound_method_attr_named<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
@@ -6193,10 +6197,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             None => return Ok(None),
         }
     };
-    try_walker_specialize_store_attr_named(ctx, op_pc, obj, value, &name, original_effect)
+    fold_store_attr_named(ctx, op_pc, obj, value, &name, original_effect)
 }
 
-pub(crate) fn try_walker_specialize_store_attr_named<Sym: WalkSym>(
+/// Same fold as [`try_walker_specialize_store_attr`] once the name is a
+/// `&str` — flattened `setattr` / `setattr_str` already resolved it.
+pub(crate) fn fold_store_attr_named<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     obj: OpRef,
@@ -10115,7 +10121,7 @@ pub(crate) fn try_fold_inline_getattr_named<Sym: WalkSym>(
         return Ok(Some(()));
     }
     if spec_gate(SpecFold::LoadTypeAttr, || {
-        try_walker_specialize_load_type_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
+        fold_load_type_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
     })?
     .is_some()
     {
@@ -10129,7 +10135,7 @@ pub(crate) fn try_fold_inline_getattr_named<Sym: WalkSym>(
         return Ok(Some(()));
     }
     spec_gate(SpecFold::LoadBoundMethodAttr, || {
-        try_walker_specialize_load_bound_method_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
+        fold_load_bound_method_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
     })
 }
 
@@ -12520,8 +12526,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // the residual the caller falls through to recomputes the lookup from the
     // unguarded operands.
     if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none()
-        && (try_walker_specialize_load_type_attr_named(ctx, op.pc, r_args[2], name, dst, 'r')?)
-            .is_none()
+        && (fold_load_type_attr_named(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none()
     {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
@@ -21074,14 +21079,24 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise_with_name<Sym: WalkSym>
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
 
-    let active_concrete = pyre_interpreter::eval::get_current_exception();
-    let active = ctx.trace_ctx.const_ref(active_concrete as i64);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_op, active],
-        crate::descr::w_exception_context_descr(kind),
-    );
+    // `error.py OperationError.record_context` reads `ec.sys_exc_info()`.
+    // A ConstPtr of the recording-time active exception aliases the
+    // previous raise's NewWithVtable and keeps both allocations live;
+    // GETFIELD is the same word PUSH_EXC_INFO / POP_EXCEPT write.
+    if let Some(ec) = walker_ensure_execution_context(ctx) {
+        let active = ctx.trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[ec],
+            crate::descr::ec_sys_exc_value_descr(),
+        );
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[new_op, active],
+            crate::descr::w_exception_context_descr(kind),
+        );
+    }
     fbw_context_chained_insert(new_op);
+    let active_concrete = pyre_interpreter::eval::get_current_exception();
     if !active_concrete.is_null() {
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_context(exc, active_concrete);
@@ -21378,9 +21393,9 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     let Some((sub_body, sym_ptr)) = orthodox_list_setitem_body_and_sym(ctx) else {
         return Ok(None);
     };
-    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
+    if (unsafe { pyre_object::w_list_getitem(list_obj, index) }).is_none() {
         return Ok(None);
-    };
+    }
     // Typed getitem boxes the displaced int/float and may move the operands.
     let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
         walker_concrete_ref_object(ctx, list_op),
@@ -21526,6 +21541,14 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         walker_concrete_ref_object(ctx, key_op),
         walker_concrete_ref_object(ctx, value_op),
     ) else {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    };
+    // The pre-walk probe may have boxed a typed element and the sub-walk
+    // may have collected; re-read the displaced box after both so the
+    // journal roots the live pointer.
+    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);

@@ -310,14 +310,18 @@ fn last_ref_is_fresh_iterator<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, top:
     }) else {
         return false;
     };
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return false;
+    }
+    // `space.iter` admits a result iff the type answers `__next__`
+    // (`baseobjspace.rs iter_check_is_iterator`).  A later wrapint /
+    // setattr dest does not, so a surviving generator, dict-iter,
+    // enumerate, or user iterator stays in TOS when GET_ITER is only
+    // visited, not re-executed.
     unsafe {
-        pyre_object::is_list_iter(obj)
-            || pyre_object::is_seq_iter(obj)
-            || pyre_object::is_tuple_iter(obj)
-            || pyre_object::functional::is_range_iter_one_arg(obj)
-            || pyre_object::functional::is_range_iter_step_one(obj)
-            || pyre_object::functional::is_range_iter_general(obj)
-            || pyre_object::functional::is_zip(obj)
+        let w_type = (*obj).w_class;
+        !w_type.is_null()
+            && pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__next__").is_some()
     }
 }
 

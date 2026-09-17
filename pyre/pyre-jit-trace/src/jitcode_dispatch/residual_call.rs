@@ -7413,12 +7413,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                     }
                     if matches!(
                         spec_gate_store_attr(|| {
-                            try_walker_specialize_store_attr_named(
-                                ctx, op.pc, r_args[0], r_args[2], name, ei,
-                            )
+                            fold_store_attr_named(ctx, op.pc, r_args[0], r_args[2], name, ei)
                         })?,
                         Some(WalkerStoreAttrSpecialization::Direct)
                     ) {
+                        fbw_mark_foriter_body_effect_since_consume();
+                        fbw_bump_executed_effect("store_attr_direct");
                         if dst_bank == 'r' {
                             let none_ptr = pyre_object::w_none();
                             let none = ctx.trace_ctx.const_ref(none_ptr as i64);
@@ -7452,6 +7452,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             {
                 let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
                 if let Ok(name) = name.as_str() {
+                    if !r_args[1].is_constant() {
+                        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+                        walker_emit_fold_guard_with_snapshot(
+                            ctx,
+                            op.pc,
+                            majit_ir::OpCode::GuardValue,
+                            &[r_args[1], name_const],
+                        )?;
+                        ctx.trace_ctx
+                            .heap_cache_mut()
+                            .replace_box(r_args[1], name_const);
+                    }
                     if let Some(outcome) = try_walker_trace_immutable_type_attr_raise_with_name(
                         ctx,
                         op,

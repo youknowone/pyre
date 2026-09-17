@@ -14705,7 +14705,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     }
                     matches!(
                         spec_gate_store_attr(|| {
-                            super::specialize::try_walker_specialize_store_attr_named(
+                            super::specialize::fold_store_attr_named(
                                 ctx,
                                 op.pc,
                                 obj,
@@ -14722,6 +14722,10 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             } else {
                 false
             };
+            if folded {
+                fbw_mark_foriter_body_effect_since_consume();
+                fbw_bump_executed_effect("store_attr_direct");
+            }
             if folded && dst_bank == 'r' {
                 let dst = code[op.pc + 1 + 2 + arg_width] as usize;
                 let none_ptr = pyre_object::w_none();
@@ -15516,7 +15520,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
                     matches!(
                         spec_gate_store_attr(|| {
-                            super::specialize::try_walker_specialize_store_attr_named(
+                            super::specialize::fold_store_attr_named(
                                 ctx,
                                 op.pc,
                                 obj,
@@ -15530,6 +15534,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 } else {
                     false
                 };
+            if folded {
+                fbw_mark_foriter_body_effect_since_consume();
+                fbw_bump_executed_effect("store_attr_direct");
+            }
             if folded && dst_bank == 'r' {
                 let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
                 let none_ptr = pyre_object::w_none();
