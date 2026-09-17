@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, Weak};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at
@@ -557,7 +557,7 @@ pub fn set_inline_eager_max_bytes(max_bytes: u32) {
 
 /// Deferred merges waiting on their entry trip.
 pub fn pending_inline_count() -> usize {
-    PENDING_INLINES.lock().len()
+    with_pending_inlines(|pending| pending.len())
 }
 
 /// Entries the bridge standing in for a merge must be entered before the merge
@@ -2449,11 +2449,6 @@ struct PendingInline {
     retry_on_sibling: bool,
 }
 
-/// `InlinedBridge` uniquely owns its `Op` argument heaps. The raw
-/// pointers inside `ArgSlot` are not shared, so the entry can live in
-/// the process-global table the same way `memmgr` holds tokens.
-unsafe impl Send for PendingInline {}
-
 impl PendingInline {
     fn owner(&self) -> Option<Arc<JitCellToken>> {
         self.owner.upgrade()
@@ -2488,20 +2483,43 @@ impl PendingInline {
 
 /// Deferred merges by id, the id being what the bridge module passes back.
 ///
-/// Process-global, matching `rpython/rlib/objectmodel.py` / `memmgr.py`
-/// token lifetime: a pending merge is not thread-local state. Weak
-/// owners keep an otherwise dead loop from staying reachable.
-static PENDING_INLINES: LazyLock<Mutex<IndexMap<i64, PendingInline>>> =
-    LazyLock::new(|| Mutex::new(IndexMap::new()));
-/// Source of the ids above.
+/// Thread-local: the stored `Op` graph holds non-atomic `Rc` (`OpRc`,
+/// `InputArgRc`). PyPy's cpu compiles and resumes on the thread that
+/// ran the compiled frame (`eval.rs` post-`run_compiled`). `memmgr`
+/// owns token GC globally; the IR itself stays on this cpu.
+thread_local! {
+    static PENDING_INLINES: RefCell<IndexMap<i64, PendingInline>> =
+        RefCell::new(IndexMap::new());
+    /// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`] on this
+    /// thread. The probe runs inside the bridge, so the host is between
+    /// `run_compiled` and its return; only this thread's driver may
+    /// install.
+    static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+/// Source of the ids above. A counter is not IR; unique ids can be
+/// process-wide.
 static NEXT_PENDING_INLINE_ID: AtomicI64 = AtomicI64::new(1);
 
-/// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`], waiting to be
-/// merged. The probe runs inside the bridge, so the host is between
-/// `run_compiled` and its return and already holds the driver mutably; the
-/// trip marks the source descriptor and queues here. The caller of
-/// [`take_tripped_inlines`] installs the merge once the trace has returned.
-static TRIPPED_INLINES: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+fn with_pending_inlines<R>(f: impl FnOnce(&IndexMap<i64, PendingInline>) -> R) -> R {
+    PENDING_INLINES.with(|pending| f(&pending.borrow()))
+}
+
+fn with_pending_inlines_mut<R>(f: impl FnOnce(&mut IndexMap<i64, PendingInline>) -> R) -> R {
+    PENDING_INLINES.with(|pending| f(&mut pending.borrow_mut()))
+}
+
+fn push_tripped_inline(pending_id: i64) {
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
+}
+
+fn take_tripped_inline_queue() -> Vec<i64> {
+    TRIPPED_INLINES.with(|tripped| std::mem::take(&mut *tripped.borrow_mut()))
+}
+
+/// Put unused trip ids back without dropping ids recorded since the take.
+fn restore_tripped_inlines(keep: Vec<i64>) {
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().extend(keep));
+}
 
 /// Drops a registered [`PendingInline`] unless the bridge whose probe would
 /// fire its callback actually got published.
@@ -2524,7 +2542,8 @@ impl PendingInlineGuard {
 impl Drop for PendingInlineGuard {
     fn drop(&mut self) {
         if let Some(pending_id) = self.0
-            && let Some(_item) = PENDING_INLINES.lock().shift_remove(&pending_id)
+            && let Some(_item) =
+                with_pending_inlines_mut(|pending| pending.shift_remove(&pending_id))
         {
             #[cfg(target_arch = "wasm32")]
             _item.set_dispatch_withdrawn(false);
@@ -2563,39 +2582,43 @@ fn merged_region_fail_index(
 /// but leave module installation to the caller after compiled code returns.
 pub fn record_inline_trip(pending_id: i64) {
     #[cfg(target_arch = "wasm32")]
-    if let Some(pending) = PENDING_INLINES.lock().get(&pending_id)
-        && pending.remap.is_none()
-    {
-        pending.set_dispatch_withdrawn(true);
-    }
-    TRIPPED_INLINES.lock().push(pending_id);
+    with_pending_inlines(|pending| {
+        if let Some(pending) = pending.get(&pending_id)
+            && pending.remap.is_none()
+        {
+            pending.set_dispatch_withdrawn(true);
+        }
+    });
+    push_tripped_inline(pending_id);
 }
 
 fn sweep_dead_pending() {
-    PENDING_INLINES.lock().retain(|_, item| {
-        let Some(owner) = item.owner() else {
-            return false;
-        };
-        if !owner.is_invalidated() {
-            return true;
-        }
-        // The one-shot trip already zeroed the cell and marked the
-        // shared FailDescr withdrawn. Dropping the entry without
-        // restoring those leaves the next compile of that descr
-        // permanently cold.
-        if item.remap.is_none() {
-            #[cfg(target_arch = "wasm32")]
-            item.set_dispatch_withdrawn(false);
-            WasmBackend::restore_dispatch_cell(&owner, item.region.source_fail_index);
-        }
-        false
+    with_pending_inlines_mut(|pending| {
+        pending.retain(|_, item| {
+            let Some(owner) = item.owner() else {
+                return false;
+            };
+            if !owner.is_invalidated() {
+                return true;
+            }
+            // The one-shot trip already zeroed the cell and marked the
+            // shared FailDescr withdrawn. Dropping the entry without
+            // restoring those leaves the next compile of that descr
+            // permanently cold.
+            if item.remap.is_none() {
+                #[cfg(target_arch = "wasm32")]
+                item.set_dispatch_withdrawn(false);
+                WasmBackend::restore_dispatch_cell(&owner, item.region.source_fail_index);
+            }
+            false
+        });
     });
 }
 
 /// Take the merges whose bridges have tripped since the last call, for a caller
 /// with no compiled trace left on the stack.
 pub fn take_tripped_inlines() -> Vec<i64> {
-    std::mem::take(&mut *TRIPPED_INLINES.lock())
+    take_tripped_inline_queue()
 }
 
 /// Record a deferred merge and describe the probe the bridge standing in for
@@ -2618,15 +2641,17 @@ fn register_pending_inline(
     // A remapped child must not zero an owner cell: the source guard
     // still lives on the parent module until that parent is merged.
     let cells_base_ptr = if remap.is_some() { 0 } else { cells_base_ptr };
-    PENDING_INLINES.lock().insert(
-        pending_id,
-        PendingInline {
-            owner: Arc::downgrade(&owner),
-            region,
-            remap,
-            retry_on_sibling: false,
-        },
-    );
+    with_pending_inlines_mut(|pending| {
+        pending.insert(
+            pending_id,
+            PendingInline {
+                owner: Arc::downgrade(&owner),
+                region,
+                remap,
+                retry_on_sibling: false,
+            },
+        );
+    });
     codegen::InlineTripProbe {
         counter_addr,
         threshold: inline_trip_threshold_for(owner_module_bytes),
@@ -3128,7 +3153,7 @@ impl WasmBackend {
     /// lost is the merge.
     pub fn install_pending_inline(&mut self, pending_id: i64) {
         sweep_dead_pending();
-        let Some(pending) = PENDING_INLINES.lock().shift_remove(&pending_id) else {
+        let Some(pending) = with_pending_inlines_mut(|p| p.shift_remove(&pending_id)) else {
             return;
         };
         let Some(owner) = pending.owner() else {
@@ -3149,17 +3174,18 @@ impl WasmBackend {
         // An `uninitialized_label` trip can also fire before the sibling
         // peel that publishes its JUMP target; fold those too so the
         // one-shot probe is not the only retry.
-        let mut sibling_ids: Vec<i64> = PENDING_INLINES
-            .lock()
-            .iter()
-            .filter(|(_, item)| {
-                item.same_owner(&owner) && (item.remap.is_some() || item.retry_on_sibling)
-            })
-            .map(|(&id, _)| id)
-            .collect();
+        let mut sibling_ids: Vec<i64> = with_pending_inlines(|pending| {
+            pending
+                .iter()
+                .filter(|(_, item)| {
+                    item.same_owner(&owner) && (item.remap.is_some() || item.retry_on_sibling)
+                })
+                .map(|(&id, _)| id)
+                .collect()
+        });
         sibling_ids.sort_unstable();
         for id in sibling_ids {
-            if let Some(item) = PENDING_INLINES.lock().shift_remove(&id) {
+            if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
                 #[cfg(target_arch = "wasm32")]
                 if item.remap.is_none() {
                     item.set_dispatch_withdrawn(false);
@@ -3167,11 +3193,10 @@ impl WasmBackend {
                 work.push((id, item.region, item.remap));
             }
         }
-        let queued: Vec<i64> = std::mem::take(&mut *TRIPPED_INLINES.lock());
+        let queued = take_tripped_inline_queue();
         let mut keep = Vec::new();
         let mut extra_ids = Vec::new();
-        {
-            let pending = PENDING_INLINES.lock();
+        with_pending_inlines(|pending| {
             for id in queued {
                 if pending.get(&id).is_some_and(|item| item.same_owner(&owner)) {
                     extra_ids.push(id);
@@ -3179,11 +3204,11 @@ impl WasmBackend {
                     keep.push(id);
                 }
             }
-        }
-        *TRIPPED_INLINES.lock() = keep;
+        });
+        restore_tripped_inlines(keep);
         for id in extra_ids {
             diag_bump(55);
-            if let Some(item) = PENDING_INLINES.lock().shift_remove(&id) {
+            if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
                 // Remapped children still name a parent-local fail index;
                 // the owner's descr array does not hold that guard.
                 #[cfg(target_arch = "wasm32")]
@@ -3238,15 +3263,17 @@ impl WasmBackend {
                         let Some(id) = id else {
                             continue;
                         };
-                        PENDING_INLINES.lock().insert(
-                            id,
-                            PendingInline {
-                                owner: Arc::downgrade(&owner),
-                                region,
-                                remap,
-                                retry_on_sibling: remap.is_none(),
-                            },
-                        );
+                        with_pending_inlines_mut(|pending| {
+                            pending.insert(
+                                id,
+                                PendingInline {
+                                    owner: Arc::downgrade(&owner),
+                                    region,
+                                    remap,
+                                    retry_on_sibling: remap.is_none(),
+                                },
+                            );
+                        });
                     }
                 }
             } else {
@@ -3282,7 +3309,9 @@ impl WasmBackend {
             if remap.is_none() {
                 item.set_dispatch_withdrawn(false);
             }
-            PENDING_INLINES.lock().insert(id, item);
+            with_pending_inlines_mut(|pending| {
+                pending.insert(id, item);
+            });
         }
     }
 
@@ -5514,8 +5543,10 @@ impl majit_backend::Backend for WasmBackend {
                     // to join this owner. A parent declined as
                     // `not_loop_closing` never enters PENDING, so the child
                     // would re-register forever.
-                    let parent_pending = PENDING_INLINES.lock().values().any(|item| {
-                        item.same_owner(&owner) && item.region.trace_id == source_trace_id
+                    let parent_pending = with_pending_inlines(|pending| {
+                        pending.values().any(|item| {
+                            item.same_owner(&owner) && item.region.trace_id == source_trace_id
+                        })
                     });
                     if parent_pending {
                         defer_inline = Some((
