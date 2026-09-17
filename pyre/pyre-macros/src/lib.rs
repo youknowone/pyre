@@ -1255,6 +1255,23 @@ fn expand_pyre_class(
     let name_lit = attrs.name;
     let cpython_heaptype = attrs.cpython_heaptype;
     let cpython_immutabletype = !attrs.cpython_mutable;
+    let has_mapdict_mixin = {
+        let Fields::Named(ref named) = st.fields else {
+            return Err(syn::Error::new(
+                st.span(),
+                "#[pyre_class] requires a struct with named fields",
+            ));
+        };
+        let has_map = named
+            .named
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|i| i == "map"));
+        let has_storage = named
+            .named
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|i| i == "storage"));
+        has_map && has_storage
+    };
 
     // Derive static names from the struct name.
     //   W_Random          -> RANDOM_TYPE, W_RANDOM_GC_TYPE_ID,
@@ -1285,6 +1302,12 @@ fn expand_pyre_class(
     // omitted `type_id`, the cell starts unassigned and the legacy
     // const is not emitted — callers must read the cell at runtime via
     // `<W_X as GcType>::type_id()` (which itself becomes `cell.get()`).
+    let pytype_ctor = if has_mapdict_mixin {
+        quote! { ::pyre_object::pyobject::new_pytype_with_mapdict_mixin }
+    } else {
+        quote! { ::pyre_object::pyobject::new_pytype }
+    };
+
     let (cell_init, legacy_const) = match attrs.type_id.as_ref() {
         Some(n) => (
             quote! { ::pyre_object::lltype::TypeIdCell::with(#n) },
@@ -1360,7 +1383,7 @@ fn expand_pyre_class(
         #st
 
         #st_vis static #pytype_static: ::pyre_object::PyType =
-            ::pyre_object::pyobject::new_pytype(#name_lit);
+            #pytype_ctor(#name_lit);
 
         /// Runtime-resolved GC tid for this class.  Initialized either
         /// to the explicit `type_id = N` from the attribute (drift-
@@ -1429,6 +1452,7 @@ fn expand_pyre_class(
             const PYNAME: &'static str = #name_lit;
             const CPYTHON_HEAPTYPE: bool = #cpython_heaptype;
             const CPYTHON_IMMUTABLETYPE: bool = #cpython_immutabletype;
+            const HAS_MAPDICT_MIXIN: bool = #has_mapdict_mixin;
         }
 
         impl #st_name {
