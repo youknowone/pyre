@@ -669,7 +669,7 @@ fn wrap_new_always_err_ok_payload_is_result_fieldread() {
             79usize,
         ),
         (
-            "pyre_interpreter::module::_ssl::ssl_session_methods::__majit_wrap___new__",
+            "pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__",
             94usize,
         ),
     ] {

@@ -2860,6 +2860,7 @@ dependencies = [
  "paste",
  "pymath",
  "pyre-interpreter",
+ "pyre-native",
  "pyre-object",
  "rustpython-common",
  "rustpython-compiler",

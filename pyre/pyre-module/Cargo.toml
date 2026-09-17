@@ -8,14 +8,19 @@ description = "Optional builtin modules for pyre interpreter"
 
 [features]
 default = ["host_env"]
-host_env = ["pyre-interpreter/host_env", "dep:rustpython-host_env"]
-sandbox = ["pyre-interpreter/sandbox"]
+host_env = [
+    "pyre-interpreter/host_env",
+    "dep:rustpython-host_env",
+    "pyre-native/host_env",
+]
+sandbox = ["pyre-interpreter/sandbox", "pyre-native/sandbox"]
 dynasm = ["pyre-interpreter/dynasm", "majit-metainterp/dynasm"]
 cranelift = ["pyre-interpreter/cranelift", "majit-metainterp/cranelift"]
 
 [dependencies]
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
+pyre-native = { workspace = true }
 ctor = { workspace = true }
 libc = { workspace = true }
 linkme = { workspace = true }

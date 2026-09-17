@@ -248,7 +248,7 @@ pub fn runtime_thread_entered() -> bool {
 /// parameter handler is silenced for the duration (`crt_call`) and the saved
 /// code is the runtime's `errno` rather than `GetLastError`.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
+pub fn call_external_function<R>(f: impl FnOnce() -> R) -> (R, i32) {
     let _blocked = before_external_block();
     let result = crate::builtins::crt_call!(f());
     let errno = crate::builtins::crt_errno();

@@ -1465,7 +1465,7 @@ pub unsafe fn py_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
 ///
 /// # Safety
 /// `obj` must be a live `W_BaseException`.
-pub(crate) unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+pub unsafe fn base_exception_str_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // `space.str(self.args_w[0])` re-enters `py_str_wtf8` on the element, which
     // for `e.args = (e,)` lands back here. The re-entry pushes no Python frame
     // and sits in tail position, so neither the frame counter nor the stack

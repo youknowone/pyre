@@ -63,6 +63,10 @@ pub fn install_optional_modules() {
         module::_posixsubprocess::init,
     );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
+    #[cfg(not(feature = "sandbox"))]
+    pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
     pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
     pyre_interpreter::importing::register_builtin_module(
         "_suggestions",
@@ -343,6 +347,31 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         // it closes the ungated aliases ahead of the target-gated ones.
         subclass_range_alias(179, typed::<module::_queue::W_SimpleQueue>()),
     ];
+    // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
+    // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    {
+        aliases.push(subclass_range_alias(
+            190,
+            typed::<module::_ssl::W_SSLContext>(),
+        ));
+        aliases.push(subclass_range_alias(
+            191,
+            typed::<module::_ssl::W_MemoryBIO>(),
+        ));
+        aliases.push(subclass_range_alias(
+            192,
+            typed::<module::_ssl::W_SSLSession>(),
+        ));
+        aliases.push(subclass_range_alias(
+            193,
+            typed::<module::_ssl::W_SSLSocket>(),
+        ));
+        aliases.push(subclass_range_alias(
+            194,
+            typed::<module::_ssl::W_Certificate>(),
+        ));
+    }
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(
         196,
@@ -387,6 +416,18 @@ mod tests {
                 "pyre_module::module::_bz2::compressor_methods::__majit_wrap___new__"
             ),
             "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_ssl_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__"
+            ),
+            "moved _ssl #[pyre_methods] wrappers must publish residual fnaddrs",
         );
     }
 

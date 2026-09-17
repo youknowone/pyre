@@ -1235,19 +1235,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(188, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
-        // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
-        // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(190, typed::<crate::module::_ssl::W_SSLContext>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(191, typed::<crate::module::_ssl::W_MemoryBIO>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(192, typed::<crate::module::_ssl::W_SSLSession>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(193, typed::<crate::module::_ssl::W_SSLSocket>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(194, typed::<crate::module::_ssl::W_Certificate>()),
-        // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
+        // rustls-backed `_ssl` aliases 190-194 live on the optional-module
+        // hook. `mmap.mmap` follows the optional SSL tail on ordinary Unix
+        // builds.
         // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]

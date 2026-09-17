@@ -5564,7 +5564,7 @@ pub fn kwarg_reject_unknown(
 /// falls back to the matching keyword.  Raises the argument-clinic
 /// "given by name and position" TypeError when the same parameter is supplied
 /// both ways.  `pos_index` is the 1-based position used in that message.
-pub(crate) fn bind_pos_or_kw(
+pub fn bind_pos_or_kw(
     positional: &[PyObjectRef],
     kwargs: Option<PyObjectRef>,
     slot: usize,
@@ -5888,7 +5888,7 @@ fn parse_single_required(
 
 /// Reject `f(x, name=...)` when `name` already arrived positionally.
 /// The flat builtin ABI leaves this validation to each kw-aware method.
-pub(crate) fn kwarg_reject_duplicate(
+pub fn kwarg_reject_duplicate(
     kwargs: Option<PyObjectRef>,
     fn_name: &str,
     name: &str,
@@ -8674,7 +8674,7 @@ fn os_error_family_new(
     Ok(exc)
 }
 
-pub(crate) fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn exc_os_error_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     os_error_family_new(args, exc_os_error)
 }
 
@@ -10030,7 +10030,7 @@ pub(crate) fn make_exc_type_with_init(
 /// Both classes built this way — `io.UnsupportedOperation` and
 /// `ssl.SSLCertVerificationError` — come from `PyErr_NewException*`, so both
 /// are weak-referenceable for the reason [`new_exception_class`] gives.
-pub(crate) fn make_exc_type_multi(
+pub fn make_exc_type_multi(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
     bases: &[PyObjectRef],
@@ -11062,7 +11062,7 @@ pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
 }
 
 /// `str(obj)` → convert to string
-pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = split_builtin_kwargs(args);
     kwarg_reject_unknown(kwargs, &["object", "encoding", "errors"], "str")?;
     let kw_count = kwargs
@@ -11714,7 +11714,7 @@ pub(crate) fn int_max_str_digits_error(maxdigits: i32) -> crate::PyError {
 /// conversion guard. The bit-length lower bound rejects enormous values
 /// before the quadratic decimal conversion; the resulting string supplies
 /// the exact boundary check.
-pub(crate) unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
+pub unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::PyError> {
     let owned;
     let value = if pyre_object::is_bool(obj) {
         owned = BigInt::from(pyre_object::w_bool_get_value(obj) as i64);
@@ -20102,7 +20102,7 @@ fn file_check_writable(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
 
 /// One `space.acquire_writebuf` export held for a FileIO `readinto` call.
 /// PyPy's `with view:` keeps this lock until after `output_slice`/`c_read`.
-pub(crate) struct WritableBuffer {
+pub struct WritableBuffer {
     _roots: pyre_object::gc_roots::RootScope,
     owner_slot: usize,
     held: bool,
@@ -20115,7 +20115,7 @@ pub(crate) struct WritableBuffer {
 }
 
 impl WritableBuffer {
-    pub(crate) unsafe fn acquire(obj: PyObjectRef) -> Result<Self, crate::PyError> {
+    pub unsafe fn acquire(obj: PyObjectRef) -> Result<Self, crate::PyError> {
         // `space.acquire_writebuf` owns a traced exporter for the complete
         // `with view:` extent.  Root both the requested object and the
         // concrete storage owner so Python called while the buffer is live
@@ -20152,7 +20152,7 @@ impl WritableBuffer {
         })
     }
 
-    pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.address, self.length) }
     }
 }

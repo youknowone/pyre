@@ -15,7 +15,7 @@ use pyre_object::*;
 /// that allocation; pyre preserves the same native prefix.
 // CPython 3.14 Modules/_ssl.c:_ssl_exec uses PyType_FromModuleAndSpec;
 // the SSLContext spec is immutable.
-#[crate::pyre_class("_ssl._SSLContext", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_ssl._SSLContext", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SSLContext {
     pub map: usize,
@@ -32,7 +32,7 @@ pub struct W_SSLContext {
 /// PyPy owns `MemoryBIO` as an app-level class, so it uses the same mapdict
 /// prefix rather than relying on a side table for instance attributes.
 // `_ssl_exec` creates the immutable MemoryBIO module heap type.
-#[crate::pyre_class("_ssl.MemoryBIO", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_ssl.MemoryBIO", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_MemoryBIO {
     pub map: usize,
@@ -62,7 +62,7 @@ const _: () = assert!(
 );
 
 // `_ssl_exec` creates the immutable SSLSession module heap type.
-#[crate::pyre_class("_ssl.SSLSession", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_ssl.SSLSession", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SSLSession {
     pub backend: *mut pyre_native::ssl::NativeSession,
@@ -124,7 +124,7 @@ impl RecordCursor {
 /// remains opaque in `pyre-native`; these references preserve the same
 /// per-object ownership shape as PyPy's `W_SSLObject`.
 // `_ssl_exec` creates the immutable SSLSocket module heap type.
-#[crate::pyre_class("_ssl._SSLSocket", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_ssl._SSLSocket", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SSLSocket {
     pub backend: *mut pyre_native::ssl::TlsConnection,
@@ -141,7 +141,7 @@ pub struct W_SSLSocket {
 }
 
 // `_ssl_exec` creates the immutable Certificate module heap type.
-#[crate::pyre_class("_ssl.Certificate", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_ssl.Certificate", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Certificate {
     pub der: PyObjectRef,
@@ -165,14 +165,14 @@ fn set_library_reason(exception: PyObjectRef, message: &str) {
         let _ = pyre_object::gc_roots::pin_root(exception);
         let library_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(library));
-        let _ = crate::baseobjspace::setattr_str(
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
             "library",
             pyre_object::gc_roots::shadow_stack_get(library_slot),
         );
         let reason_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(reason));
-        let _ = crate::baseobjspace::setattr_str(
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
             "reason",
             pyre_object::gc_roots::shadow_stack_get(reason_slot),
@@ -180,14 +180,14 @@ fn set_library_reason(exception: PyObjectRef, message: &str) {
     }
 }
 
-fn ssl_error(message: impl Into<String>) -> crate::PyError {
+fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
     let message = message.into();
-    let mut err = crate::PyError::os_error(message.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("ssl.SSLError") {
+    let mut err = pyre_interpreter::PyError::os_error(message.clone());
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError") {
         let _roots = pyre_object::gc_roots::push_roots();
         let message_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
-        if let Ok(exc) = crate::builtins::exc_exception_new(&[
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[
             cls,
             w_int_new(0),
             pyre_object::gc_roots::shadow_stack_get(message_slot),
@@ -203,7 +203,7 @@ fn ssl_error(message: impl Into<String>) -> crate::PyError {
 /// TLS message rather than the generic two-item exception tuple.  Keep this
 /// policy in the `_ssl` boundary instead of teaching the process-wide
 /// exception formatter about an extension-module class.
-fn ssl_error_str(args: &[PyObjectRef]) -> crate::PyResult {
+fn ssl_error_str(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let w_args = unsafe { pyre_object::interp_exceptions::w_exception_get_args(args[0]) };
     let len = unsafe { pyre_object::w_tuple_len(w_args) };
     if len >= 2 {
@@ -211,29 +211,29 @@ fn ssl_error_str(args: &[PyObjectRef]) -> crate::PyResult {
             pyre_object::w_tuple_getitem(w_args, 1)
                 .expect("SSLError argument tuple has a second element")
         };
-        crate::builtins::builtin_str(&[message])
+        pyre_interpreter::builtins::builtin_str(&[message])
     } else {
         Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
-            crate::display::base_exception_str_wtf8(args[0])?
+            pyre_interpreter::display::base_exception_str_wtf8(args[0])?
         }))
     }
 }
 
-fn native_result<T>(result: Result<T, (i32, String)>) -> Result<T, crate::PyError> {
+fn native_result<T>(result: Result<T, (i32, String)>) -> Result<T, pyre_interpreter::PyError> {
     result.map_err(|(errno, message)| {
         if errno != 0 {
-            crate::PyError::os_error_with_errno(errno, message)
+            pyre_interpreter::PyError::os_error_with_errno(errno, message)
         } else {
             ssl_error(message)
         }
     })
 }
 
-fn tls_error(code: i32, message: String) -> crate::PyError {
+fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
     // `PyErr_NoMemory()`: a destination the allocator refused is a
     // `MemoryError` carrying no message, not an `SSLError` with an errno.
     if code == pyre_native::ssl::TLS_ERROR_NO_MEMORY {
-        return crate::PyError::memory_error("");
+        return pyre_interpreter::PyError::memory_error("");
     }
     let verify_code = (code >= pyre_native::ssl::TLS_ERROR_CERT_VERIFY_BASE)
         .then_some(code - pyre_native::ssl::TLS_ERROR_CERT_VERIFY_BASE);
@@ -248,17 +248,17 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
     // `ssl_error` would build a complete `_ssl.SSLError` only for the
     // class-specific instance below to replace it, and WANT_READ/WANT_WRITE
     // travel this path on every non-blocking handshake step.
-    let mut error = crate::PyError::os_error(message.clone());
+    let mut error = pyre_interpreter::PyError::os_error(message.clone());
     let public_errno = if verify_code.is_some() {
         pyre_native::ssl::TLS_ERROR_SSL
     } else {
         code
     };
-    if let Some(class) = crate::builtins::lookup_exc_class(class_name) {
+    if let Some(class) = pyre_interpreter::builtins::lookup_exc_class(class_name) {
         let _roots = pyre_object::gc_roots::push_roots();
         let message_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
-        if let Ok(exception) = crate::builtins::exc_os_error_new(&[
+        if let Ok(exception) = pyre_interpreter::builtins::exc_os_error_new(&[
             class,
             w_int_new(public_errno as i64),
             pyre_object::gc_roots::shadow_stack_get(message_slot),
@@ -267,7 +267,7 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
             let _ = pyre_object::gc_roots::pin_root(exception);
             set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
             if let Some(verify_code) = verify_code {
-                let _ = crate::baseobjspace::setattr_str(
+                let _ = pyre_interpreter::baseobjspace::setattr_str(
                     pyre_object::gc_roots::shadow_stack_get(exc_slot),
                     "verify_code",
                     w_int_new(verify_code as i64),
@@ -276,14 +276,14 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(
                     pyre_native::ssl::certificate_verify_message(verify_code),
                 ));
-                let _ = crate::baseobjspace::setattr_str(
+                let _ = pyre_interpreter::baseobjspace::setattr_str(
                     pyre_object::gc_roots::shadow_stack_get(exc_slot),
                     "verify_message",
                     pyre_object::gc_roots::shadow_stack_get(verify_slot),
                 );
                 let library_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("SSL"));
-                let _ = crate::baseobjspace::setattr_str(
+                let _ = pyre_interpreter::baseobjspace::setattr_str(
                     pyre_object::gc_roots::shadow_stack_get(exc_slot),
                     "library",
                     pyre_object::gc_roots::shadow_stack_get(library_slot),
@@ -291,7 +291,7 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
                 let reason_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ =
                     pyre_object::gc_roots::pin_root(w_str_new_managed("CERTIFICATE_VERIFY_FAILED"));
-                let _ = crate::baseobjspace::setattr_str(
+                let _ = pyre_interpreter::baseobjspace::setattr_str(
                     pyre_object::gc_roots::shadow_stack_get(exc_slot),
                     "reason",
                     pyre_object::gc_roots::shadow_stack_get(reason_slot),
@@ -303,13 +303,13 @@ fn tls_error(code: i32, message: String) -> crate::PyError {
     error
 }
 
-fn tls_result<T>(result: pyre_native::ssl::TlsResult<T>) -> Result<T, crate::PyError> {
+fn tls_result<T>(result: pyre_native::ssl::TlsResult<T>) -> Result<T, pyre_interpreter::PyError> {
     result.map_err(|(code, message)| tls_error(code, message))
 }
 
-fn fs_path(obj: PyObjectRef) -> Result<std::path::PathBuf, crate::PyError> {
+fn fs_path(obj: PyObjectRef) -> Result<std::path::PathBuf, pyre_interpreter::PyError> {
     if obj.is_null() || unsafe { is_none(obj) || is_bool(obj) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "path should be string, bytes, os.PathLike or integer, not NoneType",
         ));
     }
@@ -322,37 +322,39 @@ fn fs_path(obj: PyObjectRef) -> Result<std::path::PathBuf, crate::PyError> {
     // text is lossy on a name the filesystem accepts but UTF-8 does not: two
     // distinct files collapse onto one `U+FFFD` spelling, and re-encoding that
     // spelling names neither of them.
-    let bytes = crate::gateway::fsencode_bytes_w(obj)?;
-    Ok(crate::gateway::os_string_from_fs_bytes(&bytes).into())
+    let bytes = pyre_interpreter::gateway::fsencode_bytes_w(obj)?;
+    Ok(pyre_interpreter::gateway::os_string_from_fs_bytes(&bytes).into())
 }
 
-fn password_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, crate::PyError> {
+fn password_bytes(obj: PyObjectRef) -> Result<Option<Vec<u8>>, pyre_interpreter::PyError> {
     if obj.is_null() || unsafe { is_none(obj) } {
         return Ok(None);
     }
     let callable = !unsafe { is_str(obj) }
         && !unsafe { bytesobject::is_bytes_like(obj) }
-        && crate::baseobjspace::getattr_str(obj, "__call__").is_ok();
+        && pyre_interpreter::baseobjspace::getattr_str(obj, "__call__").is_ok();
     let value = if callable {
-        crate::call::call_function_impl_result(obj, &[])?
+        pyre_interpreter::call::call_function_impl_result(obj, &[])?
     } else {
         obj
     };
     let bytes = if unsafe { is_str(value) } {
-        crate::baseobjspace::str_utf8_w(value)?.as_bytes().to_vec()
-    } else if let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(value)? {
+        pyre_interpreter::baseobjspace::str_utf8_w(value)?
+            .as_bytes()
+            .to_vec()
+    } else if let Some(buffer) = pyre_interpreter::baseobjspace::simple_buffer_bytes(value)? {
         let bytes = buffer.as_bytes().to_vec();
         buffer.release();
         bytes
     } else {
-        return Err(crate::PyError::type_error(if callable {
+        return Err(pyre_interpreter::PyError::type_error(if callable {
             "password callback must return a string"
         } else {
             "password should be a string or callable"
         }));
     };
     if bytes.len() > 1024 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "password cannot be longer than 1024 bytes",
         ));
     }
@@ -531,28 +533,28 @@ fn decoded_certificate_dict(cert: *mut pyre_native::ssl::DecodedCertificate) -> 
 
 fn parse_server_hostname(
     value: Option<PyObjectRef>,
-) -> Result<(Option<String>, PyObjectRef), crate::PyError> {
+) -> Result<(Option<String>, PyObjectRef), pyre_interpreter::PyError> {
     let Some(value) = value.filter(|value| !unsafe { is_none(*value) }) else {
         return Ok((None, w_none()));
     };
     if !unsafe { is_str(value) } {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "server_hostname must be a string",
         ));
     }
-    let hostname = crate::baseobjspace::str_utf8_w(value)?.to_string();
+    let hostname = pyre_interpreter::baseobjspace::str_utf8_w(value)?.to_string();
     if hostname.as_bytes().contains(&0) {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "argument must be encoded string without null bytes",
         ));
     }
     if hostname.is_empty() || hostname.starts_with('.') {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "server_hostname cannot be an empty string or start with a leading dot",
         ));
     }
     if !hostname.is_ascii() {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "server_hostname must contain ASCII only",
         ));
     }
@@ -647,16 +649,16 @@ fn allocate_certificate(der: Vec<u8>) -> PyObjectRef {
 fn clone_requested_session(
     value: Option<PyObjectRef>,
     context: *mut pyre_native::ssl::Context,
-) -> Result<*mut pyre_native::ssl::NativeSession, crate::PyError> {
+) -> Result<*mut pyre_native::ssl::NativeSession, pyre_interpreter::PyError> {
     let Some(value) = value.filter(|value| !unsafe { is_none(*value) }) else {
         return Ok(std::ptr::null_mut());
     };
     let session = W_SSLSession::from_obj(value)
-        .ok_or_else(|| crate::PyError::type_error("Value is not a SSLSession."))?;
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("Value is not a SSLSession."))?;
     if unsafe { pyre_native::ssl::session_context_identity(session.backend) }
         != unsafe { pyre_native::ssl::context_identity(context) }
     {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "Session refers to a different SSLContext.",
         ));
     }
@@ -688,44 +690,47 @@ mod context_methods {
             post_handshake_auth: false,
             num_tickets: 2,
         });
-        crate::typedef::tag_subclass_instance(obj, unsafe {
+        pyre_interpreter::typedef::tag_subclass_instance(obj, unsafe {
             pyre_object::gc_roots::shadow_stack_get(cls_slot)
         })
     }
 
-    #[crate::pyre_methods(doc = "An SSLContext holds TLS configuration and state.")]
+    #[pyre_interpreter::pyre_methods(doc = "An SSLContext holds TLS configuration and state.")]
     impl W_SSLContext {
         #[staticmethod]
-        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if crate::builtins::has_real_kwargs(kwargs) {
-                return Err(crate::PyError::type_error(
+        fn __new__(
+            cls: PyObjectRef,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+            if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+                return Err(pyre_interpreter::PyError::type_error(
                     "_SSLContext.__new__() takes no keyword arguments",
                 ));
             }
             let protocol_obj = positional.get(1).copied().ok_or_else(|| {
-                crate::PyError::type_error(
+                pyre_interpreter::PyError::type_error(
                     "_SSLContext.__new__() missing required argument 'protocol'",
                 )
             })?;
             if positional.len() != 2 {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "_SSLContext.__new__() takes 2 arguments ({} given)",
                     positional.len()
                 )));
             }
-            crate::typedef::check_user_subclass(type_object(), cls)?;
-            let protocol = crate::baseobjspace::int_w(protocol_obj)?;
+            pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
+            let protocol = pyre_interpreter::baseobjspace::int_w(protocol_obj)?;
             let protocol = i32::try_from(protocol).map_err(|_| {
-                crate::PyError::value_error("invalid or unsupported protocol version")
+                pyre_interpreter::PyError::value_error("invalid or unsupported protocol version")
             })?;
             let backend = pyre_native::ssl::context_new(protocol)
-                .map_err(|message| crate::PyError::value_error(message))?;
+                .map_err(|message| pyre_interpreter::PyError::value_error(message))?;
             if matches!(
                 protocol,
                 PROTOCOL_TLS | PROTOCOL_TLSV1 | PROTOCOL_TLSV1_1 | PROTOCOL_TLSV1_2
             ) {
-                crate::warn::warn_deprecation(&format!(
+                pyre_interpreter::warn::warn_deprecation(&format!(
                     "ssl.PROTOCOL_{} is deprecated",
                     match protocol {
                         PROTOCOL_TLS => "TLS",
@@ -765,13 +770,15 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_verify_mode(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let mode = crate::baseobjspace::int_w(value)?;
+        fn set_verify_mode(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+            let mode = pyre_interpreter::baseobjspace::int_w(value)?;
             if !(CERT_NONE as i64..=CERT_REQUIRED as i64).contains(&mode) {
-                return Err(crate::PyError::value_error("invalid verify mode"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "invalid verify mode",
+                ));
             }
             if mode == CERT_NONE as i64 && self.check_hostname() {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Cannot set verify_mode to CERT_NONE when check_hostname is enabled",
                 ));
             }
@@ -785,10 +792,14 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_verify_flags(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let value = crate::baseobjspace::int_w(value)?;
-            let value = i32::try_from(value)
-                .map_err(|_| crate::PyError::overflow_error("verify_flags out of range"))?;
+        fn set_verify_flags(
+            &mut self,
+            value: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            let value = pyre_interpreter::baseobjspace::int_w(value)?;
+            let value = i32::try_from(value).map_err(|_| {
+                pyre_interpreter::PyError::overflow_error("verify_flags out of range")
+            })?;
             unsafe { pyre_native::ssl::context_set_verify_flags(self.backend, value) };
             Ok(())
         }
@@ -799,13 +810,13 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_options(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let value = crate::baseobjspace::uint_w(value)?;
+        fn set_options(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+            let value = pyre_interpreter::baseobjspace::uint_w(value)?;
             let old = unsafe { pyre_native::ssl::context_options(self.backend) };
             const DEPRECATED: u64 =
                 0x0200_0000 | 0x0400_0000 | 0x1000_0000 | 0x0800_0000 | 0x2000_0000;
             if (!old & value) & DEPRECATED != 0 {
-                crate::warn::warn_deprecation(
+                pyre_interpreter::warn::warn_deprecation(
                     "ssl.OP_NO_SSL*/ssl.OP_NO_TLS* options are deprecated",
                 )?;
             }
@@ -819,8 +830,11 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_minimum_version(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let value = validate_tls_version(crate::baseobjspace::int_w(value)?)?;
+        fn set_minimum_version(
+            &mut self,
+            value: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            let value = validate_tls_version(pyre_interpreter::baseobjspace::int_w(value)?)?;
             let value = if value == -1 { 0x304 } else { value };
             unsafe { pyre_native::ssl::context_set_minimum_version(self.backend, value) };
             Ok(())
@@ -832,8 +846,11 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_maximum_version(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let value = validate_tls_version(crate::baseobjspace::int_w(value)?)?;
+        fn set_maximum_version(
+            &mut self,
+            value: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            let value = validate_tls_version(pyre_interpreter::baseobjspace::int_w(value)?)?;
             let value = if value == -2 { 0x303 } else { value };
             unsafe { pyre_native::ssl::context_set_maximum_version(self.backend, value) };
             Ok(())
@@ -845,10 +862,11 @@ mod context_methods {
         }
 
         #[setter("_host_flags")]
-        fn set_host_flags(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let value = crate::baseobjspace::int_w(value)?;
-            self.host_flags = i32::try_from(value)
-                .map_err(|_| crate::PyError::overflow_error("_host_flags out of range"))?;
+        fn set_host_flags(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+            let value = pyre_interpreter::baseobjspace::int_w(value)?;
+            self.host_flags = i32::try_from(value).map_err(|_| {
+                pyre_interpreter::PyError::overflow_error("_host_flags out of range")
+            })?;
             Ok(())
         }
 
@@ -868,7 +886,10 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_keylog_filename(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_keylog_filename(
+            &mut self,
+            value: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
             // PyPy `_SSLContext.keylog_filename` accepts exactly str or None,
             // closes the old BIO first, opens the replacement in append mode,
             // and retains the original Python str object for the getter.
@@ -880,8 +901,8 @@ mod context_methods {
                 self.keylog_filename = w_none();
                 return Ok(());
             }
-            if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
-                return Err(crate::PyError::type_error("str path expected"));
+            if !unsafe { pyre_interpreter::baseobjspace::isinstance_str_w(value) } {
+                return Err(pyre_interpreter::PyError::type_error("str path expected"));
             }
             let path = fs_path(value)?;
             native_result(unsafe {
@@ -898,20 +919,21 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_num_tickets(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
-            let value = crate::baseobjspace::int_w(value)?;
+        fn set_num_tickets(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+            let value = pyre_interpreter::baseobjspace::int_w(value)?;
             if value < 0 {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "num_tickets must be a non-negative integer",
                 ));
             }
             if self.protocol() != PROTOCOL_TLS_SERVER as i64 {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "num_tickets can only be set on server-side contexts",
                 ));
             }
-            self.num_tickets = i32::try_from(value)
-                .map_err(|_| crate::PyError::overflow_error("num_tickets out of range"))?;
+            self.num_tickets = i32::try_from(value).map_err(|_| {
+                pyre_interpreter::PyError::overflow_error("num_tickets out of range")
+            })?;
             unsafe {
                 pyre_native::ssl::context_set_num_tickets(self.backend, self.num_tickets as usize)
             };
@@ -924,11 +946,16 @@ mod context_methods {
         }
 
         #[setter]
-        fn set_sni_callback(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_sni_callback(
+            &mut self,
+            value: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
             if !unsafe { is_none(value) }
-                && crate::baseobjspace::getattr_str(value, "__call__").is_err()
+                && pyre_interpreter::baseobjspace::getattr_str(value, "__call__").is_err()
             {
-                return Err(crate::PyError::type_error("not a callable object"));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "not a callable object",
+                ));
             }
             pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
             self.sni_callback = value;
@@ -941,13 +968,16 @@ mod context_methods {
         }
 
         #[setter("_msg_callback")]
-        fn set_msg_callback(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_msg_callback(
+            &mut self,
+            value: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
             if !unsafe { is_none(value) }
-                && crate::baseobjspace::getattr_str(value, "__call__").is_err()
+                && pyre_interpreter::baseobjspace::getattr_str(value, "__call__").is_err()
             {
-                return Err(crate::PyError::type_error(format!(
+                return Err(pyre_interpreter::PyError::type_error(format!(
                     "{} is not callable.",
-                    crate::type_methods::arg_type_name(value)
+                    pyre_interpreter::type_methods::arg_type_name(value)
                 )));
             }
             pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
@@ -955,27 +985,48 @@ mod context_methods {
             Ok(())
         }
 
-        fn load_cert_chain(&mut self, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+        fn load_cert_chain(
+            &mut self,
+            args: &[PyObjectRef],
+        ) -> Result<(), pyre_interpreter::PyError> {
             const KEYWORDS: &[&str] = &["certfile", "keyfile", "password"];
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
             let user = positional.get(1..).unwrap_or(&[]);
             if user.len() > 3 {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "load_cert_chain() takes at most 3 arguments",
                 ));
             }
-            let cert =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 0, "certfile", "load_cert_chain", 1)?
-                    .ok_or_else(|| {
-                        crate::PyError::type_error(
-                            "load_cert_chain() missing required argument 'certfile'",
-                        )
-                    })?;
-            let key =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 1, "keyfile", "load_cert_chain", 2)?;
-            let password =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 2, "password", "load_cert_chain", 3)?;
-            crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "load_cert_chain")?;
+            let cert = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                0,
+                "certfile",
+                "load_cert_chain",
+                1,
+            )?
+            .ok_or_else(|| {
+                pyre_interpreter::PyError::type_error(
+                    "load_cert_chain() missing required argument 'certfile'",
+                )
+            })?;
+            let key = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                1,
+                "keyfile",
+                "load_cert_chain",
+                2,
+            )?;
+            let password = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                2,
+                "password",
+                "load_cert_chain",
+                3,
+            )?;
+            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "load_cert_chain")?;
             let cert_path = fs_path(cert)?;
             let key_path = match key {
                 Some(value) if !unsafe { is_none(value) } => fs_path(value)?,
@@ -1006,16 +1057,19 @@ mod context_methods {
             .map(|_| ())
         }
 
-        fn load_verify_locations(&mut self, args: &[PyObjectRef]) -> Result<(), crate::PyError> {
+        fn load_verify_locations(
+            &mut self,
+            args: &[PyObjectRef],
+        ) -> Result<(), pyre_interpreter::PyError> {
             const KEYWORDS: &[&str] = &["cafile", "capath", "cadata"];
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
             let user = positional.get(1..).unwrap_or(&[]);
             if user.len() > 3 {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "load_verify_locations() takes at most 3 arguments",
                 ));
             }
-            let cafile = crate::builtins::bind_pos_or_kw(
+            let cafile = pyre_interpreter::builtins::bind_pos_or_kw(
                 user,
                 kwargs,
                 0,
@@ -1023,7 +1077,7 @@ mod context_methods {
                 "load_verify_locations",
                 1,
             )?;
-            let capath = crate::builtins::bind_pos_or_kw(
+            let capath = pyre_interpreter::builtins::bind_pos_or_kw(
                 user,
                 kwargs,
                 1,
@@ -1031,7 +1085,7 @@ mod context_methods {
                 "load_verify_locations",
                 2,
             )?;
-            let cadata = crate::builtins::bind_pos_or_kw(
+            let cadata = pyre_interpreter::builtins::bind_pos_or_kw(
                 user,
                 kwargs,
                 2,
@@ -1039,12 +1093,16 @@ mod context_methods {
                 "load_verify_locations",
                 3,
             )?;
-            crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "load_verify_locations")?;
+            pyre_interpreter::builtins::kwarg_reject_unknown(
+                kwargs,
+                KEYWORDS,
+                "load_verify_locations",
+            )?;
             let cafile = cafile.filter(|value| !unsafe { is_none(*value) });
             let capath = capath.filter(|value| !unsafe { is_none(*value) });
             let cadata = cadata.filter(|value| !unsafe { is_none(*value) });
             if cafile.is_none() && capath.is_none() && cadata.is_none() {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "cafile, capath and cadata cannot be all omitted",
                 ));
             }
@@ -1057,7 +1115,7 @@ mod context_methods {
             if let Some(capath) = capath {
                 let path = fs_path(capath)?;
                 if !path.is_dir() {
-                    return Err(crate::PyError::os_error_with_errno(
+                    return Err(pyre_interpreter::PyError::os_error_with_errno(
                         libc::ENOENT,
                         "CA directory does not exist",
                     ));
@@ -1066,7 +1124,7 @@ mod context_methods {
             }
             if let Some(cadata) = cadata {
                 if unsafe { is_str(cadata) } {
-                    let data = crate::baseobjspace::str_utf8_w(cadata)?;
+                    let data = pyre_interpreter::baseobjspace::str_utf8_w(cadata)?;
                     unsafe {
                         pyre_native::ssl::context_load_verify_data(
                             self.backend,
@@ -1078,9 +1136,9 @@ mod context_methods {
                         ssl_error("no start line: cadata does not contain a certificate")
                     })?;
                 } else {
-                    let buffer =
-                        crate::baseobjspace::simple_buffer_bytes(cadata)?.ok_or_else(|| {
-                            crate::PyError::type_error(
+                    let buffer = pyre_interpreter::baseobjspace::simple_buffer_bytes(cadata)?
+                        .ok_or_else(|| {
+                            pyre_interpreter::PyError::type_error(
                                 "cadata should be an ASCII string or a bytes-like object",
                             )
                         })?;
@@ -1105,13 +1163,18 @@ mod context_methods {
         /// bundle file and a hashed directory.  `SSL_CERT_FILE` overrides only
         /// the first and `SSL_CERT_DIR` only the second, so neither variable
         /// may suppress the other's source.
-        fn set_default_verify_paths(&mut self) -> Result<(), crate::PyError> {
+        fn set_default_verify_paths(&mut self) -> Result<(), pyre_interpreter::PyError> {
             // `SSL_CERT_FILE` and `SSL_CERT_DIR` name files, so their bytes
             // reach the host as a path for the same reason `fs_path`'s do.
             let env_path = |name: &[u8]| {
-                crate::host_seam::getenv(name).ok().flatten().map(|value| {
-                    std::path::PathBuf::from(crate::gateway::os_string_from_fs_bytes(&value))
-                })
+                pyre_interpreter::host_seam::getenv(name)
+                    .ok()
+                    .flatten()
+                    .map(|value| {
+                        std::path::PathBuf::from(
+                            pyre_interpreter::gateway::os_string_from_fs_bytes(&value),
+                        )
+                    })
             };
             let cert_file = env_path(b"SSL_CERT_FILE").filter(|path| path.is_file());
             match cert_file {
@@ -1146,7 +1209,7 @@ mod context_methods {
         fn get_ca_certs(
             &self,
             #[default(false)] binary_form: bool,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let certs = unsafe { pyre_native::ssl::context_ca_certs(self.backend) };
             // Each entry is freshly allocated and decoding the next one allocates
             // again, so they are pinned as they arrive.
@@ -1162,11 +1225,16 @@ mod context_methods {
             Ok(w_list_new(result.take()))
         }
 
-        fn set_ciphers(&mut self, cipherlist: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_ciphers(
+            &mut self,
+            cipherlist: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
             if !unsafe { is_str(cipherlist) } {
-                return Err(crate::PyError::type_error("cipherlist must be a string"));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "cipherlist must be a string",
+                ));
             }
-            let cipherlist = crate::baseobjspace::str_utf8_w(cipherlist)?;
+            let cipherlist = pyre_interpreter::baseobjspace::str_utf8_w(cipherlist)?;
             unsafe { pyre_native::ssl::context_set_cipher_list(self.backend, cipherlist.as_ref()) }
                 .map_err(ssl_error)
         }
@@ -1258,15 +1326,15 @@ mod context_methods {
         /// forward-secret key exchange, and `supports_kx_alias` reports no DHE
         /// so callers can detect the gap.  Raising here instead would reject
         /// `load_dh_params` outright for every caller.
-        fn load_dh_params(&self, path: PyObjectRef) -> Result<(), crate::PyError> {
+        fn load_dh_params(&self, path: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             if path.is_null() || unsafe { is_none(path) } {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "load_dh_params() missing required path argument",
                 ));
             }
             let path = fs_path(path)?;
             let data = std::fs::read(&path).map_err(|error| {
-                crate::PyError::os_error_with_errno(
+                pyre_interpreter::PyError::os_error_with_errno(
                     error.raw_os_error().unwrap_or(libc::EIO),
                     error.to_string(),
                 )
@@ -1280,17 +1348,19 @@ mod context_methods {
             Ok(())
         }
 
-        fn set_ecdh_curve(&self, curve: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_ecdh_curve(&self, curve: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             let curve = if unsafe { is_str(curve) } {
-                crate::baseobjspace::str_utf8_w(curve)?.to_string()
+                pyre_interpreter::baseobjspace::str_utf8_w(curve)?.to_string()
             } else if unsafe { bytesobject::is_bytes_like(curve) } {
                 String::from_utf8(unsafe { bytesobject::bytes_like_data(curve) }.to_vec())
-                    .map_err(|_| crate::PyError::value_error("invalid curve name"))?
+                    .map_err(|_| pyre_interpreter::PyError::value_error("invalid curve name"))?
             } else {
-                return Err(crate::PyError::type_error("curve_name must be a string"));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "curve_name must be a string",
+                ));
             };
             unsafe { pyre_native::ssl::context_set_ecdh_curve(self.backend, &curve) }
-                .map_err(crate::PyError::value_error)
+                .map_err(pyre_interpreter::PyError::value_error)
         }
 
         #[getter]
@@ -1298,7 +1368,10 @@ mod context_methods {
             2
         }
 
-        fn _wrap_bio(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn _wrap_bio(
+            &self,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             const KEYWORDS: &[&str] = &[
                 "incoming",
                 "outgoing",
@@ -1307,33 +1380,51 @@ mod context_methods {
                 "owner",
                 "session",
             ];
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
             let user = positional.get(1..).unwrap_or(&[]);
             if user.len() > KEYWORDS.len() {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "_wrap_bio() takes at most 6 arguments",
                 ));
             }
-            let incoming =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 0, "incoming", "_wrap_bio", 1)?
-                    .ok_or_else(|| {
-                        crate::PyError::type_error(
-                            "_wrap_bio() missing required argument 'incoming'",
-                        )
-                    })?;
-            let outgoing =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 1, "outgoing", "_wrap_bio", 2)?
-                    .ok_or_else(|| {
-                        crate::PyError::type_error(
-                            "_wrap_bio() missing required argument 'outgoing'",
-                        )
-                    })?;
-            let server_side =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 2, "server_side", "_wrap_bio", 3)?
-                    .map(crate::baseobjspace::is_true)
-                    .transpose()?
-                    .unwrap_or(false);
-            let hostname = crate::builtins::bind_pos_or_kw(
+            let incoming = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                0,
+                "incoming",
+                "_wrap_bio",
+                1,
+            )?
+            .ok_or_else(|| {
+                pyre_interpreter::PyError::type_error(
+                    "_wrap_bio() missing required argument 'incoming'",
+                )
+            })?;
+            let outgoing = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                1,
+                "outgoing",
+                "_wrap_bio",
+                2,
+            )?
+            .ok_or_else(|| {
+                pyre_interpreter::PyError::type_error(
+                    "_wrap_bio() missing required argument 'outgoing'",
+                )
+            })?;
+            let server_side = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                2,
+                "server_side",
+                "_wrap_bio",
+                3,
+            )?
+            .map(pyre_interpreter::baseobjspace::is_true)
+            .transpose()?
+            .unwrap_or(false);
+            let hostname = pyre_interpreter::builtins::bind_pos_or_kw(
                 user,
                 kwargs,
                 3,
@@ -1341,29 +1432,44 @@ mod context_methods {
                 "_wrap_bio",
                 4,
             )?;
-            let owner = crate::builtins::bind_pos_or_kw(user, kwargs, 4, "owner", "_wrap_bio", 5)?
-                .unwrap_or_else(w_none);
-            let session =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 5, "session", "_wrap_bio", 6)?;
-            crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "_wrap_bio")?;
+            let owner = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                4,
+                "owner",
+                "_wrap_bio",
+                5,
+            )?
+            .unwrap_or_else(w_none);
+            let session = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                5,
+                "session",
+                "_wrap_bio",
+                6,
+            )?;
+            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "_wrap_bio")?;
             if W_MemoryBIO::from_obj(incoming).is_none()
                 || W_MemoryBIO::from_obj(outgoing).is_none()
             {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "incoming and outgoing must be MemoryBIO objects",
                 ));
             }
             if let Some(session) = session.filter(|value| !unsafe { is_none(*value) })
                 && W_SSLSession::from_obj(session).is_none()
             {
-                return Err(crate::PyError::type_error("Value is not a SSLSession."));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "Value is not a SSLSession.",
+                ));
             }
             let (hostname, hostname_obj) = parse_server_hostname(hostname)?;
             if !server_side
                 && unsafe { pyre_native::ssl::context_check_hostname(self.backend) }
                 && hostname.is_none()
             {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "check_hostname requires server_hostname",
                 ));
             }
@@ -1392,29 +1498,44 @@ mod context_methods {
             ))
         }
 
-        fn _wrap_socket(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn _wrap_socket(
+            &self,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             const KEYWORDS: &[&str] =
                 &["sock", "server_side", "server_hostname", "owner", "session"];
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
             let user = positional.get(1..).unwrap_or(&[]);
             if user.len() > KEYWORDS.len() {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "_wrap_socket() takes at most 5 arguments",
                 ));
             }
-            let socket =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 0, "sock", "_wrap_socket", 1)?
-                    .ok_or_else(|| {
-                        crate::PyError::type_error(
-                            "_wrap_socket() missing required argument 'sock'",
-                        )
-                    })?;
-            let server_side =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 1, "server_side", "_wrap_socket", 2)?
-                    .map(crate::baseobjspace::is_true)
-                    .transpose()?
-                    .unwrap_or(false);
-            let hostname = crate::builtins::bind_pos_or_kw(
+            let socket = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                0,
+                "sock",
+                "_wrap_socket",
+                1,
+            )?
+            .ok_or_else(|| {
+                pyre_interpreter::PyError::type_error(
+                    "_wrap_socket() missing required argument 'sock'",
+                )
+            })?;
+            let server_side = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                1,
+                "server_side",
+                "_wrap_socket",
+                2,
+            )?
+            .map(pyre_interpreter::baseobjspace::is_true)
+            .transpose()?
+            .unwrap_or(false);
+            let hostname = pyre_interpreter::builtins::bind_pos_or_kw(
                 user,
                 kwargs,
                 2,
@@ -1422,23 +1543,37 @@ mod context_methods {
                 "_wrap_socket",
                 3,
             )?;
-            let owner =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 3, "owner", "_wrap_socket", 4)?
-                    .unwrap_or_else(w_none);
-            let session =
-                crate::builtins::bind_pos_or_kw(user, kwargs, 4, "session", "_wrap_socket", 5)?;
-            crate::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "_wrap_socket")?;
+            let owner = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                3,
+                "owner",
+                "_wrap_socket",
+                4,
+            )?
+            .unwrap_or_else(w_none);
+            let session = pyre_interpreter::builtins::bind_pos_or_kw(
+                user,
+                kwargs,
+                4,
+                "session",
+                "_wrap_socket",
+                5,
+            )?;
+            pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, KEYWORDS, "_wrap_socket")?;
             if let Some(session) = session.filter(|value| !unsafe { is_none(*value) })
                 && W_SSLSession::from_obj(session).is_none()
             {
-                return Err(crate::PyError::type_error("Value is not a SSLSession."));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "Value is not a SSLSession.",
+                ));
             }
             let (hostname, hostname_obj) = parse_server_hostname(hostname)?;
             if !server_side
                 && unsafe { pyre_native::ssl::context_check_hostname(self.backend) }
                 && hostname.is_none()
             {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "check_hostname requires server_hostname",
                 ));
             }
@@ -1467,9 +1602,14 @@ mod context_methods {
             ))
         }
 
-        fn _set_alpn_protocols(&mut self, data: PyObjectRef) -> Result<(), crate::PyError> {
-            let buffer = crate::baseobjspace::simple_buffer_bytes(data)?
-                .ok_or_else(|| crate::PyError::type_error("a bytes-like object is required"))?;
+        fn _set_alpn_protocols(
+            &mut self,
+            data: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            let buffer =
+                pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("a bytes-like object is required")
+                })?;
             // `PyBuffer_Release` before propagating: a parse failure must not
             // leave a `bytearray` argument permanently exported.
             let parsed = pyre_native::ssl::parse_length_prefixed_alpn(buffer.as_bytes());
@@ -1479,17 +1619,20 @@ mod context_methods {
             Ok(())
         }
 
-        fn _set_npn_protocols(&mut self, _data: PyObjectRef) -> Result<(), crate::PyError> {
+        fn _set_npn_protocols(
+            &mut self,
+            _data: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
             Err(ssl_error("NPN is not supported by rustls"))
         }
     }
 
-    fn validate_tls_version(value: i64) -> Result<i32, crate::PyError> {
+    fn validate_tls_version(value: i64) -> Result<i32, pyre_interpreter::PyError> {
         let value = i32::try_from(value).map_err(|_| {
-            crate::PyError::value_error(format!("invalid protocol version: {value}"))
+            pyre_interpreter::PyError::value_error(format!("invalid protocol version: {value}"))
         })?;
         if value != -2 && value != -1 && !(0x300..=0x304).contains(&value) {
-            return Err(crate::PyError::value_error(format!(
+            return Err(pyre_interpreter::PyError::value_error(format!(
                 "invalid protocol version: {value}"
             )));
         }
@@ -1500,15 +1643,20 @@ mod context_methods {
 mod memory_bio_methods {
     use super::*;
 
-    #[crate::pyre_methods(doc = "Memory BIO for TLS protocol data.")]
+    #[pyre_interpreter::pyre_methods(doc = "Memory BIO for TLS protocol data.")]
     impl W_MemoryBIO {
         #[staticmethod]
-        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if positional.len() != 1 || crate::builtins::has_real_kwargs(kwargs) {
-                return Err(crate::PyError::type_error("MemoryBIO() takes no arguments"));
+        fn __new__(
+            cls: PyObjectRef,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+            if positional.len() != 1 || pyre_interpreter::builtins::has_real_kwargs(kwargs) {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "MemoryBIO() takes no arguments",
+                ));
             }
-            crate::typedef::check_user_subclass(type_object(), cls)?;
+            pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(cls);
             let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -1521,25 +1669,32 @@ mod memory_bio_methods {
                 storage: std::ptr::null_mut(),
                 backend: pyre_native::ssl::memory_bio_new(),
             });
-            Ok(crate::typedef::tag_subclass_instance(obj, unsafe {
-                pyre_object::gc_roots::shadow_stack_get(cls_slot)
-            }))
+            Ok(pyre_interpreter::typedef::tag_subclass_instance(
+                obj,
+                unsafe { pyre_object::gc_roots::shadow_stack_get(cls_slot) },
+            ))
         }
 
-        fn read(&mut self, #[default(-1)] size: i64) -> Result<PyObjectRef, crate::PyError> {
+        fn read(
+            &mut self,
+            #[default(-1)] size: i64,
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let size = if size < 0 {
                 unsafe { pyre_native::ssl::memory_bio_pending(self.backend) }
             } else {
-                usize::try_from(size)
-                    .map_err(|_| crate::PyError::overflow_error("read size out of range"))?
+                usize::try_from(size).map_err(|_| {
+                    pyre_interpreter::PyError::overflow_error("read size out of range")
+                })?
             };
             let bytes = unsafe { pyre_native::ssl::memory_bio_read(self.backend, size) };
             Ok(w_bytes_from_bytes(&bytes))
         }
 
-        fn write(&mut self, data: PyObjectRef) -> Result<usize, crate::PyError> {
-            let buffer = crate::baseobjspace::simple_buffer_bytes(data)?
-                .ok_or_else(|| crate::PyError::type_error("a bytes-like object is required"))?;
+        fn write(&mut self, data: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
+            let buffer =
+                pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("a bytes-like object is required")
+                })?;
             let result =
                 unsafe { pyre_native::ssl::memory_bio_write(self.backend, buffer.as_bytes()) }
                     .map_err(ssl_error);
@@ -1566,15 +1721,15 @@ mod memory_bio_methods {
 mod ssl_socket_methods {
     use super::*;
 
-    fn is_blocking_error(error: &crate::PyError) -> bool {
-        let Some(class) = crate::builtins::lookup_exc_class("BlockingIOError") else {
+    fn is_blocking_error(error: &pyre_interpreter::PyError) -> bool {
+        let Some(class) = pyre_interpreter::builtins::lookup_exc_class("BlockingIOError") else {
             return false;
         };
         !error.exc_object.is_null()
-            && unsafe { crate::baseobjspace::isinstance_w(error.exc_object, class) }
+            && unsafe { pyre_interpreter::baseobjspace::isinstance_w(error.exc_object, class) }
     }
 
-    fn ensure_connection(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+    fn ensure_connection(socket: &mut W_SSLSocket) -> Result<(), pyre_interpreter::PyError> {
         if !socket.backend.is_null() {
             return Ok(());
         }
@@ -1583,7 +1738,7 @@ mod ssl_socket_methods {
         let hostname = if unsafe { is_none(socket.server_hostname) } {
             None
         } else {
-            Some(crate::baseobjspace::str_utf8_w(socket.server_hostname)?.to_string())
+            Some(pyre_interpreter::baseobjspace::str_utf8_w(socket.server_hostname)?.to_string())
         };
         socket.backend = native_result(unsafe {
             pyre_native::ssl::connection_new(
@@ -1596,7 +1751,7 @@ mod ssl_socket_methods {
         Ok(())
     }
 
-    fn transport_socket(socket: &W_SSLSocket) -> Result<PyObjectRef, crate::PyError> {
+    fn transport_socket(socket: &W_SSLSocket) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let value =
             unsafe { pyre_object::weakref::w_gc_weakref_box_or_strong_deref(socket.socket) };
         if value.is_null() {
@@ -1606,7 +1761,10 @@ mod ssl_socket_methods {
         }
     }
 
-    fn receive_tls(socket: &mut W_SSLSocket, data: &[u8]) -> Result<usize, crate::PyError> {
+    fn receive_tls(
+        socket: &mut W_SSLSocket,
+        data: &[u8],
+    ) -> Result<usize, pyre_interpreter::PyError> {
         // `PySSL_BEGIN_ALLOW_THREADS` around `SSL_read`: parsing the records
         // and verifying the peer's certificate is the expensive half of a
         // handshake, and it reads a buffer this module owns rather than
@@ -1614,7 +1772,7 @@ mod ssl_socket_methods {
         // is what let a server finish rejecting a client certificate — alert
         // and socket close included — inside the client thread's own `send`.
         let outcome = {
-            let _blocked = crate::module::thread::before_external_block();
+            let _blocked = pyre_interpreter::module::thread::before_external_block();
             unsafe { pyre_native::ssl::connection_receive_tls(socket.backend, data) }
         };
         let read = match outcome {
@@ -1635,7 +1793,7 @@ mod ssl_socket_methods {
     /// the protocol events it observed, and keep the trust anchor a lazy CA
     /// directory contributed.  Both need the interpreter, so a released run
     /// leaves them to its caller.
-    fn settle_received_tls(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+    fn settle_received_tls(socket: &mut W_SSLSocket) -> Result<(), pyre_interpreter::PyError> {
         run_message_callbacks(socket)?;
         if let Some(root) =
             unsafe { pyre_native::ssl::connection_take_verified_root(socket.backend) }
@@ -1649,7 +1807,7 @@ mod ssl_socket_methods {
         Ok(())
     }
 
-    fn run_message_callbacks(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+    fn run_message_callbacks(socket: &mut W_SSLSocket) -> Result<(), pyre_interpreter::PyError> {
         let events = unsafe { pyre_native::ssl::connection_take_message_events(socket.backend) };
         if events.is_empty() {
             return Ok(());
@@ -1684,7 +1842,7 @@ mod ssl_socket_methods {
             let version = w_int_new(event.version as i64);
             let content_type = w_int_new(event.content_type as i64);
             let message_type = w_int_new(event.message_type as i64);
-            crate::call::call_function_impl_result(
+            pyre_interpreter::call::call_function_impl_result(
                 context.msg_callback,
                 &[
                     pyre_object::gc_roots::shadow_stack_get(owner_slot),
@@ -1699,7 +1857,7 @@ mod ssl_socket_methods {
         Ok(())
     }
 
-    fn flush_transport(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+    fn flush_transport(socket: &mut W_SSLSocket) -> Result<(), pyre_interpreter::PyError> {
         ensure_connection(socket)?;
         if !unsafe { is_none(socket.outgoing) } {
             let data =
@@ -1723,7 +1881,7 @@ mod ssl_socket_methods {
                 match pump(backend, fd, &mut [], PumpGoal::Flush, &mut socket.record) {
                     PumpExit::Done(_) => return Ok(()),
                     PumpExit::Interrupted => {
-                        crate::module::signal::interp_signal::checksignals_now()?
+                        pyre_interpreter::module::signal::interp_signal::checksignals_now()?
                     }
                     PumpExit::Failed { write, code }
                         if wait_for_transport(transport, fd, write, code)? => {}
@@ -1815,15 +1973,15 @@ mod ssl_socket_methods {
     /// caller, which re-enters here and has to resume where it stopped.
     fn pump(
         backend: *mut pyre_native::ssl::TlsConnection,
-        fd: crate::rsocket_rffi::Socket,
+        fd: pyre_interpreter::rsocket_rffi::Socket,
         buf: &mut [u8],
         goal: PumpGoal,
         record: &mut RecordCursor,
     ) -> PumpExit {
         use crate::module::_socket::interp_socket::{socket_recv_raw, socket_send_raw};
-        use crate::rsocket_rffi::error_is_interrupted;
+        use pyre_interpreter::rsocket_rffi::error_is_interrupted;
 
-        let _blocked = crate::module::thread::before_external_block();
+        let _blocked = pyre_interpreter::module::thread::before_external_block();
         // The shutdown exchange stops at a record boundary.  What follows the
         // peer's close_notify is the plaintext `unwrap()` hands back with the
         // socket, so a read that crossed the boundary would lift those bytes
@@ -1910,11 +2068,11 @@ mod ssl_socket_methods {
     /// the `TimeoutError` `wait_for_data` raises.
     fn wait_for_transport(
         transport: PyObjectRef,
-        fd: crate::rsocket_rffi::Socket,
+        fd: pyre_interpreter::rsocket_rffi::Socket,
         write: bool,
         code: i32,
-    ) -> Result<bool, crate::PyError> {
-        if !crate::rsocket_rffi::error_is_would_block(code) {
+    ) -> Result<bool, pyre_interpreter::PyError> {
+        if !pyre_interpreter::rsocket_rffi::error_is_would_block(code) {
             return Ok(false);
         }
         crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, write)
@@ -1928,7 +2086,7 @@ mod ssl_socket_methods {
         transport: PyObjectRef,
         backend: *const pyre_native::ssl::TlsConnection,
         exit: PumpExit,
-    ) -> crate::PyError {
+    ) -> pyre_interpreter::PyError {
         match exit {
             PumpExit::Eof => tls_error(
                 pyre_native::ssl::TLS_ERROR_EOF,
@@ -1997,7 +2155,10 @@ mod ssl_socket_methods {
     /// every record as it is seen.
     fn pump_transport(
         socket: &W_SSLSocket,
-    ) -> Result<Option<(PyObjectRef, crate::rsocket_rffi::Socket)>, crate::PyError> {
+    ) -> Result<
+        Option<(PyObjectRef, pyre_interpreter::rsocket_rffi::Socket)>,
+        pyre_interpreter::PyError,
+    > {
         if !unsafe { is_none(socket.incoming) } || !unsafe { is_none(socket.outgoing) } {
             return Ok(None);
         }
@@ -2013,7 +2174,7 @@ mod ssl_socket_methods {
     /// The callback-aware counterpart of [`pump`], which returns to the
     /// interpreter after every record instead of holding it across the
     /// exchange.  It stops at the same boundary, for the same reason.
-    fn receive_transport(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
+    fn receive_transport(socket: &mut W_SSLSocket) -> Result<(), pyre_interpreter::PyError> {
         ensure_connection(socket)?;
         if !unsafe { is_none(socket.incoming) } {
             let incoming = W_MemoryBIO::from_obj(socket.incoming)
@@ -2067,7 +2228,11 @@ mod ssl_socket_methods {
         receive_tls(socket, &buf[..read]).map(|_| ())
     }
 
-    fn reject_sni(socket: &mut W_SSLSocket, alert: u8, reason: &str) -> Result<(), crate::PyError> {
+    fn reject_sni(
+        socket: &mut W_SSLSocket,
+        alert: u8,
+        reason: &str,
+    ) -> Result<(), pyre_interpreter::PyError> {
         tls_result(unsafe { pyre_native::ssl::connection_reject_server(socket.backend, alert) })?;
         // The peer must receive the fatal alert before the server-side
         // operation reports its callback failure.
@@ -2087,7 +2252,9 @@ mod ssl_socket_methods {
     /// `servername_callback` likewise reloads the SSL object's context after
     /// the app-level callback returns.
     #[inline(never)]
-    unsafe fn configure_accepted_server(socket: *mut W_SSLSocket) -> Result<(), crate::PyError> {
+    unsafe fn configure_accepted_server(
+        socket: *mut W_SSLSocket,
+    ) -> Result<(), pyre_interpreter::PyError> {
         let backend = unsafe { (*socket).backend };
         if !unsafe { (*socket).server_side }
             || !unsafe { pyre_native::ssl::connection_waiting_for_server_config(backend) }
@@ -2119,7 +2286,7 @@ mod ssl_socket_methods {
             });
             let context_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(initial_context);
-            let result = match crate::call::call_function_impl_result(
+            let result = match pyre_interpreter::call::call_function_impl_result(
                 callback,
                 &[
                     pyre_object::gc_roots::shadow_stack_get(owner_slot),
@@ -2138,10 +2305,10 @@ mod ssl_socket_methods {
                 }
             };
             if !unsafe { is_none(result) } {
-                let alert = match crate::baseobjspace::int_w(result) {
+                let alert = match pyre_interpreter::baseobjspace::int_w(result) {
                     Ok(alert) if (0..=u8::MAX as i64).contains(&alert) => alert as u8,
                     _ => {
-                        let mut error = crate::PyError::type_error(
+                        let mut error = pyre_interpreter::PyError::type_error(
                             "SNI callback must return None or a TLS alert integer",
                         );
                         error.write_unraisable(
@@ -2172,11 +2339,11 @@ mod ssl_socket_methods {
         }
     }
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_SSLSocket {
         #[staticmethod]
-        fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            Err(crate::PyError::type_error(
+        fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::type_error(
                 "cannot create '_ssl._SSLSocket' instances",
             ))
         }
@@ -2204,9 +2371,11 @@ mod ssl_socket_methods {
         }
 
         #[setter]
-        fn set_context(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_context(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             if W_SSLContext::from_obj(value).is_none() {
-                return Err(crate::PyError::type_error("context must be an SSLContext"));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "context must be an SSLContext",
+                ));
             }
             pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLSocket as *mut u8);
             self.context = value;
@@ -2237,14 +2406,16 @@ mod ssl_socket_methods {
         }
 
         #[setter]
-        fn set_session(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+        fn set_session(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             if !unsafe { is_none(value) } && W_SSLSession::from_obj(value).is_none() {
-                return Err(crate::PyError::type_error("Value is not a SSLSession."));
+                return Err(pyre_interpreter::PyError::type_error(
+                    "Value is not a SSLSession.",
+                ));
             }
             if !self.backend.is_null()
                 && !unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
             {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Cannot set session after handshake.",
                 ));
             }
@@ -2258,7 +2429,7 @@ mod ssl_socket_methods {
             Ok(())
         }
 
-        fn do_handshake(&mut self) -> Result<(), crate::PyError> {
+        fn do_handshake(&mut self) -> Result<(), pyre_interpreter::PyError> {
             ensure_connection(self)?;
             if self.server_side {
                 let context =
@@ -2302,7 +2473,7 @@ mod ssl_socket_methods {
                             continue;
                         }
                         PumpExit::Interrupted => {
-                            crate::module::signal::interp_signal::checksignals_now()?;
+                            pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
                         PumpExit::Failed { write, code }
@@ -2339,13 +2510,15 @@ mod ssl_socket_methods {
             }
         }
 
-        fn write(&mut self, data: PyObjectRef) -> Result<usize, crate::PyError> {
+        fn write(&mut self, data: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
             if self.shutdown_started {
                 return Err(ssl_error("TLS/SSL connection has been closed"));
             }
             ensure_connection(self)?;
-            let buffer = crate::baseobjspace::simple_buffer_bytes(data)?
-                .ok_or_else(|| crate::PyError::type_error("a bytes-like object is required"))?;
+            let buffer =
+                pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
+                    pyre_interpreter::PyError::type_error("a bytes-like object is required")
+                })?;
             let result = tls_result(unsafe {
                 pyre_native::ssl::connection_write_plain(self.backend, buffer.as_bytes())
             });
@@ -2355,32 +2528,37 @@ mod ssl_socket_methods {
             Ok(written)
         }
 
-        fn read(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn read(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             ensure_connection(self)?;
-            let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-            if crate::builtins::has_real_kwargs(kwargs) || positional.len() > 3 {
-                return Err(crate::PyError::type_error(
+            let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+            if pyre_interpreter::builtins::has_real_kwargs(kwargs) || positional.len() > 3 {
+                return Err(pyre_interpreter::PyError::type_error(
                     "read() takes at most 2 arguments",
                 ));
             }
             let requested = positional
                 .get(1)
                 .copied()
-                .map(crate::baseobjspace::int_w)
+                .map(pyre_interpreter::baseobjspace::int_w)
                 .transpose()?
                 .unwrap_or(1024);
             let output_buffer = positional.get(2).copied();
             if requested < 0 && output_buffer.is_none() {
-                return Err(crate::PyError::value_error("size should not be negative"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "size should not be negative",
+                ));
             }
             if requested == 0 && output_buffer.is_none() {
                 return Ok(w_bytes_from_bytes(&[]));
             }
             let mut writable = if let Some(buffer) = output_buffer {
                 Some(
-                    unsafe { crate::builtins::WritableBuffer::acquire(buffer) }.map_err(|_| {
-                        crate::PyError::type_error("read() argument 2 must be a writable buffer")
-                    })?,
+                    unsafe { pyre_interpreter::builtins::WritableBuffer::acquire(buffer) }
+                        .map_err(|_| {
+                            pyre_interpreter::PyError::type_error(
+                                "read() argument 2 must be a writable buffer",
+                            )
+                        })?,
                 )
             } else {
                 None
@@ -2433,7 +2611,7 @@ mod ssl_socket_methods {
                             unsafe { configure_accepted_server(self as *mut W_SSLSocket) }?
                         }
                         PumpExit::Interrupted => {
-                            crate::module::signal::interp_signal::checksignals_now()?
+                            pyre_interpreter::module::signal::interp_signal::checksignals_now()?
                         }
                         PumpExit::Failed { write, code }
                             if wait_for_transport(transport, fd, write, code)? => {}
@@ -2551,11 +2729,13 @@ mod ssl_socket_methods {
         fn getpeercert(
             &self,
             #[default(false)] binary_form: bool,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             if self.backend.is_null()
                 || unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
             {
-                return Err(crate::PyError::value_error("handshake not done yet"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "handshake not done yet",
+                ));
             }
             let Some(der) =
                 (unsafe { pyre_native::ssl::connection_peer_certificate(self.backend) })
@@ -2578,11 +2758,13 @@ mod ssl_socket_methods {
         /// one `_ssl.Certificate` per certificate sent by the peer.  Python
         /// 3.14's public `ssl` layer converts these objects to DER bytes for
         /// `SSLSocket`/`SSLObject`, which is the API pip's truststore consumes.
-        fn get_unverified_chain(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn get_unverified_chain(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             if self.backend.is_null()
                 || unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
             {
-                return Err(crate::PyError::value_error("handshake not done yet"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "handshake not done yet",
+                ));
             }
             let chain = unsafe { pyre_native::ssl::connection_peer_certificates(self.backend) };
             if chain.is_empty() {
@@ -2600,11 +2782,13 @@ mod ssl_socket_methods {
         /// PyPy `_cffi_ssl/_stdssl/__init__.py:get_verified_chain`: return the
         /// path selected by certificate verification, including its trust
         /// anchor even when the peer did not transmit that anchor.
-        fn get_verified_chain(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        fn get_verified_chain(&mut self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             if self.backend.is_null()
                 || unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) }
             {
-                return Err(crate::PyError::value_error("handshake not done yet"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "handshake not done yet",
+                ));
             }
             let chain = unsafe { pyre_native::ssl::connection_verified_certificates(self.backend) };
             if chain.is_empty() {
@@ -2622,9 +2806,9 @@ mod ssl_socket_methods {
         fn get_channel_binding(
             &mut self,
             #[default("tls-unique")] kind: &str,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             if kind != "tls-unique" {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "'channel_binding_type' must be 'tls-unique'",
                 ));
             }
@@ -2642,7 +2826,7 @@ mod ssl_socket_methods {
             Ok(w_bytes_from_bytes(&binding))
         }
 
-        fn shutdown(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        fn shutdown(&mut self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             ensure_connection(self)?;
             if !self.shutdown_started {
                 unsafe { pyre_native::ssl::connection_send_close_notify(self.backend) };
@@ -2694,7 +2878,7 @@ mod ssl_socket_methods {
                             break;
                         }
                         PumpExit::Interrupted => {
-                            crate::module::signal::interp_signal::checksignals_now()?
+                            pyre_interpreter::module::signal::interp_signal::checksignals_now()?
                         }
                         PumpExit::Failed { write, code }
                             if wait_for_transport(transport, fd, write, code)? => {}
@@ -2728,11 +2912,11 @@ mod ssl_socket_methods {
 mod ssl_session_methods {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_SSLSession {
         #[staticmethod]
-        fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            Err(crate::PyError::type_error(
+        fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::type_error(
                 "cannot create '_ssl.SSLSession' instances",
             ))
         }
@@ -2781,16 +2965,19 @@ mod ssl_session_methods {
 mod certificate_methods {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_Certificate {
         #[staticmethod]
-        fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-            Err(crate::PyError::type_error(
+        fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::type_error(
                 "cannot create '_ssl.Certificate' instances",
             ))
         }
 
-        fn public_bytes(&self, #[default(1)] encoding: i64) -> Result<PyObjectRef, crate::PyError> {
+        fn public_bytes(
+            &self,
+            #[default(1)] encoding: i64,
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             if encoding == 2 {
                 return Ok(self.der);
             }
@@ -2810,22 +2997,22 @@ mod certificate_methods {
                 // data, so PEM_write_bio_X509_AUX has the same output as PEM.
                 return Ok(w_str_new_managed(&pem));
             }
-            Err(crate::PyError::value_error("Unsupported format"))
+            Err(pyre_interpreter::PyError::value_error("Unsupported format"))
         }
 
-        fn get_info(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn get_info(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
             let decoded = native_result(pyre_native::ssl::certificate_decode_der(der))?;
             Ok(decoded_certificate_dict(decoded))
         }
 
-        fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn __repr__(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
             let subject = native_result(pyre_native::ssl::certificate_subject_rfc2253(der))?;
             Ok(w_str_new_managed(&format!("<Certificate '{subject}'>")))
         }
 
-        fn __hash__(&mut self) -> Result<i64, crate::PyError> {
+        fn __hash__(&mut self) -> Result<i64, pyre_interpreter::PyError> {
             if self.hash == -1 {
                 let der = unsafe { pyre_object::bytesobject::w_bytes_data(self.der) };
                 self.hash = native_result(pyre_native::ssl::certificate_subject_hash(der))?;
@@ -2895,22 +3082,24 @@ pub unsafe fn w_ssl_socket_dealloc(obj: PyObjectRef) {
     }
 }
 
-fn rand_status(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn rand_status(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_bool_from(true))
 }
 
-fn rand_add(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn rand_add(_args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     Ok(w_none())
 }
 
-fn rand_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let size = crate::baseobjspace::int_w(args[0])?;
+fn rand_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let size = pyre_interpreter::baseobjspace::int_w(args[0])?;
     if size < 0 {
-        return Err(crate::PyError::value_error("num must be positive"));
+        return Err(pyre_interpreter::PyError::value_error(
+            "num must be positive",
+        ));
     }
     let size = usize::try_from(size)
-        .map_err(|_| crate::PyError::overflow_error("RAND_bytes size out of range"))?;
-    let bytes = crate::importing::host::os::urandom(size)
+        .map_err(|_| pyre_interpreter::PyError::overflow_error("RAND_bytes size out of range"))?;
+    let bytes = pyre_interpreter::importing::host::os::urandom(size)
         .map_err(|err| ssl_error(format!("RAND_bytes failed: {err}")))?;
     Ok(w_bytes_from_bytes(&bytes))
 }
@@ -2924,18 +3113,19 @@ fn oid_tuple(entry: pyre_native::ssl::OidInfo) -> PyObjectRef {
     w_tuple_new(fields.take())
 }
 
-fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let (positional, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
     if positional.is_empty() || positional.len() > 2 {
-        return Err(crate::PyError::type_error(
+        return Err(pyre_interpreter::PyError::type_error(
             "txt2obj() takes 1 or 2 arguments",
         ));
     }
-    let value = crate::baseobjspace::str_utf8_w(positional[0])?;
-    let name_arg = crate::builtins::bind_pos_or_kw(positional, kwargs, 1, "name", "txt2obj", 2)?;
-    crate::builtins::kwarg_reject_unknown(kwargs, &["name"], "txt2obj")?;
+    let value = pyre_interpreter::baseobjspace::str_utf8_w(positional[0])?;
+    let name_arg =
+        pyre_interpreter::builtins::bind_pos_or_kw(positional, kwargs, 1, "name", "txt2obj", 2)?;
+    pyre_interpreter::builtins::kwarg_reject_unknown(kwargs, &["name"], "txt2obj")?;
     let allow_names = name_arg
-        .map(crate::baseobjspace::is_true)
+        .map(pyre_interpreter::baseobjspace::is_true)
         .transpose()?
         .unwrap_or(false);
     let name: &str = value.as_ref();
@@ -2952,20 +3142,24 @@ fn txt2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
     entry
         .map(oid_tuple)
-        .ok_or_else(|| crate::PyError::value_error(format!("unknown object '{name}'")))
+        .ok_or_else(|| pyre_interpreter::PyError::value_error(format!("unknown object '{name}'")))
 }
 
-fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let nid = crate::baseobjspace::int_w(args[0])?;
+fn nid2obj(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let nid = pyre_interpreter::baseobjspace::int_w(args[0])?;
     let Ok(nid32) = i32::try_from(nid) else {
-        return Err(crate::PyError::value_error(format!("unknown NID {nid}")));
+        return Err(pyre_interpreter::PyError::value_error(format!(
+            "unknown NID {nid}"
+        )));
     };
     pyre_native::ssl::oid_by_nid(nid32)
         .map(oid_tuple)
-        .ok_or_else(|| crate::PyError::value_error(format!("unknown NID {nid}")))
+        .ok_or_else(|| pyre_interpreter::PyError::value_error(format!("unknown NID {nid}")))
 }
 
-fn get_default_verify_paths(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn get_default_verify_paths(
+    _args: &[PyObjectRef],
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let (cert_file, cert_dir) = pyre_native::ssl::default_verify_paths();
     let mut fields = pyre_object::gc_roots::RootedItems::new();
     fields.push(w_str_new_managed("SSL_CERT_FILE"));
@@ -2986,8 +3180,8 @@ mod cert_store {
     use pyre_object::{PyObjectRef, gc_roots::RootedItems};
     use rustpython_host_env::cert_store::{self as host, CertificateUses, EncodingType};
 
-    fn win32_error(error: std::io::Error) -> crate::PyError {
-        crate::PyError::os_error_win32_syscall2(
+    fn win32_error(error: std::io::Error) -> pyre_interpreter::PyError {
+        pyre_interpreter::PyError::os_error_win32_syscall2(
             error.raw_os_error().unwrap_or(0),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
@@ -3002,11 +3196,13 @@ mod cert_store {
         }
     }
 
-    pub fn enum_certificates(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+    pub fn enum_certificates(
+        args: &[PyObjectRef],
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
         let certs = host::enum_certificates(name);
         if !certs.had_open_store {
-            return Err(crate::PyError::os_error(format!(
+            return Err(pyre_interpreter::PyError::os_error(format!(
                 "failed to open certificate store {name:?}"
             )));
         }
@@ -3036,10 +3232,12 @@ mod cert_store {
         Ok(pyre_object::w_list_new(items.take()))
     }
 
-    pub fn enum_crls(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        let name = crate::baseobjspace::str_utf8_w(args[0])?;
+    pub fn enum_crls(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        let name = pyre_interpreter::baseobjspace::str_utf8_w(args[0])?;
         let entries = host::enum_crls(name).map_err(|_| {
-            crate::PyError::os_error(format!("failed to open certificate store {name:?}"))
+            pyre_interpreter::PyError::os_error(format!(
+                "failed to open certificate store {name:?}"
+            ))
         })?;
         let mut items = RootedItems::new();
         for entry in entries {
@@ -3055,13 +3253,13 @@ mod cert_store {
     }
 }
 
-fn test_decode_cert(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn test_decode_cert(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let path = fs_path(args[0])?;
     let cert = native_result(pyre_native::ssl::certificate_decode_file(&path))?;
     Ok(decoded_certificate_dict(cert))
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_ssl",
     interpleveldefs: {
         "_SSLContext" => context_methods::type_object(),
@@ -3074,35 +3272,35 @@ crate::py_module! {
         // own `basicsize`, which leaves it without a managed weakref.  The
         // subclasses below come from `PyErr_NewExceptionWithDoc` and do have
         // one.
-        "SSLError" => crate::builtins::make_exc_type(
+        "SSLError" => pyre_interpreter::builtins::make_exc_type(
             "ssl.SSLError",
-            crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("OSError").expect("OSError installed"),
+            pyre_interpreter::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::lookup_exc_class("OSError").expect("OSError installed"),
         ),
-        "SSLZeroReturnError" => crate::builtins::new_exception_class(
+        "SSLZeroReturnError" => pyre_interpreter::builtins::new_exception_class(
             "ssl.SSLZeroReturnError",
-            crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
+            pyre_interpreter::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLWantReadError" => crate::builtins::new_exception_class(
+        "SSLWantReadError" => pyre_interpreter::builtins::new_exception_class(
             "ssl.SSLWantReadError",
-            crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
+            pyre_interpreter::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLWantWriteError" => crate::builtins::new_exception_class(
+        "SSLWantWriteError" => pyre_interpreter::builtins::new_exception_class(
             "ssl.SSLWantWriteError",
-            crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
+            pyre_interpreter::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLSyscallError" => crate::builtins::new_exception_class(
+        "SSLSyscallError" => pyre_interpreter::builtins::new_exception_class(
             "ssl.SSLSyscallError",
-            crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
+            pyre_interpreter::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLEOFError" => crate::builtins::new_exception_class(
+        "SSLEOFError" => pyre_interpreter::builtins::new_exception_class(
             "ssl.SSLEOFError",
-            crate::builtins::exc_os_error_new,
-            crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
+            pyre_interpreter::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
         // OpenSSL-shaped compatibility fields are required by `ssl.py` and
         // consumers such as urllib3, while the suffix names the real backend.
@@ -3211,7 +3409,7 @@ crate::py_module! {
         // preserve those owner/storage choices and suppress only the
         // caller-visible per-type BASETYPE capability.
         for name in ["MemoryBIO", "SSLSession", "Certificate", "_SSLSocket"] {
-            let ty = crate::module_ns_get(ns, name).expect("_ssl type installed");
+            let ty = pyre_interpreter::module_ns_get(ns, name).expect("_ssl type installed");
             unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
         }
         // The Windows-only store readers. They live here rather than in
@@ -3221,16 +3419,16 @@ crate::py_module! {
         for (name, func) in [
             (
                 "enum_certificates",
-                crate::py_module_fn!("enum_certificates", 1, cert_store::enum_certificates),
+                pyre_interpreter::py_module_fn!("enum_certificates", 1, cert_store::enum_certificates),
             ),
             (
                 "enum_crls",
-                crate::py_module_fn!("enum_crls", 1, cert_store::enum_crls),
+                pyre_interpreter::py_module_fn!("enum_crls", 1, cert_store::enum_crls),
             ),
         ] {
-            crate::module_ns_store(ns, name, crate::gateway::with_module("_ssl", func));
+            pyre_interpreter::module_ns_store(ns, name, pyre_interpreter::gateway::with_module("_ssl", func));
         }
-        let ssl_error = crate::builtins::lookup_exc_class("ssl.SSLError")
+        let ssl_error = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError")
             .expect("SSLError installed");
         let ssl_error_dict =
             unsafe { pyre_object::w_type_get_dict_ptr(ssl_error) as PyObjectRef };
@@ -3238,17 +3436,17 @@ crate::py_module! {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ssl_error_dict,
                 "__str__",
-                crate::make_builtin_function_with_arity("__str__", ssl_error_str, 1),
+                pyre_interpreter::make_builtin_function_with_arity("__str__", ssl_error_str, 1),
             );
         }
-        let value_error = crate::builtins::lookup_exc_class("ValueError")
+        let value_error = pyre_interpreter::builtins::lookup_exc_class("ValueError")
             .expect("ValueError installed");
-        let cert_error = crate::builtins::make_exc_type_multi(
+        let cert_error = pyre_interpreter::builtins::make_exc_type_multi(
             "ssl.SSLCertVerificationError",
-            crate::builtins::exc_os_error_new,
+            pyre_interpreter::builtins::exc_os_error_new,
             &[ssl_error, value_error],
         );
-        crate::module_ns_store(ns, "SSLCertVerificationError", cert_error);
+        pyre_interpreter::module_ns_store(ns, "SSLCertVerificationError", cert_error);
         for (name, value) in [
             ("ALERT_DESCRIPTION_CLOSE_NOTIFY", 0),
             ("ALERT_DESCRIPTION_UNEXPECTED_MESSAGE", 10),
@@ -3285,7 +3483,7 @@ crate::py_module! {
             ("ALERT_DESCRIPTION_CERTIFICATE_REQUIRED", 116),
             ("ALERT_DESCRIPTION_NO_APPLICATION_PROTOCOL", 120),
         ] {
-            crate::module_ns_store(ns, name, w_int_new(value));
+            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
         }
     },
 }
