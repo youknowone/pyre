@@ -7730,19 +7730,19 @@ impl Drop for ExceptionStringInlineGuard {
     }
 }
 
-pub(crate) fn format_inline_constructs_str_active() -> bool {
-    FORMAT_INLINE_CONSTRUCTS_STR.with(|c| c.get())
+pub(crate) fn format_inline_constructs_str_active_for(w_code: *const ()) -> bool {
+    FORMAT_INLINE_CONSTRUCTS_STR.with(|c| c.get() == Some(w_code as usize))
 }
 
 pub(crate) struct FormatInlineConstructsStrGuard {
-    prior: bool,
+    prior: Option<usize>,
 }
 
 impl FormatInlineConstructsStrGuard {
-    fn enter() -> Self {
+    fn enter(w_code: *const ()) -> Self {
         let prior = FORMAT_INLINE_CONSTRUCTS_STR.with(|c| {
             let prior = c.get();
-            c.set(true);
+            c.set(Some(w_code as usize));
             prior
         });
         Self { prior }

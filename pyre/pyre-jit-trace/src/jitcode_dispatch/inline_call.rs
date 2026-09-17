@@ -6318,7 +6318,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 let loop_header_admitted = !body_facts.owns_loop_header
                     || !fbw_callee_body_has_two_entry_method_push(body.code, callee_descr_refs);
                 foriter_deferred_admit = (entry_is_call_boundary
-                    || crate::jitcode_dispatch::format_inline_constructs_str_active())
+                    || crate::jitcode_dispatch::format_inline_constructs_str_active_for(w_code))
                     && loop_header_admitted
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !body_facts.has_exception_table;
@@ -12705,7 +12705,7 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         (Some(body), Some((descr_refs, _, _)))
             if format_body_constructs_str(body.code, descr_refs) =>
         {
-            Some(crate::jitcode_dispatch::FormatInlineConstructsStrGuard::enter())
+            Some(crate::jitcode_dispatch::FormatInlineConstructsStrGuard::enter(w_code))
         }
         _ => None,
     };

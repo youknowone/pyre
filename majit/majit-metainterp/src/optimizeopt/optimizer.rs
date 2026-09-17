@@ -1604,6 +1604,7 @@ impl Optimizer {
         }
         self.pending_bridge_rd = None;
         self.building_bridge = false;
+        self.bridge_vm_red = None;
         self.simple_compile = false;
         self.all_descrs = Arc::new(Vec::new());
         self.snapshot_boxes = Vec::new();

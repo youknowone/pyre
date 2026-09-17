@@ -2559,8 +2559,8 @@ thread_local! {
     /// to `descroperation.py format`'s TypeError residual).  The body is
     /// still `get_and_call_function`, and this flag lets the DeferredCall
     /// gate admit it.
-    pub(crate) static FORMAT_INLINE_CONSTRUCTS_STR: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+    pub(crate) static FORMAT_INLINE_CONSTRUCTS_STR: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     /// Code keys of the callees [`fbw_decline_inline_callee`] named.  The
     /// inline callsite declines them from then on, so the call residualizes
     /// and the enclosing trace never re-enters the identical abort.

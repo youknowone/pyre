@@ -5486,7 +5486,11 @@ impl<M: Clone> MetaInterp<M> {
         opt.cpu = self.cpu.clone();
         opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
         opt.set_vrefinfo(self.virtualref_info().clone());
-        opt.constant_fold_alloc = Some(crate::optimizeopt::leak_constant_fold_alloc());
+        // Do not install `leak_constant_fold_alloc`: it returns a raw
+        // `alloc_zeroed` block with no GC header or type id, and the
+        // fold writer only copies Int/Ref fields.  `force_box` then
+        // leaves `constant_fold_alloc` unset and materializes via
+        // SETFIELD (`info.py` fallback).
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();

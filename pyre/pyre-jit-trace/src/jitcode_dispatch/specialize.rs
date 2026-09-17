@@ -17714,6 +17714,8 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
         crate::descr::int_intval_descr(),
     )?;
     let helper = pyre_object::lowlevel_string::jit_ll_int2dec as *const ();
+    // Non-elidable: two `str(i)` / `format(i)` sites must not CSE the
+    // payload.  `is_w` of `_len() > 1` compares `_utf8` storage.
     let payload = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
@@ -17721,7 +17723,7 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
         &[majit_ir::Type::Int],
         majit_ir::Type::Ref,
         majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::ElidableOrMemoryError,
+            majit_ir::ExtraEffect::CanRaise,
             majit_ir::OopSpecIndex::None,
         ),
     );
@@ -19117,10 +19119,13 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
 
     let helper = jit_import_cached as *const ();
-    // Impure `CallR`: `sys.modules` is mutable.  The helper only reads
-    // module/spec dicts on exact `module` objects whose `__getattribute__`
-    // is the module default, so it cannot raise or force a virtualizable.
-    // Hook-shaped objects declined above; `IMPORT_NAME` keeps CallMayForce.
+    // Impure `CallR`: `sys.modules` is mutable.  `call_typed_with_effect_pure`
+    // would CSE / const-fold the lookup; a later replacement of
+    // `sys.modules[name]` must re-run and `GuardValue`-exit.  The helper
+    // only reads module/spec dicts on exact `module` objects whose
+    // `__getattribute__` is the module default, so it cannot raise or
+    // force a virtualizable.  Hook-shaped objects declined above;
+    // `IMPORT_NAME` keeps CallMayForce.
     let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
     let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,

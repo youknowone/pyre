@@ -996,10 +996,12 @@ pub struct ImportedShortAlias {
 /// allocated memory. The optimizer writes field values directly.
 pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 
-/// `optimizer.py` constant_fold allocator: immutable objects live for
-/// the process (`Box::leak` analog). Every Optimizer the metainterp
-/// mints — including SimpleCompile and unroll phase instances — uses
-/// this, because `Optimizer.__init__` always has `metainterp_sd`.
+/// Raw `alloc_zeroed` stand-in for `optimizer.py` constant_fold.
+/// Not installed: the block has no GC header or type id, and the
+/// fold writer only copies Int/Ref fields.  Keep the helper so a
+/// GC-backed allocator can replace the body without rewiring call
+/// sites.
+#[allow(dead_code)]
 pub fn leak_constant_fold_alloc() -> ConstantFoldAllocFn {
     Box::new(|size_bytes: usize| {
         let layout = std::alloc::Layout::from_size_align(size_bytes, 8)

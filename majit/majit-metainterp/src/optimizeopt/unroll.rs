@@ -541,7 +541,6 @@ impl UnrollOptimizer {
         if let Some(vrefinfo) = self.vrefinfo.clone() {
             opt.set_vrefinfo(vrefinfo);
         }
-        opt.constant_fold_alloc = Some(crate::optimizeopt::leak_constant_fold_alloc());
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
