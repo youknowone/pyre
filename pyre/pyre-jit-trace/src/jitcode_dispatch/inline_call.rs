@@ -14508,16 +14508,16 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
         // Named `add`/`mul`/… helpers arrive as `dR>r`, not
-        // `binary_value_from_tag`.  Emit before walking so a declined
-        // `w_float_new` body cannot leave a residual `CallF` with a
-        // symbolic funcptr in the caller trace (`float_loop` SIGBUS).
-        if let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::BinaryOpDescent, || {
-            super::specialize::try_emit_exact_int_binop(ctx, op.pc, op_tag, &args, dst, dst_bank)
+        // `binary_value_from_tag`.  Descend the generated body the same
+        // way the tagged helper does; do not emit `try_emit_exact_*`
+        // under this descent row.
+        let tag_op = ctx.trace_ctx.const_int(op_tag);
+        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+            super::specialize::try_walker_orthodox_binary_op(
+                ctx, op.pc, op_tag, tag_op, &args, dst, dst_bank,
+            )
         })? {
-            write_boxed(ctx, boxed)?;
-            return Ok((DispatchOutcome::Continue, op.next_pc));
+            return Ok((outcome, op.next_pc));
         }
         if let Some(DispatchOutcome::SubReturn {
             result: Some(boxed),
@@ -14658,6 +14658,23 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             let unicode_name = walker_concrete_ref_object(ctx, name_opref).and_then(|n| {
                 unsafe { pyre_object::w_str_get_wtf8(n).as_str().ok() }.map(str::to_string)
             });
+            if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
+                && !name_opref.is_constant()
+                && unsafe {
+                    pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
+                }
+            {
+                let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+                walker_emit_fold_guard_with_snapshot(
+                    ctx,
+                    op.pc,
+                    majit_ir::OpCode::GuardValue,
+                    &[name_opref, name_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .replace_box(name_opref, name_const);
+            }
             if let Some(outcome) =
                 super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
                     ctx,
