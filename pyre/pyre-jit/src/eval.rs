@@ -7732,6 +7732,20 @@ fn unpack_merge_point_jit(
     drive_unpack_iterable_trace(green_key, greenkey, w_iterator, items);
 }
 
+/// `generatorentry_driver.jit_merge_point` runtime hook.
+/// `warmspot.py rewrite_can_enter_jits` inserts `can_enter_jit` at a
+/// portal that has none; this is that insert. The translator already
+/// treats `GeneratorEntryJitDriver::jit_merge_point` as
+/// `BC_JIT_MERGE_POINT`. Driving a dedicated portal is the next peel;
+/// this hook is the merge-point so `caro_no_merge_entry` is not the
+/// only door.
+fn genentry_merge_point_jit(
+    _gen: pyre_object::PyObjectRef,
+    _w_arg: pyre_object::PyObjectRef,
+    _pycode: pyre_object::PyObjectRef,
+) {
+}
+
 /// The exception a jd1 drain exit escapes with, as a `PyError`, unless it is the
 /// drain's own loop-exit `StopIteration` (which the caller `ln` loop re-derives
 /// on its next `next()`) or the slot is empty.
@@ -8302,6 +8316,7 @@ pub fn init_jit_hooks() {
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
+    pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
     // Install the dict key `eq_w` / `hash_w` / `compares_by_identity`
     // trampolines here, at boot, before any user statement runs. They are
     // also registered inside the `JIT_DRIVER` initializer for the
@@ -9482,6 +9497,7 @@ fn eval_with_jit_inner(
     pyre_interpreter::call::register_set_jit_param_string_hook(set_jit_param_string_via_warmstate);
     pyre_interpreter::call::register_unpack_merge_hook(unpack_merge_point_jit);
     pyre_interpreter::call::register_unpack_portal_runner_hook(unpackiterable_ll_portal_runner);
+    pyre_interpreter::call::register_genentry_merge_hook(genentry_merge_point_jit);
     // The backend-agnostic registrations here — notably the JIT exception
     // raiser (`register_jit_exc_raiser`) that `jit_publish_exception` routes
     // residual-call raises through — are required on every backend; the

@@ -15488,6 +15488,21 @@ const unpackiterable_driver: UnpackIterableJitDriver = UnpackIterableJitDriver;
 #[inline]
 fn generator_unpack_driver_jit_merge_point(_pycode: PyObjectRef) {}
 
+/// `generator.py` `generatorentry_driver` — greens=`['pycode']`,
+/// reds=`['gen', 'w_arg']`, name=`generatorentry`.
+struct GeneratorEntryJitDriver;
+
+impl GeneratorEntryJitDriver {
+    /// `send_ex`: `generatorentry_driver.jit_merge_point(gen=self, w_arg=..., pycode=pycode)`.
+    #[inline]
+    fn jit_merge_point(&self, w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef) {
+        crate::call::genentry_merge_point(w_gen, w_arg, pycode);
+    }
+}
+
+#[allow(non_upper_case_globals)]
+const generatorentry_driver: GeneratorEntryJitDriver = GeneratorEntryJitDriver;
+
 /// pypy/interpreter/generator.py `_create_unpack_into` body.
 ///
 /// ```python
@@ -19952,6 +19967,32 @@ unsafe fn generator_invoke_execute_frame(
 /// Resume a generator frame: push w_arg (for send/next) or inject operr
 /// (for throw), then run the frame until YIELD_VALUE or RETURN_VALUE.
 fn generator_send_ex(
+    gen_obj: PyObjectRef,
+    w_arg: PyObjectRef,
+    operr: Option<PyError>,
+    throw_args: Option<([PyObjectRef; 3], usize)>,
+    closing: bool,
+) -> PyResult {
+    use pyre_object::generator::*;
+    unsafe {
+        // `generator.py send_ex`: when already in a trace and the body
+        // has two or more yields, hit `generatorentry_driver` instead of
+        // inlining `_send_ex`. Single-yield bodies fall through and
+        // look inside (`should_not_inline` is false).
+        let pycode = w_generator_get_pycode(gen_obj);
+        if !pycode.is_null() {
+            let raw = crate::pycode::w_code_get_ptr(pycode) as *const crate::CodeObject;
+            if !raw.is_null() && majit_metainterp::jit::we_are_jitted() && should_not_inline(&*raw)
+            {
+                generatorentry_driver.jit_merge_point(gen_obj, w_arg, pycode);
+            }
+        }
+    }
+    generator_send_ex_body(gen_obj, w_arg, operr, throw_args, closing)
+}
+
+/// `generator.py` `_send_ex`.
+fn generator_send_ex_body(
     gen_obj: PyObjectRef,
     w_arg: PyObjectRef,
     operr: Option<PyError>,

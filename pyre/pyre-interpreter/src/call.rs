@@ -613,6 +613,23 @@ pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items:
     }
 }
 
+/// jd `generatorentry_driver` (`generator.py`): greens=`pycode`,
+/// reds=`gen`, `w_arg`. Called from `send_ex` when `we_are_jitted()`
+/// and `should_not_inline(pycode)`.
+type GenEntryMergeFn = fn(w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef);
+static GENENTRY_MERGE_HOOK: OnceLock<GenEntryMergeFn> = OnceLock::new();
+
+pub fn register_genentry_merge_hook(f: GenEntryMergeFn) {
+    let _ = GENENTRY_MERGE_HOOK.set(f);
+}
+
+#[inline]
+pub fn genentry_merge_point(w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef) {
+    if let Some(f) = GENENTRY_MERGE_HOOK.get() {
+        f(w_gen, w_arg, pycode);
+    }
+}
+
 /// `warmspot.py rewrite_jit_merge_point`: the original portal graph ends in
 /// `return portal_runner(*args)`. pyre-interpreter cannot import pyre-jit, so
 /// the JIT registers the runner at boot. Without a hook the split portal
