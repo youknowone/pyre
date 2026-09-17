@@ -5243,6 +5243,15 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                     false,
                 ),
                 (
+                    "W_BaseException.w_weakreflifeline",
+                    EXC_W_WEAKREF_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
                     "W_BaseException.suppress_context",
                     EXC_SUPPRESS_CONTEXT_OFFSET,
                     1,

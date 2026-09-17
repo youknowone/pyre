@@ -2520,7 +2520,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     // Slim `W_BaseException` / `_new_exception` layout.  Extra-field
     // subclasses (`W_OSError`, `W_ImportError`, …) get a tail TypeInfo
-    // so a ValueError is SizeDescr 72, matching PyPy.
+    // so a ValueError stays on the slim SizeDescr (header + weakref).
     let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
         object_tid,
