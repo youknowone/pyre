@@ -419,7 +419,7 @@ impl<K, V, S> RDict<K, V, S> {
 
     #[inline]
     pub fn is_valid_slot(&self, slot: usize) -> bool {
-        matches!(self.entries.get(slot), Some(Some(_)))
+        slot < self.entries.len() && self.entry_at(slot).is_some()
     }
 
     /// Changes whenever a compaction or reindex moves entries; see the field.
@@ -454,18 +454,20 @@ impl<K, V, S> RDict<K, V, S> {
 
     #[inline]
     pub fn get_slot(&self, slot: usize) -> Option<(&K, &V)> {
-        match self.entries.get(slot) {
-            Some(Some(e)) => Some((&e.key, &e.value)),
-            _ => None,
+        if slot >= self.entries.len() {
+            return None;
         }
+        self.entry_at(slot).as_ref().map(|e| (&e.key, &e.value))
     }
 
     #[inline]
     pub fn get_slot_mut(&mut self, slot: usize) -> Option<(&K, &mut V)> {
-        match self.entries.get_mut(slot) {
-            Some(Some(e)) => Some((&e.key, &mut e.value)),
-            _ => None,
+        if slot >= self.entries.len() {
+            return None;
         }
+        self.entry_at_mut(slot)
+            .as_mut()
+            .map(|e| (&e.key, &mut e.value))
     }
 
     pub fn iter(&self) -> LiveIter<'_, K, V> {
@@ -564,13 +566,18 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
         loop {
-            let index = *self.indexes.get(i)?;
+            if i >= self.indexes.len() {
+                return None;
+            }
+            let index = self.index_at(i);
             if index == FREE {
                 return None;
             }
             if index >= VALID_OFFSET {
                 let slot = (index - VALID_OFFSET) as usize;
-                if let Some(Some(e)) = self.entries.get(slot) {
+                if slot < self.entries.len()
+                    && let Some(e) = self.entry_at(slot).as_ref()
+                {
                     if e.hash == hash && key.equivalent(&e.key) {
                         return Some(slot);
                     }
@@ -598,9 +605,10 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         let mut perturb = hash;
         let mut deleted_slot: Option<usize> = None;
         loop {
-            let Some(&index) = self.indexes.get(i) else {
+            if i >= self.indexes.len() {
                 return Err(deleted_slot.unwrap_or(0));
-            };
+            }
+            let index = self.index_at(i);
             if index == FREE {
                 return Err(deleted_slot.unwrap_or(i));
             }
@@ -610,7 +618,9 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
                 }
             } else {
                 let slot = (index - VALID_OFFSET) as usize;
-                if let Some(Some(e)) = self.entries.get(slot) {
+                if slot < self.entries.len()
+                    && let Some(e) = self.entry_at(slot).as_ref()
+                {
                     if e.hash == hash && key.equivalent(&e.key) {
                         return Ok(slot);
                     }
@@ -844,9 +854,12 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
 
     /// Delete the pair at `slot`, which must be valid.
     pub fn remove_slot(&mut self, slot: usize) -> Option<(K, V)> {
-        let hash = match self.entries.get(slot) {
-            Some(Some(e)) => e.hash,
-            _ => return None,
+        if slot >= self.entries.len() {
+            return None;
+        }
+        let hash = match self.entry_at(slot) {
+            Some(e) => e.hash,
+            None => return None,
         };
         Some(self.take_slot(hash, slot))
     }
@@ -893,9 +906,12 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     /// move; upstream calls its own path "a *very slow* fall-back" and rebuilds
     /// the dict, so this does too.
     pub fn move_slot_to_end(&mut self, slot: usize, last: bool) -> bool {
-        let hash = match self.entries.get(slot) {
-            Some(Some(e)) => e.hash,
-            _ => return false,
+        if slot >= self.entries.len() {
+            return false;
+        }
+        let hash = match self.entry_at(slot) {
+            Some(e) => e.hash,
+            None => return false,
         };
         if last {
             if slot + 1 == self.entries.len() {

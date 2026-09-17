@@ -1,8 +1,9 @@
 # pyre-check: max-pypy-ratio=3.3
-# The trip count is set by pypy's end of the comparison: under it pypy's own
-# execution falls below FLOOR_GATE_MIN_BASELINE_S, the baseline it divides is
-# the floor constant rather than a measurement, and neither bound arms.
-N = 105200000
+# The trip count is set so pypy's execution-only time clears
+# FLOOR_GATE_MIN_BASELINE_S on unix and windows (10× timer quantum).
+# Under that, the baseline is the floor constant and CI reports a
+# 6.6x spike against a 0.04s denominator.
+N = 420800000
 
 S = '\udcff'                  # lone low surrogate
 H = 'a' + chr(0xd800) + 'b'   # embedded high surrogate

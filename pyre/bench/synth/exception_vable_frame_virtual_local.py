@@ -19,11 +19,15 @@
 # and cranelift both lost `marker` from the iteration the entry trace compiled
 # onwards.
 #
-# Expected output:
-#   4000 ('i', 'marker')
-#   4000 ('i', 'marker', 'odd_only')
+# Expected output (N/2 each):
+#   40000 ('i', 'marker')
+#   40000 ('i', 'marker', 'odd_only')
+#
+# N is 10× the original 8000 so a CI pypy reading near the 0.01s
+# floor becomes a real denominator. Stays under FLOOR_GATE_MIN_BASELINE_S
+# so the 11x ceiling still gets the near-floor grace buffer.
 
-N = 8000
+N = 80000
 
 
 def branchy(i):
