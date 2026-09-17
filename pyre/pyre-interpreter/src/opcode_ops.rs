@@ -298,6 +298,21 @@ fn compare_value_from_tag_inner(
             )));
         }
     };
+    // Two exact builtin ints: `compare_slot` only. `is_int_like` is
+    // true for an int subclass (`is_int` is the vtable/`ob_type`
+    // check); taking the slot on that shape skips `LiarInt.__lt__`
+    // and returns the raw payload (`True` where the override returns
+    // `"LT"`). `compare` is loop-free (`try_compare_override` is
+    // residual) so other callers (`operator`, containers) can look
+    // inside it the way `comparison_impl` is looked inside.
+    let both_exact_int = unsafe {
+        crate::objspace::descroperation::is_int_like(a)
+            && crate::objspace::descroperation::is_int_like(b)
+            && crate::objspace::descroperation::both_exact_builtin_instances_promoted(a, b)
+    };
+    if both_exact_int {
+        return crate::objspace::descroperation::compare_slot(a, b, op);
+    }
     compare(a, b, op)
 }
 

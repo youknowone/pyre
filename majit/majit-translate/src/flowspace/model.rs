@@ -22,6 +22,7 @@
 //!   Rust has no class-mutable-state, this is the minimum deviation.
 
 use parking_lot::Mutex;
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -2735,6 +2736,52 @@ pub enum ConstValue {
         is_max: bool,
         value: i64,
     },
+    /// RPython `Constant.value` holding a live rtyper object
+    /// (`rclass.FieldListAccessor` in `VTYPE._hints['virtualizable_accessor']`).
+    /// Identity is the `Arc` pointer, matching Python `is`.
+    Opaque(OpaqueConst),
+}
+
+/// Identity-bearing rtyper object stored on `Constant.value`.
+#[derive(Clone)]
+pub struct OpaqueConst {
+    inner: Arc<dyn Any + Send + Sync>,
+}
+
+impl OpaqueConst {
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        OpaqueConst {
+            inner: Arc::new(value),
+        }
+    }
+
+    pub fn from_arc<T: Any + Send + Sync>(value: Arc<T>) -> Self {
+        OpaqueConst { inner: value }
+    }
+
+    pub fn downcast_ref<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.inner.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for OpaqueConst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Opaque")
+    }
+}
+
+impl PartialEq for OpaqueConst {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for OpaqueConst {}
+
+impl Hash for OpaqueConst {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.inner).hash(state);
+    }
 }
 
 impl PartialEq for ConstValue {
@@ -2766,6 +2813,7 @@ impl PartialEq for ConstValue {
             }
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
+            (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             (
@@ -2805,6 +2853,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::None => f.write_str("None"),
             ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
             ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
+            ConstValue::Opaque(_) => f.write_str("<opaque>"),
             ConstValue::Dict(_)
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
@@ -2871,6 +2920,7 @@ impl Hash for ConstValue {
                 }
             },
             ConstValue::HostObject(obj) => obj.hash(state),
+            ConstValue::Opaque(opaque) => opaque.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
             ConstValue::InheritanceId {
@@ -3480,6 +3530,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::AddressOffset(_) => "AddressOffset",
         ConstValue::SpecTag(_) => "SpecTag",
         ConstValue::InheritanceId { .. } => "InheritanceId",
+        ConstValue::Opaque(_) => "Opaque",
     }
 }
 
@@ -3630,6 +3681,7 @@ impl ConstValue {
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
             ConstValue::InheritanceId { .. } => Some(true),
+            ConstValue::Opaque(_) => Some(true),
         }
     }
 
@@ -3719,7 +3771,8 @@ impl ConstValue {
             | ConstValue::LLAddress(_)
             | ConstValue::AddressOffset(_)
             | ConstValue::InheritanceId { .. }
-            | ConstValue::SpecTag(_) => None,
+            | ConstValue::SpecTag(_)
+            | ConstValue::Opaque(_) => None,
         }
     }
 

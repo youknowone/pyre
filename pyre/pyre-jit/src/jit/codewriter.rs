@@ -3139,6 +3139,11 @@ fn emit_frontend_super_attr_unwrap(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn frontend_load_small_int_flow_value(val: i64) -> super::flow::FlowValue {
+    pyobject_const_ref_value(pyre_object::w_small_int_const(val))
+}
+
 fn frontend_load_const_flow_value(
     w_code: *const (),
     code: &CodeObject,
@@ -8926,23 +8931,17 @@ impl CodeWriter {
 
                         Instruction::LoadSmallInt { i } => {
                             let val = i.get(op_arg) as u32 as i64;
-                            // Graph-side `residual_call_ir_r` for
-                            // `box_int_fn(val:Int) → Ref`.  RPython parity:
-                            // `flowcontext.py self.recorder.append`
-                            // produces a fresh result Variable for every
-                            // residual_call, and the consumer (here, the
-                            // value-stack push) reads that Variable directly
-                            // — no separate fresh Ref placeholder.  Thread
-                            // the call result Variable into the symbolic
-                            // stack so the def-use chain matches the
-                            // upstream "call result is the downstream value"
-                            // shape.
-                            // Walker-orthodoxy: graph residual_call
-                            // dual-write fires unconditionally.  `box_int_fn`
-                            // takes only a literal Int as input, so no
-                            // frame_var or other portal-only Variable is
-                            // threaded — the graph op is well-formed for
-                            // every CodeWriter regardless of frame shape.
+                            // Interpreter `LOAD_SMALL_INT` still returns the
+                            // interned box (`w_small_int_const`). The
+                            // recorded graph cannot: a process-global
+                            // ConstPtr of that box, stored through
+                            // `setarrayitem_vable_r`, is reused onto a live
+                            // local (`it`) at a `trace_limit` abort and
+                            // `for _ in it` sees an int. `wrapint` /
+                            // `box_int_fn` keeps a fresh identity per
+                            // site, matching `intobject.py wrapint`
+                            // (`withprebuiltint=False`). `getconstant_w`
+                            // intern stays on `LOAD_CONST` (`co_consts_w`).
                             let boxed = residual_call!(
                                 box_int_fn_idx,
                                 CallFlavor::Plain,
@@ -17437,6 +17436,25 @@ mod tests {
         let link_borrow = link.borrow();
         assert_eq!(link_borrow.exitcase, Some(Constant::bool(true).into()));
         assert_eq!(link_borrow.llexitcase, Some(Constant::bool(true).into()));
+    }
+
+    #[test]
+    fn frontend_load_small_int_flow_value_is_interned_ref() {
+        let first = frontend_load_small_int_flow_value(1);
+        let second = frontend_load_small_int_flow_value(1);
+        match (first, second) {
+            (FlowValue::Constant(a), FlowValue::Constant(b)) => {
+                assert_eq!(a.kind, Some(Kind::Ref));
+                assert_eq!(a.value, b.value);
+                assert_eq!(
+                    a.value,
+                    super::super::flow::ConstantValue::Signed(
+                        pyre_object::w_small_int_const(1) as i64
+                    ),
+                );
+            }
+            other => panic!("LOAD_SMALL_INT graph value must be a Ref constant, got {other:?}"),
+        }
     }
 
     #[test]

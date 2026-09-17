@@ -916,6 +916,9 @@ fn run_python_impl(source: &str) -> String {
     install_panic_hook();
     #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
     residual_host::install();
+    // Optional-module rclass aliases must be installed before the collector
+    // is built: `init_jit_hooks` / `build_gc` snapshots the alias census.
+    pyre_module::register();
     // Eagerly install pyre-jit's hooks (pyrex real_main does the same at
     // boot): the dict `eq_w` / `hash_w` / `hash_str` /
     // `compares_by_identity` trampolines must be live before
@@ -964,7 +967,6 @@ fn run_python_impl(source: &str) -> String {
             }
         }
     }
-    pyre_module::register();
     pyre_interpreter::importing::install_builtin_modules();
     // Give the import machinery a source of module bytes. The browser has no
     // filesystem, so the web build serves the embedded stdlib closure from an

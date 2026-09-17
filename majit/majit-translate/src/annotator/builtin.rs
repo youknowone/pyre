@@ -876,6 +876,7 @@ pub fn builtin_bool(
             // override metadata in the Rust port, so take Python's
             // default `True`.
             ConstValue::HostObject(_)
+            | ConstValue::Opaque(_)
             | ConstValue::Function(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
+use majit_ir::descr::SizeDescr;
 use majit_ir::forwarding::Forwarded;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value};
@@ -323,6 +324,22 @@ impl ValueLocals {
             if dst < alias_source.len()
                 && src < by_id.len()
                 && by_id[src].is_some()
+                && id_types[dst] == id_types[src]
+            {
+                alias_source[dst] = Some(src);
+            }
+        }
+        // Loop-closing defs that do not interfere with their LABEL slot
+        // share that slot's local (x86 colors the same way). SAME_AS
+        // above refuses LABEL ids; this edge is the one JUMP rewrite.
+        for (jid, lid) in jump_phi_coalesce_pairs(ops) {
+            let dst = jid as usize;
+            let src = lid as usize;
+            if dst < alias_source.len()
+                && src < by_id.len()
+                && by_id[src].is_some()
+                && by_id[dst].is_some()
+                && alias_source[dst].is_none()
                 && id_types[dst] == id_types[src]
             {
                 alias_source[dst] = Some(src);
@@ -1388,6 +1405,35 @@ impl RefHomes {
                 Self::assign(&mut by_id, &mut next, r.raw());
             }
         }
+        // Same JUMP→LABEL coloring as ValueLocals: one home for the
+        // coalesced pair so store-on-def of the def already updates
+        // the slot the next iteration reloads.
+        for (jid, lid) in jump_phi_coalesce_pairs(ops) {
+            let j = jid as usize;
+            let l = lid as usize;
+            let jh = by_id.get(j).copied().unwrap_or(Self::NONE);
+            let lh = by_id.get(l).copied().unwrap_or(Self::NONE);
+            match (jh != Self::NONE, lh != Self::NONE) {
+                (true, true) => {
+                    if j < by_id.len() {
+                        by_id[j] = lh;
+                    }
+                }
+                (false, true) => {
+                    if j >= by_id.len() {
+                        by_id.resize(j + 1, Self::NONE);
+                    }
+                    by_id[j] = lh;
+                }
+                (true, false) => {
+                    if l >= by_id.len() {
+                        by_id.resize(l + 1, Self::NONE);
+                    }
+                    by_id[l] = jh;
+                }
+                (false, false) => {}
+            }
+        }
         RefHomes {
             by_id,
             len: next as usize,
@@ -1478,17 +1524,18 @@ impl InlinedRegionSpan {
 
 impl LabelResumeData {
     fn collect(inputargs: &[InputArg], ops: &[Op]) -> Self {
-        Self::collect_with_regions(inputargs, ops, &[])
+        Self::collect_with_regions(inputargs, ops, &[], inputargs.len())
     }
 
     fn collect_with_regions(
         inputargs: &[InputArg],
         ops: &[Op],
         regions: &[InlinedRegionSpan],
+        entry_arity: usize,
     ) -> Self {
         let (_, num_vars) = collect_guards_and_vars(inputargs, ops);
         let ref_values = RefValues::collect(inputargs, ops);
-        let normal_value_slots = normal_frame_value_slots(inputargs, ops);
+        let normal_value_slots = normal_frame_value_slots_for(inputargs, ops, entry_arity);
         let mut has_producer = vec![false; num_vars as usize];
         let mut is_input = vec![false; num_vars as usize];
         for ia in inputargs {
@@ -1612,7 +1659,17 @@ impl LabelResumeData {
 
             let mut missing = Vec::new();
             let mut bad = false;
-            for op in &ops[label_pos + 1..] {
+            // An appended region is not a predecessor of this label's
+            // resume. Its body reads would only reserve frozen slots
+            // the resume loader never reloads — the guard-fail branch
+            // is the region's sole predecessor.
+            let scan_end = regions
+                .iter()
+                .filter(|region| region.ops_start > label_pos)
+                .map(|region| region.ops_start)
+                .min()
+                .unwrap_or(ops.len());
+            for op in &ops[label_pos + 1..scan_end] {
                 let mut reads: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
                 if let Some(failargs) = op.getfailargs() {
                     reads.extend(failargs.iter().map(|a| a.to_opref()));
@@ -1804,13 +1861,17 @@ pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 /// names a slot in the register save area `_push_all_regs_to_frame` writes at
 /// every exit, so a slot always exists and no frame is ever sized for it.
 fn normal_frame_value_slots(inputargs: &[InputArg], ops: &[Op]) -> usize {
+    normal_frame_value_slots_for(inputargs, ops, inputargs.len())
+}
+
+fn normal_frame_value_slots_for(inputargs: &[InputArg], ops: &[Op], entry_arity: usize) -> usize {
     let (guards, _) = collect_guards_and_vars(inputargs, ops);
     let max_fail_args = guards
         .iter()
         .map(|g| live_fail_arg_count(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
         .max()
         .unwrap_or(0);
-    let value_area = max_fail_args.max(inputargs.len());
+    let value_area = max_fail_args.max(entry_arity);
     1 + value_area + 1
 }
 
@@ -2445,6 +2506,10 @@ impl HomeLiveness {
     /// nothing reads it. `regalloc.py` spells this `Lifetime.last_usage`.
     fn last_use(&self, raw: u32) -> i32 {
         self.last_use.get(raw as usize).copied().unwrap_or(-1)
+    }
+
+    fn defined_at(&self, raw: u32) -> i32 {
+        self.def_pos.get(raw as usize).copied().unwrap_or(i32::MAX)
     }
 }
 
@@ -3849,43 +3914,47 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
         }
     }
 
-    // The parked operands share ONE slot, past every exit's fail args and past
-    // the inputargs (`counter_slot`), so it can only be named once every
-    // exit's width is known. `must_compile` reads the stamp back through
-    // `get_value_direct`. The descriptor maps that logical coordinate to
-    // the physical slot `emit_guard_fail_args_spill` writes.
-    if guards.iter().any(|g| g.counter_value_spill.is_some()) {
-        let value_area = guards
-            .iter()
-            .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
-            .max()
-            .unwrap_or(0)
-            .max(inputargs.len());
-        let physical_value_area = guards
-            .iter()
-            .map(|g| live_fail_arg_count(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
-            .max()
-            .unwrap_or(0)
-            .max(inputargs.len());
-        for g in &mut guards {
-            if g.counter_value_spill.is_some() {
-                g.fail_locs.resize(value_area + 1, None);
-                g.fail_locs[value_area] = Some(physical_value_area);
-            }
-            if let Some(operand) = g.counter_value_spill
-                && let Some(fd) = g.meta_descr.as_ref().and_then(|d| d.as_fail_descr())
-            {
-                let type_tag = match operand.ty() {
-                    Some(Type::Ref) => majit_backend::STATUS_TY_REF,
-                    Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
-                    _ => majit_backend::STATUS_TY_INT,
-                };
-                fd.make_a_counter_per_value(value_area as u32, type_tag);
-            }
+    (guards, max_var)
+}
+
+/// Park every GUARD_VALUE counter on one slot past the owner's value area.
+///
+/// Merged analysis concatenates region InputArgs into one id namespace; those
+/// ids are not simultaneous entry slots. The physical slot and the stamp
+/// index are the owner's function-entry arity, the same width
+/// `normal_frame_value_slots` reserved when the token froze.
+fn park_guard_value_counters(guards: &mut [GuardExit], entry_arity: usize) {
+    if guards.iter().all(|g| g.counter_value_spill.is_none()) {
+        return;
+    }
+    let value_area = guards
+        .iter()
+        .map(|g| live_fail_arg_extent(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
+        .max()
+        .unwrap_or(0)
+        .max(entry_arity);
+    let physical_value_area = guards
+        .iter()
+        .map(|g| live_fail_arg_count(g.meta_descr.as_ref(), g.fail_arg_refs.len()))
+        .max()
+        .unwrap_or(0)
+        .max(entry_arity);
+    for g in guards {
+        if g.counter_value_spill.is_some() {
+            g.fail_locs.resize(value_area + 1, None);
+            g.fail_locs[value_area] = Some(physical_value_area);
+        }
+        if let Some(operand) = g.counter_value_spill
+            && let Some(fd) = g.meta_descr.as_ref().and_then(|d| d.as_fail_descr())
+        {
+            let type_tag = match operand.ty() {
+                Some(Type::Ref) => majit_backend::STATUS_TY_REF,
+                Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                _ => majit_backend::STATUS_TY_INT,
+            };
+            fd.make_a_counter_per_value(value_area as u32, type_tag);
         }
     }
-
-    (guards, max_var)
 }
 
 /// Number of guard/finish exits a module will need bridge-dispatch cells for.
@@ -4399,6 +4468,20 @@ fn emit_zero_bytes(sink: &mut PeepSink<'_, '_>, base_local: u32, offset: u32, le
     sink.memory_fill(0);
 }
 
+/// `malloc_cond` does not zero the payload. Nursery reset is dirty
+/// (`malloc_zero_filled = False`), so a leftover *gc pointer* would be
+/// traced. Skip the fill when this lowering stamps every gc Ref
+/// (`NewWithVtable` writes `w_class`) or the descr has none — fannkuch's
+/// eight `W_IntObject` bumps at JUMP are that case.
+fn nursery_new_has_unstamped_gc_refs(sd: &dyn SizeDescr, stamps_class_word: bool) -> bool {
+    let class_off = stamps_class_word
+        .then(|| sd.class_word_field().map(|fd| fd.offset()))
+        .flatten();
+    sd.gc_fielddescrs()
+        .iter()
+        .any(|fd| fd.field_type() == Type::Ref && Some(fd.offset()) != class_off)
+}
+
 /// Zero the payload of a headered nursery object whose header is in
 /// `header_local` and whose allocated total is `total` bytes.
 fn emit_zero_headered_payload(sink: &mut PeepSink<'_, '_>, header_local: u32, total: usize) {
@@ -4585,8 +4668,9 @@ pub fn source_guard_precedes_loop_label(ops: &[Op], fail_index: u32) -> bool {
 
 /// An outside-loop region skips its target LABEL's capture loader. The
 /// source path must therefore have crossed that LABEL already. Share this
-/// structural check between emission and deferred-inline eligibility: a
-/// doomed merge must not arm a trip that clears a working bridge cell.
+/// structural check between emission and deferred-inline eligibility.
+/// A failed install restores the out-of-line cell, so a compile-time
+/// miss (sibling peel not yet attached) can still arm a trip.
 pub fn outside_region_labels_initialized(
     owner_ops: &[Op],
     source_fail_index: u32,
@@ -4900,6 +4984,7 @@ pub fn build_wasm_module(
         &rebased_constants
     };
     let (mut guards, num_vars) = collect_guards_and_vars(analysis_inputargs, analysis_ops);
+    park_guard_value_counters(&mut guards, inputargs.len());
 
     // An inlined bridge branches back into the owner with wasm `br`.  The
     // merged stream must therefore contain the local LABEL that opens the
@@ -5031,10 +5116,15 @@ pub fn build_wasm_module(
     // Ref homes, and the always-present tail call area; a chained bridge must
     // fit the source token's frozen value-slot count before it can share that
     // frame.
-    let label_resume =
-        LabelResumeData::collect_with_regions(&analysis_inputargs, &analysis_ops, &region_spans);
+    let label_resume = LabelResumeData::collect_with_regions(
+        &analysis_inputargs,
+        &analysis_ops,
+        &region_spans,
+        inputargs.len(),
+    );
     let max_value_slots =
-        normal_frame_value_slots(&analysis_inputargs, &analysis_ops) + label_resume.scalar_slots;
+        normal_frame_value_slots_for(&analysis_inputargs, &analysis_ops, inputargs.len())
+            + label_resume.scalar_slots;
     if max_value_slots > frame.value_slots {
         let shortage = super::FrameShortage::new(
             super::FrameShortageKind::FrameValueSlots,
@@ -5894,7 +5984,7 @@ fn build_function(
         closed_outside_regions: 0,
         ref_homes,
         frame,
-        counter_slot: counter_slot(inputargs, ops).map(|slot| slot as u64),
+        counter_slot: counter_slot(entry_inputargs, ops).map(|slot| slot as u64),
         spill_helpers: spill_helper_indices,
         gc_table_slots: &gc_table_slots,
     };
@@ -6570,7 +6660,15 @@ fn build_function(
                 let moved: Vec<usize> = (0..n)
                     .filter(|&i| {
                         let jarg = jump_args[i].to_opref();
-                        jarg.is_constant() || jarg.raw() != label_args[i].raw()
+                        if jarg.is_constant() {
+                            return true;
+                        }
+                        let larg = label_args[i];
+                        if larg.is_constant() {
+                            return true;
+                        }
+                        jarg.raw() != larg.raw()
+                            && value_types.local(jarg.raw()) != value_types.local(larg.raw())
                     })
                     .collect();
                 debug_assert!(
@@ -6614,7 +6712,10 @@ fn build_function(
                         // A constant jump arg is never a self-move, and OpRef::raw() must
                         // not be called on an inline constant, so guard the comparison.
                         let jarg = jump_args[i].to_opref();
-                        if !jarg.is_constant() && jarg.raw() == la.raw() {
+                        if !jarg.is_constant()
+                            && (jarg.raw() == la.raw()
+                                || value_types.local(jarg.raw()) == value_types.local(la.raw()))
+                        {
                             continue;
                         }
                         sink.local_get(0);
@@ -9596,6 +9697,17 @@ fn build_function(
                             .map(|fd| (fd.offset() as u64, w_class))
                     })
                 });
+                // Same predicate as the store below (`w_class != 0`).
+                // `w_class_obj_for_vtable` already returns None for a
+                // null instantiate; keep the pair aligned if a descr
+                // answers Some(0).
+                let stamps_class_word = op.opcode == OpCode::NewWithVtable
+                    && w_class_init.is_some_and(|(_, w_class)| w_class != 0);
+                // `New` still fills: rewrite may leave gc Refs unstamped.
+                // `NewWithVtable` stamps `w_class` here; skip the fill when
+                // that covers every gc Ref (`malloc_cond` does not zero).
+                let zero_payload = op.opcode != OpCode::NewWithVtable
+                    || sd.is_none_or(|sd| nursery_new_has_unstamped_gc_refs(sd, stamps_class_word));
 
                 // `rewrite.rs handle_new`: a `non_moving` descr declines the
                 // nursery outright — both the inline bump and the collecting
@@ -9644,12 +9756,14 @@ fn build_function(
                         *prev_size,
                         type_id,
                     );
-                    emit_zero_bytes(
-                        &mut sink,
-                        alloc_scratch_local,
-                        0,
-                        total_size.saturating_sub(GcHeader::SIZE) as u32,
-                    );
+                    if zero_payload {
+                        emit_zero_bytes(
+                            &mut sink,
+                            alloc_scratch_local,
+                            0,
+                            total_size.saturating_sub(GcHeader::SIZE) as u32,
+                        );
+                    }
                     sink.else_();
                     sink.i64_const(type_id);
                     sink.i64_const(size);
@@ -9748,7 +9862,9 @@ fn build_function(
                         align: 3,
                         memory_index: 0,
                     });
-                    emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
+                    if zero_payload {
+                        emit_zero_headered_payload(&mut sink, alloc_scratch_local, total_size);
+                    }
                     if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
                         sink.i32_const(1);
                         sink.local_set(alloc_batch_flag_local);
@@ -10784,6 +10900,73 @@ fn jump_label_ordinal(ops: &[Op], jump: &Op) -> Option<usize> {
             .filter(|op| op.opcode == OpCode::Label)
             .count(),
     )
+}
+
+/// JUMP args that can occupy their LABEL-arg wasm local and Ref home.
+///
+/// x86 `RegisterManager` colors a loop-closing def into the LABEL
+/// register; wasm otherwise mints a fresh local, then parallel-moves
+/// and re-homes at every back-edge. When the def and the LABEL slot
+/// do not interfere (`HomeLiveness::live_across`), share the location
+/// so the JUMP is an identity self-move.
+fn jump_phi_coalesce_pairs(ops: &[Op]) -> Vec<(u32, u32)> {
+    let liveness = HomeLiveness::collect_with_regions(&[], ops, &[]);
+    let mut pairs = Vec::new();
+    let mut taken_j = Vec::new();
+    let mut taken_l = Vec::new();
+    for jump in ops.iter().filter(|op| op.opcode == OpCode::Jump) {
+        if find_jump_target_label_index(ops, jump).is_none() {
+            continue;
+        }
+        let label_args = find_label_args(ops, jump);
+        let jump_args = jump.getarglist();
+        let n = jump_args.len().min(label_args.len());
+        // LABEL args are simultaneous phis. `live_across` dates each at
+        // the LABEL (or at -1 for an inputarg), so it does not see two
+        // phis as interfering. A swap `JUMP(p1, p0)` / rotate then
+        // accepts every pair; ValueLocals walks the alias cycle and
+        // falls back to distinct locals, but RefHomes remaps sequentially
+        // and both values keep one home. Refuse a JUMP arg that is
+        // itself a target LABEL arg.
+        let label_arg_ids: Vec<u32> = label_args
+            .iter()
+            .copied()
+            .filter(|a| *a != OpRef::NONE && !a.is_constant())
+            .map(OpRef::raw)
+            .collect();
+        for i in 0..n {
+            let jarg = jump_args[i].to_opref();
+            let larg = label_args[i];
+            if jarg.is_constant()
+                || larg.is_constant()
+                || jarg == OpRef::NONE
+                || larg == OpRef::NONE
+                || jarg.raw() == larg.raw()
+                || jarg.ty() != larg.ty()
+            {
+                continue;
+            }
+            let jid = jarg.raw();
+            let lid = larg.raw();
+            if taken_j.contains(&jid) || taken_l.contains(&lid) {
+                continue;
+            }
+            if label_arg_ids.contains(&jid) {
+                continue;
+            }
+            let def_j = liveness.defined_at(jid);
+            if def_j == i32::MAX || def_j < 0 {
+                continue;
+            }
+            if liveness.live_across(lid, def_j as usize) {
+                continue;
+            }
+            pairs.push((jid, lid));
+            taken_j.push(jid);
+            taken_l.push(lid);
+        }
+    }
+    pairs
 }
 
 fn find_label_args(ops: &[Op], jump: &Op) -> Vec<OpRef> {
@@ -12930,6 +13113,113 @@ mod tests {
     fn aligned_varsize_frame_bump_rejects_u32_overflow() {
         assert_eq!(aligned_varsize_frame_bump(20), Some(24));
         assert_eq!(aligned_varsize_frame_bump(0xffff_fffc), None);
+    }
+
+    #[test]
+    fn jump_phi_coalesces_new_onto_dead_label_slot() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let label = Op::new(OpCode::Label, &[rb(p0)]);
+        label.setdescr(descr.clone());
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::ref_op(10))]);
+        jump.setdescr(descr);
+        let ops = vec![label, new, jump];
+        assert_eq!(jump_phi_coalesce_pairs(&ops), vec![(10, 0)]);
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
+        let locals = ValueLocals::collect(&inputargs, &ops, 16, 1);
+        assert_eq!(
+            locals.local(10),
+            locals.local(0),
+            "New that only closes the JUMP must share the LABEL local"
+        );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_when_label_slot_is_still_live() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let label = Op::new(OpCode::Label, &[rb(p0)]);
+        label.setdescr(descr.clone());
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let keep = Op::new(OpCode::GuardNonnull, &[rb(p0)]);
+        let jump = Op::new(OpCode::Jump, &[rb(OpRef::ref_op(10))]);
+        jump.setdescr(descr);
+        let ops = vec![label, new, keep, jump];
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "LABEL slot still read after the New must keep its own local"
+        );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_swapped_label_args() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let label = Op::new(OpCode::Label, &[rb(p0), rb(p1)]);
+        label.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(p1), rb(p0)]);
+        jump.setdescr(descr);
+        let ops = vec![label, jump];
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "JUMP(p1, p0) onto LABEL(p0, p1) must not alias the two phis"
+        );
+    }
+
+    #[test]
+    fn jump_phi_does_not_coalesce_rotated_label_args() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let p2 = OpRef::input_arg_ref(2);
+        let label = Op::new(OpCode::Label, &[rb(p0), rb(p1), rb(p2)]);
+        label.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(p1), rb(p2), rb(p0)]);
+        jump.setdescr(descr);
+        let ops = vec![label, jump];
+        assert!(
+            jump_phi_coalesce_pairs(&ops).is_empty(),
+            "JUMP(p1, p2, p0) onto LABEL(p0, p1, p2) must not alias the rotate"
+        );
+    }
+
+    #[test]
+    fn ref_homes_keep_distinct_slots_for_swapped_label_args() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let p0 = OpRef::input_arg_ref(0);
+        let p1 = OpRef::input_arg_ref(1);
+        let label = Op::new(OpCode::Label, &[rb(p0), rb(p1)]);
+        label.setdescr(descr.clone());
+        let new = Op::new(OpCode::NewWithVtable, &[]);
+        new.pos().set(OpRef::ref_op(10));
+        new.setdescr(descr.clone());
+        let jump = Op::new(OpCode::Jump, &[rb(p1), rb(p0)]);
+        jump.setdescr(descr);
+        let ops = vec![label, new, jump];
+        let inputargs = vec![
+            InputArg::from_type(Type::Ref, 0),
+            InputArg::from_type(Type::Ref, 1),
+        ];
+        let homes = RefHomes::collect(&inputargs, &ops, true, &[], &[]);
+        let h0 = homes.home(p0).expect("p0 lives across NewWithVtable");
+        let h1 = homes.home(p1).expect("p1 lives across NewWithVtable");
+        assert_ne!(h0, h1, "swapped LABEL refs must keep distinct GC homes");
     }
 
     #[test]

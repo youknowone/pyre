@@ -1839,7 +1839,7 @@ fn thread_is_stopping(ec: &mut crate::PyExecutionContext) {
 /// `rustpython_host_env::thread::current_thread_id`.  This is the single
 /// in-tree seam every traced caller reaches it through.
 #[majit_macros::dont_look_inside]
-pub(crate) fn current_ident() -> i64 {
+pub fn current_ident() -> i64 {
     #[cfg(all(
         feature = "host_env",
         not(target_arch = "wasm32"),

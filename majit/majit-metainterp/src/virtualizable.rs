@@ -17,7 +17,7 @@
 use indexmap::IndexMap;
 use std::sync::{Arc, Weak};
 
-use majit_ir::{DescrRef, Type, descr::descr_identity};
+use majit_ir::{DescrRef, Type, Value, descr::descr_identity};
 
 /// `virtualizable.py TOKEN_TRACING_RESCALL`: the GCREF address of the
 /// prebuilt `JITFRAME_DUMMY` object shared with virtual references.
@@ -293,6 +293,24 @@ impl majit_translate::call::VirtualizableInfoHandle for VirtualizableInfo {
             None => false,
         }
     }
+
+    fn finish(&self) {
+        VirtualizableInfo::finish(self);
+    }
+
+    fn has_static_field(&self, name: &str) -> bool {
+        self.static_fields.iter().any(|field| field.name == name)
+    }
+
+    fn has_array_field(&self, name: &str) -> bool {
+        self.array_fields.iter().any(|field| field.name == name)
+    }
+
+    fn static_field_index(&self, name: &str) -> Option<usize> {
+        self.static_fields
+            .iter()
+            .position(|field| field.name == name)
+    }
 }
 
 /// majit-ir's `FieldDescr::get_vinfo()` returns `Option<Arc<dyn VinfoMarker>>`;
@@ -305,6 +323,16 @@ impl majit_ir::descr::VinfoMarker for VirtualizableInfo {
 }
 
 impl VirtualizableInfo {
+    /// `virtualizable.py VirtualizableInfo.unwrap_virtualizable_box`.
+    ///
+    /// `return virtualizable_box.getref(llmemory.GCREF)`.
+    pub fn unwrap_virtualizable_box(virtualizable_box: Option<Value>) -> *const u8 {
+        match virtualizable_box {
+            Some(Value::Ref(gcref)) => gcref.as_usize() as *const u8,
+            _ => std::ptr::null(),
+        }
+    }
+
     /// Create a new VirtualizableInfo.
     pub fn new(token_offset: usize) -> Self {
         Self::with_token(token_offset, true)
@@ -527,6 +555,24 @@ impl VirtualizableInfo {
             descr = descr.with_vinfo(w);
         }
         Arc::new(descr)
+    }
+
+    /// virtualizable.py `VirtualizableInfo.finish`.
+    ///
+    /// Upstream rewrites residual `jit_force_virtualizable` via
+    /// `replace_force_virtualizable_with_call` and stamps
+    /// `clear_vable_ptr` / `clear_vable_descr`. The rewrite lives in
+    /// `CallControl::finish` over remaining MIR force Calls after
+    /// `make_jitcodes`. The stamp happens at construction
+    /// (`set_clear_vable`). This asserts that stamp for machines that
+    /// have a `vable_token`.
+    pub fn finish(&self) {
+        if self.has_vable_token() {
+            assert!(
+                self.clear_vable_ptr.is_some() && self.clear_vable_descr.is_some(),
+                "virtualizable.py finish: clear_vable_ptr/descr must be stamped"
+            );
+        }
     }
 
     /// virtualizable.py `finish()` registers the `clear_vable_ptr`
@@ -925,6 +971,14 @@ impl VirtualizableInfo {
         self.array_field_by_descrs
             .get(&descr_identity(descr))
             .copied()
+    }
+
+    /// virtualizable.py `is_token_nonnull_gcref`.
+    ///
+    /// # Safety
+    /// `obj_ptr` must point to a valid virtualizable object.
+    pub unsafe fn is_token_nonnull_gcref(&self, obj_ptr: *const u8) -> bool {
+        !matches!(unsafe { self.read_token(obj_ptr) }, VableToken::None)
     }
 
     /// RPython parity surface: reset the virtualizable token to TOKEN_NONE.
@@ -1671,10 +1725,7 @@ unsafe fn reset_vable_token(info: &VirtualizableInfo, obj_ptr: *mut u8) {
 /// The caller must ensure `obj_ptr` points to a valid object.
 #[allow(dead_code)]
 unsafe fn is_token_nonnull(info: &VirtualizableInfo, obj_ptr: *const u8) -> bool {
-    unsafe {
-        let token_ptr = obj_ptr.add(info.token_offset) as *const usize;
-        *token_ptr != 0
-    }
+    unsafe { info.is_token_nonnull_gcref(obj_ptr) }
 }
 
 /// Force a virtualizable: flush JIT-held values back to the heap.
@@ -2039,6 +2090,30 @@ mod tests {
             assert_eq!(*(obj_ptr.add(8) as *const i64), 100);
             assert_eq!(*(obj_ptr.add(16) as *const i64), 200);
         }
+    }
+
+    #[test]
+    fn is_token_nonnull_gcref_matches_read_token() {
+        let info = VirtualizableInfo::new(0);
+        let mut obj = vec![0u8; 8];
+        let obj_ptr = obj.as_mut_ptr();
+        unsafe {
+            assert!(!info.is_token_nonnull_gcref(obj_ptr));
+            info.write_token(obj_ptr, VableToken::TracingRescall);
+            assert!(info.is_token_nonnull_gcref(obj_ptr));
+            info.reset_vable_token(obj_ptr);
+            assert!(!info.is_token_nonnull_gcref(obj_ptr));
+        }
+    }
+
+    #[test]
+    fn finish_asserts_clear_vable_is_stamped() {
+        let mut info = VirtualizableInfo::new(0);
+        info.set_clear_vable(
+            std::ptr::null(),
+            VirtualizableInfo::make_clear_vable_descr(),
+        );
+        info.finish();
     }
 
     #[test]

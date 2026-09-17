@@ -4,12 +4,16 @@
 # __hash__ is None / raises / returns a non-int — raises instead of silently
 # building a set, and a user __hash__ is actually invoked.  Only the
 # exception type is printed so the line matches across CPython/PyPy/Pyre.
-# Trip count kept clear of the major-collection threshold check.py pins: at
-# the previous 680000 this loop crossed it, and the eval-breaker bailout that
-# follows re-enters through a bridge whose guard can then fail once more,
-# which moves guard_failures for reasons outside this fixture. Crossing
-# resumes around 0.3x of the old count; the gated counters are unchanged.
-N = 85000
+# Trip count kept clear of the major-collection threshold check.py pins.
+# 680000 crossed it: the eval-breaker bailout re-entered through a bridge
+# whose guard then failed once more, moving guard_failures for reasons
+# outside this fixture. 85000 still arms the breaker on wasm
+# (`back_edge_polls=1`) while native stays at 0, and ubuntu wasm then
+# reads guard_failures 42 or 43. On this host the breaker first arms at
+# 71000; 70000 is the last zero-poll value. 60000 keeps a ~10k margin,
+# `back_edge_polls=0` on all three backends, and the same guard_failures;
+# loops_compiled stays 3.
+N = 60000
 
 
 class HashRaises:

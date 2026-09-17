@@ -1000,6 +1000,10 @@ impl OptHeap {
                 return false;
             }
         }
+        // quasiimmut.py `is_still_valid_for`: `qmut is not self.qmut`
+        // is unconditional False. A later wrapint New+setfield that
+        // revokes the process-global watcher must InvalidLoop, not be
+        // rescued by a live w_class compare.
         if !qmutdescr.qmut().is_current() {
             return false;
         }
@@ -2252,10 +2256,10 @@ impl OptHeap {
         let descr = op.getdescr().unwrap();
         let field_idx = Self::field_slot_index(&descr);
 
-        // heap.py:640-643: constant_fold — pure getfield on constant object.
-        //   if descr.is_always_pure() and self.get_constant_box(arg0):
-        //       resbox = self.optimizer.constant_fold(op)
-        //       self.optimizer.make_constant(op, resbox)
+        // heap.py `optimize_GETFIELD_GC_I`: constant_fold only when
+        // `descr.is_always_pure()` and arg0 is a constant box.
+        // Quasi-immutability is recorded by `optimize_QUASIIMMUT_FIELD`,
+        // not by widening this purity test.
         if descr.is_always_pure()
             && ctx
                 .get_constant_box(&op.arg(0).get_box_replacement(false))
@@ -3477,16 +3481,26 @@ impl OptHeap {
                 // Records quasi_immutable_deps for invalidation tracking.
                 let obj = op.arg(0).to_opref();
                 let descr = op.getdescr();
-                // heap.py `structvalue = self.ensure_ptr_info_arg0(op)`
-                // / `if not structvalue.is_constant(): return`.  The dependency
-                // object is baked as a `ConstPtr`, so its pointer lives in
-                // `Value::Ref`, not `Value::Int`.
-                let struct_ptr = ctx
-                    .get_box_replacement_operand_opt(obj)
-                    .and_then(|b| ctx.get_constant_ptr_box(&b));
-                if let Some(struct_ptr) = struct_ptr
-                    && struct_ptr != 0
-                {
+                // heap.py `optimize_QUASIIMMUT_FIELD`:
+                //     structvalue = self.ensure_ptr_info_arg0(op)
+                //     if not structvalue.is_constant():
+                //         return
+                // `get_box_replacement_operand_opt` + `get_constant_ptr_box`
+                // skipped the dep block when the ConstPtr lived on the
+                // replacement chain that `ensure_ptr_info_arg0` already
+                // answers (`optimizer.py` `ensure_ptr_info_arg0`).
+                let structvalue = ctx.ensure_ptr_info_arg0(op);
+                let struct_ptr = if structvalue.is_constant() {
+                    match structvalue {
+                        crate::optimizeopt::info::EnsuredPtrInfo::Constant { gcref, .. } => {
+                            gcref.0 as u64
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                if struct_ptr != 0 {
                     // heap.py:812-814 `assert isinstance(qmutdescr,
                     // QuasiImmutDescr)`, answered as a verdict.  A marker whose
                     // recording resolved no instance has nobody to register the

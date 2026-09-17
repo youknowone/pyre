@@ -186,9 +186,9 @@ pub use call_descr::{
     nursery_alloc_effect_info,
 };
 pub use compile::{
-    make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
+    AllVirtuals, make_fail_descr, make_fail_descr_typed, make_finish_fail_descr_typed,
     make_resume_guard_descr_instance_next_foriter, make_resume_guard_descr_range_foriter,
-    raw_exit_values,
+    raw_exit_values, resume_guard_descr, set_all_virtuals_gc_type_id,
 };
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
@@ -251,11 +251,12 @@ pub use pyjitpl::{
     ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
     JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
-    MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey, RawCompileResult,
-    StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
+    MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey,
+    RawCompileResult, StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
     build_state_field_snapshot, call_int_function, call_ref_function, call_void_function, counters,
-    record_application_traceback_for_recording, record_application_traceback_hook_address,
-    record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
+    decode_jit_merge_point_banks, record_application_traceback_for_recording,
+    record_application_traceback_hook_address, record_discarded_level_traceback_for_recording,
+    record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
     record_inline_application_traceback_hook_address, residual_write_effect_info,
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,

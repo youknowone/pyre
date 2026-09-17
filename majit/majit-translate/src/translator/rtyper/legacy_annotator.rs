@@ -253,7 +253,8 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         | ConstValue::Code(_)
         | ConstValue::LLPtr(_)
         | ConstValue::Function(_)
-        | ConstValue::HostObject(_) => ValueType::Ref(None),
+        | ConstValue::HostObject(_)
+        | ConstValue::Opaque(_) => ValueType::Ref(None),
     }
 }
 

@@ -647,6 +647,25 @@ impl VableFlags {
             fresh_virtualizable: self.fresh_virtualizable || other.fresh_virtualizable,
         }
     }
+
+    /// `inputconst(lltype.Void, flags)` for
+    /// `hook_access_field`'s third genop argument.
+    fn to_const(self) -> crate::flowspace::model::ConstValue {
+        let mut items = std::collections::HashMap::new();
+        if self.access_directly {
+            items.insert(
+                crate::flowspace::model::ConstValue::byte_str("access_directly"),
+                crate::flowspace::model::ConstValue::Bool(true),
+            );
+        }
+        if self.fresh_virtualizable {
+            items.insert(
+                crate::flowspace::model::ConstValue::byte_str("fresh_virtualizable"),
+                crate::flowspace::model::ConstValue::Bool(true),
+            );
+        }
+        crate::flowspace::model::ConstValue::Dict(items)
+    }
 }
 
 /// `jtransform.py is_virtualizable_getset` result: `False`, `True`, or
@@ -1482,7 +1501,85 @@ fn getsubstruct_offset_for_access(
     }
 }
 
+/// Struct name of a VTYPEPTR-shaped lltype (`Ptr(Struct)` / resolved fwd).
+fn lltype_vtype_name(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Struct(s) => Some(s._name.clone()),
+            PtrTarget::ForwardReference(fwd) => fwd.resolved().as_ref().and_then(lltype_vtype_name),
+            _ => None,
+        },
+        LowLevelType::Struct(s) => Some(s._name.clone()),
+        LowLevelType::ForwardReference(fwd) => fwd.resolved().as_ref().and_then(lltype_vtype_name),
+        _ => None,
+    }
+}
+
 impl<'a> Transformer<'a> {
+    /// `jtransform.py Transformer.get_vinfo(v_virtualizable)`.
+    ///
+    /// ```python
+    /// def get_vinfo(self, v_virtualizable):
+    ///     if self.callcontrol is None:      # for tests
+    ///         return None
+    ///     return self.callcontrol.get_vinfo(v_virtualizable.concretetype)
+    /// ```
+    ///
+    /// Production MIR has no VTYPEPTR on the Variable. The codewriter
+    /// matches `owner_root` / `red_types` via
+    /// [`crate::call::CallControl::get_vinfo_by_owner`].
+    fn get_vinfo(
+        &self,
+        owner: Option<&str>,
+    ) -> Option<std::sync::Arc<dyn crate::call::VirtualizableInfoHandle>> {
+        let cc = self.callcontrol.as_ref()?;
+        if let Some(owner) = owner {
+            if let Some(vinfo) = cc.get_vinfo_by_owner(owner) {
+                return Some(vinfo);
+            }
+        }
+        None
+    }
+
+    /// `jtransform.py Transformer.get_vinfo(v_virtualizable)` via
+    /// `v_virtualizable.concretetype`.
+    fn get_vinfo_for_var(
+        &self,
+        var: &crate::flowspace::model::Variable,
+        owner: Option<&str>,
+    ) -> Option<std::sync::Arc<dyn crate::call::VirtualizableInfoHandle>> {
+        if let Some(ct) = var.concretetype() {
+            if let Some(name) = lltype_vtype_name(&ct) {
+                if let Some(vinfo) = self.get_vinfo(Some(&name)) {
+                    return Some(vinfo);
+                }
+            }
+        }
+        self.get_vinfo(owner)
+    }
+
+    /// `jtransform.py Transformer.get_virtualizable_field_descr`.
+    ///
+    /// ```python
+    /// fieldname = op.args[1].value
+    /// vinfo = self.get_vinfo(op.args[0])
+    /// index = vinfo.static_field_to_extra_box[fieldname]
+    /// return vinfo.static_field_descrs[index]
+    /// ```
+    fn get_virtualizable_field_descr(&self, field: &FieldDescriptor) -> Option<usize> {
+        if let Some(vinfo) = self.get_vinfo(field.owner_root.as_deref()) {
+            if let Some(index) = vinfo.static_field_index(&field.name) {
+                return Some(index);
+            }
+        }
+        self.config
+            .virtualizable_field(field)
+            .map(|item| item.index)
+    }
+
     /// RPython: `Transformer.__init__(cpu=None, callcontrol=None, portal_jd=None)`
     /// (`jtransform.py:62-66`). Pyre keeps `cpu` / `callcontrol` behind
     /// builder setters because the borrow checker demands a late binding
@@ -1648,7 +1745,7 @@ impl<'a> Transformer<'a> {
         let mut count_before_last_operation = None;
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
-            self.rematerialize_vable_flags_for_access(original_op, &op);
+            self.hook_access_field(original_op, &op, graph_name, graph);
             // `jtransform.py` binds `_rewrite_symmetric` as the whole
             // `rewrite_op_<name>` for the symmetric ops, so it runs before
             // any other rewriting can look at the operands.
@@ -1792,10 +1889,10 @@ impl<'a> Transformer<'a> {
     /// lower to `getfield_vable_*` / `setfield_vable_*`, and an array
     /// field read must not enter `vable_array_vars`.
     ///
-    /// `rematerialize_vable_flags_for_access` is the
-    /// `VirtualizableInstanceRepr.hook_access_field` step: it reads the
-    /// base Variable's `SomeInstance.flags` annotation and repopulates this
-    /// per-block table immediately before every redirected access.
+    /// `hook_access_field` is the
+    /// `VirtualizableInstanceRepr.hook_access_field` step: it emits the
+    /// 3-arg `jit_force_virtualizable` genop and lets
+    /// `rewrite_op_jit_force_virtualizable` file this per-block table.
     ///
     /// The two frame constructors call the hint (`pyre-interpreter`
     /// `pyframe.rs` `PyFrame::new` and `createframe_obj`, mirroring
@@ -1824,9 +1921,20 @@ impl<'a> Transformer<'a> {
     /// field instead of one at the end.  The GC and the JIT want the same
     /// shape here; they simply want it for different reasons.
     fn is_fresh_virtualizable(&self, base: &crate::flowspace::model::Variable) -> bool {
+        // `flags = self.vable_flags[op.args[0]]` — KeyError if the hook
+        // did not file this access. Missing is not "empty flags".
+        // Lookup the same alias key `rewrite_op_jit_force_virtualizable`
+        // inserted.
+        let key = resolve_alias(base, &self.aliases);
         self.vable_flags
-            .get(base)
-            .is_some_and(|flags| flags.fresh_virtualizable)
+            .get(&key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "vable_flags missing for virtualizable getset \
+                     (jtransform.py is_virtualizable_getset)"
+                )
+            })
+            .fresh_virtualizable
     }
 
     /// `jtransform.py is_virtualizable_getset`.
@@ -1856,11 +1964,6 @@ impl<'a> Transformer<'a> {
         if !self.config.lower_virtualizable {
             return VirtualizableGetset::No;
         }
-        let is_static = self.config.virtualizable_field(field).is_some();
-        let is_array = self.config.virtualizable_array(field).is_some();
-        if !is_static && !is_array {
-            return VirtualizableGetset::No;
-        }
         // Frame-constructor by-value: the container was never dereferenced,
         // so this is not a live virtualizable access. Same fact
         // `hint(access_directly=True, fresh_virtualizable=True)` marks
@@ -1869,28 +1972,58 @@ impl<'a> Transformer<'a> {
         if field.suppresses_virtualizable() || field.base_is_local_aggregate() {
             return VirtualizableGetset::No;
         }
-        // `if res: flags = self.vable_flags[op.args[0]]`. rematerialize
-        // files the key for every redirected access; missing key after that
-        // is empty flags (still lower), not a translator crash.
+        // jtransform.py: `vinfo = self.get_vinfo(op.args[0])` then
+        // membership, then `if res: flags = self.vable_flags[op.args[0]]`.
+        // Flags are only filed for redirected fields (`hook_access_field`);
+        // looking them up first KeyError'd every non-vable getset.
+        let membership =
+            if let Some(vinfo) = self.get_vinfo_for_var(base, field.owner_root.as_deref()) {
+                if vinfo.has_array_field(&field.name) {
+                    VirtualizableGetset::Array
+                } else if vinfo.has_static_field(&field.name) {
+                    VirtualizableGetset::Static
+                } else {
+                    VirtualizableGetset::No
+                }
+            } else {
+                // Tests / factory-None: GraphTransformConfig is the codewriter
+                // stand-in for the missing handle.
+                let is_static = self.config.virtualizable_field(field).is_some();
+                let is_array = self.config.virtualizable_array(field).is_some();
+                if is_array {
+                    VirtualizableGetset::Array
+                } else if is_static {
+                    VirtualizableGetset::Static
+                } else {
+                    VirtualizableGetset::No
+                }
+            };
+        if membership == VirtualizableGetset::No {
+            return VirtualizableGetset::No;
+        }
         if self.is_fresh_virtualizable(base) {
             return VirtualizableGetset::No;
         }
-        if is_array {
-            VirtualizableGetset::Array
-        } else {
-            VirtualizableGetset::Static
-        }
+        membership
     }
 
-    /// The codewriter half of
-    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`.
-    /// Consult the pre-renaming SSA value for its annotator flags, then file
-    /// them under the renamed operand exactly as
-    /// `rewrite_op_jit_force_virtualizable` does upstream.
-    fn rematerialize_vable_flags_for_access(
+    /// `rvirtualizable.py VirtualizableInstanceRepr.hook_access_field`:
+    ///
+    /// ```text
+    /// if self.my_redirected_fields.get(cname.value):
+    ///     cflags = inputconst(lltype.Void, flags)
+    ///     llops.genop('jit_force_virtualizable', [vinst, cname, cflags])
+    /// ```
+    ///
+    /// PyFrame is not an RPython ClassDesc, so the genop is minted here
+    /// at each redirected access. `rewrite_op_jit_force_virtualizable`
+    /// files `vable_flags` from args[2] and deletes the op.
+    fn hook_access_field(
         &mut self,
         original_op: &SpaceOperation,
         renamed_op: &SpaceOperation,
+        graph_name: &str,
+        graph: &mut crate::model::FunctionGraph,
     ) {
         let (original_base, field) = match &original_op.kind {
             OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
@@ -1898,9 +2031,16 @@ impl<'a> Transformer<'a> {
             }
             _ => return,
         };
-        if self.config.virtualizable_field(field).is_none()
-            && self.config.virtualizable_array(field).is_none()
-        {
+        // `my_redirected_fields.get(cname.value)` — prefer the attached
+        // vinfo field maps, then the config stand-in used by tests.
+        let redirected = self
+            .get_vinfo(field.owner_root.as_deref())
+            .map(|vinfo| vinfo.has_static_field(&field.name) || vinfo.has_array_field(&field.name))
+            .unwrap_or_else(|| {
+                self.config.virtualizable_field(field).is_some()
+                    || self.config.virtualizable_array(field).is_some()
+            });
+        if !redirected {
             return;
         }
         let renamed_base = match &renamed_op.kind {
@@ -1917,7 +2057,23 @@ impl<'a> Transformer<'a> {
             .copied()
             .unwrap_or_default()
             .merge(VableFlags::from_annotation(original_base));
-        self.vable_flags.insert(renamed_base.clone(), flags);
+        let force = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: vec![
+                    crate::model::LinkArg::from(renamed_base.clone()),
+                    crate::model::LinkArg::Const(crate::flowspace::model::Constant::new(
+                        crate::flowspace::model::ConstValue::byte_str(&field.name),
+                    )),
+                    crate::model::LinkArg::Const(crate::flowspace::model::Constant::new(
+                        flags.to_const(),
+                    )),
+                ],
+                result_ty: ValueType::Void,
+            },
+        };
+        let _ = self.rewrite_operation(&force, graph_name, graph);
     }
 
     /// `jtransform.py _check_no_vable_array`.
@@ -3881,20 +4037,40 @@ impl<'a> Transformer<'a> {
     /// Production residual is the 1-arg `jit_force_virtualizable(frame)`
     /// marker. The 3-arg hook form carries `[vinst, cname, cflags]`. File
     /// flags from `args[2]` when present, otherwise from the instance
-    /// annotation — the same source `rematerialize_vable_flags_for_access`
-    /// reads at each redirected access.
+    /// annotation — the same source `hook_access_field` reads at each
+    /// redirected access.
     fn rewrite_op_jit_force_virtualizable(
         &mut self,
         args: &[crate::model::LinkArg],
         graph_name: &str,
     ) -> RewriteResult {
         if let Some(base) = args.first().and_then(crate::model::LinkArg::as_variable) {
-            let mut flags = VableFlags::from_annotation(base);
+            let key = resolve_alias(base, &self.aliases);
+            let mut flags = self
+                .vable_flags
+                .get(&key)
+                .copied()
+                .unwrap_or_default()
+                .merge(VableFlags::from_annotation(base));
             if let Some(crate::model::LinkArg::Const(c)) = args.get(2) {
                 flags = flags.merge(VableFlags::from_const(&c.value));
             }
-            self.vable_flags
-                .insert(resolve_alias(base, &self.aliases), flags);
+            self.vable_flags.insert(key, flags);
+            // jtransform.py: `vinfo = self.get_vinfo(op.args[0]); assert vinfo is not None`.
+            // Tests pass `callcontrol is None`. When a handle is attached and
+            // the operand's concretetype names no vtype, the unique handle is
+            // the VTYPEPTR stand-in.
+            if let Some(cc) = self.callcontrol.as_ref() {
+                let vinfo = self
+                    .get_vinfo_for_var(base, None)
+                    .or_else(|| cc.unique_virtualizable_info());
+                assert!(
+                    vinfo.is_some(),
+                    "{:?} is a class with _virtualizable_, but no jitdriver was found \
+                     with a 'virtualizable' argument naming a variable of that class",
+                    base.concretetype()
+                );
+            }
         }
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -4264,14 +4440,11 @@ impl<'a> Transformer<'a> {
         }
         // Virtualizable scalar field → VableFieldRead
         if getset == VirtualizableGetset::Static
-            && let Some(vable_field) = self.config.virtualizable_field(field)
+            && let Some(field_index) = self.get_virtualizable_field_descr(field)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
-                detail: format!(
-                    "rewrite: {} → VableFieldRead[{}]",
-                    field.name, vable_field.index
-                ),
+                detail: format!("rewrite: {} → VableFieldRead[{}]", field.name, field_index),
             });
             self.vable_rewrites += 1;
             let base_var = match &op.kind {
@@ -4290,7 +4463,7 @@ impl<'a> Transformer<'a> {
                     result: op.result.clone(),
                     kind: OpKind::VableFieldRead {
                         base: base_var,
-                        field_index: vable_field.index,
+                        field_index,
                         ty: typed_ty.clone(),
                     },
                 },
@@ -4455,13 +4628,13 @@ impl<'a> Transformer<'a> {
             );
         }
         if getset == VirtualizableGetset::Static
-            && let Some(vable_field) = self.config.virtualizable_field(field)
+            && let Some(field_index) = self.get_virtualizable_field_descr(field)
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
                 detail: format!(
                     "rewrite: {} = ... → VableFieldWrite[{}]",
-                    field.name, vable_field.index
+                    field.name, field_index
                 ),
             });
             self.vable_rewrites += 1;
@@ -4480,7 +4653,7 @@ impl<'a> Transformer<'a> {
                     result: op.result.clone(),
                     kind: OpKind::VableFieldWrite {
                         base: base_var,
-                        field_index: vable_field.index,
+                        field_index,
                         // `rewrite_op_setfield` forwards `v_value` unchanged to
                         // `setfield_vable_%s` (`jtransform.py`); a
                         // constant operand stays inline.  `setfield_vable_i`

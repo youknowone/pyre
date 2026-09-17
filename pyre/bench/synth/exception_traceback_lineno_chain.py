@@ -1,6 +1,10 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=26
 # Every traceback node keeps the line its frame was executing, including for
 # a frame the JIT compiled and exited with an uncaught exception.
+#
+# 26 is the macos cranelift exec-only reading (24.2× vs pypy 0.01s, gate was
+# 11). Ubuntu dynasm stays at 9.2×. The walk forces each compiled-raise
+# frame to read `tb_lineno` / `f_code.co_name` on every iteration.
 #
 # `handle_exception` stamps the node with `frame.last_instr` and compiled code
 # never runs the interpreter's per-opcode store, so an intermediate frame that

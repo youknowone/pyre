@@ -2703,8 +2703,9 @@ impl TraceCtx {
     ///   * `TraceCtx::replace_box` (this method) handles the
     ///     `virtualref_boxes` + `virtualizable_boxes` + `heap_cache`
     ///     walks — every piece of per-trace box state that lives on
-    ///     `TraceCtx`.  This is what `is_nonstandard_virtualizable`
-    ///     Step 4 calls directly.
+    ///     `TraceCtx`.  `_nonstandard_virtualizable` Step 4 calls
+    ///     `replace_standard_vable`, which walks the framestack hook
+    ///     and then this method.
     ///
     ///   * `MetaInterp::replace_box` (in pyjitpl.rs) is the structural
     ///     mirror of the full RPython entry point; it adds the

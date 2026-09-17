@@ -1,4 +1,9 @@
 # pyre-check: max-pypy-ratio=125
+# pyre-check: jitstats-band=guard_failures=25
+# Function-entry `push` deopts on each list realloc. The orthodox
+# append fold now compiles two helper traces with 5 guard failures
+# on every backend (was 65). The band still covers doubling-schedule
+# jitter around that count.
 # The trip count puts pypy above the startup-subtraction floor, so this ratio
 # is a measurement rather than pyre divided by the floor constant. The ceiling
 # is twice the slowest backend observed (61.9x on cranelift).

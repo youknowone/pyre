@@ -85,6 +85,13 @@ pub struct WasmFrameData {
     /// exited through a GuardNoException / GuardException (0 = none), surfaced
     /// via `grab_exc_value`.
     pub exc_value: i64,
+    /// `cpu.set_savedata_ref` / `get_savedata_ref` word — compile.py
+    /// `jf_savedata`. Rooted while non-zero, same as `exc_value`.
+    pub savedata: i64,
+    /// Live JITFRAME `force()` borrowed, if this snapshot was taken
+    /// mid-call. `set_savedata` writes `jf_savedata` there so the
+    /// later GUARD_NOT_FORCED exit can copy the word back.
+    origin_jf: Option<*mut majit_backend::jitframe::JitFrame>,
     /// Slots handed to [`crate::wasm_gc_add_roots`] by [`WasmFrameData::boxed`],
     /// released again in `Drop`.
     roots: Vec<usize>,
@@ -113,6 +120,8 @@ impl WasmFrameData {
             raw_values,
             fail_descr,
             exc_value,
+            savedata: 0,
+            origin_jf: None,
             roots: Vec::new(),
         });
         let ref_count = data
@@ -138,6 +147,50 @@ impl WasmFrameData {
             data.roots = roots;
         }
         data
+    }
+
+    /// Bind this snapshot to the live JITFRAME `force()` borrowed so
+    /// `set_savedata` writes `jf_savedata` on that frame, matching
+    /// `llmodel.py set_savedata_ref`.
+    pub fn attach_origin_jf(&mut self, jf: *mut majit_backend::jitframe::JitFrame) {
+        self.origin_jf = Some(jf);
+        let savedata = unsafe { (*jf).jf_savedata };
+        if savedata != 0 {
+            self.set_savedata(majit_ir::GcRef(savedata));
+        }
+    }
+
+    /// Seed the snapshot's `savedata` word from a JITFRAME that is
+    /// about to be dropped. No origin is kept.
+    pub fn seed_savedata_from_jf(&mut self, jf: *const majit_backend::jitframe::JitFrame) {
+        let savedata = unsafe { (*jf).jf_savedata };
+        if savedata != 0 {
+            self.set_savedata(majit_ir::GcRef(savedata));
+        }
+    }
+
+    /// `cpu.set_savedata_ref(deadframe, data)` — write the `jf_savedata`
+    /// word and keep it rooted while non-zero. When this snapshot was
+    /// taken by `force()`, also persist the word on the live JITFRAME
+    /// so the later GUARD_NOT_FORCED exit can read it back.
+    pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
+        let was_nonzero = self.savedata != 0;
+        let now_nonzero = !data.is_null();
+        self.savedata = data.0 as i64;
+        if let Some(jf) = self.origin_jf {
+            unsafe { (*jf).jf_savedata = data.0 };
+        }
+        if was_nonzero == now_nonzero {
+            return;
+        }
+        let slot = &mut self.savedata as *mut i64 as usize;
+        if now_nonzero {
+            unsafe { crate::wasm_gc_add_roots(&[slot]) };
+            self.roots.push(slot);
+        } else {
+            crate::wasm_gc_remove_roots(std::iter::once(slot));
+            self.roots.retain(|&s| s != slot);
+        }
     }
 }
 
@@ -383,6 +436,42 @@ mod tests {
         assert_eq!(roots.load(Ordering::SeqCst), before);
         drop(frame);
         assert_eq!(roots.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn set_savedata_roots_until_cleared_or_drop() {
+        let roots = install_root_counting_gc();
+        let before = roots.load(Ordering::SeqCst);
+        let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+        frame.set_savedata(GcRef(0x40));
+        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        frame.set_savedata(GcRef(0x41));
+        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        frame.set_savedata(GcRef(0));
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+        frame.set_savedata(GcRef(0x42));
+        assert_eq!(roots.load(Ordering::SeqCst), before + 1);
+        drop(frame);
+        assert_eq!(roots.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn set_savedata_on_a_force_snapshot_writes_the_live_jitframe() {
+        use majit_backend::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
+
+        let jf = alloc_off_gc_jitframe(4);
+        let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
+        frame.attach_origin_jf(jf);
+        frame.set_savedata(GcRef(0x51));
+        unsafe {
+            assert_eq!((*jf).jf_savedata, 0x51);
+        }
+        drop(frame);
+        unsafe {
+            assert_eq!((*jf).jf_savedata, 0x51);
+            free_off_gc_jitframe(jf);
+        }
     }
 
     fn dummy_label_target(func_handle: u32) -> super::LabelTarget {

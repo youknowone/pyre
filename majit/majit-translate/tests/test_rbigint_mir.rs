@@ -26,6 +26,10 @@ const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
+const MODULE_LLBC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../build/llbc/pyre-module.ullbc"
+);
 const RLIB_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../build/llbc/majit-rlib.ullbc"
@@ -1329,8 +1333,15 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         return;
     }
 
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
-    let hints = harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+    let interpreter = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let module = std::path::Path::new(MODULE_LLBC)
+        .is_file()
+        .then(|| Llbc::load(MODULE_LLBC).expect("load pyre-module.ullbc"));
+    let mut llbcs = vec![interpreter];
+    if let Some(module) = module {
+        llbcs.push(module);
+    }
+    let hints = harvest_hints_from_llbcs(&llbcs);
     for path in [
         "objspace::descroperation::jit_bigint_add",
         "objspace::descroperation::jit_bigint_int_add",
@@ -1383,7 +1394,7 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         );
     }
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
-        &[llbc],
+        &llbcs,
         HostStaticAddrs::default(),
         &[
             "objspace::descroperation",
@@ -1591,7 +1602,11 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         "the host Result wrapper must not survive in the translated graph: {pow_calls:?}"
     );
 
+    let module_loaded = llbcs.len() > 1;
     for &(module_suffix, caller_name) in BORROWED_PAYLOAD_CALLERS {
+        if module_suffix.starts_with("module::") && !module_loaded {
+            continue;
+        }
         let caller = program
             .functions
             .iter()

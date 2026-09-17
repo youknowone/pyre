@@ -526,6 +526,9 @@ impl CalleeLocalsShadow {
 
 /// One inlined-callee level of the walk's framestack.
 pub struct InlineFrame {
+    /// `true` for the portal `MIFrame` at `framestack[0]`.
+    /// `pyjitpl.py initialize_state_from_start` / `newframe(mainjitcode)`.
+    pub is_portal: bool,
     /// Callee `w_code`, used by the recursion-depth scan. Once the same code
     /// reaches the live `max_unroll_recursion`, the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
@@ -572,11 +575,27 @@ pub struct InlineFrame {
     live: Option<LiveFrameRegs>,
 }
 
+impl InlineFrame {
+    /// Portal frame `pyjitpl.py newframe(mainjitcode)` leaves at
+    /// `framestack[0]`.
+    pub(crate) fn portal() -> Self {
+        Self {
+            is_portal: true,
+            w_code: 0,
+            recursion_greenkey: false,
+            call_id: 0,
+            debug_merge_point_py_pc: None,
+            parents: Vec::new(),
+            entry_executed_effects: 0,
+            live: None,
+        }
+    }
+}
+
 /// The live register banks of one paused `MIFrame`.
 ///
 /// `MetaInterp.replace_box` writes `framestack` frames in place. The portal
-/// is not an `InlineFrame` (depth scans treat `framestack.len()` as the
-/// inlined-callee count), so it lives on [`WalkSession::portal_live`].
+/// is `framestack[0]`; inlined callees follow.
 #[derive(Clone)]
 pub(crate) struct LiveFrameRegs {
     pub(crate) registers_r: RegisterBank,
@@ -619,11 +638,8 @@ pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
 
-    /// Portal `MIFrame` registers while a child runs. Not on `framestack`
-    /// because `framestack.len()` is the inlined-callee depth.
-    pub(crate) portal_live: Option<LiveFrameRegs>,
     /// Paused transparent-helper `SubWalkFrame` banks. Helpers are not
-    /// Python `MIFrame`s and must not overwrite `portal_live`.
+    /// Python `MIFrame`s and must not sit on `framestack`.
     pub(crate) helper_live: Vec<LiveFrameRegs>,
     /// The root frame's `is_being_profiled` portal green for this walk.
     pub is_being_profiled: bool,
@@ -759,7 +775,6 @@ impl Default for WalkSession {
         Self {
             is_being_profiled: false,
 
-            portal_live: None,
             helper_live: Vec::new(),
             framestack: Vec::new(),
             next_call_id: 1,
@@ -784,6 +799,27 @@ impl Default for WalkSession {
 }
 
 impl WalkSession {
+    /// `pyjitpl.py` portal is `framestack[0]`; inlined callees follow.
+    pub(crate) fn at_portal(&self) -> bool {
+        self.framestack.iter().all(|frame| frame.is_portal)
+    }
+
+    /// Inlined-callee depth, excluding the portal at `framestack[0]`.
+    pub(crate) fn inline_depth(&self) -> usize {
+        self.framestack
+            .iter()
+            .filter(|frame| !frame.is_portal)
+            .count()
+    }
+
+    pub(crate) fn last_inline(&self) -> Option<&InlineFrame> {
+        self.framestack.iter().rev().find(|frame| !frame.is_portal)
+    }
+
+    pub(crate) fn first_inline(&self) -> Option<&InlineFrame> {
+        self.framestack.iter().find(|frame| !frame.is_portal)
+    }
+
     /// Claim an abort coordinate for the frame whose `walk()` observed it.
     ///
     /// The first inline sub-walk to see the error owns its `pc` and may build
@@ -1500,14 +1536,15 @@ fn emit_traceback_node<Sym: WalkSym>(
     // without it the promote reaches the decoder holding
     // `UNSTAMPED_JITCODE_INDEX` and `frame_value_count_at` fails loud.
     let guards_before = ctx.trace_ctx.num_guards();
-    let write = ctx.trace_ctx.vable_setfield(
-        opcode_position,
-        site.frame,
-        last_instr_descr,
-        last_instr_value,
-        Some(Value::Int(i64::from(site.last_instruction))),
-    );
-    vable_ops::apply_pending_vable_box_replace(ctx);
+    let write = vable_ops::with_replace_frames(ctx, |ctx| {
+        ctx.trace_ctx.vable_setfield(
+            opcode_position,
+            site.frame,
+            last_instr_descr,
+            last_instr_value,
+            Some(Value::Int(i64::from(site.last_instruction))),
+        )
+    });
     walker_capture_inline_nonstandard_vable_guard(ctx, opcode_position, guards_before, write)?;
 
     let traceback_descr = crate::descr::w_exception_traceback_descr(kind);
@@ -3935,22 +3972,33 @@ pub fn walk<Sym: WalkSym>(
                     // too; a traceback reader forces it through the armed
                     // deadframe only if redirected fields are observed.
                     fbw_store_token_in_vable(ctx, recording_opcode_position)?;
-                    // The runtime half of the node, emitted here rather than
-                    // beside the recording half above: it is the only consumer
-                    // of the frame on this arm, and reading the frame before
-                    // the store-back moves the escape ahead of it, which costs
-                    // the trace bridges and guard failures for no gain.  The
-                    // publish above has already settled `last_instr`, which the
-                    // recorder falls back to.
+                    // Runtime node after the vable token, same order as
+                    // `compile_exit_frame_with_exception` (`pyjitpl.py`) plus
+                    // `record_application_traceback` (`pytraceback.py`):
+                    // store_token, then attach.  Prefer the IR-virtual
+                    // `NewWithVtable` node (`record_prepend_application_traceback`)
+                    // so a function-entry raise (`thrower` / `raise KeyError(i)`)
+                    // keeps the exception and frame virtual through
+                    // `Finish(ExitFrameWithExceptionDescrRef)`.  The opaque
+                    // hook is `EffectInfo::MOST_GENERAL` and forces both.
+                    // Same fallback the in-frame catch arm above already uses.
                     if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
-                        record_top_level_application_traceback(
+                        let emit_runtime = !record_prepend_application_traceback(
                             ctx,
                             exc,
                             exc_concrete,
                             recording_opcode_position,
-                            false,
-                            true,
-                        );
+                        )?;
+                        if emit_runtime {
+                            record_top_level_application_traceback(
+                                ctx,
+                                exc,
+                                exc_concrete,
+                                recording_opcode_position,
+                                false,
+                                true,
+                            );
+                        }
                     }
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
@@ -4662,8 +4710,8 @@ fn write_ref_reg<Sym: WalkSym>(
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
-/// `valuestackdepth(2)`, `debugdata(3)`, and `w_globals(4)`
-/// (`virtualizable_gen.rs`, `NUM_VABLE_SCALARS = 5`). They are frame
+/// `valuestackdepth(2)` and `debugdata(3)` (`virtualizable_gen.rs`,
+/// `NUM_VABLE_SCALARS = 4`). They are frame
 /// bookkeeping; the Python operand stack lives in the separate
 /// `locals_cells_stack_w` array (`virtualizable_gen.rs`,
 /// `pyre-interpreter/src/pyframe.rs`).  PyPy's `interp_jit.py`
@@ -6810,6 +6858,7 @@ impl<'a> InlineFrameGuard<'a> {
             call_id
         };
         walk.framestack.push(InlineFrame {
+            is_portal: false,
             w_code,
             recursion_greenkey,
             call_id,
@@ -8065,7 +8114,7 @@ impl ActiveResumeFrame {
         session: &std::cell::RefCell<WalkSession>,
         snapshot_sym: *const Sym,
     ) -> Option<Self> {
-        let current_code = session.borrow().framestack.last().map(|frame| frame.w_code);
+        let current_code = session.borrow().last_inline().map(|frame| frame.w_code);
         match current_code {
             Some(callee_w_code) => {
                 let idx = crate::state::ensure_jitcode_index(callee_w_code as *const ())?;
@@ -9135,7 +9184,10 @@ fn walker_int_specialization_operands<Sym: WalkSym>(
 )> {
     let (lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val) =
         walker_int_specialization_input_operands(ctx, r_args)?;
-    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr)?;
+    // A virtual wrapint has no concrete pointer, so the authentic helper
+    // cannot run.  `walker_newbool_guarded` / wrapint of the raw result
+    // does not need that shadow; 0 is only the residual-box fallback.
+    let boxed_result_i64 = walker_execute_may_force_boxed(ctx, allboxes, call_descr).unwrap_or(0);
     Some((
         lhs,
         rhs,
@@ -9167,31 +9219,50 @@ fn walker_int_specialization_input_operands<Sym: WalkSym>(
     }
     let lhs = r_args[0];
     let rhs = r_args[1];
-    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
-    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
-    let (lhs_val, rhs_val) = unsafe {
-        // `bool` is a `W_IntObject` subclass sharing the `intval` layout; the
-        // consumer unboxes it through its own `&BOOL_TYPE` guard, so it stays
-        // on the int path. Returns the concrete objects so the consumer can
-        // pick the per-operand class/descr.
-        if !pyre_object::is_int(lhs_obj) || !pyre_object::is_int(rhs_obj) {
-            return None;
-        }
-        // A numeric subclass keeps the builtin `ob_type` layout while its
-        // Python-visible class lives in `w_class`.  The raw int specialization
-        // bypasses special-method dispatch, so only exact builtin ints/bools
-        // may enter it; subclasses continue through the residual BINARY_OP.
-        if !pyre_object::is_exact_builtin_instance(lhs_obj)
-            || !pyre_object::is_exact_builtin_instance(rhs_obj)
-        {
-            return None;
-        }
-        (
-            pyre_object::w_int_get_value(lhs_obj),
-            pyre_object::w_int_get_value(rhs_obj),
-        )
-    };
+    let (lhs_obj, lhs_val) = walker_int_specialization_one_operand(ctx, lhs)?;
+    let (rhs_obj, rhs_val) = walker_int_specialization_one_operand(ctx, rhs)?;
     Some((lhs, rhs, lhs_obj, rhs_obj, lhs_val, rhs_val))
+}
+
+/// One operand of [`walker_int_specialization_input_operands`].
+///
+/// A heap `W_IntObject` / `W_BoolObject` still answers from its concrete
+/// shadow.  A walker-made wrapint (`emit_box_int_inline`) has no concrete
+/// pointer — `set_opref_concrete` is not called — so the concrete path
+/// declines and COMPARE/BINARY residualise as `CallMayForceR`.  That New
+/// already has `intval` in the heapcache and `class_now_known`; read those
+/// the way `optimizeopt` folds `getfield intval` on a virtual wrapint.
+fn walker_int_specialization_one_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    operand: OpRef,
+) -> Option<(pyre_object::PyObjectRef, i64)> {
+    if let Some(obj) = walker_concrete_ref_object(ctx, operand) {
+        let val = unsafe {
+            if !pyre_object::is_int(obj) {
+                return None;
+            }
+            // A numeric subclass keeps the builtin `ob_type` layout while its
+            // Python-visible class lives in `w_class`.  The raw int
+            // specialization bypasses special-method dispatch, so only exact
+            // builtin ints/bools may enter it; subclasses continue through
+            // the residual BINARY_OP / COMPARE_OP.
+            if !pyre_object::is_exact_builtin_instance(obj) {
+                return None;
+            }
+            pyre_object::w_int_get_value(obj)
+        };
+        return Some((obj, val));
+    }
+    if !ctx.trace_ctx.heap_cache().is_class_known(operand) {
+        return None;
+    }
+    let cached = ctx
+        .trace_ctx
+        .heapcache_getfield_cached(operand, crate::descr::int_intval_descr().index())?;
+    let majit_ir::Value::Int(n) = ctx.trace_ctx.box_value(cached)? else {
+        return None;
+    };
+    Some((std::ptr::null_mut(), n))
 }
 
 /// Float counterpart of [`walker_int_specialization_operands`].  Each
@@ -9316,6 +9387,21 @@ fn walker_unbox_int<Sym: WalkSym>(
     )
 }
 
+/// Pin exact `w_class` first, then unbox. Exact class implies the layout
+/// vtable, so [`walker_unbox_int_typed`] sees `is_class_known` and skips
+/// the redundant `GuardClass`.
+fn walker_unbox_int_exact<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+    intval_descr: majit_ir::DescrRef,
+    expected_class: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    walker_guard_exact_w_class(ctx, op_pc, obj, expected_class)?;
+    walker_unbox_int_typed(ctx, op_pc, obj, type_addr, intval_descr)
+}
+
 /// True when `obj` is an InputArg the concrete boundary GUARANTEES was
 /// converted from a tagged immediate to a heap `W_IntObject` — i.e. a
 /// frame LOCALS-region array-item InputArg (`raw() - vable_array_base <
@@ -9418,13 +9504,29 @@ fn walker_unbox_int_typed<Sym: WalkSym>(
         }
     }
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, type_addr);
+        let already_this_class = obj.is_constant()
+            && walker_concrete_ref_object(ctx, obj).is_some_and(|o| {
+                !o.is_null()
+                    && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(o))
+                    && std::ptr::eq(
+                        unsafe { (*o).ob_type },
+                        type_addr as *const pyre_object::PyType,
+                    )
+            });
+        if already_this_class {
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        } else {
+            let type_const = ctx.trace_ctx.const_int(type_addr);
+            ctx.trace_ctx
+                .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj, type_addr);
+        }
     }
     Ok(crate::trace_unbox_int(
         ctx.trace_ctx,
@@ -9930,6 +10032,11 @@ fn walker_box_int<Sym: WalkSym>(
     value: i64,
 ) -> Result<OpRef, DispatchError> {
     let _ = (op_pc, value);
+    // intobject.py `wrapint` (withprebuiltint=False): every boxing
+    // allocates a fresh `W_IntObject`. Interning a constant raw here
+    // is WITHPREBUILTINT for the residual `box_int_fn` path. Only
+    // `LOAD_SMALL_INT` / `getconstant_w` intern, via the codewriter
+    // frontend.
     Ok(crate::state::wrapint(ctx.trace_ctx, raw))
 }
 
@@ -10541,6 +10648,11 @@ unsafe fn walker_exact_builtin_class(
 /// already sufficient. Heap operands were admitted by
 /// `is_exact_builtin_instance` in the shared operand gate.
 fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+    // A walker-made wrapint has no concrete object; it is always `int`
+    // (`emit_box_int_inline` / `note_class_word_after_new`).
+    if obj.is_null() {
+        return pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE);
+    }
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         pyre_object::PY_NULL
     } else if unsafe { pyre_object::is_bool(obj) } {
@@ -10628,6 +10740,21 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
         return Ok(());
     }
+    // A ConstPtr interned / co_consts box already is the exact builtin.
+    // Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every iteration is
+    // the leftover the `guard_value` comment below exists to kill;
+    // for a compile-time constant the proof is the object itself.
+    if obj.is_constant()
+        && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+    {
+        // Exact class implies the layout vtable; a later unbox / GuardClass
+        // of this ConstPtr already has its own `already_this_class` fold.
+        return Ok(());
+    }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
     // second spelling of "exact builtin", while the guard below reads the slot and
@@ -10645,6 +10772,12 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
         "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
     );
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
+    // Do not stamp `class_now_known` here. Exact `w_class` is a stronger
+    // proof, but `optimize_GETFIELD` / peel import can fold the
+    // Getfield+GuardValue away on a LABEL input. `walker_guard_class`
+    // must still emit `GuardClass` so a later entry whose box is an
+    // int cannot take the long `GetfieldGcR(value)` path and pass
+    // intval to `jit_bigint_int_mul` (`selfrec_bridge_nontail_promote`).
     Ok(())
 }
 
@@ -11005,7 +11138,7 @@ fn guarded_branch_core<Sym: WalkSym>(
                 .iter()
                 .filter(|frame| !frame.parents.is_empty())
                 .count();
-            let n_callees = session.framestack.len();
+            let n_callees = session.inline_depth();
             !(n_parents > 0 && n_parents == n_callees)
         };
         // A canonical helper body (`run_sub_jitcode_walk`) walks its OWN

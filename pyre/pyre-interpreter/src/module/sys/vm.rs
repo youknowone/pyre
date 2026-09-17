@@ -1455,7 +1455,7 @@ fn exc_info_load_const(
         // non-negative indices PyPy spells as LOAD_CONST.  It denotes the
         // same immutable integer input to the look-ahead test.
         crate::bytecode::Instruction::LoadSmallInt { i } => {
-            pyre_object::w_int_new(i.get(op_arg) as i64)
+            pyre_object::w_small_int_const(i.get(op_arg) as i64)
         }
         _ => pyre_object::PY_NULL,
     }

@@ -61,7 +61,7 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     // Bridge reconstruction stores frame guards in a Vec; their drop order
     // must not control the session owner's root registration lifetime.
     drop(frames);
-    assert!(outer.borrow().framestack.is_empty());
+    assert!(outer.borrow().at_portal());
     outer.borrow_mut().tmpreg_r = OpRef::const_ptr(majit_ir::GcRef(0x4000));
     assert_eq!(forward(), [0x4000]);
     assert_eq!(
@@ -205,6 +205,31 @@ fn portal_reachable_symbolic_residual_scan_is_empty() {
         scan.targets,
         Vec::<i64>::new(),
         "jit_fnaddr bindings must resolve every portal-reachable residual",
+    );
+}
+
+/// jd1's `unpackiterable_portal` is a second driver, not the eval portal
+/// above. A `||` closure in its drain livevar reloads used to mint
+/// `target:closure.call` hashes that this scan (and the walk) refuse.
+#[test]
+fn unpackiterable_portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let portal =
+        crate::jitcode_runtime::portal_jitcode_for_key("baseobjspace::unpackiterable_portal")
+            .expect("the build-time table registers the unpackiterable portal");
+    let portal = majit_metainterp::JitCode::from_canonical((*portal).clone());
+
+    let scan = portal.reachable_symbolic_residuals();
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the unpackiterable portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "named shadow_stack_get / next / drain residuals must resolve; \
+         a leftover target:closure.call hash aborts the jd1 walk",
     );
 }
 
@@ -958,6 +983,7 @@ fn parentless_populated_callee_does_not_publish_a_lone_resume_frame() {
     mode.inline_subwalk = true;
     let session = std::cell::RefCell::new(WalkSession::default());
     session.borrow_mut().framestack.push(InlineFrame {
+        is_portal: false,
         w_code: w_code as usize,
         // What `InlineFrameGuard::new` stamps on the first Python portal frame
         // pushed onto an empty framestack: `MetaInterp.newframe` consumes
@@ -1708,6 +1734,7 @@ fn vable_store_tracks_live_null_without_changing_the_recorded_trace() {
     let vable = tc.const_ref(1);
     let initial_boxes = vec![tc.const_null(); slot_count];
     let initial_values = vec![null; slot_count];
+    tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
         vable,
@@ -2145,6 +2172,7 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
         let standard = tc.const_ref(1);
         let initial_boxes = vec![tc.const_null(); slot_count];
         let initial_values = vec![Value::Ref(majit_ir::GcRef::NULL); slot_count];
+        tc.install_virtualizable_info(info.clone());
         tc.init_virtualizable_boxes(
             &info,
             standard,
@@ -10616,6 +10644,7 @@ fn bind_fake_vable(tc: &mut TraceCtx, buf: &mut [u8]) {
         "fake vable buffer must cover token_offset",
     );
     let vable_ref = tc.const_ref(buf.as_ptr() as i64);
+    tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
         vable_ref,
@@ -16250,6 +16279,7 @@ fn mirroring_a_static_vable_field_flushes_it_to_the_live_frame() {
     let vable = tc.const_ref(frame_ptr as i64);
     let initial_boxes = vec![tc.const_null(); slot_count];
     let initial_values = vec![Value::Int(0); slot_count];
+    tc.install_virtualizable_info(info.clone());
     tc.init_virtualizable_boxes(
         &info,
         vable,

@@ -714,7 +714,7 @@ unsafe fn pycode_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 ///     collector does not own and must never be handed; such a pointer
 ///     is left alone and is never dereferenced.  A tracer snapshot used
 ///     to land here too — the walk records tracebacks against it
-///     (`pyjitpl.rs record_application_traceback(.., self.vable_ptr, ..)`)
+///     (`pyjitpl.rs record_application_traceback` unwraps the standard vable)
 ///     — but `snapshot_for_tracing` is GC-owned now, so that traceback
 ///     keeps its frame alive instead of dangling.
 unsafe fn pytraceback_object_custom_trace(
@@ -809,7 +809,7 @@ unsafe fn array_object_destructor(obj_addr: usize) {
 /// through the generic no-destructor path.
 unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
     let obj = obj_addr as pyre_object::PyObjectRef;
-    unsafe { pyre_interpreter::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
+    unsafe { pyre_module::module::_tokenize::w_tokenizer_iter_dealloc(obj) };
 }
 
 unsafe fn hashlib_hash_state_destructor(obj_addr: usize) {
@@ -879,17 +879,13 @@ unsafe fn zlib_zdecompress_destructor(obj_addr: usize) {
 
 unsafe fn bz2_compressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_bz2::w_bz2compressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_bz2::w_bz2compressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_bz2::w_bz2decompressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_bz2::w_bz2decompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -968,9 +964,7 @@ unsafe fn cffi_lib_destructor(obj_addr: usize) {
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_overlapped::w_overlapped_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_overlapped::w_overlapped_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -1864,6 +1858,10 @@ fn register_traced_storage_box<T: 'static>(
 /// Build and configure the MiniMarkGC with all type registrations,
 /// vtable mappings, and subclass ranges.
 fn build_gc() -> Box<MiniMarkGC> {
+    // Optional-module rclass aliases must be in the census before the
+    // vtable assertion below.  Launchers also call `register`; this is
+    // the backstop for unit tests and late `driver_pair` entry.
+    pyre_module::register();
     // translationoption.py `taggedpointers` — kept in lockstep with the
     // pyre-object representation switch so the collector-core immediate
     // guards (`is_tagged_immediate`) go live exactly when small ints start
@@ -3767,7 +3765,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let tokenizer_iter_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_tokenize::W_TokenizerIter
+        <pyre_module::module::_tokenize::W_TokenizerIter
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // W_TokenizerIter owns Rust heap (source string, token / error vectors, the
@@ -4022,7 +4020,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_json::W_Scanner
+        <pyre_module::module::_json::W_Scanner
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // `_json.Encoder` keeps the `make_encoder` arguments in traced payload
@@ -4030,7 +4028,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_json::W_Encoder
+        <pyre_module::module::_json::W_Encoder
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     // CPython's EVPobject and HMACobject own their native contexts.  Pyre's
@@ -4128,12 +4126,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // with the zlib owners so their ids agree on wasm/native.
     for (descr, destructor) in [
         (
-            <pyre_interpreter::module::_bz2::W_BZ2Compressor
+            <pyre_module::module::_bz2::W_BZ2Compressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             bz2_compressor_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::_bz2::W_BZ2Decompressor
+            <pyre_module::module::_bz2::W_BZ2Decompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),
@@ -4449,7 +4447,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // performs PyPy's cancel/wait-before-free ordering and closes hEvent.
     #[cfg(all(windows, not(feature = "sandbox")))]
     {
-        let descr = <pyre_interpreter::module::_overlapped::W_Overlapped
+        let descr = <pyre_module::module::_overlapped::W_Overlapped
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
         gc.types.set_destructor(tid, overlapped_destructor);
@@ -4942,6 +4940,19 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_interpreter::active_subclass_range_hierarchy(),
         "GC rclass.OBJECT registration order must match the shared subclass-range census",
     );
+    // compile.py AllVirtuals — llopaque leaf hidden in jf_savedata.
+    // Absolute tail so no hardcoded / `#[pyre_class(type_id = N)]` id
+    // moves; published through `set_all_virtuals_gc_type_id`.
+    // Custom trace walks the off-heap GCREF slice; the destructor
+    // frees that slice. The deadframe `jf_savedata` word is the owner.
+    let all_virtuals_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(
+            std::mem::size_of::<majit_metainterp::AllVirtuals>(),
+            majit_metainterp::AllVirtuals::custom_trace,
+        )
+        .with_destructor_fn(majit_metainterp::AllVirtuals::destructor),
+    );
+    majit_metainterp::set_all_virtuals_gc_type_id(all_virtuals_tid);
     gc.freeze_types();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
@@ -5206,9 +5217,6 @@ fn install_gc_root_walkers() {
     majit_gc::shadow_stack::register_young_owner_reconciler(
         pyre_interpreter::objspace::std::mapdict::reconcile_young_owner_entries,
     );
-    // `MetaInterp::forced_virtuals` is the same shape but lives in one mutator's
-    // `JIT_DRIVER` rather than a global table, so it registers per mutator
-    // instead — see `forced_virtuals_pruner_area`.
 }
 
 fn register_thread_root_areas() {
@@ -5286,14 +5294,6 @@ fn register_thread_root_areas() {
             jit_driver,
             "compile_snapshot",
         );
-        register(
-            forced_virtuals_root_walker_area,
-            jit_driver,
-            "forced_virtuals",
-        );
-        // The ephemeron half of the walker above, on the same `data` so the
-        // prune reaches exactly the drivers the root walk reaches.
-        majit_gc::shadow_stack::register_mutator_pruner(forced_virtuals_pruner_area, jit_driver);
     }
 }
 
@@ -5391,6 +5391,11 @@ fn install_pyre_object_hooks() {
 /// `gc_sync::is_initialized()` + `gc_sync::store_singleton()` ensures
 /// exactly one GC is created even under cargo test's parallel threads.
 fn build_gc_global() {
+    // `build_gc` always registers the optional-module types this crate
+    // names.  Their rclass aliases live behind `pyre_module::register`;
+    // install them before the census assertion, including on paths that
+    // reach the collector without going through a launcher.
+    pyre_module::register();
     // `is_initialized()` is a plain check-then-act, so on a fresh process
     // every thread that reaches here before the first `store_singleton`
     // observes the flag unset and would each run `build_gc()`.  `build_gc`
@@ -5703,14 +5708,13 @@ fn build_jit_driver_pair() -> JitDriverPair {
         );
         let mut faithful = vec![
             // (f64) -> i64
-            pyre_interpreter::module::math::interp_math::jit_math_frexp_exponent as *const ()
-                as usize as i64,
-            // (f64, i64) -> f64
-            pyre_interpreter::module::math::interp_math::jit_math_ldexp_raw as *const () as usize
+            pyre_module::module::math::interp_math::jit_math_frexp_exponent as *const () as usize
                 as i64,
+            // (f64, i64) -> f64
+            pyre_module::module::math::interp_math::jit_math_ldexp_raw as *const () as usize as i64,
             // (f64, f64) -> i64
-            pyre_interpreter::module::math::interp_math::jit_math_isclose_default as *const ()
-                as usize as i64,
+            pyre_module::module::math::interp_math::jit_math_isclose_default as *const () as usize
+                as i64,
             // (i64, i64) -> f64
             pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw as *const () as usize
                 as i64,
@@ -5730,8 +5734,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ];
         // (i64) -> f64, one per float-result builtin fold.
         faithful.extend(pyre_interpreter::jit_builtin_folds::float_fold_helper_addrs());
-        faithful
-            .extend(pyre_interpreter::module::math::interp_math::math_float_fold_helper_addrs());
+        faithful.extend(pyre_module::module::math::interp_math::math_float_fold_helper_addrs());
         faithful.extend(pyre_jit_trace::walker_float_helper_addrs());
         majit_backend_wasm::set_faithful_residual_call_addrs(&faithful);
         for addr in pyre_interpreter::jit_builtin_folds::word_fold_helper_addrs() {
@@ -5753,8 +5756,8 @@ fn build_jit_driver_pair() -> JitDriverPair {
         ] {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }
-        use pyre_interpreter::module::math::interp_math as math;
         use pyre_interpreter::objspace::descroperation as desc;
+        use pyre_module::module::math::interp_math as math;
         use pyre_object::floatobject as flt;
         use pyre_object::intobject as intobj;
         use pyre_object::listobject as list;
@@ -5818,6 +5821,12 @@ fn build_jit_driver_pair() -> JitDriverPair {
             long::jit_w_long_fits_int as *const () as usize as i64,
             long::jit_w_long_toint as *const () as usize as i64,
             list::jit_list_append as *const () as usize as i64,
+            // #171 object-append fold: `jit_fnaddr` already registers the
+            // word-ABI call targets, but Vouched mode still sent every
+            // compiled append through `jit_call`. `nested_list_comprehension_hot`
+            // measured 970544 crossings each.
+            list::__majit_call_target_prepare_list_ref_store as *const () as usize as i64,
+            list::__majit_call_target_current_gc_ref as *const () as usize as i64,
             list::jit_list_getitem as *const () as usize as i64,
             list::jit_list_setitem as *const () as usize as i64,
             list::jit_list_reverse as *const () as usize as i64,
@@ -6125,42 +6134,6 @@ unsafe fn compile_snapshot_root_walker_area(
 ) {
     if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
         pair.0.walk_compile_snapshot_refs(visitor);
-    }
-}
-
-/// GC walker for the virtual caches `handle_async_forcing` produced and left
-/// for the `GUARD_NOT_FORCED` that follows. Upstream traces them through the
-/// deadframe's `jf_savedata` GCREF field; pyre holds them on `MetaInterp` and
-/// needs the edge drawn explicitly.
-/// See `MetaInterp::walk_forced_virtuals_refs`.
-unsafe fn forced_virtuals_root_walker_area(
-    data: *const (),
-    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
-) {
-    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.walk_forced_virtuals_refs(visitor);
-    }
-}
-
-/// Drop forced-virtual caches whose owner frame the major collection is about
-/// to sweep — the ephemeron half of rooting them at all.
-///
-/// The force runs inside a residual `CALL_MAY_FORCE`, and two paths leave the
-/// entry unconsumed: an escaped virtualizable raises instead of failing a
-/// guard, and `handle_fail`'s bridge-compiled arm returns without resuming.
-/// Both would otherwise pin the materialized virtuals for the process lifetime
-/// and leave a key a recycled `PyFrame` address could match.
-///
-/// Registered per mutator, next to `forced_virtuals_root_walker_area` and with
-/// the same `data`, so the prune reaches every driver the root walk reaches. The
-/// global `register_ephemeron_pruner` cannot: the table lives in this thread's
-/// `JIT_DRIVER`, and a major driven by another thread would leave it pinned.
-unsafe fn forced_virtuals_pruner_area(
-    data: *const (),
-    classify: &mut dyn FnMut(usize) -> Option<usize>,
-) {
-    if let Some(pair) = unsafe { jit_driver_pair_from_root_area(data) } {
-        pair.0.prune_forced_virtuals(classify);
     }
 }
 
@@ -7692,6 +7665,15 @@ fn unpack_merge_point_jit(
     if !jd1_experiment_enabled() {
         return;
     }
+    // Untranslated body of the `can_enter_jit` that `rewrite_can_enter_jits`
+    // inserts at the portal startblock (`warmspot.py`, reds='auto' has none).
+    // `jit_merge_point` itself is only a translator marker; blackhole hits
+    // `bhimpl_jit_merge_point` (ContinueRunningNormally / recursive portal
+    // runner) and never this hook. A residual that reaches the interpreted
+    // portal goes through `ll_portal_runner` / this insert, which may start
+    // a trace — the same as PyPy. Same-green reentry is `JC_TRACING` /
+    // `meta.is_tracing()` inside `drive_unpack_iterable_trace`, not a
+    // blackhole-running flag (none exists upstream).
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
     }
@@ -7748,6 +7730,10 @@ fn drive_unpack_iterable_trace(
     // shared global build-time pool, so install it before the walk reads the
     // first descr (idempotent OnceLock).
     let dbg = std::env::var_os("PYRE_JD1_DEBUG").is_some();
+    // Portal pins are the two slots under this hook. Capture them before
+    // ResidualExceptionScope::park can pin a standing exception on top;
+    // otherwise jd1_root_base's `len - 2` names those parked roots.
+    let portal_root_base = pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64;
     // The walk below executes each residual concretely, so the raise that ends
     // the unpack is recorded into the residual-call exception cells. Those are
     // pyre's per-thread stand-in for `metainterp.last_exc_value`, which
@@ -7818,12 +7804,8 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // baseobjspace.py:31 reds='auto' → `w_iterator`, `items` as the two Ref
-    // input args, in the order `create_sym`/`collect_jump_args` use.
-    let live_values = [
-        majit_ir::Value::Ref(majit_ir::GcRef(w_iterator as usize)),
-        majit_ir::Value::Ref(majit_ir::GcRef(items as usize)),
-    ];
+    // Extracted merge-point reds: root_base, items_slot, RootScope cell.
+    let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
 
     // `elect_active_jitdriver_sd` honours `descriptor.index` first, which is how
     // the novable jd1 is elected over jd0 (whose `virtualizable_info` would
@@ -7962,6 +7944,7 @@ fn drive_unpack_iterable_trace(
                 // jd1 is novable: it has no virtualizable to force.
                 std::ptr::null(),
                 true,
+                None,
             );
             match bh {
                 // Merge point reached: re-enter the compiled drain.
@@ -8021,29 +8004,36 @@ fn drive_unpack_iterable_trace(
         return;
     }
 
-    // reds='auto' as the merge-point InputArgs: (w_iterator, items) in the
-    // order `collect_jump_args` returns, seeded onto the registers the
-    // `jit_merge_point` op names (decoded inside
-    // `trace_jitcode_from_merge_point`) so each residual runs on the shared
-    // heap objects the caller loop holds.
-    let red_refs = [
+    // Seed every bank the extracted `jit_merge_point` names.  Green is
+    // the type object; reds are root_base / items_slot / RootScope cell.
+    let green_args = [(
+        majit_metainterp::JitArgKind::Ref,
+        greenkey_raw as usize as i64,
+    )];
+    let root_base = portal_root_base;
+    let red_args = [
         (
-            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-            w_iterator as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+            root_base,
         ),
         (
-            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
-            items as usize as i64,
+            majit_metainterp::JitArgKind::Int,
+            majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+            root_base + 1,
+        ),
+        (
+            majit_metainterp::JitArgKind::Ref,
+            majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
+            pyre_object::gc_roots::shadow_stack_cell() as usize as i64,
         ),
     ];
-    // baseobjspace.py green `greenkey` = `iterator_greenkey(w_iterator)`,
-    // a per-type singleton pointer — seeded as the merge-point green Const.
-    let green_ref = greenkey_raw as usize as i64;
 
     let mut sym = pyre_jit_trace::unpack_state::UnpackSym {
         greenkey: pyre_object::PY_NULL,
-        w_iterator: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-        items: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref),
+        root_base: majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Int),
+        items_slot: majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int),
+        roots_cell: majit_ir::OpRef::input_arg_typed(2, majit_ir::Type::Ref),
     };
 
     // The `jit_merge_point` opcode byte offset in the extracted body — the
@@ -8083,7 +8073,13 @@ fn drive_unpack_iterable_trace(
                 recursive_exec_void,
             );
             majit_metainterp::trace_jitcode_from_merge_point(
-                ctx, &mut sym, &jitcode, header_pc, &runtime, green_ref, &red_refs,
+                ctx,
+                &mut sym,
+                &jitcode,
+                header_pc,
+                &runtime,
+                &green_args,
+                &red_args,
             )
         },
     );
@@ -9789,9 +9785,11 @@ pub extern "C" fn ll_unpackiterable_portal_runner_shim(
 
 /// `warmspot.py handle_jitexception` for `unpackiterable_driver`.
 ///
-/// Greens are `['greenkey']`; reds are auto `w_iterator`, `items`.
-/// `portal_ptr(*args)` is the split-portal loop, not the `newlist_hint`
-/// prologue and not the bytecode portal's frame runner.
+/// `bhimpl_jit_merge_point` raises `ContinueRunningNormally(*args)` as the
+/// six banks; `handle_jitexception` walks `portalfunc_ARGS` and calls
+/// `portal_ptr(*args)`. The extracted portal's reds are `root_base`,
+/// `items_slot`, and the `RootScope` cell — not `w_iterator`/`items`.
+/// Reload those pinned objects the portal function still takes.
 fn unpackiterable_portal_runner(
     exc: &majit_metainterp::jitexc::JitException,
 ) -> Result<
@@ -9804,16 +9802,17 @@ fn unpackiterable_portal_runner(
     let JitException::ContinueRunningNormally(args) = exc else {
         return Ok((BhReturnType::Void, 0));
     };
-    let mut all_r = args.green_ref.clone();
-    all_r.extend(&args.red_ref);
-    let greenkey = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let w_iterator = all_r.get(1).copied().unwrap_or(0) as pyre_object::PyObjectRef;
-    let items = all_r.get(2).copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let greenkey = args.green_ref.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let root_base = args.red_int.first().copied().unwrap_or(0) as usize;
+    let items_slot = args.red_int.get(1).copied().unwrap_or(0) as usize;
+    let w_iterator = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let items = pyre_object::gc_roots::shadow_stack_get(items_slot);
     assert!(
-        !w_iterator.is_null() && !items.is_null(),
-        "unpackiterable portal runner: ContinueRunningNormally missing reds \
-         (iterator/items); greens={} reds={}",
+        !greenkey.is_null() && !w_iterator.is_null() && !items.is_null(),
+        "unpackiterable portal runner: ContinueRunningNormally missing extracted reds \
+         green_ref={} red_int={} red_ref={}",
         args.green_ref.len(),
+        args.red_int.len(),
         args.red_ref.len(),
     );
     match pyre_interpreter::unpackiterable_portal(greenkey, w_iterator, items) {
@@ -11343,34 +11342,29 @@ fn forced_guard_cache_owner(
 }
 
 /// `compile.py:956-957` — `hidden_all_virtuals =
-/// metainterp_sd.cpu.get_savedata_ref(deadframe)`.
+/// metainterp_sd.cpu.get_savedata_ref(deadframe)` then `AllVirtuals.show`.
 ///
-/// Upstream reads the cache straight out of the deadframe it is resuming,
-/// because `handle_fail` receives that deadframe. pyre's guard-failure path
-/// surfaces the running frame instead, so the cache is keyed by the frame the
-/// force ran against (`force_pyframe`) and taken back here by the same frame.
-///
-/// The jitframe address is not usable as the key: the failing exit does not
-/// name which of its slots holds the force token.
-///
-/// A miss returns `None`, which resumes the ordinary way. Upstream instead
-/// substitutes an empty `VirtualCache` (`compile.py`) and still runs
-/// the reader with `resume_after_guard_not_forced == 2` — it can, because a
-/// deadframe-local savedata slot cannot miss. A frame-keyed reconstruction
-/// can, and skipping the vable section with an empty virtuals cache would
-/// leave the resumed frame's virtuals unbound; falling back to a full decode
-/// is the same work pyre did before the cache existed.
+/// The caller must keep the deadframe alive until this returns so
+/// `jf_savedata` stays a live GCREF.
 ///
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
 pub(crate) fn take_forced_virtuals_for_frame(
-    frame: *const pyre_interpreter::PyFrame,
+    _frame: *const pyre_interpreter::PyFrame,
+    savedata: Option<majit_ir::GcRef>,
 ) -> Option<(Vec<i64>, Vec<i64>)> {
-    if frame.is_null() {
+    savedata.and_then(majit_metainterp::AllVirtuals::show)
+}
+
+/// `cpu.get_savedata_ref(deadframe)` off a raw jitframe pointer.
+pub(crate) fn savedata_from_jitframe(
+    deadframe: *const majit_backend::jitframe::JitFrame,
+) -> Option<majit_ir::GcRef> {
+    if deadframe.is_null() {
         return None;
     }
-    let (driver, _) = driver_pair();
-    driver.meta_interp_mut().take_forced_virtuals(frame as u64)
+    let ptr = unsafe { majit_backend::llmodel::get_savedata_ref(deadframe) };
+    (ptr != 0).then_some(majit_ir::GcRef(ptr))
 }
 
 /// compile.py:710-716 resume_in_blackhole parity.
@@ -11392,6 +11386,10 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     // `unpackiterable_driver`): its resume data has no vable section, so the
     // decode must not consume one. jd0 guards pass `false`.
     novable: bool,
+    // compile.py `cpu.get_savedata_ref(deadframe)` for a
+    // `GUARD_NOT_FORCED` handle_fail. `None` when the exit had no
+    // jitframe savedata word.
+    savedata: Option<majit_ir::GcRef>,
 ) -> crate::call_jit::BlackholeResult {
     // Same deadframe rooting as `handle_fail`: `decode_ref`'s TAGBOX arm reads
     // these slots after the resume construction has already allocated.  The
@@ -11439,7 +11437,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         // kind out of the self-describing deadframe+descr it was handed.
         // The sibling resume paths already pass this slice directly
         // (`jitdriver.rs`).
-        let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner);
+        let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner, savedata);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
@@ -11806,6 +11804,8 @@ fn execute_assembler(
             ref raw_values,
             ref exit_layout,
             guard_exc,
+            savedata,
+            deadframe: _deadframe,
         } => {
             match handle_fail(
                 frame_root.frame(),
@@ -11832,6 +11832,7 @@ fn execute_assembler(
                         guard_exc,
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
+                        savedata,
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -11904,7 +11905,6 @@ fn compile_and_run_once(
     }
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
-    let had_compiled = driver.has_compiled_loop(green_key);
     match start {
         CompileOnceStart::BackEdge => {
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
@@ -11977,7 +11977,11 @@ fn compile_and_run_once(
             .meta_interp_mut()
             .warm_state_mut()
             .clear_tracing_flag(starting_tracing_key);
-        if !had_compiled && driver.has_compiled_loop(compiled_key) {
+        // compile.py record_loop_or_bridge: register every compiled
+        // loop/bridge's quasi_immutable_deps against its token. The
+        // `!had_compiled` extra gate dropped deps on a replace compile,
+        // so a later mutated() never saw the new token.
+        if driver.has_compiled_loop(compiled_key) {
             register_quasi_immutable_deps(compiled_key);
         } else {
             // `register_quasi_immutable_deps` is the only drain of
@@ -12173,6 +12177,8 @@ fn bound_reached(
             ref raw_values,
             ref exit_layout,
             guard_exc,
+            savedata,
+            deadframe: _deadframe,
         } = outcome
         {
             match handle_fail(
@@ -12205,6 +12211,7 @@ fn bound_reached(
                         guard_exc,
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
+                        savedata,
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {
@@ -12486,6 +12493,8 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref raw_values,
             ref exit_layout,
             guard_exc,
+            savedata,
+            deadframe: _deadframe,
         } = outcome
         {
             match handle_fail(
@@ -12521,6 +12530,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         guard_exc,
                         forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
+                        savedata,
                     );
                     publish_blackhole_frame_finished(&bh_result, frame_root.frame());
                     match &bh_result {

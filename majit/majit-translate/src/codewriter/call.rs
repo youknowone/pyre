@@ -14,6 +14,7 @@ use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
+use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::argument::Signature;
 use crate::front::semantic::SemanticFunction;
 use crate::jitcode::{BhCallDescr, CallResultErasedKey};
@@ -378,6 +379,118 @@ pub enum CallKind {
 pub trait VirtualizableInfoHandle: std::fmt::Debug + Send + Sync {
     /// virtualizable.py `is_vtypeptr(TYPE) → TYPE == self.VTYPEPTR`.
     fn is_vtypeptr(&self, vtypeptr_id: usize) -> bool;
+    /// warmspot.py `WarmRunnerDesc.finish` → `vinfo.finish()`.
+    ///
+    /// `virtualizable.py VirtualizableInfo.finish` stamps
+    /// `clear_vable_ptr` / `clear_vable_descr`. The stamp happens at
+    /// construction (`set_clear_vable` / `build_pyframe_virtualizable_info`).
+    /// Residual `jit_force_virtualizable` rewrite lives on
+    /// [`CallControl::finish`] (`replace_force_virtualizable_with_call`
+    /// over the graphs this handle does not own). Default is a no-op.
+    fn finish(&self) {}
+    /// Codewriter-side VTYPE name (`red_types[index_of_virtualizable]`).
+    fn vtype_name(&self) -> Option<&str> {
+        None
+    }
+    /// `fname in vinfo.static_field_to_extra_box` (`jtransform.py
+    /// is_virtualizable_getset`).
+    fn has_static_field(&self, _name: &str) -> bool {
+        false
+    }
+    /// `fname in vinfo.array_fields` (`jtransform.py
+    /// is_virtualizable_getset`).
+    fn has_array_field(&self, _name: &str) -> bool {
+        false
+    }
+    /// `vinfo.static_field_to_extra_box[fieldname]` (`jtransform.py
+    /// get_virtualizable_field_descr`).
+    fn static_field_index(&self, _name: &str) -> Option<usize> {
+        None
+    }
+}
+
+/// Thin `VirtualizableInfo` for the codewriter. Runtime offsets live in
+/// `majit-metainterp::VirtualizableInfo`; this handle only answers
+/// `get_vinfo` / `is_virtualizable_getset` / `get_virtualizable_field_descr`.
+#[derive(Debug)]
+pub struct CodewriterVirtualizableInfo {
+    vtype_name: String,
+    static_fields: Vec<String>,
+    array_fields: Vec<String>,
+}
+
+impl CodewriterVirtualizableInfo {
+    /// `virtualizable.py VirtualizableInfo.__init__` over the declaration:
+    /// the static and array fields `config` declares on `vtype`, each in
+    /// declared index order, array names without the `[*]` suffix.
+    pub fn from_config(vtype: &str, config: &GraphTransformConfig) -> Option<Self> {
+        let declared = |fields: &[VirtualizableFieldDescriptor]| {
+            let mut owned: Vec<&VirtualizableFieldDescriptor> = fields
+                .iter()
+                .filter(|field| {
+                    field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|owner| names_same_type(owner, vtype))
+                })
+                .collect();
+            owned.sort_by_key(|field| field.index);
+            owned
+                .into_iter()
+                .map(|field| field.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let static_fields = declared(&config.vable_fields);
+        let array_fields = declared(&config.vable_arrays);
+        if static_fields.is_empty() && array_fields.is_empty() {
+            return None;
+        }
+        Some(Self {
+            vtype_name: vtype.to_string(),
+            static_fields,
+            array_fields,
+        })
+    }
+}
+
+impl VirtualizableInfoHandle for CodewriterVirtualizableInfo {
+    fn is_vtypeptr(&self, _vtypeptr_id: usize) -> bool {
+        false
+    }
+    fn vtype_name(&self) -> Option<&str> {
+        Some(&self.vtype_name)
+    }
+    fn has_static_field(&self, name: &str) -> bool {
+        self.static_fields.iter().any(|field| field == name)
+    }
+    fn has_array_field(&self, name: &str) -> bool {
+        self.array_fields.iter().any(|field| field == name)
+    }
+    fn static_field_index(&self, name: &str) -> Option<usize> {
+        self.static_fields.iter().position(|field| field == name)
+    }
+}
+
+/// `WarmRunnerDesc.make_virtualizable_infos` constructor for the
+/// codewriter side, for a host whose `_virtualizable_` declaration is the
+/// transform config.
+pub fn codewriter_vinfo_from_config(
+    vtype: &str,
+    config: &GraphTransformConfig,
+) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
+    let info = CodewriterVirtualizableInfo::from_config(vtype, config)?;
+    Some(std::sync::Arc::new(info))
+}
+
+/// `is_vtypeptr(VTYPEPTR)` by name: the same path, or one path naming the
+/// other with a module prefix. A bare string suffix is not a match (`Frame`
+/// does not name `OtherFrame`).
+fn names_same_type(a: &str, b: &str) -> bool {
+    let names_tail = |path: &str, tail: &str| {
+        path.strip_suffix(tail)
+            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
+    };
+    names_tail(a, b) || names_tail(b, a)
 }
 
 /// greenfield.py `GreenFieldInfo.green_fields` membership test.
@@ -1135,6 +1248,25 @@ impl std::fmt::Display for UnknownCalleeCensus {
 
 /// `CallTarget`'s variant name, for bucketing a target no `CallPath`
 /// resolution reached.
+fn is_residual_jit_force_virtualizable(target: &CallTarget) -> bool {
+    matches!(target, CallTarget::FunctionPath { segments }
+        if segments.last().is_some_and(|name| name == "jit_force_virtualizable"))
+}
+
+fn link_arg_access_directly(arg: &LinkArg) -> bool {
+    let LinkArg::Const(c) = arg else {
+        return false;
+    };
+    let crate::flowspace::model::ConstValue::Dict(items) = &c.value else {
+        return false;
+    };
+    let key = crate::flowspace::model::ConstValue::byte_str("access_directly");
+    matches!(
+        items.get(&key),
+        Some(crate::flowspace::model::ConstValue::Bool(true))
+    )
+}
+
 fn call_target_variant_name(target: &CallTarget) -> &'static str {
     match target {
         CallTarget::Method { .. } => "Method",
@@ -3851,6 +3983,126 @@ impl CallControl {
             );
             Some(seen.into_iter().next().unwrap())
         }
+    }
+
+    /// warmspot.py `WarmRunnerDesc.finish`:
+    ///
+    /// ```python
+    /// vinfos = set([jd.virtualizable_info for jd in self.jitdrivers_sd])
+    /// for vinfo in vinfos:
+    ///     if vinfo is not None:
+    ///         vinfo.finish()
+    /// ```
+    ///
+    /// `VirtualizableInfo.finish` then walks residual
+    /// `jit_force_virtualizable` ops via
+    /// `rvirtualizable.replace_force_virtualizable_with_call`. Production
+    /// MIR has no `VTYPEPTR`; remaining force Calls are rewritten by
+    /// callee name after `make_jitcodes` has deleted the looked-inside
+    /// copies (`jtransform.rewrite_op_jit_force_virtualizable`).
+    pub fn finish(&mut self) {
+        let mut seen: Vec<std::sync::Arc<dyn VirtualizableInfoHandle>> = Vec::new();
+        for jd in &self.jitdrivers_sd {
+            let Some(vinfo) = &jd.virtualizable_info else {
+                continue;
+            };
+            let seen_already = seen
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, vinfo));
+            if !seen_already {
+                seen.push(std::sync::Arc::clone(vinfo));
+            }
+        }
+        for vinfo in seen {
+            vinfo.finish();
+        }
+        self.replace_force_virtualizable_with_call();
+    }
+
+    /// `rvirtualizable.replace_force_virtualizable_with_call` over
+    /// remaining `jit_force_virtualizable` Calls.
+    ///
+    /// `access_directly` ops are dropped; every other residual force
+    /// keeps the helper Call and is stripped to the virtualizable
+    /// argument (`op.args = [c_funcptr, op.args[0]]`). The residual
+    /// helper is already `executioncontext::jit_force_virtualizable`.
+    fn replace_force_virtualizable_with_call(&mut self) -> usize {
+        let mut count = 0;
+        for graph in self.function_graphs.values_mut() {
+            for block in &mut graph.blocks {
+                let mut newops = Vec::with_capacity(block.operations.len());
+                for mut op in block.operations.drain(..) {
+                    if let OpKind::Call { target, args, .. } = &op.kind {
+                        if is_residual_jit_force_virtualizable(target) {
+                            if args.last().is_some_and(link_arg_access_directly) {
+                                continue;
+                            }
+                            if let OpKind::Call { args, .. } = &mut op.kind {
+                                if args.len() > 1 {
+                                    args.truncate(1);
+                                }
+                            }
+                            count += 1;
+                        }
+                    }
+                    newops.push(op);
+                }
+                block.operations = newops;
+            }
+        }
+        count
+    }
+
+    /// `Transformer.get_vinfo` name-token half. `is_vtypeptr` stays the
+    /// SizeDescr-identity lookup; production MIR has no VTYPEPTR, so the
+    /// codewriter matches `red_types` / field `owner_root` against
+    /// [`VirtualizableInfoHandle::vtype_name`].
+    pub fn get_vinfo_by_owner(
+        &self,
+        owner: &str,
+    ) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
+        let mut seen: Vec<std::sync::Arc<dyn VirtualizableInfoHandle>> = Vec::new();
+        for jd in &self.jitdrivers_sd {
+            let Some(vinfo) = &jd.virtualizable_info else {
+                continue;
+            };
+            let Some(name) = vinfo.vtype_name() else {
+                continue;
+            };
+            if !names_same_type(owner, name) {
+                continue;
+            }
+            let seen_already = seen
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, vinfo));
+            if !seen_already {
+                seen.push(std::sync::Arc::clone(vinfo));
+            }
+        }
+        match seen.len() {
+            0 => None,
+            1 => Some(seen.into_iter().next().unwrap()),
+            _ => panic!("get_vinfo: multiple distinct VirtualizableInfo for owner {owner}"),
+        }
+    }
+
+    /// The single attached handle, when exactly one driver has one.
+    /// `rewrite_op_jit_force_virtualizable` uses this when the force
+    /// operand has no owner annotation.
+    pub fn unique_virtualizable_info(&self) -> Option<std::sync::Arc<dyn VirtualizableInfoHandle>> {
+        let mut seen: Vec<std::sync::Arc<dyn VirtualizableInfoHandle>> = Vec::new();
+        for jd in &self.jitdrivers_sd {
+            let Some(vinfo) = &jd.virtualizable_info else {
+                continue;
+            };
+            let seen_already = seen
+                .iter()
+                .any(|existing| std::sync::Arc::ptr_eq(existing, vinfo));
+            if !seen_already {
+                seen.push(std::sync::Arc::clone(vinfo));
+            }
+        }
+        (seen.len() == 1).then(|| seen.into_iter().next().unwrap())
     }
 
     /// call.py `could_be_green_field(GTYPE, fieldname)`.
@@ -12077,6 +12329,178 @@ mod tests {
             .clone()
             .expect("vinfo populated");
         assert!(std::sync::Arc::ptr_eq(&h0, &h1));
+    }
+
+    fn frame_declaration() -> GraphTransformConfig {
+        GraphTransformConfig {
+            vable_fields: vec![
+                VirtualizableFieldDescriptor::new("pycode", Some("Frame".into()), 1),
+                VirtualizableFieldDescriptor::new("last_instr", Some("Frame".into()), 0),
+                VirtualizableFieldDescriptor::new("depth", Some("Other".into()), 0),
+            ],
+            vable_arrays: vec![VirtualizableFieldDescriptor::new(
+                "stack",
+                Some("Frame".into()),
+                0,
+            )],
+            ..GraphTransformConfig::default()
+        }
+    }
+
+    #[test]
+    fn codewriter_vinfo_from_config_takes_the_fields_declared_on_the_vtype() {
+        let config = frame_declaration();
+        let vinfo = codewriter_vinfo_from_config("Frame", &config).expect("Frame handle");
+        assert_eq!(vinfo.vtype_name(), Some("Frame"));
+        assert_eq!(vinfo.static_field_index("last_instr"), Some(0));
+        assert_eq!(vinfo.static_field_index("pycode"), Some(1));
+        assert!(vinfo.has_array_field("stack"));
+        assert!(!vinfo.has_static_field("depth"));
+        assert!(codewriter_vinfo_from_config("interp::frame::Frame", &config).is_some());
+        assert!(codewriter_vinfo_from_config("OtherFrame", &config).is_none());
+        assert!(codewriter_vinfo_from_config("Plain", &config).is_none());
+    }
+
+    #[test]
+    fn get_vinfo_by_owner_finds_the_codewriter_handle() {
+        let mut cc = cc_with_one_driver();
+        cc.jitdrivers_sd[0].virtualizable_info =
+            codewriter_vinfo_from_config("Frame", &frame_declaration());
+        let got = cc.get_vinfo_by_owner("Frame").expect("owner match");
+        assert_eq!(got.vtype_name(), Some("Frame"));
+        assert_eq!(got.static_field_index("pycode"), Some(1));
+        assert!(cc.get_vinfo_by_owner("ExecutionContext").is_none());
+        assert!(cc.get_vinfo_by_owner("interp::frame::Frame").is_some());
+        assert!(cc.get_vinfo_by_owner("OtherFrame").is_none());
+        assert!(cc.get_vinfo_by_owner("NotFrame").is_none());
+    }
+
+    #[test]
+    fn finish_is_noop_when_no_driver_has_virtualizable_info() {
+        let mut cc = cc_with_one_driver();
+        cc.finish();
+    }
+
+    #[test]
+    fn finish_calls_each_unique_vinfo_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingVInfo {
+            finishes: Arc<AtomicUsize>,
+        }
+        impl VirtualizableInfoHandle for CountingVInfo {
+            fn is_vtypeptr(&self, _vtypeptr_id: usize) -> bool {
+                false
+            }
+            fn finish(&self) {
+                self.finishes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut cc = cc_with_one_driver();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["portal_runner_b"]),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            CallPath::from_segments(["portal_runner_b"]),
+        );
+        let finishes = Arc::new(AtomicUsize::new(0));
+        let vinfo: Arc<dyn VirtualizableInfoHandle> = Arc::new(CountingVInfo {
+            finishes: Arc::clone(&finishes),
+        });
+        cc.jitdrivers_sd[0].virtualizable_info = Some(Arc::clone(&vinfo));
+        cc.jitdrivers_sd[1].virtualizable_info = Some(vinfo);
+        cc.finish();
+        assert_eq!(
+            finishes.load(Ordering::Relaxed),
+            1,
+            "warmspot.py finish walks a unique set"
+        );
+    }
+
+    #[test]
+    fn finish_rewrites_remaining_force_calls_and_drops_access_directly() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::model::{CallTarget, OpKind, ValueType};
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("residual_force");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: crate::model::call_args(vec![frame_var.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let mut flags = std::collections::HashMap::new();
+        flags.insert(
+            ConstValue::byte_str("access_directly"),
+            ConstValue::Bool(true),
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["executioncontext", "jit_force_virtualizable"]),
+                args: vec![
+                    crate::model::LinkArg::from(frame_var.clone()),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("last_instr"))),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(flags))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: vec![
+                    crate::model::LinkArg::from(frame_var),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::byte_str("pycode"))),
+                    crate::model::LinkArg::Const(Constant::new(ConstValue::Dict(
+                        std::collections::HashMap::new(),
+                    ))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+        let path = CallPath::from_segments(["residual_force"]);
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(cc.replace_force_virtualizable_with_call(), 2);
+        let ops = &cc
+            .function_graphs()
+            .get(&path)
+            .expect("registered residual graph")
+            .block(crate::model::BlockId(0))
+            .operations;
+        assert_eq!(
+            ops.len(),
+            2,
+            "access_directly force must be dropped: {ops:?}"
+        );
+        for op in ops {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                panic!("residual force must stay a Call, got {op:?}");
+            };
+            assert!(
+                is_residual_jit_force_virtualizable(target),
+                "replace_force keeps the residual helper Call: {target:?}"
+            );
+            assert_eq!(args.len(), 1, "replace_force strips to the vable arg");
+        }
     }
 
     #[test]

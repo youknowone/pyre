@@ -1540,13 +1540,11 @@ pub(super) fn rtype_non_constant(
 /// Rust source marker for RPython
 /// `VirtualizableInstanceRepr.hook_access_field`.
 ///
-/// Upstream does not call a force helper here: the rtyper emits
-/// `jit_force_virtualizable(vinst, cname, flags)` directly.  Pyre's source
-/// marker carries only the live frame because the redirected field and flags
-/// are already fixed by the gateway.  Preserve that argument and emit the
-/// same Void LLOp; `jtransform.rewrite_op_jit_force_virtualizable` removes it
-/// from looked-inside JIT graphs, while the runtime source body remains the
-/// untranslated execution path.
+/// Upstream emits `jit_force_virtualizable(vinst, cname, flags)`
+/// directly. The source marker only names the live frame; this typer
+/// appends Void `cname` and flags so the residual matches the 3-arg
+/// hook. `jtransform.rewrite_op_jit_force_virtualizable` removes it
+/// from looked-inside JIT graphs.
 pub(super) fn rtype_jit_force_virtualizable(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
@@ -1561,8 +1559,22 @@ pub(super) fn rtype_jit_force_virtualizable(
         .ok_or_else(|| {
             TyperError::message("rtype_jit_force_virtualizable: frame repr missing".to_string())
         })?;
-    let vlist = hop.inputargs(vec![ConvertedTo::Repr(r_frame.as_ref())])?;
+    let mut vlist = hop.inputargs(vec![ConvertedTo::Repr(r_frame.as_ref())])?;
     hop.exception_cannot_occur()?;
+    // `VirtualizableInstanceRepr.hook_access_field` emits
+    // `jit_force_virtualizable(vinst, cname, cflags)`. The source marker
+    // only names the live frame; synthesize the Void field name and
+    // flags dict so `replace_force_virtualizable_with_call` can read
+    // `op.args[-1].value.get('access_directly')` and
+    // `rewrite_op_jit_force_virtualizable` can file `vable_flags`.
+    vlist.push(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::byte_str(""),
+        LowLevelType::Void,
+    )));
+    vlist.push(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::Dict(std::collections::HashMap::new()),
+        LowLevelType::Void,
+    )));
     // This is a call returning None, not an operation with an impossible
     // result. LowLevelOpList.genop(resulttype=lltype.Void) returns its Void
     // Variable, as ExtLoopHeader.specialize_call does for a source marker.
@@ -4768,9 +4780,9 @@ mod tests {
     /// from a looked-inside graph.  A wrong arity, a lost repr conversion or a
     /// missing exception declaration would break every gateway silently.
     #[test]
-    fn rtype_jit_force_virtualizable_emits_a_one_argument_void_llop() {
+    fn rtype_jit_force_virtualizable_emits_a_three_argument_void_llop() {
         use crate::annotator::model::SomeInteger;
-        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::flowspace::model::{ConstValue, Hlvalue, Variable};
         use crate::translator::rtyper::rint::IntegerRepr;
 
         let hop = dummy_hop();
@@ -4797,12 +4809,23 @@ mod tests {
         assert_eq!(last.opname, "jit_force_virtualizable");
         assert_eq!(
             last.args.len(),
-            1,
-            "the marker carries the live frame and nothing else",
+            3,
+            "hook_access_field emits [vinst, cname, cflags]",
         );
         match &last.args[0] {
             Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Signed)),
             other => panic!("the frame argument must stay a Variable, got {other:?}"),
+        }
+        match &last.args[1] {
+            Hlvalue::Constant(c) => assert_eq!(c.concretetype, Some(LowLevelType::Void)),
+            other => panic!("cname must be a Void constant, got {other:?}"),
+        }
+        match &last.args[2] {
+            Hlvalue::Constant(c) => {
+                assert_eq!(c.concretetype, Some(LowLevelType::Void));
+                assert!(matches!(c.value, ConstValue::Dict(_)));
+            }
+            other => panic!("cflags must be a Void dict constant, got {other:?}"),
         }
         match &last.result {
             Hlvalue::Variable(v) => assert_eq!(v.concretetype(), Some(LowLevelType::Void)),

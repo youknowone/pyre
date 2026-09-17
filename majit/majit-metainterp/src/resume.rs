@@ -9025,7 +9025,7 @@ pub fn blackhole_from_resumedata<'a>(
 ///
 /// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache
 /// parity — plus the virtualizable the vable section named, which the caller
-/// needs as the cache key (see `MetaInterp::save_forced_virtuals`).
+/// writes onto the deadframe via `cpu.set_savedata_ref`.
 #[allow(clippy::needless_lifetimes)]
 #[expect(
     clippy::too_many_arguments,

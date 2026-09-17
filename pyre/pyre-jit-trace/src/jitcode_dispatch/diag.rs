@@ -564,11 +564,13 @@ pub(crate) fn fbw_depth_census_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_DEPTH_CENSUS").is_some())
 }
 
-/// Record the post-push framestack. The histogram's last slot is the `>=32`
-/// bucket; all earlier slots correspond to their one-based depth.
+/// Record the post-push inline depth. The portal frame at `framestack[0]` is
+/// not an inlined callee and is not counted. The histogram's last slot is the
+/// `>=32` bucket; all earlier slots correspond to their one-based depth.
 pub(crate) fn fbw_depth_census_record(framestack: &[InlineFrame]) {
     let ordering = std::sync::atomic::Ordering::Relaxed;
-    let depth = framestack.len();
+    let inline = || framestack.iter().filter(|frame| !frame.is_portal);
+    let depth = inline().count();
     debug_assert!(depth > 0);
     FBW_DEPTH_ENTRIES.fetch_add(1, ordering);
     FBW_DEPTH_HIST[depth.saturating_sub(1).min(FBW_DEPTH_HIST_BUCKETS - 1)].fetch_add(1, ordering);
@@ -577,7 +579,7 @@ pub(crate) fn fbw_depth_census_record(framestack: &[InlineFrame]) {
         let mut deepest = FBW_DEPTH_DEEPEST.lock();
         if depth > FBW_DEPTH_MAX.load(ordering) {
             deepest.clear();
-            deepest.extend(framestack.iter().map(|frame| frame.w_code));
+            deepest.extend(inline().map(|frame| frame.w_code));
             FBW_DEPTH_MAX.store(depth, ordering);
         }
     }

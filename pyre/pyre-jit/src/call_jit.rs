@@ -2265,6 +2265,7 @@ fn jit_blackhole_resume_from_guard(
         let all_virtuals = if descr_arc.is_guard_forced() {
             crate::eval::take_forced_virtuals_for_frame(
                 fail0 as *const pyre_interpreter::pyframe::PyFrame,
+                crate::eval::savedata_from_jitframe(deadframe),
             )
         } else {
             None
@@ -4745,6 +4746,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             raw_values: Vec<i64>,
             guard_value_operand: Option<i64>,
             guard_exc: i64,
+            savedata: Option<majit_ir::GcRef>,
         },
     }
     let outcome = {
@@ -4797,6 +4799,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 })
                 .collect();
             let guard_exc = backend.grab_exc_value(&frame).0 as i64;
+            let savedata = backend.get_savedata_ref(&frame);
             Outcome::Deopt {
                 descr_arc,
                 green_key,
@@ -4804,6 +4807,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 raw_values,
                 guard_value_operand,
                 guard_exc,
+                savedata,
             }
         }
     };
@@ -4827,6 +4831,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             raw_values,
             guard_value_operand,
             mut guard_exc,
+            savedata,
         } => {
             // `grab_exc_value` cleared the only root for the pending exception
             // (dynasm `ca_helper`, llmodel.py:240); root the bare carrier while
@@ -4893,6 +4898,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 guard_exc,
                 forced_cache_owner,
                 false,
+                savedata,
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
@@ -7776,15 +7782,14 @@ pub fn cranelift_resumedata_deopt(
     let backend = driver.meta_interp().backend();
     let descr = backend.fail_descr_arc_from_addr(descr_addr);
 
-    // 2. Downcast to ResumeGuardDescr.  Synthetic FINISH /
+    // 2. Unwrap to ResumeGuardDescr. Forced/exc wrappers return themselves
+    //    from `as_any` so subtype downcasts work; the resume payload lives
+    //    on the inner base (`resume_guard_descr`). Synthetic FINISH /
     //    ExitFrameWithException / external-JUMP descrs have no `rd_*`
     //    payload upstream (compile.py:624-662) — they short-circuit
     //    here.  Callers fall back to the recovery_layout walker for
     //    these until the synthetic construction path is restructured.
-    let Some(any) = descr.as_any() else {
-        return false;
-    };
-    let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
+    let Some(rgd) = majit_metainterp::resume_guard_descr(&descr) else {
         return false;
     };
 

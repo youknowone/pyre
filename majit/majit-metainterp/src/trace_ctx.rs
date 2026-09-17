@@ -684,14 +684,14 @@ pub struct TraceCtx {
     /// `None` outside the brief window between the dispatch-site stash
     /// and the jitdriver-side drain.
     pub(crate) pending_switch_to_blackhole: Option<crate::pyjitpl::SwitchToBlackhole>,
-    /// `pyjitpl.py _nonstandard_virtualizable` Step 4 calls
-    /// `self.metainterp.replace_box`, which rewrites every `MIFrame`
-    /// register bank before the vref / vable / heapcache walks.
-    /// `TraceCtx::replace_box` owns only those three walks; the
-    /// framestack lives on the jitcode machine / walker. Step 4 stashes
-    /// the alias here so the caller that owns the frames can finish the
-    /// same `replace_box` after the vable op returns.
-    pending_box_replace: Option<(OpRef, OpRef)>,
+    /// Framestack half of `pyjitpl.py MetaInterp.replace_box`.
+    ///
+    /// `_nonstandard_virtualizable` calls `self.metainterp.replace_box`
+    /// immediately (`pyjitpl.py` `if isstandard: replace_box`). The
+    /// framestack lives on the jitcode machine / walker, so that owner
+    /// installs this hook for the duration of a vable op. `None` is the
+    /// test path with no live frames.
+    replace_frames: Option<(unsafe fn(*mut (), OpRef, OpRef), *mut ())>,
 
     /// `pyjitpl.py MetaInterp.virtualref_boxes`: pairs of `[virtualbox,
     /// vrefbox]` for every `opimpl_virtual_ref` ↔ `opimpl_virtual_ref_finish`
@@ -1381,13 +1381,62 @@ impl TraceCtx {
         self.pending_guard_not_invalidated_pc = pc;
     }
 
-    /// The framestack half of `pyjitpl.py MetaInterp.replace_box`.
+    /// Install the framestack half of `MetaInterp.replace_box` for one
+    /// vable op. `walk` receives `(framestack, old, new)`.
     ///
-    /// `_nonstandard_virtualizable` Step 4 records the alias after
-    /// `TraceCtx::replace_box`. The owner of the live `MIFrame` /
-    /// walker register banks drains it and rewrites those banks.
-    pub fn take_pending_box_replace(&mut self) -> Option<(OpRef, OpRef)> {
-        self.pending_box_replace.take()
+    /// # Safety
+    /// `data` must stay a valid `walk` receiver until
+    /// [`Self::clear_replace_frames`] or the next `set_replace_frames`.
+    pub unsafe fn set_replace_frames(
+        &mut self,
+        walk: Option<unsafe fn(*mut (), OpRef, OpRef)>,
+        data: *mut (),
+    ) {
+        self.replace_frames = walk.map(|walk| (walk, data));
+    }
+
+    pub fn clear_replace_frames(&mut self) {
+        self.replace_frames = None;
+    }
+
+    /// `fielddescr.get_vinfo()` including the codewriter
+    /// `vable_static_field_descr` / `vable_array_field_descr` singletons,
+    /// which implement only `Descr`. Resolve them through the live
+    /// vinfo's identity map to the finalize_arc FieldDescr that holds
+    /// the Weak backref (`vinfo is fielddescr.get_vinfo()`).
+    fn vinfo_from_fielddescr(
+        &self,
+        fielddescr: &DescrRef,
+    ) -> Option<std::sync::Arc<dyn majit_ir::descr::VinfoMarker>> {
+        if let Some(v) = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo()) {
+            return Some(v);
+        }
+        let vi = self.virtualizable_info.as_ref()?;
+        if let Some(idx) = vi.static_field_by_descr(fielddescr) {
+            return vi
+                .static_field_descr(idx)
+                .as_field_descr()
+                .and_then(|fd| fd.get_vinfo());
+        }
+        if let Some(idx) = vi.array_field_by_descr(fielddescr) {
+            return vi
+                .array_pointer_field_descr(idx)
+                .as_field_descr()
+                .and_then(|fd| fd.get_vinfo());
+        }
+        None
+    }
+
+    /// `pyjitpl.py _nonstandard_virtualizable`:
+    /// `self.metainterp.replace_box(box, standard_box)`.
+    /// Framestack first, then vref / vable / heapcache.
+    fn replace_standard_vable(&mut self, oldbox: OpRef, newbox: OpRef) {
+        if let Some((walk, data)) = self.replace_frames {
+            unsafe {
+                walk(data, oldbox, newbox);
+            }
+        }
+        self.replace_box(oldbox, newbox);
     }
 
     /// pyjitpl.py:1776-1780: jit.isvirtual(obj) — check if an object
@@ -1865,7 +1914,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
-            pending_box_replace: None,
+            replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -1966,7 +2015,7 @@ impl TraceCtx {
             resumekey_original_loop_token: None,
             cpu: None,
             pending_switch_to_blackhole: None,
-            pending_box_replace: None,
+            replace_frames: None,
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
@@ -2626,8 +2675,28 @@ impl TraceCtx {
             self.virtualizable_live_null_slots = Some(vec![false; values.len()]);
             self.virtualizable_values = Some(values);
         }
-        self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
+        self.retain_or_store_vinfo(info);
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
+    }
+
+    /// Keep `jitdriver_sd.virtualizable_info` as the trace's vinfo so
+    /// `vinfo is fielddescr.get_vinfo()` can be object identity.
+    pub fn install_virtualizable_info(
+        &mut self,
+        info: std::sync::Arc<crate::virtualizable::VirtualizableInfo>,
+    ) {
+        self.virtualizable_info = Some(info);
+    }
+
+    fn retain_or_store_vinfo(&mut self, info: &crate::virtualizable::VirtualizableInfo) {
+        if self
+            .virtualizable_info
+            .as_ref()
+            .is_some_and(|existing| std::ptr::eq(existing.as_ref(), info))
+        {
+            return;
+        }
+        self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
     }
 
     /// \[FR\] The current standard virtualizable's info (shape), if any.  A
@@ -3800,7 +3869,7 @@ impl TraceCtx {
             self.virtualizable_live_null_slots = None;
         }
         self.virtualizable_boxes = Some(boxes);
-        self.virtualizable_info = Some(std::sync::Arc::new(info.clone()));
+        self.retain_or_store_vinfo(info);
         self.virtualizable_array_lengths = Some(array_lengths.to_vec());
     }
 
@@ -4177,7 +4246,7 @@ impl TraceCtx {
         // returns `None` and pyre falls back to the active
         // `self.virtualizable_info` slot so the existing by-value
         // test harness keeps working.
-        let marker = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
+        let marker = self.vinfo_from_fielddescr(fielddescr);
         let (token_descr, clear_ptr, clear_descr) = {
             let info_ref: &VirtualizableInfo = if let Some(ref m) = marker {
                 m.as_any()
@@ -4338,20 +4407,17 @@ impl TraceCtx {
             // PTR_EQ/replace_box short-circuit and falls through to Step 5 —
             // same behaviour as upstream when the fielddescr came from a
             // different jitdriver's vinfo.
-            let descriptor_vinfo = fielddescr.as_field_descr().and_then(|fd| fd.get_vinfo());
-            let descriptor_has_matching_vinfo = match descriptor_vinfo {
-                // Backref stamped by `finalize_arc` → concrete type must be
-                // our `VirtualizableInfo`.  Pyre's single-driver model means
-                // every marker that downcasts successfully is the active
-                // vinfo; this is the structural mirror of upstream's Python
-                // `vinfo is fielddescr.get_vinfo()` identity check.
-                Some(ref m) => m.as_any().is::<VirtualizableInfo>(),
-                // Legacy by-value descriptor → no backref to compare
-                // against.  Treat as "matching" so the PTR_EQ/replace_box
-                // block still runs for test harnesses that pre-date
-                // `finalize_arc`.  Production pyre always stamps backrefs.
-                None => true,
-            };
+            let descriptor_vinfo = self.vinfo_from_fielddescr(fielddescr);
+            // pyjitpl.py `_nonstandard_virtualizable`:
+            // `vinfo is fielddescr.get_vinfo()`. Object identity, not type.
+            let descriptor_has_matching_vinfo =
+                match (self.virtualizable_info.as_ref(), descriptor_vinfo.as_ref()) {
+                    (Some(active), Some(marker)) => marker
+                        .as_any()
+                        .downcast_ref::<VirtualizableInfo>()
+                        .is_some_and(|descr_info| std::ptr::eq(active.as_ref(), descr_info)),
+                    _ => false,
+                };
             if descriptor_has_matching_vinfo {
                 let standard_concrete = self.standard_virtualizable_concrete();
                 // pyjitpl.py `eqbox = self.metainterp.execute_and_record(
@@ -4391,26 +4457,17 @@ impl TraceCtx {
                     Some(Value::Int(isstandard)),
                     0,
                 );
-                self.promote_int(eqbox, isstandard, 0);
+                let promoted = self.promote_int(eqbox, isstandard, 0);
+                // `MIFrame.implement_guard_value`: `self.metainterp.replace_box(box, promoted)`.
+                if promoted != eqbox {
+                    self.replace_standard_vable(eqbox, promoted);
+                }
                 if isstandard != 0 {
                     // `_nonstandard_virtualizable`'s `if box.type == 'r':
                     //     self.metainterp.replace_box(box, standard_box)`.
                     // Virtualizables are always Refs here, so the
                     // `box.type == 'r'` check is unconditional.
-                    //
-                    // Upstream's `MetaInterp.replace_box` also walks the
-                    // framestack, rewriting the box in every frame's active
-                    // registers; this one rewrites only the records `TraceCtx`
-                    // owns, so an alias of `vable_opref` sitting in a register
-                    // would keep naming the nonstandard box.
-                    //
-                    // `self.metainterp.replace_box` also walks every
-                    // `MIFrame` register bank. This method owns only the
-                    // vref / vable / heapcache half; the jitcode machine
-                    // and the walker drain `take_pending_box_replace` to
-                    // finish the same walk on the frames they own.
-                    self.replace_box(vable_opref, standard_box);
-                    self.pending_box_replace = Some((vable_opref, standard_box));
+                    self.replace_standard_vable(vable_opref, standard_box);
                     return false;
                 }
             }
@@ -4435,10 +4492,7 @@ impl TraceCtx {
             // assert vinfo is not None`. A plain heap FieldDescr (test harness)
             // has no backref and no active `virtualizable_info`; skip the
             // COND_CALL rather than invent a force helper.
-            let can_emit = fielddescr
-                .as_field_descr()
-                .and_then(|fd| fd.get_vinfo())
-                .is_some()
+            let can_emit = self.vinfo_from_fielddescr(fielddescr).is_some()
                 || self.virtualizable_info.is_some();
             if can_emit {
                 self.emit_force_virtualizable(fielddescr, vable_opref);
@@ -6318,18 +6372,73 @@ mod tests {
     }
 
     #[test]
-    fn replace_box_does_not_by_itself_queue_a_framestack_rewrite() {
+    fn replace_box_does_not_install_a_framestack_hook() {
         // `pyjitpl.py replace_box` always walks frames, but
         // `TraceCtx::replace_box` is only the vref/vable/heapcache half.
-        // The framestack pending is armed only by `_nonstandard_virtualizable`
-        // Step 4, which is the one caller that used to skip the walk.
+        // The framestack hook is installed by the owner of the live frames.
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
         let old = OpRef::input_arg_ref(0);
         let new = OpRef::input_arg_ref(1);
         ctx.replace_box(old, new);
         assert!(
-            ctx.take_pending_box_replace().is_none(),
-            "a bare replace_box must not invent a framestack alias"
+            ctx.replace_frames.is_none(),
+            "a bare replace_box must not invent a framestack walk"
+        );
+    }
+
+    #[test]
+    fn nonstandard_standard_alias_walks_framestack_immediately() {
+        // `_nonstandard_virtualizable` Step 4: two boxes, same pointer,
+        // matching vinfo → `replace_box` at the promote itself.
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(16));
+        let fd = info.static_field_descr(0);
+
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let alias = recorder.record_input_arg(Type::Ref);
+        let field = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let pointer = Value::Ref(majit_ir::GcRef(0x1000));
+        ctx.set_opref_concrete(standard, pointer);
+        ctx.set_opref_concrete(alias, pointer);
+        ctx.install_virtualizable_info(info.clone());
+        ctx.set_virtualizable_boxes_with_info(
+            vec![field, standard],
+            vec![Value::Int(0), pointer],
+            info.as_ref(),
+            &[],
+        );
+
+        let mut walked = std::cell::Cell::new(None::<(OpRef, OpRef)>);
+        unsafe fn walk(data: *mut (), oldbox: OpRef, newbox: OpRef) {
+            let slot = unsafe { &*data.cast::<std::cell::Cell<Option<(OpRef, OpRef)>>>() };
+            slot.set(Some((oldbox, newbox)));
+        }
+        unsafe { ctx.set_replace_frames(Some(walk), &raw mut walked as *mut ()) };
+        let nonstandard = ctx.nonstandard_virtualizable(0, alias, &fd);
+        ctx.clear_replace_frames();
+
+        assert!(
+            !nonstandard,
+            "same-pointer alias must become the standard virtualizable"
+        );
+        assert_eq!(
+            walked.get(),
+            Some((alias, standard)),
+            "the framestack hook must run inside replace_box, not after a drain"
+        );
+        assert_eq!(
+            ctx.virtualizable_boxes
+                .as_ref()
+                .map(|boxes| boxes.as_slice()),
+            Some([field, standard].as_slice()),
+            "replace_box must already have walked virtualizable_boxes"
         );
     }
 
@@ -6942,9 +7051,113 @@ mod tests {
         assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
     }
 
+    /// `pyjitpl.py _nonstandard_virtualizable`: `vinfo is fielddescr.get_vinfo()`
+    /// is false for a different VirtualizableInfo object.
+    #[test]
+    fn foreign_vinfo_skips_standard_ptr_eq() {
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info_a = make_test_vable_info();
+        info_a.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info_a = info_a.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let mut info_b = make_test_vable_info();
+        info_b.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info_b = info_b.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info_a.static_field_descr(0);
+
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let other = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.install_virtualizable_info(info_b);
+        ctx.virtualizable_boxes = Some(vec![standard]);
+        ctx.set_opref_concrete(standard, Value::Ref(majit_ir::GcRef(1)));
+        ctx.set_opref_concrete(other, Value::Ref(majit_ir::GcRef(1)));
+        let _ = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, other, 0, fd);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::PtrEq),
+            "vinfo is fielddescr.get_vinfo() is false for a different info, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn matching_vinfo_takes_the_standard_ptr_eq_arm() {
+        extern "C" fn clear_vable_noop(_vable: *mut u8) {}
+        let mut info = make_test_vable_info();
+        info.set_clear_vable(
+            clear_vable_noop as *const (),
+            crate::virtualizable::VirtualizableInfo::make_clear_vable_descr(),
+        );
+        let info = info.finalize_arc(majit_ir::descr::make_size_descr(64));
+        let fd = info.static_field_descr(0);
+
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let other = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        let field_box = ctx.const_int(0);
+        ctx.install_virtualizable_info(info.clone());
+        ctx.init_virtualizable_boxes(
+            &info,
+            standard,
+            Value::Ref(majit_ir::GcRef(1)),
+            &[field_box],
+            &[Value::Int(0)],
+            &[],
+        );
+        ctx.set_opref_concrete(standard, Value::Ref(majit_ir::GcRef(1)));
+        ctx.set_opref_concrete(other, Value::Ref(majit_ir::GcRef(1)));
+        let _ = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, other, 0, fd);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::PtrEq),
+            "the same vinfo must enter the PTR_EQ arm, got {ops:?}"
+        );
+    }
+
     /// `pyjitpl.py _nonstandard_virtualizable`: empty `virtualizable_boxes`
     /// is the `vinfo is None` arm of the standard-box gate. Step 5 still
     /// emits `emit_force_virtualizable` before returning True.
+    /// `pyjitpl.py _nonstandard_virtualizable`: `if vinfo is fielddescr.get_vinfo()`
+    /// is false when the descr has no vinfo. Do not PTR_EQ / replace_box.
+    #[test]
+    fn foreign_fielddescr_skips_standard_ptr_eq() {
+        let mut recorder = Trace::new();
+        let standard = recorder.record_input_arg(Type::Ref);
+        let other = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.virtualizable_boxes = Some(vec![standard]);
+        let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
+        let _ = ctx.vable_getfield_int(crate::cpu::default_cpu().as_ref(), 0, other, 0, fd8);
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.iter().all(|op| op.opcode != OpCode::PtrEq),
+            "a descr with no vinfo must not enter the PTR_EQ arm, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == OpCode::GetfieldGcI),
+            "nonstandard getfield still records the heap load, got {ops:?}"
+        );
+    }
+
     #[test]
     fn empty_boxes_still_emits_force_virtualizable() {
         extern "C" fn clear_vable_noop(_vable: *mut u8) {}

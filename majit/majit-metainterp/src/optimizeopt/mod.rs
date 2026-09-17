@@ -4587,6 +4587,12 @@ impl OptContext {
         // matching PyPy `op.set_forwarded(preamble_info)` object sharing.
         let is_virtual = preamble_info_handle.borrow().is_virtual();
         if is_virtual {
+            // unroll.py `setinfo_from_preamble` virtual arm: always
+            // `op.set_forwarded(preamble_info)` and recurse. A
+            // constant-filled wrapint, range, or range-iterator must
+            // stay virtual so Phase 2 still sees the field boxes
+            // (`for _ in range(4)` otherwise becomes
+            // `'int' object is not an iterator`).
             let resolved = op_box.get_box_replacement(false);
             if !resolved.is_constant() {
                 resolved.set_forwarded_info(crate::optimizeopt::info::OpInfo::Ptr(

@@ -996,7 +996,8 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         | ConstValue::LLAddress(_)
         | ConstValue::Atom(_)
         | ConstValue::SpecTag(_)
-        | ConstValue::Placeholder => false,
+        | ConstValue::Placeholder
+        | ConstValue::Opaque(_) => false,
     }
 }
 

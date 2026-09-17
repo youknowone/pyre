@@ -291,17 +291,23 @@ pub(crate) fn classify_vstack_opcode(
     }
 }
 
-/// The boxed constant a value `LOAD_CONST` pushes, as a trace-constant OpRef,
-/// or `OpRef::NONE` when `instr` is not a `LOAD_CONST` (or its constant is
-/// unresolvable). Realizes the constant the same way `bh_load_const_fn`
-/// (`call_jit.rs`) and the LOAD_CONST fold (`residual_call.rs`) do, so the
-/// mirror carries the identical box the resume path would.
+/// The boxed constant a value `LOAD_CONST` / `LOAD_SMALL_INT` pushes, as a
+/// trace-constant OpRef, or `OpRef::NONE` when `instr` is neither (or its
+/// constant is unresolvable). Realizes the constant the same way
+/// `bh_load_const_fn` / `w_small_int_const` do, so the mirror carries the
+/// identical box the resume path would.
 fn loadconst_operand_ref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &pyre_interpreter::CodeObject,
     instr: &pyre_interpreter::bytecode::Instruction,
     op_arg: pyre_interpreter::OpArg,
 ) -> OpRef {
+    if let pyre_interpreter::bytecode::Instruction::LoadSmallInt { i } = instr {
+        let val = i.get(op_arg) as u32 as i64;
+        return ctx
+            .trace_ctx
+            .const_ref(pyre_object::w_small_int_const(val) as i64);
+    }
     let pyre_interpreter::bytecode::Instruction::LoadConst { consti } = instr else {
         return OpRef::NONE;
     };
@@ -625,20 +631,12 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // stack_sync omits the slot and resume rematerializes it.
                 let mut top = ctx.frame_state.borrow().vstack_last_ref;
                 if top == OpRef::NONE {
-                    // A value `LOAD_CONST` (large int / float) routes its result
-                    // through the unboxed int/float bank, so `write_ref_reg`
-                    // never stamps `vstack_last_ref` and this slot would stay a
-                    // NONE hole. Unlike a genuine int-bank temp, a constant has
-                    // no live register the resume can re-box from, so `stack_sync`
-                    // omitting it leaves the bridge-resumed slot NULL — fatal when
-                    // it is a following CALL argument (a literal `f(1000)` in a
-                    // hot loop makes the callee parameter reconstruct unbound).
-                    // Materialize the boxed constant so the mirror carries it,
-                    // mirroring `MIFrame.registers_r` holding a `Const` box for
-                    // the same operand (resume numbers it via `getconst`). A
-                    // Ref-typed const (str / code) already stamped
-                    // `vstack_last_ref` through `write_ref_reg`, so it never
-                    // reaches this fallback.
+                    // A value `LOAD_CONST` (large int / float) routes its
+                    // result through the unboxed int/float bank, so
+                    // `write_ref_reg` never stamps `vstack_last_ref`.
+                    // Residual `box_int_fn` (`LOAD_SMALL_INT`) does stamp
+                    // the fresh wrapint; keep that identity. Only fill a
+                    // NONE hole from `getconstant_w` / `w_small_int_const`.
                     top = loadconst_operand_ref(ctx, code, &instr, op_arg);
                 }
                 ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;

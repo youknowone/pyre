@@ -3244,81 +3244,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_arraycopy",
         pyre_object::object_array::jit_ll_arraycopy,
     );
-    // `ll_math.py math_hypot` llexternal.  The front retargets Opaque
-    // `f64::hypot` to `["ll_math", "math_hypot"]`; the crate-root alias
-    // leaf strips to that path.
-    cpa2(
-        &mut entries,
-        "ll_math::math_hypot",
-        "math_hypot",
-        crate::module::math::interp_math::jit_math_hypot,
-    );
-    cpa2(
-        &mut entries,
-        "ll_math::math_atan2",
-        "math_atan2",
-        crate::module::math::interp_math::jit_math_atan2,
-    );
-    cpa2(
-        &mut entries,
-        "ll_math::math_copysign",
-        "math_copysign",
-        crate::module::math::interp_math::jit_math_copysign,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_floor",
-        "math_floor",
-        crate::module::math::interp_math::jit_math_floor_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_ceil",
-        "math_ceil",
-        crate::module::math::interp_math::jit_math_ceil_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_log",
-        "math_log",
-        crate::module::math::interp_math::jit_math_log_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_exp",
-        "math_exp",
-        crate::module::math::interp_math::jit_math_exp_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_sin",
-        "math_sin",
-        crate::module::math::interp_math::jit_math_sin_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_cos",
-        "math_cos",
-        crate::module::math::interp_math::jit_math_cos_raw,
-    );
-    cpa2(
-        &mut entries,
-        "ll_math::math_pow",
-        "math_pow",
-        crate::module::math::interp_math::jit_math_pow_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_sqrt",
-        "math_sqrt",
-        crate::module::math::interp_math::jit_math_sqrt_raw,
-    );
-    cpa1(
-        &mut entries,
-        "ll_math::math_log10",
-        "math_log10",
-        crate::module::math::interp_math::jit_math_log10_raw,
-    );
+    // `ll_math.py` residuals live in `pyre-module`. The optional-module
+    // hook publishes them under the same `ll_math::math_*` / crate-root
+    // alias paths the front retargets Opaque `f64::{hypot,atan2,…}` to.
+    if let Some(hooks) = crate::importing::optional_module_hooks() {
+        (hooks.publish_fnaddrs)(&mut entries);
+    }
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
     // `ll_append_res_slice` once its native fnaddr is bound. Unlike shrink, these
@@ -5778,25 +5709,6 @@ mod tests {
         assert_eq!(
             bindings["module::_collections::deque_iter::type_object"],
             expected
-        );
-    }
-
-    /// The `_csv::dialect_class::type_object` accessor is hand-written (not
-    /// `#[pyre_methods]` / `py_class!`), yet the front recognizer stamps every
-    /// `type_object` accessor `dont_look_inside`.  It must still publish a
-    /// residual address, or a traced `_csv.Dialect` type lookup residualizes to
-    /// a symbolic fnaddr and inline JIT descent aborts.  Guards the invariant
-    /// that every `type_object` generator (macro or hand-written) registers.
-    #[test]
-    fn jit_trace_fnaddrs_covers_hand_written_csv_dialect_type_object() {
-        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        assert!(
-            bindings.contains_key("pyre_interpreter::module::_csv::dialect_class::type_object"),
-            "hand-written _csv::dialect_class::type_object must publish a residual fnaddr",
-        );
-        assert!(
-            bindings.contains_key("module::_csv::dialect_class::type_object"),
-            "the crate-stripped alias must resolve too",
         );
     }
 

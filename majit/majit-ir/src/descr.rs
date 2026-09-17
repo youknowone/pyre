@@ -5632,10 +5632,11 @@ pub fn vable_array_descr(idx: u16) -> DescrRef {
 /// (after `v_inst`) and `setfield_vable_<kind>` (after `v_inst,
 /// v_value`).
 ///
-/// `interp_jit.py:25-30` has 5 scalar fields in fixed order:
-/// `[last_instr, pycode, valuestackdepth, debugdata, w_globals]`, so
-/// legitimate `idx` values are `0..=4`. The canonical table is
-/// `pyre-jit-trace/src/virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
+/// `PyFrame._virtualizable_` lists five names, but
+/// `InstanceRepr._parse_field_list` skips `w_globals` — PyFrame has no
+/// such field after `frame_stores_global`. The scalar subset is
+/// `PYFRAME_VABLE_FIELDS`: `last_instr`, `pycode`, `valuestackdepth`,
+/// `debugdata`. Legitimate `idx` values are `0..=3`.
 /// The struct stores only the per-field
 /// index; bytecode emission and runtime field access still go
 /// through the field-idx-to-offset table maintained by
@@ -5661,16 +5662,10 @@ impl Descr for VableStaticFieldDescr {
 }
 
 /// Number of `OnceLock<DescrRef>` slots reserved for
-/// `vable_static_field_descr(idx)` singletons. Matches the exact
-/// scalar-field count of PyFrame's virtualizable
-/// (`interp_jit.py:25-30`: `last_instr, pycode, valuestackdepth,
-/// debugdata, w_globals`), with the canonical table at
-/// `pyre-jit-trace/src/virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`.
-/// This mirrors
-/// `rpython/jit/metainterp/virtualizable.py:71`'s
-/// `static_field_descrs = [... for name in static_fields]` which
-/// is sized exactly to `len(static_fields)`. Bump this when the
-/// PyFrame `_virtualizable_` declaration grows.
+/// `vable_static_field_descr(idx)` singletons. `virtualizable.py`
+/// `static_field_descrs` is sized to `len(static_fields)` per vinfo.
+/// This array is the shared ceiling for every vtype that uses the
+/// singleton (PyFrame has 4; jit_interp machines can need 5).
 const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 5;
 
 /// Singleton accessor for `static_field_descrs[idx]`.
@@ -5694,8 +5689,7 @@ pub fn vable_static_field_descr(idx: u16) -> DescrRef {
     assert!(
         i < VABLE_STATIC_FIELD_DESCR_SLOTS,
         "vable_static_field_descr: idx={} exceeds VABLE_STATIC_FIELD_DESCR_SLOTS={}; \
-         pyre's PyFrame _virtualizable_ declares only {} static fields \
-         (interp_jit.py:25-30)",
+         PYFRAME_VABLE_FIELDS has {} static fields",
         idx,
         VABLE_STATIC_FIELD_DESCR_SLOTS,
         VABLE_STATIC_FIELD_DESCR_SLOTS,

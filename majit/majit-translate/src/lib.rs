@@ -1070,19 +1070,14 @@ fn analyze_pipeline_from_module_paths(
     // off the class before it mints `access_directly`. Pyre has no `ClassDesc`
     // at that point, so the declaration arrives with the config — and it is
     // already there: every `VirtualizableFieldDescriptor` the consumer builds
-    // carries the `owner_root` that declares it. Derive the registry from that
+    // carries the `owner_root` that declares it and the field it lists. Derive
+    // the registry from that
     // rather than taking a second, out-of-band declaration, so the set the
     // front end reads is a property of THIS invocation's config instead of
     // whatever the thread was last told. A config that declares no owner
     // leaves the set empty, which fails closed at the minter's class test.
-    crate::virtualizable_decl::register_virtualizable_roots(
-        config
-            .pipeline
-            .transform
-            .vable_fields
-            .iter()
-            .chain(config.pipeline.transform.vable_arrays.iter())
-            .filter_map(|field| field.owner_root.clone()),
+    crate::virtualizable_decl::register_virtualizable_declarations(
+        crate::virtualizable_decl::declarations_from_config(&config.pipeline.transform),
     );
     let mut program = build_semantic_program_via_active_frontend(
         module_paths,
@@ -2439,6 +2434,11 @@ fn analyze_pipeline_from_module_paths(
     let (jitcodes, indirectcalltarget_indices, insns, descrs, all_liveness) =
         make_jitcodes(&config.pipeline, &mut call_control, &mut prof);
     mark_phase!("make_jitcodes");
+    // warmspot.py `WarmRunnerDesc.finish` after `make_jitcodes`: unique
+    // `vinfo.finish()` then `replace_force_virtualizable_with_call` over
+    // remaining residual force ops. Looked-inside copies are already
+    // deleted by `rewrite_op_jit_force_virtualizable`.
+    call_control.finish();
     // callee census: how many callees the six `getcalldescr` analyzers answer as
     // upstream's declared-external arm without a declaration behind them.
     // Off by default — it is a whole extra walk of the registered universe,
