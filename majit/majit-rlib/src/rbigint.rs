@@ -3388,12 +3388,14 @@ fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
     let size_lo = size_n.min(size);
     // rbigint.py `_kmul_split` copies `n._digits[:size_lo]` once into the
     // new rbigint. `RBigInt::new` is that copy (`Digits::new`).
-    let mut lo = if size_lo == 0 {
+    let lo = if size_lo == 0 {
         RBigInt::zero()
     } else {
         RBigInt::new(&n.digits()[..size_lo as usize], 1, size_lo)
     };
-    let mut hi = if size_lo == size_n {
+    // `RBigInt::new` for `hi` can collect; keep `lo._digits` live.
+    let lo = RBigIntGcRoot::new(lo);
+    let hi = if size_lo == size_n {
         RBigInt::zero()
     } else {
         RBigInt::new(
@@ -3402,6 +3404,9 @@ fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
             size_n - size_lo,
         )
     };
+    let hi = RBigIntGcRoot::new(hi);
+    let mut lo = (*lo).clone();
+    let mut hi = (*hi).clone();
     lo._normalize();
     hi._normalize();
     (hi, lo)
@@ -3713,10 +3718,8 @@ pub fn _divrem(a: &RBigInt, b: &RBigInt) -> Result<(RBigInt, RBigInt), RBigIntEr
     let (mut z, mut rem) = if size_b == 1 {
         let (z, urem) = _divrem1(a, b.digit(0));
         let z = RBigIntGcRoot::new(z);
-        (
-            (*z).clone(),
-            RBigInt::new(&[urem as Digit], if urem != 0 { 1 } else { 0 }, 1),
-        )
+        let rem = RBigInt::new(&[urem as Digit], if urem != 0 { 1 } else { 0 }, 1);
+        ((*z).clone(), rem)
     } else {
         _x_divrem(a, b)
     };

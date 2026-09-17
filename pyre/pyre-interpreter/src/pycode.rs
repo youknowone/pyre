@@ -3311,18 +3311,17 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     }
     let existing = unsafe { (&*table)[idx] };
     if !existing.is_null() {
-        // Follow a nursery forwarding stub, and reject a recycled
-        // nursery-debug fill (`try_gc_current_object_address` leaves
-        // those unchanged). A dead slot falls through to realize again.
-        let live =
-            pyre_object::gc_hook::try_gc_live_object_address(existing as *mut u8) as PyObjectRef;
-        if !live.is_null() {
-            if live != existing {
-                let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
-                unsafe { (&mut *table).set_ref(idx, live) };
-            }
+        // `pyopcode.py getconstant_w`: return the slot. Follow a
+        // nursery forwarding stub the way a translated load would;
+        // do not re-realize — that changes LOAD_CONST identity.
+        let live = pyre_object::gc_hook::try_gc_current_object_address(existing as *mut u8)
+            as PyObjectRef;
+        if !live.is_null() && live != existing {
+            let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
+            unsafe { (&mut *table).set_ref(idx, live) };
             return live;
         }
+        return existing;
     }
 
     let realized = match &constants[idx] {
@@ -3331,21 +3330,29 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         },
         constant => crate::pyframe::pyobject_from_constant(constant),
     };
-    // `setarrayitem_gc` on the young `co_consts_w` array. Pin the
-    // candidate; a nursery array takes `set_ref`'s no-barrier store.
     let realized_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(realized);
     let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
     if table.is_null() || idx >= unsafe { (&*table).len() } {
         return roots.get(realized_slot);
     }
-    unsafe { (&mut *table).set_ref(idx, roots.get(realized_slot)) };
-    let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
-    let published = unsafe { (&*table)[idx] };
-    if published.is_null() {
-        roots.get(realized_slot)
-    } else {
-        published
+    // Free-threaded first fill: one winner, like `w_code_getname_w`.
+    let slot = unsafe { (*table).items_mut_ptr().add(idx) };
+    let realized = roots.get(realized_slot);
+    match unsafe {
+        (*slot.cast::<std::sync::atomic::AtomicPtr<pyre_object::pyobject::PyObject>>())
+            .compare_exchange(
+                std::ptr::null_mut(),
+                realized,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+    } {
+        Ok(_) => {
+            pyre_object::gc_hook::try_gc_write_barrier_managed(table as *mut u8);
+            realized
+        }
+        Err(winner) => winner,
     }
 }
 
