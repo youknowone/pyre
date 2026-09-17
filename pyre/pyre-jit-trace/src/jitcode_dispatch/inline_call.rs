@@ -8367,10 +8367,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     | DispatchError::VableEscapedDuringResidualCall { .. }
             ) {
                 // `sys._getframe` forces the virtualizable; that force is
-                // the escape, not a Python-visible commit.  Re-run the
-                // CALL in the interpreter (`frame_inlined_callee_own_image_regression`).
-                let allow_effect_delta =
-                    matches!(e, DispatchError::VableEscapedDuringResidualCall { .. });
+                // not a Python-visible commit and does not bump the
+                // effect odometer.  A prior store in the same sub-walk
+                // does, and latching the CALL would re-apply it.
                 latch_abort_call_resume(
                     code,
                     op,
@@ -8380,7 +8379,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     unjournaled_before_subwalk,
                     executed_effects_before,
                     abort_flush_call_jitcode_coord,
-                    allow_effect_delta,
+                    false,
                 );
             }
             return Err(e);
