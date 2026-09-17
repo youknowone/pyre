@@ -1088,7 +1088,7 @@ mod byte_snapshot_map_tests {
         rec.close_loop(&[result]);
         let trace = rec.get_trace();
         assert_eq!(
-            OpRef::input_arg_typed(trace.inputargs[0].index, trace.inputargs[0].tp),
+            OpRef::input_arg_typed(trace.inputargs[0].index, trace.inputargs[0].tp.get()),
             input
         );
         assert_eq!(trace.ops[0].pos().get(), result);

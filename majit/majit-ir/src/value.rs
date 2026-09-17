@@ -607,6 +607,10 @@ impl InputArgRc {
     /// Update the box type in place. Fail-arg reconciliation can retag a
     /// shared InputArg after unboxing; `tp` is otherwise construction-fixed.
     pub fn set_tp(&self, tp: Type) {
+        assert!(
+            tp != Type::Void,
+            "InputArg::set_tp: Type::Void is not a valid input-arg type",
+        );
         self.tp.set(tp);
     }
 

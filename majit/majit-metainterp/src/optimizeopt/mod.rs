@@ -3637,9 +3637,12 @@ impl OptContext {
     /// private `Rc` is invisible to `find_producer_op`; a forwarding chain
     /// ending on it leaves guard resume numbering with no producer to bind.
     ///
-    /// Only a genuinely unbound position is filled. An already-registered host
-    /// is the one every other chain resolves through, and overwriting it with a
-    /// foreign Phase-1 `Rc` would split one position across two boxes.
+    /// For Op hosts, only a genuinely unbound position is filled. An
+    /// already-registered Op is the one every other chain resolves
+    /// through, and overwriting it with a foreign Phase-1 `Rc` would
+    /// split one position across two boxes. The InputArg branch below
+    /// is the exception: it overwrites `inputarg_refs` so the carried
+    /// box replaces the stand-in.
     pub(crate) fn register_carried_host(&mut self, o: &Operand) {
         let pos = o.to_opref();
         if pos.is_none() || pos.is_constant() {

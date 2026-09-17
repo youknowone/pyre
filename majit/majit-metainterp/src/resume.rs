@@ -104,9 +104,10 @@ fn leaf3_prov_enabled() -> bool {
 
 /// Ordered livebox map: canonical box (`Rc::ptr_eq`) → i16 tag.
 ///
-/// resume.py:137/370: RPython uses `dict` keyed by the actual Box object
-/// (object `is` identity). In Python 3 that dict is insertion-ordered, and
-/// `_number_virtuals` iterates it directly. #160/S11 keys this map by the
+/// `ResumeDataLoopMemo._number_boxes` / `_number_virtuals`: RPython uses
+/// `dict` keyed by the actual Box object (object `is` identity). In
+/// Python 3 that dict is insertion-ordered, and `_number_virtuals`
+/// iterates it directly. #160/S11 keys this map by the
 /// canonical [`Operand`](majit_ir::operand::Operand) (`Rc::ptr_eq` on the
 /// producer = PyPy `box is box`), the faithful port of the dict-by-`is` —
 /// `Operand` IS the box object `resume.py liveboxes` stores. The backing is an
@@ -120,8 +121,9 @@ fn leaf3_prov_enabled() -> bool {
 /// collapse to one key; distinct boxes — e.g. an `InputArg` vs a `ResOp`
 /// result — stay distinct, where a raw-position key could have aliased them.
 ///
-/// Invariant: keys are never Const boxes. Per `resume.py:204-205`
-/// `_number_boxes`, `isinstance(box, Const)` short-circuits to
+/// Invariant: keys are never Const boxes. Per
+/// `ResumeDataLoopMemo._number_boxes`, `isinstance(box, Const)`
+/// short-circuits to
 /// `self.getconst(box)` and the result is never written into
 /// `numb_state.liveboxes`. Only the `else` branch (line 207-223,
 /// non-Const Box) reaches `liveboxes[box] = tagged`. `insert` enforces
