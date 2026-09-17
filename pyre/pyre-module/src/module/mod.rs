@@ -50,6 +50,12 @@ pub mod _queue;
 #[cfg(target_os = "macos")]
 pub mod _scproxy;
 #[allow(non_snake_case)]
+#[cfg(not(feature = "sandbox"))]
+pub mod _socket;
+#[allow(non_snake_case)]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+pub mod _ssl;
+#[allow(non_snake_case)]
 pub mod _statistics;
 #[allow(non_snake_case)]
 pub mod _suggestions;

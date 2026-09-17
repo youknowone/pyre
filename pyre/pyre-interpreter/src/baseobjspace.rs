@@ -9870,7 +9870,7 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
 /// Note: `__trunc__` is NOT consulted here. `__trunc__` belongs to the
 /// `int(...)` builtin path (`intobject.py _new_baseint`), not to
 /// `space.int()` / `space.int_w()`.
-pub(crate) fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn space_int(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     // baseobjspace.py `w_impl = space.lookup(self, '__int__')`
     let w_impl = unsafe { lookup(obj, "__int__") }
         // baseobjspace.py `w_impl = space.lookup(self, '__index__')`

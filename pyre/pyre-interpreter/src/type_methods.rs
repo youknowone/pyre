@@ -3628,7 +3628,7 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
 /// for instances, else the storage type name.
 /// `_PyArg_BadArgument`'s rendering of a rejected argument: `None` names
 /// itself where every other value names its type.
-pub(crate) fn clinic_arg_type_name(obj: PyObjectRef) -> String {
+pub fn clinic_arg_type_name(obj: PyObjectRef) -> String {
     if unsafe { pyre_object::is_none(obj) } {
         return "None".to_string();
     }

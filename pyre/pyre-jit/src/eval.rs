@@ -829,28 +829,28 @@ unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_context_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_ssl_context_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn memory_bio_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_memory_bio_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_session_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_ssl_session_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
+        pyre_module::module::_ssl::w_ssl_socket_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -1036,7 +1036,7 @@ unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut maj
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_context_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { object_object_custom_trace(obj_addr, f) };
-    let context = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLContext) };
+    let context = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLContext) };
     f(std::ptr::addr_of_mut!(context.sni_callback) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(context.msg_callback) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(context.keylog_filename) as *mut majit_ir::GcRef);
@@ -1081,7 +1081,7 @@ unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 /// and hostname directly on the typed object.
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    let socket = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLSocket) };
+    let socket = unsafe { &mut *(obj_addr as *mut pyre_module::module::_ssl::W_SSLSocket) };
     f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.context) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.socket) as *mut majit_ir::GcRef);
@@ -4324,7 +4324,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Their sweep destructors release the opaque rustls allocations.
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
-        let context_descr = <pyre_interpreter::module::_ssl::W_SSLContext
+        let context_descr = <pyre_module::module::_ssl::W_SSLContext
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let context_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4346,7 +4346,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             context_descr.ptr_offsets,
         );
 
-        let bio_descr = <pyre_interpreter::module::_ssl::W_MemoryBIO
+        let bio_descr = <pyre_module::module::_ssl::W_MemoryBIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let bio_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4368,7 +4368,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             bio_descr.ptr_offsets,
         );
 
-        let session_descr = <pyre_interpreter::module::_ssl::W_SSLSession
+        let session_descr = <pyre_module::module::_ssl::W_SSLSession
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let session_tid = gc.register_type(
             TypeInfo::object_subclass(session_descr.object_size, object_tid)
@@ -4386,7 +4386,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             session_descr.ptr_offsets,
         );
 
-        let socket_descr = <pyre_interpreter::module::_ssl::W_SSLSocket
+        let socket_descr = <pyre_module::module::_ssl::W_SSLSocket
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let socket_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(
@@ -4411,7 +4411,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(
             &mut gc,
             &mut pytype_to_tid,
-            <pyre_interpreter::module::_ssl::W_Certificate
+            <pyre_module::module::_ssl::W_Certificate
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
     }

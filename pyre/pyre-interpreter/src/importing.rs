@@ -38,7 +38,7 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 /// disabled the same names fall back to `std::*` shims so call sites
 /// stay uniform.
 #[cfg(feature = "host_env")]
-pub(crate) mod host {
+pub mod host {
     #[cfg(not(target_arch = "wasm32"))]
     pub use rustpython_host_env::fs;
     pub mod os {
@@ -54,7 +54,7 @@ pub(crate) mod host {
     }
 }
 #[cfg(not(feature = "host_env"))]
-pub(crate) mod host {
+pub mod host {
     pub mod fs {
         pub use std::fs::{metadata, read, read_dir, read_to_string, symlink_metadata};
     }
@@ -766,12 +766,12 @@ pub fn install_builtin_modules() {
 
     pyre_install_module!(atexit);
 
-    // Host-access modules — network (`_socket`), arbitrary FFI (`_ctypes`),
-    // real signals, `select`, `mmap`.  `pwd`/`grp` and the other optional
-    // host databases live in `pyre-module`.  None belong to the mediated
-    // ll_os/ll_time surface, so the sandbox interpreter omits them entirely:
-    // `import _socket` then raises ModuleNotFoundError, as in a build whose
-    // syscall code is absent.
+    // Host-access modules — arbitrary FFI (`_ctypes`), real signals,
+    // `select`, `mmap`.  `_socket`/`_ssl`, `pwd`/`grp` and the other
+    // optional host modules live in `pyre-module`.  None belong to the
+    // mediated ll_os/ll_time surface, so the sandbox interpreter omits
+    // them entirely: `import _ctypes` then raises ModuleNotFoundError,
+    // as in a build whose syscall code is absent.
     #[cfg(not(feature = "sandbox"))]
     {
         // `_signal` is a bootstrap module upstream: it is built on every
@@ -781,13 +781,6 @@ pub fn install_builtin_modules() {
         // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
         pyre_install_module!(select);
-        // `socket.py`'s module body subclasses `_socket.socket`, so the type
-        // has to be there even where nothing can be connected: a target with
-        // no host layer publishes it and the numbers, and leaves out the
-        // entry points that would need a descriptor.
-        pyre_install_module!(_socket);
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        pyre_install_module!(_ssl);
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(mmap);
         pyre_install_module!(_ctypes);
