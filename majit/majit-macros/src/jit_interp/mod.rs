@@ -3639,6 +3639,7 @@ fn rewrite_body(
     // edge inside an opcode arm that can precede the merge point in the tree.
     struct SinglePassCloseScan {
         found: bool,
+        first_state: Option<MergePointArgs>,
     }
     impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -3651,12 +3652,20 @@ fn rewrite_body(
                 .join("::");
             if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
                 let args = syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
-                self.found |= args.state.is_some();
+                if args.state.is_some() {
+                    self.found = true;
+                    if self.first_state.is_none() {
+                        self.first_state = Some(args);
+                    }
+                }
             }
             syn::visit::visit_macro(self, mac);
         }
     }
-    let mut scan = SinglePassCloseScan { found: false };
+    let mut scan = SinglePassCloseScan {
+        found: false,
+        first_state: None,
+    };
     syn::visit::Visit::visit_block(&mut scan, &cloned_block);
 
     let mut rewriter = MarkerRewriter {
@@ -3671,8 +3680,90 @@ fn rewrite_body(
     };
     rewriter.visit_block_mut(&mut cloned_block);
 
-    let stmts = &cloned_block.stmts;
+    // warmspot.py ll_portal_runner: maybe enter from the function's start,
+    // before the interpreter loop. Only the `; state` form has a live state
+    // handle to extract reds from, which is what compiled entry and
+    // force_start_tracing both need.
+    let entry_door = if let Some(args) = scan.first_state {
+        let driver = args
+            .driver
+            .clone()
+            .unwrap_or_else(|| syn::parse_quote!(driver));
+        let env = args
+            .env
+            .clone()
+            .unwrap_or_else(|| syn::parse_quote!(program));
+        let pc = args.pc.clone().unwrap_or_else(|| syn::parse_quote!(pc));
+        let state = args.state.clone().expect("scan only stores state merges");
+        let finish_drain = finish_return
+            .map(|finish_return| finish_return.drain(&driver))
+            .unwrap_or_default();
+        match green_key_expr(&pc, &pc, default_greens, default_green_type_tags) {
+            Some(key) => quote! {
+                {
+                    let (__green_hash, __make_key) = #key;
+                    if let Some(__resume) = #driver.function_entry_structured(
+                        __green_hash,
+                        __make_key,
+                        #pc,
+                        &mut #state,
+                        #env,
+                    ) {
+                        #pc = __resume;
+                    }
+                    #finish_drain
+                }
+            },
+            None => quote! {},
+        }
+    } else {
+        quote! {}
+    };
+
+    let stmts = insert_before_first_loop(cloned_block.stmts, entry_door);
     quote! { #(#stmts)* }
+}
+
+/// `ll_portal_runner` sits after driver/pc/state exist and before the
+/// interpreter loop. Prepending it to the function body names those
+/// bindings before they are declared.
+fn insert_before_first_loop(stmts: Vec<syn::Stmt>, door: TokenStream) -> Vec<syn::Stmt> {
+    if door.is_empty() {
+        return stmts;
+    }
+    let door_stmt: syn::Stmt =
+        syn::parse2(door).expect("function-entry door must parse as a statement");
+    let mut out = Vec::with_capacity(stmts.len() + 1);
+    let mut inserted = false;
+    for stmt in stmts {
+        if !inserted && stmt_is_loop(&stmt) {
+            out.push(door_stmt.clone());
+            inserted = true;
+        }
+        out.push(stmt);
+    }
+    if !inserted {
+        out.insert(0, door_stmt);
+    }
+    out
+}
+
+fn stmt_is_loop(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Expr(expr, _) => expr_is_loop(expr),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .is_some_and(|init| expr_is_loop(&init.expr)),
+        _ => false,
+    }
+}
+
+fn expr_is_loop(expr: &syn::Expr) -> bool {
+    matches!(
+        expr,
+        syn::Expr::While(_) | syn::Expr::Loop(_) | syn::Expr::ForLoop(_)
+    )
 }
 
 #[cfg(test)]
@@ -4342,6 +4433,54 @@ mod tests {
              inverting this line — a form-dependent refusal cannot fire on the \
              crates that need it, which is what the conjunct did for as long as \
              it stood. Expansion was:\n{bare_form}"
+        );
+    }
+
+    /// `ll_portal_runner` sits in front of the interpreter. A `; state`
+    /// merge point is the only form that has reds to extract, so that is
+    /// the form that must emit `function_entry_structured`.
+    #[test]
+    fn state_merge_point_emits_function_entry_door() {
+        let config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                while pc < program.len() {
+                    jit_merge_point!(driver, program, pc; state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                state.acc
+            }
+        };
+        let expanded = transform_jit_interp(config, func).to_string();
+        assert!(
+            expanded.contains("function_entry_structured"),
+            "the generated portal must call the function-entry door before \
+             the interpreter loop. Expansion was:\n{expanded}"
+        );
+        let door_at = expanded
+            .find("function_entry_structured")
+            .expect("door present");
+        let pc_at = expanded.find("let mut pc").expect("pc binding");
+        let driver_at = expanded.find("let mut driver").expect("driver binding");
+        let state_at = expanded.find("let mut state").expect("state binding");
+        assert!(
+            pc_at < door_at && driver_at < door_at && state_at < door_at,
+            "the door must sit after driver/pc/state are bound. Expansion was:\n{expanded}"
         );
     }
 }

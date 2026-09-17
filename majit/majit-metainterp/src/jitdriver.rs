@@ -1883,6 +1883,13 @@ pub struct JitDriver<S: JitState> {
     /// This driver's payload for the per-thread `frame_value_count` store,
     /// built once by `register_dispatch_jitcode`. `None` until then.
     state_field_fvc: Option<StateFieldFvcData>,
+    /// One-shot skip for the next [`Self::function_entry_structured`].
+    ///
+    /// An embedder whose loop-header door can already serve the call (CEL
+    /// yields when a sibling loop key is runnable) sets this so the generated
+    /// `ll_portal_runner` prefix does not mint a second artifact for the same
+    /// activation. Taken, not read: a skipped door must not stay skipped.
+    function_entry_suppressed: bool,
     /// Reusable buffers for the compiled-entry argument walk.
     ///
     /// `warmstate.py execute_assembler` builds the entry arguments
@@ -2146,6 +2153,7 @@ impl<S: JitState> JitDriver<S> {
             blackhole_allocator: None,
             portal_jd_index: None,
             state_field_fvc: None,
+            function_entry_suppressed: false,
             entry_scratch: Some(Box::default()),
             exit_raw_scratch: Some(Vec::new()),
             #[expect(
@@ -8535,6 +8543,54 @@ impl<S: JitState> JitDriver<S> {
             .function_entry_step(cell_key, green_key_hash, green_key_raw)
     }
 
+    /// `warmspot.py` `ll_portal_runner`: maybe enter from the function's start.
+    ///
+    /// `maybe_compile_and_run(increment_function_threshold, *args)` then the
+    /// interpreter. A runnable procedure token is entered through
+    /// [`Self::back_edge_resolved`] so FINISH, deopt and blackhole resume are
+    /// the same as a back-edge run. A counter hit arms tracing at `target_pc`
+    /// via [`Self::force_start_tracing`] and returns `None` so the caller
+    /// falls into the interpreter; the next merge point records.
+    ///
+    /// Returns `Some(resume_pc)` only when compiled code ran and left a
+    /// resume point. FINISH is published on the same latch as
+    /// [`Self::back_edge`].
+    /// Skip the next generated function-entry door.
+    ///
+    /// `warmspot.py` has no equivalent: a portal has one runner. An embedder
+    /// that still has a second, loop-header door and cannot yet coexist two
+    /// artifacts for one program uses this to yield that other door.
+    pub fn suppress_function_entry(&mut self) {
+        self.function_entry_suppressed = true;
+    }
+
+    pub fn function_entry_structured(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<usize> {
+        if std::mem::replace(&mut self.function_entry_suppressed, false) {
+            return None;
+        }
+        if self.meta.is_tracing() {
+            return None;
+        }
+        let cell_key = self.resolve_cell_key(green_key_hash, make_green_key);
+        match self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc)) {
+            FunctionEntryStep::RunCompiled(token) => {
+                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+            }
+            FunctionEntryStep::Proceed => {
+                self.force_start_tracing(cell_key, target_pc, state, env);
+                None
+            }
+            FunctionEntryStep::NotHot => None,
+        }
+    }
+
     /// Turn the raw green-key hash a door arrives with into the key that names
     /// exactly one cell, so the door's decision, its token read and the run it
     /// hands them to are all about that one cell.
@@ -10114,6 +10170,73 @@ mod tests {
         assert!(
             driver.is_tracing(),
             "the early ceiling check and typed decision must select the same cell",
+        );
+    }
+
+    #[test]
+    fn function_entry_structured_arms_tracing_on_the_function_threshold() {
+        // warmspot.py ll_portal_runner: maybe_compile_and_run uses
+        // increment_function_threshold, not the back-edge increment.
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.meta.warm_state_mut().set_function_threshold(2);
+        let hash = 0xA11u64;
+        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let mut state = CountingDoorState {
+            build_meta_calls: std::cell::Cell::new(0),
+            extract_live_values_calls: std::cell::Cell::new(0),
+            code_ptr: 0,
+        };
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            !driver.is_tracing(),
+            "a single entry must not arm tracing below the function threshold"
+        );
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the function-entry door must arm tracing when the function threshold fires"
+        );
+    }
+
+    #[test]
+    fn suppress_function_entry_skips_the_next_door_only() {
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        driver.meta.warm_state_mut().set_function_threshold(1);
+        let hash = 0xB0Du64;
+        let make_key = || GreenKey::with_types(vec![hash as i64], vec![GreenType::Int]);
+        let mut state = CountingDoorState {
+            build_meta_calls: std::cell::Cell::new(0),
+            extract_live_values_calls: std::cell::Cell::new(0),
+            code_ptr: 0,
+        };
+        driver.suppress_function_entry();
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            !driver.is_tracing(),
+            "a suppressed door must not arm tracing"
+        );
+        assert!(
+            driver
+                .function_entry_structured(hash, make_key, 0, &mut state, &())
+                .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "suppress is one-shot: the next door must run"
         );
     }
 

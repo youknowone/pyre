@@ -3639,6 +3639,60 @@ fn test_force_arm_rematerializes_constptr_from_gc_table() {
 }
 
 #[test]
+fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
+    // After a collection forwards the live slot, rebind must still find
+    // the leftover ConstPtr by its compile-time address.
+    let table = majit_gc::GcTable::from_gcrefs(&[majit_ir::GcRef(0x1000)]);
+    table.trace(&mut |r| {
+        if r.0 == 0x1000 {
+            r.0 = 0x9000;
+        }
+    });
+    codegen::bind_failarg_const_table(&[], 0);
+    codegen::extend_failarg_const_table_from_gc_table(&table);
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_ptr(majit_ir::GcRef(0x1000))),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let bytes = build_module_with_write_barrier_target(
+        &[InputArg::from_type(Type::Ref, 0)],
+        &[call, guard, finish],
+        127,
+    );
+    codegen::bind_failarg_const_table(&[], 0);
+    validate_wasm(&bytes);
+    let tagged = i64::from(table.base_addr() as u32) | 3;
+    assert!(
+        wasm_contains_i64_const(&bytes, tagged),
+        "rebind must still tag the table slot for the original ConstPtr"
+    );
+    assert!(
+        !wasm_contains_i64_const(&bytes, 0x1000),
+        "must not fall through to the compile-time address"
+    );
+    assert!(
+        !wasm_contains_i64_const(&bytes, 0x9000),
+        "must not key the map on the forwarded slot"
+    );
+}
+
+#[test]
 fn test_inputarg_observation_is_not_a_folded_scalar() {
     // An InputArg's get_value() is the sample seen while tracing. Seeding
     // that sample would freeze the first loop counter into later iterations.
