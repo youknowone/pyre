@@ -46,6 +46,24 @@ fn concrete_ref_operand_ptr<Sym: WalkSym>(
         .filter(|&ptr| ptr != 0 && ptr != usize::MAX as i64)
 }
 
+/// Live `0 <= index < len`.  A Ref bit-pattern in an Int register is
+/// almost never a valid index; on wasm32 it still fits `i32`, so a
+/// magnitude check is not enough.
+fn index_in_array_bounds<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    array_ptr: i64,
+    index_value: i64,
+    descr: &majit_ir::DescrRef,
+) -> bool {
+    if index_value < 0 {
+        return false;
+    }
+    match ctx.trace_ctx.arraylen_sanity_load(array_ptr, descr) {
+        Some(majit_ir::Value::Int(len)) => index_value < len,
+        _ => false,
+    }
+}
+
 /// `getarrayitem_gc_<i|r|f>/rid>X` handler. Operand layout `rid>X`:
 /// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B X-dst.
 ///
@@ -94,7 +112,7 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             let array_ptr = array_ref.0 as i64;
             if array_ptr != 0
                 && array_ptr != usize::MAX as i64
-                && (0..i32::MAX as i64).contains(&index_value)
+                && index_in_array_bounds(ctx, array_ptr, index_value, &descr)
             {
                 let folded =
                     match ctx
@@ -185,10 +203,12 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             let array_ptr = array_ref.0 as i64;
             // A helper walk can put a Ref bit-pattern in an Int index
             // register.  `bh_getarrayitem_gc_r` then SIGBUS
-            // (`test.test_dict` `items ^ items`).  Skip the live load.
+            // (`test.test_dict` `items ^ items`).  On wasm32 that
+            // bit-pattern still fits `i32`, so prove `0 <= index < len`
+            // instead of a magnitude heuristic.
             if array_ptr != usize::MAX as i64
                 && array_ptr != 0
-                && (0..i32::MAX as i64).contains(&index_value)
+                && index_in_array_bounds(ctx, array_ptr, index_value, &descr)
             {
                 ctx.trace_ctx
                     .array_sanity_load(array_ptr, index_value, &descr, ty)

@@ -1192,6 +1192,10 @@ fn variable_has_declared_unsigned_type(
     graph: &FunctionGraph,
     variable: &crate::flowspace::model::Variable,
 ) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if matches!(variable.concretetype(), Some(LowLevelType::Unsigned)) {
+        return true;
+    }
     graph
         .blocks
         .iter()
@@ -1202,37 +1206,48 @@ fn variable_has_declared_unsigned_type(
             }
             matches!(
                 &op.kind,
-                OpKind::Input {
-                    ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::FieldRead {
-                    ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::VableFieldRead {
-                    ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::ArrayRead {
-                    item_ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::InteriorFieldRead {
-                    item_ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::VableArrayRead {
-                    item_ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::Call {
-                    result_ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::IndirectCall {
-                    result_ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::BinOp {
-                    result_ty: ValueType::Unsigned,
-                    ..
-                } | OpKind::UnaryOp {
-                    result_ty: ValueType::Unsigned,
-                    ..
-                }
+                OpKind::ConstUInt(_)
+                    | OpKind::ConstUInt128(_)
+                    | OpKind::Input {
+                        ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::FieldRead {
+                        ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::VableFieldRead {
+                        ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::ArrayRead {
+                        item_ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::InteriorFieldRead {
+                        item_ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::VableArrayRead {
+                        item_ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::Call {
+                        result_ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::IndirectCall {
+                        result_ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::BinOp {
+                        result_ty: ValueType::Unsigned,
+                        ..
+                    }
+                    | OpKind::UnaryOp {
+                        result_ty: ValueType::Unsigned,
+                        ..
+                    }
             )
         })
 }
@@ -13896,6 +13911,7 @@ mod tests {
                 true,
             )
             .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&arg, ConcreteType::Signed);
         let result = graph
             .push_op_var(
                 graph.startblock,
