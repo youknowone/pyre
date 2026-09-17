@@ -3274,21 +3274,29 @@ where
 /// new graph-side descr producer must extend the recognition arms.
 fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
     let descr_ref = &descr.0;
-    if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_field_descr(0)) {
+    if std::sync::Arc::ptr_eq(
+        descr_ref,
+        &pyre_jit_trace::frame_layout::pyframe_array_field_descr(0),
+    ) || std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_field_descr(0))
+    {
         return Operand::descr_vable_array_field(0);
     }
-    if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_descr(0)) {
+    if std::sync::Arc::ptr_eq(
+        descr_ref,
+        &pyre_jit_trace::frame_layout::pyframe_array_item_descr(0),
+    ) || std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_descr(0))
+    {
         return Operand::descr_vable_array(0);
     }
-    // VableStaticField: probe each declared scalar index in turn and
-    // Arc::ptr_eq against the per-idx singleton.  Mirrors the
-    // `array_field_descrs[i]` enumeration above.  The bound is
-    // `NUM_VABLE_SCALARS` rather than a literal so it follows
-    // `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS`; a literal here
-    // outlives the table it describes and asks
-    // `vable_static_field_descr` for an index it no longer reserves.
+    // VableStaticField: the vinfo's own FieldDescr first
+    // (`virtualizable.py static_field_descrs[idx]`), then the
+    // leftover idx singleton for a vtype past PyFrame's count.
     for idx in 0u16..pyre_jit_trace::virtualizable_gen::NUM_VABLE_SCALARS as u16 {
-        if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_static_field_descr(idx)) {
+        if std::sync::Arc::ptr_eq(
+            descr_ref,
+            &pyre_jit_trace::frame_layout::pyframe_static_field_descr(idx),
+        ) || std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_static_field_descr(idx))
+        {
             return Operand::descr_vable_static_field(idx);
         }
     }

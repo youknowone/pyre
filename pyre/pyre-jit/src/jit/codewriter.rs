@@ -1997,10 +1997,9 @@ fn record_graph_op(
 /// `portal_graph_inputvars(code).0` — matching jtransform.py:840 where
 /// the JIT driver's red `frame` arg is threaded into every vable op
 /// from the start. The trailing two operands are the
-/// `vable_array_field_descr` / `vable_array_descr` singletons from
-/// `majit_ir::descr` (matching `virtualizable.py:73,58` 1:1 — Arc
-/// identity is preserved across calls so `flatten_descr_by_ptr`
-/// resolves them via `Arc::ptr_eq`).
+/// `virtualizable.py` `array_field_descrs` / `array_descrs` on the
+/// one PyFrame vinfo (Arc identity is preserved across calls so
+/// `flatten_descr_by_ptr` resolves them via `Arc::ptr_eq`).
 ///
 /// Pyre's PyFrame has a single virtualizable array
 /// (`locals_cells_stack_w`) so the array index is hardcoded to 0
@@ -2015,8 +2014,8 @@ fn vable_setarrayitem_ref_graph_args(
         v_base,
         v_idx,
         v_value,
-        majit_ir::descr::vable_array_field_descr(0).into(),
-        majit_ir::descr::vable_array_descr(0).into(),
+        pyre_jit_trace::frame_layout::pyframe_array_field_descr(0).into(),
+        pyre_jit_trace::frame_layout::pyframe_array_item_descr(0).into(),
     ]
 }
 
@@ -2034,8 +2033,8 @@ fn vable_getarrayitem_ref_graph_args(
     vec![
         v_base,
         v_idx,
-        majit_ir::descr::vable_array_field_descr(0).into(),
-        majit_ir::descr::vable_array_descr(0).into(),
+        pyre_jit_trace::frame_layout::pyframe_array_field_descr(0).into(),
+        pyre_jit_trace::frame_layout::pyframe_array_item_descr(0).into(),
     ]
 }
 
@@ -2044,8 +2043,8 @@ fn vable_getarrayitem_ref_graph_args(
 /// branch): `[v_inst, v_value, descr]`.  `v_inst` is the portal frame
 /// Variable from `portal_graph_inputvars(code).0` per
 /// jtransform.py:840 (the JIT driver's red `frame` arg threaded into
-/// every vable op). The trailing `vable_static_field_descr(idx)`
-/// singleton mirrors `virtualizable.py:71 static_field_descrs[idx]`.
+/// every vable op). The trailing descr is
+/// `virtualizable.py static_field_descrs[idx]` on the PyFrame vinfo.
 fn vable_setfield_int_graph_args(
     v_inst: super::flow::SpaceOperationArg,
     v_value: super::flow::SpaceOperationArg,
@@ -2054,7 +2053,7 @@ fn vable_setfield_int_graph_args(
     vec![
         v_inst,
         v_value,
-        majit_ir::descr::vable_static_field_descr(field_idx).into(),
+        pyre_jit_trace::frame_layout::pyframe_static_field_descr(field_idx).into(),
     ]
 }
 
@@ -2063,15 +2062,15 @@ fn vable_setfield_int_graph_args(
 /// branch): `[v_inst, descr]`.  `v_inst` is the portal frame Variable
 /// from `portal_graph_inputvars(code).0` per jtransform.py:840 (the
 /// JIT driver's red `frame` arg threaded into every vable op). The
-/// trailing `vable_static_field_descr(idx)` singleton mirrors
-/// `virtualizable.py:71 static_field_descrs[idx]`.
+/// trailing descr is `virtualizable.py static_field_descrs[idx]`
+/// on the PyFrame vinfo.
 fn vable_getfield_ref_graph_args(
     v_inst: super::flow::SpaceOperationArg,
     field_idx: u16,
 ) -> Vec<super::flow::SpaceOperationArg> {
     vec![
         v_inst,
-        majit_ir::descr::vable_static_field_descr(field_idx).into(),
+        pyre_jit_trace::frame_layout::pyframe_static_field_descr(field_idx).into(),
     ]
 }
 

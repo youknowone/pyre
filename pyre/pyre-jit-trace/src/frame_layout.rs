@@ -170,6 +170,41 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
     .clone()
 }
 
+/// `virtualizable.py static_field_descrs[idx]` on the one PyFrame vinfo.
+/// The process-global `vable_static_field_descr` singleton is only the
+/// overflow when `idx` is past PyFrame's static count (jit_interp).
+pub fn pyframe_static_field_descr(idx: u16) -> majit_ir::DescrRef {
+    let info = build_pyframe_virtualizable_info();
+    let i = idx as usize;
+    if i < info.static_field_descrs().len() {
+        info.static_field_descr(i)
+    } else {
+        majit_ir::descr::vable_static_field_descr(idx)
+    }
+}
+
+/// `virtualizable.py array_field_descrs[idx]` on the one PyFrame vinfo.
+pub fn pyframe_array_field_descr(idx: u16) -> majit_ir::DescrRef {
+    let info = build_pyframe_virtualizable_info();
+    let i = idx as usize;
+    if i < info.array_fields.len() {
+        info.array_pointer_field_descr(i)
+    } else {
+        majit_ir::descr::vable_array_field_descr(idx)
+    }
+}
+
+/// `virtualizable.py array_descrs[idx]` on the one PyFrame vinfo.
+pub fn pyframe_array_item_descr(idx: u16) -> majit_ir::DescrRef {
+    let info = build_pyframe_virtualizable_info();
+    let i = idx as usize;
+    if i < info.array_descrs.len() {
+        info.array_item_descr(i)
+    } else {
+        majit_ir::descr::vable_array_descr(idx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_pyframe_virtualizable_info;
@@ -250,6 +285,25 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&a, &b),
             "warmspot.py vinfos[VTYPEPTR] is one VirtualizableInfo"
+        );
+    }
+
+    #[test]
+    fn pyframe_field_descrs_are_the_vinfo_objects() {
+        let info = build_pyframe_virtualizable_info();
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &super::pyframe_static_field_descr(0),
+                &info.static_field_descr(0)
+            ),
+            "static_field_descrs[0] is the vinfo FieldDescr"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &super::pyframe_array_field_descr(0),
+                &info.array_pointer_field_descr(0)
+            ),
+            "array_field_descrs[0] is the vinfo FieldDescr"
         );
     }
 
