@@ -1249,6 +1249,48 @@ pub fn stringpiece_size_descr() -> DescrRef {
     STRINGPIECE_DESCR_GROUP.size_descr.clone()
 }
 
+/// rlist.py LIST — interp-level `list of W_Root` used for exception `args_w`.
+static RLIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::interp_exceptions as exc;
+    build_bare_gcstruct_descr_group(
+        exc::RLIST_SIZE,
+        exc::rlist_gc_type_id(),
+        &[
+            (
+                "length",
+                exc::RLIST_LENGTH_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "items",
+                exc::RLIST_ITEMS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "rlist.LIST",
+    )
+});
+
+pub fn rlist_size_descr() -> DescrRef {
+    RLIST_DESCR_GROUP.size_descr.clone()
+}
+
+pub fn rlist_length_descr() -> DescrRef {
+    field_descr_from_group(&RLIST_DESCR_GROUP, 0)
+}
+
+pub fn rlist_items_descr() -> DescrRef {
+    field_descr_from_group(&RLIST_DESCR_GROUP, 1)
+}
+
 static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_IntObject>(),
