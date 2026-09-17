@@ -299,6 +299,7 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
+    ("match_signature", "argument.py _match_signature"),
     // `rlib/jit.py look_inside_iff.inner` does `func = unroll_safe(func)`.
     // Harvested names are the inlined originals (`_orig_*`), not the
     // dispatch wrappers.

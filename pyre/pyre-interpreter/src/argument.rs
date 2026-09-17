@@ -1045,6 +1045,8 @@ impl Arguments {
     /// - `w_kw_defs`: keyword-only defaults dict, `PY_NULL` if absent.
     /// - `blindargs`: number of "blind" positional args from `prepend()`
     ///   (mostly 0; non-zero only for the bound-method dispatcher).
+    /// `argument.py _match_signature` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     pub fn match_signature(
         &self,
         w_firstarg: PyObjectRef,

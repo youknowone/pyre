@@ -5471,7 +5471,9 @@ impl PyFrame {
     /// generator's `f_lineno` is its `def` line — and the wrong one for a line
     /// event, which is why this is a second entry point rather than an edit to
     /// that one.
+    /// `pycode.py _get_lineno_for_pc_tracing` is `@jit.elidable`.
     #[inline]
+    #[majit_macros::elidable]
     pub fn get_lineno_for_pc_tracing(&self) -> isize {
         if self.last_instr < 0
             || !crate::pycode::instruction_can_start_a_line(self.code(), self.last_instr as usize)
