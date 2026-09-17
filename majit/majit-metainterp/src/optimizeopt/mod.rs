@@ -5375,11 +5375,10 @@ impl OptContext {
     ///
     /// Total, like the operand sibling [`Operand::get_box_replacement`]
     /// (returns the position-only operand on a miss) and
-    /// `get_box_replacement` (`resoperation.py` returns `op` itself when the
-    /// `_forwarded` chain is empty). The chain terminal is the result; a
-    /// debug assertion checks it is `Rc`-identical to the canonical
-    /// producer for that opref. A position that resolves to neither a
-    /// producer `Op`, an `inputarg_refs` slot, nor a Const falls back to
+    /// `resoperation.py get_box_replacement` (returns the last
+    /// `AbstractResOpOrInputArg` before `None` / Info / a rejected Const).
+    /// A position that resolves to neither a producer `Op`, an
+    /// `inputarg_refs` slot, nor a Const falls back to
     /// [`Operand::bound_from_opref`], which mints a synthetic producer carrying
     /// the same `pos` (`to_opref` byte-identical) rather than panicking. Every
     /// value-bearing op-arg position has a findable producer, so the fallback
@@ -5391,18 +5390,7 @@ impl OptContext {
             return Operand::None;
         }
         if let Some(start) = self.resolve_to_operand(opref) {
-            let terminal = start.get_box_replacement(false);
-            debug_assert!(
-                self.resolve_to_operand(terminal.to_opref())
-                    .as_ref()
-                    .is_some_and(|c| c.same_box(&terminal)),
-                "get_box_replacement_operand: chain terminal is not Rc-identical \
-                 to the canonical producer: terminal={terminal:?} \
-                 canonical={:?} opref={:?}",
-                self.resolve_to_operand(terminal.to_opref()),
-                terminal.to_opref(),
-            );
-            return terminal;
+            return start.get_box_replacement(false);
         }
         self.s9_probe_fire(opref);
         Operand::bound_from_opref(opref)
@@ -9910,13 +9898,18 @@ mod boxref_forwarding_tests {
     }
 
     #[test]
-    #[should_panic(expected = "chain terminal is not Rc-identical")]
-    fn replacement_operand_rebinds_chain_terminal_to_canonical_producer() {
+    fn replacement_operand_walks_to_the_forwarded_terminal() {
         let (ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         let foreign = InputArgRc::new(majit_ir::InputArg::from_type(Type::Int, 1));
         b0.set_forwarded_inputarg(&foreign);
 
-        let _resolved = ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int));
+        let resolved = ctx.get_box_replacement_operand(OpRef::input_arg_typed(0, Type::Int));
+        assert!(majit_ir::InputArgRc::ptr_eq(
+            &resolved
+                .bound_inputarg()
+                .expect("walked terminal carries bound InputArg"),
+            &foreign,
+        ));
     }
 
     /// Forward-reference dup-materialization regression: a

@@ -3673,7 +3673,7 @@ fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
     let bytes = build_module_with_write_barrier_target(
-        &[InputArg::from_type(Type::Ref, 0)],
+        &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
     );
