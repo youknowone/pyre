@@ -193,6 +193,12 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
     );
     pair(
         entries,
+        "ll_math::math_tan",
+        "math_tan",
+        math::jit_math_tan_raw as *const (),
+    );
+    pair(
+        entries,
         "ll_math::math_pow",
         "math_pow",
         math::jit_math_pow_raw as *const (),

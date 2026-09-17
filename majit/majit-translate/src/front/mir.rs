@@ -10692,7 +10692,7 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Opaque `f64::{hypot,atan2,copysign,floor,ceil,powf,ln,
-                // exp,sin,cos,sqrt,log10}` are the C llexternals in
+                // exp,sin,cos,tan,sqrt,log10}` are the C llexternals in
                 // `ll_math.py` (`math_hypot`, …).  The raising wrappers
                 // (`ll_math_hypot`, …) stay around them.
                 if let Some((arity, leaf)) = self.f64_ll_math_leaf(&reg)
@@ -15128,6 +15128,7 @@ impl<'a> Lowering<'a> {
             "exp" => (1, "math_exp"),
             "sin" => (1, "math_sin"),
             "cos" => (1, "math_cos"),
+            "tan" => (1, "math_tan"),
             "sqrt" => (1, "math_sqrt"),
             "log10" => (1, "math_log10"),
             _ => return None,
