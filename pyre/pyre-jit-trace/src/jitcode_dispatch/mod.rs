@@ -2799,6 +2799,11 @@ pub enum DispatchError {
     /// a Python pc here would make a later side exit resume at a guessed
     /// block head, so the walker declines before the trace is installed.
     GuardResumeCoordinateUnavailable { pc: usize },
+    /// `walker_guard_exact_w_class` would pin a `w_class` the recorded
+    /// operand does not carry: the snapshot is not a live heap object,
+    /// or its `w_class` is not the expected type. Returning `Ok` here
+    /// would fold as if the pin succeeded.
+    GuardExactWClassOperandMismatch { pc: usize },
     /// `last_exception/>i` fired but no concrete standing exception was
     /// available. RPython parity: `pyjitpl.py opimpl_last_exception`:
     ///
@@ -3007,6 +3012,7 @@ impl DispatchError {
             Self::VableEscapedDuringResidualCall { .. } => "VableEscapedDuringResidualCall",
             Self::GuardSnapshotVableUntyped { .. } => "GuardSnapshotVableUntyped",
             Self::GuardResumeCoordinateUnavailable { .. } => "GuardResumeCoordinateUnavailable",
+            Self::GuardExactWClassOperandMismatch { .. } => "GuardExactWClassOperandMismatch",
             Self::LastExceptionWithoutActiveException { .. } => {
                 "LastExceptionWithoutActiveException"
             }
@@ -3091,6 +3097,7 @@ impl DispatchError {
             | Self::VableEscapedDuringResidualCall { pc, .. }
             | Self::GuardSnapshotVableUntyped { pc, .. }
             | Self::GuardResumeCoordinateUnavailable { pc, .. }
+            | Self::GuardExactWClassOperandMismatch { pc, .. }
             | Self::LastExceptionWithoutActiveException { pc, .. }
             | Self::JitMergePointGreenKeyUnresolved { pc, .. }
             | Self::PortalFrameTracerArmed { pc, .. }
@@ -10804,10 +10811,10 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
             && pyre_object::tagged_int::is_tagged_int(concrete);
         if !tagged {
             let Some(live) = walker_live_heap_object(concrete) else {
-                return Ok(());
+                return Err(DispatchError::GuardExactWClassOperandMismatch { pc: op_pc });
             };
             if !std::ptr::eq(unsafe { (*live).w_class }, expected_typeobj) {
-                return Ok(());
+                return Err(DispatchError::GuardExactWClassOperandMismatch { pc: op_pc });
             }
         }
     }

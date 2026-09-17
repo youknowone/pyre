@@ -961,6 +961,13 @@ pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::Gc
             if code == 0 {
                 continue;
             }
+            // Managed `PyCode` interiors are reached by MiniMark's
+            // write barrier / `old_objects_pointing_to_young`, like
+            // a young `PyCode` copy+scan. Only off-GC bootstrap
+            // wrappers still need this extra-root walk.
+            if pyre_object::gc_hook::try_gc_owns_object(code as *mut u8) {
+                continue;
+            }
             unsafe { crate::eval::walk_enrolled_code_roots(code as PyObjectRef, visitor) };
         }
     }

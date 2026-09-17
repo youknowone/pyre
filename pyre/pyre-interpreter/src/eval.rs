@@ -1805,11 +1805,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // those slots, like the lazily published states above.
         unsafe { walk_builtin_type_dicts_gc(&mut fwd) };
     }
-    // Old-gen `PyCode` interiors (`co_consts_w`) are not scanned by a
-    // root visit. Walk every enrolled wrapper here, not behind the
-    // prebuilt dirty bit: a just-filled code can hold young constants
-    // without a further store that would set the bit.
-    crate::pycode::walk_prebuilt_code_roots(visitor);
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
     let scan_prebuilt = !is_minor

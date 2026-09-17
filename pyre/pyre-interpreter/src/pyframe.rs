@@ -3660,7 +3660,13 @@ impl PyFrame {
                 raw
             };
             unsafe { (*frame_anchor.live()).debugdata = debugdata };
-            let debugdata = unsafe { (*frame_anchor.live()).debugdata };
+            // Old-gen frame → nursery `debugdata` is an old-to-young
+            // field store (`incminimark.py write_barrier`). Remembering
+            // only the payload leaves the frame off
+            // `old_objects_pointing_to_young`.
+            let live_frame = frame_anchor.live() as *mut Self;
+            pyre_object::gc_hook::try_gc_write_barrier(live_frame as *mut u8);
+            let debugdata = unsafe { (*live_frame).debugdata };
             remember_frame_debug_data(debugdata);
             return unsafe { &mut *debugdata };
         }

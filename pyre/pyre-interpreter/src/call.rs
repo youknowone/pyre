@@ -5935,6 +5935,10 @@ fn build_class_inner(
         unsafe {
             (*w).w_class = crate::typedef::w_type();
         }
+        // `setfield_gc` of `w_class` on an old-gen type: remember the
+        // holder so a young class survives the next minor
+        // (`incminimark.py write_barrier`).
+        pyre_object::gc_hook::try_gc_write_barrier(w as *mut u8);
         // typeobject.py `compute_mro(w_self)`, reached only once
         // `check_and_find_best_base` inside `create_all_slots` above accepted
         // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s

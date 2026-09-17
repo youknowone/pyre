@@ -10449,15 +10449,16 @@ fn exception_group_subgroup_inner(
     for i in 0..children.len() {
         let exc = children.get(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
+            let exc = children.get(i);
             let subgroup = exception_group_subgroup_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
             }
-            if !std::ptr::eq(subgroup, exc) {
+            if !std::ptr::eq(subgroup, children.get(i)) {
                 modified = true;
             }
-        } else if live_condition().matches(exc)? {
-            selected.push(exc);
+        } else if live_condition().matches(children.get(i))? {
+            selected.push(children.get(i));
         } else {
             modified = true;
         }
@@ -10499,6 +10500,7 @@ fn exception_group_split_inner(
     for i in 0..children.len() {
         let exc = children.get(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
+            let exc = children.get(i);
             let (yes, no) = exception_group_split_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(yes) } {
                 matching_at.push(kept.len());

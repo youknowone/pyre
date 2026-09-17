@@ -1257,25 +1257,15 @@ impl FixedObjectArray {
         if unsafe { (*header).is_forwarded() } {
             stale_array_abort(self as *mut Self as usize, index);
         }
-        let _roots = crate::gc_roots::push_roots();
-        let root_base = _roots.base();
-        let _ = _roots.pin_root(self as *mut Self as PyObjectRef);
-        let _ = _roots.pin_root(value);
-        let array = _roots.get(root_base) as *mut Self;
-        // Every mutable FixedObjectArray has a real header word: managed frame
-        // locals carry the collector's header, while the StdAlloc snapshot
-        // fallback is deliberately prefixed with a zeroed one
-        // (`alloc_fixed_array_with_header`).  This is therefore the ordinary
-        // RPython `setarrayitem_gc` shape: test the header flag directly and
-        // enter the membership-free slow path only when it is set.  The zeroed
-        // fallback header makes the same call a no-op without an arena lookup.
-        crate::gc_hook::try_gc_write_barrier_managed(array as *mut u8);
-        // The barrier may wait behind a foreign collection. Reload the array
-        // as well as the value before the store: RPython's setarrayitem_gc
-        // keeps both live across the barrier.
-        let array = _roots.get(root_base) as *mut Self;
-        let value = _roots.get(root_base + 1);
-        unsafe { (*array).items_mut_ptr().add(index).write(value) };
+        // incminimark.py `write_barrier` / `remember_young_pointer`:
+        // append to `old_objects_pointing_to_young` and clear
+        // `TRACK_YOUNG_PTRS`. That helper is not a collection point;
+        // `setarrayitem_gc` does not `push_roots` around it. A pin here
+        // used to wait on `try_gc_current_object_address` and consume
+        // the birth remembered-set entry mid-fill, after which later
+        // stores took the no-barrier arm.
+        crate::gc_hook::try_gc_write_barrier_managed(self as *mut Self as *mut u8);
+        unsafe { self.items_mut_ptr().add(index).write(value) };
     }
 
     pub fn to_vec(&self) -> Vec<PyObjectRef> {

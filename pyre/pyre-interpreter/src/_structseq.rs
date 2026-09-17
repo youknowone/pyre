@@ -54,7 +54,7 @@ struct StructSeqDescr {
 }
 
 /// Live type → descr. The type pointer sits in a MiniMark root so a
-/// nursery heap type can move; lookup compares the forwarded slot.
+/// forwarded slot still matches after a collection.
 struct StructSeqRegEntry {
     cls_slot: Box<usize>,
     descr: StructSeqDescr,

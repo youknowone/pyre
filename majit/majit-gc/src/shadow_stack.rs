@@ -895,7 +895,11 @@ pub unsafe fn walk_owner_roots_area(data: *const (), mut visitor: impl FnMut(&mu
         return;
     }
     let roots = unsafe { &*(data as *const RefCell<Vec<Option<GcRef>>>) };
-    for root in roots.borrow_mut().iter_mut().flatten() {
+    // Same as `walk_all_roots`: a `RefCell` borrow is a same-thread
+    // check and must not synchronize foreign TLS. The owner is this
+    // thread or quiesced.
+    let slots = unsafe { &mut *roots.as_ptr() };
+    for root in slots.iter_mut().flatten() {
         if !root.is_null() {
             visitor(root);
         }

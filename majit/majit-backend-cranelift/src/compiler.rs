@@ -12487,11 +12487,10 @@ impl CraneliftBackend {
                     // Load the live jitframe first (the call may have moved
                     // it). Do not run the write-barrier yet: it can collect
                     // while the GCREF result is still only a CL value.
-                    // PRE-EXISTING-ADAPTATION: upstream leaves the result
-                    // in the return register until the next `before_call`
-                    // SAVE_GCREF_REGS. A free-threaded safepoint can collect
-                    // before that, so publish the Ref into its jitframe
-                    // home now.
+                    // The CallR result is published into its jitframe home
+                    // before the jitframe write barrier. The cause of that
+                    // store is not a proven free-threaded compiled-code
+                    // safepoint; compiled STW still deopts through a guard.
                     jf_ptr = emit_load_frame_from_shadow_stack(&mut builder, ptr_type);
                     builder.ins().set_pinned_reg(jf_ptr);
                     if let Some(result) = call_result {
