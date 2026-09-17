@@ -10694,8 +10694,9 @@ mod tests {
         assert!(
             lower_setitem_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant).is_none()
         );
-        // Right opname but with a result — must still return None
-        // since `emit_frontend_setitem` always emits void.
+        // A result-bearing `setitem` still lowers: inline `setitem` when
+        // the minted helper is present, otherwise the same void residual
+        // STORE_SUBSCR uses.  The dest is what `inline_call_r_r` writes.
         let r = Variable::new(VariableId(3), Kind::Ref);
         let op_with_result = SpaceOperation::new(
             "setitem",
@@ -10703,15 +10704,33 @@ mod tests {
             Some(r.into()),
             0,
         );
-        assert!(
-            lower_setitem_hlop_to_insn(
-                &op_with_result,
-                &ctx,
-                &mut get_register,
-                &mut lower_constant
-            )
-            .is_none()
-        );
+        let insn = lower_setitem_hlop_to_insn(
+            &op_with_result,
+            &ctx,
+            &mut get_register,
+            &mut lower_constant,
+        )
+        .expect("result-bearing setitem must lower");
+        match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } if opname.starts_with("inline_call") => {
+                assert_eq!(result, Some(Register::new(Kind::Ref, 3)));
+                assert!(!args.is_empty());
+            }
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => {
+                assert_eq!(opname, "residual_call_r_v");
+                assert!(result.is_none());
+                assert_eq!(args.len(), 3);
+            }
+            other => panic!("expected setitem inline or residual, got {other:?}"),
+        }
     }
 
     #[test]
