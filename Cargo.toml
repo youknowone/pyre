@@ -255,6 +255,12 @@ insta = "1"
 # release carrying it reaches crates.io.
 [patch.crates-io]
 xz-core = { git = "https://github.com/simnalamburt/xz-rs", rev = "5bf95411d0307e052ca2aeb06f0d75565c9a7362" }
+# rustpython-host_env turns on rustls-pki-types `web` for wasm32-unknown-unknown
+# so UnixTime::now exists. The published web-time crate implements that via
+# wasm-bindgen Date.now(), and wasmtime then fails to instantiate the guest
+# (`__wbindgen_placeholder__::__wbindgen_describe`). This stand-in keeps the
+# type and reports the Unix epoch; interpreter `_ssl` is not built for wasm.
+web-time = { path = "third_party/web-time" }
 
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;
