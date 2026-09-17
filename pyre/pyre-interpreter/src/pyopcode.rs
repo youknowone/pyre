@@ -626,6 +626,19 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
         // Default: build as tuple. PyFrame overrides to create W_FrozenSetObject.
         self.build_tuple(items)
     }
+    /// Keep a realized constant live while a later sibling mint can collect.
+    /// Default is a no-op; [`PyFrame`] publishes the word on the shadow stack.
+    fn pin_const(&mut self, value: Self::Value) -> Self::Value {
+        value
+    }
+    /// One root bracket around a nested container constant. Default does
+    /// not open one; [`PyFrame`] does so `pin_const` has a slot to use.
+    fn with_const_roots<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<R, PyError>,
+    ) -> Result<R, PyError> {
+        f(self)
+    }
 }
 
 fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
@@ -654,7 +667,8 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Tuple { elements } => {
             let mut items = Vec::with_capacity(elements.len());
             for element in elements {
-                items.push(load_const_value(handler, element)?);
+                let value = load_const_value(handler, element)?;
+                items.push(handler.pin_const(value));
             }
             handler.build_tuple(&items)
         }
@@ -666,7 +680,8 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Frozenset { elements } => {
             let mut items = Vec::with_capacity(elements.len());
             for element in elements {
-                items.push(load_const_value(handler, element)?);
+                let value = load_const_value(handler, element)?;
+                items.push(handler.pin_const(value));
             }
             handler.frozenset_constant(&items)
         }
@@ -674,7 +689,8 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
             // Slice constant → build start/stop/step via handler.slice_constant()
             let mut items = Vec::with_capacity(3);
             for element in elements.iter() {
-                items.push(load_const_value(handler, element)?);
+                let value = load_const_value(handler, element)?;
+                items.push(handler.pin_const(value));
             }
             if items.len() == 3 {
                 let items = items.as_slice();
@@ -690,8 +706,10 @@ pub fn opcode_load_const<H: ConstantOpcodeHandler + ?Sized>(
     handler: &mut H,
     constant: &ConstantData,
 ) -> Result<(), PyError> {
-    let value = load_const_value(handler, constant)?;
-    handler.push_value(value)
+    handler.with_const_roots(|handler| {
+        let value = load_const_value(handler, constant)?;
+        handler.push_value(value)
+    })
 }
 
 pub fn opcode_load_small_int<H: ConstantOpcodeHandler + ?Sized>(
