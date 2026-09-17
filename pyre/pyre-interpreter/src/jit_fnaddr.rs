@@ -1145,6 +1145,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     #[cfg(target_arch = "wasm32")]
     push_abi_unsound_fnaddr(
         &mut entries,
+        "pyre_interpreter::type_methods::__majit_wrap_str_descr_startswith",
+        crate::type_methods::__majit_wrap_str_descr_startswith as *const (),
+    );
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
+        "pyre_interpreter::type_methods::__majit_wrap_str_descr_endswith",
+        crate::type_methods::__majit_wrap_str_descr_endswith as *const (),
+    );
+    #[cfg(target_arch = "wasm32")]
+    push_abi_unsound_fnaddr(
+        &mut entries,
         "pyre_interpreter::module::r#struct::__majit_wrap_struct_pack",
         crate::module::r#struct::__majit_wrap_struct_pack as *const (),
     );
