@@ -10801,7 +10801,7 @@ pub(crate) unsafe fn lookup_where_class_uncached(
 /// bounded so a type that keeps mutating cannot livelock the lookup.
 /// Keeping the raw walk behind the two residuals contains its
 /// `<other> ∪ _ptr` phi-merge.
-pub(crate) unsafe fn lookup_where_pair(
+pub unsafe fn lookup_where_pair(
     w_type: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {

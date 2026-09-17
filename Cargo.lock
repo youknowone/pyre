@@ -2862,6 +2862,7 @@ dependencies = [
  "libc",
  "linkme",
  "majit-ir",
+ "majit-macros",
  "majit-metainterp",
  "majit-rlib",
  "num-complex",

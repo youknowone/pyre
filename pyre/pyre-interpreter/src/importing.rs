@@ -804,8 +804,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
-    pyre_install_module!(zlib);
-    pyre_install_module!(_lsprof);
     pyre_install_module!(_lzma);
     pyre_install_module!(_typing);
     pyre_install_module!(_hashlib);
@@ -824,7 +822,6 @@ pub fn install_builtin_modules() {
         crate::module::array::init_array_module,
         crate::module::array::startup_array_module,
     );
-    register_builtin_module("_queue", crate::module::_queue::init);
     register_builtin_module("_types", crate::module::_types::init);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);
