@@ -1950,6 +1950,8 @@ pub fn validate_check_exc_match_class(exc_type: PyObjectRef) -> Result<(), PyErr
     Ok(())
 }
 
+/// `pyopcode.py check_except_star_type_valid` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn validate_check_eg_match_class(exc_type: PyObjectRef) -> Result<(), PyError> {
     validate_check_exc_match_class(exc_type)?;
     let base_group = crate::builtins::lookup_exc_class("BaseExceptionGroup").unwrap();

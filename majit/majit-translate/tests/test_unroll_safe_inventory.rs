@@ -291,6 +291,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("build_map_from_refs", "pyopcode.py BUILD_MAP pair store"),
     ("match_keys_value", "pyopcode.py MATCH_KEYS"),
     ("match_class_value", "pyopcode.py _match_class"),
+    (
+        "validate_check_eg_match_class",
+        "pyopcode.py check_except_star_type_valid",
+    ),
     // `rlib/jit.py look_inside_iff.inner` does `func = unroll_safe(func)`.
     // Harvested names are the inlined originals (`_orig_*`), not the
     // dispatch wrappers.
