@@ -49,6 +49,38 @@ mismatch, bridge-resume inline-frame globals and vable-resident root locals. Fix
 it by restoring the per-frame red frame, never by baking an anchor's value as a
 constant.
 
+### No new hand folds
+
+`pyjitpl.py` has no hand-written specializations. Every fast path PyPy has
+comes from tracing the interpreter's own body (`space.add`, `int_w`,
+`w_float_new` as `new_with_vtable` + `setfield`) plus interpreter-side hints
+(`@jit.elidable`, `@jit.look_inside_iff`, `promote`, `@jit.unroll_safe`) and
+the optimizer (`intbounds`, `heap`, `virtualize`, `unroll`). pyre's
+`try_walker_specialize_*` functions and `spec_folds!` rows are the manual
+traces the descent work exists to retire, and their count is monotonic:
+
+- **The census must not go up.** Rows:
+  `sed -n '/^spec_folds! {/,/^}/p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`.
+  Functions: `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
+  A change that raises either number is rejected in review; record both
+  numbers before and after in the commit message when a change touches them.
+- **A descent wall is a lowering gap, not a reason to fold.** When descending
+  a helper does not finish or aborts (an unlowered constructor such as
+  `w_float_new`/`w_complex_new`, a guard with a null class pointer, a trace
+  length or recursion limit), fix the codewriter, walker or optimizer so the
+  body records, and cite the upstream shape that records it. Emitting the
+  helper's result by hand, or residualizing the helper to make the walk stop
+  early, re-creates the manual trace under a new name.
+- **A renamed fold is still a fold.** A `try_emit_exact_*` or similar
+  "exact operand" shortcut consulted before a descent is a hand fold gated
+  under a descent row and counts toward the census. Do not hide one under a
+  `_descent` row.
+- **Speed is recovered upstream's way.** Where a descent is slower than the
+  fold it replaced, the missing piece is an interpreter hint or an optimizer
+  pass the fold was standing in for; port that. Reinstating the fold,
+  raising a `pyre-check` ratio gate, or re-recording `.jitstats` without a
+  root cause are not fixes.
+
 ## Charon LLBC extraction — the prepass input
 
 The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read

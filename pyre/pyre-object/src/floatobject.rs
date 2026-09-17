@@ -58,8 +58,32 @@ impl crate::lltype::GcType for W_FloatObject {
 /// readable type id while staying off the sweep set. Future GC
 /// integration replaces only that body; this constructor stays
 /// unchanged.
+///
+/// The collector-heap arm is [`w_float_gc_alloc`], residualised like
+/// [`crate::intobject::w_int_gc_alloc`]. Exact-int `/` goes through
+/// [`newfloat`] so a helper walk records the `malloc_typed` cluster
+/// `fuse_boxing_alloc` rewrites, not this residual.
+#[inline]
 pub fn w_float_new(value: f64) -> PyObjectRef {
-    let obj = W_FloatObject {
+    if crate::gc_interp::enabled() {
+        let boxed = w_float_gc_alloc(value);
+        if !boxed.is_null() {
+            return boxed;
+        }
+    }
+    newfloat(value)
+}
+
+/// `space.newfloat` / `W_FloatObject(floatval)` (`objspace.py newfloat`,
+/// `floatobject.py` `__init__`). Own graph so `fuse_boxing_alloc` rewrites
+/// the `malloc_typed` cluster to `new_with_vtable` + payload `setfield`.
+/// Looked inside: `@dont_look_inside` would residualise the constructor
+/// PyPy traces. `_truediv` carries the same constructor body so its
+/// own graph has the New; other callers still `inline_call` this fused
+/// helper.
+#[inline(never)]
+pub fn newfloat(value: f64) -> PyObjectRef {
+    crate::lltype::malloc_typed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
@@ -67,17 +91,28 @@ pub fn w_float_new(value: f64) -> PyObjectRef {
         floatval: value,
         w_dict: PY_NULL,
         w_slots: PY_NULL,
-    };
-    if crate::gc_interp::enabled() {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(raw as *mut W_FloatObject, obj);
-                return raw as PyObjectRef;
-            }
-        }
+    }) as PyObjectRef
+}
+
+/// Collector-heap arm of [`w_float_new`]. Same residual boundary as
+/// [`crate::intobject::w_int_gc_alloc`]: the write-into-block shape is
+/// not the `malloc_typed(%agg)` cluster `fuse_boxing_alloc` rewrites,
+/// and looking inside it is what hung a `truediv` helper subwalk.
+#[majit_macros::dont_look_inside]
+pub fn w_float_gc_alloc(value: f64) -> *mut PyObject {
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_FLOAT_GC_TYPE_ID, W_FLOAT_OBJECT_SIZE);
+    if raw.is_null() {
+        return crate::PY_NULL;
     }
-    crate::lltype::malloc_typed(obj) as PyObjectRef
+    unsafe {
+        let p = raw as *mut W_FloatObject;
+        (*p).ob_header.ob_type = &FLOAT_TYPE as *const PyType;
+        (*p).ob_header.w_class = get_instantiate(&FLOAT_TYPE);
+        (*p).floatval = value;
+        (*p).w_dict = PY_NULL;
+        (*p).w_slots = PY_NULL;
+    }
+    raw as PyObjectRef
 }
 
 /// Allocate a `W_FloatObject` for a `float` subclass instance, on the

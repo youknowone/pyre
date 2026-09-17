@@ -4968,17 +4968,41 @@ impl<'a> Transformer<'a> {
         if matches!(target, CallTarget::FunctionPath { segments } if segments == &["__builtin__", "float"])
             && args.len() == 1
             && matches!(result_ty, ValueType::Float)
-            && variable_has_declared_unsigned_type(graph, &args[0])
         {
-            let cast_op = SpaceOperation {
+            // `IntegerRepr.rtype_float` (`rint.py`): Unsigned goes through
+            // `cast_uint_to_float` → `_do_builtin_call`; Signed (and Bool,
+            // renamed to the same backend op) emit `cast_int_to_float`.
+            // `FloatRepr.rtype_float` is identity.  Production still feeds
+            // this rich MIR call, so project all three here.  Do not require
+            // the operand to be the Input itself: `_truediv` copies `x`/`y`
+            // into a temp before `float()`.
+            let src = resolve_alias(&args[0], &self.aliases);
+            if variable_has_declared_unsigned_type(graph, &src)
+                || variable_has_declared_unsigned_type(graph, &args[0])
+            {
+                let cast_op = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: "cast_uint_to_float".into(),
+                        operand: src,
+                        result_ty: ValueType::Float,
+                    },
+                };
+                return self.rewrite_operation(&cast_op, graph_name, graph);
+            }
+            if self.get_value_kind_var(&src) == 'f' {
+                return RewriteResult::Identity(src);
+            }
+            // Return Replace, not a nested `rewrite_operation`: Keep on the
+            // inner UnaryOp would keep the original `float()` Call.
+            return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::UnaryOp {
-                    op: "cast_uint_to_float".into(),
-                    operand: args[0].clone(),
+                    op: "cast_int_to_float".into(),
+                    operand: src,
                     result_ty: ValueType::Float,
                 },
-            };
-            return self.rewrite_operation(&cast_op, graph_name, graph);
+            }]);
         }
         // `__getslice_rangefrom(l, start)` — the front's deferred `l[start:]`
         // on a GC array.  The rtyper's `rtype_getslice` (`rlist.py`) turns
@@ -13721,6 +13745,80 @@ mod tests {
             other => panic!("expected CallResidual with runtime funcptr, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn float_of_signed_projects_to_cast_int_to_float() {
+        // IntegerRepr.rtype_float on Signed emits `cast_int_to_float`
+        // (`rint.py`).  The rich-graph compatibility path must do the same
+        // for `simple_call(__builtin__.float, v_int)` or `_truediv`'s
+        // `x as f64` residualizes as `residual_call_irf_f`.
+        let mut graph = FunctionGraph::new("cast_int_to_float_test");
+        let arg = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arg".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__builtin__", "float"]),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["__builtin__", "float"]),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: ValueType::Float,
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &CallTarget::function_path(["__builtin__", "float"]),
+            std::slice::from_ref(&arg),
+            &ValueType::Float,
+            "cast_int_to_float_test",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, operand, result_ty }
+                            if op == "cast_int_to_float"
+                                && *operand == arg
+                                && *result_ty == ValueType::Float
+                    )),
+                    "signed float() must become cast_int_to_float; ops={ops:?}"
+                );
+                assert!(
+                    !ops.iter()
+                        .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+                    "signed float() must not residualize; ops={ops:?}"
+                );
+            }
+            RewriteResult::Keep => panic!("signed float() must rewrite, got Keep"),
+            RewriteResult::Identity(_) => {
+                panic!("signed float() must rewrite, got Identity")
+            }
+        }
     }
 
     #[test]

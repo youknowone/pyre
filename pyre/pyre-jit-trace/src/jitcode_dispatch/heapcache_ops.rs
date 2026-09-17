@@ -92,7 +92,10 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             ctx.trace_ctx.box_value(index),
         ) {
             let array_ptr = array_ref.0 as i64;
-            if array_ptr != 0 && array_ptr != usize::MAX as i64 {
+            if array_ptr != 0
+                && array_ptr != usize::MAX as i64
+                && (0..i32::MAX as i64).contains(&index_value)
+            {
                 let folded =
                     match ctx
                         .trace_ctx
@@ -180,7 +183,13 @@ pub(crate) fn getarrayitem_gc_via_heapcache<Sym: WalkSym>(
             ctx.trace_ctx.box_value(index),
         ) {
             let array_ptr = array_ref.0 as i64;
-            if array_ptr != usize::MAX as i64 && array_ptr != 0 {
+            // A helper walk can put a Ref bit-pattern in an Int index
+            // register.  `bh_getarrayitem_gc_r` then SIGBUS
+            // (`test.test_dict` `items ^ items`).  Skip the live load.
+            if array_ptr != usize::MAX as i64
+                && array_ptr != 0
+                && (0..i32::MAX as i64).contains(&index_value)
+            {
                 ctx.trace_ctx
                     .array_sanity_load(array_ptr, index_value, &descr, ty)
             } else {

@@ -473,9 +473,11 @@ jobs:
     runs-on: ubuntu-24.04
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
-    # Two cargo passes, one per backend. They measured ~27 min together, so
-    # the cap bounds a hang without bounding the work.
-    timeout-minutes: 60
+    # Two cargo passes used to measure ~27 min together; PR 1832 run
+    # 34968256365 spent ~55 min on dynasm alone (29 compile + 21 test +
+    # 3 serial) and the 60 min cap cancelled cranelift mid-link. 90 min
+    # bounds a hang without cutting the sequential dynasm+cranelift work.
+    timeout-minutes: 90
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
       # artifact into this workspace path.

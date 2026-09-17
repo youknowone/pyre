@@ -5346,10 +5346,10 @@ fn abs_structural(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
         if is_int(obj) {
             let v = w_int_get_value(obj);
             // i64::MIN.abs() overflows; promote to long
-            return Ok(match v.checked_abs() {
-                Some(r) => w_int_new(r),
-                None => w_long_new(-BigInt::from(v)),
-            });
+            return match v.checked_abs() {
+                Some(_) => crate::objspace::descroperation::_int_abs(v),
+                None => Ok(w_long_new(-BigInt::from(v))),
+            };
         }
         if is_long(obj) {
             let val = w_long_get_value(obj);
@@ -5366,7 +5366,7 @@ fn abs_structural(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
             return Ok(w_long_new(val.neg()));
         }
         if is_float(obj) {
-            return Ok(w_float_new(w_float_get_value(obj).abs()));
+            return crate::objspace::descroperation::_float_abs(w_float_get_value(obj));
         }
         if pyre_object::is_complex(obj) {
             return crate::objspace::descroperation::complex_abs(obj);
