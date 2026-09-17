@@ -98,17 +98,20 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # host_env thread/locale/loader/BSTR, rustls-free ssl core, wasm
 # _ssl/_socket, Windows types, thread _NAME_MAXLEN, WASI rustls,
 # parse-override ranking, and hang-at-finalize daemon handles.
+# Then youknowone/host-env-share (7c7adb5d5): host_env `ssl` is rustls-free;
+# `ssl-rustls` is the rustls engine. wasm-host no longer needs a web-time
+# patch because host_env no longer forces rustls-pki-types `web`.
 #
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
+rustpython-common = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
+rustpython-literal = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
+rustpython-compiler = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
+rustpython-compiler-core = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
 ruff-text-size = { package = "rustpython-ruff_text_size", version = "0.16.5" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "3191ecaf38e94f634f04eea4b8ca1a169e7d145b" }
+rustpython-host_env = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
+rustpython-wtf8 = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
+rustpython-unicode = { git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/youknowone/RustPython.git", rev = "7c7adb5d56f4d6c9608ab28c9731a6ab7b568f7e" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
@@ -255,12 +258,6 @@ insta = "1"
 # release carrying it reaches crates.io.
 [patch.crates-io]
 xz-core = { git = "https://github.com/simnalamburt/xz-rs", rev = "5bf95411d0307e052ca2aeb06f0d75565c9a7362" }
-# rustpython-host_env turns on rustls-pki-types `web` for wasm32-unknown-unknown
-# so UnixTime::now exists. The published web-time crate implements that via
-# wasm-bindgen Date.now(), and wasmtime then fails to instantiate the guest
-# (`__wbindgen_placeholder__::__wbindgen_describe`). This stand-in keeps the
-# type and reports the Unix epoch; interpreter `_ssl` is not built for wasm.
-web-time = { path = "third_party/web-time" }
 
 # `cargo run --release` is the benchmark/developer performance surface too.
 # Give it the same cross-crate optimization used by distributable binaries;

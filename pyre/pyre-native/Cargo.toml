@@ -18,8 +18,8 @@ bitflags = { workspace = true }
 rustpython-common = { workspace = true, features = ["hashlib"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-# `ssl` compiles the whole host_env ssl module. rustls stays native-only
-# inside that crate, so this feature is safe on wasm32.
+# `ssl` is MemoryBIO/OID/ALPN. `ssl-rustls` is the rustls engine and is
+# native-only; wasm-host must not compile rustls (no JS UnixTime::now).
 rustpython-host_env = { workspace = true, features = ["ssl"] }
 libc = { workspace = true }
 lz4_flex = { version = "0.13", default-features = false, features = [
@@ -27,6 +27,7 @@ lz4_flex = { version = "0.13", default-features = false, features = [
 ], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustpython-host_env = { workspace = true, features = ["ssl-rustls"] }
 rustls = { workspace = true }
 rustls-webpki = { workspace = true }
 rustls-pemfile = { workspace = true }
