@@ -18512,6 +18512,29 @@ fn emit_integer_append_spare_capacity<Sym: WalkSym>(
     list_op: OpRef,
     value_op: OpRef,
 ) -> Result<(), DispatchError> {
+    // `guard_list_strategy` (`pyjitpl.py` / `listobject.py`
+    // `switch_to_correct_strategy`): the spare-capacity store reads
+    // `int_items.block` and `arraylen_gc`s it.  An Empty/Object
+    // accumulator (BUILD_LIST 0 on an outer back-edge that
+    // `jump_to_existing_trace` retargets onto this header) has a null
+    // block; without the strategy guard the header `ArraylenGc`s that
+    // null.  Same getfield + GuardValue + replace_box as the subscript
+    // path (`MIFrame.guard_list_strategy`).
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx
+        .trace_ctx
+        .const_int(pyre_object::listobject::ListStrategy::Integer as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
     let len = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         list_op,
@@ -18524,6 +18547,9 @@ fn emit_integer_append_spare_capacity<Sym: WalkSym>(
         list_op,
         crate::descr::list_int_items_block_descr(),
     );
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardNonnull, &[block], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
     let cap =
         crate::state::opimpl_arraylen_gc(ctx.trace_ctx, block, crate::state::int_gcarray_descr());
     let need_grow = ctx.trace_ctx.record_op(OpCode::IntLt, &[cap, newsize]);
