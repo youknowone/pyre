@@ -1130,18 +1130,46 @@ enum FailDescrSlot {
 #[cfg(test)]
 pub static FAIL_DESCR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// Acquires [`FAIL_DESCR_TEST_LOCK`] and clears this thread's GC box and
-/// shadow stack *before* releasing it. Fields drop last-to-first, so
-/// `_cleanup` is declared after `_lock`. cargo joins the test thread
-/// after the function returns; TLS dtors then race the next test. The
-/// cpu must be quiet first (`cpu.gc_ll_descr` / shadowstack die with
-/// the frame).
+/// Acquires [`FAIL_DESCR_TEST_LOCK`], then installs a fresh cpu.
+///
+/// `BaseBackendTest.setup_method` does `self.cpu = self.get_cpu()` and
+/// sets `done_with_this_frame_descr_* = None`. The wasm host keeps those
+/// tables process-global (guest writes an exit index, not a cpu pointer),
+/// so the equivalent is to empty them here. Drop is
+/// `AsmMemoryManager._delete`: the cpu dies with the frame
+/// (`cpu.gc_ll_descr` / shadowstack). Fields drop last-to-first, so
+/// `_cleanup` is declared after `_lock`.
 #[cfg(test)]
 pub fn lock_cpu() -> CpuTestGuard {
-    CpuTestGuard {
+    let guard = CpuTestGuard {
         _lock: FAIL_DESCR_TEST_LOCK.lock(),
         _cleanup: CpuTestCleanup,
+    };
+    reset_cpu_for_tests();
+    guard
+}
+
+/// Empty the process-global cpu tables and uninstall this thread's
+/// `gc_ll_descr`. `BaseBackendTest.setup_method` / `get_cpu`.
+#[cfg(test)]
+fn reset_cpu_for_tests() {
+    {
+        // Registry first, then `FINISH_EXITS` — same order as
+        // `reserve_finish_exit_block` / `attach_finish_descr`.
+        let mut reg = FAIL_DESCR_REGISTRY.lock();
+        *reg = None;
+        let mut exits = FINISH_EXITS.lock();
+        *exits = [None, None, None, None, None];
     }
+    *LABEL_TARGETS.lock() = None;
+    *CALL_ASSEMBLER_TARGETS.lock() = None;
+    *WASM_CA_DISPATCH.lock() = None;
+    *CA_GNF2_COMPILED_PTRS.lock() = None;
+    crate::gc_box::clear();
+    majit_gc::shadow_stack::clear();
+    crate::clear_pending_inlines_for_tests();
+    crate::jit_exc_clear();
+    crate::set_wasm_jitframe_tid(0);
 }
 
 #[cfg(test)]
@@ -1150,15 +1178,8 @@ struct CpuTestCleanup;
 #[cfg(test)]
 impl Drop for CpuTestCleanup {
     fn drop(&mut self) {
-        // Under the cpu lock, before the harness joins this worker.
-        // cargo releases the test function then runs TLS dtors
-        // concurrently with the next test; leftover jf roots and the
-        // TLS GC box must already be gone (`cpu.gc_ll_descr` dies with
-        // the frame, `GcRootMap_shadowstack` is per-thread and empty
-        // at detach).
-        crate::gc_box::clear();
-        majit_gc::shadow_stack::clear();
-        crate::clear_pending_inlines_for_tests();
+        // `AsmMemoryManager._delete` / cpu teardown, still under the lock.
+        reset_cpu_for_tests();
     }
 }
 
