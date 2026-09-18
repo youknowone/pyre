@@ -21414,9 +21414,9 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     let Some((sub_body, sym_ptr)) = orthodox_list_setitem_body_and_sym(ctx) else {
         return Ok(None);
     };
-    if (unsafe { pyre_object::w_list_getitem(list_obj, index) }).is_none() {
+    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
         return Ok(None);
-    }
+    };
     // Typed getitem boxes the displaced int/float and may move the operands.
     let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
         walker_concrete_ref_object(ctx, list_op),
@@ -21425,6 +21425,10 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     ) else {
         return Ok(None);
     };
+    // Root the original element before the sub-walk executes the store
+    // (`w_list_setitem_inner`).  A post-walk getitem would read the new
+    // value and rollback would restore that, leaving the list mutated.
+    fbw_store_journal_root(list_obj, key_obj, displaced);
     let sym = unsafe { &*sym_ptr };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
 
@@ -21530,6 +21534,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-SETITEM-SUBWALK pc={pc}");
             }
+            fbw_store_journal_pop();
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
@@ -21542,6 +21547,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
                     error.variant_name()
                 );
             }
+            fbw_bump_executed_effect("store_journal");
             return Err(error);
         }
     };
@@ -21551,30 +21557,23 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
             let _ = result;
         }
         _ => {
+            fbw_store_journal_pop();
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
         }
     }
 
-    let (Some(list_obj), Some(key_obj), Some(value_obj)) = (
+    let (Some(list_obj), Some(value_obj)) = (
         walker_concrete_ref_object(ctx, list_op),
-        walker_concrete_ref_object(ctx, key_op),
         walker_concrete_ref_object(ctx, value_op),
     ) else {
+        fbw_store_journal_pop();
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     };
-    // The pre-walk probe may have boxed a typed element and the sub-walk
-    // may have collected; re-read the displaced box after both so the
-    // journal roots the live pointer.
-    let Some(displaced) = (unsafe { pyre_object::w_list_getitem(list_obj, index) }) else {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    };
-    fbw_store_journal_push(list_obj, key_obj, displaced);
+    fbw_bump_executed_effect("store_journal");
     // Overwrite is idempotent: a residual the sub-walk already executed
     // wrote this same value.
     let stored = unsafe { pyre_object::w_list_setitem(list_obj, index, value_obj) };

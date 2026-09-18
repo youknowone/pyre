@@ -917,11 +917,28 @@ pub(crate) fn fbw_store_journal_push(
     key: pyre_object::PyObjectRef,
     displaced: pyre_object::PyObjectRef,
 ) {
-    FBW_STORE_JOURNAL.with(|j| j.borrow_mut().push([list, key, displaced]));
+    fbw_store_journal_root(list, key, displaced);
     // gh#467: a journaled store still mutated the heap this iteration; the
     // forward-flush gate counts it so a callee sub-walk that appends/setitems
     // cannot be committed-then-re-executed (a double).
     fbw_bump_executed_effect("store_journal");
+}
+
+/// Root `[list, key, displaced]` so a collecting setitem sub-walk forwards
+/// the original element.  Does not bump the effect odometer; the caller
+/// bumps on a successful store or pops on decline.
+pub(crate) fn fbw_store_journal_root(
+    list: pyre_object::PyObjectRef,
+    key: pyre_object::PyObjectRef,
+    displaced: pyre_object::PyObjectRef,
+) {
+    FBW_STORE_JOURNAL.with(|j| j.borrow_mut().push([list, key, displaced]));
+}
+
+pub(crate) fn fbw_store_journal_pop() {
+    FBW_STORE_JOURNAL.with(|j| {
+        let _ = j.borrow_mut().pop();
+    });
 }
 
 /// Record the live length a walked eager list append grew past, for the
