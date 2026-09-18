@@ -3919,6 +3919,14 @@ impl ConstantOpcodeHandler for PyFrame {
         pyre_object::gc_roots::pin_root(value)
     }
 
+    fn pinned_const_slot(&self) -> usize {
+        pyre_object::gc_roots::shadow_stack_len() - 1
+    }
+
+    fn const_at_slot(&self, slot: usize) -> Self::Value {
+        pyre_object::gc_roots::shadow_stack_get(slot)
+    }
+
     fn with_const_roots<R>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<R, PyError>,

@@ -631,6 +631,17 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     fn pin_const(&mut self, value: Self::Value) -> Self::Value {
         value
     }
+    /// Slot [`pin_const`] just published, or `usize::MAX` when this
+    /// handler does not pin. A later sibling mint can move the value;
+    /// [`const_at_slot`] is what reads the forwarded word.
+    fn pinned_const_slot(&self) -> usize {
+        usize::MAX
+    }
+    /// Reload a word [`pin_const`] published. Only called when
+    /// [`pinned_const_slot`] returned a real slot.
+    fn const_at_slot(&self, _slot: usize) -> Self::Value {
+        unreachable!("const_at_slot is only for handlers that pin_const")
+    }
     /// One root bracket around a nested container constant. Default does
     /// not open one; [`PyFrame`] does so `pin_const` has a slot to use.
     fn with_const_roots<R>(
@@ -638,6 +649,36 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
         f: impl FnOnce(&mut Self) -> Result<R, PyError>,
     ) -> Result<R, PyError> {
         f(self)
+    }
+}
+
+/// Realize each nested constant and keep it rooted while later siblings
+/// mint. `pin_const` publishes a slot; a later mint can move that object,
+/// so the Vec of returned words is stale — reload each sibling from its
+/// slot before the container constructor reads them.
+fn load_const_pinned_items<H: ConstantOpcodeHandler + ?Sized>(
+    handler: &mut H,
+    elements: &[ConstantData],
+) -> Result<Vec<H::Value>, PyError> {
+    let mut slots = Vec::with_capacity(elements.len());
+    let mut items = Vec::with_capacity(elements.len());
+    for element in elements {
+        let value = load_const_value(handler, element)?;
+        let live = handler.pin_const(value);
+        let slot = handler.pinned_const_slot();
+        if slot == usize::MAX {
+            items.push(live);
+        } else {
+            slots.push(slot);
+        }
+    }
+    if slots.is_empty() {
+        Ok(items)
+    } else {
+        Ok(slots
+            .into_iter()
+            .map(|slot| handler.const_at_slot(slot))
+            .collect())
     }
 }
 
@@ -665,11 +706,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Boolean { value } => handler.bool_constant(*value),
         ConstantData::Str { value } => handler.str_constant(value),
         ConstantData::Tuple { elements } => {
-            let mut items = Vec::with_capacity(elements.len());
-            for element in elements {
-                let value = load_const_value(handler, element)?;
-                items.push(handler.pin_const(value));
-            }
+            let items = load_const_pinned_items(handler, elements)?;
             handler.build_tuple(&items)
         }
         ConstantData::Code { code } => handler.code_constant(code),
@@ -678,20 +715,12 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Bytes { value } => handler.bytes_constant(value),
         ConstantData::Complex { value } => handler.complex_constant(value.re, value.im),
         ConstantData::Frozenset { elements } => {
-            let mut items = Vec::with_capacity(elements.len());
-            for element in elements {
-                let value = load_const_value(handler, element)?;
-                items.push(handler.pin_const(value));
-            }
+            let items = load_const_pinned_items(handler, elements)?;
             handler.frozenset_constant(&items)
         }
         ConstantData::Slice { elements } => {
             // Slice constant → build start/stop/step via handler.slice_constant()
-            let mut items = Vec::with_capacity(3);
-            for element in elements.iter() {
-                let value = load_const_value(handler, element)?;
-                items.push(handler.pin_const(value));
-            }
+            let items = load_const_pinned_items(handler, elements)?;
             if items.len() == 3 {
                 let items = items.as_slice();
                 handler.slice_constant(items[0], items[1], items[2])
