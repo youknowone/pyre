@@ -5250,6 +5250,51 @@ impl<'a> Lowering<'a> {
     /// `FieldRead` arm in `resolve_place` (the declaration-side field
     /// ty is the generic param for generic ADTs, which
     /// `tyref_to_value_type` can only degrade to `Ref(None)`).
+    /// `heaptracker.py all_fielddescrs` flattens a by-value nested
+    /// struct into dotted leaves on the outer GC owner. `W_ListObject`
+    /// stores Integer/Float items as an inline `IntArray` /
+    /// `FloatArray`; a write of `.block` / `.len` is therefore
+    /// `setfield_gc(l, int_items.block)` — the same field
+    /// `_handle_list_call` and `rlist.py` `l.items = newitems` use.
+    /// Without the flatten, Charon emits `FieldWrite(block)` on the
+    /// nested `IntArray` copy, so heap CSE of `int_items.block` and
+    /// the CondCall write-set both miss the store.
+    fn flatten_list_storage_field_write(
+        &self,
+        inner: &Place,
+        elem: &ProjectionElem,
+    ) -> Option<(String, String)> {
+        let leaf_payload = match elem {
+            ProjectionElem::Tagged(v) => v.as_object().and_then(|m| m.get("Field"))?,
+            _ => return None,
+        };
+        let (_, leaf_name, _, _) = self.resolve_adt_field(leaf_payload)?;
+        if !matches!(leaf_name.as_str(), "block" | "len") {
+            return None;
+        }
+        let mut cur = inner;
+        loop {
+            match &cur.kind {
+                PlaceKind::Projection(next, ProjectionElem::Atom(s)) if s == "Deref" => {
+                    cur = next;
+                }
+                PlaceKind::Projection(_, ProjectionElem::Tagged(v)) => {
+                    let nested_payload = v.as_object().and_then(|m| m.get("Field"))?;
+                    let (owner, nested_name, _, _) = self.resolve_adt_field(nested_payload)?;
+                    if matches!(
+                        nested_name.as_str(),
+                        "int_items" | "float_items" | "bytes_items" | "ascii_items"
+                    ) && owner.ends_with("W_ListObject")
+                    {
+                        return Some((owner, format!("{nested_name}.{leaf_name}")));
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+    }
+
     fn emit_projection_write(
         &mut self,
         mir_bb: usize,
@@ -5258,6 +5303,21 @@ impl<'a> Lowering<'a> {
         mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
+        if let Some((owner, flat_name)) = self.flatten_list_storage_field_write(&inner, &elem) {
+            let list_place = peel_nested_storage_place(inner);
+            let base = self.resolve_place(mir_bb, list_place)?;
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base,
+                    field: FieldDescriptor::new(flat_name, Some(owner)),
+                    value,
+                    ty: tyref_to_value_type(dest_ty, self.llbc),
+                },
+            });
+            return Ok(());
+        }
         // A plain `*p = v` (`__deref_write` Call below) reads a
         // materialised register: its Call args must be Variables, so a
         // constant operand must already have been forced to a Variable.
@@ -26502,6 +26562,25 @@ fn charon_const_generic_to_string(cg: &serde_json::Value) -> String {
         }
     }
     "N".to_string()
+}
+
+/// Drop Deref wrappers and the by-value storage field (`int_items` /
+/// `float_items` / …) so the write base is the list pointer. Pair of
+/// [`Lowering::flatten_list_storage_field_write`].
+fn peel_nested_storage_place(inner: Place) -> Place {
+    let mut cur = inner;
+    loop {
+        match cur.kind {
+            PlaceKind::Projection(next, ProjectionElem::Atom(s)) if s == "Deref" => {
+                cur = *next;
+            }
+            PlaceKind::Projection(next, ProjectionElem::Tagged(_)) => return *next,
+            other => {
+                cur.kind = other;
+                return cur;
+            }
+        }
+    }
 }
 
 /// Stable short label for an [`Rvalue::Aggregate`]'s [`Field`]

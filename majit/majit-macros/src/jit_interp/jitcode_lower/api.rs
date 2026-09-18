@@ -748,17 +748,29 @@ pub(super) fn bind_pre_merge_point_stmts(
     lowerer: &mut Lowerer,
     func_block: &syn::Block,
 ) -> Option<()> {
-    let dispatch_match = find_dispatch_match(func_block)?;
-    let loop_body = find_dispatch_loop_body(func_block, dispatch_match)?;
+    let loop_body = if let Some(dispatch_match) = find_dispatch_match(func_block) {
+        find_dispatch_loop_body(func_block, dispatch_match)?
+    } else {
+        portal_loop_body(func_block)?
+    };
     for stmt in &loop_body.stmts {
         if is_jit_merge_point_macro(stmt) {
             break;
         }
         if let syn::Stmt::Local(local) = stmt {
-            // lower_local delegates to lower_value_expr; failure here is
-            // intentionally silent — emit_promote_greens will produce the
-            // diagnostic if the green's binding is still missing.
-            let _ = lowerer.lower_local(local);
+            // A side-effecting `let` the lowerer cannot reproduce must
+            // not stay in the interpreter-only prefix: the compiled
+            // back-edge would omit it. Fail the body so the portal
+            // stays in the interpreter rather than compiling a loop
+            // that drops the mutation. A side-effect-free match
+            // (`jit_interp_dispatch_match_choice` `InLoopState`) is
+            // prefix-only and can be skipped — `jit_merge_point` is
+            // the compiled header.
+            if lowerer.lower_local(local).is_none()
+                && crate::jit_interp::codegen_trace::local_init_has_mutating_effect(local)
+            {
+                return None;
+            }
         }
     }
     Some(())

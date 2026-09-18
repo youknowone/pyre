@@ -1552,12 +1552,12 @@ impl Optimizer {
                 crate::resume::ResumeDataLoopMemo::new(),
             )),
             snapshot_boxes: Vec::new(),
-            snapshot_frame_sizes: Vec::new(),
+            snapshot_frame_sizes: SnapshotFrameSizes::new(),
             snapshot_vable_boxes: Vec::new(),
             // resume.py:401-402: `-1` for a jitdriver with no virtualizable.
             minimum_virtualizable_size: -1,
             snapshot_vref_boxes: Vec::new(),
-            snapshot_frame_pcs: Vec::new(),
+            snapshot_frame_pcs: SnapshotFramePcs::new(),
             phase1_emit_ops: Vec::new(),
             opt_ops_emitted: 0,
             opt_guards_emitted: 0,
@@ -1599,10 +1599,10 @@ impl Optimizer {
         self.simple_compile = false;
         self.all_descrs = Arc::new(Vec::new());
         self.snapshot_boxes = Vec::new();
-        self.snapshot_frame_sizes = Vec::new();
+        self.snapshot_frame_sizes.clear();
         self.snapshot_vable_boxes = Vec::new();
         self.snapshot_vref_boxes = Vec::new();
-        self.snapshot_frame_pcs = Vec::new();
+        self.snapshot_frame_pcs.clear();
         self.phase1_emit_ops.clear();
         self.opt_ops_emitted = 0;
         self.opt_guards_emitted = 0;

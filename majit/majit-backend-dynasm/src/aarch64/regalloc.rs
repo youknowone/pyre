@@ -138,7 +138,7 @@ impl<'a> RegAlloc<'a> {
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
         self.possibly_free_var(dst, Type::Int);
         let res_loc = Loc::Reg(res);
-        self.perform(i, vec![lhs_loc, rhs_loc], Some(res_loc), output);
+        self.perform(i, [lhs_loc, rhs_loc], Some(res_loc), output);
     }
 
     /// aarch64/regalloc.py — `prepare_op_int_mul` is reused for
@@ -195,7 +195,7 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(lhs, Type::Int);
         self.possibly_free_var(rhs, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
-        self.perform(i, vec![lhs_loc, rhs_loc], Some(Loc::Reg(res)), output);
+        self.perform(i, [lhs_loc, rhs_loc], Some(Loc::Reg(res)), output);
     }
 
     /// aarch64/regalloc.py:877 `prepare_comp_op_int_add_ovf =
@@ -339,6 +339,6 @@ impl<'a> RegAlloc<'a> {
         self.possibly_free_var(lhs, Type::Int);
         self.possibly_free_var(rhs, Type::Int);
         let res = self.force_allocate_reg(dst, Type::Int, &[], None, false);
-        self.perform(i, vec![l0, l1], Some(Loc::Reg(res)), output);
+        self.perform(i, [l0, l1], Some(Loc::Reg(res)), output);
     }
 }

@@ -754,21 +754,39 @@ impl<'a> ByteTraceIter<'a> {
         end: usize,
         start_fresh: u32,
     ) -> Self {
+        Self::new_with_inputargs(trace, start, end, &trace.inputargs, start_fresh)
+    }
+
+    /// `TraceIterator.__init__` with an explicit inputarg list.
+    ///
+    /// `History.set_inputargs` is hole-filtered and keeps each surviving
+    /// box's original `get_position()`. Seeding `_cache` from
+    /// `trace.inputargs` (the reserved prefix) types a later live Int as
+    /// the dead Ref when those lists are zipped by compact index.
+    pub(crate) fn new_with_inputargs(
+        trace: &'a TraceRecordBuffer,
+        start: usize,
+        end: usize,
+        live_inputargs: &[InputArg],
+        start_fresh: u32,
+    ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
         let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
         let mut _fresh = start_fresh;
         // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
         // self.trace.inputargs]` — type comes from each `InputArg.tp.get()`.
-        let inputargs: Vec<majit_ir::InputArgRc> = trace
-            .inputargs
+        let inputargs: Vec<majit_ir::InputArgRc> = live_inputargs
             .iter()
             .map(|ia| {
                 let r = InputArg::from_type_rc(ia.tp.get(), _fresh);
                 _fresh += 1;
+                if let Some(value) = ia.get_value() {
+                    r.set_value(value);
+                }
                 r
             })
             .collect();
-        for (i, ia) in trace.inputargs.iter().enumerate() {
+        for (i, ia) in live_inputargs.iter().enumerate() {
             let p = ia.index as usize;
             if p >= _cache.len() {
                 _cache.resize(p + 1, None);
@@ -1283,9 +1301,10 @@ pub struct SnapshotIterator<'a> {
     /// opencoder.py:211,214-217 self.framestack — snapshot byte
     /// offsets in bottom-up order (outermost frame first, innermost
     /// frame last), built by reversing the top-down iterator.
-    /// Eight inline slots cover the inlined-callee chain so
-    /// `SnapshotIterator.__init__` does not spill a 64 B heap per snapshot.
-    pub framestack: SmallVec<[usize; 8]>,
+    /// Sixteen inline slots cover the inlined-callee chain so
+    /// `SnapshotIterator.__init__` does not spill a 128 B heap per snapshot.
+    /// Regex `and`/`or` inlines past eight (`number_from_parts`).
+    pub framestack: SmallVec<[usize; 16]>,
     /// Back-reference to `_snapshot_array_data` so callers can
     /// construct fresh `BoxArrayIter` values without rethreading the
     /// buffer. Matches RPython's implicit `main_iter.trace._snapshot_array_data`
@@ -1622,14 +1641,22 @@ impl Trace {
             _descrs: vec![None],
             // opencoder.py:482 — `_refs = [lltype.nullptr(GCREF.TO)]` so
             // index 0 is the null reference / empty-array sentinel.
-            _refs: vec![0u64],
-            rooted_refs: Vec::new(),
-            _refs_dict: indexmap::IndexMap::new(),
+            // A fresh Trace per bridge grew these through the 64 B / 128 B
+            // classes on the regex and/or timed row (`_encode_ptr`,
+            // `encode_varint_signed`). One reserve matches
+            // `recorder::Trace::attach_byte_buffer`'s slots/py_pc reserve.
+            _refs: {
+                let mut refs = Vec::with_capacity(32);
+                refs.push(0);
+                refs
+            },
+            rooted_refs: Vec::with_capacity(32),
+            _refs_dict: indexmap::IndexMap::with_capacity(32),
             _bigints: Vec::new(),
             _bigints_dict: indexmap::IndexMap::new(),
             _floats: Vec::new(),
-            _snapshot_data: Vec::new(),
-            _snapshot_array_data: Vec::new(),
+            _snapshot_data: Vec::with_capacity(128),
+            _snapshot_array_data: Vec::with_capacity(128),
             _total_snapshots: 0,
             tag_overflow: false,
             _consts_bigint: 0,
@@ -3027,6 +3054,47 @@ mod tests {
     }
 
     #[test]
+    fn trace_new_reserves_constptr_and_snapshot_pools() {
+        // opencoder.py Trace.__init__ starts `_refs` / snapshot lists
+        // empty. A Vec that doubles through 8/16/32/64/128 B on every
+        // regex bridge was the timed-row class (`_encode_ptr`,
+        // `encode_varint_signed`). The first 16 unique ConstPtrs and the
+        // first 128 snapshot bytes must stay inside the constructor
+        // reserve.
+        let mut trace = TraceRecordBuffer::new(0, empty_sd());
+        assert!(
+            trace._refs.capacity() >= 32,
+            "_refs must absorb the first unique ConstPtrs without growing"
+        );
+        assert!(
+            trace._snapshot_data.capacity() >= 128,
+            "_snapshot_data must absorb the first snapshot without a 64 B grow"
+        );
+        assert!(
+            trace._snapshot_array_data.capacity() >= 128,
+            "_snapshot_array_data must absorb the first snapshot without a 64 B grow"
+        );
+        let refs_cap = trace._refs.capacity();
+        let snap_cap = trace._snapshot_array_data.capacity();
+        for i in 1..=16u64 {
+            let _ = trace._encode_ptr(i * 0x1000);
+        }
+        assert_eq!(
+            trace._refs.capacity(),
+            refs_cap,
+            "16 unique ConstPtrs grew _refs off the constructor reserve"
+        );
+        for i in 0..32 {
+            trace.append_snapshot_array_data_int(i);
+        }
+        assert_eq!(
+            trace._snapshot_array_data.capacity(),
+            snap_cap,
+            "32 snapshot varints grew _snapshot_array_data off the constructor reserve"
+        );
+    }
+
+    #[test]
     fn trace_drop_preserves_later_lexical_roots() {
         let base = majit_gc::shadow_stack::depth();
         let mut trace = TraceRecordBuffer::new(0, empty_sd());
@@ -3713,6 +3781,28 @@ mod tests {
         assert_eq!(op.arg(1).to_opref(), fresh_i1);
         assert!(it.done());
         assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn byte_trace_iter_seeds_sparse_live_inputargs() {
+        // History.set_inputargs keeps sparse get_position() (0 and 2).
+        // Reminting the reserved prefix would type the second live Int as
+        // the dead Ref when zipped by compact index.
+        let mut buf = TraceRecordBuffer::new(3, empty_sd());
+        let _ = buf.record_input_arg(Type::Int);
+        let _ = buf.record_input_arg(Type::Ref);
+        let _ = buf.record_input_arg(Type::Int);
+        let _ = buf.record_op2(OpCode::IntAdd, Box::ResOp(0), Box::ResOp(2), None);
+        let live = vec![InputArg::new_int(0), InputArg::new_int(2)];
+        let mut it =
+            ByteTraceIter::new_with_inputargs(&buf, buf._start as usize, buf._pos, &live, 1000);
+        assert_eq!(it.inputargs[0].opref(), iarg(1000));
+        assert_eq!(it.inputargs[1].opref(), iarg(1001));
+        assert_eq!(it.inputargs[0].tp.get(), Type::Int);
+        assert_eq!(it.inputargs[1].tp.get(), Type::Int);
+        let add = it.next().expect("one op");
+        assert_eq!(add.arg(0).to_opref(), iarg(1000));
+        assert_eq!(add.arg(1).to_opref(), iarg(1001));
     }
 
     /// M4 step 1: chained ops — the second op references the first

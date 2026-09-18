@@ -276,7 +276,7 @@ fn refresh_forwarded_const_ref(
 fn fold_recorded_jump_args(
     args: Vec<OpRef>,
     inputarg_boxes: &[majit_ir::InputArgRc],
-    recorded_ops: &[Op],
+    recorded_ops: &[OpRc],
 ) -> Vec<OpRef> {
     args.into_iter()
         .map(|arg| {
@@ -541,6 +541,18 @@ impl UnrollOptimizer {
         self.target_tokens = tokens;
     }
 
+    /// Hand a phase optimizer its own snapshot banks without emptying
+    /// `self`. compile_loop_body takes these fields back on InvalidLoop
+    /// for `compile_simple_loop`; a `mem::take` into Phase 2 left that
+    /// retry with no snapshot 0.
+    fn clone_snapshots_onto(&self, opt: &mut crate::optimizeopt::optimizer::Optimizer) {
+        opt.snapshot_boxes = self.snapshot_boxes.clone();
+        opt.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
+        opt.snapshot_vable_boxes = self.snapshot_vable_boxes.clone();
+        opt.snapshot_vref_boxes = self.snapshot_vref_boxes.clone();
+        opt.snapshot_frame_pcs = self.snapshot_frame_pcs.clone();
+    }
+
     pub fn new() -> Self {
         UnrollOptimizer {
             supports_efficient_uint_mul_high: true,
@@ -566,10 +578,10 @@ impl UnrollOptimizer {
             final_exported_state: None,
             final_exported_label_source_positions: None,
             snapshot_boxes: Vec::new(),
-            snapshot_frame_sizes: Vec::new(),
+            snapshot_frame_sizes: SnapshotFrameSizes::new(),
             snapshot_vable_boxes: Vec::new(),
             snapshot_vref_boxes: Vec::new(),
-            snapshot_frame_pcs: Vec::new(),
+            snapshot_frame_pcs: SnapshotFramePcs::new(),
             all_descrs: std::sync::Arc::new(Vec::new()),
             quasi_immutable_deps: Vec::new(),
             trace_inputargs: Vec::new(),
@@ -799,7 +811,8 @@ impl UnrollOptimizer {
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
     ) -> (Vec<majit_ir::OpRc>, usize) {
-        self.optimize_trace_with_constants_and_inputs_vable(ops, constants, num_inputs, None)
+        let ops_rc: Vec<OpRc> = ops.iter().cloned().map(OpRc::new).collect();
+        self.optimize_trace_with_constants_and_inputs_vable(&ops_rc, constants, num_inputs, None)
             .expect("optimize_trace_with_constants_and_inputs: unexpected InvalidLoop")
     }
 
@@ -812,7 +825,7 @@ impl UnrollOptimizer {
     /// Assembly: [preamble_no_jump] + Label(label_args) + [body_with_jump].
     pub(crate) fn optimize_trace_with_constants_and_inputs_vable(
         &mut self,
-        ops: &[Op],
+        ops: &[OpRc],
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
@@ -833,7 +846,7 @@ impl UnrollOptimizer {
     /// still has the Phase 1 results for retrace_needed.
     pub(crate) fn optimize_trace_with_constants_and_inputs_vable_out(
         &mut self,
-        ops: &[Op],
+        ops: &[OpRc],
         constants: &mut majit_ir::ConstMap<majit_ir::Value>,
         num_inputs: usize,
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
@@ -1218,24 +1231,15 @@ impl UnrollOptimizer {
         // TraceIterator setup (`p2_inputarg_types`) and by the earlier
         // `debug_assert_eq!` on its length.
         opt_p2.trace_inputargs = self.trace_inputargs.clone();
-        // Move, not clone: Phase 2 is the last reader of these fields in this
-        // function (no `self.`-qualified read past this point on any path —
-        // the imported_state path writes `phase1_emit_ops` above then reads it
-        // here; the non-peeled early-return arm returns before reaching here),
-        // and the caller never reads `unroll_opt.{snapshot_*,phase1_emit_ops}`
-        // after the optimize call (the InvalidLoop retry
-        // moves the caller's own `snapshot_map` locals, not these fields). A
-        // `Vec` move copies only the (ptr,len,cap) header and leaves the inner
-        // buffers — and the `*mut OpRef` const-ptr root slots collected into
-        // `opt_p2` at the re-root below — at the same addresses. Mirrors the
-        // move-not-clone precedent on the InvalidLoop retry path (pyjitpl.rs
-        // `simple_opt.snapshot_boxes = snapshot_map`).
+        // Clone, like Phase 1. compile_loop_body moves the recorded maps
+        // onto this UnrollOptimizer and, on InvalidLoop, takes them back
+        // for compile_simple_loop. Phase 2 used to `mem::take` them, so
+        // a peel that raised InvalidLoop left the retry with empty
+        // snapshot_boxes and `store_final_boxes_in_guard` panicked on
+        // GuardIsnull resume_pos=0 (tuple_slice_index_rooting).
+        // phase1_emit_ops is not read by that retry.
         opt_p2.phase1_emit_ops = std::mem::take(&mut self.phase1_emit_ops);
-        opt_p2.snapshot_boxes = std::mem::take(&mut self.snapshot_boxes);
-        opt_p2.snapshot_frame_sizes = std::mem::take(&mut self.snapshot_frame_sizes);
-        opt_p2.snapshot_vable_boxes = std::mem::take(&mut self.snapshot_vable_boxes);
-        opt_p2.snapshot_vref_boxes = std::mem::take(&mut self.snapshot_vref_boxes);
-        opt_p2.snapshot_frame_pcs = std::mem::take(&mut self.snapshot_frame_pcs);
+        self.clone_snapshots_onto(&mut opt_p2);
         // compile.py / optimizer.py share the attempt's args_dict itself.
         opt_p2.call_pure_results = self.call_pure_results.clone();
         // RPython: same Optimizer instance keeps patchguardop across phases.
@@ -5866,8 +5870,14 @@ fn assemble_peeled_trace_with_jump_args(
         std::collections::HashMap::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = (**op).clone();
-        let mut original_args: Vec<OpRef> =
-            op.getarglist_copy().iter().map(|a| a.to_opref()).collect();
+        // compile.py never snapshots every body's arglist. Only the Label
+        // arm extends this vec; a Vec per p2 op was a 32 B malloc on
+        // every getfield/setfield (regex and/or 0.15 class).
+        let mut original_args: Vec<OpRef> = if op.opcode == OpCode::Label {
+            op.getarglist().iter().map(|a| a.to_opref()).collect()
+        } else {
+            Vec::new()
+        };
         if let Some(&mapped_pos) = body_result_remap.get(&op.pos().get()) {
             new_op.pos().set(mapped_pos);
         }
@@ -6060,7 +6070,7 @@ fn assemble_peeled_trace_with_jump_args(
                 (Some(jump_idx), Some(label_idx)) if jump_idx == label_idx
             );
             let target_base_len = if current_inner_label_index.is_some() {
-                original_args.len()
+                op.num_args()
             } else {
                 label_args.len()
             };
@@ -6502,12 +6512,8 @@ fn clone_guard_snapshot_remapped(
             remap_snapshot_boxes(&vref_boxes, ref_map),
         );
     }
-    if let Some(frame_pcs) = snapshot_get(&ctx.snapshot_frame_pcs, old_pos).cloned() {
-        snapshot_insert(&mut ctx.snapshot_frame_pcs, new_pos, frame_pcs);
-    }
-    if let Some(frame_sizes) = snapshot_get(&ctx.snapshot_frame_sizes, old_pos).cloned() {
-        snapshot_insert(&mut ctx.snapshot_frame_sizes, new_pos, frame_sizes);
-    }
+    ctx.snapshot_frame_pcs.copy_run(old_pos, new_pos);
+    ctx.snapshot_frame_sizes.copy_run(old_pos, new_pos);
     guard.set_rd_resume_position(new_pos);
 }
 
@@ -6583,6 +6589,31 @@ mod tests {
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
     use majit_ir::operand::Operand;
+
+    #[test]
+    fn phase2_snapshot_handoff_keeps_recorded_snapshot_zero() {
+        // compile_loop_body moves recorded maps onto UnrollOptimizer and
+        // takes them back on InvalidLoop. clone_snapshots_onto must not
+        // empty that field (a take left GuardIsnull with no snapshot).
+        let mut u = UnrollOptimizer::new();
+        let mut boxes = crate::optimizeopt::SnapshotBoxes::new();
+        crate::optimizeopt::snapshot_insert(
+            &mut boxes,
+            0,
+            crate::optimizeopt::SnapshotBoxList::default(),
+        );
+        u.snapshot_boxes = boxes;
+        let mut phase2 = Optimizer::default_pipeline();
+        u.clone_snapshots_onto(&mut phase2);
+        assert!(
+            crate::optimizeopt::snapshot_contains(&u.snapshot_boxes, 0),
+            "UnrollOptimizer must keep snapshot 0 for the InvalidLoop retry"
+        );
+        assert!(crate::optimizeopt::snapshot_contains(
+            &phase2.snapshot_boxes,
+            0
+        ));
+    }
 
     /// Publish a `PreviewShortState` the way the preview pass does at its
     /// group site (`optimizer.rs`), so `export_state` reads carried short
@@ -7576,9 +7607,9 @@ mod tests {
             let backup = source.clone();
             let mut unroll = UnrollOptimizer::new();
             unroll.trace_inputargs = majit_ir::OpRef::inputarg_refs(&[Type::Int]);
-            unroll.phase2_input_ops_seed = Some(canonical);
+            unroll.phase2_input_ops_seed = Some(canonical.clone());
             let result = unroll.optimize_trace_with_constants_and_inputs_vable_out(
-                &source,
+                &canonical,
                 &mut majit_ir::ConstMap::default(),
                 1,
                 None,
@@ -7623,6 +7654,7 @@ mod tests {
             Op::new(OpCode::Jump, &[rooted_inputarg_operand(Type::Int, 0)]),
         ];
         assign_positions(&mut ops, 1);
+        let ops: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
         let mut constants = majit_ir::ConstMap::default();
         let mut phase1_out = None;
 
@@ -7658,7 +7690,7 @@ mod tests {
         );
         add.pos().set(OpRef::int_op(1));
         add.set_value(Value::Int(73));
-        let folded = fold_recorded_jump_args(vec![OpRef::int_op(1)], &[], &[add]);
+        let folded = fold_recorded_jump_args(vec![OpRef::int_op(1)], &[], &[OpRc::new(add)]);
         assert_eq!(
             folded[0],
             OpRef::const_int(73),
@@ -8654,6 +8686,59 @@ mod tests {
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].same_as_source.to_opref(), OpRef::int_op(14));
         assert_eq!(aliases[0].same_as_opcode, OpCode::SameAsI);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_does_not_snapshot_every_body_arglist() {
+        // compile.py never builds a Vec of every body's args. Nine
+        // setfields + a JUMP (regex-shaped) must still assemble.
+        let p1_ops = vec![{
+            let mut op = Op::new(
+                OpCode::IntAdd,
+                &[
+                    rooted_resop_operand(Type::Int, 0),
+                    rooted_resop_operand(Type::Int, 1),
+                ],
+            );
+            op.pos().set(OpRef::int_op(3));
+            op
+        }];
+        let mut p2_ops: Vec<Op> = (0..9)
+            .map(|i| {
+                let mut op = Op::new(
+                    OpCode::SetfieldGc,
+                    &[
+                        rooted_resop_operand(Type::Ref, 10),
+                        rooted_resop_operand(Type::Int, 3 + i),
+                    ],
+                );
+                op.pos().set(OpRef::void_op(20 + i as u32));
+                op
+            })
+            .collect();
+        p2_ops.push(Op::new(OpCode::Jump, &[rooted_resop_operand(Type::Int, 3)]));
+        let combined = assemble_peeled_trace(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef::int_op(3)],
+            &[OpRef::int_op(0)],
+            &[],
+            1,
+            true,
+            &[],
+            &majit_ir::ConstMap::default(),
+            None,
+            None,
+        );
+        let setfields = combined
+            .iter()
+            .filter(|op| op.opcode == OpCode::SetfieldGc)
+            .count();
+        assert_eq!(setfields, 9, "all body setfields must survive assembly");
+        assert!(
+            combined.iter().any(|op| op.opcode == OpCode::Jump),
+            "the closing JUMP must survive without a per-op arglist Vec"
+        );
     }
 
     #[test]

@@ -920,6 +920,10 @@ impl ShortBoxes {
         if self.boxes_in_production.contains(&okey) {
             return None;
         }
+        // shortpreamble.py add_op_to_short / produce_arg:
+        // `self.potential_ops[op]` looks the entry up and leaves the
+        // OrderedDict in place. Cloning the value is the port of that
+        // lookup; shift_remove + shift_insert was O(N) per candidate.
         let candidate = self.potential_ops.get(&okey)?.clone();
         self.boxes_in_production.insert(okey.clone());
         let produced = candidate.add_op_to_short(self, ctx);
@@ -1093,7 +1097,7 @@ impl ShortBoxes {
         // (registered on first materialization), so the insert key here and
         // the lookup keys in `materialize_one`/`produce_arg` are ptr_eq.
         let key = ctx.materialize_operand_at(result);
-        let pop = PotentialShortOp::Preamble(PreambleOp {
+        let pop = PreambleOp {
             source_op: None,
             res: key.clone(),
             op: OpRc::new(op),
@@ -1101,16 +1105,22 @@ impl ShortBoxes {
             label_arg_idx,
             invented_name: false,
             same_as_source: None,
-        });
-        let next = match self.potential_ops.get(&key) {
-            Some(prev) => PotentialShortOp::Compound(CompoundOp {
-                res: result,
-                one: Box::new(pop),
-                two: Box::new(prev.clone()),
-            }),
-            None => pop,
         };
-        self.add_op(key, next);
+        // shortpreamble.py add_potential_op: `CompoundOp(op, pop, prev_op)`
+        // overwrites the OrderedDict value in place. `IndexMap::insert` on
+        // an existing key does the same without shifting later entries.
+        if let Some(prev) = self.potential_ops.get(&key).cloned() {
+            self.potential_ops.insert(
+                key,
+                PotentialShortOp::Compound(CompoundOp {
+                    res: result,
+                    one: pop,
+                    two: Box::new(prev),
+                }),
+            );
+        } else {
+            self.add_op(key, PotentialShortOp::Preamble(pop));
+        }
     }
 }
 
@@ -1289,9 +1299,9 @@ impl Default for CollectedExtendedShortPreambleBuilder {
 pub struct CompoundOp {
     /// The result OpRef of the compound operation.
     pub res: OpRef,
-    /// First sub-operation.
-    one: Box<PotentialShortOp>,
-    /// Second sub-operation (depends on the result of `one`).
+    /// shortpreamble.py `pop` — always a leaf (`PureOp` / `HeapOp` / …).
+    one: PreambleOp,
+    /// shortpreamble.py `prev_op` — the previous dict value.
     two: Box<PotentialShortOp>,
 }
 
@@ -1306,15 +1316,8 @@ impl CompoundOp {
         ctx: &mut crate::optimizeopt::OptContext,
         mut produced: Vec<ProducedShortOp>,
     ) -> Vec<ProducedShortOp> {
-        match self.one.as_ref() {
-            PotentialShortOp::Compound(compound) => {
-                produced = compound.flatten(sb, ctx, produced);
-            }
-            PotentialShortOp::Preamble(op) => {
-                if let Some(pop) = op.add_op_to_short(sb, ctx) {
-                    produced.push(pop);
-                }
-            }
+        if let Some(pop) = self.one.add_op_to_short(sb, ctx) {
+            produced.push(pop);
         }
         match self.two.as_ref() {
             PotentialShortOp::Compound(compound) => compound.flatten(sb, ctx, produced),
@@ -4150,6 +4153,9 @@ mod tests {
 
         let mut pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 30), rop(Type::Int, 31)]);
         pure.pos().set(OpRef::int_op(10));
+        // Second add wraps the first value in CompoundOp (shortpreamble.py
+        // add_potential_op). produced_ops must flatten both after the
+        // wrap moves `prev` instead of cloning it.
         sb.add_potential_op(&mut __ctx, None, pure, PreambleOpKind::Pure);
 
         let produced = sb.produced_ops(&mut __ctx);
@@ -4184,6 +4190,54 @@ mod tests {
         assert_eq!(
             alias.1.same_as_source.as_ref().map(|b| b.to_opref()),
             Some(OpRef::int_op(10))
+        );
+    }
+
+    fn heap_oprc_strong_count(op: &PotentialShortOp) -> Option<usize> {
+        match op {
+            PotentialShortOp::Preamble(p) if p.kind == PreambleOpKind::Heap => {
+                Some(OpRc::strong_count(&p.op))
+            }
+            PotentialShortOp::Compound(c) => (c.one.kind == PreambleOpKind::Heap)
+                .then(|| OpRc::strong_count(&c.one.op))
+                .or_else(|| heap_oprc_strong_count(&c.two)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn add_potential_op_moves_prev_into_compound_without_cloning_oprc() {
+        // shortpreamble.py add_potential_op: `CompoundOp(op, pop, prev_op)`
+        // stores the previous dict value. Cloning PreambleOp clones its
+        // OpRc and bumps the strong count; a move leaves the count alone.
+        let mut ctx = crate::optimizeopt::OptContext::new(256);
+        let mut sb = ShortBoxes::with_label_args(&[OpRef::int_op(30)]);
+        sb.add_short_input_arg(&mut ctx, OpRef::int_op(30), majit_ir::Type::Int);
+
+        let mut heap = Op::with_descr(
+            OpCode::GetfieldGcI,
+            &[rop(Type::Int, 30)],
+            majit_ir::make_field_descr(0, 8, majit_ir::Type::Int, majit_ir::ArrayFlag::Signed),
+        );
+        heap.pos().set(OpRef::int_op(10));
+        sb.add_potential_op(&mut ctx, None, heap, PreambleOpKind::Heap);
+        let count_before = sb
+            .potential_ops
+            .values()
+            .find_map(heap_oprc_strong_count)
+            .expect("heap producer is in potential_ops");
+
+        let mut pure = Op::new(OpCode::IntAdd, &[rop(Type::Int, 30), rop(Type::Int, 30)]);
+        pure.pos().set(OpRef::int_op(10));
+        sb.add_potential_op(&mut ctx, None, pure, PreambleOpKind::Pure);
+        let count_after = sb
+            .potential_ops
+            .values()
+            .find_map(heap_oprc_strong_count)
+            .expect("heap producer is inside the CompoundOp");
+        assert_eq!(
+            count_before, count_after,
+            "add_potential_op must move prev into CompoundOp; cloning PreambleOp bumps OpRc"
         );
     }
 
