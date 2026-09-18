@@ -5361,75 +5361,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         path: &[u8],
         mut each: impl FnMut(&[u8], &[u8], WinFindData),
     ) -> std::io::Result<()> {
-        use std::os::windows::ffi::{OsStrExt, OsStringExt};
-        use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::Storage::FileSystem::{
-            FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
-        };
-
-        const SEP_UNIT: u16 = b'\\' as u16;
-        const ALTSEP_UNIT: u16 = b'/' as u16;
-        const COLON_UNIT: u16 = b':' as u16;
-
-        fn join_path_filename(prefix: &[u16], name: &[u16]) -> Vec<u16> {
-            let mut joined = prefix.to_vec();
-            if let Some(&last) = joined.last() {
-                if last != SEP_UNIT && last != ALTSEP_UNIT && last != COLON_UNIT {
-                    joined.push(SEP_UNIT);
-                }
-                joined.extend_from_slice(name);
+        let wide =
+            widestring::WideCString::from_os_str(&*os_str_from_bytes(path)).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "embedded null character in path",
+                )
+            })?;
+        let mut scan = rustpython_host_env::nt::scandir(&wide)?;
+        while let Some(entry) = scan.next_entry()? {
+            if entry.is_dot_or_dotdot() {
+                continue;
             }
-            joined
+            let full = scan.entry_path(&entry);
+            each(
+                entry.name.as_encoded_bytes(),
+                full.as_encoded_bytes(),
+                WinFindData {
+                    file_attributes: entry.file_attributes,
+                    reserved0: entry.reserved0,
+                    file_size: entry.file_size,
+                    creation_ticks: entry.creation_ticks,
+                    last_access_ticks: entry.last_access_ticks,
+                    last_write_ticks: entry.last_write_ticks,
+                },
+            );
         }
-
-        let prefix: Vec<u16> = os_str_from_bytes(path).encode_wide().collect();
-        let mut pattern = join_path_filename(&prefix, &[b'*' as u16, b'.' as u16, b'*' as u16]);
-        pattern.push(0);
-
-        fn filetime_ticks(ft: windows_sys::Win32::Foundation::FILETIME) -> u64 {
-            ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)
-        }
-
-        let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-        let handle = unsafe { FindFirstFileW(pattern.as_ptr(), &mut data) };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        loop {
-            let len = data
-                .cFileName
-                .iter()
-                .position(|&unit| unit == 0)
-                .unwrap_or(data.cFileName.len());
-            let name_units = &data.cFileName[..len];
-            let dot = [b'.' as u16];
-            let dotdot = [b'.' as u16, b'.' as u16];
-            if name_units != dot && name_units != dotdot {
-                let name = std::ffi::OsString::from_wide(name_units);
-                let full = std::ffi::OsString::from_wide(&join_path_filename(&prefix, name_units));
-                each(
-                    name.as_encoded_bytes(),
-                    full.as_encoded_bytes(),
-                    WinFindData {
-                        file_attributes: data.dwFileAttributes,
-                        reserved0: data.dwReserved0,
-                        file_size: ((data.nFileSizeHigh as u64) << 32) | (data.nFileSizeLow as u64),
-                        creation_ticks: filetime_ticks(data.ftCreationTime),
-                        last_access_ticks: filetime_ticks(data.ftLastAccessTime),
-                        last_write_ticks: filetime_ticks(data.ftLastWriteTime),
-                    },
-                );
-            }
-            if unsafe { FindNextFileW(handle, &mut data) } == 0 {
-                let error = std::io::Error::last_os_error();
-                unsafe { FindClose(handle) };
-                return if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
-                    Ok(())
-                } else {
-                    Err(error)
-                };
-            }
-        }
+        Ok(())
     }
 
     /// Where the `host_env::posix`-backed implementations below are compiled.
