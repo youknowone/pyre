@@ -759,6 +759,16 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         );
         single(
             entries,
+            "pyre_interpreter::module::_cffi_backend::cdataobj::raw_malloc_varsize_zero",
+            cdataobj::raw_malloc_varsize_zero as *const (),
+        );
+        single(
+            entries,
+            "pyre_module::module::_cffi_backend::cdataobj::raw_malloc_varsize_zero",
+            cdataobj::raw_malloc_varsize_zero as *const (),
+        );
+        single(
+            entries,
             "pyre_interpreter::module::_cffi_backend::cdataobj::raw_free",
             cdataobj::raw_free as *const (),
         );

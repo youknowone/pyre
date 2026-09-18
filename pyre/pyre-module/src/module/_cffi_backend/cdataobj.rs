@@ -493,6 +493,17 @@ pub fn raw_malloc_varsize_char(size: usize) -> usize {
     unsafe { libc::malloc(size.max(1)) as usize }
 }
 
+/// `lltype.malloc(..., flavor='raw', zero=True)` — the
+/// `_ll_1_raw_malloc_varsize_zero` residual. Same
+/// `OS_RAW_MALLOC_VARSIZE_CHAR` as the non-zero Char helper
+/// (`jtransform.py _rewrite_raw_malloc` when `TYPE.OF == Char`).
+#[inline(never)]
+#[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_malloc_varsize_zero(size: usize) -> usize {
+    unsafe { libc::calloc(size.max(1), 1) as usize }
+}
+
 /// `lltype.free(ptr, flavor='raw')` — the `raw_free` residual
 /// (`support.py ll_raw_free`).
 #[inline(never)]
@@ -523,20 +534,21 @@ pub fn raw_alloc(size: i64, zero: bool) -> Result<usize, PyError> {
         return Err(PyError::value_error("negative allocation size"));
     }
     let bytes = size.max(1) as usize;
-    let ptr = unsafe {
-        if zero {
-            libc::calloc(bytes, 1)
-        } else {
-            libc::malloc(bytes)
-        }
+    // `support.py _ll_1_raw_malloc_varsize[_zero]`: the C leaf stays
+    // inside the residual. Inlining `raw_alloc` onto `libc::calloc`
+    // made the descent scan decline on that un-lowered helper.
+    let ptr = if zero {
+        raw_malloc_varsize_zero(bytes)
+    } else {
+        raw_malloc_varsize_char(bytes)
     };
-    if ptr.is_null() {
+    if ptr == 0 {
         return Err(PyError::new(
             pyre_interpreter::PyErrorKind::MemoryError,
             "out of memory",
         ));
     }
-    Ok(ptr as usize)
+    Ok(ptr)
 }
 
 /// `lltype.free(self._ptr, flavor='raw')` in the light finalizers of
