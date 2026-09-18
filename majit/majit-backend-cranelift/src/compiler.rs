@@ -377,6 +377,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         alloc_nursery_collecting_typed_rooted_via_active_runtime,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_roots(Some(
+        alloc_nursery_collecting_typed_roots_via_active_runtime,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
     majit_gc::set_active_collect_generation(Some(collect_generation_via_active_runtime));
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
@@ -1747,6 +1750,32 @@ unsafe fn alloc_nursery_collecting_typed_rooted_via_active_runtime(
 ) -> GcRef {
     with_cranelift_gc(|gc| unsafe {
         gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
+}
+
+/// Rooted companion used when more than one native Rust slot holds a GC child.
+/// MiniMark registers those slots only on the nursery-full slow path.
+///
+/// # Safety
+/// `roots` must address `root_count` contiguous mutable [`GcRef`] slots
+/// which remain valid until this call returns.
+/// `needs_write_barrier` must remain a valid mutable `bool` slot.
+unsafe fn alloc_nursery_collecting_typed_roots_via_active_runtime(
+    type_id: u32,
+    size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_cranelift_gc(|gc| unsafe {
+        gc.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
     })
     .unwrap_or(GcRef(0))
 }
