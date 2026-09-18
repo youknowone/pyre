@@ -4172,17 +4172,6 @@ pub(crate) fn wrapfloat(ctx: &mut TraceCtx, value: OpRef) -> OpRef {
     emit_box_float_inline(ctx, value, w_float_size_descr(), float_floatval_descr())
 }
 
-pub(crate) fn wrapcomplex(ctx: &mut TraceCtx, real: OpRef, imag: OpRef) -> OpRef {
-    crate::helpers::emit_box_complex_inline(
-        ctx,
-        real,
-        imag,
-        crate::descr::w_complex_size_descr(),
-        crate::descr::complex_real_descr(),
-        crate::descr::complex_imag_descr(),
-    )
-}
-
 // RPython parity note: pyjitpl.py (tracer) records GETFIELD_GC ops WITHOUT
 // any constant folding. Folding happens exclusively in the optimizer's
 // `optimize_GETFIELD_GC_I` (heap.py), which delegates to

@@ -9900,20 +9900,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             }
                         }
                         if specialized.is_none() {
-                            if let Some(DispatchOutcome::SubReturn {
-                                result: Some(boxed),
-                            }) = spec_gate(SpecFold::BinaryOpComplex, || {
-                                try_emit_exact_complex_binop(
-                                    ctx, op.pc, op_tag, &r_args, dst, dst_bank,
-                                )
-                            })? {
-                                write_residual_call_result_to_dst(
-                                    ctx, op.pc, dst, dst_bank, boxed,
-                                )?;
-                                return Ok((DispatchOutcome::Continue, op.next_pc));
-                            }
-                        }
-                        if specialized.is_none() {
                             // `str + str` last: every numeric arm above
                             // declines a Ref operand, and `descr_add`
                             // (unicodeobject.py) is the only body left for two
@@ -10002,20 +9988,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                     // (unicodeobject.py) answers from one WTF-8
                                     // ordering, which no numeric arm above can
                                     // express.
-                                    None => match spec_gate(SpecFold::CompareOpStr, || {
+                                    None => spec_gate(SpecFold::CompareOpStr, || {
                                         try_walker_specialize_compare_op_str(
                                             ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
                                             dst, dst_bank,
                                         )
-                                    })? {
-                                        Some(()) => Some(()),
-                                        None => spec_gate(SpecFold::CompareOpTuple, || {
-                                            try_walker_specialize_compare_op_tuple(
-                                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
-                                                dst, dst_bank,
-                                            )
-                                        })?,
-                                    },
+                                    })?,
                                 },
                             },
                         },
