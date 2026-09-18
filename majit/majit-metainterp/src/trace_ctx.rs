@@ -4080,6 +4080,9 @@ impl TraceCtx {
         // pyjitpl.py:3478 self.forced_virtualizable = vbox
         self.forced_virtualizable = Some(vable_opref);
 
+        // pyjitpl.py `gen_store_back_in_vable` writes every static field and
+        // every array item. The `xxx only write back the fields really
+        // modified` note is not a filter.
         for field_index in 0..info.static_fields.len() {
             if let Some(&value) = boxes.get(field_index) {
                 // pyjitpl.py `gen_store_back_in_vable` records SETFIELD_GC

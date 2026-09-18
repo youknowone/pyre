@@ -633,7 +633,7 @@ mod tests {
         jump.pos().set(OpRef::int_op(4));
 
         let ops = vec![label, add, lt, guard, jump];
-        let plan = TracePlan::build(&[InputArg::from_type(Type::Int, 0)], &ops);
+        let plan = TracePlan::build(&[InputArg::from_type_rc(Type::Int, 0)], &ops);
 
         let lowered = TracePlan::lower_ops(&ops);
         assert_eq!(
@@ -687,7 +687,7 @@ mod tests {
         finish.pos().set(OpRef::int_op(4));
 
         let plan = TracePlan::build(
-            &[InputArg::from_type(Type::Int, 0)],
+            &[InputArg::from_type_rc(Type::Int, 0)],
             &[add, is_true, guard, finish],
         );
 
@@ -752,9 +752,9 @@ mod tests {
 
         let plan = TracePlan::build(
             &[
-                InputArg::from_type(Type::Ref, base.raw()),
-                InputArg::from_type(Type::Int, index.raw()),
-                InputArg::from_type(Type::Int, value.raw()),
+                InputArg::from_type_rc(Type::Ref, base.raw()),
+                InputArg::from_type_rc(Type::Int, index.raw()),
+                InputArg::from_type_rc(Type::Int, value.raw()),
             ],
             &[load, store],
         );
@@ -792,7 +792,7 @@ mod tests {
         let debug = Op::new(OpCode::JitDebug, &[]);
 
         let plan = TracePlan::build(
-            &[InputArg::from_type(Type::Int, i0.raw())],
+            &[InputArg::from_type_rc(Type::Int, i0.raw())],
             &[same_as, debug],
         );
 
@@ -824,7 +824,7 @@ mod tests {
         future.pos().set(OpRef::int_op(2));
         future.setfailargs(vec![rb(i0)].into());
         let plan = TracePlan::build(
-            &[InputArg::from_type(Type::Ref, i0.raw())],
+            &[InputArg::from_type_rc(Type::Ref, i0.raw())],
             &[is_object, future],
         );
 

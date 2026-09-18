@@ -2551,19 +2551,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(self as *const Self as *mut u8)
             }
 
-            fn blackhole_virtualizable_identity(
-                &self,
-                _meta: &Self::Meta,
-                _virtualizable: &str,
-                _info: &majit_metainterp::virtualizable::VirtualizableInfo,
-            ) -> Option<*mut u8> {
-                // This is intentionally distinct from the PyFrame path:
-                // `state` is the current host-stack object, not a movable GC
-                // object whose trace-time address may be baked into resume
-                // data. At deopt, re-derive its identity from this call.
-                Some(self as *const Self as *mut u8)
-            }
-
             // warmstate.py `execute_assembler`: all a compiled entry
             // does to its virtualizable is `vinfo.clear_vable_token(virt)` —
             // one store, before the call, and nothing after it. There is no

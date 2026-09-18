@@ -7302,15 +7302,6 @@ impl<S: JitState> JitDriver<S> {
                 bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
             }
             let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
-            // The state-field macro's `&state` is host-stack storage, so
-            // its identity may be folded out of the failing frame. Ask
-            // only an explicit host opt-in for the current call's address;
-            // heap virtualizables retain the live resume TAGBOX path.
-            let vable_identity_override = self.meta.virtualizable_info().and_then(|info| {
-                state
-                    .blackhole_virtualizable_identity(&compiled_meta, &info.name, info)
-                    .map(|ptr| ptr as i64)
-            });
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. Keep
             // `result` (and its deadframe) alive across this call so
@@ -7351,7 +7342,6 @@ impl<S: JitState> JitDriver<S> {
                     .virtualizable_info()
                     .map(|a| a.as_ref() as &dyn crate::resume::VirtualizableInfo),
                 None, // ginfo
-                vable_identity_override,
                 savedata.and_then(crate::compile::AllVirtuals::show),
                 allocator,
             );

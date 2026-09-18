@@ -7672,10 +7672,6 @@ impl<M: Clone> MetaInterp<M> {
             Some(flat) => flat.len,
             None => driver.num_reds(),
         };
-        if inputargs.len() <= entry_prefix_len {
-            // Trace was never expanded (no virtualizable fields live at entry).
-            return;
-        }
         // compile.py:508-511
         //     vable = orig_inpargs[jitdriver_sd.index_of_virtualizable].getref_base()
         //     patch_new_loop_to_load_virtualizable_fields(loop, jitdriver_sd, vable)
@@ -17069,8 +17065,16 @@ impl<M: Clone> MetaInterp<M> {
             );
             // compile.py: cpu.set_savedata_ref(deadframe, AllVirtuals(cache).hide())
             if let Some(cache) = cache {
+                let savedata = crate::compile::AllVirtuals::hide(cache);
+                // compile.py handle_async_forcing writes `deadframe.jf_savedata`
+                // through a GCREF store. Root the fresh AllVirtuals object and
+                // publish the forwarded address.
+                let mut savedata_slot = [savedata.as_usize() as i64];
+                let _savedata_root = unsafe {
+                    crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| true)
+                };
                 self.backend
-                    .set_savedata_ref(&mut deadframe, crate::compile::AllVirtuals::hide(cache));
+                    .set_savedata_ref(&mut deadframe, majit_ir::GcRef(savedata_slot[0] as usize));
             }
         });
     }
