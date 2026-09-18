@@ -6063,7 +6063,7 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
     // Do not pin at the head: `pin_roots` is `dont_look_inside`, and a
     // residual on the walked `int < int` path blocks `compare_op_descent`
     // and doubles guard-failures. The MayForce C ABI copies are published
-    // in `compare_value_from_tag_inner`; the override arm below publishes
+    // in `jit_compare_value_from_tag`; the override arm below publishes
     // only when `try_compare_override` can collect.
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.

@@ -247,14 +247,11 @@ fn compare_value_from_tag_inner(
     if a.is_null() || b.is_null() {
         return Err(null_operand_error("comparison"));
     }
-    // `jit_compare_value_from_tag` is a MayForce residual: a prior getattr
-    // or the force itself can collect, and the C ABI copies are not GC
-    // roots. `pin_root` publishes them and resolves a forwarding stub
-    // before `compare` reads `w_class`.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let a = pyre_object::gc_roots::shadow_stack_get(base);
-    let b = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    // Do not pin here: this body is the graph `CompareOpDescent` walks
+    // (`compare_value_from_tag`). A `dont_look_inside` pin at the head
+    // blocks that descent and is what doubled guard_failures / dropped
+    // `compare_op_descent`. The MayForce C ABI copies are published in
+    // `jit_compare_value_from_tag` only.
     // CONTAINS_OP routes through the compare-residual machinery.
     // `a` is the needle, `b` the container (flatten lowers the args
     // as `[item, container]`).
@@ -1118,7 +1115,11 @@ pub extern "C" fn jit_binary_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 
 
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_compare_value_from_tag(a: i64, b: i64, op_tag: i64) -> i64 {
-    match compare_value_from_tag_inner(a as PyObjectRef, b as PyObjectRef, op_tag) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a as PyObjectRef, b as PyObjectRef]);
+    let a = pyre_object::gc_roots::shadow_stack_get(base);
+    let b = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    match compare_value_from_tag_inner(a, b, op_tag) {
         Ok(value) => value as i64,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
