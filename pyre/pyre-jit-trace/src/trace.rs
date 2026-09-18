@@ -155,9 +155,10 @@ pub(crate) enum WalkEndCommitLeg {
     /// ([`crate::jitcode_dispatch::DispatchError::leaves_complete_image`])
     /// whose mid-opcode MIFrame image was converted to blackhole frames and run
     /// forward.  Same contract as [`Self::TraceTooLong`]; kept a separate leg
-    /// both so the census can tell a bounded-length abort from a capability
-    /// gap, and because the two take their operand stack from different
-    /// sources — see `capture_frame_stack_from_mirror`.
+    /// so the census can tell a bounded-length abort from a capability gap.
+    /// Both legs publish the walker's OpRef mirror — a root walk never
+    /// refreshes the virtualizable snapshot array, so that array is the
+    /// pre-walk stack (`capture_frame_stack_from_mirror`).
     WalkAbort = 11,
     /// `SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`
     /// (`pyjitpl.py _create_segmented_trace_and_blackhole`): the walk cut
@@ -3169,18 +3170,21 @@ fn try_adopt_single_frame_blackhole(
         // checkable at runtime rather than argued.  Measured on the one adopt
         // in `list_length_hint_validate`: `snapshot-array=[0]` where
         // `mirror=[0x99651ab18]` — the array reads NULL, the mirror holds the
-        // live operand.
-        // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
-        // array is the image RPython would copy.  `WalkAbort` and
-        // `VableEscape` stop INSIDE an opcode, and for a root walk that array
-        // was never written at all — it still holds the pre-walk stack (see
-        // `capture_frame_stack_from_mirror`). Take the walker's OpRef mirror,
-        // which the latch resolved while the concrete side tables were still
-        // live.  The segment cut stops at a boundary but at the merge point,
-        // where the array is equally unrefreshed, so it reads the mirror too.
+        // live operand.  The same hole lands on `ABORT_TOO_LONG` of a root
+        // walk (`trace_too_long_inline_multiframe`: snapshot-array `[x, 0]`,
+        // mirror `[x, iter]`): a root walk keeps the virtualizable symbolic
+        // (`capture_frame_stack_from_mirror`), so the array is still the
+        // pre-walk stack.  RPython has no such split — `_copy_data_from_miframe`
+        // copies the live MIFrame banks after every `run_one_step`.  The
+        // walker's OpRef mirror is that bank.
+        // `WalkAbort` / `VableEscape` stop INSIDE an opcode; `SegmentTrace`
+        // stops at a merge point whose array is equally unrefreshed.  Take
+        // the mirror the latch resolved while the concrete side tables were
+        // still live.
         let takes_mirror = commit_leg == WalkEndCommitLeg::WalkAbort
             || commit_leg == WalkEndCommitLeg::VableEscape
-            || commit_leg == WalkEndCommitLeg::SegmentTrace;
+            || commit_leg == WalkEndCommitLeg::SegmentTrace
+            || commit_leg == WalkEndCommitLeg::TraceTooLong;
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
                 .map(|stack| stack.roots_snapshot());
@@ -3795,18 +3799,20 @@ fn try_adopt_multi_frame_blackhole(
         restore_links(&saved_links);
         return false;
     };
-    // Same split as the single-frame arm: `WalkAbort` and `VableEscape`
-    // stop INSIDE an opcode, and for a root walk the snapshot array was
-    // never written there — it still holds the pre-walk stack (see
-    // `capture_frame_stack_from_mirror`).  Both multi-frame latches
-    // reconstruct frame 0 from the paused caller image
+    // Same split as the single-frame arm: a root walk never writes the
+    // snapshot array (`current_inline_vable_target` is none), so the array
+    // is the pre-walk stack — including a NULL FOR_ITER iterator.  RPython
+    // copies the live MIFrame banks (`_copy_data_from_miframe`); the
+    // walker's OpRef mirror is that bank.  `WalkAbort` / `VableEscape`
+    // stop INSIDE an opcode; `ABORT_TOO_LONG` stops after the step but
+    // still on a root walk whose array was never refreshed.  Both
+    // multi-frame latches reconstruct frame 0 from the paused caller image
     // (`capture_root_parent_resume_stack`) because their `ctx` is the
     // innermost callee; a latch that could not build one leaves no mirror
     // here, which declines the adopt and keeps the legacy replay.
-    // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
-    // array is the image RPython would copy.
     let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
         || commit_leg == WalkEndCommitLeg::VableEscape
+        || commit_leg == WalkEndCommitLeg::TraceTooLong
     {
         latched.mirror_stack.as_ref().and_then(|mirror| {
             crate::state::capture_frame_stack_from_mirror(root_addr, mirror.py_pc, &mirror.slots)

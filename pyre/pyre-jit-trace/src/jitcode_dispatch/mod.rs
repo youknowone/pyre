@@ -3802,7 +3802,24 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
+            // Reconcile the operand-stack mirror to the post-step resume
+            // coordinate before latching.  A block-head merge point is
+            // otherwise left on the completed opcode's on-entry stack
+            // (`reconcile_vstack_to_resume_pc`).
+            if snapshot_safe {
+                reconcile_vstack_to_resume_pc(ctx, pc);
+            }
+            let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
+            // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
+            // equivalent).  Ask the height check here, while a refusal can still
+            // unstage: a preflighted adopt treats a later decline as an assert.
+            if blackhole_latched
+                && !ctx.fbw_mode.inline_subwalk
+                && !latched_single_frame_mirror_publishable()
+            {
+                reset_single_frame_blackhole();
+                blackhole_latched = false;
+            }
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
@@ -5686,21 +5703,6 @@ fn funcptr_concrete_int<Sym: WalkSym>(
         Some(majit_ir::Value::Int(v)) => Some(v),
         _ => None,
     }
-}
-
-fn walk_body_has_exception_handler<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    code: &[u8],
-) -> bool {
-    let jitcode_index = if ctx.is_top_level {
-        ctx.session.borrow().recording_jitcode_index
-    } else {
-        ctx.inline_callee_consts
-            .map_or(-1, |consts| consts.jitcode_index)
-    };
-    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
-        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
-    })
 }
 
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port for residual calls
@@ -10932,7 +10934,7 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     dst_bank: char,
     w_globals: pyre_object::PyObjectRef,
     name: &str,
-    pin_version: bool,
+    w_code_ptr: usize,
 ) -> Result<bool, DispatchError> {
     // Cell fast path applies only to a module dict still in strategy mode
     // whose slot holds a raw value, an `ObjectMutableCell`, or an
@@ -10940,12 +10942,18 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
         if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
             if !stored.is_null() {
-                // RPython's `ConstPtr.value` is a GC-visible field. Pyre keeps
-                // the same value in the active trace, resume pools and backend
-                // GC table, whose registered walkers forward it in place.
-                // Movability therefore does not change whether this elidable
-                // cell lookup can fold; the namespace version guard below
-                // still revokes the constant when the slot is rebound.
+                // `celldict.py getdictvalue_no_unwrapping` is
+                // `@elidable_promote` on `version?` for every lookup,
+                // cell or raw.  Skip that pin only when this CodeObject
+                // itself `DELETE_NAME`s: `delitem` always `mutated()`,
+                // and a watcher already installed makes
+                // `opimpl_jit_force_quasi_immutable` abort the same
+                // trace (`exception_reraise_tb_depth_hot`).  A cell
+                // load in a delete-free body still pins — otherwise
+                // `unwrap_cell`'s recording concrete becomes a
+                // `GUARD_VALUE` that deopts on the next in-place
+                // rebind and never retraces (`global_reassign`).
+                let pin_version = !specialize::code_has_any_delete_name_from_ptr(w_code_ptr);
                 return emit_namespace_cell_fold(
                     ctx,
                     op_pc,
@@ -10992,10 +11000,10 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // In-place `write_cell` / `unwrap_cell` do not call `mutated()`.
-    // Pinning the dict `version?` on those loads made every `except as`
-    // (`DELETE_NAME` → `delitem` always `mutated()`) kill the module
-    // while-loop — 116 qmut aborts on jitstress.  LoadGlobal of a
-    // rebindable name still pins.
+    // The live getfield is the cell, so a later in-place store is
+    // visible without a dict `version?` pin.  Pinning `version?` here
+    // made `DELETE_NAME` of a *different* name (`except as`) invalidate
+    // the inner while (`opimpl_jit_force_quasi_immutable`).
     if pin_version {
         if !walker_pin_namespace_version(ctx, op_pc, ns)? {
             return Ok(false);
