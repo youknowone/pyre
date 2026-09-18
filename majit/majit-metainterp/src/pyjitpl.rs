@@ -25712,7 +25712,7 @@ mod tests {
         rec.close_loop(&[add]);
         let live = rec.live_inputargs_cloned();
         assert_eq!(
-            live.iter().map(InputArg::opref).collect::<Vec<_>>(),
+            live.iter().map(|arg| arg.opref()).collect::<Vec<_>>(),
             vec![OpRef::input_arg_int(0), OpRef::input_arg_int(2)]
         );
         let prepared = prepare_bridge_from_byte_recorder(
@@ -25732,7 +25732,7 @@ mod tests {
             prepared
                 .inputargs
                 .iter()
-                .map(|arg| (arg.index, arg.tp))
+                .map(|arg| (arg.index, arg.tp.get()))
                 .collect::<Vec<_>>(),
             vec![(1000, Type::Int), (1001, Type::Int)],
             "hole-filtered live Ints remint densely with their own types; \

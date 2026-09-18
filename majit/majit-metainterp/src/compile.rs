@@ -3014,7 +3014,7 @@ mod tests {
             rooted_inputarg_operand(Type::Int, 0),
             rooted_inputarg_operand(Type::Ref, 1),
         ]);
-        let types = exit_types_for_guard_or_finish(&guard, false, &[]);
+        let types = exit_types_for_guard_or_finish(&guard, false, &[] as &[InputArg]);
         assert_eq!(&types[..], &[Type::Int, Type::Ref]);
     }
 

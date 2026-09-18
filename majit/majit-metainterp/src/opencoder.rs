@@ -767,7 +767,7 @@ impl<'a> ByteTraceIter<'a> {
         trace: &'a TraceRecordBuffer,
         start: usize,
         end: usize,
-        live_inputargs: &[InputArg],
+        live_inputargs: &[impl AsRef<InputArg>],
         start_fresh: u32,
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
@@ -778,6 +778,7 @@ impl<'a> ByteTraceIter<'a> {
         let inputargs: Vec<majit_ir::InputArgRc> = live_inputargs
             .iter()
             .map(|ia| {
+                let ia = ia.as_ref();
                 let r = InputArg::from_type_rc(ia.tp.get(), _fresh);
                 _fresh += 1;
                 if let Some(value) = ia.get_value() {
@@ -787,7 +788,7 @@ impl<'a> ByteTraceIter<'a> {
             })
             .collect();
         for (i, ia) in live_inputargs.iter().enumerate() {
-            let p = ia.index as usize;
+            let p = ia.as_ref().index as usize;
             if p >= _cache.len() {
                 _cache.resize(p + 1, None);
             }

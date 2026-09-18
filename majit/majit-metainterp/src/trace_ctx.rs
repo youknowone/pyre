@@ -192,7 +192,10 @@ impl GreenBox {
             .inputargs()
             .iter()
             .enumerate()
-            .map(|(i, arg)| Self::new(OpRef::input_arg_typed(i as u32, arg.tp), arg.tp))
+            .map(|(i, arg)| {
+                let tp = arg.tp.get();
+                Self::new(OpRef::input_arg_typed(i as u32, tp), tp)
+            })
             .collect()
     }
 }

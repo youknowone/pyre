@@ -876,9 +876,9 @@ impl Trace {
     /// them. The unique-keyed cache rewrites snapshot / runtime boxes.
     pub(crate) fn get_iter_for_optimizer(
         &self,
-        live_inputargs: &[InputArg],
+        live_inputargs: &[InputArgRc],
         start_fresh: u32,
-    ) -> Option<(Vec<OpRc>, Vec<InputArg>, Vec<Option<Operand>>)> {
+    ) -> Option<(Vec<OpRc>, Vec<InputArgRc>, Vec<Option<Operand>>)> {
         let trb = self.trb.as_ref()?;
         let mut iter = crate::opencoder::ByteTraceIter::new_with_inputargs(
             trb,
@@ -893,11 +893,11 @@ impl Trace {
         }
         debug_assert_eq!(ops.len(), self.slots.len());
 
-        let reminted_inputargs: Vec<InputArg> = live_inputargs
+        let reminted_inputargs: Vec<InputArgRc> = live_inputargs
             .iter()
             .zip(iter.inputargs.iter())
             .map(|(src, ia)| {
-                let reminted = InputArg::from_type(src.tp, ia.opref().raw());
+                let reminted = InputArg::from_type_rc(src.tp.get(), ia.opref().raw());
                 if let Some(value) = src.get_value() {
                     reminted.set_value(value);
                 }
@@ -919,7 +919,7 @@ impl Trace {
             if p >= unique_cache.len() {
                 unique_cache.resize(p + 1, None);
             }
-            let ia = InputArg::from_type_rc(src.tp, reminted.index);
+            let ia = InputArg::from_type_rc(src.tp.get(), reminted.index);
             if let Some(value) = reminted.get_value() {
                 ia.set_value(value);
             }
@@ -2116,7 +2116,7 @@ mod tests {
         assert_eq!(
             reminted
                 .iter()
-                .map(|arg| (arg.index, arg.tp))
+                .map(|arg| (arg.index, arg.tp.get()))
                 .collect::<Vec<_>>(),
             vec![(1000, Type::Int), (1001, Type::Int)]
         );
