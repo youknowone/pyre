@@ -5587,6 +5587,105 @@ mod tests {
         );
     }
 
+    /// `array_deopt_resume`: `buf[i%4] = newv; total += buf[i%4]` uses
+    /// `GetarrayitemGcI` with a non-const index.  The post-write load
+    /// must observe `newv`, not CSE to the pre-write raw.
+    #[test]
+    fn test_getarrayitem_gc_i_varindex_sees_setarrayitem() {
+        let d = descr(0);
+        let idx = OpRef::int_op(50);
+        let new_val = OpRef::int_op(102);
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                ],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                    rooted_resop_operand(Type::Int, new_val.raw()),
+                ],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[
+                    rooted_resop_operand(Type::Ref, 100),
+                    rooted_resop_operand(Type::Int, idx.raw()),
+                ],
+                d.clone(),
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+        let r1_pos = ops[0].pos().get();
+        let r2_pos = ops[2].pos().get();
+
+        let mut ctx = OptContext::new(ops.len());
+        ctx.materialize_operand_at(idx);
+        ctx.materialize_operand_at(new_val);
+        ctx.materialize_operand_at(OpRef::ref_op(100));
+
+        let mut pass = OptHeap::new();
+        pass.setup();
+
+        for op in &ops {
+            let mut resolved = op.clone();
+            for i in 0..resolved.num_args() {
+                let arg = resolved.arg(i);
+                let rb = match ctx.resolve_operand_operand_opt(&arg) {
+                    Some(b) => b,
+                    None => {
+                        let __ar = arg.to_opref();
+                        if __ar.is_none() {
+                            arg.clone()
+                        } else {
+                            ctx.materialize_operand_at(__ar).get_box_replacement(false)
+                        }
+                    }
+                };
+                resolved.setarg(i, rb);
+            }
+            match pass.propagate_forward(&resolved, &OpRc::new(resolved.clone()), &mut ctx) {
+                OptimizationResult::Emit(emitted) => {
+                    ctx.emit(emitted);
+                }
+                OptimizationResult::Remove => {}
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
+                    ctx.emit(replaced);
+                }
+                OptimizationResult::PassOn => {
+                    ctx.emit(resolved);
+                }
+                OptimizationResult::InvalidLoop(_) => {
+                    panic!("unexpected InvalidLoop in test");
+                }
+            }
+        }
+
+        let r2_repl = ctx.get_replacement_opref(r2_pos);
+        assert_ne!(
+            r2_repl, r1_pos,
+            "post-write GetarrayitemGcI must not CSE to the pre-write raw"
+        );
+        // heap.py cache_varindex_write can replace the load with `new_val`;
+        // a surviving GetarrayitemGcI is also correct if SETARRAYITEM emitted.
+        assert!(
+            r2_repl == new_val
+                || ctx
+                    .new_operations
+                    .iter()
+                    .any(|o| o.opcode == OpCode::GetarrayitemGcI),
+            "post-write load must be the stored raw or a live GetarrayitemGcI"
+        );
+    }
+
     #[test]
     fn test_getarrayitem_postprocess_updates_ptr_info() {
         let d = descr(0);
