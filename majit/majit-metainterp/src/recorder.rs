@@ -893,17 +893,13 @@ impl Trace {
         }
         debug_assert_eq!(ops.len(), self.slots.len());
 
-        let reminted_inputargs: Vec<InputArgRc> = live_inputargs
-            .iter()
-            .zip(iter.inputargs.iter())
-            .map(|(src, ia)| {
-                let reminted = InputArg::from_type_rc(src.tp.get(), ia.opref().raw());
-                if let Some(value) = src.get_value() {
-                    reminted.set_value(value);
-                }
-                reminted
-            })
-            .collect();
+        // Reuse the walk's reminted Rc. A second from_type_rc splits box identity.
+        for (src, ia) in live_inputargs.iter().zip(iter.inputargs.iter()) {
+            if let Some(value) = src.get_value() {
+                ia.set_value(value);
+            }
+        }
+        let reminted_inputargs = iter.inputargs;
 
         let mut max_unique = 0u32;
         for ia in live_inputargs {
@@ -919,11 +915,7 @@ impl Trace {
             if p >= unique_cache.len() {
                 unique_cache.resize(p + 1, None);
             }
-            let ia = InputArg::from_type_rc(src.tp.get(), reminted.index);
-            if let Some(value) = reminted.get_value() {
-                ia.set_value(value);
-            }
-            unique_cache[p] = Some(Operand::from_bound_inputarg(&ia));
+            unique_cache[p] = Some(Operand::from_bound_inputarg(reminted));
         }
 
         for (op, slot) in ops.iter().zip(self.slots.iter()) {
