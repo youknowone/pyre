@@ -9860,6 +9860,120 @@ const FLOAT_ASIN_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-ASIN-SUBWALK",
 };
 
+macro_rules! math1_descent {
+    ($name:ident, $path:literal, $label:literal, $tag:literal) => {
+        const $name: HelperDescent = HelperDescent {
+            path: $path,
+            commit_label: $label,
+            call_site_label: concat!($label, "_site"),
+            decline_tag: $tag,
+        };
+    };
+}
+
+math1_descent!(
+    FLOAT_ACOS_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_acos",
+    "float_acos_commit",
+    "FLOAT-ACOS-SUBWALK"
+);
+math1_descent!(
+    FLOAT_SINH_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_sinh",
+    "float_sinh_commit",
+    "FLOAT-SINH-SUBWALK"
+);
+math1_descent!(
+    FLOAT_COSH_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_cosh",
+    "float_cosh_commit",
+    "FLOAT-COSH-SUBWALK"
+);
+math1_descent!(
+    FLOAT_TANH_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_tanh",
+    "float_tanh_commit",
+    "FLOAT-TANH-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ASINH_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_asinh",
+    "float_asinh_commit",
+    "FLOAT-ASINH-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ACOSH_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_acosh",
+    "float_acosh_commit",
+    "FLOAT-ACOSH-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ATANH_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_atanh",
+    "float_atanh_commit",
+    "FLOAT-ATANH-SUBWALK"
+);
+math1_descent!(
+    FLOAT_CBRT_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_cbrt",
+    "float_cbrt_commit",
+    "FLOAT-CBRT-SUBWALK"
+);
+math1_descent!(
+    FLOAT_EXP2_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_exp2",
+    "float_exp2_commit",
+    "FLOAT-EXP2-SUBWALK"
+);
+math1_descent!(
+    FLOAT_EXPM1_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_expm1",
+    "float_expm1_commit",
+    "FLOAT-EXPM1-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ERF_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_erf",
+    "float_erf_commit",
+    "FLOAT-ERF-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ERFC_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_erfc",
+    "float_erfc_commit",
+    "FLOAT-ERFC-SUBWALK"
+);
+math1_descent!(
+    FLOAT_GAMMA_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_gamma",
+    "float_gamma_commit",
+    "FLOAT-GAMMA-SUBWALK"
+);
+math1_descent!(
+    FLOAT_LGAMMA_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_lgamma",
+    "float_lgamma_commit",
+    "FLOAT-LGAMMA-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ULP_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_ulp",
+    "float_ulp_commit",
+    "FLOAT-ULP-SUBWALK"
+);
+math1_descent!(
+    FLOAT_DEGREES_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_degrees",
+    "float_degrees_commit",
+    "FLOAT-DEGREES-SUBWALK"
+);
+math1_descent!(
+    FLOAT_RADIANS_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_radians",
+    "float_radians_commit",
+    "FLOAT-RADIANS-SUBWALK"
+);
+
 /// floatobject.py `descr_abs` / `ll_math_fabs`.
 const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_abs",
@@ -15188,6 +15302,10 @@ enum MathFloatDomain {
     GreaterThanMinusOne,
     /// `ll_math_asin`: in `[-1, 1]`, and finite.
     AbsLeOne,
+    /// `ll_math_acosh`: at least `1`, and finite.
+    GreaterEqualOne,
+    /// `ll_math_atanh`: strictly inside `(-1, 1)`, and finite.
+    AbsLtOne,
     /// The body raises for no input and cannot leave the float domain, so the
     /// operand needs no pinning at all.
     Total,
@@ -15211,6 +15329,8 @@ impl MathFloatDomain {
             Self::Finite => x.is_finite(),
             Self::GreaterThanMinusOne => x.is_finite() && x > -1.0,
             Self::AbsLeOne => x.is_finite() && (-1.0..=1.0).contains(&x),
+            Self::GreaterEqualOne => x.is_finite() && x >= 1.0,
+            Self::AbsLtOne => x.is_finite() && x > -1.0 && x < 1.0,
             Self::Total | Self::ResultFinite => true,
         }
     }
@@ -15247,6 +15367,16 @@ impl MathFloatDomain {
                 let one = ctx.trace_ctx.const_float(1.0f64.to_bits() as i64);
                 walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[x, minus_one], false)?;
                 walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[one, x], false)?;
+            }
+            Self::GreaterEqualOne => {
+                let one = ctx.trace_ctx.const_float(1.0f64.to_bits() as i64);
+                walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[x, one], false)?;
+            }
+            Self::AbsLtOne => {
+                let minus_one = ctx.trace_ctx.const_float((-1.0f64).to_bits() as i64);
+                let one = ctx.trace_ctx.const_float(1.0f64.to_bits() as i64);
+                walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[minus_one, x], true)?;
+                walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[x, one], true)?;
             }
             Self::Total | Self::ResultFinite => unreachable!("returned above"),
         }
@@ -16069,93 +16199,6 @@ pub(crate) fn try_walker_orthodox_float_cos<Sym: WalkSym>(
     try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_COS_DESCENT)
 }
 
-/// Exact finite `math.tan`: walk `_float_tan`.
-pub(crate) fn try_walker_orthodox_float_tan<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_TAN_DESCENT)
-}
-
-/// Exact `math.atan`: walk `_float_atan`.
-pub(crate) fn try_walker_orthodox_float_atan<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_float_trig(ctx, op_pc, operand, obj, dst, dst_bank, &FLOAT_ATAN_DESCENT)
-}
-
-/// Exact finite `math.exp`: walk `_float_exp`.
-pub(crate) fn try_walker_orthodox_float_exp<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_float_math1(
-        ctx,
-        op_pc,
-        operand,
-        obj,
-        dst,
-        dst_bank,
-        MathFloatDomain::Finite,
-        &FLOAT_EXP_DESCENT,
-    )
-}
-
-/// Exact `math.log1p` with `x > -1`: walk `_float_log1p`.
-pub(crate) fn try_walker_orthodox_float_log1p<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_float_math1(
-        ctx,
-        op_pc,
-        operand,
-        obj,
-        dst,
-        dst_bank,
-        MathFloatDomain::GreaterThanMinusOne,
-        &FLOAT_LOG1P_DESCENT,
-    )
-}
-
-/// Exact `math.asin` in `[-1, 1]`: walk `_float_asin`.
-pub(crate) fn try_walker_orthodox_float_asin<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    obj: pyre_object::PyObjectRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    try_walker_orthodox_float_math1(
-        ctx,
-        op_pc,
-        operand,
-        obj,
-        dst,
-        dst_bank,
-        MathFloatDomain::AbsLeOne,
-        &FLOAT_ASIN_DESCENT,
-    )
-}
-
 fn try_walker_orthodox_float_trig<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -16175,6 +16218,83 @@ fn try_walker_orthodox_float_trig<Sym: WalkSym>(
         MathFloatDomain::Finite,
         descent,
     )
+}
+
+fn math1_result_is_admitted(descent: &HelperDescent, x: f64) -> bool {
+    let y = if std::ptr::eq(descent, &FLOAT_EXP_DESCENT) {
+        x.exp()
+    } else if std::ptr::eq(descent, &FLOAT_EXP2_DESCENT) {
+        x.exp2()
+    } else if std::ptr::eq(descent, &FLOAT_EXPM1_DESCENT) {
+        x.exp_m1()
+    } else if std::ptr::eq(descent, &FLOAT_SINH_DESCENT) {
+        x.sinh()
+    } else if std::ptr::eq(descent, &FLOAT_COSH_DESCENT) {
+        x.cosh()
+    } else if std::ptr::eq(descent, &FLOAT_GAMMA_DESCENT)
+        || std::ptr::eq(descent, &FLOAT_LGAMMA_DESCENT)
+    {
+        if x <= 0.0 && x == x.trunc() {
+            return false;
+        }
+        return true;
+    } else {
+        return true;
+    };
+    y.is_finite()
+}
+
+fn math1_descent_for(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(&'static HelperDescent, MathFloatDomain)> {
+    use pyre_module::module::math::interp_math as m;
+    if m::is_math_tan_function(callable) {
+        Some((&FLOAT_TAN_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_atan_function(callable) {
+        Some((&FLOAT_ATAN_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_exp_function(callable) {
+        Some((&FLOAT_EXP_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_log1p_function(callable) {
+        Some((&FLOAT_LOG1P_DESCENT, MathFloatDomain::GreaterThanMinusOne))
+    } else if m::is_math_asin_function(callable) {
+        Some((&FLOAT_ASIN_DESCENT, MathFloatDomain::AbsLeOne))
+    } else if m::is_math_acos_function(callable) {
+        Some((&FLOAT_ACOS_DESCENT, MathFloatDomain::AbsLeOne))
+    } else if m::is_math_sinh_function(callable) {
+        Some((&FLOAT_SINH_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_cosh_function(callable) {
+        Some((&FLOAT_COSH_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_tanh_function(callable) {
+        Some((&FLOAT_TANH_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_asinh_function(callable) {
+        Some((&FLOAT_ASINH_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_acosh_function(callable) {
+        Some((&FLOAT_ACOSH_DESCENT, MathFloatDomain::GreaterEqualOne))
+    } else if m::is_math_atanh_function(callable) {
+        Some((&FLOAT_ATANH_DESCENT, MathFloatDomain::AbsLtOne))
+    } else if m::is_math_cbrt_function(callable) {
+        Some((&FLOAT_CBRT_DESCENT, MathFloatDomain::Total))
+    } else if m::is_math_exp2_function(callable) {
+        Some((&FLOAT_EXP2_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_expm1_function(callable) {
+        Some((&FLOAT_EXPM1_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_erf_function(callable) {
+        Some((&FLOAT_ERF_DESCENT, MathFloatDomain::Total))
+    } else if m::is_math_erfc_function(callable) {
+        Some((&FLOAT_ERFC_DESCENT, MathFloatDomain::Total))
+    } else if m::is_math_gamma_function(callable) {
+        Some((&FLOAT_GAMMA_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_lgamma_function(callable) {
+        Some((&FLOAT_LGAMMA_DESCENT, MathFloatDomain::Finite))
+    } else if m::is_math_ulp_function(callable) {
+        Some((&FLOAT_ULP_DESCENT, MathFloatDomain::Total))
+    } else if m::is_math_degrees_function(callable) {
+        Some((&FLOAT_DEGREES_DESCENT, MathFloatDomain::Total))
+    } else if m::is_math_radians_function(callable) {
+        Some((&FLOAT_RADIANS_DESCENT, MathFloatDomain::Total))
+    } else {
+        None
+    }
 }
 
 fn try_walker_orthodox_float_math1<Sym: WalkSym>(
@@ -16203,8 +16323,7 @@ fn try_walker_orthodox_float_math1<Sym: WalkSym>(
     if !domain.admits(&[x]) {
         return Ok(None);
     }
-    // `ll_math_exp` raises OverflowError when the result is non-finite.
-    if std::ptr::eq(descent, &FLOAT_EXP_DESCENT) && !x.exp().is_finite() {
+    if !math1_result_is_admitted(descent, x) {
         return Ok(None);
     }
     let xa =
@@ -16512,39 +16631,19 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
         if r_args.len() >= 3 {
-            use pyre_module::module::math::interp_math;
-            if interp_math::is_math_tan_function(callable) {
+            if let Some((descent, domain)) = math1_descent_for(callable) {
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-                if try_walker_orthodox_float_tan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                    .is_some()
-                {
-                    return Ok(Some(()));
-                }
-            } else if interp_math::is_math_atan_function(callable) {
-                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-                if try_walker_orthodox_float_atan(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                    .is_some()
-                {
-                    return Ok(Some(()));
-                }
-            } else if interp_math::is_math_exp_function(callable) {
-                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-                if try_walker_orthodox_float_exp(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                    .is_some()
-                {
-                    return Ok(Some(()));
-                }
-            } else if interp_math::is_math_log1p_function(callable) {
-                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-                if try_walker_orthodox_float_log1p(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                    .is_some()
-                {
-                    return Ok(Some(()));
-                }
-            } else if interp_math::is_math_asin_function(callable) {
-                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
-                if try_walker_orthodox_float_asin(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
-                    .is_some()
+                if try_walker_orthodox_float_math1(
+                    ctx,
+                    op.pc,
+                    r_args[2],
+                    operands[0],
+                    dst,
+                    'r',
+                    domain,
+                    descent,
+                )?
+                .is_some()
                 {
                     return Ok(Some(()));
                 }

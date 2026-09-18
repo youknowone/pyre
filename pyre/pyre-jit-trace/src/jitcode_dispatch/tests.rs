@@ -4389,6 +4389,68 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "",
         ),
         (
+            "pyre_interpreter::objspace::descroperation::_float_acos",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_sinh",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_cosh",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_tanh",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_asinh",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_acosh",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_atanh",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_cbrt",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_exp2",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_expm1",
+            "",
+        ),
+        ("pyre_interpreter::objspace::descroperation::_float_erf", ""),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_erfc",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_gamma",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_lgamma",
+            "",
+        ),
+        ("pyre_interpreter::objspace::descroperation::_float_ulp", ""),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_degrees",
+            "float_mul",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_radians",
+            "float_mul",
+        ),
+        (
             "pyre_interpreter::objspace::descroperation::_int_abs",
             "int_sub",
         ),

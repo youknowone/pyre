@@ -3162,6 +3162,23 @@ pub const FLOAT_MATH1_ATAN: i64 = 5;
 pub const FLOAT_MATH1_EXP: i64 = 6;
 pub const FLOAT_MATH1_LOG1P: i64 = 7;
 pub const FLOAT_MATH1_ASIN: i64 = 8;
+pub const FLOAT_MATH1_ACOS: i64 = 9;
+pub const FLOAT_MATH1_SINH: i64 = 10;
+pub const FLOAT_MATH1_COSH: i64 = 11;
+pub const FLOAT_MATH1_TANH: i64 = 12;
+pub const FLOAT_MATH1_ASINH: i64 = 13;
+pub const FLOAT_MATH1_ACOSH: i64 = 14;
+pub const FLOAT_MATH1_ATANH: i64 = 15;
+pub const FLOAT_MATH1_CBRT: i64 = 16;
+pub const FLOAT_MATH1_EXP2: i64 = 17;
+pub const FLOAT_MATH1_EXPM1: i64 = 18;
+pub const FLOAT_MATH1_ERF: i64 = 19;
+pub const FLOAT_MATH1_ERFC: i64 = 20;
+pub const FLOAT_MATH1_GAMMA: i64 = 21;
+pub const FLOAT_MATH1_LGAMMA: i64 = 22;
+pub const FLOAT_MATH1_ULP: i64 = 23;
+pub const FLOAT_MATH1_DEGREES: i64 = 24;
+pub const FLOAT_MATH1_RADIANS: i64 = 25;
 
 /// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
@@ -3176,6 +3193,23 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_EXP => _float_exp(x),
         FLOAT_MATH1_LOG1P => _float_log1p(x),
         FLOAT_MATH1_ASIN => _float_asin(x),
+        FLOAT_MATH1_ACOS => _float_acos(x),
+        FLOAT_MATH1_SINH => _float_sinh(x),
+        FLOAT_MATH1_COSH => _float_cosh(x),
+        FLOAT_MATH1_TANH => _float_tanh(x),
+        FLOAT_MATH1_ASINH => _float_asinh(x),
+        FLOAT_MATH1_ACOSH => _float_acosh(x),
+        FLOAT_MATH1_ATANH => _float_atanh(x),
+        FLOAT_MATH1_CBRT => _float_cbrt(x),
+        FLOAT_MATH1_EXP2 => _float_exp2(x),
+        FLOAT_MATH1_EXPM1 => _float_expm1(x),
+        FLOAT_MATH1_ERF => _float_erf(x),
+        FLOAT_MATH1_ERFC => _float_erfc(x),
+        FLOAT_MATH1_GAMMA => _float_gamma(x),
+        FLOAT_MATH1_LGAMMA => _float_lgamma(x),
+        FLOAT_MATH1_ULP => _float_ulp(x),
+        FLOAT_MATH1_DEGREES => _float_degrees(x),
+        FLOAT_MATH1_RADIANS => _float_radians(x),
         _ => _float_abs(x),
     }
 }
@@ -6681,7 +6715,7 @@ pub(crate) fn _int_neg(x: i64) -> PyResult {
 
 /// floatobject.py `descr_pos`: `W_FloatObject(self.floatval)`.
 #[inline(never)]
-pub(crate) fn _float_pos(x: f64) -> PyResult {
+pub fn _float_pos(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -6804,6 +6838,48 @@ pub(crate) fn _float_asin(x: f64) -> PyResult {
         w_slots: PY_NULL,
     }) as PyObjectRef)
 }
+
+/// Unboxed `W_FloatObject` leaf. `|x| $compute` names the parameter; it is
+/// not a Rust closure (those residualize an extra `new` + call).
+macro_rules! float_math1_leaf {
+    ($fn:ident, |$x:ident| $compute:expr) => {
+        #[inline(never)]
+        pub(crate) fn $fn($x: f64) -> PyResult {
+            Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                ob_header: PyObject {
+                    ob_type: &FLOAT_TYPE as *const PyType,
+                    w_class: get_instantiate(&FLOAT_TYPE),
+                },
+                floatval: $compute,
+                w_dict: PY_NULL,
+                w_slots: PY_NULL,
+            }) as PyObjectRef)
+        }
+    };
+}
+
+float_math1_leaf!(_float_acos, |x| x.acos());
+float_math1_leaf!(_float_sinh, |x| x.sinh());
+float_math1_leaf!(_float_cosh, |x| x.cosh());
+float_math1_leaf!(_float_tanh, |x| x.tanh());
+float_math1_leaf!(_float_asinh, |x| x.asinh());
+float_math1_leaf!(_float_acosh, |x| x.acosh());
+float_math1_leaf!(_float_atanh, |x| x.atanh());
+float_math1_leaf!(_float_cbrt, |x| x.cbrt());
+float_math1_leaf!(_float_exp2, |x| x.exp2());
+float_math1_leaf!(_float_expm1, |x| x.exp_m1());
+// crates.io pymath is not in the Charon artefact, so these residualize.
+// Interpreter `math1_pymath` already boxed the pymath `Ok` via `_float_pos`.
+float_math1_leaf!(_float_erf, |x| pymath::math::erf(x).unwrap_or(f64::NAN));
+float_math1_leaf!(_float_erfc, |x| pymath::math::erfc(x).unwrap_or(f64::NAN));
+float_math1_leaf!(_float_gamma, |x| pymath::math::gamma(x).unwrap_or(f64::NAN));
+float_math1_leaf!(_float_lgamma, |x| {
+    pymath::math::lgamma(x).unwrap_or(f64::NAN)
+});
+float_math1_leaf!(_float_ulp, |x| pymath::math::ulp(x));
+// pymath::math::{degrees,radians} is `x * (180/π)` / `x * (π/180)`.
+float_math1_leaf!(_float_degrees, |x| x * (180.0 / std::f64::consts::PI));
+float_math1_leaf!(_float_radians, |x| x * (std::f64::consts::PI / 180.0));
 
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
 #[inline(never)]
