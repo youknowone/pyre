@@ -2919,17 +2919,23 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     let substop = RBigIntGcRoot::new(&*rstart_b + &*sl_stop * &*rstep_b);
     let _roots = pyre_object::gc_roots::push_roots();
     let w_substart = pyre_object::range_bigint_to_obj(substart.translated_alias());
-    let w_substart = pyre_object::gc_roots::pin_root(w_substart);
+    let _ = pyre_object::gc_roots::pin_root(w_substart);
+    let substart_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_substep = pyre_object::range_bigint_to_obj(substep.translated_alias());
-    let w_substep = pyre_object::gc_roots::pin_root(w_substep);
+    let _ = pyre_object::gc_roots::pin_root(w_substep);
+    let substep_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // functional.py:523-526 tests `if w_stop`, i.e. whether the wrapped
     // pointer exists, not whether its integer payload is zero.  The wrapped
     // result of compute_slice_indices3 is always present, so compute the stop
     // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
     let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
-    let w_substop = pyre_object::gc_roots::pin_root(w_substop);
+    let _ = pyre_object::gc_roots::pin_root(w_substop);
+    let substop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::w_range_new(
-        w_substart, w_substop, w_substep, false,
+        pyre_object::gc_roots::shadow_stack_get(substart_slot),
+        pyre_object::gc_roots::shadow_stack_get(substop_slot),
+        pyre_object::gc_roots::shadow_stack_get(substep_slot),
+        false,
     ))
 }
 

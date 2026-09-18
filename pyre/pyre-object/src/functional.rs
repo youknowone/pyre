@@ -948,8 +948,11 @@ pub fn w_range_new(
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let start = crate::gc_roots::pin_root(start);
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
     let stop = crate::gc_roots::pin_root(stop);
+    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
     let step = crate::gc_roots::pin_root(step);
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
     let length = unsafe {
         let len_big = range_length_big(
             &range_obj_to_bigint(start),
@@ -958,7 +961,14 @@ pub fn w_range_new(
         );
         range_bigint_to_obj(len_big)
     };
+    // `range_bigint_to_obj` is `w_int_new` / `w_long_new` and may collect.
+    // The three bounds live on the shadow stack (`expand_pop_roots` /
+    // `gc_restore_root`); the Rust locals do not, so an old-gen store of
+    // those copies would remember a nursery interior.
     let length = crate::gc_roots::pin_root(length);
+    let start = crate::gc_roots::shadow_stack_get(start_slot);
+    let stop = crate::gc_roots::shadow_stack_get(stop_slot);
+    let step = crate::gc_roots::shadow_stack_get(step_slot);
     W_Range::allocate_stable(W_Range {
         ob: PyObject {
             ob_type: std::ptr::null(),
@@ -975,10 +985,16 @@ pub fn w_range_new(
 /// Convenience constructor wrapping three machine-int bounds.  The explicit
 /// step spells `promote_step = false`, matching `range(start, stop, step)`.
 pub fn w_range_new_i64(start: i64, stop: i64, step: i64) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(start));
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(crate::intobject::w_int_new(stop));
+    let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let step = crate::gc_roots::pin_root(crate::intobject::w_int_new(step));
     w_range_new(
-        crate::intobject::w_int_new(start),
-        crate::intobject::w_int_new(stop),
-        crate::intobject::w_int_new(step),
+        crate::gc_roots::shadow_stack_get(start_slot),
+        crate::gc_roots::shadow_stack_get(stop_slot),
+        step,
         false,
     )
 }
@@ -1339,11 +1355,16 @@ pub fn w_long_range_iter_new(
     len: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let start = crate::gc_roots::pin_root(start);
-    let step = crate::gc_roots::pin_root(step);
-    let len = crate::gc_roots::pin_root(len);
-    let index = crate::intobject::w_int_new(0);
-    let index = crate::gc_roots::pin_root(index);
+    let _ = crate::gc_roots::pin_root(start);
+    let start_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(step);
+    let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let _ = crate::gc_roots::pin_root(len);
+    let len_slot = crate::gc_roots::shadow_stack_len() - 1;
+    let index = crate::gc_roots::pin_root(crate::intobject::w_int_new(0));
+    let start = crate::gc_roots::shadow_stack_get(start_slot);
+    let step = crate::gc_roots::shadow_stack_get(step_slot);
+    let len = crate::gc_roots::shadow_stack_get(len_slot);
     W_LongRangeIterator::allocate_stable(W_LongRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
