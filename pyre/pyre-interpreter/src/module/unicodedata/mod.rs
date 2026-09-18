@@ -25,10 +25,6 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::{PyError, PyErrorKind};
 
-pub(crate) fn character_name(ch: char) -> Option<String> {
-    ucd_core::character_name(ch)
-}
-
 type PyResult = Result<PyObjectRef, PyError>;
 
 /// `interp_ucd.py UCD._unicodedb` — the view is a field of the UCD
