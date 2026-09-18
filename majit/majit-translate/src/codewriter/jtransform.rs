@@ -10782,6 +10782,10 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // malloc is the one raw allocation the optimizer can virtualise
         // (`virtualize.py do_RAW_MALLOC_VARSIZE_CHAR`).
         "raw_malloc_varsize_char" => OopSpecIndex::RawMallocVarsizeChar,
+        // `_rewrite_raw_malloc` appends `_zero` to the helper name and
+        // still attaches `OS_RAW_MALLOC_VARSIZE_CHAR` when `TYPE.OF`
+        // is Char.
+        "raw_malloc_varsize_zero" => OopSpecIndex::RawMallocVarsizeChar,
         "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
@@ -19144,6 +19148,10 @@ mod tests {
         assert_eq!(
             super::map_user_oopspec_to_index("raw_free(node)"),
             OopSpecIndex::RawFree
+        );
+        assert_eq!(
+            super::map_user_oopspec_to_index("raw_malloc_varsize_zero(n)"),
+            OopSpecIndex::RawMallocVarsizeChar
         );
         assert_eq!(
             super::map_user_oopspec_to_index("ordereddict.lookup(d, key, hash, flag)"),
