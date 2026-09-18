@@ -662,9 +662,12 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         // identities and fail the live-root check.
         // `ctx` IS the root walk on this arm (`framestack.is_empty() &&
         // !inline_subwalk`), so its mirror describes the very frame whose
-        // operand stack the adopter publishes.  `ABORT_TOO_LONG` stops at an
-        // opcode boundary and keeps the snapshot-array source; a capability-gap
-        // abort stops mid-opcode and needs this.
+        // operand stack the adopter publishes.  A root walk never refreshes
+        // the virtualizable snapshot array; `_copy_data_from_miframe` copies
+        // the live MIFrame banks, which is this mirror.  `ABORT_TOO_LONG`
+        // reconciles the mirror to the next instruction first (`walk`), so
+        // the captured slots are the post-step stack.  A capability-gap
+        // abort stops mid-opcode and needs the same source.
         let mirror_stack = capture_vstack_mirror_image(ctx, origin);
         if fbw_debug_abort_enabled() {
             eprintln!(
@@ -7369,7 +7372,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             ei.runtime_helper,
             majit_ir::RuntimeHelperKind::StoreName | majit_ir::RuntimeHelperKind::StoreGlobal
         )
-        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref), Some(&value_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2))
@@ -9192,15 +9194,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
 
-    // LoadName: descend `typeobject.py unwrap_cell` for a name already
-    // in the module dict.  A later `DELETE_NAME` (`except as`) still
-    // forces `version?` (`opimpl_jit_force_quasi_immutable` →
-    // `SwitchToBlackhole(ABORT_FORCE_QUASIIMMUT)`).  Same exception-table
-    // gate as StoreName: the fold elides the residual's kept-stack guards,
-    // and a later `ABORT_TOO_LONG` then resumes with a NULL peeled slot.
+    // LoadName: descend `getitem_str` = `getdictvalue_no_unwrapping` +
+    // `unwrap_cell`.  No handler gate: `except as` is a different
+    // `next_instr` green from the inner while (`interp_jit.py
+    // pypyjitdriver.greens`).  A present cell is the live getfield, not
+    // a `version?` pin — `write_cell` in-place does not `mutated()`,
+    // and pinning the whole dict made `DELETE_NAME` of `except as`
+    // retrace the while every iteration.
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
-        && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (

@@ -6807,11 +6807,12 @@ pub extern "C" fn bh_load_name_fn(frame_ptr: i64, w_name: i64, namei: i64) -> i6
         Ok(w_value) => w_value as i64,
         Err(mut err) => {
             // Publish into BOTH the blackhole `BH_LAST_EXC_VALUE` and the
-            // backend `_store_exception` cells: LOAD_NAME lowers into the
-            // full-body-walk compiled trace (a handler-bearing body skips the
-            // cell-fold), where the following `GUARD_NO_EXCEPTION` reads the
-            // backend cells — writing only `BH_LAST_EXC_VALUE` lets the guard
-            // pass on a stale 0 and a raising LOAD_NAME is silently swallowed.
+            // backend `_store_exception` cells: an unfoldable LOAD_NAME
+            // (`except as` delete target, non-module locals) stays residual
+            // in the full-body-walk compiled trace, where the following
+            // `GUARD_NO_EXCEPTION` reads the backend cells — writing only
+            // `BH_LAST_EXC_VALUE` lets the guard pass on a stale 0 and a
+            // raising LOAD_NAME is silently swallowed.
             publish_residual_call_exception(err.to_exc_object() as i64);
             0
         }
