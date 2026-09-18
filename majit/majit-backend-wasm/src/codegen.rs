@@ -13238,14 +13238,20 @@ fn emit_unary_vi(
 mod tests {
     use super::*;
 
+    fn cpu() -> crate::failguard::CpuTestGuard {
+        crate::failguard::lock_cpu()
+    }
+
     #[test]
     fn aligned_varsize_frame_bump_rejects_u32_overflow() {
+        let _cpu = cpu();
         assert_eq!(aligned_varsize_frame_bump(20), Some(24));
         assert_eq!(aligned_varsize_frame_bump(0xffff_fffc), None);
     }
 
     #[test]
     fn jump_phi_coalesces_new_onto_dead_label_slot() {
+        let _cpu = cpu();
         use majit_ir::descr::SimpleSizeDescr;
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
@@ -13270,6 +13276,7 @@ mod tests {
 
     #[test]
     fn jump_phi_does_not_coalesce_when_label_slot_is_still_live() {
+        let _cpu = cpu();
         use majit_ir::descr::SimpleSizeDescr;
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
@@ -13291,6 +13298,7 @@ mod tests {
 
     #[test]
     fn jump_phi_does_not_coalesce_swapped_label_args() {
+        let _cpu = cpu();
         use majit_ir::descr::SimpleSizeDescr;
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
@@ -13309,6 +13317,7 @@ mod tests {
 
     #[test]
     fn jump_phi_does_not_coalesce_rotated_label_args() {
+        let _cpu = cpu();
         use majit_ir::descr::SimpleSizeDescr;
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
@@ -13328,6 +13337,7 @@ mod tests {
 
     #[test]
     fn ref_homes_keep_distinct_slots_for_swapped_label_args() {
+        let _cpu = cpu();
         use majit_ir::descr::SimpleSizeDescr;
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
@@ -13353,6 +13363,7 @@ mod tests {
 
     #[test]
     fn label_arg_that_is_also_a_later_read_is_still_seeded() {
+        let _cpu = cpu();
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
         let mut constants = indexmap::IndexMap::new();
@@ -13379,6 +13390,7 @@ mod tests {
 
     #[test]
     fn label_arg_import_hole_is_not_an_unbound_read() {
+        let _cpu = cpu();
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![
             InputArg::from_type_rc(Type::Int, 0),
@@ -13401,6 +13413,7 @@ mod tests {
 
     #[test]
     fn debug_merge_point_import_hole_is_not_an_unbound_read() {
+        let _cpu = cpu();
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![
             InputArg::from_type_rc(Type::Int, 0),
@@ -13424,6 +13437,7 @@ mod tests {
 
     #[test]
     fn guard_failarg_import_hole_is_not_an_unbound_read() {
+        let _cpu = cpu();
         use majit_ir::forwarding::bound_operand_from_opref as rb;
         let inputargs = vec![
             InputArg::from_type_rc(Type::Int, 0),
@@ -13449,6 +13463,7 @@ mod tests {
 
     #[test]
     fn peep_sink_applies_all_local_folds() {
+        let _cpu = cpu();
         let mut bytes = Vec::new();
         {
             let mut raw_sink = InstructionSink::new(&mut bytes);
@@ -13469,6 +13484,7 @@ mod tests {
 
     #[test]
     fn peep_sink_folds_i64_constants_and_right_identities() {
+        let _cpu = cpu();
         let mut bytes = Vec::new();
         {
             let mut raw_sink = InstructionSink::new(&mut bytes);
@@ -13492,6 +13508,7 @@ mod tests {
 
     #[test]
     fn peep_sink_folds_i32_constants_and_right_identities() {
+        let _cpu = cpu();
         let mut bytes = Vec::new();
         {
             let mut raw_sink = InstructionSink::new(&mut bytes);
@@ -13520,6 +13537,7 @@ mod tests {
     /// branch to the enclosing `loop` instead of the region's block.
     #[test]
     fn inline_region_br_depth_counts_only_the_frames_the_caller_opened() {
+        let _cpu = cpu();
         let ref_homes = RefHomes {
             by_id: Vec::new(),
             len: 0,
@@ -13563,6 +13581,7 @@ mod tests {
 
     #[test]
     fn compact_geometry_keeps_tail_call_area_out_of_ca_prefix() {
+        let _cpu = cpu();
         let frame = FrameGeometry::compact(32, 16, 0);
         assert_eq!(frame.dispatch_key_ofs, 32 * SLOT_SIZE);
         assert_eq!(frame.home_slot_base, 33 * SLOT_SIZE);
@@ -13579,6 +13598,7 @@ mod tests {
     /// interesting cases).
     #[test]
     fn ovf_const_bound_agrees_with_checked_arithmetic() {
+        let _cpu = cpu();
         let edges = [
             i64::MIN,
             i64::MIN + 1,

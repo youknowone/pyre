@@ -1096,7 +1096,7 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 /// dependency, so the box is eliminated by the optimizer rather than by
 /// conditional compilation. Mirrors `majit-backend-dynasm/src/runner.rs`'s
 /// `gc_box`.
-mod gc_box {
+pub(crate) mod gc_box {
     use super::{GcAllocator, RefCell};
 
     thread_local! {
@@ -1160,6 +1160,22 @@ mod gc_box {
             *guard = Some(gc);
             let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+        });
+    }
+
+    /// Uninstall this thread's box without freeing its nursery.
+    ///
+    /// The raw mirror is cleared first so a reentrant query during
+    /// uninstall does not observe a dangling pointer. The MiniMark
+    /// itself is leaked: `gc_sync::replace_singleton_leaking_old`
+    /// — a dropped nursery's pages return to the OS and ExtraHeap /
+    /// InputArg slabs reuse them, smashing their mutex words.
+    pub(crate) fn clear() {
+        WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+        WASM_ACTIVE_GC.with(|cell| {
+            if let Some(gc) = cell.borrow_mut().take() {
+                std::mem::forget(gc);
+            }
         });
     }
 }
@@ -1264,6 +1280,17 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     );
 }
 
+/// Owns the TLS GC box installed by [`install_gc_box`]. Dropping it
+/// uninstalls the box on this thread (`llmodel.py` `cpu.gc_ll_descr`
+/// dies with the cpu).
+pub(crate) struct ActiveGcBox;
+
+impl Drop for ActiveGcBox {
+    fn drop(&mut self) {
+        gc_box::clear();
+    }
+}
+
 /// Store a GC allocator in the wasm backend thread-local and register
 /// the `majit_gc::set_active_*` function-pointer hooks, without
 /// requiring a `WasmBackend` instance.
@@ -1272,7 +1299,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// the backend thread. Production uses [`install_gc_standalone`], which
 /// registers the same hooks WITHOUT a box so the trampolines fall through
 /// to `gc_sync`.
-fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
+fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
@@ -1280,6 +1307,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
+    ActiveGcBox
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
@@ -2243,6 +2271,10 @@ pub struct WasmBackend {
     constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
+    /// Test-path `gc_ll_descr`. Dropping the backend uninstalls the TLS
+    /// box so a cargo worker thread does not run MiniMark `Drop` at
+    /// pthread TLS teardown.
+    gc_box: Option<ActiveGcBox>,
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -2502,6 +2534,16 @@ static NEXT_PENDING_INLINE_ID: AtomicI64 = AtomicI64::new(1);
 
 fn with_pending_inlines<R>(f: impl FnOnce(&IndexMap<i64, PendingInline>) -> R) -> R {
     PENDING_INLINES.with(|pending| f(&pending.borrow()))
+}
+
+/// Drop this thread's deferred-inline Op graphs before the cpu lock
+/// is released. The graph holds `OpRc` / ExtraHeap slots; a worker
+/// TLS dtor freeing them after the next test has started is what
+/// smashed ExtraHeap's process mutex.
+#[cfg(test)]
+pub(crate) fn clear_pending_inlines_for_tests() {
+    PENDING_INLINES.with(|pending| pending.borrow_mut().clear());
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().clear());
 }
 
 fn with_pending_inlines_mut<R>(f: impl FnOnce(&mut IndexMap<i64, PendingInline>) -> R) -> R {
@@ -2911,6 +2953,7 @@ impl WasmBackend {
             next_header_pc: 0,
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
+            gc_box: None,
         }
     }
 
@@ -2931,7 +2974,7 @@ impl WasmBackend {
     /// wasm dependency.
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
-        install_gc_box(gc);
+        self.gc_box = Some(install_gc_box(gc));
     }
 
     /// No-op: present for API parity with the dynasm backend so
@@ -6636,6 +6679,7 @@ mod tests {
 
     #[test]
     fn home_gcmap_marks_used_homes_and_label_captures_only() {
+        let _compile_guard = failguard::lock_cpu();
         let sign = std::mem::size_of::<isize>();
         let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
         let map = codegen::build_home_gcmap(frame, 5, 2);
@@ -6658,6 +6702,7 @@ mod tests {
 
     #[test]
     fn union_gcmap_covers_incomparable_ordinary_and_label_maps() {
+        let _compile_guard = failguard::lock_cpu();
         let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
         let owner = codegen::build_home_gcmap(frame, 8, 0);
         let bridge = codegen::build_home_gcmap(frame, 3, 2);
@@ -6684,6 +6729,7 @@ mod tests {
 
     #[test]
     fn union_gcmap_keeps_bits_past_sixty_four_words() {
+        let _compile_guard = failguard::lock_cpu();
         // value_slots=16, 4200 homes: last signed index is past 64 data words
         // on a 64-bit host (`build_home_gcmap` word count).
         let frame = codegen::FrameGeometry::compact(16, 4200, 2);
@@ -6705,6 +6751,7 @@ mod tests {
 
     #[test]
     fn parameter_bridge_dispatch_is_bounded_by_guard_population() {
+        let _compile_guard = failguard::lock_cpu();
         assert!(bridge_param_dispatch_profitable(
             true,
             MAX_BRIDGE_PARAM_GUARDS
@@ -6718,6 +6765,7 @@ mod tests {
 
     #[test]
     fn ca_pop_publishes_the_forwarded_shadow_stack_frame() {
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, jitframe_type_info};
         use majit_gc::GcAllocator;
 
@@ -6756,6 +6804,7 @@ mod tests {
 
     #[test]
     fn callee_gcmap_marks_homes_not_overwritable_input_slots() {
+        let _compile_guard = failguard::lock_cpu();
         // FRAME_SLOT_BASE is the value/fail-arg area. A static gcmap bit there
         // stays set after a guard spill overwrites the slot with an integer,
         // and `is_nursery_object_start` is only a nursery range check.
@@ -6775,16 +6824,16 @@ mod tests {
 
     #[test]
     fn headerless_helper_rejects_non_positive_size() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let gc = MiniMarkGC::new();
-        install_gc_box(Box::new(gc));
+        let _gc_box = install_gc_box(Box::new(gc));
         assert_eq!(wasm_jit_alloc_headerless(-1), 0);
         assert_eq!(wasm_jit_alloc_headerless(0), 0);
     }
 
     #[test]
     fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{JitFrame, jitframe_type_info};
         use majit_gc::GcAllocator;
 
@@ -6798,7 +6847,7 @@ mod tests {
         gc.collect_nursery();
 
         set_wasm_jitframe_tid(tid);
-        install_gc_box(Box::new(gc));
+        let _gc_box = install_gc_box(Box::new(gc));
         let frame = wasm_jit_ca_alloc_frame(std::mem::size_of::<isize>() as i64, 0);
         assert_ne!(frame, 0);
         unsafe {
@@ -6815,6 +6864,7 @@ mod tests {
 
     #[test]
     fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
+        let _compile_guard = failguard::lock_cpu();
         // No active wasm GC is installed on this test thread.  A typed descr
         // therefore has no legal allocator and must report NULL to
         // blackhole.py `_get_method`; the previous raw fallback returned a
@@ -6825,6 +6875,7 @@ mod tests {
 
     #[test]
     fn blackhole_varsize_rejects_negative_lengths_without_panicking() {
+        let _compile_guard = failguard::lock_cpu();
         let backend = WasmBackend::new();
         assert_eq!(backend.bh_newstr(-1), 0);
         assert_eq!(backend.bh_newunicode(-1), 0);
@@ -6832,6 +6883,7 @@ mod tests {
 
     #[test]
     fn cross_loop_terminal_jump_uses_target_descr_identity() {
+        let _compile_guard = failguard::lock_cpu();
         let local_descr = majit_ir::make_loop_target_descr(1, false);
         let foreign_descr = majit_ir::make_loop_target_descr(2, false);
         let label = Op::new(majit_ir::OpCode::Label, &[]);
@@ -6847,7 +6899,7 @@ mod tests {
 
     #[test]
     fn straightline_trace_defers_host_module_until_execution() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(1);
         let finish = Op::new(majit_ir::OpCode::Finish, &[]);
@@ -6892,7 +6944,7 @@ mod tests {
 
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let token_number = 9_900_000;
         let compiled_ptr = 1_000_022;
         let _cleanup = DispatchCleanup {
@@ -6948,7 +7000,7 @@ mod tests {
 
     #[test]
     fn mark_gnf2_sets_the_cell_without_a_new_snapshot() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let token_number = 9_900_001;
         let compiled_ptr = 1_000_023;
         let _cleanup = DispatchCleanup {
@@ -6977,7 +7029,7 @@ mod tests {
 
     #[test]
     fn mark_gnf2_raises_redirected_alias_cells() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let old_number = 9_900_030;
         let new_number = 9_900_031;
         let old_ptr = 1_000_024;
@@ -7009,7 +7061,7 @@ mod tests {
 
     #[test]
     fn mark_gnf2_raises_cells_that_retain_a_historical_target() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let alias = 9_900_040;
         let source = 9_900_041;
         let source_ptr = 1_000_026;
@@ -7047,7 +7099,7 @@ mod tests {
 
     #[test]
     fn publish_after_mark_raises_a_new_alias_cell() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let source = 9_900_050;
         let alias = 9_900_051;
         let compiled_ptr = 1_000_028;
@@ -7077,7 +7129,7 @@ mod tests {
 
     #[test]
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
             let inputargs = vec![InputArg::new_int_rc(0)];
             let mut previous = majit_ir::OpRef::input_arg_int(0);
@@ -7160,7 +7212,7 @@ mod tests {
     /// vtable→type_id mapping.
     #[test]
     fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let mut gc = MiniMarkGC::new();
         let int_tid = gc.register_type(TypeInfo::simple(16));
         let int_vtable: usize = 0x3333_4400;
@@ -7181,7 +7233,7 @@ mod tests {
     /// ConstPtr that is only in `LIVE_GC_TABLES` would stay unforwarded.
     #[test]
     fn compile_loop_remembers_gc_table_for_minor_collection() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -7239,7 +7291,7 @@ mod tests {
     /// side works so the feeders can be built.
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_FRAME_OFS, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
@@ -7310,7 +7362,7 @@ mod tests {
     /// homes and a recycled nursery address is left in a gcmap slot.
     #[test]
     fn oldgen_jitframe_must_be_remembered_before_host_pop() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
@@ -7329,7 +7381,7 @@ mod tests {
             *((frame_ptr as *mut u8).add(JF_GCMAP_OFS as usize) as *mut *const u8) =
                 gcmap.as_ptr() as *const u8;
         }
-        install_gc_box(Box::new(gc));
+        let _gc_box = install_gc_box(Box::new(gc));
         let saved = majit_gc::shadow_stack::push_jf(frame);
         remember_and_drop_execution_frame(frame_ptr, saved);
         with_wasm_active_gc_mut(|gc| gc.collect_nursery());

@@ -285,10 +285,10 @@ mod tests {
         }
     }
 
-    fn install_root_counting_gc() -> Arc<AtomicUsize> {
+    fn install_root_counting_gc() -> (Arc<AtomicUsize>, crate::ActiveGcBox) {
         let roots = Arc::new(AtomicUsize::new(0));
-        crate::install_gc_box(Box::new(RootCountingGc(Arc::clone(&roots))));
-        roots
+        let gc_box = crate::install_gc_box(Box::new(RootCountingGc(Arc::clone(&roots))));
+        (roots, gc_box)
     }
 
     fn fail_descr(fail_arg_types: Vec<Type>) -> Arc<WasmFailDescr> {
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn a_finish_singleton_resolves_to_its_reserved_exit() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
+        let _serialized = super::lock_cpu();
         // The emitted FINISH writes the index this returns and the emitted
         // CALL_ASSEMBLER check compares against the same constant, so a
         // singleton that failed to bind would send every clean callee finish
@@ -333,7 +333,7 @@ mod tests {
         // The emitted CALL_ASSEMBLER check compares against a baked reserved
         // index, so a trace whose own exits started below the reserved block
         // would collide with it.
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
+        let _serialized = super::lock_cpu();
         let base = reserve_fail_descrs(3);
         assert!(base >= super::FINISH_EXIT_INDEX_COUNT);
         for (index, types) in [
@@ -381,7 +381,7 @@ mod tests {
         // tests (shared GC box / finish-exit slots) and SIGSEGV'd the
         // process. Disjointness is what this checks; the wasm host is
         // single-threaded.
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
+        let _serialized = super::lock_cpu();
         const COMPILES: usize = 8;
         const EXITS: usize = 2;
         let mut ranges = Vec::new();
@@ -422,8 +422,8 @@ mod tests {
 
     #[test]
     fn boxed_roots_ref_slots_and_nonzero_exception_until_drop() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
-        let roots = install_root_counting_gc();
+        let _serialized = super::lock_cpu();
+        let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let frame = WasmFrameData::boxed(
             vec![0x10, 42, 0, 0x20],
@@ -437,8 +437,8 @@ mod tests {
 
     #[test]
     fn boxed_without_refs_or_exception_does_not_bracket_roots() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
-        let roots = install_root_counting_gc();
+        let _serialized = super::lock_cpu();
+        let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let frame = WasmFrameData::boxed(vec![1, 2], fail_descr(vec![Type::Int, Type::Float]), 0);
         assert_eq!(roots.load(Ordering::SeqCst), before);
@@ -448,8 +448,8 @@ mod tests {
 
     #[test]
     fn set_savedata_roots_until_cleared_or_drop() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
-        let roots = install_root_counting_gc();
+        let _serialized = super::lock_cpu();
+        let (roots, _gc_box) = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
         assert_eq!(roots.load(Ordering::SeqCst), before);
@@ -467,19 +467,23 @@ mod tests {
 
     #[test]
     fn set_savedata_on_a_force_snapshot_writes_the_live_jitframe() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
-        use majit_backend::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
+        let _serialized = super::lock_cpu();
+        use majit_backend::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
 
-        let jf = alloc_off_gc_jitframe(4);
+        let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
         frame.attach_origin_jf(jf);
-        frame.set_savedata(GcRef(0x51));
+        // `NO_CONCRETE` is not a heap object (even, non-8-aligned, non-null).
+        // A low dummy (0x51) was chased as a nursery pointer when another
+        // test's MiniMark was still the process hook target.
+        let saved = GcRef::NO_CONCRETE;
+        frame.set_savedata(saved);
         unsafe {
-            assert_eq!((*jf).jf_savedata, 0x51);
+            assert_eq!((*jf).jf_savedata, saved.0);
         }
         drop(frame);
         unsafe {
-            assert_eq!((*jf).jf_savedata, 0x51);
+            assert_eq!((*jf).jf_savedata, saved.0);
             free_off_gc_jitframe(jf);
         }
     }
@@ -499,7 +503,7 @@ mod tests {
 
     #[test]
     fn retract_label_target_keeps_a_replacement_handle() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
+        let _serialized = super::lock_cpu();
         let id = 0x7e71_ac10_usize;
         super::publish_label_target(id, dummy_label_target(7));
         super::retract_label_target_if_handle(id, 7);
@@ -514,7 +518,7 @@ mod tests {
 
     #[test]
     fn retarget_slots_skips_the_owner_and_zero() {
-        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
+        let _serialized = super::lock_cpu();
         // Native has no host table; the helper must still ignore the
         // owner's own slot and a missing handle without panicking.
         super::retarget_slots_to_module([0, 4, 4], 4, b"\0asm");
@@ -709,17 +713,47 @@ fn reserved_finish_descr(exit_index: u32, meta_descr: Option<DescrRef>) -> Arc<W
     })
 }
 
+/// CPU singletons for the five `done_with_this_frame` / exception exits.
+///
+/// `make_and_attach_done_descrs` stores those descrs on the cpu, not in
+/// the per-trace fail-index vec. The growable registry still reserves
+/// indices 0..5 so a trace `fail_descr_base` cannot collide with them,
+/// but lookups and attachment go through this array so a smashed or
+/// overwritten registry slot cannot change the singleton layout.
+static FINISH_EXITS: parking_lot::Mutex<[Option<Arc<WasmFailDescr>>; 5]> =
+    parking_lot::Mutex::new([None, None, None, None, None]);
+
+fn finish_exits_init(exits: &mut [Option<Arc<WasmFailDescr>>; 5]) {
+    for (index, slot) in exits.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(reserved_finish_descr(index as u32, None));
+        }
+    }
+}
+
+fn finish_exit(index: u32) -> Arc<WasmFailDescr> {
+    let mut exits = FINISH_EXITS.lock();
+    finish_exits_init(&mut exits);
+    exits[index as usize]
+        .clone()
+        .expect("reserved finish exit is uninitialized")
+}
+
 /// Claim the reserved block if the registry has not been opened yet. Called
 /// under the registry lock from every entry point that can grow or read it, so
 /// a trace can never take a `fail_descr_base` below `FINISH_EXIT_INDEX_COUNT`.
 fn reserve_finish_exit_block(vec: &mut Vec<FailDescrSlot>) {
+    let mut exits = FINISH_EXITS.lock();
+    finish_exits_init(&mut exits);
     if !vec.is_empty() {
         return;
     }
     for index in 0..FINISH_EXIT_INDEX_COUNT {
-        vec.push(FailDescrSlot::Registered(reserved_finish_descr(
-            index, None,
-        )));
+        vec.push(FailDescrSlot::Registered(
+            exits[index as usize]
+                .clone()
+                .expect("reserved finish exit is uninitialized"),
+        ));
     }
 }
 
@@ -739,21 +773,17 @@ fn thin_descr_ptr(descr: &DescrRef) -> usize {
 /// compile happened in.
 pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
     let ptr = thin_descr_ptr(descr.as_ref()?);
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    vec[..FINISH_EXIT_INDEX_COUNT as usize]
-        .iter()
-        .position(|reserved| {
-            let FailDescrSlot::Registered(reserved) = reserved else {
-                unreachable!("the reserved finish block contains an empty slot")
-            };
+    let mut exits = FINISH_EXITS.lock();
+    finish_exits_init(&mut exits);
+    exits.iter().enumerate().find_map(|(index, reserved)| {
+        reserved.as_ref().and_then(|reserved| {
             reserved
                 .meta_descr
                 .as_ref()
                 .is_some_and(|attached| thin_descr_ptr(attached) == ptr)
+                .then_some(index as u32)
         })
-        .map(|index| index as u32)
+    })
 }
 
 /// `make_and_attach_done_descrs`' per-target attachment for one of the five.
@@ -762,11 +792,18 @@ pub fn attached_finish_exit_index(descr: &Option<DescrRef>) -> Option<u32> {
 /// already-claimed entry keeps the fast path available to a process that
 /// compiled something before the attachment landed.
 pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
+    let attached = reserved_finish_descr(exit_index, Some(descr));
+    // Registry first, then `FINISH_EXITS` — same order as
+    // `reserve_finish_exit_block` (called under the registry lock).
     let mut reg = FAIL_DESCR_REGISTRY.lock();
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
-    vec[exit_index as usize] =
-        FailDescrSlot::Registered(reserved_finish_descr(exit_index, Some(descr)));
+    {
+        let mut exits = FINISH_EXITS.lock();
+        finish_exits_init(&mut exits);
+        exits[exit_index as usize] = Some(Arc::clone(&attached));
+    }
+    vec[exit_index as usize] = FailDescrSlot::Registered(attached);
 }
 
 /// Whether the cpu has been handed `exit_frame_with_exception_descr_ref`.
@@ -777,13 +814,7 @@ pub fn attach_finish_descr(exit_index: u32, descr: DescrRef) {
 /// plain finish, which would hand the raised value back as the loop's result
 /// instead of raising it, so the emitter has to know which of the two it has.
 pub fn exit_frame_with_exception_attached() -> bool {
-    let mut reg = FAIL_DESCR_REGISTRY.lock();
-    let vec = reg.get_or_insert_with(Default::default);
-    reserve_finish_exit_block(vec);
-    matches!(
-        &vec[FINISH_EXIT_INDEX_EXC as usize],
-        FailDescrSlot::Registered(reserved) if reserved.meta_descr.is_some()
-    )
+    finish_exit(FINISH_EXIT_INDEX_EXC).meta_descr.is_some()
 }
 
 /// Stable, guest-memory dispatch entries, keyed by CALL_ASSEMBLER token.
@@ -1092,13 +1123,50 @@ enum FailDescrSlot {
     Registered(Arc<WasmFailDescr>),
 }
 
-/// Serializes tests that claim a [`fail_descr_base`] and later
-/// [`register_fail_descrs`]. The wasm host never interleaves those two
-/// calls; cargo's parallel unit-test runner does. Held by this module's
-/// reserved-exit and parallel-reserve tests and by every `compile_loop`
-/// unit test in `lib.rs`.
+/// Serializes tests that mutate cpu-global tables (fail-descr registry,
+/// finish singletons, GC box, label targets). The wasm host never
+/// interleaves those; cargo's parallel unit-test runner does. Held by
+/// every lib test in this crate.
 #[cfg(test)]
 pub static FAIL_DESCR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Acquires [`FAIL_DESCR_TEST_LOCK`] and clears this thread's GC box and
+/// shadow stack *before* releasing it. Fields drop last-to-first, so
+/// `_cleanup` is declared after `_lock`. cargo joins the test thread
+/// after the function returns; TLS dtors then race the next test. The
+/// cpu must be quiet first (`cpu.gc_ll_descr` / shadowstack die with
+/// the frame).
+#[cfg(test)]
+pub fn lock_cpu() -> CpuTestGuard {
+    CpuTestGuard {
+        _lock: FAIL_DESCR_TEST_LOCK.lock(),
+        _cleanup: CpuTestCleanup,
+    }
+}
+
+#[cfg(test)]
+struct CpuTestCleanup;
+
+#[cfg(test)]
+impl Drop for CpuTestCleanup {
+    fn drop(&mut self) {
+        // Under the cpu lock, before the harness joins this worker.
+        // cargo releases the test function then runs TLS dtors
+        // concurrently with the next test; leftover jf roots and the
+        // TLS GC box must already be gone (`cpu.gc_ll_descr` dies with
+        // the frame, `GcRootMap_shadowstack` is per-thread and empty
+        // at detach).
+        crate::gc_box::clear();
+        majit_gc::shadow_stack::clear();
+        crate::clear_pending_inlines_for_tests();
+    }
+}
+
+#[cfg(test)]
+pub struct CpuTestGuard {
+    _lock: parking_lot::MutexGuard<'static, ()>,
+    _cleanup: CpuTestCleanup,
+}
 
 /// Global `frame[0]` fail-index space.
 ///
@@ -1145,6 +1213,11 @@ pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
     let vec = reg.get_or_insert_with(Default::default);
     reserve_finish_exit_block(vec);
     for d in descrs {
+        assert!(
+            d.fail_index >= FINISH_EXIT_INDEX_COUNT,
+            "trace fail_index {} collides with the reserved finish block",
+            d.fail_index
+        );
         let slot = vec
             .get_mut(d.fail_index as usize)
             .expect("fail descr registered without reserving its global fail_index");
@@ -1158,6 +1231,9 @@ pub fn register_fail_descrs(descrs: &[Arc<WasmFailDescr>]) {
 
 /// Resolve a `frame[0]` value through the global fail-index space.
 pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
+    if fail_index < FINISH_EXIT_INDEX_COUNT {
+        return Some(finish_exit(fail_index));
+    }
     FAIL_DESCR_REGISTRY
         .lock()
         .as_ref()
