@@ -1439,8 +1439,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 // `getservbyport` rejects a port outside the range before it
                 // narrows: taking the low sixteen bits of 70000 would look up
-                // 4464 and answer for it.
-                let port = unsafe { pyre_object::w_int_get_value(args[0]) };
+                // 4464 and answer for it.  The clinic spells the parameter
+                // `int port`, so an argument that is not one owes a TypeError
+                // rather than reading its first word as the port.
+                let port = crate::baseobjspace::gateway_int_w(args[0])?;
                 if !(0..=0xffff).contains(&port) {
                     return Err(crate::PyError::overflow_error(
                         "getservbyport: port must be 0-65535.",
@@ -2908,9 +2910,20 @@ pub(crate) fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, c
     if rffi::is_invalid(fd) {
         // `close` leaves `self.fd = INVALID_SOCKET` (`rsocket.py RSocket.close`)
         // and the operations run the syscall on it anyway, so what a closed
-        // socket reports is the kernel's `EBADF` in its `(errno, strerror)`
-        // form.  This check stands in for that call and owes the same error —
-        // callers read `.errno` to tell a closed socket from a failed one.
+        // socket reports is whatever the host answers for that descriptor.
+        // This check stands in for that call and owes the same error — callers
+        // read `.errno` to tell a closed socket from a failed one.
+        //
+        // WinSock answers `WSAENOTSOCK` rather than the kernel's `EBADF`, and
+        // `set_error` carries a WinSock code in `.winerror` the way every other
+        // socket failure here does.
+        #[cfg(windows)]
+        return Err(crate::PyError::os_error_win32_syscall2(
+            rffi::WSAENOTSOCK,
+            pyre_object::PY_NULL,
+            pyre_object::PY_NULL,
+        ));
+        #[cfg(not(windows))]
         return Err(crate::PyError::os_error_syscall(
             libc::EBADF,
             pyre_object::PY_NULL,
