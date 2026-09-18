@@ -5662,6 +5662,21 @@ fn loopinvariant_now_known<Sym: WalkSym>(
         .call_loopinvariant_now_known(descr_key, arg0_int, result, 0);
 }
 
+fn walk_body_has_exception_handler<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &[u8],
+) -> bool {
+    let jitcode_index = if ctx.is_top_level {
+        ctx.session.borrow().recording_jitcode_index
+    } else {
+        ctx.inline_callee_consts
+            .map_or(-1, |consts| consts.jitcode_index)
+    };
+    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
+        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+    })
+}
+
 /// Resolve a residual-call funcptr OpRef to the concrete function
 /// pointer integer that RPython's heapcache keys on
 /// (`heapcache.py` calls `allboxes[0].getint()`).
@@ -10771,15 +10786,20 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
         return Ok(());
     }
-    // Do not skip the pin for a ConstPtr whose live `w_class` already
-    // matches. Interned ints and `co_consts` boxes are exact builtins,
-    // but `inline_call` also hands a descriptor ConstPtr through here.
-    // That instance can have `__class__` reassigned; without
-    // `walker_pin_instance_w_class` no `QuasiimmutField` watcher is
-    // installed, so `notify_w_class_mutated_then` cannot invalidate
-    // the compiled loop. The pin records the watcher; OptHeap then
-    // folds the ConstPtr getfield the way `optimize_GETFIELD` does
-    // after `QUASIIMMUT_FIELD`.
+    // A ConstPtr interned / co_consts / builtin-method box already is the
+    // exact builtin. Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every
+    // iteration doubled `list_ops` guard failures. Heap instances handed
+    // through `inline_call` can have `__class__` reassigned; those are not
+    // `is_constant()` interned boxes with a matching live `w_class`.
+    if obj.is_constant()
+        && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
+        && !concrete.is_null()
+        && !(pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete))
+        && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
+    {
+        return Ok(());
+    }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,
     // `is_plain_int1`, [`walker_exact_builtin_class`] — treats a null `w_class` as a
     // second spelling of "exact builtin", while the guard below reads the slot and
