@@ -1193,10 +1193,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `_hashlib`'s per-object digest/HMAC contexts follow their Python
-        // owners and have sweep-time native-state destructors in build_gc.
-        subclass_range_alias(164, typed::<crate::module::_hashlib::W_HashState>()),
-        subclass_range_alias(165, typed::<crate::module::_hashlib::W_Hmac>()),
+        // `_hashlib` aliases 164-165 live on the optional-module hook.
         // `gc.GcRef` keeps its raw referent as a traced wrapper field.
         // referent field is traced on the wrapper itself, as in
         // `pypy/module/gc/referents.py`.

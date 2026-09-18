@@ -665,7 +665,7 @@ fn pop_value_keeps_its_unfused_materialisation() {
 fn wrap_new_always_err_ok_payload_is_result_fieldread() {
     for (name, expected_idx) in [
         (
-            "pyre_interpreter::module::_hashlib::hash_state_class::__majit_wrap___new__",
+            "pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__",
             79usize,
         ),
         (

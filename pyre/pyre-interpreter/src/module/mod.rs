@@ -28,8 +28,6 @@ pub mod _contextvars;
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
-#[allow(non_snake_case)]
-pub mod _hashlib;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;

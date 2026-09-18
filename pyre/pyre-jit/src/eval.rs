@@ -814,15 +814,13 @@ unsafe fn tokenizer_iter_destructor(obj_addr: usize) {
 
 unsafe fn hashlib_hash_state_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_hashlib::w_hash_state_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        );
+        pyre_module::module::_hashlib::w_hash_state_dealloc(obj_addr as pyre_object::PyObjectRef);
     }
 }
 
 unsafe fn hashlib_hmac_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_hashlib::w_hmac_dealloc(obj_addr as pyre_object::PyObjectRef);
+        pyre_module::module::_hashlib::w_hmac_dealloc(obj_addr as pyre_object::PyObjectRef);
     }
 }
 
@@ -4032,7 +4030,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let hashlib_hash_state_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_hashlib::W_HashState
+        <pyre_module::module::_hashlib::W_HashState
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     gc.types
@@ -4040,7 +4038,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     let hashlib_hmac_tid = register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::_hashlib::W_Hmac
+        <pyre_module::module::_hashlib::W_Hmac
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     gc.types
