@@ -5145,6 +5145,15 @@ pub fn finditem_str_named(
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
+        // `celldict.py ModuleDictStrategy.getitem_str`:
+        // `getdictvalue_no_unwrapping` + `unwrap_cell`.  No user `__eq__`,
+        // so the DictOperationGuard lock in `w_dict_getitem_str` is not
+        // load-bearing and would be an effect in front of the elidable
+        // `_getdictvalue_no_unwrapping_pure` walk.
+        let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(obj) };
+        if !strategy.is_null() {
+            return Ok(unsafe { (*strategy).getitem_str(obj, key) });
+        }
         let hash = named_key_hash(key, pycode, nameindex);
         return unsafe {
             pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash)
