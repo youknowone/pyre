@@ -9862,3 +9862,15 @@ mod set_member_lookup_tests {
         assert_eq!(field.index_in_parent(), 1);
     }
 }
+
+/// The one `EffectInfo` every `jit_ll_strconcat` calldescr is minted with:
+/// `rstr.py ll_strconcat` is `@jit.elidable` under `oopspec
+/// 'stroruni.concat(s1, s2)'`.  The `callinfocollection` row
+/// `resume.py concat_strings` reads and the calls the walker records have to
+/// name the same descr, so both spell the effect through here.
+pub fn ll_strconcat_effectinfo() -> majit_ir::EffectInfo {
+    majit_ir::EffectInfo::const_new(
+        majit_ir::ExtraEffect::ElidableOrMemoryError,
+        majit_ir::OopSpecIndex::StrConcat,
+    )
+}

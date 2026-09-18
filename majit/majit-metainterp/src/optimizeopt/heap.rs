@@ -3196,21 +3196,14 @@ impl OptHeap {
     ///     which sits after `string` and `earlyforce` in `ENABLE_ALL_OPTS`.  So
     ///     the jitcode alphabet does not bound these six.
     ///
-    /// Those six stay absent because the virtuals that would force them never
-    /// exist.  Nothing carries a `stroruni.*` oopspec — the attribute census is
-    /// thirteen `list.*` entries in `pyre-object/src/listobject.rs`, and the
-    /// programmatic `mark_oopspec` table registers only the `jit.*` builtins and
-    /// `newlist_clear` — so `_handle_stroruni_call` never fires and the
-    /// `opt_call_stroruni_*` handlers are unreachable.  The raw-buffer half now
-    /// has one carrier, `_cffi_backend::cdataobj::raw_malloc_varsize_char`, so
-    /// a build that includes that module can reach the virtual raw buffer;
-    /// wasm32, which excludes it, cannot.
-    ///
-    /// Annotating a string helper with
-    /// `#[majit_macros::oopspec("stroruni.concat")]` is what would make this
-    /// list start paying.  Until then, do not attribute a benchmark move to it:
-    /// a string concat+slice probe over 4000 iterations saw zero of the eleven
-    /// against a working positive control.
+    /// The string half has carriers: `rstr.py ll_strconcat`
+    /// (`pyre_object::lowlevel_string::jit_ll_strconcat`, `OS_STR_CONCAT`) and
+    /// `_ll_stringslice` (`stroruni.slice`), both over `rstr.STR` payloads, so
+    /// `opt_call_stroruni_*` and the vstring force paths are reachable.  The
+    /// raw-buffer half has one,
+    /// `_cffi_backend::cdataobj::raw_malloc_varsize_char`, so a build that
+    /// includes that module can reach the virtual raw buffer; wasm32, which
+    /// excludes it, cannot.
     fn has_no_heap_cache_effect(opcode: OpCode) -> bool {
         matches!(
             opcode,
@@ -3229,6 +3222,15 @@ impl OptHeap {
                 | OpCode::Copystrcontent
                 | OpCode::Copyunicodecontent
                 | OpCode::CheckMemoryError
+                // `rewrite.py gen_write_barrier` only creates this op after
+                // the optimizer has run, so `emitting_operation` has no arm
+                // for it.  The walker records it ahead of that (the list
+                // barrier), and it touches a header flag and the remembered
+                // set -- no field or item any cache here describes.  Falling
+                // through to the generic side-effect arm would force every
+                // lazy set and drop every cache once per `list.append`.
+                | OpCode::CondCallGcWb
+                | OpCode::CondCallGcWbArray
         )
     }
 

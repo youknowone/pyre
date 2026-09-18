@@ -11208,7 +11208,7 @@ pub(crate) fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // so the walker can descend it.  A subclass keeps `ob_type` at
     // `INT_TYPE` and may override `__str__`; `is_int` is too wide.
     if unsafe {
-        std::ptr::eq((*obj).ob_type, &pyre_object::INT_TYPE)
+        pyre_object::py_type_check(obj, &pyre_object::INT_TYPE)
             && pyre_object::is_exact_builtin_instance(obj)
     } {
         return Ok(unsafe { pyre_object::descr_str(obj) });

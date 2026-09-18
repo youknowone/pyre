@@ -8605,10 +8605,19 @@ impl<'a> Assembler386<'a> {
                  consider_load_effective_address, got {other:?}"
             ),
         };
+        // `make_sure_var_in_reg` hands a constant back as an immediate, and
+        // `addr_add` takes an `ImmedLoc` base; the scratch register is never
+        // allocated, so it cannot alias `dst` or the index.
         let base_reg = match base {
             Loc::Reg(r) if !r.is_xmm => r.value,
+            Loc::Immed(i) => {
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                let imm = i.value;
+                dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD imm);
+                scratch
+            }
             other => panic!(
-                "LoadEffectiveAddress base must be Loc::Reg after \
+                "LoadEffectiveAddress base must be Loc::Reg or Loc::Immed after \
                  consider_load_effective_address, got {other:?}"
             ),
         };

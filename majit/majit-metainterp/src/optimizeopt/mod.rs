@@ -996,25 +996,6 @@ pub struct ImportedShortAlias {
 /// allocated memory. The optimizer writes field values directly.
 pub type ConstantFoldAllocFn = Box<dyn Fn(usize) -> majit_ir::GcRef>;
 
-/// Raw `alloc_zeroed` stand-in for `optimizer.py` constant_fold.
-/// Not installed: the block has no GC header or type id, and the
-/// fold writer only copies Int/Ref fields.  Keep the helper so a
-/// GC-backed allocator can replace the body without rewiring call
-/// sites.
-#[allow(dead_code)]
-pub fn leak_constant_fold_alloc() -> ConstantFoldAllocFn {
-    Box::new(|size_bytes: usize| {
-        let layout = std::alloc::Layout::from_size_align(size_bytes, 8)
-            .unwrap_or(std::alloc::Layout::new::<u8>());
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            majit_ir::GcRef::NULL
-        } else {
-            majit_ir::GcRef(ptr as usize)
-        }
-    })
-}
-
 /// Re-export of `info::StringLengthResolver` for callers that import
 /// `optimizeopt::StringLengthResolver`. The runtime hook signature is
 /// `Arc<dyn Fn(GcRef, u8) -> Option<i64> + Send + Sync>`. See

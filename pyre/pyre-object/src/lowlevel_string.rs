@@ -215,27 +215,23 @@ pub extern "C" fn jit_ll_strconcat(s1: i64, s2: i64) -> i64 {
     if s1 == 0 || s2 == 0 {
         return 0;
     }
-    // Nursery operands can move during `bh_alloc_lowlevel_string`.
-    // Pin both, then reload the slots after the allocation — the same
-    // bracket `w_str_from_storage_and_length` uses.
-    let _roots = crate::gc_roots::push_roots();
-    let s1_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(s1 as crate::PyObjectRef);
-    let s2_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(s2 as crate::PyObjectRef);
-    let s1 = crate::gc_roots::shadow_stack_get(s1_slot) as i64;
-    let s2 = crate::gc_roots::shadow_stack_get(s2_slot) as i64;
     let n1 = bh_lowlevel_string_len(s1);
     let n2 = bh_lowlevel_string_len(s2);
-    let Some(total) = n1.checked_add(n2) else {
-        return 0;
-    };
+    // "a single '+' like this is allowed to overflow: it gets a negative
+    // result, and the gc will complain" -- MemoryError upstream.  A null
+    // payload handed back instead would be wrapped into a `str` whose `len`
+    // disagrees with its storage; abort loudly as `rbuilder` does until
+    // MemoryError propagation is ported.
+    let total = n1
+        .checked_add(n2)
+        .expect("ll_strconcat length overflow; MemoryError propagation is not ported yet");
+    // `bh_alloc_lowlevel_string` does not collect, so the operands read
+    // above are still where they were.
     let out = bh_alloc_lowlevel_string(total, LOWLEVEL_STR_BASE_SIZE, 1);
-    if out == 0 {
-        return 0;
-    }
-    let s1 = crate::gc_roots::shadow_stack_get(s1_slot) as i64;
-    let s2 = crate::gc_roots::shadow_stack_get(s2_slot) as i64;
+    assert!(
+        out != 0,
+        "ll_strconcat failed to allocate {total} bytes; MemoryError propagation is not ported yet"
+    );
     unsafe {
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         std::ptr::copy_nonoverlapping((s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), dst, n1);
@@ -319,9 +315,11 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> i64 {
     let text = val.to_string();
     let bytes = text.as_bytes();
     let out = bh_alloc_lowlevel_string(bytes.len(), LOWLEVEL_STR_BASE_SIZE, 1);
-    if out == 0 {
-        return 0;
-    }
+    // `descr_str` wraps the payload unchecked, as `ll_strconcat`'s callers do.
+    assert!(
+        out != 0,
+        "ll_int2dec failed to allocate; MemoryError propagation is not ported yet"
+    );
     unsafe {
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());

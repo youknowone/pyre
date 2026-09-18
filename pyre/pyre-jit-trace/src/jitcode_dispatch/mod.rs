@@ -7730,31 +7730,6 @@ impl Drop for ExceptionStringInlineGuard {
     }
 }
 
-pub(crate) fn format_inline_constructs_str_active_for(w_code: *const ()) -> bool {
-    FORMAT_INLINE_CONSTRUCTS_STR.with(|c| c.get() == Some(w_code as usize))
-}
-
-pub(crate) struct FormatInlineConstructsStrGuard {
-    prior: Option<usize>,
-}
-
-impl FormatInlineConstructsStrGuard {
-    fn enter(w_code: *const ()) -> Self {
-        let prior = FORMAT_INLINE_CONSTRUCTS_STR.with(|c| {
-            let prior = c.get();
-            c.set(Some(w_code as usize));
-            prior
-        });
-        Self { prior }
-    }
-}
-
-impl Drop for FormatInlineConstructsStrGuard {
-    fn drop(&mut self) {
-        FORMAT_INLINE_CONSTRUCTS_STR.with(|c| c.set(self.prior));
-    }
-}
-
 /// # Safety
 /// `data` must come from [`capture_fbw_store_journal_root_area`], and the
 /// owning thread must be quiesced.

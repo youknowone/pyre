@@ -183,9 +183,11 @@ pub(crate) fn default_jitdriver_receiver_roots() -> Vec<String> {
 }
 
 /// The [`GraphTransformConfig::str_concat_helper`] default: pyre's own, in
-/// `pyre_object::unicodeobject`, whose address `jit_fnaddr.rs` binds.
+/// `pyre_object::lowlevel_string`, whose address `jit_fnaddr.rs` binds.  It
+/// is the `ll_strconcat` port over `rstr.STR` payloads, the operand type
+/// `OS_STR_CONCAT` promises the optimizer.
 fn default_str_concat_helper() -> String {
-    "jit_str_concat".to_string()
+    "jit_ll_strconcat".to_string()
 }
 
 /// The [`GraphTransformConfig::int_str_helper`] default, on the same terms.
@@ -3182,8 +3184,8 @@ impl<'a> Transformer<'a> {
             // lowers `s1 + s2` to a residual call to the concat helper.
             // Pyre's front-end emits a unified `BinOp { op: "add" }`
             // (Rust `+` is one AST node); over two Ref (string) operands
-            // this lowers to the registered `jit_str_concat` host extern
-            // (`pyre_object::unicodeobject`, address in `jit_fnaddr.rs`,
+            // this lowers to the registered `jit_ll_strconcat` host extern
+            // (`pyre_object::lowlevel_string`, address in `jit_fnaddr.rs`,
             // descriptor `OopSpecIndex::StrConcat` in
             // `STR_CONCAT_TARGETS`), assembling to the wired
             // `residual_call_r_r/iRd>r`.  Without this the op falls
@@ -10225,11 +10227,13 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
         return StrOrUniKind::Other;
     };
     match s._name.as_str() {
-        // `rstr.py STR` plus the Rust spellings bookkeeper maps to it
-        // (`Utf8Str` is `W_UnicodeObject._utf8`).
-        "rpy_string" | "Utf8Str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "String" => {
-            StrOrUniKind::Str
-        }
+        // `Utf8Str` is `W_UnicodeObject._utf8` and carries the `rstr.py STR`
+        // layout (hash, length, chars) field for field.  The other Rust
+        // spellings the bookkeeper annotates as `SomeString` do not --
+        // `BytesBlock` has no hash word and `String` / `Wtf8Buf` are
+        // Vec-shaped -- so a `stroruni.*` oopspec on them would be lowered
+        // with STR offsets they do not have.
+        "rpy_string" | "Utf8Str" => StrOrUniKind::Str,
         "rpy_unicode" => StrOrUniKind::Unicode,
         "rpy_bytearray" => StrOrUniKind::ByteArray,
         _ => StrOrUniKind::Other,

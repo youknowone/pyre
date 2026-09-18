@@ -5670,10 +5670,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
         let descr = majit_metainterp::make_call_descr_with_effect(
             &[majit_ir::Type::Ref, majit_ir::Type::Ref],
             majit_ir::Type::Ref,
-            majit_ir::EffectInfo::const_new(
-                majit_ir::ExtraEffect::ElidableOrMemoryError,
-                majit_ir::OopSpecIndex::StrConcat,
-            ),
+            pyre_jit_trace::descr::ll_strconcat_effectinfo(),
         );
         d.meta_interp_mut().ensure_oopspec_callinfo(
             majit_ir::OopSpecIndex::StrConcat,

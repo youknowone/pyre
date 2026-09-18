@@ -121,4 +121,22 @@ class WideFmt(int):
 
 assert format(WideFmt(1 << 100), "") == "X"
 
+
+# A nested `{spec}` is a box, not a constant.  An empty spec takes the
+# FORMAT_SIMPLE rendering, and a loop compiled on it must leave for the
+# residual when a later iteration hands in a width.
+def nested_spec_loop(values, specs):
+    acc = []
+    i = 0
+    while i < len(values):
+        acc.append(f"{values[i]:{specs[i]}}")
+        i = i + 1
+    return acc
+
+
+empty_then_wide = [""] * 300 + [">5"]
+assert nested_spec_loop([7] * 301, empty_then_wide)[-1] == "    7"
+assert nested_spec_loop(["ab"] * 301, empty_then_wide)[-1] == "   ab"
+assert nested_spec_loop([7] * 301, empty_then_wide)[0] == "7"
+
 print("OK")

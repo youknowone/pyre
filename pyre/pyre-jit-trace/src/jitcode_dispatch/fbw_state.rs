@@ -2553,14 +2553,6 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// `try_walker_inline_format` for a `__format__` that builds a string
-    /// (`"<" + spec + ">"`).  The entry is not a CALL, so
-    /// `entry_is_call_boundary` stays false (a non-str result must decline
-    /// to `descroperation.py format`'s TypeError residual).  The body is
-    /// still `get_and_call_function`, and this flag lets the DeferredCall
-    /// gate admit it.
-    pub(crate) static FORMAT_INLINE_CONSTRUCTS_STR: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
     /// Code keys of the callees [`fbw_decline_inline_callee`] named.  The
     /// inline callsite declines them from then on, so the call residualizes
     /// and the enclosing trace never re-enters the identical abort.

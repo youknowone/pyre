@@ -1346,16 +1346,19 @@ pub extern "C" fn jit_str_concat(a: i64, b: i64) -> i64 {
 /// The wrapper is allocated here because wrap stays residual; the walker
 /// records this fused helper `CanRaise` so two `s * n` sites do not CSE
 /// (`descr_mul` / `is_w`).  `ovfcheck(len * times)` is MemoryError
-/// upstream; a later huge `times` must not hang on `"" * n` or panic
-/// in `with_capacity`.
+/// upstream.  A null handed back with no exception set would pass the
+/// `GuardNoException` that follows the call and store a null ref, so the
+/// overflow aborts until MemoryError propagation is ported; `"" * n` does
+/// not loop.
 pub extern "C" fn jit_str_repeat(s: i64, n: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe {
         let sv = w_str_get_wtf8(s);
         let count = if n < 0 { 0 } else { n as usize };
-        let Some(cap) = sv.len().checked_mul(count) else {
-            return PY_NULL as i64;
-        };
+        let cap = sv
+            .len()
+            .checked_mul(count)
+            .expect("ll_str_mul length overflow; MemoryError propagation is not ported yet");
         let mut result = Wtf8Buf::with_capacity(cap);
         if !sv.is_empty() {
             for _ in 0..count {
@@ -1599,7 +1602,10 @@ pub extern "C" fn jit_str_slice(s: i64, start: i64, end: i64) -> i64 {
     let s = s as PyObjectRef;
     unsafe {
         let Some((lo, hi)) = str_byte_window(s, start, end) else {
-            return w_str_new("") as i64;
+            // `_empty()`.  `w_str_new` is the immortal constructor: from a
+            // residual call it would leave one unreclaimable header and
+            // payload behind per `s[5:2]`.
+            return w_str_new_managed("") as i64;
         };
         let hay = w_str_get_wtf8(s);
         let part = rustpython_wtf8::Wtf8::from_bytes(&hay.as_bytes()[lo..hi])
@@ -1619,7 +1625,13 @@ pub extern "C" fn jit_str_count_bounds(s: i64, sub: i64, start: i64, end: i64) -
         let hay = w_str_get_wtf8(s).as_bytes();
         let needle = w_str_get_wtf8(sub).as_bytes();
         if needle.is_empty() {
-            return w_str_byte_to_index(s, hi) as i64 - w_str_byte_to_index(s, lo) as i64 + 1;
+            // `descr_count`: the whole-string window is `_len() + 1`, and any
+            // other counts the code points between the two byte bounds
+            // rather than paying `_byte_to_index` twice.
+            if lo == 0 && hi == hay.len() {
+                return w_str_len(s) as i64 + 1;
+            }
+            return w_str_codepoints_in_utf8(s, lo, hi) as i64 + 1;
         }
         let mut count = 0i64;
         let mut pos = lo;

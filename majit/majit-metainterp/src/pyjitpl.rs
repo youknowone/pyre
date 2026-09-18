@@ -5199,11 +5199,14 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or_default();
         cic.add(oopspec, calldescr.clone(), func_addr);
         cic.register_func_name(func_addr, name.to_string());
-        if let Some(sd) = std::sync::Arc::get_mut(&mut self.staticdata) {
-            sd.callinfocollection.add(oopspec, calldescr, func_addr);
-            sd.callinfocollection
-                .register_func_name(func_addr, name.to_string());
-        }
+        // One table upstream: a staticdata Arc already shared here would
+        // leave `staticdata.callinfocollection` without the row the
+        // per-MetaInterp copy has, and nothing downstream could tell.
+        let sd = std::sync::Arc::get_mut(&mut self.staticdata)
+            .expect("ensure_oopspec_callinfo must run before staticdata is shared");
+        sd.callinfocollection.add(oopspec, calldescr, func_addr);
+        sd.callinfocollection
+            .register_func_name(func_addr, name.to_string());
         self.callinfocollection = Some(std::sync::Arc::new(cic));
     }
 
@@ -5486,11 +5489,10 @@ impl<M: Clone> MetaInterp<M> {
         opt.cpu = self.cpu.clone();
         opt.set_pureop_historylength(self.warm_state.pureop_historylength() as usize);
         opt.set_vrefinfo(self.virtualref_info().clone());
-        // Do not install `leak_constant_fold_alloc`: it returns a raw
-        // `alloc_zeroed` block with no GC header or type id, and the
-        // fold writer only copies Int/Ref fields.  `force_box` then
-        // leaves `constant_fold_alloc` unset and materializes via
-        // SETFIELD (`info.py` fallback).
+        // `constant_fold_alloc` stays unset until it can be `cpu.bh_new*`
+        // (`optimizer.py constant_fold` -> `execute_nonspec_const`), which
+        // yields a block with a GC header and type id.  `force_box` then
+        // materializes via SETFIELD (`info.py` fallback).
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();

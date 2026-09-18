@@ -526,36 +526,29 @@ pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyOb
 /// Message word of a fused `PyError::<kind>(msg)` raise
 /// (`front/result_exc.rs` `fuse_kind_ctor_raise`).
 ///
-/// The front rule keeps the constructor's single argument.  A Python `str`
-/// constant is a `W_UnicodeObject` (`box_str_constant`).  After Unicode
-/// payloads moved to rstr `STR`, a rust `&str` literal in a small
-/// look-inside body (`float_truediv`) is the one-word `STR` payload
-/// (hash @0, len @8, chars @16) instead — `w_str_get_wtf8` would then
-/// read those header words as a `W_UnicodeObject`.  `is_str` is a
-/// pointer compare on `ob_type` and is false for a `STR`.
-fn fused_raise_message(w_msg: *mut pyre_object::PyObject) -> Wtf8Buf {
+/// The front rule fires only where the message resolves to a string literal,
+/// and a literal's one-word `r` constant is `Ptr(STR)`
+/// (`rstr.py StringRepr.convert_const`) -- the payload `oefmt` takes before
+/// `space.newtext(msg)`, never a `W_UnicodeObject`.
+fn fused_raise_message(msg: *mut pyre_object::PyObject) -> Wtf8Buf {
     unsafe {
-        if !w_msg.is_null() && pyre_object::is_str(w_msg) {
-            return pyre_object::unicodeobject::w_str_get_wtf8(w_msg).to_owned();
-        }
+        debug_assert!(
+            !msg.is_null() && !pyre_object::is_str(msg),
+            "fused raise message must be a STR payload, not a W_UnicodeObject"
+        );
         pyre_object::unicodeobject::utf8_payload_wtf8(
-            w_msg as *mut pyre_object::unicodeobject::UnicodeValueStorage,
+            msg as *mut pyre_object::unicodeobject::UnicodeValueStorage,
         )
         .to_owned()
     }
 }
 
-/// `w_msg` is the message *object*, not a `&str`: the JIT models a Rust
-/// string constant as a single `W_UnicodeObject` word, while `&str` is a
-/// two-word aggregate with no one-word residual-call ABI — the reason
-/// `stack_underflow_error` stays unpublished (`jit_fnaddr.rs`). The front
-/// rule only fires where the message resolves to a string literal, which is
-/// what makes that word a `box_str_constant` object.  A rust `&str` that
-/// still arrives as the rodata word is recovered by
-/// [`fused_raise_message`].
+/// `w_msg` is the message word, not a `&str`: `&str` is a two-word aggregate
+/// with no one-word residual-call ABI -- the reason `stack_underflow_error`
+/// stays unpublished (`jit_fnaddr.rs`).
 ///
 /// # Safety
-/// `w_msg` is a live `W_UnicodeObject` or an rstr `STR` payload.
+/// `w_msg` is a live rstr `STR` payload.
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_type_error_to_exc_object(
     w_msg: *mut pyre_object::PyObject,
@@ -572,7 +565,7 @@ pub unsafe fn pyerror_type_error_to_exc_object(
 /// `W_BaseException` value that PyPy's `OperationError` path exposes.
 ///
 /// # Safety
-/// `w_msg` is a live `W_UnicodeObject` or an rstr `STR` payload.
+/// `w_msg` is a live rstr `STR` payload.
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_zero_division_to_exc_object(
     w_msg: *mut pyre_object::PyObject,

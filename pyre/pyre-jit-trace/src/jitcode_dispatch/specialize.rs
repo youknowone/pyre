@@ -17713,6 +17713,15 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
         int_type_addr,
         crate::descr::int_intval_descr(),
     )?;
+    // Decided before the call is recorded: declining after it would leave
+    // the payload allocation in the trace ahead of the residual.
+    let pad_sign_value = match pad {
+        Some(_) => match ctx.trace_ctx.box_value(int_raw) {
+            Some(majit_ir::Value::Int(int_value)) => Some(int_value),
+            _ => return Ok(None),
+        },
+        None => None,
+    };
     let helper = pyre_object::lowlevel_string::jit_ll_int2dec as *const ();
     // Non-elidable: two `str(i)` / `format(i)` sites must not CSE the
     // payload.  `is_w` of `_len() > 1` compares `_utf8` storage.
@@ -17730,10 +17739,7 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
     // A pad is taken from one sign.  `format(-42, "05d")` is
     // `"-0042"` while `format(42, "05d")` is `"00042"`; pin the
     // recorded sign so the other deopts to the residual.
-    if pad.is_some() {
-        let Some(majit_ir::Value::Int(int_value)) = ctx.trace_ctx.box_value(int_raw) else {
-            return Ok(None);
-        };
+    if let Some(int_value) = pad_sign_value {
         let zero = ctx.trace_ctx.const_int(0);
         let is_neg = ctx.trace_ctx.record_op(OpCode::IntLt, &[int_raw, zero]);
         if int_value < 0 {
@@ -17749,13 +17755,11 @@ fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
     // `ll_int2dec` yields the unpadded decimal.  With a pad the
     // formatted wrapper's `_utf8` is the concat, so the payload
     // concrete has to be a fresh unpadded storage.
-    let unpadded = if pad.is_some() {
-        let Some(majit_ir::Value::Int(int_value)) = ctx.trace_ctx.box_value(int_raw) else {
-            return Ok(None);
-        };
-        pyre_object::w_str_new(&pyre_object::unicodeobject::int_str_text(int_value))
-    } else {
-        boxed_result
+    let unpadded = match pad_sign_value {
+        Some(int_value) => {
+            pyre_object::w_str_new(&pyre_object::unicodeobject::int_str_text(int_value))
+        }
+        None => boxed_result,
     };
     let storage = unsafe { pyre_object::unicodeobject::w_str_storage(unpadded) };
     ctx.trace_ctx.set_opref_concrete(
@@ -17822,10 +17826,7 @@ fn walker_wrap_int_str_payload<Sym: WalkSym>(
                 &args,
                 &[majit_ir::Type::Ref, majit_ir::Type::Ref],
                 majit_ir::Type::Ref,
-                majit_ir::EffectInfo::const_new(
-                    majit_ir::ExtraEffect::ElidableOrMemoryError,
-                    majit_ir::OopSpecIndex::StrConcat,
-                ),
+                crate::descr::ll_strconcat_effectinfo(),
             );
             let concat_storage = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
             ctx.trace_ctx.set_opref_concrete(
@@ -18219,9 +18220,32 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     let value = r_args[0];
     let spec = r_args[1];
     if spec_text.is_empty() {
-        // Empty spec is FORMAT_SIMPLE.  Do not pin the spec first: the
-        // simple arm may still decline (bool / subclass), and a guard
-        // emitted here would then sit in front of the generic residual.
+        // Empty spec is FORMAT_SIMPLE, but only for this spec: `_parse_spec`
+        // reads the live one on every call, and `f"{i:{w}}"` hands in a box
+        // that is `""` on one iteration and `">5"` on the next.  The simple
+        // arm guards the value's class alone, so the spec is pinned here.
+        // The arm's cheap declines (bool / subclass / long) are answered
+        // first so the guard does not land in front of the generic residual.
+        let simple_admits = unsafe {
+            pyre_object::is_exact_type(concrete, &pyre_object::STR_TYPE)
+                || (std::ptr::eq((*concrete).ob_type, &pyre_object::pyobject::INT_TYPE)
+                    && std::ptr::eq(
+                        (*concrete).w_class,
+                        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE),
+                    ))
+        };
+        if !simple_admits {
+            return Ok(None);
+        }
+        if !spec.is_constant() {
+            let spec_const = ctx.trace_ctx.const_ref(concrete_spec as i64);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op.pc,
+                OpCode::GuardValue,
+                &[spec, spec_const],
+            )?;
+        }
         return try_walker_specialize_format_simple(ctx, op, &r_args[..1], dst);
     }
     if !spec_is_decimal_int_format(spec_text) {
@@ -19206,6 +19230,15 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
         concretes.push(obj);
     }
 
+    // `pyopcode.py BUILD_STRING` always does `Utf8StringBuilder` +
+    // `space.newutf8(builder.build(), …)`, including `itemcount == 1`.
+    // Returning the fragment itself makes `f"{s}" is s` True for a
+    // one-piece BUILD_STRING; decline so the residual allocates --
+    // before any guard is emitted, so none is left ahead of it.
+    if fragments.len() == 1 {
+        return Ok(None);
+    }
+
     let boxed_result = pyre_interpreter::runtime_ops::build_string_from_refs(&concretes);
     if boxed_result.is_null()
         || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
@@ -19215,14 +19248,6 @@ pub(crate) fn try_walker_specialize_build_string<Sym: WalkSym>(
 
     for &frag in &fragments {
         walker_guard_exact_str(ctx, op_pc, frag)?;
-    }
-
-    // `pyopcode.py BUILD_STRING` always does `Utf8StringBuilder` +
-    // `space.newutf8(builder.build(), …)`, including `itemcount == 1`.
-    // Returning the fragment itself makes `f"{s}" is s` True for a
-    // one-piece BUILD_STRING; decline so the residual allocates.
-    if fragments.len() == 1 {
-        return Ok(None);
     }
 
     let mut acc = fragments[0];
@@ -25013,10 +25038,7 @@ fn emit_walker_descr_add<Sym: WalkSym>(
         &[lhs_utf8, rhs_utf8],
         &[majit_ir::Type::Ref, majit_ir::Type::Ref],
         majit_ir::Type::Ref,
-        majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::ElidableOrMemoryError,
-            majit_ir::OopSpecIndex::StrConcat,
-        ),
+        crate::descr::ll_strconcat_effectinfo(),
     );
     let payload = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
     ctx.trace_ctx.set_opref_concrete(
@@ -25144,17 +25166,37 @@ fn try_walker_specialize_str_mul<Sym: WalkSym>(
         .set_opref_concrete(gt1, majit_ir::Value::Int(1));
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt1])?;
 
-    // `ll_str_mul` `ovfcheck(len(s.chars) * times)`.  A later huge
-    // machine-int `times` must side-exit to the interpreter rather than
-    // panic in `with_capacity` or hang on `"" * n`.
-    let payload_len = unsafe { pyre_object::w_str_get_wtf8(str_obj).len() };
-    if payload_len > 0 {
-        let max_times = (isize::MAX as i64) / (payload_len as i64);
-        if times > max_times {
-            return Ok(None);
-        }
-        let max_op = ctx.trace_ctx.const_int(max_times);
-        let fits = ctx.trace_ctx.record_op(OpCode::IntLe, &[times_raw, max_op]);
+    // `ll_str_mul` `ovfcheck(len(s.chars) * times)`, on the live length: the
+    // receiver is pinned by class only, so a bound derived from the recorded
+    // string's length would let a longer one through.  The overflow arm
+    // side-exits to the interpreter, which raises.
+    let payload_len = unsafe { pyre_object::w_str_get_wtf8(str_obj).len() } as i64;
+    let Some(total) = payload_len.checked_mul(times) else {
+        return Ok(None);
+    };
+    if total > isize::MAX as i64 {
+        return Ok(None);
+    }
+    let byte_len = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        str_op,
+        crate::descr::unicode_byte_len_descr(),
+    );
+    let (total_op, overflow) = record_int_ovf(
+        ctx,
+        op_pc,
+        OpCode::IntMulOvf,
+        byte_len,
+        times_raw,
+        Some((payload_len, times)),
+    )?;
+    debug_assert!(!overflow, "checked_mul above decided this");
+    if !total_op.is_constant() {
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
+    }
+    if (isize::MAX as i64) < i64::MAX {
+        let max_op = ctx.trace_ctx.const_int(isize::MAX as i64);
+        let fits = ctx.trace_ctx.record_op(OpCode::IntLe, &[total_op, max_op]);
         ctx.trace_ctx
             .set_opref_concrete(fits, majit_ir::Value::Int(1));
         walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[fits])?;

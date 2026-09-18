@@ -3582,7 +3582,7 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
         // also matches a long.  Machine int is the storage `ob_type`.
         // A subclass keeps that `ob_type` and may override `__str__`.
         if unsafe {
-            std::ptr::eq((*val).ob_type, &pyre_object::INT_TYPE)
+            pyre_object::py_type_check(val, &pyre_object::INT_TYPE)
                 && pyre_object::is_exact_builtin_instance(val)
         } {
             // `format_int_or_long` empty spec is `space.str(w_num)` —
@@ -3590,7 +3590,7 @@ pub fn format_w(val: PyObjectRef, w_spec: PyObjectRef) -> Result<PyObjectRef, cr
             return Ok(unsafe { pyre_object::descr_str(val) });
         }
         if unsafe {
-            std::ptr::eq((*val).ob_type, &pyre_object::LONG_TYPE)
+            pyre_object::py_type_check(val, &pyre_object::LONG_TYPE)
                 && pyre_object::is_exact_builtin_instance(val)
         } {
             return Ok(pyre_object::w_str_from_wtf8_managed(unsafe {
