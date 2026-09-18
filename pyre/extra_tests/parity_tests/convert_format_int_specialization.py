@@ -139,4 +139,32 @@ assert nested_spec_loop([7] * 301, empty_then_wide)[-1] == "    7"
 assert nested_spec_loop(["ab"] * 301, empty_then_wide)[-1] == "   ab"
 assert nested_spec_loop([7] * 301, empty_then_wide)[0] == "7"
 
+
+# A pad is recorded from one value: the sign and the digit count that
+# produced it both have to be pinned, for every fill / align / sign spelling.
+def padded_loop(values, which):
+    acc = []
+    i = 0
+    while i < len(values):
+        x = values[i]
+        if which == 0:
+            acc.append(f"{x:+5d}")
+        elif which == 1:
+            acc.append(f"{x:5d}")
+        elif which == 2:
+            acc.append(f"{x:<5d}|")
+        elif which == 3:
+            acc.append(f"{x:05d}")
+        else:
+            acc.append(f"{x: d}")
+        i = i + 1
+    return acc[-3:]
+
+
+assert padded_loop([-1] * 300 + [1, 12, 0], 0) == ["   +1", "  +12", "   +0"]
+assert padded_loop([1] * 300 + [12, -1, 1234567], 1) == ["   12", "   -1", "1234567"]
+assert padded_loop([123] * 300 + [-5, 7, 0], 2) == ["-5   |", "7    |", "0    |"]
+assert padded_loop([-1] * 300 + [1, 12, -123456], 3) == ["00001", "00012", "-123456"]
+assert padded_loop([-1] * 300 + [1, 12, 0], 4) == [" 1", " 12", " 0"]
+
 print("OK")
