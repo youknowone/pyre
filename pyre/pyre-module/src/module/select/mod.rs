@@ -11,4 +11,4 @@ pub mod interp_kevent;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 pub mod interp_kqueue;
 
-crate::pyre_module_init!(interp_select);
+pyre_interpreter::pyre_module_init!(interp_select);

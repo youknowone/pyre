@@ -18,7 +18,7 @@ use pyre_object::PyObjectRef;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 // CPython 3.14 Modules/selectmodule.c:select_exec creates
 // kqueue_event_Type_spec as a mutable module heap type.
-#[crate::pyre_class("select.kevent", cpython_mutable)]
+#[pyre_interpreter::pyre_class("select.kevent", cpython_mutable)]
 #[derive(Default)]
 pub struct W_Kevent {
     pub ident: u64,
@@ -118,7 +118,7 @@ impl W_Kevent {
 }
 
 #[cfg(all(target_os = "macos", feature = "host_env"))]
-#[crate::pyre_methods(
+#[pyre_interpreter::pyre_methods(
     doc = "kevent(ident, filter=KQ_FILTER_READ, flags=KQ_EV_ADD, fflags=0, data=0, udata=0)"
 )]
 impl W_Kevent {
@@ -135,17 +135,17 @@ impl W_Kevent {
         #[default(pyre_object::w_int_new(0))] w_fflags: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] w_data: PyObjectRef,
         #[default(pyre_object::w_int_new(0))] w_udata: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<(), pyre_interpreter::PyError> {
         let ident: u64 = if unsafe { pyre_object::is_int(w_ident) } {
-            crate::baseobjspace::uint_w(w_ident)?
+            pyre_interpreter::baseobjspace::uint_w(w_ident)?
         } else {
             filedescriptor_w(w_ident)? as u64
         };
-        let filter = crate::baseobjspace::int_w(w_filter)?;
-        let flags = crate::baseobjspace::c_uint_w(w_flags)?;
-        let fflags = crate::baseobjspace::c_uint_w(w_fflags)?;
-        let data = crate::baseobjspace::int_w(w_data)?;
-        let udata = crate::baseobjspace::uint_w(w_udata)?;
+        let filter = pyre_interpreter::baseobjspace::int_w(w_filter)?;
+        let flags = pyre_interpreter::baseobjspace::c_uint_w(w_flags)?;
+        let fflags = pyre_interpreter::baseobjspace::c_uint_w(w_fflags)?;
+        let data = pyre_interpreter::baseobjspace::int_w(w_data)?;
+        let udata = pyre_interpreter::baseobjspace::uint_w(w_udata)?;
         self.ident = ident;
         self.filter = filter as i16;
         self.flags = flags as u16;

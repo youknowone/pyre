@@ -82,6 +82,8 @@ pub mod pwd;
 pub mod pyexpat;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;
+#[cfg(not(feature = "sandbox"))]
+pub mod select;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
