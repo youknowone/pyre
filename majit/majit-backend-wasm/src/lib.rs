@@ -1306,6 +1306,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         wasm_alloc_nursery_collecting_typed_rooted,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_roots(Some(
+        wasm_alloc_nursery_collecting_typed_roots,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
     majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
@@ -1777,6 +1780,25 @@ unsafe fn wasm_alloc_nursery_collecting_typed_rooted(
 ) -> GcRef {
     with_wasm_active_gc_mut(|gc| unsafe {
         gc.alloc_nursery_collecting_typed_rooted(type_id, size, root, needs_write_barrier)
+    })
+    .unwrap_or(GcRef(0))
+}
+
+unsafe fn wasm_alloc_nursery_collecting_typed_roots(
+    type_id: u32,
+    size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    with_wasm_active_gc_mut(|gc| unsafe {
+        gc.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
     })
     .unwrap_or(GcRef(0))
 }

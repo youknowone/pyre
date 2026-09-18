@@ -387,6 +387,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_alloc_nursery_collecting_typed_rooted(Some(
         dynasm_alloc_nursery_collecting_typed_rooted,
     ));
+    majit_gc::set_active_alloc_nursery_collecting_typed_roots(Some(
+        dynasm_alloc_nursery_collecting_typed_roots,
+    ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
     majit_gc::set_active_collect_generation(Some(dynasm_collect_generation));
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
@@ -702,6 +705,35 @@ unsafe fn dynasm_alloc_nursery_collecting_typed_rooted(
             type_id,
             size,
             root,
+            needs_write_barrier,
+        )
+    }
+}
+
+unsafe fn dynasm_alloc_nursery_collecting_typed_roots(
+    type_id: u32,
+    size: usize,
+    roots: *mut GcRef,
+    root_count: usize,
+    needs_write_barrier: *mut bool,
+) -> GcRef {
+    if let Some(r) = gc_box::with_mut(|g| unsafe {
+        g.alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
+            needs_write_barrier,
+        )
+    }) {
+        return r;
+    }
+    unsafe {
+        majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots(
+            type_id,
+            size,
+            roots,
+            root_count,
             needs_write_barrier,
         )
     }
