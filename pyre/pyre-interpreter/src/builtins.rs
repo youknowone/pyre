@@ -21503,7 +21503,7 @@ fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, 
         crate::PyError::os_error_win32_syscall2(
             error
                 .raw_os_error()
-                .unwrap_or(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32),
+                .unwrap_or(rustpython_host_env::nt::ERROR_INVALID_HANDLE_I32),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
         )

@@ -129,10 +129,9 @@ pub mod overlapped;
 mod process {
     use pyre_object::{PyObjectRef, w_int_new, w_none, w_tuple_new};
     use rustpython_host_env::winapi as host_winapi;
+    use rustpython_host_env::winapi::{CSTR_EQUAL, HANDLE, LCMAP_UPPERCASE};
     use rustpython_wtf8::Wtf8Buf;
     use widestring::WideCString;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal, LCMAP_UPPERCASE};
 
     use super::{IntArg, handle_w, w_handle, win32_err};
 
@@ -303,16 +302,7 @@ mod process {
     /// case-insensitive match `CompareStringOrdinal` makes.  Both are passed
     /// by length, so neither has to be terminated.
     fn environment_names_equal(left: &[u16], right: &[u16]) -> bool {
-        let result = unsafe {
-            CompareStringOrdinal(
-                left.as_ptr(),
-                left.len() as i32,
-                right.as_ptr(),
-                right.len() as i32,
-                1,
-            )
-        };
-        result == CSTR_EQUAL
+        host_winapi::compare_string_ordinal(left, right, true) == CSTR_EQUAL
     }
 
     /// The environment block `CreateProcess` takes: every `KEY=value` in
@@ -785,12 +775,12 @@ crate::py_module! {
                 match result {
                     Ok(result) => (result, 0),
                     Err(error) => (
-                        windows_sys::Win32::Foundation::WAIT_FAILED,
+                        host_winapi::WAIT_FAILED,
                         error.raw_os_error().unwrap_or(0) as u32,
                     ),
                 }
             };
-            if result == windows_sys::Win32::Foundation::WAIT_FAILED {
+            if result == host_winapi::WAIT_FAILED {
                 return Err(win32_code(error));
             }
             Ok(i64::from(result))

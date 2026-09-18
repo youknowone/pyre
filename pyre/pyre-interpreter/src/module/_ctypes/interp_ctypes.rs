@@ -113,9 +113,9 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 // filesystem's own units: a byte with no UTF-8 spelling names
                 // a real file and must not be replaced with U+FFFD.
                 if pyre_object::is_bytes(args[0]) {
-                    crate::gateway::os_string_from_fs_bytes(
-                        pyre_object::bytesobject::w_bytes_data(args[0]),
-                    )
+                    crate::gateway::os_string_from_fs_bytes(pyre_object::bytesobject::w_bytes_data(
+                        args[0],
+                    ))
                 } else if pyre_object::is_str(args[0]) {
                     crate::gateway::os_string_from_fs_bytes(&crate::gateway::fsencode(args[0])?)
                 } else {
@@ -130,12 +130,13 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                 None
             };
             let mode = host_ctypes::dlopen_mode(load_flags);
-            let h = rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
-                let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
-                msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
-                msg.push_str(&format!("): {}", crate::with_causes(&e)));
-                crate::PyError::os_error(msg)
-            })?;
+            let h =
+                rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
+                    let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
+                    msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
+                    msg.push_str(&format!("): {}", crate::with_causes(&e)));
+                    crate::PyError::os_error(msg)
+                })?;
             Ok(pyre_object::w_int_new(h as i64))
         }),
     );
@@ -475,29 +476,12 @@ pub(super) fn lookup_symbol(
     let Ok(name) = std::ffi::CString::new(symbol) else {
         return Err(Error::Load("symbol name contains a null byte".to_string()));
     };
-    let address = unsafe {
-        windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-            handle as *mut core::ffi::c_void,
-            name.as_ptr().cast(),
-        )
-    };
-    match address {
-        // `GetProcAddress` can hand back a NULL address without reporting an
-        // error. A NULL address is not callable, so the lookup failed — the
-        // rejection the posix arm applies to a NULL `dlsym`.
-        Some(address) if address as usize != 0 => Ok(address as usize),
-        Some(_) => Err(Error::Load(format!(
+    rustpython_host_env::ctypes::get_proc_address(handle as _, &name).ok_or_else(|| {
+        Error::Load(format!(
             "symbol '{}' not found",
             String::from_utf8_lossy(symbol)
-        ))),
-        // windows-sys represents the documented NULL miss as `None`.
-        // This is the normal not-found result, not a loader failure carrying
-        // a meaningful last-error message.
-        None => Err(Error::Load(format!(
-            "symbol '{}' not found",
-            String::from_utf8_lossy(symbol)
-        ))),
-    }
+        ))
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -566,39 +550,33 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 Some(&flags) => crate::baseobjspace::int_w(flags)? as u32,
                 None => 0,
             };
-            let module = {
-                use std::os::windows::ffi::OsStrExt;
-                let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
-                unsafe {
-                    windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
-                        wide.as_ptr(),
-                        std::ptr::null_mut(),
-                        load_flags,
-                    )
+            let wide = widestring::WideCString::from_os_str(&name)
+                .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+            let module = match host_ctypes::load_library_ex_w(&wide, load_flags) {
+                Ok(module) => module,
+                Err(error) => {
+                    // ERROR_MOD_NOT_FOUND is answered with a plain
+                    // FileNotFoundError naming the module rather than the winerror
+                    // OSError every other failure gets, because the DLL that is
+                    // missing is as often a dependency as the name asked for.
+                    const ERROR_MOD_NOT_FOUND: i32 = 126;
+                    if error.raw_os_error() != Some(ERROR_MOD_NOT_FOUND) {
+                        return Err(last_win32_error());
+                    }
+                    let mut msg = rustpython_wtf8::Wtf8Buf::from_string(
+                        "Could not find module '".to_string(),
+                    );
+                    msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
+                    msg.push_str(
+                        "' (or one of its dependencies). Try using the full path with \
+                         constructor syntax.",
+                    );
+                    return Err(crate::PyError::new(
+                        crate::error::PyErrorKind::FileNotFoundError,
+                        msg,
+                    ));
                 }
             };
-            if module.is_null() {
-                // ERROR_MOD_NOT_FOUND is answered with a plain
-                // FileNotFoundError naming the module rather than the winerror
-                // OSError every other failure gets, because the DLL that is
-                // missing is as often a dependency as the name asked for.
-                const ERROR_MOD_NOT_FOUND: i32 = 126;
-                let err = std::io::Error::last_os_error().raw_os_error();
-                if err != Some(ERROR_MOD_NOT_FOUND) {
-                    return Err(last_win32_error());
-                }
-                let mut msg =
-                    rustpython_wtf8::Wtf8Buf::from_string("Could not find module '".to_string());
-                msg.push_wtf8(&crate::gateway::fsdecode_os_str_wtf8(&name));
-                msg.push_str(
-                    "' (or one of its dependencies). Try using the full path with \
-                     constructor syntax.",
-                );
-                return Err(crate::PyError::new(
-                    crate::error::PyErrorKind::FileNotFoundError,
-                    msg,
-                ));
-            }
             Ok(pyre_object::w_int_new(module as isize as i64))
         }),
     );
@@ -613,13 +591,8 @@ fn register_windows_loader(ns: pyre_object::PyObjectRef) {
                 let Some(&handle) = args.first() else {
                     return Err(crate::PyError::type_error("FreeLibrary() needs handle"));
                 };
-                let module = crate::baseobjspace::int_w(handle)? as isize as *mut core::ffi::c_void;
-                let freed = unsafe {
-                    windows_sys::Win32::Foundation::FreeLibrary(module) != 0
-                };
-                if !freed {
-                    return Err(last_win32_error());
-                }
+                let module = crate::baseobjspace::int_w(handle)? as isize;
+                host_ctypes::free_library(module as _).map_err(|_| last_win32_error())?;
                 Ok(pyre_object::w_none())
             },
             1,
@@ -992,7 +965,9 @@ pub(super) fn carg_type() -> pyre_object::PyObjectRef {
                     let value = unsafe { pyre_object::w_dict_getitem_str(d, "_obj") }
                         .unwrap_or_else(pyre_object::w_none);
                     let rendered = unsafe { crate::display::py_repr_wtf8(value) }?;
-                    Ok(pyre_object::w_str_from_wtf8_managed(crate::display::wtf8_format!("<cparam ", rendered, ">")))
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        crate::display::wtf8_format!("<cparam ", rendered, ">"),
+                    ))
                 }),
             );
         });

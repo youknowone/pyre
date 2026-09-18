@@ -2536,11 +2536,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
-            // CPython 3.14 `_Py_get_blocking`: translate the CRT descriptor
-            // through the host seam, then read PIPE_NOWAIT from the pipe's
-            // current mode.
+            // `PIPE_NOWAIT` is the named-pipe mode bit `get_blocking` reads.
+            const PIPE_NOWAIT: u32 = 0x0000_0001;
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
                 .map_err(|error| {
                     crate::PyError::os_error_syscall(
@@ -2624,13 +2622,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         {
             use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
 
-            // CPython 3.14 `_Py_set_blocking` maps a CRT descriptor back to
-            // its pipe HANDLE and flips PIPE_NOWAIT with
-            // SetNamedPipeHandleState.  rustpython-host_env owns both unsafe
-            // host boundaries; keep the PyPy `set_blocking` entry point and
-            // argument conversion around them.
+            // `PIPE_NOWAIT` is the named-pipe mode bit `set_blocking` flips.
+            const PIPE_NOWAIT: u32 = 0x0000_0001;
             let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(fd) }
                 .map_err(|error| {
                     crate::PyError::os_error_syscall(
@@ -6753,7 +6747,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         {
             let invalid_handle = || {
                 crate::PyError::os_error_win32_syscall2(
-                    windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32,
+                    rustpython_host_env::nt::ERROR_INVALID_HANDLE_I32,
                     pyre_object::PY_NULL,
                     pyre_object::PY_NULL,
                 )
@@ -11412,7 +11406,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         fn handle_err(e: &std::io::Error) -> crate::PyError {
             let winerror = e
                 .raw_os_error()
-                .unwrap_or(windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE as i32);
+                .unwrap_or(rustpython_host_env::nt::ERROR_INVALID_HANDLE_I32);
             crate::PyError::os_error_win32_syscall2(
                 winerror,
                 pyre_object::PY_NULL,
