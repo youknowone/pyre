@@ -12124,6 +12124,19 @@ pub(super) fn user_binop_forward_dunder(
 /// True when any operand is a heap-type instance.  Builtin str/tuple/list
 /// are not heaptypes; a Python dunder on either side can commit then
 /// return NotImplemented (`A().__add__(1)`).
+/// Decode a concrete attribute name only when it is a `str`.
+/// `w_str_get_wtf8` requires `W_UnicodeObject`.
+fn walker_concrete_str_name<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    name_opref: OpRef,
+) -> Option<String> {
+    let n = walker_concrete_ref_object(ctx, name_opref)?;
+    if n.is_null() || !unsafe { pyre_object::is_str(n) } {
+        return None;
+    }
+    unsafe { pyre_object::w_str_get_wtf8(n).as_str().ok() }.map(str::to_string)
+}
+
 fn any_operand_is_heaptype<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     args: &[OpRef],
@@ -14641,9 +14654,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             } else {
                 let obj = args[0];
                 let name_opref = args[1];
-                let unicode_name = walker_concrete_ref_object(ctx, name_opref).and_then(|n| {
-                    unsafe { pyre_object::w_str_get_wtf8(n).as_str().ok() }.map(str::to_string)
-                });
+                let unicode_name = walker_concrete_str_name(ctx, name_opref);
                 if let Some(outcome) =
                     super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
                         ctx,
@@ -14667,9 +14678,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     false,
                 );
             };
-            let unicode_name = walker_concrete_ref_object(ctx, name_opref).and_then(|n| {
-                unsafe { pyre_object::w_str_get_wtf8(n).as_str().ok() }.map(str::to_string)
-            });
+            let unicode_name = walker_concrete_str_name(ctx, name_opref);
             if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
                 && !name_opref.is_constant()
                 && unsafe {
