@@ -15744,6 +15744,13 @@ fn try_walker_orthodox_ldexp<Sym: WalkSym>(
     if exp_value <= -EXP_LIMIT || exp_value >= EXP_LIMIT {
         return Ok(None);
     }
+    // Overflow is the builtin’s `OverflowError`; do not specialize it.
+    // Publishing the boxed inf into `dst` before the finite guard would
+    // snapshot that float over the call’s live callable register, so the
+    // compiled loop later calls a float (`test_float.test_roundtrip`).
+    if !(x * 2.0f64.powf(exp_value as f64)).is_finite() {
+        return Ok(None);
+    }
     let xa =
         walker_coerce_dispatching_operand_to_float(ctx, op_pc, x_op, x_obj, x_is_int, x, false)?;
     MathFloatDomain::Finite.emit_operand_guards(ctx, op_pc, xa)?;
@@ -15769,15 +15776,11 @@ fn try_walker_orthodox_ldexp<Sym: WalkSym>(
         &[],
         &[(xa, x)],
         dst,
-        dst_bank,
+        'v',
         &FLOAT_LDEXP_DESCENT,
         Some(&mut boxed),
     )?;
-    let Some(boxed) = boxed else {
-        return Ok(outcome);
-    };
-    walker_guard_descended_float_finite(ctx, op_pc, boxed)?;
-    Ok(outcome)
+    publish_descended_boxed_float(ctx, op_pc, dst, dst_bank, boxed, outcome, true)
 }
 
 /// `math.isqrt(n)` on an exact nonnegative machine integer that fits an
@@ -16305,17 +16308,19 @@ fn try_walker_orthodox_float_math1<Sym: WalkSym>(
         &[],
         &[(xa, x)],
         dst,
-        dst_bank,
+        'v',
         descent,
         Some(&mut boxed),
     )?;
-    if result_check.needs_runtime_finite() {
-        let Some(boxed) = boxed else {
-            return Ok(outcome);
-        };
-        walker_guard_descended_float_finite(ctx, op_pc, boxed)?;
-    }
-    Ok(outcome)
+    publish_descended_boxed_float(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        boxed,
+        outcome,
+        result_check.needs_runtime_finite(),
+    )
 }
 
 fn walker_guard_descended_float_finite<Sym: WalkSym>(
@@ -16326,6 +16331,29 @@ fn walker_guard_descended_float_finite<Sym: WalkSym>(
     let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
     let raw = super::walker_unbox_float(ctx, pc, boxed, float_type_addr)?;
     walker_guard_float_result_finite(ctx, pc, raw)
+}
+
+/// Record the finite-result guard (if any) before publishing into the
+/// call's `dst`.  Writing first snapshots a boxed float over a live
+/// callable register when `dst` aliases it, and the compiled loop then
+/// calls that float.
+fn publish_descended_boxed_float<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    dst: usize,
+    dst_bank: char,
+    boxed: Option<OpRef>,
+    outcome: Option<DispatchOutcome>,
+    guard_finite: bool,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    let Some(boxed) = boxed else {
+        return Ok(outcome);
+    };
+    if guard_finite {
+        walker_guard_descended_float_finite(ctx, op_pc, boxed)?;
+    }
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(outcome)
 }
 
 #[derive(Clone, Copy)]
@@ -16431,17 +16459,19 @@ fn try_walker_orthodox_float_math2<Sym: WalkSym>(
         &[],
         &[(xa, x), (ya, y)],
         dst,
-        dst_bank,
+        'v',
         descent,
         Some(&mut boxed),
     )?;
-    if matches!(domain, MathFloat2Domain::Pow) {
-        let Some(boxed) = boxed else {
-            return Ok(outcome);
-        };
-        walker_guard_descended_float_finite(ctx, op_pc, boxed)?;
-    }
-    Ok(outcome)
+    publish_descended_boxed_float(
+        ctx,
+        op_pc,
+        dst,
+        dst_bank,
+        boxed,
+        outcome,
+        matches!(domain, MathFloat2Domain::Pow),
+    )
 }
 
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
