@@ -3053,21 +3053,26 @@ impl GcRewriterImpl {
                     &[st.last_malloced_ref.clone(), prev_size_ref],
                 );
                 let r = st.emit_result(incr_op, result_pos);
-                // rewrite.py:914-918 initializes every batched object's
-                // Signed-sized HDR.tid word.  pyre splits that word into a
-                // 32-bit type id and 32-bit flags, so gen_initialize_tid's
-                // narrow store cannot clear poison/stale flags.  The first
-                // object is cleared by CallMallocNursery's backend fast path;
-                // clear the flags half of each interior header here.  This
-                // must stay specific to NurseryPtrIncrement: the first result
-                // can come from an old-gen slow path whose TRACK_YOUNG_PTRS
-                // flag gen_initialize_tid intentionally preserves.
-                let flags_ofs = st.const_int(-(std::mem::size_of::<u32>() as i64));
+                // rewrite.py gen_initialize_tid writes the whole Signed
+                // HDR.tid, which zeros flags. pyre's descr is the type-id
+                // half only (`make_tid_field_descr`), so leftover nursery
+                // flags survive unless this store clears that half.
+                // header.rs: flags start at FLAG_SHIFT bits into the
+                // physical header (obj - SIZE + FLAG_SHIFT/8). On wasm32
+                // that is obj-6, not obj-4: obj-4 is ABI padding, and a
+                // recycled HAS_SHADOW bit there is what
+                // `copy_nursery_object` / `find_shadow` then panic on.
+                // Nursery-only: the first CallMallocNursery result can
+                // be an old-gen slow path whose TRACK_YOUNG_PTRS
+                // gen_initialize_tid must keep.
+                let flags_byteofs = (crate::header::FLAG_SHIFT / 8) as i64;
+                let flags_ofs =
+                    st.const_int(-(crate::header::GcHeader::SIZE as i64) + flags_byteofs);
                 let zero = st.const_int(0);
-                let word32 = st.const_int(std::mem::size_of::<u32>() as i64);
+                let flags_size = st.const_int((crate::header::TYPE_ID_BITS / 8) as i64);
                 st.emit(mk_op(
                     OpCode::GcStore,
-                    &[r.clone(), flags_ofs, zero, word32],
+                    &[r.clone(), flags_ofs, zero, flags_size],
                 ));
                 st.previous_size = size;
                 st.last_malloced_ref = r.clone();
@@ -4897,6 +4902,8 @@ mod tests {
         // Both have tid initialisation; the interior allocation also clears
         // the flags half of its header because NurseryPtrIncrement bypasses
         // the backend's CallMallocNursery header clear.
+        let flags_ofs =
+            -(crate::header::GcHeader::SIZE as i64) + (crate::header::FLAG_SHIFT / 8) as i64;
         let tid_stores: Vec<_> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GcStore)
@@ -4924,7 +4931,7 @@ mod tests {
                 .to_opref()
                 .inline_const_bits()
                 .expect("inline ConstInt"),
-            -(std::mem::size_of::<u32>() as i64)
+            flags_ofs
         );
         assert_eq!(
             tid_stores[1]
