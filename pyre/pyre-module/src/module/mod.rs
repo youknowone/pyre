@@ -29,6 +29,8 @@ pub mod _json;
 #[allow(non_snake_case)]
 pub mod _lsprof;
 #[allow(non_snake_case)]
+pub mod _lzma;
+#[allow(non_snake_case)]
 pub mod _multibytecodec;
 #[allow(non_snake_case)]
 #[cfg(not(feature = "sandbox"))]

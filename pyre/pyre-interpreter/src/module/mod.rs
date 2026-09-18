@@ -34,8 +34,6 @@ pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
 #[allow(non_snake_case)]
-pub mod _lzma;
-#[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
 pub mod _pypy_generic_alias;
