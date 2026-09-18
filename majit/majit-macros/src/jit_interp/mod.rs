@@ -3758,9 +3758,12 @@ fn stmt_is_traced_loop(stmt: &syn::Stmt) -> bool {
         _ => return false,
     };
     body.stmts.iter().any(|s| match s {
-        syn::Stmt::Macro(m) => m.mac.path.segments.last().is_some_and(|seg| {
-            seg.ident == "jit_merge_point"
-        }),
+        syn::Stmt::Macro(m) => m
+            .mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "jit_merge_point"),
         syn::Stmt::Expr(syn::Expr::Macro(m), _) => m
             .mac
             .path
