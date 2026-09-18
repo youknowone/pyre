@@ -546,7 +546,7 @@ impl OptVirtualize {
         let field_descr = setfield_descr_arc
             .as_field_descr()
             .expect("optimize_setfield_gc: field op without FieldDescr");
-        let field_idx = field_descr.index_in_parent() as u32;
+        let field_idx = parent_list_slot(field_descr);
         let is_typeptr = field_descr.is_typeptr();
         // Pre-extract constant value before mutable borrow of ptr_info.
         // Class pointer may be stored as Value::Int OR Value::Ref.
@@ -692,7 +692,7 @@ impl OptVirtualize {
         let field_descr = field_descr_arc
             .as_field_descr()
             .expect("optimize_getfield_gc: descr is not a FieldDescr");
-        let field_idx = field_descr.index_in_parent() as u32;
+        let field_idx = parent_list_slot(field_descr);
         let is_typeptr = field_descr.is_typeptr();
         let is_raw_op = matches!(
             op.opcode,
@@ -2333,6 +2333,14 @@ fn field_slot_disagreement(
     if !crate::jit_strict_mode() {
         return None;
     }
+    // An uninterned SizeDescr (`index == u32::MAX`) has field rows whose
+    // parent identities are not the assembler-pool keys `slot_holds_field`
+    // compares. The check cannot name a real disagreement, so it must not
+    // abort a walk that recorded an ADT tag write (StepResult::__discriminant
+    // vs StepResult::Return::__discriminant at the same offset).
+    if descr.index() == u32::MAX {
+        return None;
+    }
     let fields = descr.as_size_descr()?.all_fielddescrs();
     let Some(slot) = fields.get(field_idx as usize) else {
         return Some(format!(
@@ -2356,6 +2364,28 @@ fn field_slot_disagreement(
         ));
     }
     None
+}
+
+/// Slot in the parent SizeDescr's current field list.
+///
+/// `FieldDescr.index_in_parent` can be minted before `kind` is listed,
+/// so `args_w` keeps 1 while the completed list puts it at 2.  The
+/// virtual object's `_fields` array follows that list; look the field
+/// up by identity, not by the stale mint.
+fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
+    if field.is_typeptr() || field.is_w_class() {
+        return field.index_in_parent() as u32;
+    }
+    if let Some(parent) = field.get_parent_descr()
+        && let Some(size) = parent.as_size_descr()
+        && let Some(i) = size
+            .all_fielddescrs()
+            .iter()
+            .position(|slot| slot_holds_field(slot.as_ref(), field))
+    {
+        return i as u32;
+    }
+    field.index_in_parent() as u32
 }
 
 /// Whether `slot` and `field` name the same field.
