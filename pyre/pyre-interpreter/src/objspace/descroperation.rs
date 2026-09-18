@@ -4263,6 +4263,24 @@ unsafe fn same_unoverridden_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
     same_rpy_type(a, b)
 }
 
+/// Residual: `shortcut_binop` slot on the live typeptr.  STR/list types
+/// leave it null; int/bool/float stamp it at startup.  Walked
+/// `getfield_gc` of that word on a static `PyType` adds a GC header
+/// and crashes, so the load stays in-process.
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(crate) unsafe fn obj_has_binop_shortcut(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    !get_shortcut_binop(&*(*obj).ob_type).is_null()
+}
+
+/// CALL_PURE fold after `guard_class`: the slot is immutable post-init.
+#[doc(hidden)]
+#[allow(non_upper_case_globals)]
+pub const _elidable_function_obj_has_binop_shortcut: bool = true;
+
 /// `typedef.py use_special_method_shortcut` — one function pointer
 /// per binop, the `W_Root.shortcut___mod__` class attribute after
 /// `getattr(self, shortcut_name)`.
