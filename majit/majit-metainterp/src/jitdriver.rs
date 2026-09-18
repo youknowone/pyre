@@ -8556,7 +8556,7 @@ impl<S: JitState> JitDriver<S> {
     /// interpreter. A runnable procedure token is entered through
     /// [`Self::back_edge_resolved`] so FINISH, deopt and blackhole resume are
     /// the same as a back-edge run. A counter hit arms tracing at `target_pc`
-    /// via [`Self::bound_reached`] and returns `None` so the caller
+    /// via [`Self::force_start_tracing`] and returns `None` so the caller
     /// falls into the interpreter; the next merge point records.
     ///
     /// Returns `Some(resume_pc)` only when compiled code ran and left a
@@ -8587,11 +8587,15 @@ impl<S: JitState> JitDriver<S> {
                 }
                 // warmstate.py bound_reached: decay, then refuse a nearly
                 // full stack, then start the function-entry trace.
+                // Do not call `bound_reached` itself: that consumes
+                // `single_pass_label_entry_key` reserved for the next
+                // back edge. `force_start_tracing` republishes the
+                // frame decoder and leaves that handoff alone.
                 self.meta.warm_state_mut().decay_counters();
                 if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
                     return None;
                 }
-                self.bound_reached(cell_key, target_pc, state, env);
+                self.force_start_tracing(cell_key, target_pc, state, env);
                 None
             }
             FunctionEntryStep::NotHot => None,
