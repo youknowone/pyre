@@ -79,8 +79,8 @@ pub(crate) unsafe fn backing_exports_incref(buffer: &pyre_object::buffer::Buffer
                 // unmap while this one still reads the mapping.
                 let _ = w_obj;
                 #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-                if crate::module::mmap::interp_mmap::is_mmap(*w_obj) {
-                    crate::module::mmap::interp_mmap::mmap_exports_incref(*w_obj);
+                if pyre_object::buffer::has_external_buffer_layout(*w_obj) {
+                    unsafe { pyre_object::buffer::external_buffer_acquire(*w_obj) };
                 }
             }
             _ => {}
@@ -115,8 +115,8 @@ pub unsafe fn buffer_export_incref(obj: PyObjectRef) -> bool {
             return true;
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if crate::module::mmap::interp_mmap::is_mmap(obj) {
-            crate::module::mmap::interp_mmap::mmap_exports_incref(obj);
+        if pyre_object::buffer::has_external_buffer_layout(obj) {
+            unsafe { pyre_object::buffer::external_buffer_acquire(obj) };
             return true;
         }
     }
@@ -138,7 +138,7 @@ pub unsafe fn buffer_export_decref(obj: PyObjectRef) {
             pyre_object::memoryview::w_memoryview_exports_decref(obj);
         } else {
             #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-            crate::module::mmap::interp_mmap::mmap_exports_decref(obj);
+            pyre_object::buffer::external_buffer_release(obj);
         }
     }
 }
@@ -502,7 +502,7 @@ unsafe fn w_memoryview_new_mmap(
         // Unlike the GC-owned exporters, the mapping is foreign memory that
         // `close`/`resize` hand straight back to the kernel, so the window
         // must keep it from being unmapped while this view can still read it.
-        crate::module::mmap::interp_mmap::mmap_exports_incref(r_obj);
+        pyre_object::buffer::external_buffer_acquire(r_obj);
         mv
     }
 }
@@ -771,8 +771,8 @@ fn w_memoryview_new_with_flags_impl(
             return Ok(mv);
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
-            let (address, length, readonly) = view?;
+        if let Some(view) = pyre_object::buffer::external_buffer_view(w_obj) {
+            let (address, length, readonly) = view.map_err(crate::PyError::value_error)?;
             return Ok(w_memoryview_new_mmap(w_obj, address, length, readonly));
         }
         #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
@@ -2076,8 +2076,8 @@ fn memoryview_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 /// release.  Returns `true` when it handled the backing.
 unsafe fn release_external_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool {
     #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-    if crate::module::mmap::interp_mmap::is_mmap(backing) {
-        unsafe { crate::module::mmap::interp_mmap::mmap_exports_decref(backing) };
+    if pyre_object::buffer::has_external_buffer_layout(backing) {
+        unsafe { pyre_object::buffer::external_buffer_release(backing) };
         return true;
     }
     // A C exporter's `bf_releasebuffer` is handed back the exact `Py_buffer`
@@ -20193,8 +20193,8 @@ pub unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::P
         }
         // `W_MMap.readbuf_w` — the live mapping.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-            let (address, length, _readonly) = view?;
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
             return Ok(std::slice::from_raw_parts(address as *const u8, length));
         }
         if pyre_object::interp_array::is_array(obj) {
@@ -20269,8 +20269,8 @@ pub unsafe fn fileio_writebuf(
             ));
         }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-            let (address, length, readonly) = view?;
+        if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+            let (address, length, readonly) = view.map_err(crate::PyError::value_error)?;
             if !readonly {
                 return Ok((
                     std::slice::from_raw_parts_mut(address as *mut u8, length),

@@ -2495,7 +2495,7 @@ fn ctypes_pointer_layout(obj: PyObjectRef) -> bool {
 fn mmap_layout(obj: PyObjectRef) -> bool {
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
-        crate::module::mmap::interp_mmap::has_mmap_layout(obj)
+        pyre_object::buffer::has_external_buffer_layout(obj)
     }
     #[cfg(any(target_arch = "wasm32", feature = "sandbox"))]
     {
@@ -23806,8 +23806,8 @@ pub fn buffer_as_bytes_like(obj: PyObjectRef) -> Result<Option<PyObjectRef>, cra
     // right, so `bytes(m)` / `bytearray(m)` copy it here instead of falling
     // through to the iterable path.
     #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-    if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-        let (address, length, _readonly) = view?;
+    if let Some(view) = pyre_object::buffer::external_buffer_view(obj) {
+        let (address, length, _readonly) = view.map_err(crate::PyError::value_error)?;
         let data = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
