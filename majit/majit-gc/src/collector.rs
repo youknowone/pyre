@@ -1238,6 +1238,52 @@ pub struct MiniMarkGC {
     stress_collect: bool,
 }
 
+/// Whether a byte at `addr` can be read without SIGBUS / SIGSEGV.
+///
+/// `write` from the address into a pipe returns `EFAULT` for a
+/// reserved commpage or an unmapped hole and does not raise. `mincore`
+/// and `msync` are not substitutes: Darwin lists the commpage in the
+/// process map, and `msync` itself can SIGBUS there. A hardcoded 12 GB
+/// hole is also not a substitute — macos-latest places live
+/// `alloc_with_gc_header` objects inside the range a crash report
+/// labelled reserved.
+#[cfg(unix)]
+fn page_is_mapped(addr: usize) -> bool {
+    unsafe extern "C" {
+        fn pipe(fds: *mut i32) -> i32;
+        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
+        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
+    }
+    thread_local! {
+        static PIPE: [i32; 2] = {
+            let mut fds = [0i32; 2];
+            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+                [-1, -1]
+            } else {
+                fds
+            }
+        };
+    }
+    PIPE.with(|fds| {
+        if fds[0] < 0 {
+            return false;
+        }
+        let n = unsafe { write(fds[1], addr as *const u8, 1) };
+        if n == 1 {
+            let mut byte = 0u8;
+            let _ = unsafe { read(fds[0], &mut byte, 1) };
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn page_is_mapped(_addr: usize) -> bool {
+    true
+}
+
 impl MiniMarkGC {
     /// Create a new GC with default configuration.
     pub fn new() -> Self {
@@ -1582,15 +1628,17 @@ impl MiniMarkGC {
         addr != 0 && !self.is_tagged_immediate(addr)
     }
 
-    /// Whether `addr` is a word the external-header probe may load.
+    /// Cheap filter before the external-header probe loads a word.
     ///
     /// RPython's write barrier only ever sees a typed GC pointer. The
     /// external-header probe is a pyre fallback for bootstrap objects
     /// allocated off the managed heaps; a blackhole resume can hand it a
-    /// garbage `struct_ptr` (ARM instruction bits decoded as a Ref, or a
-    /// `Box::into_raw` payload sitting on a mapping start). Loading that
-    /// word is SIGBUS / SIGSEGV. Refuse addresses that cannot be a user
-    /// object pointer.
+    /// garbage `struct_ptr` (ARM instruction bits decoded as a Ref).
+    /// Refuse bit-patterns that cannot be a user object pointer. Mapping
+    /// membership is [`page_is_mapped`], not a hardcoded Darwin hole:
+    /// treating `0x844000000..0xb43000000` as reserved rejected live
+    /// `alloc_with_gc_header` objects on macos-latest (`prebuilt_write_
+    /// barrier_registers_root_once_and_traces_children`).
     fn addr_is_safe_user_word(&self, addr: usize) -> bool {
         // The first page is never a bootstrap object (crash reports
         // include `0x8`).
@@ -1609,27 +1657,10 @@ impl MiniMarkGC {
                 return false;
             }
         }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            // Reserved commpage. `do_write_barrier` SIGBUS'd here on
-            // `0xb42fffff8` (KERN_PROTECTION_FAILURE, end of the hole).
-            const COMMPAGE_LO: usize = 0x8440_00000;
-            const COMMPAGE_HI: usize = 0xB430_00000;
-            if (COMMPAGE_LO..COMMPAGE_HI).contains(&addr) {
-                return false;
-            }
-        }
         true
     }
 
-    /// Whether `registered_external_header` may load a vtable word at
-    /// `addr` and a `GcHeader` at `header_of(addr)`.
-    ///
-    /// Both loads are required. A headerless `Box::into_raw` float whose
-    /// payload sits at Darwin `MALLOC_SMALL` start `0xb43000000` has a
-    /// readable vtable word (the `ob_type`) but `header_of` is
-    /// `0xb42fffff8` in the reserved commpage — the 2026-09-18 nbody
-    /// SIGBUS. Reject that payload, not only the header address itself.
+    /// Whether `registered_external_header` may even consider `addr`.
     fn addr_is_safe_header_probe(&self, addr: usize) -> bool {
         let Some(header_addr) = addr.checked_sub(GcHeader::SIZE) else {
             return false;
@@ -1662,8 +1693,19 @@ impl MiniMarkGC {
         if !self.addr_is_safe_header_probe(addr) {
             return None;
         }
+        // A headerless `Box::into_raw` at Darwin `MALLOC_SMALL` start
+        // `0xb43000000` has a mapped vtable word and an unmapped
+        // `header_of` (`0xb42fffff8`, the 2026-09-18 nbody SIGBUS).
+        // `mincore` answers that without a 12 GB reserved-range guess.
+        if !page_is_mapped(addr) {
+            return None;
+        }
         let vtable = unsafe { *(addr as *const usize) };
         let expected_type_id = *self.vtable_to_type_id.get(&vtable)?;
+        let header_addr = addr - GcHeader::SIZE;
+        if !page_is_mapped(header_addr) {
+            return None;
+        }
         let hdr = unsafe { header_of(addr) };
         if unsafe { (*hdr).type_id() } == expected_type_id {
             Some(hdr)
@@ -12031,16 +12073,10 @@ mod tests {
         assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
         assert!(!gc.addr_is_safe_header_probe(8));
         assert!(!gc.addr_is_safe_header_probe(0xf940_0501_f940_4840));
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            gc.do_write_barrier(GcRef(0xb_42ff_fff8));
-            gc.do_write_barrier(GcRef(0xb43_000_000));
-            assert!(!gc.addr_is_safe_header_probe(0xb_42ff_fff8));
-            assert!(
-                !gc.addr_is_safe_header_probe(0xb43_000_000),
-                "payload at MALLOC_SMALL start has its header in the commpage"
-            );
-        }
+        let live = 1usize;
+        assert!(page_is_mapped(std::ptr::addr_of!(live) as usize));
+        #[cfg(unix)]
+        assert!(!page_is_mapped(8));
     }
 
     #[test]
