@@ -2455,6 +2455,31 @@ fn emit_jitframe_write_barrier(
     sink.end();
 }
 
+/// Date a use at `at` unless it is an owner-defined value leaking into an
+/// appended region's body. Those reads are not successors of the owner's
+/// collect points — the guard-fail branch is the region's only predecessor
+/// — so they must not keep a Ref home live across the owner
+/// (`regalloc.py` `Lifetime.last_usage` on the reachable path).
+fn note_home_use(
+    last_use: &mut [i32],
+    def_pos: &[i32],
+    regions: &[InlinedRegionSpan],
+    raw: usize,
+    at: i32,
+) {
+    if let Some(region) = regions
+        .iter()
+        .rev()
+        .find(|region| at as usize >= region.ops_start)
+    {
+        let region_def = region.ops_start as i32 - 1;
+        if def_pos[raw] < region_def && !region.inputarg_ids.contains(&(raw as u32)) {
+            return;
+        }
+    }
+    last_use[raw] = at;
+}
+
 /// Per-value def / last-use op positions over the trace, used to filter the
 /// post-collection Ref reloads ([`emit_reload_refs_from_homes`]) down to
 /// values that are both already defined and still read — the wasm-shaped
@@ -2506,7 +2531,7 @@ impl HomeLiveness {
                 if a == OpRef::NONE || a.is_constant() || (a.raw() as usize) >= n {
                     continue;
                 }
-                last_use[a.raw() as usize] = i as i32;
+                note_home_use(&mut last_use, &def_pos, regions, a.raw() as usize, i as i32);
                 // A LABEL arg is a phi def (`consider_label`). A
                 // producerless RefOp is a residual virtualizable slot,
                 // not a phi: dating it here would hide the unwritten
@@ -2520,7 +2545,7 @@ impl HomeLiveness {
                 for a in fa.iter() {
                     let a = a.to_opref();
                     if a != OpRef::NONE && !a.is_constant() && (a.raw() as usize) < n {
-                        last_use[a.raw() as usize] = i as i32;
+                        note_home_use(&mut last_use, &def_pos, regions, a.raw() as usize, i as i32);
                     }
                 }
             }

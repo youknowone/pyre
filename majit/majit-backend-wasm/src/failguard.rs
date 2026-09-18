@@ -207,8 +207,8 @@ impl Drop for WasmFrameData {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
 
     use majit_gc::GcAllocator;
     use majit_ir::GcRef;
@@ -306,6 +306,7 @@ mod tests {
 
     #[test]
     fn a_finish_singleton_resolves_to_its_reserved_exit() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         // The emitted FINISH writes the index this returns and the emitted
         // CALL_ASSEMBLER check compares against the same constant, so a
         // singleton that failed to bind would send every clean callee finish
@@ -375,37 +376,42 @@ mod tests {
 
     #[test]
     fn parallel_compiles_reserve_disjoint_fail_descr_ranges() {
+        // The registry lock already serializes reserve/register. Spawning
+        // workers to overlap those calls raced cargo's other failguard
+        // tests (shared GC box / finish-exit slots) and SIGSEGV'd the
+        // process. Disjointness is what this checks; the wasm host is
+        // single-threaded.
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         const COMPILES: usize = 8;
         const EXITS: usize = 2;
-        let all_reserved = Arc::new(Barrier::new(COMPILES));
-        let threads: Vec<_> = (0..COMPILES)
-            .map(|trace_id| {
-                let all_reserved = Arc::clone(&all_reserved);
-                std::thread::spawn(move || {
-                    let base = reserve_fail_descrs(EXITS);
-                    let descrs: Vec<_> = (0..EXITS)
-                        .map(|index| {
-                            Arc::new(WasmFailDescr {
-                                fail_index: base + index as u32,
-                                trace_id: trace_id as u64,
-                                fail_arg_types: vec![Type::Int],
-                                fail_locs: Vec::new(),
-                                is_finish: false,
-                                force_args_offset: 8,
-                                force_gcmap_ptr: 0,
-                                meta_descr: None,
-                            })
-                        })
-                        .collect();
-                    all_reserved.wait();
-                    register_fail_descrs(&descrs);
-                    (base, trace_id)
+        let mut ranges = Vec::new();
+        for trace_id in 0..COMPILES {
+            let base = reserve_fail_descrs(EXITS);
+            let descrs: Vec<_> = (0..EXITS)
+                .map(|index| {
+                    Arc::new(WasmFailDescr {
+                        fail_index: base + index as u32,
+                        trace_id: trace_id as u64,
+                        fail_arg_types: vec![Type::Int],
+                        fail_locs: Vec::new(),
+                        is_finish: false,
+                        force_args_offset: 8,
+                        force_gcmap_ptr: 0,
+                        meta_descr: None,
+                    })
                 })
-            })
-            .collect();
-
-        for thread in threads {
-            let (base, trace_id) = thread.join().expect("parallel compile panicked");
+                .collect();
+            register_fail_descrs(&descrs);
+            ranges.push((base, trace_id));
+        }
+        ranges.sort_by_key(|(base, _)| *base);
+        for window in ranges.windows(2) {
+            assert!(
+                window[0].0 + EXITS as u32 <= window[1].0,
+                "reserved ranges overlap"
+            );
+        }
+        for (base, trace_id) in ranges {
             for index in 0..EXITS {
                 let descr = global_fail_descr(base + index as u32)
                     .expect("reserved fail descr was not registered");
@@ -416,6 +422,7 @@ mod tests {
 
     #[test]
     fn boxed_roots_ref_slots_and_nonzero_exception_until_drop() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         let roots = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let frame = WasmFrameData::boxed(
@@ -430,6 +437,7 @@ mod tests {
 
     #[test]
     fn boxed_without_refs_or_exception_does_not_bracket_roots() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         let roots = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let frame = WasmFrameData::boxed(vec![1, 2], fail_descr(vec![Type::Int, Type::Float]), 0);
@@ -440,6 +448,7 @@ mod tests {
 
     #[test]
     fn set_savedata_roots_until_cleared_or_drop() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         let roots = install_root_counting_gc();
         let before = roots.load(Ordering::SeqCst);
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
@@ -458,6 +467,7 @@ mod tests {
 
     #[test]
     fn set_savedata_on_a_force_snapshot_writes_the_live_jitframe() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
 
         let jf = alloc_off_gc_jitframe(4);
@@ -489,6 +499,7 @@ mod tests {
 
     #[test]
     fn retract_label_target_keeps_a_replacement_handle() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         let id = 0x7e71_ac10_usize;
         super::publish_label_target(id, dummy_label_target(7));
         super::retract_label_target_if_handle(id, 7);
@@ -503,6 +514,7 @@ mod tests {
 
     #[test]
     fn retarget_slots_skips_the_owner_and_zero() {
+        let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
         // Native has no host table; the helper must still ignore the
         // owner's own slot and a missing handle without panicking.
         super::retarget_slots_to_module([0, 4, 4], 4, b"\0asm");
@@ -1083,7 +1095,8 @@ enum FailDescrSlot {
 /// Serializes tests that claim a [`fail_descr_base`] and later
 /// [`register_fail_descrs`]. The wasm host never interleaves those two
 /// calls; cargo's parallel unit-test runner does. Held by this module's
-/// reserved-exit test and by every `compile_loop` unit test in `lib.rs`.
+/// reserved-exit and parallel-reserve tests and by every `compile_loop`
+/// unit test in `lib.rs`.
 #[cfg(test)]
 pub static FAIL_DESCR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 

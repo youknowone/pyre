@@ -557,7 +557,7 @@ pub fn set_inline_eager_max_bytes(max_bytes: u32) {
 
 /// Deferred merges waiting on their entry trip.
 pub fn pending_inline_count() -> usize {
-    PENDING_INLINES.with(|pending| pending.borrow().len())
+    with_pending_inlines(|pending| pending.len())
 }
 
 /// Entries the bridge standing in for a merge must be entered before the merge
@@ -2481,21 +2481,44 @@ impl PendingInline {
     }
 }
 
+/// Deferred merges by id, the id being what the bridge module passes back.
+///
+/// Thread-local: the stored `Op` graph holds non-atomic `Rc` (`OpRc`,
+/// `InputArgRc`). PyPy's cpu compiles and resumes on the thread that
+/// ran the compiled frame (`eval.rs` post-`run_compiled`). `memmgr`
+/// owns token GC globally; the IR itself stays on this cpu.
 thread_local! {
-    /// Deferred merges by id, the id being what the bridge module passes back.
     static PENDING_INLINES: RefCell<IndexMap<i64, PendingInline>> =
         RefCell::new(IndexMap::new());
-    /// Source of the ids above.
-    static NEXT_PENDING_INLINE_ID: std::cell::Cell<i64> = const { std::cell::Cell::new(1) };
+    /// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`] on this
+    /// thread. The probe runs inside the bridge, so the host is between
+    /// `run_compiled` and its return; only this thread's driver may
+    /// install.
+    static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
+/// Source of the ids above. A counter is not IR; unique ids can be
+/// process-wide.
+static NEXT_PENDING_INLINE_ID: AtomicI64 = AtomicI64::new(1);
+
+fn with_pending_inlines<R>(f: impl FnOnce(&IndexMap<i64, PendingInline>) -> R) -> R {
+    PENDING_INLINES.with(|pending| f(&pending.borrow()))
 }
 
-thread_local! {
-    /// Ids whose bridges have reached [`INLINE_TRIP_THRESHOLD`], waiting to be
-    /// merged. The probe runs inside the bridge, so the host is between
-    /// `run_compiled` and its return and already holds the driver mutably; the
-    /// trip marks the source descriptor and queues here. The caller of
-    /// [`take_tripped_inlines`] installs the merge once the trace has returned.
-    static TRIPPED_INLINES: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+fn with_pending_inlines_mut<R>(f: impl FnOnce(&mut IndexMap<i64, PendingInline>) -> R) -> R {
+    PENDING_INLINES.with(|pending| f(&mut pending.borrow_mut()))
+}
+
+fn push_tripped_inline(pending_id: i64) {
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
+}
+
+fn take_tripped_inline_queue() -> Vec<i64> {
+    TRIPPED_INLINES.with(|tripped| std::mem::take(&mut *tripped.borrow_mut()))
+}
+
+/// Put unused trip ids back without dropping ids recorded since the take.
+fn restore_tripped_inlines(keep: Vec<i64>) {
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().extend(keep));
 }
 
 /// Drops a registered [`PendingInline`] unless the bridge whose probe would
@@ -2518,13 +2541,12 @@ impl PendingInlineGuard {
 
 impl Drop for PendingInlineGuard {
     fn drop(&mut self) {
-        if let Some(pending_id) = self.0 {
-            PENDING_INLINES.with(|pending| {
-                if let Some(_item) = pending.borrow_mut().remove(&pending_id) {
-                    #[cfg(target_arch = "wasm32")]
-                    _item.set_dispatch_withdrawn(false);
-                }
-            });
+        if let Some(pending_id) = self.0
+            && let Some(_item) =
+                with_pending_inlines_mut(|pending| pending.shift_remove(&pending_id))
+        {
+            #[cfg(target_arch = "wasm32")]
+            _item.set_dispatch_withdrawn(false);
         }
     }
 }
@@ -2560,19 +2582,19 @@ fn merged_region_fail_index(
 /// but leave module installation to the caller after compiled code returns.
 pub fn record_inline_trip(pending_id: i64) {
     #[cfg(target_arch = "wasm32")]
-    PENDING_INLINES.with(|pending| {
-        if let Some(pending) = pending.borrow().get(&pending_id)
+    with_pending_inlines(|pending| {
+        if let Some(pending) = pending.get(&pending_id)
             && pending.remap.is_none()
         {
             pending.set_dispatch_withdrawn(true);
         }
     });
-    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().push(pending_id));
+    push_tripped_inline(pending_id);
 }
 
 fn sweep_dead_pending() {
-    PENDING_INLINES.with(|pending| {
-        pending.borrow_mut().retain(|_, item| {
+    with_pending_inlines_mut(|pending| {
+        pending.retain(|_, item| {
             let Some(owner) = item.owner() else {
                 return false;
             };
@@ -2596,7 +2618,7 @@ fn sweep_dead_pending() {
 /// Take the merges whose bridges have tripped since the last call, for a caller
 /// with no compiled trace left on the stack.
 pub fn take_tripped_inlines() -> Vec<i64> {
-    TRIPPED_INLINES.with(|tripped| std::mem::take(&mut *tripped.borrow_mut()))
+    take_tripped_inline_queue()
 }
 
 /// Record a deferred merge and describe the probe the bridge standing in for
@@ -2615,16 +2637,12 @@ fn register_pending_inline(
 ) -> codegen::InlineTripProbe {
     let counter_addr = Box::leak(Box::new(0u64)) as *const u64 as usize as u32;
     let dispatch_cell_index = region.source_fail_index;
-    let pending_id = NEXT_PENDING_INLINE_ID.with(|next| {
-        let id = next.get();
-        next.set(id + 1);
-        id
-    });
+    let pending_id = NEXT_PENDING_INLINE_ID.fetch_add(1, Ordering::Relaxed);
     // A remapped child must not zero an owner cell: the source guard
     // still lives on the parent module until that parent is merged.
     let cells_base_ptr = if remap.is_some() { 0 } else { cells_base_ptr };
-    PENDING_INLINES.with(|pending| {
-        pending.borrow_mut().insert(
+    with_pending_inlines_mut(|pending| {
+        pending.insert(
             pending_id,
             PendingInline {
                 owner: Arc::downgrade(&owner),
@@ -2632,7 +2650,7 @@ fn register_pending_inline(
                 remap,
                 retry_on_sibling: false,
             },
-        )
+        );
     });
     codegen::InlineTripProbe {
         counter_addr,
@@ -3135,7 +3153,7 @@ impl WasmBackend {
     /// lost is the merge.
     pub fn install_pending_inline(&mut self, pending_id: i64) {
         sweep_dead_pending();
-        let Some(pending) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&pending_id)) else {
+        let Some(pending) = with_pending_inlines_mut(|p| p.shift_remove(&pending_id)) else {
             return;
         };
         let Some(owner) = pending.owner() else {
@@ -3156,9 +3174,8 @@ impl WasmBackend {
         // An `uninitialized_label` trip can also fire before the sibling
         // peel that publishes its JUMP target; fold those too so the
         // one-shot probe is not the only retry.
-        let mut sibling_ids: Vec<i64> = PENDING_INLINES.with(|pending| {
+        let mut sibling_ids: Vec<i64> = with_pending_inlines(|pending| {
             pending
-                .borrow()
                 .iter()
                 .filter(|(_, item)| {
                     item.same_owner(&owner) && (item.remap.is_some() || item.retry_on_sibling)
@@ -3168,7 +3185,7 @@ impl WasmBackend {
         });
         sibling_ids.sort_unstable();
         for id in sibling_ids {
-            if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
+            if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
                 #[cfg(target_arch = "wasm32")]
                 if item.remap.is_none() {
                     item.set_dispatch_withdrawn(false);
@@ -3176,29 +3193,22 @@ impl WasmBackend {
                 work.push((id, item.region, item.remap));
             }
         }
-        let extra_ids: Vec<i64> = TRIPPED_INLINES.with(|tripped| {
-            let mut queue = tripped.borrow_mut();
-            let mut keep = Vec::new();
-            let mut extra = Vec::new();
-            for id in queue.drain(..) {
-                let same_owner = PENDING_INLINES.with(|pending| {
-                    pending
-                        .borrow()
-                        .get(&id)
-                        .is_some_and(|item| item.same_owner(&owner))
-                });
-                if same_owner {
-                    extra.push(id);
+        let queued = take_tripped_inline_queue();
+        let mut keep = Vec::new();
+        let mut extra_ids = Vec::new();
+        with_pending_inlines(|pending| {
+            for id in queued {
+                if pending.get(&id).is_some_and(|item| item.same_owner(&owner)) {
+                    extra_ids.push(id);
                 } else {
                     keep.push(id);
                 }
             }
-            *queue = keep;
-            extra
         });
+        restore_tripped_inlines(keep);
         for id in extra_ids {
             diag_bump(55);
-            if let Some(item) = PENDING_INLINES.with(|p| p.borrow_mut().remove(&id)) {
+            if let Some(item) = with_pending_inlines_mut(|p| p.shift_remove(&id)) {
                 // Remapped children still name a parent-local fail index;
                 // the owner's descr array does not hold that guard.
                 #[cfg(target_arch = "wasm32")]
@@ -3253,8 +3263,8 @@ impl WasmBackend {
                         let Some(id) = id else {
                             continue;
                         };
-                        PENDING_INLINES.with(|pending| {
-                            pending.borrow_mut().insert(
+                        with_pending_inlines_mut(|pending| {
+                            pending.insert(
                                 id,
                                 PendingInline {
                                     owner: Arc::downgrade(&owner),
@@ -3262,7 +3272,7 @@ impl WasmBackend {
                                     remap,
                                     retry_on_sibling: remap.is_none(),
                                 },
-                            )
+                            );
                         });
                     }
                 }
@@ -3289,18 +3299,18 @@ impl WasmBackend {
             let Some(id) = id else {
                 continue;
             };
-            PENDING_INLINES.with(|pending| {
-                let item = PendingInline {
-                    owner: Arc::downgrade(&owner),
-                    region,
-                    remap,
-                    retry_on_sibling: remap.is_none(),
-                };
-                #[cfg(target_arch = "wasm32")]
-                if remap.is_none() {
-                    item.set_dispatch_withdrawn(false);
-                }
-                pending.borrow_mut().insert(id, item);
+            let item = PendingInline {
+                owner: Arc::downgrade(&owner),
+                region,
+                remap,
+                retry_on_sibling: remap.is_none(),
+            };
+            #[cfg(target_arch = "wasm32")]
+            if remap.is_none() {
+                item.set_dispatch_withdrawn(false);
+            }
+            with_pending_inlines_mut(|pending| {
+                pending.insert(id, item);
             });
         }
     }
@@ -5533,8 +5543,8 @@ impl majit_backend::Backend for WasmBackend {
                     // to join this owner. A parent declined as
                     // `not_loop_closing` never enters PENDING, so the child
                     // would re-register forever.
-                    let parent_pending = PENDING_INLINES.with(|pending| {
-                        pending.borrow().values().any(|item| {
+                    let parent_pending = with_pending_inlines(|pending| {
+                        pending.values().any(|item| {
                             item.same_owner(&owner) && item.region.trace_id == source_trace_id
                         })
                     });
@@ -6765,6 +6775,7 @@ mod tests {
 
     #[test]
     fn headerless_helper_rejects_non_positive_size() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let gc = MiniMarkGC::new();
         install_gc_box(Box::new(gc));
         assert_eq!(wasm_jit_alloc_headerless(-1), 0);
@@ -6773,6 +6784,7 @@ mod tests {
 
     #[test]
     fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{JitFrame, jitframe_type_info};
         use majit_gc::GcAllocator;
 
@@ -7148,6 +7160,7 @@ mod tests {
     /// vtable→type_id mapping.
     #[test]
     fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         let mut gc = MiniMarkGC::new();
         let int_tid = gc.register_type(TypeInfo::simple(16));
         let int_vtable: usize = 0x3333_4400;
@@ -7226,6 +7239,7 @@ mod tests {
     /// side works so the feeders can be built.
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_FRAME_OFS, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
@@ -7296,6 +7310,7 @@ mod tests {
     /// homes and a recycled nursery address is left in a gcmap slot.
     #[test]
     fn oldgen_jitframe_must_be_remembered_before_host_pop() {
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
