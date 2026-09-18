@@ -1600,10 +1600,11 @@ impl MiniMarkGC {
         if !self.is_valid_gc_object(addr) {
             return false;
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(target_pointer_width = "64")]
         {
-            // Pyre GcRefs do not use TBI; a non-zero top 16 bits is not a
-            // user pointer (seen as `0xf9400501f9404840` in crash reports).
+            // User pointers live in the low 48 bits. ARM instruction
+            // bits decoded as a Ref (`0xf9400501f9404840`) fail this,
+            // as does any non-canonical x86-64 address.
             if addr >> 48 != 0 {
                 return false;
             }
@@ -12020,20 +12021,21 @@ mod tests {
         // Blackhole resume has handed `bh_setfield_gc_r` these exact
         // bit-patterns (`pyre-dynasm` crash reports 2026-09-18). The
         // external-header probe must return without loading them.
+        // `do_write_barrier` is only called for addresses this host's
+        // probe rejects; a commpage hole on Darwin is a mapped userspace
+        // gap on Linux, and loading it is SIGSEGV (`majit-gc` lib test
+        // on ubuntu-24.04).
         let mut gc = test_gc(1024);
-        gc.do_write_barrier(GcRef(0xb_42ff_fff8));
-        gc.do_write_barrier(GcRef(0xf940_0501_f940_4840));
         gc.do_write_barrier(GcRef(8));
+        gc.do_write_barrier(GcRef(0xf940_0501_f940_4840));
         assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
-        assert!(!gc.addr_is_safe_header_probe(0xb_42ff_fff8));
-        assert!(!gc.addr_is_safe_header_probe(0xf940_0501_f940_4840));
         assert!(!gc.addr_is_safe_header_probe(8));
-        // The live object pointer from the SIGBUS, not the fault address:
-        // a `Box::into_raw` float at Darwin `MALLOC_SMALL` start. The
-        // vtable word is mapped; `header_of` is the commpage hole.
+        assert!(!gc.addr_is_safe_header_probe(0xf940_0501_f940_4840));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
+            gc.do_write_barrier(GcRef(0xb_42ff_fff8));
             gc.do_write_barrier(GcRef(0xb43_000_000));
+            assert!(!gc.addr_is_safe_header_probe(0xb_42ff_fff8));
             assert!(
                 !gc.addr_is_safe_header_probe(0xb43_000_000),
                 "payload at MALLOC_SMALL start has its header in the commpage"
