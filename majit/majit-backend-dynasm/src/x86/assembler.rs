@@ -8600,17 +8600,17 @@ impl<'a> Assembler386<'a> {
         }
         let index_reg = match index {
             Loc::Reg(r) if !r.is_xmm => r.value,
-            _ => {
-                self.emit_load_loc_to_scratch(*index);
-                crate::regloc::X86_64_SCRATCH_REG.value
-            }
+            other => panic!(
+                "LoadEffectiveAddress index must be Loc::Reg after \
+                 consider_load_effective_address, got {other:?}"
+            ),
         };
         let base_reg = match base {
             Loc::Reg(r) if !r.is_xmm => r.value,
-            _ => {
-                self.regalloc_mov(base, &Loc::Reg(*dst));
-                dst.value
-            }
+            other => panic!(
+                "LoadEffectiveAddress base must be Loc::Reg after \
+                 consider_load_effective_address, got {other:?}"
+            ),
         };
         let scale = match shift_amt {
             0 => 1,
