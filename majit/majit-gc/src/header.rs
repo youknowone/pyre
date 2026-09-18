@@ -359,6 +359,23 @@ mod tests {
     }
 
     #[test]
+    fn has_shadow_lives_in_logical_flag_half() {
+        let mut hdr = GcHeader::new(1);
+        hdr.set_flag(GcFlags::GCFLAG_HAS_SHADOW);
+        let bytes = hdr.tid_and_flags.to_le_bytes();
+        let flag_byte = (FLAG_SHIFT / 8) as usize;
+        assert_ne!(
+            bytes[flag_byte], 0,
+            "HAS_SHADOW must occupy the flags half at byte {flag_byte}"
+        );
+        // Physical header is 8 bytes on every target; wasm32's upper 4 are
+        // padding. A store at obj-4 (byte 4) therefore cannot clear HAS_SHADOW.
+        if FLAG_SHIFT < 32 {
+            assert_eq!(&bytes[4..8], &[0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
     fn alloc_with_gc_header_prepends_header() {
         // Leaked: the payload pointer points past the header, so it must not
         // be freed.
