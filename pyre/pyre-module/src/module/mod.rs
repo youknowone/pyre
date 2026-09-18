@@ -77,6 +77,8 @@ pub mod fcntl;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
 pub mod math;
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+pub mod mmap;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod pwd;
 pub mod pyexpat;
