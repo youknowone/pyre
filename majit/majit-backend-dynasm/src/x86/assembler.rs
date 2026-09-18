@@ -8285,6 +8285,12 @@ impl<'a> Assembler386<'a> {
             .unwrap_or((8, 8, 0, 0));
         let clear = matches!(op.opcode, OpCode::NewArrayClear) as i64;
         self.emit_load_to_rax(*len_loc);
+        // Six integer args: on Win64 args 4/5 live at [rsp+32]/[rsp+40], so
+        // the call area (shadow + two stack slots) must exist before those
+        // stores. `emit_abi_call_rax` would reserve after the stores and
+        // overwrite them. SysV keeps args 4/5 in registers.
+        #[cfg(target_os = "windows")]
+        let call_area_adjust = self.emit_reserve_abi_call_area(0, 2);
         self.emit_abi_int_arg_from_reg(4, 0);
         self.emit_abi_int_arg_from_imm(0, base_size);
         self.emit_abi_int_arg_from_imm(1, item_size);
@@ -8294,6 +8300,12 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64
             ; mov rax, QWORD (crate::runner::dynasm_malloc_new_array as *const () as i64)
         );
+        #[cfg(target_os = "windows")]
+        {
+            dynasm!(self.mc ; .arch x64 ; call rax);
+            self.emit_release_abi_call_area(call_area_adjust);
+        }
+        #[cfg(not(target_os = "windows"))]
         self.emit_abi_call_rax();
         if !op.pos().get().is_none() {
             self.store_rax_to_result(op.pos().get());

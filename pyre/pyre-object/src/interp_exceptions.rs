@@ -811,7 +811,9 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(value: T) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let tid = T::type_id();
     let raw = if tid != 0 {
-        crate::gc_hook::try_gc_alloc(tid, T::SIZE).unwrap_or(std::ptr::null_mut())
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(tid, T::SIZE))
+            .allocated_or_abort(T::SIZE)
+            .unwrap_or(std::ptr::null_mut())
     } else {
         std::ptr::null_mut()
     };
@@ -1048,7 +1050,9 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     // holder_offset on StopIteration-heavy tests).
     let tid = rlist_gc_type_id();
     let raw = if tid != 0 {
-        crate::gc_hook::try_gc_alloc(tid, RLIST_SIZE).unwrap_or(std::ptr::null_mut())
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(tid, RLIST_SIZE))
+            .allocated_or_abort(RLIST_SIZE)
+            .unwrap_or(std::ptr::null_mut())
     } else {
         std::ptr::null_mut()
     };

@@ -688,7 +688,7 @@ impl RootedItems {
     /// require the set to own the top of the stack.
     #[inline]
     pub fn get(&self, index: usize) -> PyObjectRef {
-        debug_assert!(index < self.len);
+        assert!(index < self.len);
         self.scope.get(self.base + index)
     }
 
