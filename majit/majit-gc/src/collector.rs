@@ -1684,7 +1684,14 @@ impl MiniMarkGC {
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
-            return self.alloc_in_oldgen_clear(type_id, total_size);
+            // `external_malloc` (`incminimark.py`): `arena_malloc` returning
+            // NULL is `MemoryError`, not a process abort. `rbigint.lshift`
+            // of `1 << 10**18` is the public edge that depends on it.
+            if let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) {
+                Self::raw_memclear(obj, total_size);
+                return obj;
+            }
+            return GcRef(0);
         }
 
         // `IncrementalMiniMarkGC.collect_and_reserve`: a failed bump may have
@@ -1880,7 +1887,14 @@ impl MiniMarkGC {
             if let Some(obj) = self.try_alloc_young_nonmoving_clear(type_id, total_size) {
                 return obj;
             }
-            return self.alloc_in_oldgen_clear(type_id, total_size);
+            // `external_malloc` (`incminimark.py`): `arena_malloc` returning
+            // NULL is `MemoryError`, not a process abort. `rbigint.lshift`
+            // of `1 << 10**18` is the public edge that depends on it.
+            if let Some(obj) = self.try_alloc_in_oldgen(type_id, total_size) {
+                Self::raw_memclear(obj, total_size);
+                return obj;
+            }
+            return GcRef(0);
         }
 
         // `IncrementalMiniMarkGC.collect_and_reserve`: crossing a pinned

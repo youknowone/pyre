@@ -3841,6 +3841,12 @@ impl PyFrame {
             "PyFrame::__init__: initialize_frame_scopes raised — caller should use createframe",
         );
         remember_frame_locals_array(self.locals_cells_stack_w);
+        // Old-gen frame → nursery locals array is an old-to-young field
+        // store (`incminimark.py write_barrier`). Remembering only the
+        // array leaves the frame off `old_objects_pointing_to_young`.
+        if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+        }
     }
 
     /// PyPy-compatible `__repr__`.
