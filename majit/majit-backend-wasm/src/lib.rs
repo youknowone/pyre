@@ -1127,7 +1127,10 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 /// conditional compilation. Mirrors `majit-backend-dynasm/src/runner.rs`'s
 /// `gc_box`.
 pub(crate) mod gc_box {
-    use super::{GcAllocator, RefCell};
+    use super::{GcAllocator, Ordering, RefCell};
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_GC_BOX_GEN: AtomicU64 = AtomicU64::new(1);
 
     thread_local! {
         /// llmodel.py self.gc_ll_descr — owned by the active wasm backend on
@@ -1143,6 +1146,10 @@ pub(crate) mod gc_box {
         /// of taking a second borrow.
         static WASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn GcAllocator>> =
             const { std::cell::Cell::new(None) };
+        /// Installation id of the live box. An [`ActiveGcBox`] only
+        /// uninstalls when this still matches, so dropping an older
+        /// backend cannot clear a newer one on the same thread.
+        static WASM_ACTIVE_GC_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     /// `&mut` access to this thread's GC box, for allocation, write barriers
@@ -1184,13 +1191,22 @@ pub(crate) mod gc_box {
     }
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
-    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) {
+    /// Returns the installation id the matching [`ActiveGcBox`] must present
+    /// to uninstall. A previous box is forgotten, not dropped
+    /// (`replace_singleton_leaking_old`).
+    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> u64 {
+        let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
         WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
+            if let Some(old) = guard.take() {
+                std::mem::forget(old);
+            }
             *guard = Some(gc);
             let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+            WASM_ACTIVE_GC_GEN.with(|slot| slot.set(generation));
         });
+        generation
     }
 
     /// Uninstall this thread's box without freeing its nursery.
@@ -1201,12 +1217,21 @@ pub(crate) mod gc_box {
     /// — a dropped nursery's pages return to the OS and ExtraHeap /
     /// InputArg slabs reuse them, smashing their mutex words.
     pub(crate) fn clear() {
+        WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
         WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
         WASM_ACTIVE_GC.with(|cell| {
             if let Some(gc) = cell.borrow_mut().take() {
                 std::mem::forget(gc);
             }
         });
+    }
+
+    /// [`clear`] only when `generation` is still the live installation.
+    pub(crate) fn clear_if_generation(generation: u64) {
+        let live = WASM_ACTIVE_GC_GEN.with(|slot| slot.get());
+        if live == generation && generation != 0 {
+            clear();
+        }
     }
 }
 
@@ -1312,12 +1337,14 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 
 /// Owns the TLS GC box installed by [`install_gc_box`]. Dropping it
 /// uninstalls the box on this thread (`llmodel.py` `cpu.gc_ll_descr`
-/// dies with the cpu).
-pub(crate) struct ActiveGcBox;
+/// dies with the cpu) only if this guard still owns the slot.
+pub(crate) struct ActiveGcBox {
+    generation: u64,
+}
 
 impl Drop for ActiveGcBox {
     fn drop(&mut self) {
-        gc_box::clear();
+        gc_box::clear_if_generation(self.generation);
     }
 }
 
@@ -1335,9 +1362,9 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    gc_box::store(gc);
+    let generation = gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
-    ActiveGcBox
+    ActiveGcBox { generation }
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
