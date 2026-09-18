@@ -247,6 +247,14 @@ fn compare_value_from_tag_inner(
     if a.is_null() || b.is_null() {
         return Err(null_operand_error("comparison"));
     }
+    // `jit_compare_value_from_tag` is a MayForce residual: a prior getattr
+    // or the force itself can collect, and the C ABI copies are not GC
+    // roots. `pin_root` publishes them and resolves a forwarding stub
+    // before `compare` reads `w_class`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let a = pyre_object::gc_roots::shadow_stack_get(base);
+    let b = pyre_object::gc_roots::shadow_stack_get(base + 1);
     // CONTAINS_OP routes through the compare-residual machinery.
     // `a` is the needle, `b` the container (flatten lowers the args
     // as `[item, container]`).

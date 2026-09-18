@@ -1540,6 +1540,9 @@ pub(crate) unsafe fn subclass_special_override(
     obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     if pyre_object::is_exact_builtin_instance(obj) {
         return None;
     }
@@ -1548,6 +1551,7 @@ pub(crate) unsafe fn subclass_special_override(
     // The builtin layout type for `obj` — the canonical type object for its
     // `ob_type`.  When the MRO resolution matches that type's own slot the
     // method is inherited, not overridden.
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let base = pyre_object::get_instantiate(&*(*obj).ob_type);
     if !base.is_null()
         && let Some(inherited) = lookup_in_type_where(base, name)

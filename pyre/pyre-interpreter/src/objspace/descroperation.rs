@@ -6060,6 +6060,14 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 /// [`try_compare_override`] (`look_inside_graph` / `contains_loop`).
 /// `compare_slot_rest` is the same split for non-int layouts.
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // Livevars across every collection in this body (`try_compare_override`,
+    // `lookup_in_type_where`). The translator would emit `push_roots` for
+    // `w_obj1`/`w_obj2`; a forwarding stub here is what
+    // `subclass_special_override` then reads as `w_class == 0x2`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cmp_base = pyre_object::gc_roots::pin_roots(&[a, b]);
+    let mut a = pyre_object::gc_roots::shadow_stack_get(cmp_base);
+    let mut b = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.
     unsafe {
@@ -6067,6 +6075,8 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
             let w_res = compare_slot(a, b, op)?;
+            a = pyre_object::gc_roots::shadow_stack_get(cmp_base);
+            b = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
@@ -6107,6 +6117,8 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             if let Some(result) = try_compare_override(a, b, op)? {
                 return Ok(result);
             }
+            a = pyre_object::gc_roots::shadow_stack_get(cmp_base);
+            b = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
         }
         // PyPy `descroperation.py:_make_comparison_impl` swaps the operands
         // whenever the right-hand type is a proper subtype, before invoking
