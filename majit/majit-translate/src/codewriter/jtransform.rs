@@ -861,6 +861,20 @@ pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
         || joined.starts_with("std::default")
 }
 
+/// `try_gc_write_barrier` / `try_gc_write_barrier_managed` — the
+/// interpreter stand-in for a raw store. `rewrite.py
+/// handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
+/// `SETFIELD_GC` of a pointer; the hook itself is
+/// `@dont_look_inside` and must not survive as a residual helper.
+/// `try_gc_write_barrier_before_move` is a different op
+/// (`gct_gc_writebarrier_before_move`) and is not this.
+fn is_gc_write_barrier_path(segments: &[String]) -> bool {
+    matches!(
+        segments.last().map(String::as_str),
+        Some("try_gc_write_barrier") | Some("try_gc_write_barrier_managed")
+    )
+}
+
 /// `rtype_const_result` / `rtype_ptr_null` for a Default whose Self
 /// is a known zero: integer, bool, float, or a raw-pointer Ref.
 /// `Ref(None)` is `Vec` / a GC struct and stays residual.
@@ -6047,6 +6061,25 @@ impl<'a> Transformer<'a> {
                 result: op.result.clone(),
                 kind,
             }]);
+        }
+        // `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier`
+        // into a call the rewriter does not keep: `SETFIELD_GC` of a
+        // pointer already grows `COND_CALL_GC_WB`. The explicit hook is
+        // only for the interpreter's raw store; a residual helper here
+        // is the descent wall after a fused allocation.
+        if let CallTarget::FunctionPath { segments } = target
+            && args.len() == 1
+            && is_gc_write_barrier_path(segments)
+        {
+            return if op.result.is_some() {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Bool);
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::ConstBool(true),
+                }])
+            } else {
+                RewriteResult::Replace(vec![])
+            };
         }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
@@ -18608,6 +18641,72 @@ mod tests {
         ) {
             RewriteResult::Keep => {}
             _ => panic!("expected residual Keep for allocating Default"),
+        }
+    }
+
+    /// `handle_write_barrier_setfield` owns the barrier on SETFIELD_GC.
+    /// The explicit hook must not survive as a residual helper.
+    #[test]
+    fn gc_write_barrier_call_is_dropped() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("wb_drop");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier_managed",
+        ]);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![obj.clone()]),
+                result_ty: ValueType::Bool,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&obj),
+            &ValueType::Bool,
+            "wb_drop",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => assert!(ops.is_empty()),
+            _ => panic!("expected empty Replace"),
+        }
+    }
+
+    #[test]
+    fn gc_write_barrier_before_move_stays_residual() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("wb_before_move");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "pyre_object",
+            "gc_hook",
+            "try_gc_write_barrier_before_move",
+        ]);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![obj.clone()]),
+                result_ty: ValueType::Bool,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&obj),
+            &ValueType::Bool,
+            "wb_before_move",
+            &mut graph,
+        ) {
+            RewriteResult::Keep => {}
+            _ => panic!("expected residual Keep for before_move"),
         }
     }
 
