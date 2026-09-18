@@ -7349,9 +7349,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
-        // virtualizable inputarg's ConstPtr.  `pending_vable_ptr` is retained only as
-        // the legacy/test fallback when neither the rebuilt boxes nor their
-        // heap mirror were installed.
+        // virtualizable inputarg's ConstPtr.  When neither the rebuilt
+        // boxes nor their heap mirror were installed, there is no
+        // trace-bound identity to name — do not fall back to the
+        // ambient host seed.
         std::ptr::null()
     }
 
@@ -13329,7 +13330,7 @@ impl<M: Clone> MetaInterp<M> {
     ///    `optimizeopt/unroll.py` peeled-entry LABEL is the JUMP target.
     /// 2. Non-peeled loops — there is no peeled-entry token; the JUMP target
     ///    is the loop's `TreeLoop.inputargs` (`history.py`). Their types
-    ///    live on `root_trace.inputargs[i].tp`.
+    ///    live on `root_trace.inputargs[i].tp.get()`.
     pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;

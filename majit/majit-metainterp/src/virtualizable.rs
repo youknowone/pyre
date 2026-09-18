@@ -509,7 +509,7 @@ impl VirtualizableInfo {
             .collect();
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
         // Identity-keyed on the FieldDescr this vinfo owns, the same
-        // object the codewriter now emits (`pyframe_static_field_descr`).
+        // object the codewriter emits.
         self.static_field_by_descrs = indexmap::IndexMap::new();
         for (i, d) in self._static_field_descrs.iter().enumerate() {
             self.static_field_by_descrs.insert(descr_identity(d), i);

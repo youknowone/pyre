@@ -2446,8 +2446,8 @@ impl<'a> GraphFlattener<'a> {
             )),
             // `flatten.py:365-367` passes AbstractDescr through
             // unchanged.  Pyre routes the `DescrByPtr` to the matching
-            // `DescrOperand` variant via singleton `Arc::ptr_eq` —
-            // see `flatten_descr_by_ptr`.
+            // `DescrOperand` variant via `Arc::ptr_eq` against the
+            // PyFrame vinfo FieldDescrs — see `flatten_descr_by_ptr`.
             SpaceOperationArg::Descr(descr_by_ptr) => flatten_descr_by_ptr(descr_by_ptr),
             // `flatten.py` also passes IndirectCallTargets
             // through unchanged.  `Operand::IndirectCallTargets` takes a
@@ -3257,10 +3257,10 @@ where
 /// Lower a `flow::DescrByPtr` to the matching SSARepr-side
 /// `DescrOperand`.  Two recognition paths:
 ///
-/// 1. `Arc::ptr_eq` against the vable singleton accessors in
-///    `majit_ir::descr` — array_field / array / static_field, emitted
-///    by `record_graph_op` for vable get/setfield + get/setarrayitem
-///    ops (`jtransform.py:846-927`, `:1880-1906`).
+/// 1. `Arc::ptr_eq` against the PyFrame vinfo
+///    `array_field_descrs` / `array_descrs` / `static_field_descrs`,
+///    emitted by `record_graph_op` for vable get/setfield +
+///    get/setarrayitem ops (`jtransform.py:846-927`, `:1880-1906`).
 /// 2. `as_any` downcast to pyre's local [`CallDescrStub`], for graph-
 ///    side `residual_call_*` recorders that thread the
 ///    interned stub via [`intern_call_descr_stub`].  The downcast
@@ -3356,8 +3356,8 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
         }));
     }
     panic!(
-        "flatten_descr_by_ptr: unmapped DescrByPtr {} — only vable \
-         array_field / array / static_field singletons, FieldDescr, and CallDescrStub \
+        "flatten_descr_by_ptr: unmapped DescrByPtr {} — only PyFrame vinfo \
+         array_field / array / static_field descrs, FieldDescr, and CallDescrStub \
          are recognised today",
         descr_ref.repr()
     )

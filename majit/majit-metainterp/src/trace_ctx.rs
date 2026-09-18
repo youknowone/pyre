@@ -1418,8 +1418,7 @@ impl TraceCtx {
     }
 
     /// `fielddescr.get_vinfo()`. Codewriter emits the vinfo's own
-    /// FieldDescr (`pyframe_static_field_descr`), which already holds
-    /// the Weak backref.
+    /// FieldDescr, which already holds the Weak backref.
     fn vinfo_from_fielddescr(
         &self,
         fielddescr: &DescrRef,
