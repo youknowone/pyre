@@ -3187,6 +3187,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
         crate::objspace::descroperation::call_descr_obj_arg,
     );
+    upa1(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
+        "pyre_interpreter::objspace::descroperation::obj_has_binop_shortcut",
+        crate::objspace::descroperation::obj_has_binop_shortcut,
+    );
     cpa1(
         &mut entries,
         "pyre_object::floatobject::jit_w_float_new",
