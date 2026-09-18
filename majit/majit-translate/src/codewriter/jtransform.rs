@@ -606,6 +606,11 @@ pub struct Transformer<'a> {
     /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
     /// reads `op.args[0].concretetype`).
     direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
+    /// Results of a construct-on-stack `PyObject` header ctor rewritten
+    /// to `ConstRefNull`. Nested `ob_type` / `w_class` stores into that
+    /// result are dropped — `rclass.py` embeds `OBJECT` in the instance
+    /// and `rewrite_op_setfield` already ignores `typeptr`.
+    header_stack_results: std::collections::HashSet<crate::flowspace::model::Variable>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -738,6 +743,16 @@ fn is_typeptr_field(field: &FieldDescriptor) -> bool {
         .as_deref()
         .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
     field.name == "ob_type" && owner_leaf == Some("PyObject")
+}
+
+/// Nested `PyObject { ob_type, w_class }` struct literal. The leaf is
+/// the header type; a user function named `PyObject` stays a
+/// `FunctionPath` and is not this.
+fn is_object_header_ctor(target: &CallTarget) -> bool {
+    let CallTarget::SyntheticTransparentCtor { name, .. } = target else {
+        return false;
+    };
+    name.rsplit("::").next() == Some("PyObject")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1635,6 +1650,7 @@ impl<'a> Transformer<'a> {
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
+            header_stack_results: std::collections::HashSet::new(),
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -4799,6 +4815,19 @@ impl<'a> Transformer<'a> {
             });
             return RewriteResult::Replace(Vec::new());
         }
+        // A construct-on-stack `PyObject` header is not a heap object
+        // (`rclass.py` embeds `OBJECT` in the instance). Stores into the
+        // rewritten null stand-in are the header words `new` / the
+        // vtable already stamp.
+        if let OpKind::FieldWrite { base, .. } = &op.kind
+            && self.header_stack_results.contains(base)
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: setfield({}) on stack header → dropped", field.name),
+            });
+            return RewriteResult::Replace(Vec::new());
+        }
         // `jtransform.py rewrite_op_setfield`: `if RESULT is lltype.Void: return`.
         // A unit payload has no register; emitting the store sends it to
         // the assembler with no coloring.
@@ -5564,6 +5593,26 @@ impl<'a> Transformer<'a> {
         // jtransform does not perform name-only matching.
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
+        }
+        // `rclass.py` embeds `OBJECT` in the instance; there is no
+        // `malloc` of a bare header. `front::mir` still emits a
+        // niladic `PyObject` ctor plus `ob_type` / `w_class` stores
+        // (the construct-on-stack header `fuse_boxing_alloc` sweeps
+        // when the parent is `malloc_typed`). Left as a residual it
+        // has no function address, so the descent scan declines on
+        // the symbolic hash. It is not a heap `New` either: both
+        // fields are header words (`heaptracker.is_header_word`) and
+        // an empty field list has no registered tid
+        // (`UnregisteredNewGcType`). Produce a null stand-in; the
+        // header stores are dropped below.
+        if is_object_header_ctor(target) && args.is_empty() {
+            if let Some(res) = op.result.clone() {
+                self.header_stack_results.insert(res);
+            }
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ConstRefNull,
+            }]);
         }
         // The two signedness markers `front::mir` emits for a same-width
         // reinterpret.  Both coerce their input to the result's low-level type
@@ -19108,6 +19157,74 @@ mod tests {
             &target,
             &[arg],
             &ValueType::Ref(None),
+        ));
+    }
+
+    /// `rclass.py` embeds `OBJECT` in the instance. A niladic `PyObject`
+    /// struct literal must not become a residual helper.
+    #[test]
+    fn pyobject_header_ctor_becomes_null_standin() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("header_ctor");
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["pyre_object".into(), "pyobject".into()],
+            "PyObject",
+        );
+        let result_ty = ValueType::Ref(Some("pyre_object::pyobject::PyObject".into()));
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "header_ctor",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::ConstRefNull,
+                        ..
+                    }]
+                ));
+            }
+            _ => panic!("expected ConstRefNull stand-in"),
+        }
+        let w_class = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let store = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: result,
+                field: crate::model::FieldDescriptor::new("w_class", Some("PyObject".into())),
+                value: crate::model::LinkArg::Value(w_class),
+                ty: ValueType::Ref(None),
+            },
+        };
+        match transformer.rewrite_operation(&store, "header_ctor", &mut graph) {
+            RewriteResult::Replace(ops) if ops.is_empty() => {}
+            _ => panic!("expected header store into the stand-in to drop"),
+        }
+    }
+
+    /// A user function named `PyObject` is an ordinary call.
+    #[test]
+    fn pyobject_function_path_is_not_a_header_ctor() {
+        assert!(!super::is_object_header_ctor(&CallTarget::function_path([
+            "mymod",
+            "PyObject",
+        ])));
+        assert!(super::is_object_header_ctor(
+            &CallTarget::synthetic_transparent_ctor("PyObject")
         ));
     }
 
