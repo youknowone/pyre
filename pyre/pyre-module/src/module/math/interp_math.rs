@@ -149,60 +149,14 @@ fn float_repr(val: f64) -> String {
 
 // ── 1-arg float→float via pymath ─────────────────────────────────────
 
-macro_rules! pm1 {
-    ($name:ident) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly one argument"
-                )));
-            }
-            map_err(pymath::math::$name(try_get_double(args[0])?))
-        }
+/// True when pymath's `gamma`/`lgamma` returns a finite `Ok`.
+pub fn math1_gamma_result_finite(x: f64, lgamma: bool) -> bool {
+    let result = if lgamma {
+        pymath::math::lgamma(x)
+    } else {
+        pymath::math::gamma(x)
     };
-}
-
-/// Like `pm1!`, but an `EDOM` result becomes a value-carrying message
-/// ("<prefix>, got <repr>") instead of the generic "math domain error".
-macro_rules! pm1_edom {
-    ($name:ident, $prefix:literal) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly one argument"
-                )));
-            }
-            let val = try_get_double(args[0])?;
-            match pymath::math::$name(val) {
-                Ok(v) => Ok(floatobject::w_float_new(v)),
-                Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
-                    concat!($prefix, ", got {}"),
-                    float_repr(val)
-                ))),
-                Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-                    "math range error",
-                )),
-            }
-        }
-    };
-}
-
-macro_rules! pm1_plain {
-    ($name:ident) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly one argument"
-                )));
-            }
-            Ok(floatobject::w_float_new(pymath::math::$name(
-                try_get_double(args[0])?,
-            )))
-        }
-    };
+    matches!(result, Ok(v) if v.is_finite())
 }
 
 /// Domain pin via pymath; box the pymath success value.  The walker
@@ -676,28 +630,6 @@ pub struct MathFloatFold<Raw: 'static> {
 
 pub type MathFloat1Fold = MathFloatFold<extern "C" fn(f64) -> f64>;
 pub type MathFloat2Fold = MathFloatFold<extern "C" fn(f64, f64) -> f64>;
-
-/// Raw counterpart of a `pm1!`/`pm1_edom!` body: the same `pymath` call, with
-/// every error direction reported as NaN.
-macro_rules! jit_raw1 {
-    ($helper:ident, $name:ident) => {
-        pub extern "C" fn $helper(x: f64) -> f64 {
-            match pymath::math::$name(x) {
-                Ok(v) => v,
-                Err(_) => f64::NAN,
-            }
-        }
-    };
-}
-
-/// Raw counterpart of a `pm1_plain!` body, which has no error direction.
-macro_rules! jit_raw1_plain {
-    ($helper:ident, $name:ident) => {
-        pub extern "C" fn $helper(x: f64) -> f64 {
-            pymath::math::$name(x)
-        }
-    };
-}
 
 macro_rules! jit_raw2 {
     ($helper:ident, $name:ident) => {

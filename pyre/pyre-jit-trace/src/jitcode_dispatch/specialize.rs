@@ -10924,6 +10924,22 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
+    try_walker_orthodox_descent_ex(
+        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None,
+    )
+}
+
+fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    int_args: &[(OpRef, i64)],
+    ref_args: &[(OpRef, pyre_object::PyObjectRef)],
+    float_args: &[(OpRef, f64)],
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+    boxed_out: Option<&mut Option<OpRef>>,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // Resolve every possible decline before recording anything.  Each
     // decline names itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1
     // fired=0` census line can be attributed without a rebuild.
@@ -11031,6 +11047,9 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
             _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
         };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    if let Some(slot) = boxed_out {
+        *slot = Some(result);
+    }
     // `handle_possible_exception`: a successful descent of `//` / `%`
     // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
     // deopts instead of dest-writing NULL into the caller's `+=` slot.
@@ -15449,6 +15468,7 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
                     'r',
                     MathFloatDomain::PositiveFinite,
                     &FLOAT_LOG_DESCENT,
+                    Math1ResultCheck::None,
                 )?
             } else {
                 None
@@ -16052,81 +16072,184 @@ fn try_walker_orthodox_float_trig<Sym: WalkSym>(
         dst_bank,
         MathFloatDomain::Finite,
         descent,
+        Math1ResultCheck::None,
     )
 }
 
-fn math1_result_is_admitted(descent: &HelperDescent, x: f64) -> bool {
-    let y = if std::ptr::eq(descent, &FLOAT_EXP_DESCENT) {
-        x.exp()
-    } else if std::ptr::eq(descent, &FLOAT_EXP2_DESCENT) {
-        x.exp2()
-    } else if std::ptr::eq(descent, &FLOAT_EXPM1_DESCENT) {
-        x.exp_m1()
-    } else if std::ptr::eq(descent, &FLOAT_SINH_DESCENT) {
-        x.sinh()
-    } else if std::ptr::eq(descent, &FLOAT_COSH_DESCENT) {
-        x.cosh()
-    } else if std::ptr::eq(descent, &FLOAT_GAMMA_DESCENT)
-        || std::ptr::eq(descent, &FLOAT_LGAMMA_DESCENT)
-    {
-        if x <= 0.0 && x == x.trunc() {
-            return false;
+#[derive(Clone, Copy)]
+enum Math1ResultCheck {
+    None,
+    Exp,
+    Exp2,
+    Expm1,
+    Sinh,
+    Cosh,
+    Gamma,
+    Lgamma,
+}
+
+impl Math1ResultCheck {
+    fn admits(self, x: f64) -> bool {
+        match self {
+            Self::None => true,
+            Self::Exp => x.exp().is_finite(),
+            Self::Exp2 => x.exp2().is_finite(),
+            Self::Expm1 => x.exp_m1().is_finite(),
+            Self::Sinh => x.sinh().is_finite(),
+            Self::Cosh => x.cosh().is_finite(),
+            Self::Gamma | Self::Lgamma => {
+                if x <= 0.0 && x == x.trunc() {
+                    return false;
+                }
+                pyre_module::module::math::interp_math::math1_gamma_result_finite(
+                    x,
+                    matches!(self, Self::Lgamma),
+                )
+            }
         }
-        return true;
-    } else {
-        return true;
-    };
-    y.is_finite()
+    }
+
+    fn needs_runtime_finite(self) -> bool {
+        !matches!(self, Self::None)
+    }
 }
 
 fn math1_descent_for(
     callable: pyre_object::PyObjectRef,
-) -> Option<(&'static HelperDescent, MathFloatDomain)> {
+) -> Option<(&'static HelperDescent, MathFloatDomain, Math1ResultCheck)> {
     use pyre_module::module::math::interp_math as m;
     if m::is_math_tan_function(callable) {
-        Some((&FLOAT_TAN_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_TAN_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_atan_function(callable) {
-        Some((&FLOAT_ATAN_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_ATAN_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_exp_function(callable) {
-        Some((&FLOAT_EXP_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_EXP_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Exp,
+        ))
     } else if m::is_math_log1p_function(callable) {
-        Some((&FLOAT_LOG1P_DESCENT, MathFloatDomain::GreaterThanMinusOne))
+        Some((
+            &FLOAT_LOG1P_DESCENT,
+            MathFloatDomain::GreaterThanMinusOne,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_asin_function(callable) {
-        Some((&FLOAT_ASIN_DESCENT, MathFloatDomain::AbsLeOne))
+        Some((
+            &FLOAT_ASIN_DESCENT,
+            MathFloatDomain::AbsLeOne,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_acos_function(callable) {
-        Some((&FLOAT_ACOS_DESCENT, MathFloatDomain::AbsLeOne))
+        Some((
+            &FLOAT_ACOS_DESCENT,
+            MathFloatDomain::AbsLeOne,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_sinh_function(callable) {
-        Some((&FLOAT_SINH_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_SINH_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Sinh,
+        ))
     } else if m::is_math_cosh_function(callable) {
-        Some((&FLOAT_COSH_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_COSH_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Cosh,
+        ))
     } else if m::is_math_tanh_function(callable) {
-        Some((&FLOAT_TANH_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_TANH_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_asinh_function(callable) {
-        Some((&FLOAT_ASINH_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_ASINH_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_acosh_function(callable) {
-        Some((&FLOAT_ACOSH_DESCENT, MathFloatDomain::GreaterEqualOne))
+        Some((
+            &FLOAT_ACOSH_DESCENT,
+            MathFloatDomain::GreaterEqualOne,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_atanh_function(callable) {
-        Some((&FLOAT_ATANH_DESCENT, MathFloatDomain::AbsLtOne))
+        Some((
+            &FLOAT_ATANH_DESCENT,
+            MathFloatDomain::AbsLtOne,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_cbrt_function(callable) {
-        Some((&FLOAT_CBRT_DESCENT, MathFloatDomain::Total))
+        Some((
+            &FLOAT_CBRT_DESCENT,
+            MathFloatDomain::Total,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_exp2_function(callable) {
-        Some((&FLOAT_EXP2_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_EXP2_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Exp2,
+        ))
     } else if m::is_math_expm1_function(callable) {
-        Some((&FLOAT_EXPM1_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_EXPM1_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Expm1,
+        ))
     } else if m::is_math_erf_function(callable) {
-        Some((&FLOAT_ERF_DESCENT, MathFloatDomain::Total))
+        Some((
+            &FLOAT_ERF_DESCENT,
+            MathFloatDomain::Total,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_erfc_function(callable) {
-        Some((&FLOAT_ERFC_DESCENT, MathFloatDomain::Total))
+        Some((
+            &FLOAT_ERFC_DESCENT,
+            MathFloatDomain::Total,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_gamma_function(callable) {
-        Some((&FLOAT_GAMMA_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_GAMMA_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Gamma,
+        ))
     } else if m::is_math_lgamma_function(callable) {
-        Some((&FLOAT_LGAMMA_DESCENT, MathFloatDomain::Finite))
+        Some((
+            &FLOAT_LGAMMA_DESCENT,
+            MathFloatDomain::Finite,
+            Math1ResultCheck::Lgamma,
+        ))
     } else if m::is_math_ulp_function(callable) {
-        Some((&FLOAT_ULP_DESCENT, MathFloatDomain::Total))
+        Some((
+            &FLOAT_ULP_DESCENT,
+            MathFloatDomain::Total,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_degrees_function(callable) {
-        Some((&FLOAT_DEGREES_DESCENT, MathFloatDomain::Total))
+        Some((
+            &FLOAT_DEGREES_DESCENT,
+            MathFloatDomain::Total,
+            Math1ResultCheck::None,
+        ))
     } else if m::is_math_radians_function(callable) {
-        Some((&FLOAT_RADIANS_DESCENT, MathFloatDomain::Total))
+        Some((
+            &FLOAT_RADIANS_DESCENT,
+            MathFloatDomain::Total,
+            Math1ResultCheck::None,
+        ))
     } else {
         None
     }
@@ -16141,6 +16264,7 @@ fn try_walker_orthodox_float_math1<Sym: WalkSym>(
     dst_bank: char,
     domain: MathFloatDomain,
     descent: &HelperDescent,
+    result_check: Math1ResultCheck,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
@@ -16158,13 +16282,41 @@ fn try_walker_orthodox_float_math1<Sym: WalkSym>(
     if !domain.admits(&[x]) {
         return Ok(None);
     }
-    if !math1_result_is_admitted(descent, x) {
+    if !result_check.admits(x) {
         return Ok(None);
     }
     let xa =
         walker_coerce_dispatching_operand_to_float(ctx, op_pc, operand, obj, is_int, x, false)?;
     domain.emit_operand_guards(ctx, op_pc, xa)?;
-    try_walker_orthodox_descent(ctx, op_pc, &[], &[], &[(xa, x)], dst, dst_bank, descent)
+    let mut boxed = None;
+    let outcome = try_walker_orthodox_descent_ex(
+        ctx,
+        op_pc,
+        &[],
+        &[],
+        &[(xa, x)],
+        dst,
+        dst_bank,
+        descent,
+        Some(&mut boxed),
+    )?;
+    if result_check.needs_runtime_finite() {
+        let Some(boxed) = boxed else {
+            return Ok(outcome);
+        };
+        walker_guard_descended_float_finite(ctx, op_pc, boxed)?;
+    }
+    Ok(outcome)
+}
+
+fn walker_guard_descended_float_finite<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    boxed: OpRef,
+) -> Result<(), DispatchError> {
+    let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+    let raw = super::walker_unbox_float(ctx, pc, boxed, float_type_addr)?;
+    walker_guard_float_result_finite(ctx, pc, raw)
 }
 
 #[derive(Clone, Copy)]
@@ -16256,7 +16408,8 @@ fn try_walker_orthodox_float_math2<Sym: WalkSym>(
     let ya =
         walker_coerce_dispatching_operand_to_float(ctx, op_pc, y_op, y_obj, y_is_int, y, false)?;
     domain.emit_guards(ctx, op_pc, xa, ya)?;
-    try_walker_orthodox_descent(
+    let mut boxed = None;
+    let outcome = try_walker_orthodox_descent_ex(
         ctx,
         op_pc,
         &[],
@@ -16265,7 +16418,15 @@ fn try_walker_orthodox_float_math2<Sym: WalkSym>(
         dst,
         dst_bank,
         descent,
-    )
+        Some(&mut boxed),
+    )?;
+    if matches!(domain, MathFloat2Domain::Pow) {
+        let Some(boxed) = boxed else {
+            return Ok(outcome);
+        };
+        walker_guard_descended_float_finite(ctx, op_pc, boxed)?;
+    }
+    Ok(outcome)
 }
 
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
@@ -16514,7 +16675,7 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 1) {
         if r_args.len() >= 3 {
-            if let Some((descent, domain)) = math1_descent_for(callable) {
+            if let Some((descent, domain, result_check)) = math1_descent_for(callable) {
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 if try_walker_orthodox_float_math1(
                     ctx,
@@ -16525,6 +16686,7 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
                     'r',
                     domain,
                     descent,
+                    result_check,
                 )?
                 .is_some()
                 {
