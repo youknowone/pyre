@@ -2539,7 +2539,7 @@ fn drive_carrier_finishframe_exception<Sym: WalkSym>(
                 root_ec,
                 root_ec_box,
                 middle,
-                &carrier.recipes[..i],
+                &middles[..i],
                 exc,
                 exc_concrete,
                 catch_target,
