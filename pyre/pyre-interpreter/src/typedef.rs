@@ -527,6 +527,12 @@ pub fn init_typeobjects() {
         // CPython 3.14 Modules/arraymodule.c:array_modexec uses
         // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
         mark_cpython_heap_type(array_type, true);
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                array_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
+        }
         reg.insert(
             &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
             array_type as usize,
@@ -1084,25 +1090,39 @@ pub fn init_typeobjects() {
         );
 
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
+        let bytearray_type = new_typeobject_with_base_and_layout(
+            "bytearray",
+            init_bytearray_type,
+            object_type,
+            &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
+        );
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                bytearray_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
+        }
         reg.insert(
             &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "bytearray",
-                init_bytearray_type,
-                object_type,
-                &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
-            ) as usize,
+            bytearray_type as usize,
         );
 
         // bytes — PyPy: bytesobject.py W_BytesObject, bases=(object,)
+        let bytes_type = new_typeobject_with_base_and_layout(
+            "bytes",
+            init_bytes_type,
+            object_type,
+            &pyre_object::bytesobject::BYTES_TYPE as *const PyType,
+        );
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                bytes_type,
+                Some(pyre_object::TypeDefBuffer::Read),
+            );
+        }
         reg.insert(
             &pyre_object::bytesobject::BYTES_TYPE as *const PyType as usize,
-            new_typeobject_with_base_and_layout(
-                "bytes",
-                init_bytes_type,
-                object_type,
-                &pyre_object::bytesobject::BYTES_TYPE as *const PyType,
-            ) as usize,
+            bytes_type as usize,
         );
 
         // set / frozenset — PyPy: setobject.py, bases=(object,).
@@ -1295,6 +1315,10 @@ pub fn init_typeobjects() {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(memoryview_type, false);
             pyre_object::w_type_set_weakrefable(memoryview_type, true);
+            pyre_object::w_type_set_typedef_buffer(
+                memoryview_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
         }
         reg.insert(
             &pyre_object::memoryview::MEMORYVIEW_TYPE as *const PyType as usize,
@@ -3116,6 +3140,9 @@ fn new_typeobject_with_metatype_and_layout(
             // before publication. W_TypeObject.__init__ consumes the selected
             // Layout.typedef, including when an override reuses a base.
             definition.method_descriptor = method_descriptor;
+            if !parent_layout.is_null() {
+                definition.buffer = (*(*parent_layout).typedef).buffer;
+            }
             pyre_object::lltype::malloc_raw(definition) as *const TypeDef
         } else {
             overridetypedef
