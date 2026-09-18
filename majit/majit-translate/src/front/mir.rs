@@ -5263,7 +5263,7 @@ impl<'a> Lowering<'a> {
         &self,
         inner: &Place,
         elem: &ProjectionElem,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, Option<majit_ir::descr::StructId>)> {
         let leaf_payload = match elem {
             ProjectionElem::Tagged(v) => v.as_object().and_then(|m| m.get("Field"))?,
             _ => return None,
@@ -5280,13 +5280,14 @@ impl<'a> Lowering<'a> {
                 }
                 PlaceKind::Projection(_, ProjectionElem::Tagged(v)) => {
                     let nested_payload = v.as_object().and_then(|m| m.get("Field"))?;
-                    let (owner, nested_name, _, _) = self.resolve_adt_field(nested_payload)?;
+                    let (owner, nested_name, _, owner_id) =
+                        self.resolve_adt_field(nested_payload)?;
                     if matches!(
                         nested_name.as_str(),
                         "int_items" | "float_items" | "bytes_items" | "ascii_items"
-                    ) && owner.ends_with("W_ListObject")
+                    ) && owner == "W_ListObject"
                     {
-                        return Some((owner, format!("{nested_name}.{leaf_name}")));
+                        return Some((owner, format!("{nested_name}.{leaf_name}"), owner_id));
                     }
                     return None;
                 }
@@ -5303,7 +5304,9 @@ impl<'a> Lowering<'a> {
         mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
-        if let Some((owner, flat_name)) = self.flatten_list_storage_field_write(&inner, &elem) {
+        if let Some((owner, flat_name, owner_id)) =
+            self.flatten_list_storage_field_write(&inner, &elem)
+        {
             let list_place = peel_nested_storage_place(inner);
             let base = self.resolve_place(mir_bb, list_place)?;
             let bb_id = self.block_id[mir_bb];
@@ -5311,7 +5314,7 @@ impl<'a> Lowering<'a> {
                 result: None,
                 kind: OpKind::FieldWrite {
                     base,
-                    field: FieldDescriptor::new(flat_name, Some(owner)),
+                    field: FieldDescriptor::new(flat_name, Some(owner)).with_owner_id(owner_id),
                     value,
                     ty: tyref_to_value_type(dest_ty, self.llbc),
                 },

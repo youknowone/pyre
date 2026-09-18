@@ -874,9 +874,9 @@ impl Trace {
     /// `start_fresh = bridge_inputarg_base`. Overlay FrontendSlot
     /// fail_args / resume / concrete — the byte stream does not carry
     /// them. The unique-keyed cache rewrites snapshot / runtime boxes.
-    pub(crate) fn get_iter_for_optimizer(
+    pub(crate) fn get_iter_for_optimizer<A: AsRef<InputArg>>(
         &self,
-        live_inputargs: &[InputArgRc],
+        live_inputargs: &[A],
         start_fresh: u32,
     ) -> Option<(Vec<OpRc>, Vec<InputArgRc>, Vec<Option<Operand>>)> {
         let trb = self.trb.as_ref()?;
@@ -893,29 +893,33 @@ impl Trace {
         }
         debug_assert_eq!(ops.len(), self.slots.len());
 
-        // Reuse the walk's reminted Rc. A second from_type_rc splits box identity.
+        // Reuse the walk's reminted Rc. A second from_type_rc splits box
+        // identity. Stamp FrontendOp value onto those same boxes
+        // (`inputarg_from_tp` is type-only; the value lives on the source).
         for (src, ia) in live_inputargs.iter().zip(iter.inputargs.iter()) {
-            if let Some(value) = src.get_value() {
+            if let Some(value) = src.as_ref().get_value() {
                 ia.set_value(value);
             }
         }
-        let reminted_inputargs = iter.inputargs;
 
         let mut max_unique = 0u32;
         for ia in live_inputargs {
-            max_unique = max_unique.max(ia.opref().raw());
+            max_unique = max_unique.max(ia.as_ref().opref().raw());
         }
         for slot in &self.slots {
             max_unique = max_unique.max(slot.unique);
         }
         let mut unique_cache: Vec<Option<Operand>> = vec![None; (max_unique as usize) + 1];
 
-        for (src, reminted) in live_inputargs.iter().zip(reminted_inputargs.iter()) {
-            let p = src.opref().raw() as usize;
+        // history.py InputArg identity: ByteTraceIter already bound
+        // decoded operands to iter.inputargs. Return those boxes
+        // (compile.py compile_trace / #1839) instead of reminting.
+        for (i, src) in live_inputargs.iter().enumerate() {
+            let p = src.as_ref().opref().raw() as usize;
             if p >= unique_cache.len() {
                 unique_cache.resize(p + 1, None);
             }
-            unique_cache[p] = Some(Operand::from_bound_inputarg(reminted));
+            unique_cache[p] = Some(Operand::from_bound_inputarg(&iter.inputargs[i]));
         }
 
         for (op, slot) in ops.iter().zip(self.slots.iter()) {
@@ -950,7 +954,7 @@ impl Trace {
             op.setfailargs(boxed);
         }
 
-        Some((ops, reminted_inputargs, unique_cache))
+        Some((ops, iter.inputargs, unique_cache))
     }
 
     fn operand_from_unique_cache(&self, r: OpRef, cache: &[Option<Operand>]) -> Operand {
@@ -2118,6 +2122,12 @@ mod tests {
         let fail = ops[1].guard_fail_args().expect("fail_args overlay");
         assert_eq!(fail[0].to_opref(), OpRef::input_arg_int(1000));
         assert_eq!(fail[1].to_opref(), ops[0].pos().get());
+        assert!(
+            cache[0]
+                .as_ref()
+                .is_some_and(|a| a.same_box(&ops[0].arg(0))),
+            "unique_cache must reuse ByteTraceIter inputarg identity"
+        );
         assert_eq!(
             cache[0].as_ref().map(|a| a.to_opref()),
             Some(OpRef::input_arg_int(1000))

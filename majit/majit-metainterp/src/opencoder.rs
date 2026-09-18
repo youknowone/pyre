@@ -763,11 +763,11 @@ impl<'a> ByteTraceIter<'a> {
     /// box's original `get_position()`. Seeding `_cache` from
     /// `trace.inputargs` (the reserved prefix) types a later live Int as
     /// the dead Ref when those lists are zipped by compact index.
-    pub(crate) fn new_with_inputargs(
+    pub(crate) fn new_with_inputargs<A: AsRef<InputArg>>(
         trace: &'a TraceRecordBuffer,
         start: usize,
         end: usize,
-        live_inputargs: &[impl AsRef<InputArg>],
+        live_inputargs: &[A],
         start_fresh: u32,
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);

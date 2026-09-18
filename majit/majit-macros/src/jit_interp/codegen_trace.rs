@@ -647,6 +647,13 @@ fn expr_has_pre_merge_effect(expr: &syn::Expr, reject_macros: bool) -> bool {
         fn visit_expr_yield(&mut self, _: &'ast syn::ExprYield) {
             self.hit = true;
         }
+        fn visit_expr_index(&mut self, node: &'ast syn::ExprIndex) {
+            // `[1, 2][state.pos]` can panic; lower_local cannot
+            // reproduce a non-const index. The compiled back-edge
+            // would drop it.
+            self.hit = true;
+            syn::visit::visit_expr_index(self, node);
+        }
         fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {
             // The closure body does not run at the merge point.
         }
@@ -1148,6 +1155,18 @@ mod find_dispatch_match_tests {
         let block = fn_block(
             "while pos < len {
                 let ignored = if stop { return 7 } else { 0 };
+                jit_merge_point!(driver, program, pc; state);
+                pos = pos + 1;
+            }",
+        );
+        assert!(first_unsupported_pre_merge_stmt(&block).is_some());
+    }
+
+    #[test]
+    fn an_indexed_let_before_merge_is_unsupported() {
+        let block = fn_block(
+            "while pos < len {
+                let ignored = [1, 2][state.pos];
                 jit_merge_point!(driver, program, pc; state);
                 pos = pos + 1;
             }",
