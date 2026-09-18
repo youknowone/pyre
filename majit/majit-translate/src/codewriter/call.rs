@@ -486,7 +486,7 @@ pub fn codewriter_vinfo_from_config(
 /// `is_vtypeptr(VTYPEPTR)` by name: the same path, or one path naming the
 /// other with a module prefix. A bare string suffix is not a match (`Frame`
 /// does not name `OtherFrame`).
-fn names_same_type(a: &str, b: &str) -> bool {
+pub(crate) fn names_same_type(a: &str, b: &str) -> bool {
     let names_tail = |path: &str, tail: &str| {
         path.strip_suffix(tail)
             .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))

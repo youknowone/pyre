@@ -152,13 +152,7 @@ pub(super) fn with_replace_frames<Sym: WalkSym, R>(
         ctx.trace_ctx
             .set_replace_frames(Some(walk), &raw mut data as *mut ());
     }
-    struct ClearReplaceFrames(*mut TraceCtx);
-    impl Drop for ClearReplaceFrames {
-        fn drop(&mut self) {
-            unsafe { (*self.0).clear_replace_frames() };
-        }
-    }
-    let _clear = ClearReplaceFrames(ctx.trace_ctx);
+    let _clear = ctx.trace_ctx.clear_replace_frames_guard();
     f(ctx)
 }
 
