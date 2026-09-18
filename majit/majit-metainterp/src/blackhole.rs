@@ -657,48 +657,65 @@ impl BlackholeInterpreter {
     ///     self.copy_constants(self.registers_i, jitcode.constants_i, jitcode.num_regs_i())
     /// ```
     ///
-    /// Two properties the earlier unconditional `clear()` + `resize()` did not
-    /// have.  A bank already wide enough is reused rather than rebuilt, so the
-    /// registers it holds survive — only `copy_constants` overwrites, and only
-    /// the constants area.  And a jitcode that declares no registers of a kind
-    /// leaves that bank alone instead of emptying it.
-    fn init_register_file_from_i64s(
+    /// Grow only when the bank is too small; `copy` then writes exactly
+    /// `nconsts` entries at `num_regs` (`blackhole.py BlackholeInterpreter.copy_constants`).
+    /// A jitcode that declares no registers of a kind leaves that bank alone.
+    fn init_register_file(
         regs: &mut Vec<i64>,
-        num_regs_and_consts: usize,
-        target_index: usize,
-        constants: impl IntoIterator<Item = i64>,
+        num_regs: usize,
+        nconsts: usize,
+        copy: impl FnOnce(&mut [i64]),
     ) {
-        if num_regs_and_consts == 0 {
+        let need = num_regs + nconsts;
+        if need == 0 {
             return;
         }
-        if regs.len() < num_regs_and_consts {
+        if regs.len() < need {
             regs.clear();
-            regs.resize(num_regs_and_consts, 0);
+            regs.resize(need, 0);
         }
-        // `copy_constants(registers, constants, jitcode.num_regs_*())`.
-        for (i, c) in constants.into_iter().enumerate() {
-            regs[target_index + i] = c;
+        if nconsts != 0 {
+            copy(&mut regs[num_regs..num_regs + nconsts]);
         }
     }
 
+    fn init_register_file_from_i64s(regs: &mut Vec<i64>, num_regs: usize, constants: &[i64]) {
+        Self::init_register_file(regs, num_regs, constants.len(), |dst| {
+            dst.copy_from_slice(constants);
+        });
+    }
+
+    fn init_register_file_from_const_slots_r(
+        regs: &mut Vec<i64>,
+        num_regs: usize,
+        constants: &[majit_translate::jitcode::ConstSlotR],
+    ) {
+        Self::init_register_file(regs, num_regs, constants.len(), |dst| {
+            for (dst, slot) in dst.iter_mut().zip(constants) {
+                *dst = slot.get();
+            }
+        });
+    }
+
     fn init_register_files_from_runtime_jitcode(&mut self, jitcode: &JitCode) {
+        // One `body()` so a same-helper reseat does not pay nine
+        // `OnceLock` walks (`num_regs_*` / `num_regs_and_consts_*` /
+        // `constants_*` each Deref through the body).
+        let body = jitcode.body();
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
-            jitcode.num_regs_and_consts_i(),
-            jitcode.num_regs_i(),
-            jitcode.constants_i.iter().copied(),
+            body.c_num_regs_i as usize,
+            &body.constants_i,
         );
-        Self::init_register_file_from_i64s(
+        Self::init_register_file_from_const_slots_r(
             &mut self.registers_r,
-            jitcode.num_regs_and_consts_r(),
-            jitcode.num_regs_r(),
-            jitcode.constants_r.iter().map(|slot| slot.get()),
+            body.c_num_regs_r as usize,
+            &body.constants_r,
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
-            jitcode.num_regs_and_consts_f(),
-            jitcode.num_regs_f(),
-            jitcode.constants_f.iter().copied(),
+            body.c_num_regs_f as usize,
+            &body.constants_f,
         );
     }
 
@@ -719,43 +736,35 @@ impl BlackholeInterpreter {
         let body = jitcode.body();
         Self::init_register_file_from_i64s(
             &mut self.registers_i,
-            jitcode.num_regs_and_consts_i(),
-            jitcode.num_regs_i(),
-            body.constants_i.iter().copied(),
+            body.c_num_regs_i as usize,
+            &body.constants_i,
         );
-        Self::init_register_file_from_i64s(
+        Self::init_register_file_from_const_slots_r(
             &mut self.registers_r,
-            jitcode.num_regs_and_consts_r(),
-            jitcode.num_regs_r(),
-            body.constants_r.iter().map(|slot| slot.get()),
+            body.c_num_regs_r as usize,
+            &body.constants_r,
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
-            jitcode.num_regs_and_consts_f(),
-            jitcode.num_regs_f(),
-            body.constants_f.iter().copied(),
+            body.c_num_regs_f as usize,
+            &body.constants_f,
         );
         self.reset_position_state(position);
     }
 
-    /// Restore an inline callee frame to the state `Default::default()`
-    /// would have produced, so [`Self::inline_callee_scratch`] can hand the
-    /// same frame to the next `BC_INLINE_CALL` without the sub-jitcode being
-    /// able to tell.  Everything `clone_context_from` and `setposition` will
-    /// overwrite is left alone; everything else this run touched is cleared.
+    /// Restore an inline callee frame so [`Self::inline_callee_scratch`] can
+    /// hand it to the next `BC_INLINE_CALL`.
     ///
-    /// The three register files are zeroed, not just `registers_r`: a fresh
-    /// frame's files are empty `Vec`s that `init_register_file_from_i64s`
-    /// grows with `resize(_, 0)`, so every slot a sub-jitcode does not seed
-    /// reads 0 there and must read 0 here.  `registers_r` additionally must
-    /// not carry a dead reference into the next run —
-    /// [`Self::cleanup_registers`] documents why, and `run` publishes the
-    /// whole file to the collector through `push_bh_regs`.  The `Vec`
-    /// capacities survive, which is the point.
+    /// `blackhole.py BlackholeInterpreter.cleanup_registers` NULLs only the
+    /// first `num_regs_r()` REF registers and `exception_last_value`. It
+    /// never touches int/float registers and never clears constants. The
+    /// earlier whole-bank `fill(0)` wiped the constant area and forced
+    /// [`Self::setposition_ref`] to recopy it on every seating of the same
+    /// helper. Working int/float leftovers are overwritten by the next
+    /// `setposition` + argument copy the same way a pooled interp is.
     pub(crate) fn reset_for_inline_reuse(&mut self) {
-        self.registers_i.fill(0);
-        self.registers_r.fill(0);
-        self.registers_f.fill(0);
+        let n_r = self.jitcode.num_regs_r().min(self.registers_r.len());
+        self.registers_r[..n_r].fill(0);
         self.tmpreg_i = 0;
         self.tmpreg_r = 0;
         self.tmpreg_f = 0;
@@ -834,17 +843,18 @@ impl BlackholeInterpreter {
 
     /// `setposition` without taking the `Arc`.
     ///
-    /// `blackhole.py setposition` always `copy_constants` into the constant
-    /// area, even when the bank is already wide enough for this jitcode.
-    /// Skipping that walk after [`Self::reset_for_inline_reuse`] (which zeros
-    /// the whole file, constants included) leaves residual-call fnaddrs as 0
-    /// on the next seating of the same helper.
+    /// `blackhole.py BlackholeInterpreter.setposition` grows a bank only
+    /// when it is too small, then `copy_constants` of `len(constants)`
+    /// entries at `num_regs_*`. A same-helper reseat after
+    /// [`Self::reset_for_inline_reuse`] does not recopy: that reset no
+    /// longer wipes the constant area, so the previous copy is still
+    /// there (regex `shift` has `constants_* = 0` in any case).
     #[inline]
     pub fn setposition_ref(&mut self, jitcode: &std::sync::Arc<JitCode>, position: usize) {
         if !std::sync::Arc::ptr_eq(&self.jitcode, jitcode) {
             self.jitcode = std::sync::Arc::clone(jitcode);
+            self.init_register_files_from_runtime_jitcode(jitcode);
         }
-        self.init_register_files_from_runtime_jitcode(jitcode);
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
             eprintln!(
@@ -4650,11 +4660,12 @@ mod tests {
             );
         }
 
-        /// `reset_for_inline_reuse` zeros the constant area. `setposition`
-        /// must `copy_constants` again (`blackhole.py setposition`), or the
-        /// next residual call on that helper reads fnaddr 0.
+        /// `reset_for_inline_reuse` must not wipe the constant area.
+        /// `blackhole.py BlackholeInterpreter.cleanup_registers` never
+        /// clears constants, so a same-helper reseat keeps the previous
+        /// `copy_constants` and does not walk the table again.
         #[test]
-        fn setposition_ref_recopies_constants_after_inline_reuse() {
+        fn setposition_ref_keeps_constants_after_inline_reuse() {
             let mut b = JitCodeBuilder::default();
             b.ensure_i_regs(1);
             b.load_const_i_value(0, 0x1234_5678);
@@ -4672,14 +4683,37 @@ mod tests {
             assert_eq!(bh.registers_i[const_index], expected);
             bh.reset_for_inline_reuse();
             assert_eq!(
-                bh.registers_i[const_index], 0,
-                "reuse zeros the constant area"
+                bh.registers_i[const_index], expected,
+                "reuse must not wipe the constant area"
             );
             bh.setposition_ref(&jitcode, 0);
             assert_eq!(
                 bh.registers_i[const_index], expected,
-                "setposition must copy_constants after reset_for_inline_reuse"
+                "same-helper reseat keeps the previous copy_constants"
             );
+        }
+
+        /// A different jitcode still gets `copy_constants` of its own table.
+        #[test]
+        fn setposition_ref_copies_constants_when_the_jitcode_changes() {
+            let mut first = JitCodeBuilder::default();
+            first.ensure_i_regs(1);
+            first.load_const_i_value(0, 0x1111);
+            first.int_return(0);
+            let first = std::sync::Arc::new(first.finish());
+            let mut second = JitCodeBuilder::default();
+            second.ensure_i_regs(1);
+            second.load_const_i_value(0, 0x2222);
+            second.int_return(0);
+            let second = std::sync::Arc::new(second.finish());
+            let first_slot = first.num_regs_i();
+            let second_slot = second.num_regs_i();
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&first, 0);
+            assert_eq!(bh.registers_i[first_slot], 0x1111);
+            bh.setposition_ref(&second, 0);
+            assert_eq!(bh.registers_i[second_slot], 0x2222);
         }
 
         /// `_setup_return_value_i` reads `code[position-1]`, the single
