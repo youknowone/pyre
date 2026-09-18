@@ -3183,6 +3183,11 @@ pub const FLOAT_MATH1_LOG: i64 = 26;
 /// Discovery only: `kind` is a hub parameter, so these arms stay in the graph.
 pub const FLOAT_MATH1_MATH2: i64 = 27;
 pub const FLOAT_MATH1_INT_FROM_FLOAT: i64 = 28;
+pub const FLOAT_MATH1_FREXP: i64 = 29;
+pub const FLOAT_MATH1_FREXP_EXP: i64 = 30;
+pub const FLOAT_MATH1_LDEXP: i64 = 31;
+pub const FLOAT_MATH1_ISQRT: i64 = 32;
+pub const FLOAT_MATH1_ISCLOSE: i64 = 33;
 
 /// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
@@ -3217,6 +3222,11 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_LOG => _float_log(x),
         FLOAT_MATH1_MATH2 => _float_math2(x, x, 0),
         FLOAT_MATH1_INT_FROM_FLOAT => _int_from_float(x, 0),
+        FLOAT_MATH1_FREXP => _float_frexp_mantissa(x),
+        FLOAT_MATH1_FREXP_EXP => _int_frexp_exponent(x),
+        FLOAT_MATH1_LDEXP => _float_ldexp(x, 0),
+        FLOAT_MATH1_ISQRT => _int_isqrt(0),
+        FLOAT_MATH1_ISCLOSE => _float_isclose(x, x),
         _ => _float_abs(x),
     }
 }
@@ -6975,6 +6985,67 @@ int_from_float_leaf!(_int_from_ceil, |x| unsafe {
     x.ceil().to_int_unchecked::<i64>()
 });
 int_from_float_leaf!(_int_from_trunc, |x| unsafe { x.to_int_unchecked::<i64>() });
+
+/// ll_math.py `ll_math_frexp` mantissa half after the walker pins a
+/// normal finite non-zero.  The pair is two leaves because a
+/// `(f64, i64)` return residualizes as an aggregate call.
+float_math1_leaf!(_float_frexp_mantissa, |x| {
+    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
+    let sign = bits & i64::MIN;
+    let fraction = bits & ((1i64 << 52) - 1);
+    unsafe { std::mem::transmute::<i64, f64>(sign | (1022i64 << 52) | fraction) }
+});
+
+/// ll_math.py `ll_math_frexp` exponent half after the same pin.
+int_from_float_leaf!(_int_frexp_exponent, |x| {
+    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
+    let exponent = ((bits >> 52) & 0x7ff) as i64;
+    exponent - 1022
+});
+
+/// ll_math.py `ll_math_ldexp` after the finite-x pin: `x * 2**exp`.
+/// `powf` is the already-lowered `math_pow` leaf; overflow becomes
+/// inf and the walker's finite-result guard resumes in the builtin.
+#[inline(never)]
+pub(crate) fn _float_ldexp(x: f64, exp: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x * 2.0f64.powf(exp as f64),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// app_math.py `isqrt` on a positive machine int that fits an exact
+/// `f64`.  One ulp correction, written as arithmetic so the body
+/// stays branch-free for `fuse_boxing_alloc`.
+#[inline(never)]
+pub(crate) fn _int_isqrt(n: i64) -> PyResult {
+    let guess = unsafe { (n as f64).sqrt().to_int_unchecked::<i64>() };
+    let too_high = i64::from(guess > n / guess);
+    let too_low = i64::from(guess < n / (guess + 1));
+    let root = guess - too_high + too_low;
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: root,
+    }) as PyObjectRef)
+}
+
+/// interp_math.py `isclose` with both keyword tolerances defaulted,
+/// after the walker pins finite operands.  `|` rather than `||` so
+/// the comparison is one expression.
+#[inline(never)]
+pub(crate) fn _float_isclose(a: f64, b: f64) -> PyResult {
+    let diff = (b - a).abs();
+    let close = (a == b) | (diff <= (1e-9 * b).abs()) | (diff <= (1e-9 * a).abs());
+    Ok(w_bool_from(close))
+}
 
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
 #[inline(never)]

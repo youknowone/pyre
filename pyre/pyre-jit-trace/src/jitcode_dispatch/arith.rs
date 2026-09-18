@@ -767,6 +767,55 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
         // first member of RPython's generated unary cast family
         // (`pyjitpl.py:357`) and uses the same concrete operation as
         // `blackhole.py bhimpl_cast_float_to_int`.
+        OpCode::ConvertFloatBytesToLonglong => {
+            let a = read_float_reg(code, op, 0, ctx)?;
+            let result = if let Some(majit_ir::Value::Float(f)) = a.inline_const_to_value()
+                && let Some(majit_ir::Value::Int(n)) =
+                    majit_metainterp::executor::execute_cast_const(
+                        opcode,
+                        majit_ir::Value::Float(f),
+                    ) {
+                ctx.trace_ctx.const_int(n)
+            } else {
+                count_ops_recorded(ctx, opcode);
+                let result = ctx.trace_ctx.record_op(opcode, &[a]);
+                if let Some(majit_ir::Value::Float(f)) = ctx.trace_ctx.box_value(a) {
+                    ctx.trace_ctx
+                        .set_opref_concrete(result, majit_ir::Value::Int(f.to_bits() as i64));
+                }
+                result
+            };
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
+        OpCode::ConvertLonglongBytesToFloat => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = if let Some(majit_ir::Value::Int(n)) = a.inline_const_to_value() {
+                ctx.trace_ctx
+                    .const_float(f64::from_bits(n as u64).to_bits() as i64)
+            } else {
+                count_ops_recorded(ctx, opcode);
+                let result = ctx.trace_ctx.record_op(opcode, &[a]);
+                if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                    ctx.trace_ctx.set_opref_concrete(
+                        result,
+                        majit_ir::Value::Float(f64::from_bits(n as u64)),
+                    );
+                }
+                result
+            };
+            let len = ctx.registers_f.len();
+            let _ = ctx
+                .registers_f
+                .get(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            ctx.registers_f.set(dst, result);
+        }
         OpCode::CastFloatToInt => {
             let a = read_float_reg(code, op, 0, ctx)?;
             let result = if let Some(majit_ir::Value::Float(f)) = a.inline_const_to_value()
@@ -1101,6 +1150,8 @@ regular_record_table! {
         "cast_int_to_float/i>f" => CastIntToFloat,
         "cast_int_to_ptr/i>r" => CastIntToPtr,
         "cast_ptr_to_int/r>i" => CastPtrToInt,
+        "convert_float_bytes_to_longlong/f>i" => ConvertFloatBytesToLonglong,
+        "convert_longlong_bytes_to_float/i>f" => ConvertLonglongBytesToFloat,
     }
     // `ptr_eq` / `ptr_ne` (`pyjitpl.py`): Ref operands, int result. The
     // `instance_ptr_*` pair shares that generated compare loop —

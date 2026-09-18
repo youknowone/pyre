@@ -15180,9 +15180,13 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::from_bits")
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
+            path == "core::f64::<Impl>::from_bits"
+                || path == "std::f64::<Impl>::from_bits"
+                || path.ends_with("::from_bits")
+                || path.contains("from_bits")
+        })
     }
 
     /// `f64::to_bits(self)` — the reverse of [`is_f64_from_bits`].
@@ -15190,9 +15194,13 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::to_bits")
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
+            path == "core::f64::<Impl>::to_bits"
+                || path == "std::f64::<Impl>::to_bits"
+                || path.ends_with("::to_bits")
+                || path.contains("to_bits")
+        })
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the

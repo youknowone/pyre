@@ -4481,6 +4481,22 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "cast_float_to_int",
         ),
         (
+            "pyre_interpreter::objspace::descroperation::_float_frexp_mantissa",
+            "convert_float_bytes_to_longlong",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_frexp_exponent",
+            "convert_float_bytes_to_longlong",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_ldexp",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_isqrt",
+            "cast_float_to_int",
+        ),
+        (
             "pyre_interpreter::objspace::descroperation::_int_abs",
             "int_sub",
         ),
@@ -4506,6 +4522,22 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
         );
         eprintln!("{path} {} ops: {ops:?}", ops.len());
     }
+    // `space.newbool` is a singleton, not a boxed alloc.
+    let isclose = "pyre_interpreter::objspace::descroperation::_float_isclose";
+    let jc = crate::jitcode_runtime::pathed_jitcode(isclose)
+        .unwrap_or_else(|| panic!("{isclose} must be a discovered jitcode"));
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        ops.iter().any(|op| *op == "float_le" || *op == "float_eq"),
+        "{isclose} must record the comparison; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.starts_with("inline_call")),
+        "{isclose} must not inline_call; ops={ops:?}"
+    );
+    eprintln!("{isclose} {} ops: {ops:?}", ops.len());
 }
 
 #[test]

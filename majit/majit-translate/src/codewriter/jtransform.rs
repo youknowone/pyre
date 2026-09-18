@@ -5100,6 +5100,39 @@ impl<'a> Transformer<'a> {
                 }]);
             }
         }
+        // `f64::to_bits` / `from_bits` are `float2longlong` /
+        // `longlong2float`.  Charon residualizes some rustc spellings
+        // as a typed call; project those onto the same llops rfloat.rs
+        // emits for the pair.
+        if is_f64_to_bits_target(target) && args.len() == 1 && matches!(result_ty, ValueType::Int) {
+            let src = resolve_alias(&args[0], &self.aliases);
+            if self.get_value_kind_var(&src) == 'f' || self.get_value_kind_var(&args[0]) == 'f' {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: "convert_float_bytes_to_longlong".into(),
+                        operand: src,
+                        result_ty: ValueType::Int,
+                    },
+                }]);
+            }
+        }
+        if is_f64_from_bits_target(target)
+            && args.len() == 1
+            && matches!(result_ty, ValueType::Float)
+        {
+            let src = resolve_alias(&args[0], &self.aliases);
+            if self.get_value_kind_var(&src) == 'i' || self.get_value_kind_var(&args[0]) == 'i' {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: "convert_longlong_bytes_to_float".into(),
+                        operand: src,
+                        result_ty: ValueType::Float,
+                    },
+                }]);
+            }
+        }
         // `__getslice_rangefrom(l, start)` — the front's deferred `l[start:]`
         // on a GC array.  The rtyper's `rtype_getslice` (`rlist.py`) turns
         // the lifted graph's `getslice` into a direct call of
@@ -9972,6 +10005,29 @@ fn is_float_to_signed_int_leaf(leaf: &str) -> bool {
             | "fixdfdi"
     ) || leaf.contains("fptosi")
         || leaf.ends_with("to_int_unchecked")
+}
+
+fn is_f64_bitcast_leaf(leaf: &str) -> bool {
+    leaf == "to_bits"
+        || leaf == "from_bits"
+        || leaf.contains("to_bits")
+        || leaf.contains("from_bits")
+        || leaf == "transmute"
+        || leaf.ends_with("transmute")
+}
+
+fn is_f64_to_bits_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments } => segments
+            .last()
+            .is_some_and(|leaf| is_f64_bitcast_leaf(leaf)),
+        CallTarget::Method { name, .. } => is_f64_bitcast_leaf(name),
+        _ => false,
+    }
+}
+
+fn is_f64_from_bits_target(target: &CallTarget) -> bool {
+    is_f64_to_bits_target(target)
 }
 
 fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
