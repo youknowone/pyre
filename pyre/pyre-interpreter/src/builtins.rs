@@ -19041,18 +19041,26 @@ pub fn sort_list_in_place(
         // while key and comparison calls can collect.  The receiver is empty
         // for the whole operation, so user code cannot alter this sorting
         // slice through the visible list.
+        //
+        // Pin from the live list, not from a copied Vec: `pin_root` of an
+        // earlier item can collect, and a Vec of pre-collection words would
+        // then re-publish interior pointers. The list's items block is a
+        // real GC root until we clear it, so each getitem sees the forwarded
+        // word. PyPy's `descr_sort` keeps the snapshot in `sorter.list`
+        // (a wrapped list) for the same reason.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
-        let saved = pyre_object::listobject::w_list_items_copy_as_vec_mode(
-            list,
-            majit_metainterp::jit::we_are_jitted(),
-        );
+        let n = pyre_object::listobject::w_list_len(list);
         let _roots = pyre_object::gc_roots::push_roots();
         let item_base = pyre_object::gc_roots::shadow_stack_len();
-        for item in saved {
+        for i in 0..n {
+            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+            let item = pyre_object::listobject::w_list_getitem(list, i as i64)
+                .unwrap_or(pyre_object::PY_NULL);
             let _ = pyre_object::gc_roots::pin_root(item);
         }
         let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         pyre_object::listobject::w_list_clear(list);
         // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
         // as -1. Any resizing mutation replaces the sentinel with a normal
