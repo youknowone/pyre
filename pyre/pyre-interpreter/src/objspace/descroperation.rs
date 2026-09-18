@@ -4237,15 +4237,24 @@ unsafe fn rpy_type_of(obj: PyObjectRef) -> *const PyType {
     (*obj).ob_type
 }
 
-/// Own jitcode: two live `ob_type` words and `ptr_eq`.  Routing through
-/// [`rpy_type_of`] left a call whose getfield encoding compared the
-/// objects themselves (or uninit registers) instead of the typeptrs.
+/// Overlay so the first payload word is a named `i64` field, not
+/// `PyObject.ob_type`.  `handle_getfield_typeptr` rewrites only that
+/// name to `guard_class`; the walk of `guard_class` then residualized
+/// or compared unequal.  `getfield_gc_i` of this word stays `int_eq`.
+#[repr(C)]
+struct TypeptrWord {
+    word: i64,
+}
+
+/// Own jitcode: two live typeptr words and `int_eq`.
 #[inline(never)]
 unsafe fn same_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
     if a.is_null() || b.is_null() {
         return false;
     }
-    std::ptr::eq((*a).ob_type, (*b).ob_type)
+    let ta = (*(a as *const TypeptrWord)).word;
+    let tb = (*(b as *const TypeptrWord)).word;
+    ta == tb
 }
 
 /// `_make_binop_impl` / `_make_comparison_impl` first-arm gate:
