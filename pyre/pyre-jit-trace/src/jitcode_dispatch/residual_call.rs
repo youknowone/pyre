@@ -698,16 +698,23 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
             latchdbg!("origin={origin} mf-preflight");
             return false;
         }
+        // `ctx` is the innermost callee, so its ordinary vstack mirror names
+        // the wrong frame.  Reconstruct frame 0 from the paused caller image
+        // captured at the outermost inline push, exactly where RPython keeps
+        // that root MIFrame's register bank.  An incomplete image is not a
+        // latch: `ABORT_TOO_LONG` with effects cannot decline into replay
+        // (`trace_too_long_abort_safe`), so refuse here and keep recording
+        // until a later step can hand off (`latch_abort_blackhole`).
+        let Some(mirror_stack) = capture_root_parent_resume_stack(ctx) else {
+            latchdbg!("origin={origin} mf-root-parent-stack");
+            return false;
+        };
         FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
             *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
                 framestack,
                 last_exc_value,
                 raising_exception: false,
-                // `ctx` is the innermost callee, so its ordinary vstack mirror
-                // names the wrong frame.  Reconstruct frame 0 from the paused
-                // caller image captured at the outermost inline push, exactly
-                // where RPython keeps that root MIFrame's register bank.
-                mirror_stack: capture_root_parent_resume_stack(ctx),
+                mirror_stack: Some(mirror_stack),
                 origin,
             });
         });
