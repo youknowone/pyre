@@ -3763,15 +3763,10 @@ fn call_with_kwargs_in_ctx_impl(
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
         // The `function`, `memoryview`, `_cffi_backend.buffer`, deque iterator,
-        // and `_lzma` stream
-        // types are non-acceptable-as-base too, but their `tp_new` functions
-        // accept keywords: FunctionType has `kwdefaults=...`, CPython 3.14
-        // exposes `memoryview(object=...)`, PyPy's `MiniBuffer___new__`
-        // accepts `cdata=` and `size=`, the deque iterator constructors
-        // accept (and ignore) `index=...`, both `_lzma` constructors take
-        // `format=`/`preset=`/`filters=`, and `select.kevent` takes the six
-        // `ident=`/`filter=`/`flags=`/`fflags=`/`data=`/`udata=` names.
-        // Route them through `__new__`.
+        // and stream constructors whose `tp_new` Signature binds keywords
+        // (`format=`/`preset=`/`filters=` on `_lzma`, `ident=`/`filter=` on
+        // `select.kevent`) are non-acceptable-as-base too. Route those
+        // through `__new__`.
         // `select` is not built under the sandbox feature, so the kevent arm
         // is answered before the chain rather than inside it.
         #[cfg(not(feature = "sandbox"))]
@@ -3804,8 +3799,7 @@ fn call_with_kwargs_in_ctx_impl(
                 current_type(),
                 crate::module::_contextvars::context_var_type(),
             )
-            || std::ptr::eq(current_type(), crate::module::_lzma::compressor_type())
-            || std::ptr::eq(current_type(), crate::module::_lzma::decompressor_type())
+            || type_new_accepts_keywords(current_type())
             || is_kevent
             || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
@@ -4319,6 +4313,30 @@ fn type_call_vectorcall(
     _kwargs: &[(Wtf8Buf, PyObjectRef)],
 ) -> Option<PyResult> {
     None
+}
+
+/// `gateway.py Signature` on the type's `__new__` — keyword-capable when
+/// it has `**kwargs`, kw-only names, or positional-or-keyword slots.
+/// Types whose `tp_new` is positional-only keep a null Signature.
+fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
+    let Some(new_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }) else {
+        return false;
+    };
+    if !crate::function::is_builtin_code(new_fn) {
+        return false;
+    }
+    let code = unsafe { crate::getcode(new_fn) };
+    if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
+        return false;
+    }
+    let sig = unsafe { (*(code as *const crate::gateway::BuiltinCode)).sig };
+    if sig.is_null() {
+        return false;
+    }
+    let sig = unsafe { &*sig };
+    sig.has_kwarg()
+        || sig.num_kwonlyargnames() > 0
+        || sig.num_argnames() > sig.num_posonlyargnames()
 }
 
 /// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
