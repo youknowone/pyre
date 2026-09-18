@@ -9900,6 +9900,20 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             }
                         }
                         if specialized.is_none() {
+                            if let Some(DispatchOutcome::SubReturn {
+                                result: Some(boxed),
+                            }) = spec_gate(SpecFold::BinaryOpComplex, || {
+                                try_emit_exact_complex_binop(
+                                    ctx, op.pc, op_tag, &r_args, dst, dst_bank,
+                                )
+                            })? {
+                                write_residual_call_result_to_dst(
+                                    ctx, op.pc, dst, dst_bank, boxed,
+                                )?;
+                                return Ok((DispatchOutcome::Continue, op.next_pc));
+                            }
+                        }
+                        if specialized.is_none() {
                             // `str + str` last: every numeric arm above
                             // declines a Ref operand, and `descr_add`
                             // (unicodeobject.py) is the only body left for two

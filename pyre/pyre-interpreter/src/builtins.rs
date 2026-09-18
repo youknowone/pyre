@@ -7371,7 +7371,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
             }
         }
     }
-    let args_list = pyre_object::w_list_new(
+    let args_list = pyre_object::interp_exceptions::w_exception_args_new(
         (0..positional.len())
             .map(|index| pyre_object::gc_roots::shadow_stack_get(base + 1 + index))
             .collect(),
@@ -10181,7 +10181,13 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
     );
     unsafe {
-        let tuple = pyre_object::w_tuple_new(exceptions);
+        // `isinstance` / `issubclass` above can collect.  Rebuild the
+        // tuple from the pinned slots, not the pre-check Vec.
+        let tuple = pyre_object::w_tuple_new(
+            (0..exceptions.len())
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(items + i))
+                .collect(),
+        );
         let _ = pyre_object::gc_roots::pin_root(tuple);
         let tuple_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // `interp_group.py:19-20` — the two attrproperty slots, plus the
@@ -10231,20 +10237,13 @@ enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
     /// `app_group.py _exception_group_projection`'s `resultset`, which upstream
-    /// keeps as an `identity_dict` of the leaf objects.
-    ///
-    /// Addresses stand in for the objects here, and that is sound only because
-    /// every member is an exception: `w_exception_new_empty_impl` allocates one
-    /// through `try_gc_alloc_stable_raw`, the non-moving oldgen, precisely so a
-    /// carrier may hold it as a bare word across allocating code, and
-    /// `check_new_args` refuses a group member that is not a `BaseException`.
-    /// The walk between collecting these and testing the last child runs
-    /// arbitrary Python -- an overridden `derive`, a metaclass
-    /// `__instancecheck__`, a callable condition -- so were a leaf ever
-    /// nursery-allocated, a minor collection there would relocate one not yet
-    /// tested and this set would silently drop it.
-    /// `except_star_projection_gc_roots` is the guard on that invariant.
-    Identity(Vec<usize>),
+    /// keeps as an `identity_dict` of the leaf objects.  A Python list of those
+    /// leaves is the same identity set: the walk between collecting them and
+    /// testing the last child runs arbitrary Python (`derive`, a metaclass
+    /// `__instancecheck__`, a callable condition), so the container must be a
+    /// GC object whose items the collector forwards.  A bare address set
+    /// would drop a nursery-allocated leaf the moment `derive` collected.
+    Identity(PyObjectRef),
 }
 
 impl ExceptionGroupCondition {
@@ -10258,7 +10257,10 @@ impl ExceptionGroupCondition {
                 let result = crate::call::call_function_impl_result(callable, &[exc])?;
                 crate::baseobjspace::is_true(result)
             }
-            Self::Identity(ref addresses) => Ok(addresses.contains(&(exc as usize))),
+            Self::Identity(leaves) => {
+                let items = crate::baseobjspace::fixedview(leaves, -1)?;
+                Ok(items.iter().any(|&leaf| std::ptr::eq(leaf, exc)))
+            }
         }
     }
 }
@@ -10354,9 +10356,17 @@ fn exception_group_derive_and_copy(
 
 fn exception_group_condition_obj(condition: &ExceptionGroupCondition) -> Option<PyObjectRef> {
     match *condition {
-        ExceptionGroupCondition::Class(obj) | ExceptionGroupCondition::Callable(obj) => Some(obj),
-        ExceptionGroupCondition::Identity(_) => None,
+        ExceptionGroupCondition::Class(obj)
+        | ExceptionGroupCondition::Callable(obj)
+        | ExceptionGroupCondition::Identity(obj) => Some(obj),
     }
+}
+
+fn pin_exception_group_children(exceptions: PyObjectRef) -> (usize, usize) {
+    let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
+    let n = items.len();
+    let base = pyre_object::gc_roots::pin_roots(&items);
+    (base, n)
 }
 
 fn pin_exception_group_walk(
@@ -10385,8 +10395,10 @@ fn live_exception_group_condition(
                 cond_slot.expect("callable condition is pinned"),
             ))
         }
-        ExceptionGroupCondition::Identity(ref addresses) => {
-            ExceptionGroupCondition::Identity(addresses.clone())
+        ExceptionGroupCondition::Identity(_) => {
+            ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(
+                cond_slot.expect("identity condition is pinned"),
+            ))
         }
     }
 }
@@ -10404,21 +10416,26 @@ fn exception_group_subgroup_inner(
     }
     let (_, exceptions) = exception_group_fields(w_self())?;
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    // A selected child can be a freshly derived subgroup and the next child
-    // allocates again, so each is pinned as it arrives (`build_list_storage`).
+    // Children are nursery-allocated exceptions.  `derive` (and isinstance)
+    // can collect, so the walk pins the tuple items and reloads each child
+    // after every allocating call.  An unrooted `Vec` copy would keep the
+    // pre-collect address of a later sibling.
+    let (children_base, n_children) = pin_exception_group_children(exceptions);
+    let child = |i| pyre_object::gc_roots::shadow_stack_get(children_base + i);
     let mut selected = pyre_object::gc_roots::RootedItems::new();
     let mut modified = false;
-    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+    for i in 0..n_children {
+        let exc = child(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
             let subgroup = exception_group_subgroup_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
             }
-            if !std::ptr::eq(subgroup, exc) {
+            if !std::ptr::eq(subgroup, child(i)) {
                 modified = true;
             }
-        } else if live_condition().matches(exc)? {
-            selected.push(exc);
+        } else if live_condition().matches(child(i))? {
+            selected.push(child(i));
         } else {
             modified = true;
         }
@@ -10449,11 +10466,16 @@ fn exception_group_split_inner(
     // still recursing and allocating, so every kept child is pinned as it
     // arrives; both sides share one bracket, because two open brackets pin onto
     // the same shadow stack and would read each other's slots back
-    // (`build_list_storage`).
+    // (`build_list_storage`).  The source children are pinned too: `derive`
+    // collects, and a bare tuple-copy would leave the next sibling's address
+    // stale.
+    let (children_base, n_children) = pin_exception_group_children(exceptions);
+    let child = |i| pyre_object::gc_roots::shadow_stack_get(children_base + i);
     let mut kept = pyre_object::gc_roots::RootedItems::new();
     let mut matching_at = Vec::new();
     let mut nonmatching_at = Vec::new();
-    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+    for i in 0..n_children {
+        let exc = child(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
             let (yes, no) = exception_group_split_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(yes) } {
@@ -10464,16 +10486,18 @@ fn exception_group_split_inner(
                 nonmatching_at.push(kept.len());
                 kept.push(no);
             }
-        } else if live_condition().matches(exc)? {
+        } else if live_condition().matches(child(i))? {
             matching_at.push(kept.len());
-            kept.push(exc);
+            kept.push(child(i));
         } else {
             nonmatching_at.push(kept.len());
-            kept.push(exc);
+            kept.push(child(i));
         }
     }
-    let kept_items = kept.take();
-    let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept_items[i]).collect() };
+    // Reload each side from the pinned slots at the moment it is derived.
+    // `derive` collects, so a one-shot `take()` before both calls would
+    // hand the second side the pre-collect addresses of its children.
+    let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept.get(i)).collect() };
     // Deriving one side allocates, so the group derived for the other side is
     // pinned across it.
     let mut derived = pyre_object::gc_roots::RootedItems::new();
@@ -10592,9 +10616,9 @@ fn exception_group_same_metadata(
     })
 }
 
-fn exception_group_collect_leaf_addresses(
+fn exception_group_collect_leaves(
     w_exc: PyObjectRef,
-    addresses: &mut Vec<usize>,
+    leaves: &mut Vec<PyObjectRef>,
 ) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_none(w_exc) } {
         return Ok(());
@@ -10602,13 +10626,16 @@ fn exception_group_collect_leaf_addresses(
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     if crate::baseobjspace::isinstance(w_exc, base_group)? {
         let (_, exceptions) = exception_group_fields(w_exc)?;
-        for child in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
-            exception_group_collect_leaf_addresses(child, addresses)?;
+        let (children_base, n_children) = pin_exception_group_children(exceptions);
+        for i in 0..n_children {
+            exception_group_collect_leaves(
+                pyre_object::gc_roots::shadow_stack_get(children_base + i),
+                leaves,
+            )?;
         }
     } else if unsafe { pyre_object::is_exception(w_exc) } {
-        let address = w_exc as usize;
-        if !addresses.contains(&address) {
-            addresses.push(address);
+        if !leaves.iter().any(|&leaf| std::ptr::eq(leaf, w_exc)) {
+            leaves.push(w_exc);
         }
     } else {
         let name = crate::baseobjspace::object_functionstr_type_name(w_exc);
@@ -10623,12 +10650,17 @@ fn exception_group_projection(
     w_group: PyObjectRef,
     keep: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let mut addresses = Vec::new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut leaves = Vec::new();
     for w_exc in keep.iter().copied() {
-        exception_group_collect_leaf_addresses(w_exc, &mut addresses)?;
+        exception_group_collect_leaves(w_exc, &mut leaves)?;
     }
-    let (matching, _) =
-        exception_group_split_inner(w_group, &ExceptionGroupCondition::Identity(addresses))?;
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(leaves));
+    let (matching, _) = exception_group_split_inner(
+        w_group,
+        &ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(list_slot)),
+    )?;
     Ok(matching)
 }
 

@@ -10793,6 +10793,141 @@ pub(crate) fn try_emit_exact_float_binop<Sym: WalkSym>(
     }))
 }
 
+/// Exact `complex` + `complex` add/sub/mul.  Walking `binary_value_from_tag`
+/// records `w_complex_new` as a bare `object`; residualizing that helper
+/// keeps the type but the compile handoff drops one `n += 1` per assembled
+/// loop.  Emit the unboxed leaf instead: `GuardClass` + `getfield` real/imag
+/// + `float_*` + `NewWithVtable(COMPLEX_TYPE)`.
+pub(crate) fn try_emit_exact_complex_binop<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::BinaryOperator;
+    let op_code = match bin_op {
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => OpCode::FloatAdd,
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => OpCode::FloatSub,
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => OpCode::FloatMul,
+        _ => return Ok(None),
+    };
+    let Some(lhs_obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    let Some(rhs_obj) = walker_concrete_ref_object(ctx, r_args[1]) else {
+        return Ok(None);
+    };
+    if unsafe { !pyre_object::is_complex(lhs_obj) || !pyre_object::is_complex(rhs_obj) } {
+        return Ok(None);
+    }
+    if unsafe {
+        !pyre_object::is_exact_builtin_instance(lhs_obj)
+            || !pyre_object::is_exact_builtin_instance(rhs_obj)
+    } {
+        return Ok(None);
+    }
+    let type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
+    let w_class = pyre_object::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
+    walker_guard_class(ctx, op_pc, r_args[0], type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[0], w_class)?;
+    walker_guard_class(ctx, op_pc, r_args[1], type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, r_args[1], w_class)?;
+    let lhs_real = crate::trace_unbox_float(
+        ctx.trace_ctx,
+        r_args[0],
+        type_addr,
+        crate::descr::complex_real_descr(),
+    );
+    let lhs_imag = crate::trace_unbox_float(
+        ctx.trace_ctx,
+        r_args[0],
+        type_addr,
+        crate::descr::complex_imag_descr(),
+    );
+    let rhs_real = crate::trace_unbox_float(
+        ctx.trace_ctx,
+        r_args[1],
+        type_addr,
+        crate::descr::complex_real_descr(),
+    );
+    let rhs_imag = crate::trace_unbox_float(
+        ctx.trace_ctx,
+        r_args[1],
+        type_addr,
+        crate::descr::complex_imag_descr(),
+    );
+    let ar = unsafe { pyre_object::complexobject::w_complex_get_real(lhs_obj) };
+    let ai = unsafe { pyre_object::complexobject::w_complex_get_imag(lhs_obj) };
+    let br = unsafe { pyre_object::complexobject::w_complex_get_real(rhs_obj) };
+    let bi = unsafe { pyre_object::complexobject::w_complex_get_imag(rhs_obj) };
+    ctx.trace_ctx
+        .set_opref_concrete(lhs_real, majit_ir::Value::Float(ar));
+    ctx.trace_ctx
+        .set_opref_concrete(lhs_imag, majit_ir::Value::Float(ai));
+    ctx.trace_ctx
+        .set_opref_concrete(rhs_real, majit_ir::Value::Float(br));
+    ctx.trace_ctx
+        .set_opref_concrete(rhs_imag, majit_ir::Value::Float(bi));
+    let (raw_real, raw_imag, result_re, result_im) = match op_code {
+        OpCode::FloatAdd => {
+            let re = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatAdd, &[lhs_real, rhs_real]);
+            let im = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatAdd, &[lhs_imag, rhs_imag]);
+            (re, im, ar + br, ai + bi)
+        }
+        OpCode::FloatSub => {
+            let re = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatSub, &[lhs_real, rhs_real]);
+            let im = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatSub, &[lhs_imag, rhs_imag]);
+            (re, im, ar - br, ai - bi)
+        }
+        OpCode::FloatMul => {
+            let arbr = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatMul, &[lhs_real, rhs_real]);
+            let aibi = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatMul, &[lhs_imag, rhs_imag]);
+            let arbi = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatMul, &[lhs_real, rhs_imag]);
+            let aibr = ctx
+                .trace_ctx
+                .record_op(OpCode::FloatMul, &[lhs_imag, rhs_real]);
+            let re = ctx.trace_ctx.record_op(OpCode::FloatSub, &[arbr, aibi]);
+            let im = ctx.trace_ctx.record_op(OpCode::FloatAdd, &[arbi, aibr]);
+            (re, im, ar * br - ai * bi, ar * bi + ai * br)
+        }
+        _ => return Ok(None),
+    };
+    ctx.trace_ctx
+        .set_opref_concrete(raw_real, majit_ir::Value::Float(result_re));
+    ctx.trace_ctx
+        .set_opref_concrete(raw_imag, majit_ir::Value::Float(result_im));
+    let boxed = crate::state::wrapcomplex(ctx.trace_ctx, raw_real, raw_imag);
+    let boxed_ptr = pyre_object::complexobject::w_complex_new(result_re, result_im) as usize;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, majit_ir::Value::Ref(majit_ir::GcRef(boxed_ptr)));
+    let _ = (dst, dst_bank);
+    Ok(Some(DispatchOutcome::SubReturn {
+        result: Some(boxed),
+    }))
+}
+
 fn binary_op_tag_for_helper_name(name: &str) -> Option<i64> {
     use pyre_interpreter::bytecode::BinaryOperator as B;
     let leaf = name.rsplit([':', '.']).next().unwrap_or(name);
@@ -20954,6 +21089,41 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+fn canonical_kind_of_class(
+    cls: pyre_object::PyObjectRef,
+) -> Option<pyre_object::interp_exceptions::ExcKind> {
+    (0..pyre_object::interp_exceptions::EXC_KIND_COUNT).find_map(|disc| {
+        let kind: pyre_object::interp_exceptions::ExcKind =
+            unsafe { std::mem::transmute(disc as u8) };
+        let candidate = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
+        if !candidate.is_null() && std::ptr::eq(candidate, cls) {
+            Some(kind)
+        } else {
+            None
+        }
+    })
+}
+
+fn heap_exc_class_mixes_layouts(cls: pyre_object::PyObjectRef) -> bool {
+    let mro = unsafe { pyre_object::typeobject::w_type_get_mro(cls) };
+    if mro.is_null() {
+        return true;
+    }
+    let mut seen_extended: Option<bool> = None;
+    for &base in unsafe { (*mro).as_slice() } {
+        let Some(kind) = canonical_kind_of_class(base) else {
+            continue;
+        };
+        let extended = pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind);
+        match seen_extended {
+            None => seen_extended = Some(extended),
+            Some(prev) if prev != extended => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Walker-native exception-construction fold.  A
 /// `Type(args)` `CallFn` residual for a canonical builtin exception class or
 /// a heap subclass with the same `__new__` / `__init__` descriptors becomes a
@@ -21032,6 +21202,13 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     let mut subclass_lookups = None;
     let subclass_version_tag = if is_canonical {
         None
+    } else if heap_exc_class_mixes_layouts(concrete_callable) {
+        // `class VS(ValueError, StopIteration)` shares descr_new/descr_init
+        // with every `_new_exception` class, but ValueError is slim and
+        // StopIteration is extended. Folding it as one kind writes the
+        // other layout's extra slots through the instance and corrupts
+        // the adjacent type-9 `args_w` items block.
+        return Ok(None);
     } else {
         // A heap subclass is safe to construct concretely only after both MRO
         // lookups have been proved identical to a canonical exception class.

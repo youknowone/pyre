@@ -15297,6 +15297,17 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+        if let Some(DispatchOutcome::SubReturn {
+            result: Some(boxed),
+        }) = spec_gate(SpecFold::BinaryOpComplex, || {
+            super::specialize::try_emit_exact_complex_binop(
+                ctx, op.pc, op_tag, &ref_args, dst, dst_bank,
+            )
+        })? {
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
+            write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)?;
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
         // Residual BINARY_OP's long/int family. Flatten lands bigint
         // `//` `%` `**` here, so the same folds must fire.
         if let Ok(setup) = inline_fnaddr_call_setup_binary_helper(ctx, op.pc, &int_args, &ref_args)
@@ -15414,11 +15425,10 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         }
     }
 
-    // `w_complex_new` is `malloc_typed` of a header-plus-payload struct.
-    // Walking `binary_value_from_tag` records that allocation as a bare
-    // `object` (`<object object at ...>`), so a compiled `abs(x - y)`
-    // over complexes TypeErrors. Residualize the helper; the real
-    // `complex_sub` builds a `W_ComplexObject`.
+    // Exact complex+complex add/sub/mul is folded above. Mixed or
+    // uncacheable complex still cannot walk `w_complex_new`: that
+    // malloc_typed records as a bare `object`. Residualize so the
+    // runtime `complex_sub` builds a `W_ComplexObject`.
     if is_binary_from_tag
         && ref_args.len() == 2
         && ref_args.iter().any(|&operand| {
