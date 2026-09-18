@@ -6847,6 +6847,32 @@ pub(crate) fn module_shadow_info(
 }
 
 pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+    // Module.descr_getattribute → object_getattribute → getdictvalue
+    // (`module.py getdictvalue` is finditem_str(self.w_dict, attr)).
+    // Spelled here so the walk does not enter getattr_str_impl: force()
+    // and pin_root are effects, and every dont_look_inside after them is
+    // after-effect.  A custom `__getattribute__`, a data descriptor, or a
+    // dict miss stays on import_from_slow (full getattr + sys.modules).
+    if unsafe { pyre_object::is_module(module) } {
+        let w_type = unsafe { (*module).w_class };
+        if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_none()
+            && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, name) }
+        {
+            let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+            if !dict.is_null()
+                && let Some(value) = crate::baseobjspace::finditem_str(dict, name)?
+            {
+                return Ok(value);
+            }
+        }
+    }
+    import_from_slow(module, name)
+}
+
+/// pyopcode.py import_from after the module-dict hit: full getattr,
+/// then the sys.modules submodule fallback and ImportError.
+#[majit_macros::dont_look_inside]
+fn import_from_slow(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     // pyopcode.py import_from — first `space.getattr(w_module, w_name)`,
     // which honours the module attribute protocol (`__getattribute__` /
     // `__getattr__`).  Only an AttributeError falls through to the
@@ -7364,6 +7390,19 @@ mod tests {
         assert_eq!(module_is_package_no_callback(module), Some(true));
         unsafe { pyre_object::w_dict_delitem_str(dict, "__path__") };
         assert_eq!(module_is_package_no_callback(module), Some(false));
+    }
+
+    #[test]
+    fn import_from_reads_exact_module_dict() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_from_dict_mod");
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        let value = pyre_object::w_int_new(3);
+        unsafe { pyre_object::w_dict_setitem_str(dict, "pi", value) };
+        let got = import_from(module, "pi").unwrap();
+        assert!(unsafe { pyre_object::is_int(got) });
+        assert_eq!(unsafe { pyre_object::w_int_get_value(got) }, 3);
     }
 
     #[test]
