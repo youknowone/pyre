@@ -267,7 +267,14 @@ pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
         unsafe { pyre_object::w_type_set_weakrefable(tp, true) };
         // A view dropped by the collector never reaches `__release_buffer__`,
         // so the buffer layer needs a way back here to drop the count.
-        unsafe { pyre_object::buffer::set_external_release_hook(mmap_exports_decref) };
+        unsafe {
+            pyre_object::buffer::set_external_buffer_exporter(
+                mmap_external_buffer_view,
+                mmap_exports_incref,
+                mmap_exports_decref,
+                has_mmap_layout,
+            );
+        }
         tp as usize
     }) as pyre_object::PyObjectRef
 }
@@ -646,11 +653,24 @@ fn mmap_check_exports(obj: pyre_object::PyObjectRef, message: &str) -> Result<()
 /// object-space buffer protocol.  `None` means the object is not an mmap;
 /// the inner error preserves the closed-mapping failure.
 #[cfg(any(unix, windows))]
+fn mmap_external_buffer_view(
+    obj: pyre_object::PyObjectRef,
+) -> Option<Result<(usize, usize, bool), &'static str>> {
+    match mmap_buffer_view(obj) {
+        None => None,
+        Some(Ok(view)) => Some(Ok(view)),
+        Some(Err(_)) => Some(Err("mmap closed or invalid")),
+    }
+}
+
+/// `W_MMap.readbuf_w` / `writebuf_w` — expose the live mapping to the
+/// object-space buffer protocol.  `None` means the object is not an mmap;
+/// the inner error preserves the closed-mapping failure.
+#[cfg(any(unix, windows))]
 pub(crate) fn mmap_buffer_view(
     obj: pyre_object::PyObjectRef,
 ) -> Option<Result<(usize, usize, bool), crate::PyError>> {
-    let w_type = crate::typedef::r#type(obj)?;
-    if !std::ptr::eq(w_type.as_ptr(), mmap_type()) {
+    if !is_mmap(obj) {
         return None;
     }
     Some(mmap_ptr(obj).map(|(ptr, len)| {
