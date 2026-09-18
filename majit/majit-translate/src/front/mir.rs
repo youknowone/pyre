@@ -10692,10 +10692,10 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Opaque `f64::{hypot,atan2,copysign,floor,ceil,powf,ln,
-                // exp,sin,cos,tan,sqrt,log10,asin,acos,atan,sinh,cosh,
-                // tanh,asinh,acosh,atanh,exp_m1,ln_1p}` are the C
-                // llexternals in `ll_math.py` (`math_hypot`, …).  The
-                // raising wrappers (`ll_math_hypot`, …) stay around them.
+                // exp,sin,cos,sqrt,log10,atan,tan,asin,acos,…}` are the C
+                // llexternals in `ll_math.py` (`math_hypot`, …), listed by
+                // `ll_math::f64_method_llexternal`.  The raising wrappers
+                // (`ll_math_hypot`, …) stay around them.
                 if let Some((arity, leaf)) = self.f64_ll_math_leaf(&reg)
                     && args.len() == arity
                 {
@@ -15118,33 +15118,7 @@ impl<'a> Lowering<'a> {
         let leaf = path
             .strip_prefix("core::f64::<Impl>::")
             .or_else(|| path.strip_prefix("std::f64::<Impl>::"))?;
-        Some(match leaf {
-            "hypot" => (2, "math_hypot"),
-            "atan2" => (2, "math_atan2"),
-            "copysign" => (2, "math_copysign"),
-            "powf" => (2, "math_pow"),
-            "floor" => (1, "math_floor"),
-            "ceil" => (1, "math_ceil"),
-            "ln" => (1, "math_log"),
-            "exp" => (1, "math_exp"),
-            "sin" => (1, "math_sin"),
-            "cos" => (1, "math_cos"),
-            "tan" => (1, "math_tan"),
-            "sqrt" => (1, "math_sqrt"),
-            "log10" => (1, "math_log10"),
-            "asin" => (1, "math_asin"),
-            "acos" => (1, "math_acos"),
-            "atan" => (1, "math_atan"),
-            "sinh" => (1, "math_sinh"),
-            "cosh" => (1, "math_cosh"),
-            "tanh" => (1, "math_tanh"),
-            "asinh" => (1, "math_asinh"),
-            "acosh" => (1, "math_acosh"),
-            "atanh" => (1, "math_atanh"),
-            "exp_m1" => (1, "math_expm1"),
-            "ln_1p" => (1, "math_log1p"),
-            _ => return None,
-        })
+        crate::translator::rtyper::lltypesystem::module::ll_math::f64_method_llexternal(leaf)
     }
 
     /// `f64::is_finite(self)` — `core` has no graph body (Opaque), so the
@@ -26969,6 +26943,13 @@ fn static_key_matches(full: &str, stripped: &str, key: &str) -> bool {
 /// lowers to (mirroring `rfloat.INFINITY` reaching the flow graph as a
 /// float `Constant`).  Matches on the `f64::<Impl>::<NAME>` tail so a
 /// `core`- or `std`-rooted path resolves identically.
+///
+/// `f64::consts::<NAME>` reaches the same dead end for the same reason:
+/// the `NamedConst` has no address and its initializer lives in `core`,
+/// which is outside the extraction set, so `fold_named_const_global`
+/// finds nothing to fold and the read would otherwise become a nullary
+/// residual call on the constant's own path.  `math.pi` is a float
+/// `Constant` in the flow graph upstream, and so is this.
 fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
     let tail: Vec<&str> = segments
         .iter()
@@ -26979,9 +26960,39 @@ fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
         .collect();
     let bits = match tail.as_slice() {
         ["f64", "<Impl>", "INFINITY"] => f64::INFINITY.to_bits(),
+        ["f64", "consts", name] => float_consts_value(name)?.to_bits(),
         _ => return None,
     };
     Some(OpKind::ConstFloat(bits))
+}
+
+/// The value `core::f64::consts::<NAME>` holds.  Spelled through the host's
+/// own definitions so the bit pattern is the one rustc would have inlined at
+/// the use site.
+fn float_consts_value(name: &str) -> Option<f64> {
+    use std::f64::consts;
+    Some(match name {
+        "PI" => consts::PI,
+        "TAU" => consts::TAU,
+        "E" => consts::E,
+        "SQRT_2" => consts::SQRT_2,
+        "LN_2" => consts::LN_2,
+        "LN_10" => consts::LN_10,
+        "LOG2_E" => consts::LOG2_E,
+        "LOG10_E" => consts::LOG10_E,
+        "LOG2_10" => consts::LOG2_10,
+        "LOG10_2" => consts::LOG10_2,
+        "FRAC_1_PI" => consts::FRAC_1_PI,
+        "FRAC_2_PI" => consts::FRAC_2_PI,
+        "FRAC_1_SQRT_2" => consts::FRAC_1_SQRT_2,
+        "FRAC_2_SQRT_PI" => consts::FRAC_2_SQRT_PI,
+        "FRAC_PI_2" => consts::FRAC_PI_2,
+        "FRAC_PI_3" => consts::FRAC_PI_3,
+        "FRAC_PI_4" => consts::FRAC_PI_4,
+        "FRAC_PI_6" => consts::FRAC_PI_6,
+        "FRAC_PI_8" => consts::FRAC_PI_8,
+        _ => return None,
+    })
 }
 
 /// Target-layout value of the scalar GcArray's items offset.  Charon leaves
@@ -30511,9 +30522,10 @@ mod tests {
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
         int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, push_cast_ptr_to_int,
-        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_value_type,
+        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, primitive_float_const,
+        push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_to_value_type,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -40673,5 +40685,38 @@ mod tests {
             )),
             "w_method_new must lower the range loop through the native next op"
         );
+    }
+
+    #[test]
+    fn primitive_float_const_folds_infinity_and_f64_named_consts() {
+        match primitive_float_const(&[
+            "core".into(),
+            "f64".into(),
+            "<Impl>".into(),
+            "INFINITY".into(),
+        ]) {
+            Some(OpKind::ConstFloat(bits)) => assert_eq!(bits, f64::INFINITY.to_bits()),
+            other => panic!("expected ConstFloat(INFINITY), got {other:?}"),
+        }
+        match primitive_float_const(&["std".into(), "f64".into(), "consts".into(), "PI".into()]) {
+            Some(OpKind::ConstFloat(bits)) => {
+                assert_eq!(bits, std::f64::consts::PI.to_bits())
+            }
+            other => panic!("expected ConstFloat(PI), got {other:?}"),
+        }
+        match primitive_float_const(&["core".into(), "f64".into(), "consts".into(), "E".into()]) {
+            Some(OpKind::ConstFloat(bits)) => assert_eq!(bits, std::f64::consts::E.to_bits()),
+            other => panic!("expected ConstFloat(E), got {other:?}"),
+        }
+        assert!(
+            primitive_float_const(&[
+                "core".into(),
+                "f64".into(),
+                "consts".into(),
+                "NO_SUCH".into()
+            ])
+            .is_none()
+        );
+        assert!(primitive_float_const(&["unrelated".into()]).is_none());
     }
 }

@@ -655,84 +655,51 @@ pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
     x.hypot(y)
 }
 
-/// `ll_math.py` C llexternals for Opaque
-/// `f64::{ln,exp,sin,cos,tan,powf,sqrt,log10,asin,acos,atan,sinh,cosh,
-/// tanh,asinh,acosh,atanh,exp_m1,ln_1p}`.
+/// `ll_math.py` C llexternals for the Opaque `f64` inherent methods
+/// `ll_math::f64_method_llexternal` names.
 /// IEEE, no raise — the `ll_math_*` wrappers stay around them.
-pub extern "C" fn jit_math_log_raw(x: f64) -> f64 {
-    x.ln()
+macro_rules! jit_math_raw1 {
+    ($($helper:ident => $method:ident),* $(,)?) => {
+        $(
+            pub extern "C" fn $helper(x: f64) -> f64 {
+                x.$method()
+            }
+        )*
+    };
 }
 
-pub extern "C" fn jit_math_exp_raw(x: f64) -> f64 {
-    x.exp()
-}
-
-pub extern "C" fn jit_math_sin_raw(x: f64) -> f64 {
-    x.sin()
-}
-
-pub extern "C" fn jit_math_cos_raw(x: f64) -> f64 {
-    x.cos()
-}
-
-pub extern "C" fn jit_math_tan_raw(x: f64) -> f64 {
-    x.tan()
-}
-
-pub extern "C" fn jit_math_asin_raw(x: f64) -> f64 {
-    x.asin()
-}
-
-pub extern "C" fn jit_math_acos_raw(x: f64) -> f64 {
-    x.acos()
-}
-
-pub extern "C" fn jit_math_atan_raw(x: f64) -> f64 {
-    x.atan()
-}
-
-pub extern "C" fn jit_math_sinh_raw(x: f64) -> f64 {
-    x.sinh()
-}
-
-pub extern "C" fn jit_math_cosh_raw(x: f64) -> f64 {
-    x.cosh()
-}
-
-pub extern "C" fn jit_math_tanh_raw(x: f64) -> f64 {
-    x.tanh()
-}
-
-pub extern "C" fn jit_math_asinh_raw(x: f64) -> f64 {
-    x.asinh()
-}
-
-pub extern "C" fn jit_math_acosh_raw(x: f64) -> f64 {
-    x.acosh()
-}
-
-pub extern "C" fn jit_math_atanh_raw(x: f64) -> f64 {
-    x.atanh()
-}
-
-pub extern "C" fn jit_math_expm1_raw(x: f64) -> f64 {
-    x.exp_m1()
-}
-
-pub extern "C" fn jit_math_log1p_raw(x: f64) -> f64 {
-    x.ln_1p()
+jit_math_raw1! {
+    jit_math_log_raw => ln,
+    jit_math_log10_raw => log10,
+    jit_math_log1p_raw => ln_1p,
+    jit_math_exp_raw => exp,
+    jit_math_exp2_raw => exp2,
+    jit_math_expm1_raw => exp_m1,
+    jit_math_sqrt_raw => sqrt,
+    jit_math_cbrt_raw => cbrt,
+    jit_math_sin_raw => sin,
+    jit_math_cos_raw => cos,
+    jit_math_tan_raw => tan,
+    jit_math_asin_raw => asin,
+    jit_math_acos_raw => acos,
+    jit_math_atan_raw => atan,
+    jit_math_sinh_raw => sinh,
+    jit_math_cosh_raw => cosh,
+    jit_math_tanh_raw => tanh,
+    jit_math_asinh_raw => asinh,
+    jit_math_acosh_raw => acosh,
+    jit_math_atanh_raw => atanh,
 }
 
 pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
-pub extern "C" fn jit_math_sqrt_raw(x: f64) -> f64 {
-    x.sqrt()
-}
-
-pub extern "C" fn jit_math_log10_raw(x: f64) -> f64 {
-    x.log10()
+/// The C `fmod` llexternal, which is also what `%` over two floats lowers
+/// to: `lloperation.py` has no `float_mod`, so the codewriter emits a
+/// residual call of this name instead.
+pub extern "C" fn jit_math_fmod_raw(x: f64, y: f64) -> f64 {
+    x % y
 }
 
 /// Raw `math.isclose(a, b)` with both keyword tolerances left at their
