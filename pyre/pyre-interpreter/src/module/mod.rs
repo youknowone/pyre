@@ -71,8 +71,6 @@ pub mod msvcrt;
 pub mod operator;
 pub mod posix;
 pub mod pypyjit;
-#[cfg(not(feature = "sandbox"))]
-pub mod select;
 #[allow(non_snake_case)]
 pub mod signal;
 #[allow(non_snake_case)]

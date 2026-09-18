@@ -96,12 +96,33 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
+    #[cfg(not(feature = "sandbox"))]
+    pyre_interpreter::importing::register_builtin_module("select", module::select::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
     pyre_interpreter::importing::register_builtin_module("unicodedata", module::unicodedata::init);
     pyre_interpreter::importing::register_builtin_module("zlib", module::zlib::init);
+}
+
+/// Immortal `#[pyre_class]` types allocated through `allocate`.  The
+/// collector never walks them, so `build_gc` only registers their
+/// `w_class` offset.  `select` is compiled out of a sandbox build
+/// (`module/mod.rs`'s `pub mod select`), so its descriptors carry that
+/// gate too.
+pub fn all_immortal_w_class_only_descriptors()
+-> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
+    #[allow(unused_imports)]
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    vec![
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        <module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        <module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        <module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
+    ]
 }
 
 /// Install [`install_optional_modules`] as the interpreter's optional-module hook.
@@ -415,6 +436,18 @@ mod tests {
     /// process-global fnaddr table. The prepass reads the same table
     /// from a host copy of this crate; a missing row here is the same
     /// defect as a build script that forgot to link `pyre-module`.
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_select_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings
+                .contains_key("pyre_module::module::select::interp_select::__majit_wrap_register"),
+            "moved select #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
     #[test]
     fn jit_trace_fnaddrs_covers_moved_lzma_wrapper() {
         let bindings: HashMap<&'static str, i64> =

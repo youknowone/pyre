@@ -18,7 +18,7 @@ use pyre_object::PyObjectRef;
 #[cfg(all(target_os = "macos", feature = "host_env"))]
 // CPython 3.14 Modules/selectmodule.c:select_exec creates
 // kqueue_queue_Type_spec as a mutable module heap type.
-#[crate::pyre_class("select.kqueue", cpython_mutable)]
+#[pyre_interpreter::pyre_class("select.kqueue", cpython_mutable)]
 pub struct W_Kqueue {
     kqfd: i32,
 }
@@ -34,16 +34,16 @@ impl Default for W_Kqueue {
 }
 
 #[cfg(all(target_os = "macos", feature = "host_env"))]
-#[crate::pyre_methods(doc = "kqueue() -> kqueue object")]
+#[pyre_interpreter::pyre_methods(doc = "kqueue() -> kqueue object")]
 impl W_Kqueue {
     /// `interp_kqueue.py descr__new__` — opens a fresh kqueue fd,
     /// clearing its inheritable flag.
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         let kqfd = unsafe { libc::kqueue() };
         if kqfd < 0 {
             let e = std::io::Error::last_os_error();
-            return Err(crate::PyError::os_error_with_errno(
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
                 e.raw_os_error().unwrap_or(0),
                 format!("kqueue: {e}"),
             ));
@@ -74,9 +74,9 @@ impl W_Kqueue {
         self.kqfd < 0
     }
 
-    fn fileno(&self) -> Result<i64, crate::PyError> {
+    fn fileno(&self) -> Result<i64, pyre_interpreter::PyError> {
         if self.kqfd < 0 {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "I/O operation on closed kqueue fd",
             ));
         }
@@ -101,14 +101,14 @@ impl W_Kqueue {
         w_changelist: PyObjectRef,
         max_events: i64,
         #[default(pyre_object::w_none())] w_timeout: PyObjectRef,
-    ) -> Result<PyObjectRef, crate::PyError> {
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         if self.kqfd < 0 {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "I/O operation on closed kqueue fd",
             ));
         }
         if max_events < 0 {
-            return Err(crate::PyError::value_error(format!(
+            return Err(pyre_interpreter::PyError::value_error(format!(
                 "Length of eventlist must be 0 or positive, got {max_events}"
             )));
         }
@@ -117,10 +117,12 @@ impl W_Kqueue {
         let mut changelist: Vec<libc::kevent> = Vec::new();
         if !unsafe { pyre_object::is_none(w_changelist) } {
             // `interp_kqueue.py:179` — space.listview accepts any iterable.
-            let items = crate::baseobjspace::unpackiterable(w_changelist, -1)?;
+            let items = pyre_interpreter::baseobjspace::unpackiterable(w_changelist, -1)?;
             for item in items {
                 let ev = W_Kevent::from_obj(item).ok_or_else(|| {
-                    crate::PyError::type_error("arg 1 must be a sequence of kevent objects")
+                    pyre_interpreter::PyError::type_error(
+                        "arg 1 must be a sequence of kevent objects",
+                    )
                 })?;
                 changelist.push(libc::kevent {
                     ident: ev.ident as libc::uintptr_t,
@@ -138,10 +140,10 @@ impl W_Kqueue {
         let have_timeout = !unsafe { pyre_object::is_none(w_timeout) };
         if have_timeout {
             // `interp_kqueue.py:187` — space.float_w honours __float__.
-            let w_secs = crate::builtins::builtin_float(&[w_timeout])?;
+            let w_secs = pyre_interpreter::builtins::builtin_float(&[w_timeout])?;
             let secs = unsafe { pyre_object::w_float_get_value(w_secs) };
             if secs < 0.0 {
-                return Err(crate::PyError::value_error(format!(
+                return Err(pyre_interpreter::PyError::value_error(format!(
                     "Timeout must be None or >= 0, got {secs}"
                 )));
             }
@@ -168,7 +170,7 @@ impl W_Kqueue {
             None
         };
         let nfds = loop {
-            let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+            let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
                 libc::kevent(
                     self.kqfd,
                     pchangelist,
@@ -184,7 +186,7 @@ impl W_Kqueue {
             if errno == libc::EINTR {
                 // `interp_kqueue.py:223-226` — deliver a pending signal, then
                 // retry with the remaining timeout recomputed.
-                crate::module::signal::interp_signal::checksignals_now()?;
+                pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                 if let Some(dl) = deadline {
                     let now = std::time::Instant::now();
                     let rem = if now >= dl {
@@ -198,7 +200,7 @@ impl W_Kqueue {
                 continue;
             }
             let e = std::io::Error::from_raw_os_error(errno);
-            return Err(crate::PyError::os_error_with_errno(
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
                 errno,
                 format!("kevent: {e}"),
             ));

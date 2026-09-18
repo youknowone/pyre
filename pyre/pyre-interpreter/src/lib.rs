@@ -1111,19 +1111,9 @@ pub fn all_w_class_only_descriptors() -> Vec<&'static pyre_object::lltype::PyreC
 /// gate this crate spells exactly.
 pub fn all_immortal_w_class_only_descriptors()
 -> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
-    #[allow(unused_imports)]
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    vec![
-        // `select` is compiled out of a sandbox build (`module/mod.rs`'s
-        // `pub mod select`), so
-        // its descriptors carry that gate too.
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
-    ]
+    // `select.poll` / `kqueue` / `kevent` live on the optional-module
+    // crate; `pyre_module::all_immortal_w_class_only_descriptors` lists them.
+    vec![]
 }
 
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.

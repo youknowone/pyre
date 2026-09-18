@@ -3948,7 +3948,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Their immortal counterparts take no type id — the collector never walks
     // an `allocate`d object — so only the immortal-root walker's offset
     // registry learns the edge.
-    for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors() {
+    for descriptor in pyre_interpreter::all_immortal_w_class_only_descriptors()
+        .into_iter()
+        .chain(pyre_module::all_immortal_w_class_only_descriptors())
+    {
         pyre_object::gc_hook::register_pyre_class_offsets(
             descriptor.pytype_ptr as usize,
             descriptor.ptr_offsets,

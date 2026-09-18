@@ -13,7 +13,7 @@ use pyre_object::PyObjectRef;
 #[cfg(all(unix, feature = "host_env"))]
 // CPython 3.14 Modules/selectmodule.c:select_exec uses
 // PyType_FromModuleAndSpec; poll_Type_spec is a mutable heap type.
-#[crate::pyre_class("select.poll", cpython_mutable)]
+#[pyre_interpreter::pyre_class("select.poll", cpython_mutable)]
 #[derive(Default)]
 pub struct Poll {
     fddict: std::collections::HashMap<i32, i16>,
@@ -29,28 +29,31 @@ fn default_poll_events() -> i16 {
 /// Resolve a Python fd argument (int or object with `fileno()`) to a
 /// raw descriptor — `space.c_filedescriptor_w`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
-pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError> {
+pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, pyre_interpreter::PyError> {
     unsafe {
         // A real int (or int subclass / bignum) is taken directly; otherwise
         // `fileno()` is called.  An object with only `__int__` is rejected.
         let w_int = if pyre_object::is_int_or_long(w_fd) {
             w_fd
         } else {
-            let fileno = crate::baseobjspace::getattr_str(w_fd, "fileno").map_err(|_| {
-                crate::PyError::type_error("argument must be an int, or have a fileno() method.")
-            })?;
-            let res = crate::call::call_function_impl_result(fileno, &[])?;
+            let fileno =
+                pyre_interpreter::baseobjspace::getattr_str(w_fd, "fileno").map_err(|_| {
+                    pyre_interpreter::PyError::type_error(
+                        "argument must be an int, or have a fileno() method.",
+                    )
+                })?;
+            let res = pyre_interpreter::call::call_function_impl_result(fileno, &[])?;
             if !pyre_object::is_int_or_long(res) {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "fileno() returned a non-integer",
                 ));
             }
             res
         };
         // `c_int_w` — OverflowError if it does not fit a 32-bit int.
-        let fd = crate::baseobjspace::c_int_w(w_int)?;
+        let fd = pyre_interpreter::baseobjspace::c_int_w(w_int)?;
         if fd < 0 {
-            return Err(crate::PyError::value_error(format!(
+            return Err(pyre_interpreter::PyError::value_error(format!(
                 "file descriptor cannot be a negative integer ({fd})"
             )));
         }
@@ -59,7 +62,7 @@ pub(crate) fn filedescriptor_w(w_fd: PyObjectRef) -> Result<i32, crate::PyError>
 }
 
 #[cfg(all(unix, feature = "host_env"))]
-#[crate::pyre_methods(
+#[pyre_interpreter::pyre_methods(
     doc = "Returns a polling object.\n\nSee the poll() documentation.",
     unhashable
 )]
@@ -67,8 +70,8 @@ impl Poll {
     /// `interp_select.py descr_new` — the type is not directly
     /// instantiable; `select.poll()` is the module-level factory.
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        Err(crate::PyError::type_error(
+    fn __new__(_cls: PyObjectRef) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+        Err(pyre_interpreter::PyError::type_error(
             "cannot create 'select.poll' instances",
         ))
     }
@@ -79,13 +82,13 @@ impl Poll {
         &mut self,
         w_fd: PyObjectRef,
         #[default(pyre_object::w_none())] w_events: PyObjectRef,
-    ) -> Result<(), crate::PyError> {
+    ) -> Result<(), pyre_interpreter::PyError> {
         let fd = filedescriptor_w(w_fd)?;
         // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.
         let events = if unsafe { pyre_object::is_none(w_events) } {
             default_poll_events()
         } else {
-            crate::baseobjspace::c_ushort_w(w_events)? as i16
+            pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16
         };
         self.fddict.insert(fd, events);
         Ok(())
@@ -93,16 +96,20 @@ impl Poll {
 
     /// `interp_select.py Poll.modify` — raises `OSError(ENOENT)` for
     /// a descriptor that was never registered.
-    fn modify(&mut self, w_fd: PyObjectRef, w_events: PyObjectRef) -> Result<(), crate::PyError> {
+    fn modify(
+        &mut self,
+        w_fd: PyObjectRef,
+        w_events: PyObjectRef,
+    ) -> Result<(), pyre_interpreter::PyError> {
         let fd = filedescriptor_w(w_fd)?;
         // @unwrap_spec(events="c_ushort"): reject negative / >0xffff.
-        let events = crate::baseobjspace::c_ushort_w(w_events)? as i16;
+        let events = pyre_interpreter::baseobjspace::c_ushort_w(w_events)? as i16;
         let known = self.fddict.contains_key(&fd);
         if known {
             self.fddict.insert(fd, events);
             Ok(())
         } else {
-            Err(crate::PyError::os_error_with_errno(
+            Err(pyre_interpreter::PyError::os_error_with_errno(
                 libc::ENOENT,
                 "poll.modify",
             ))
@@ -111,12 +118,12 @@ impl Poll {
 
     /// `interp_select.py Poll.unregister` — raises `KeyError(fd)` for
     /// an unknown descriptor.
-    fn unregister(&mut self, w_fd: PyObjectRef) -> Result<(), crate::PyError> {
+    fn unregister(&mut self, w_fd: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
         let fd = filedescriptor_w(w_fd)?;
         if self.fddict.remove(&fd).is_none() {
-            return Err(crate::PyError::key_error_with_key(pyre_object::w_int_new(
-                fd as i64,
-            )));
+            return Err(pyre_interpreter::PyError::key_error_with_key(
+                pyre_object::w_int_new(fd as i64),
+            ));
         }
         Ok(())
     }
@@ -127,7 +134,7 @@ impl Poll {
     fn poll(
         &mut self,
         #[default(pyre_object::w_none())] w_timeout: PyObjectRef,
-    ) -> Result<PyObjectRef, crate::PyError> {
+    ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
         // `None` / negative → block indefinitely (timeout = -1).  Otherwise
         // `c_int_w(space.int(w_timeout))`: truncate a float to int, then
         // range-check to a 32-bit C int (millisecond count).
@@ -138,7 +145,9 @@ impl Poll {
             if t < 0 {
                 -1
             } else if t > i32::MAX as i64 {
-                return Err(crate::PyError::overflow_error("expected a 32-bit integer"));
+                return Err(pyre_interpreter::PyError::overflow_error(
+                    "expected a 32-bit integer",
+                ));
             } else {
                 t as i32
             }
@@ -149,18 +158,20 @@ impl Poll {
             } else {
                 let trunc = t.trunc();
                 if trunc > i32::MAX as f64 {
-                    return Err(crate::PyError::overflow_error("expected a 32-bit integer"));
+                    return Err(pyre_interpreter::PyError::overflow_error(
+                        "expected a 32-bit integer",
+                    ));
                 }
                 trunc as i32
             }
         } else {
-            return Err(crate::PyError::type_error(
+            return Err(pyre_interpreter::PyError::type_error(
                 "timeout must be an integer or None",
             ));
         };
 
         if self.running {
-            return Err(crate::PyError::runtime_error(
+            return Err(pyre_interpreter::PyError::runtime_error(
                 "concurrent poll() invocation",
             ));
         }
@@ -182,7 +193,7 @@ impl Poll {
         let mut cur_timeout = timeout;
         self.running = true;
         let ret = loop {
-            let (r, errno) = crate::module::thread::call_external_function(|| unsafe {
+            let (r, errno) = pyre_interpreter::module::thread::call_external_function(|| unsafe {
                 libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, cur_timeout)
             });
             if r >= 0 {
@@ -193,7 +204,9 @@ impl Poll {
                 // retry with a recomputed timeout.  Reset `running` first so
                 // a raised handler does not leave the poll object wedged
                 // (PyPy's `finally: self.running = False`).
-                if let Err(err) = crate::module::signal::interp_signal::checksignals_now() {
+                if let Err(err) =
+                    pyre_interpreter::module::signal::interp_signal::checksignals_now()
+                {
                     self.running = false;
                     return Err(err);
                 }
@@ -209,7 +222,7 @@ impl Poll {
             }
             self.running = false;
             let e = std::io::Error::from_raw_os_error(errno);
-            return Err(crate::PyError::os_error_with_errno(
+            return Err(pyre_interpreter::PyError::os_error_with_errno(
                 errno,
                 format!("poll: {e}"),
             ));
@@ -241,9 +254,9 @@ impl Poll {
 fn selectable_fd(
     fd: i32,
     _index: usize,
-) -> Result<rustpython_host_env::select::RawFd, crate::PyError> {
+) -> Result<rustpython_host_env::select::RawFd, pyre_interpreter::PyError> {
     if fd >= libc::FD_SETSIZE as i32 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "file descriptor out of range in select()",
         ));
     }
@@ -259,9 +272,9 @@ fn selectable_fd(
 fn selectable_fd(
     fd: i32,
     index: usize,
-) -> Result<rustpython_host_env::select::RawFd, crate::PyError> {
+) -> Result<rustpython_host_env::select::RawFd, pyre_interpreter::PyError> {
     if index >= rustpython_host_env::select::platform::FD_SETSIZE as usize {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "too many file descriptors in select()",
         ));
     }
@@ -277,11 +290,11 @@ fn selectable_fd(
 /// `interp_select.py:182` — an EINTR return delivers the pending signal first,
 /// so a handler that raises (KeyboardInterrupt) wins over the retry.
 #[cfg(all(unix, feature = "host_env"))]
-fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
+fn select_failure(e: std::io::Error) -> Result<(), pyre_interpreter::PyError> {
     if e.raw_os_error() == Some(libc::EINTR) {
-        return crate::module::signal::interp_signal::checksignals_now();
+        return pyre_interpreter::module::signal::interp_signal::checksignals_now();
     }
-    Err(crate::PyError::os_error_with_errno(
+    Err(pyre_interpreter::PyError::os_error_with_errno(
         e.raw_os_error().unwrap_or(0),
         format!("select: {e}"),
     ))
@@ -292,8 +305,8 @@ fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
 /// (`PyErr_SetExcFromWindowsErr`).  A blocking WinSock call is not interrupted
 /// by a signal, so there is nothing to retry.
 #[cfg(all(windows, feature = "host_env"))]
-fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
-    Err(crate::PyError::os_error_win32_syscall2(
+fn select_failure(e: std::io::Error) -> Result<(), pyre_interpreter::PyError> {
+    Err(pyre_interpreter::PyError::os_error_win32_syscall2(
         e.raw_os_error().unwrap_or(0),
         pyre_object::PY_NULL,
         pyre_object::PY_NULL,
@@ -307,21 +320,21 @@ fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
 /// Windows over WinSock's `select`, which accepts sockets only — and the
 /// `select.poll()` polling object, which POSIX alone has.  epoll / kqueue
 /// object types are not implemented yet.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::module_ns_store(
         ns,
         "select",
         // Module functions are non-descriptors. `selectors.SelectSelector`
         // stores this object directly as its `_select` class attribute; a
         // descriptor-shaped builtin would bind the selector instance and
         // shift the three fd-set arguments.
-        crate::make_module_builtin_function("select", |args| {
+        pyre_interpreter::make_module_builtin_function("select", |args| {
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
                 use rustpython_host_env::select as host_select;
 
                 if args.len() < 3 {
-                    return Err(crate::PyError::type_error(
+                    return Err(pyre_interpreter::PyError::type_error(
                         "select() takes at least 3 arguments",
                     ));
                 }
@@ -331,9 +344,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // fd or an object exposing fileno().
                 fn collect_fds(
                     seq: pyre_object::PyObjectRef,
-                ) -> Result<Vec<(pyre_object::PyObjectRef, host_select::RawFd)>, crate::PyError>
-                {
-                    let items = crate::baseobjspace::unpackiterable(seq, -1)?;
+                ) -> Result<
+                    Vec<(pyre_object::PyObjectRef, host_select::RawFd)>,
+                    pyre_interpreter::PyError,
+                > {
+                    let items = pyre_interpreter::baseobjspace::unpackiterable(seq, -1)?;
                     let mut out = Vec::with_capacity(items.len());
                     for item in items {
                         // `interp_select.py _build_fd_set` — each item is
@@ -387,9 +402,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     None => None,
                     Some(&t) if unsafe { pyre_object::is_none(t) } => None,
                     Some(&t) => {
-                        let secs = crate::baseobjspace::float_w(t)?;
+                        let secs = pyre_interpreter::baseobjspace::float_w(t)?;
                         if secs < 0.0 {
-                            return Err(crate::PyError::value_error(
+                            return Err(pyre_interpreter::PyError::value_error(
                                 "timeout must be non-negative",
                             ));
                         }
@@ -409,7 +424,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         std::time::Duration::try_from_secs_f64(s)
                             .ok()
                             .and_then(|d| std::time::Instant::now().checked_add(d))
-                            .ok_or_else(|| crate::PyError::value_error("timeout is too large"))?,
+                            .ok_or_else(|| {
+                                pyre_interpreter::PyError::value_error("timeout is too large")
+                            })?,
                     ),
                 };
                 let mut rset = host_select::FdSet::new();
@@ -449,7 +466,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `select` already carries its errno in the returned
                     // `io::Error`, so the guard only has to span the call.
                     let outcome = {
-                        let _blocked = crate::module::thread::before_external_block();
+                        let _blocked = pyre_interpreter::module::thread::before_external_block();
                         host_select::select(nfds, &mut rset, &mut wset, &mut xset, timeout_ref)
                     };
                     match outcome {
@@ -491,7 +508,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             #[cfg(not(all(any(unix, windows), feature = "host_env")))]
             {
                 let _ = args;
-                Err(crate::PyError::not_implemented(
+                Err(pyre_interpreter::PyError::not_implemented(
                     "select.select requires host_env feature on a Unix or Windows platform",
                 ))
             }
@@ -508,13 +525,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // Poll.typedef.acceptable_as_base_class = False`.
         let _ = type_object();
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(type_object(), false) };
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "poll",
             // A module-level function, not a descriptor: `selectors.py` keeps
             // it as a class attribute (`_selector_cls = select.poll`) and
             // calling it through the instance must not bind a receiver.
-            crate::make_module_builtin_function_with_arity(
+            pyre_interpreter::make_module_builtin_function_with_arity(
                 "poll",
                 |_args| Ok(Poll::allocate(Poll::default())),
                 0,
@@ -524,7 +541,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // constants (`rpoll.eventnames`).
         macro_rules! ev {
             ($name:literal, $val:expr) => {
-                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         ev!("POLLIN", rustpython_host_env::select::POLLIN);
@@ -543,8 +560,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // filter and flag constants (BSD/macOS only).
     #[cfg(all(target_os = "macos", feature = "host_env"))]
     {
-        crate::module_ns_store(ns, "kqueue", super::interp_kqueue::type_object());
-        crate::module_ns_store(ns, "kevent", super::interp_kevent::type_object());
+        pyre_interpreter::module_ns_store(ns, "kqueue", super::interp_kqueue::type_object());
+        pyre_interpreter::module_ns_store(ns, "kevent", super::interp_kevent::type_object());
         // `interp_kqueue.py W_Kqueue.typedef.acceptable_as_base_class
         // = False` / `:406 W_Kevent.typedef.acceptable_as_base_class =
         // False`.
@@ -560,7 +577,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
         macro_rules! kq {
             ($name:literal, $val:expr) => {
-                crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         // `interp_kqueue.py symbol_map` — KQ_FILTER_* / KQ_EV_*.
@@ -610,12 +627,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
     // `interp_select.py:35 W_Error = OSError` — expose the real type so
     // `except select.error` catches what selectors raise.
-    let w_os_error = crate::builtins::lookup_exc_class("OSError")
+    let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before select init");
-    crate::module_ns_store(ns, "error", w_os_error);
+    pyre_interpreter::module_ns_store(ns, "error", w_os_error);
     #[cfg(unix)]
     {
-        crate::module_ns_store(
+        pyre_interpreter::module_ns_store(
             ns,
             "PIPE_BUF",
             pyre_object::w_int_new(libc::PIPE_BUF as i64),

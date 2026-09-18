@@ -12010,7 +12010,7 @@ pub(crate) fn builtin_int_float_dunder(
 }
 
 /// `float(obj)` → convert to float
-pub(crate) fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+pub fn builtin_float(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(floatobject::w_float_new(0.0));
     }
