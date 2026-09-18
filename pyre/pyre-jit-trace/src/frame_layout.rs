@@ -171,38 +171,36 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
 }
 
 /// `virtualizable.py static_field_descrs[idx]` on the one PyFrame vinfo.
-/// The process-global `vable_static_field_descr` singleton is only the
-/// overflow when `idx` is past PyFrame's static count (jit_interp).
 pub fn pyframe_static_field_descr(idx: u16) -> majit_ir::DescrRef {
     let info = build_pyframe_virtualizable_info();
     let i = idx as usize;
-    if i < info.static_field_descrs().len() {
-        info.static_field_descr(i)
-    } else {
-        majit_ir::descr::vable_static_field_descr(idx)
-    }
+    assert!(
+        i < info.static_field_descrs().len(),
+        "pyframe_static_field_descr: idx={idx} exceeds PyFrame static_field_descrs"
+    );
+    info.static_field_descr(i)
 }
 
 /// `virtualizable.py array_field_descrs[idx]` on the one PyFrame vinfo.
 pub fn pyframe_array_field_descr(idx: u16) -> majit_ir::DescrRef {
     let info = build_pyframe_virtualizable_info();
     let i = idx as usize;
-    if i < info.array_fields.len() {
-        info.array_pointer_field_descr(i)
-    } else {
-        majit_ir::descr::vable_array_field_descr(idx)
-    }
+    assert!(
+        i < info.array_fields.len(),
+        "pyframe_array_field_descr: idx={idx} exceeds PyFrame array_fields"
+    );
+    info.array_pointer_field_descr(i)
 }
 
 /// `virtualizable.py array_descrs[idx]` on the one PyFrame vinfo.
 pub fn pyframe_array_item_descr(idx: u16) -> majit_ir::DescrRef {
     let info = build_pyframe_virtualizable_info();
     let i = idx as usize;
-    if i < info.array_descrs.len() {
-        info.array_item_descr(i)
-    } else {
-        majit_ir::descr::vable_array_descr(idx)
-    }
+    assert!(
+        i < info.array_descrs.len(),
+        "pyframe_array_item_descr: idx={idx} exceeds PyFrame array_descrs"
+    );
+    info.array_item_descr(i)
 }
 
 #[cfg(test)]

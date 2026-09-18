@@ -5688,11 +5688,7 @@ pub fn vable_static_field_descr(idx: u16) -> DescrRef {
     let i = idx as usize;
     assert!(
         i < VABLE_STATIC_FIELD_DESCR_SLOTS,
-        "vable_static_field_descr: idx={} exceeds VABLE_STATIC_FIELD_DESCR_SLOTS={}; \
-         PYFRAME_VABLE_FIELDS has {} static fields",
-        idx,
-        VABLE_STATIC_FIELD_DESCR_SLOTS,
-        VABLE_STATIC_FIELD_DESCR_SLOTS,
+        "vable_static_field_descr: idx={idx} exceeds VABLE_STATIC_FIELD_DESCR_SLOTS={VABLE_STATIC_FIELD_DESCR_SLOTS}",
     );
     SLOTS[i]
         .get_or_init(|| {
