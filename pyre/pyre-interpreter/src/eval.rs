@@ -4531,6 +4531,16 @@ impl OpcodeStepExecutor for PyFrame {
         self as *const PyFrame as i64
     }
 
+    /// The generic `OpcodeStepExecutor::load_small_int` default walks
+    /// `ConstantOpcodeHandler::small_int_constant`'s trait-default
+    /// (`int_constant` → `w_int_new`). That look-inside writes a
+    /// translator-local `&INT_TYPE`. Use the interned table so
+    /// `type(w1) is type(w2)` sees the process `INT_TYPE`.
+    fn load_small_int(&mut self, value: i64) -> Result<(), PyError> {
+        let w = w_small_int_const(value);
+        self.push_value(w)
+    }
+
     fn pop_top(&mut self) -> Result<(), PyError> {
         let _ = self.pop_value()?;
         self.failed_attr_after_stack_pop();
