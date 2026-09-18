@@ -3129,7 +3129,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
+            simplify_lowered_graph(
+                &mut lo.graph,
+                struct_field_attrs,
+                lo.static_addrs.pytypes_by_struct,
+                false,
+            );
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
@@ -3606,7 +3611,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
+        simplify_lowered_graph(
+            &mut lo.graph,
+            struct_field_attrs,
+            lo.static_addrs.pytypes_by_struct,
+            true,
+        );
         // `format!`-chain expansion (descriptor census): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -3660,7 +3670,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
+            simplify_lowered_graph(
+                &mut lo.graph,
+                struct_field_attrs,
+                lo.static_addrs.pytypes_by_struct,
+                true,
+            );
         }
         Ok(())
     };
@@ -3822,6 +3837,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
 fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    pytypes_by_struct: &[(&str, i64)],
     sweep_dead_vars: bool,
 ) {
     // Collapse the operation-less blocks the MIR lowering leaves behind.
@@ -3858,7 +3874,11 @@ fn simplify_lowered_graph(
     // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
     // which then reclaims the orphaned construct-on-stack ctor and header
     // field writes.
-    dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    dirty |= crate::model::fuse_boxing_alloc_with_pytypes(
+        graph,
+        struct_field_attrs,
+        pytypes_by_struct,
+    ) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -39245,7 +39265,7 @@ mod tests {
         graph.set_goto(entry, forwarding, vec![array.clone()]);
         graph.set_return(forwarding, None);
 
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), &[], true);
 
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
