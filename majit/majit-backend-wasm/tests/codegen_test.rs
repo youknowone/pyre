@@ -1088,6 +1088,42 @@ fn build_module_with_write_barrier_target(
     bytes
 }
 
+fn build_module_with_gc_table(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+    write_barrier_target: i64,
+    gc_table_base: u32,
+) -> Vec<u8> {
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.to_vec(),
+        ops: ops.iter().cloned().collect(),
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(write_barrier_target, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base,
+        fail_index_base: 0,
+        bridge_cells_base: 0,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::compact(5, 2, 0),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    bytes
+}
+
 #[test]
 fn jitframe_barrier_checks_flags_and_reserves_arity_one_for_zero_argument_residuals() {
     const WB_TARGET: i64 = 127;
@@ -3622,10 +3658,11 @@ fn test_force_arm_rematerializes_constptr_from_gc_table() {
     ]);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
-    let bytes = build_module_with_write_barrier_target(
+    let bytes = build_module_with_gc_table(
         &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
+        table_base,
     );
     codegen::bind_failarg_const_table(&[], 0);
     validate_wasm(&bytes);
@@ -3672,10 +3709,11 @@ fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
     ]);
     let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
     finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
-    let bytes = build_module_with_write_barrier_target(
+    let bytes = build_module_with_gc_table(
         &[InputArg::from_type_rc(Type::Ref, 0)],
         &[call, guard, finish],
         127,
+        table.base_addr() as u32,
     );
     codegen::bind_failarg_const_table(&[], 0);
     validate_wasm(&bytes);
@@ -3691,6 +3729,60 @@ fn test_force_arm_rebinding_keeps_compile_time_constptr_key() {
     assert!(
         !wasm_contains_i64_const(&bytes, 0x9000),
         "must not key the map on the forwarded slot"
+    );
+}
+
+#[test]
+fn test_force_arm_lookup_stays_on_the_emitting_table() {
+    // Two tables can share a compile-time nursery address after a move.
+    // Force-arm must tag the emitting region's slot, not the later table's.
+    let owner = majit_gc::GcTable::from_gcrefs(&[majit_ir::GcRef(0x1000)]);
+    owner.trace(&mut |r| {
+        if r.0 == 0x1000 {
+            r.0 = 0x9000;
+        }
+    });
+    let later = majit_gc::GcTable::from_gcrefs(&[majit_ir::GcRef(0x1000)]);
+    codegen::bind_failarg_const_table(&[], 0);
+    codegen::extend_failarg_const_table_from_gc_table(&owner);
+    codegen::extend_failarg_const_table_from_gc_table(&later);
+    let call = make_op(
+        OpCode::CallMayForceI,
+        &[OpRef::const_int(42)],
+        OpRef::int_op(1),
+    );
+    call.setdescr(majit_ir::descr::make_call_descr_full(
+        0,
+        vec![],
+        Type::Int,
+        false,
+        8,
+        EffectInfo::default(),
+    ));
+    let guard = Op::new(OpCode::GuardNotForced, &[]);
+    guard.setfailargs(smallvec![
+        rb(OpRef::input_arg_ref(0)),
+        rb(OpRef::const_ptr(majit_ir::GcRef(0x1000))),
+    ]);
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_ref(0))]);
+    let bytes = build_module_with_gc_table(
+        &[InputArg::from_type_rc(Type::Ref, 0)],
+        &[call, guard, finish],
+        127,
+        owner.base_addr() as u32,
+    );
+    codegen::bind_failarg_const_table(&[], 0);
+    validate_wasm(&bytes);
+    let owner_tagged = i64::from(owner.base_addr() as u32) | 3;
+    let later_tagged = i64::from(later.base_addr() as u32) | 3;
+    assert!(
+        wasm_contains_i64_const(&bytes, owner_tagged),
+        "owner emit must tag the owner table"
+    );
+    assert!(
+        !wasm_contains_i64_const(&bytes, later_tagged),
+        "a later table with the same compile_key must not win"
     );
 }
 

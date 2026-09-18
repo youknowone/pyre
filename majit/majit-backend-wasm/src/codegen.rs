@@ -11,7 +11,7 @@
 ///
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -147,7 +147,12 @@ pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
 const UMULHI_SCRATCH: u32 = 5;
 
 thread_local! {
-    static FAILARG_CONST_TABLE: RefCell<HashMap<usize, (u32, u32)>> = RefCell::new(HashMap::new());
+    /// Per-table ConstPtr maps: `gc_table_base -> (compile_key -> slot index)`.
+    /// Nursery addresses can be reused after a collection, so two retained
+    /// tables may share a compile-time key. Lookup is scoped to the region
+    /// being emitted.
+    static FAILARG_CONST_TABLE: RefCell<HashMap<u32, HashMap<usize, u32>>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Bind the rewrite's gcref list so a ConstPtr failarg can rematerialize
@@ -156,9 +161,14 @@ pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) 
     FAILARG_CONST_TABLE.with(|cell| {
         let mut map = cell.borrow_mut();
         map.clear();
-        for (i, g) in gcrefs.iter().enumerate() {
-            map.insert(g.0, (gc_table_base, i as u32));
+        if gcrefs.is_empty() {
+            return;
         }
+        let mut inner = HashMap::with_capacity(gcrefs.len());
+        for (i, g) in gcrefs.iter().enumerate() {
+            inner.insert(g.0, i as u32);
+        }
+        map.insert(gc_table_base, inner);
     });
 }
 
@@ -172,10 +182,30 @@ pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
     FAILARG_CONST_TABLE.with(|cell| {
         let mut map = cell.borrow_mut();
         let base = table.base_addr() as u32;
+        let mut inner = HashMap::with_capacity(table.len());
         for i in 0..table.len() {
-            map.insert(table.compile_key(i), (base, i as u32));
+            inner.insert(table.compile_key(i), i as u32);
         }
+        map.insert(base, inner);
     });
+}
+
+thread_local! {
+    static FAILARG_LOOKUP_BASE: Cell<u32> = const { Cell::new(0) };
+}
+
+fn set_failarg_lookup_base(base: u32) {
+    FAILARG_LOOKUP_BASE.with(|cell| cell.set(base));
+}
+
+fn lookup_failarg_const(compile_key: usize) -> Option<(u32, u32)> {
+    let table_base = FAILARG_LOOKUP_BASE.with(|cell| cell.get());
+    FAILARG_CONST_TABLE.with(|cell| {
+        cell.borrow()
+            .get(&table_base)
+            .and_then(|inner| inner.get(&compile_key).copied())
+            .map(|index| (table_base, index))
+    })
 }
 
 /// Dense wasm-local assignment for the sparse value-id namespace.
@@ -6381,7 +6411,19 @@ fn build_function(
             Vec::new()
         };
 
+    let mut table_base_by_op = vec![gc_table_base; ops.len()];
+    if !inlined_bridges.is_empty() {
+        let mut start = bridge_start;
+        for bridge in inlined_bridges {
+            for slot in &mut table_base_by_op[start..start + bridge.ops.len()] {
+                *slot = bridge.gc_table_base;
+            }
+            start += bridge.ops.len();
+        }
+    }
+
     for (op_idx, op) in ops.iter().enumerate() {
+        set_failarg_lookup_base(table_base_by_op[op_idx]);
         if op.opcode == OpCode::Label || op.opcode.can_malloc() {
             wb_applied.clear();
         }
@@ -11185,8 +11227,7 @@ fn emit_resolve_failarg(
     // rather than baking the compile-time address as `i64.const`.
     if let Some(g) = opref.as_const_ptr()
         && !g.is_null()
-        && let Some((base, index)) =
-            FAILARG_CONST_TABLE.with(|cell| cell.borrow().get(&g.0).copied())
+        && let Some((base, index)) = lookup_failarg_const(g.0)
     {
         emit_gc_table_load(sink, base, i64::from(index));
         return;
@@ -12276,9 +12317,7 @@ fn emit_force_arm(
         } else if let Some(g) = arg_ref.as_const_ptr() {
             if g.is_null() {
                 sink.i64_const(0);
-            } else if let Some((base, index)) =
-                FAILARG_CONST_TABLE.with(|cell| cell.borrow().get(&g.0).copied())
-            {
+            } else if let Some((base, index)) = lookup_failarg_const(g.0) {
                 // Tag the GC-table slot so `dead_frame_from_forced_frame`
                 // reloads after a collection inside the bracketed call.
                 let addr = i64::from(base)
