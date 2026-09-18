@@ -1115,7 +1115,7 @@ impl Optimizer {
                     }
                     let field_idx = descr
                         .as_field_descr()
-                        .map(|field_descr| field_descr.index_in_parent() as u32)
+                        .map(crate::optimizeopt::virtualize::parent_list_slot)
                         .unwrap_or_else(|| descr.index());
                     fields.push((field_idx, field_ref));
                     let _ = descr; // descr threading handled via SizeDescr.all_fielddescrs()

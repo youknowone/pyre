@@ -1105,7 +1105,7 @@ impl OptVirtualize {
             .getdescr()
             .and_then(|d| {
                 d.as_interior_field_descr()
-                    .map(|ifd| ifd.field_descr().index_in_parent() as u32)
+                    .map(|ifd| parent_list_slot(ifd.field_descr()))
             })
             .expect("optimize_getinteriorfield_gc: op without InteriorFieldDescr");
 
@@ -1161,7 +1161,7 @@ impl OptVirtualize {
             .getdescr()
             .and_then(|d| {
                 d.as_interior_field_descr()
-                    .map(|ifd| ifd.field_descr().index_in_parent() as u32)
+                    .map(|ifd| parent_list_slot(ifd.field_descr()))
             })
             .expect("optimize_setinteriorfield_gc: op without InteriorFieldDescr");
 
@@ -2372,7 +2372,7 @@ fn field_slot_disagreement(
 /// so `args_w` keeps 1 while the completed list puts it at 2.  The
 /// virtual object's `_fields` array follows that list; look the field
 /// up by identity, not by the stale mint.
-fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
+pub(crate) fn parent_list_slot(field: &dyn FieldDescr) -> u32 {
     if field.is_typeptr() || field.is_w_class() {
         return field.index_in_parent() as u32;
     }
