@@ -2372,9 +2372,10 @@ pub unsafe fn ll_list_int_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
-        if cond {
-            obj = current_gc_ref(obj);
-        }
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
+        obj = current_gc_ref(obj);
     }
     let list = &mut *(obj as *mut W_ListObject);
     ll_list_int_set_len(list, newsize);
@@ -2489,9 +2490,10 @@ pub unsafe fn ll_list_float_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
-        if cond {
-            obj = current_gc_ref(obj);
-        }
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
+        obj = current_gc_ref(obj);
     }
     let list = &mut *(obj as *mut W_ListObject);
     ll_list_float_set_len(list, newsize);
@@ -2605,9 +2607,10 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
             newsize,
             true,
         );
-        if cond {
-            obj = current_gc_ref(obj);
-        }
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
+        obj = current_gc_ref(obj);
     }
     let list = &mut *(obj as *mut W_ListObject);
     ll_list_obj_set_len(list, newsize);
