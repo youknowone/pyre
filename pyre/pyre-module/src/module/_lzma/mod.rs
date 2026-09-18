@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 /// there is no process-global side table.
 // CPython 3.14 Modules/_lzmamodule.c:lzma_exec creates this spec with
 // PyType_FromModuleAndSpec; its spec includes IMMUTABLETYPE.
-#[crate::pyre_class("_lzma.LZMACompressor", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_lzma.LZMACompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_LZMACompressor {
     backend: *mut Mutex<backend::Compressor>,
@@ -29,7 +29,7 @@ pub struct W_LZMACompressor {
 /// `Decompressor`, object-owned the same way.  The unconsumed input and the
 /// `unused_data` tail live with the stream rather than as Python attributes.
 // Same `lzma_exec` owner and flags as LZMACompressor.
-#[crate::pyre_class("_lzma.LZMADecompressor", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_lzma.LZMADecompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_LZMADecompressor {
     backend: *mut Mutex<backend::Decompressor>,
@@ -38,12 +38,12 @@ pub struct W_LZMADecompressor {
 /// `LZMAError`, the module's own exception class.  The fallback kind only
 /// matters if the class is somehow missing from the registry; the raised
 /// object is what `except LZMAError` matches on.
-fn lzma_exception(msg: impl Into<String>) -> crate::PyError {
+fn lzma_exception(msg: impl Into<String>) -> pyre_interpreter::PyError {
     let msg = msg.into();
-    let mut err = crate::PyError::value_error(msg.clone());
-    if let Some(cls) = crate::builtins::lookup_exc_class("_lzma.LZMAError") {
+    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_lzma.LZMAError") {
         let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = crate::builtins::exc_exception_new(&args) {
+        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.exc_object = exc;
         }
     }
@@ -52,27 +52,30 @@ fn lzma_exception(msg: impl Into<String>) -> crate::PyError {
 
 /// `catch_lzma_error`, plus the three failures the filter conversion reports
 /// before liblzma is reached.
-fn lzma_error(error: backend::Error) -> crate::PyError {
+fn lzma_error(error: backend::Error) -> pyre_interpreter::PyError {
     use backend::Error as E;
     match error {
-        E::Memory => crate::PyError::memory_error("out of memory"),
-        E::Value(message) => crate::PyError::value_error(message),
+        E::Memory => pyre_interpreter::PyError::memory_error("out of memory"),
+        E::Value(message) => pyre_interpreter::PyError::value_error(message),
         E::Lzma(message) => lzma_exception(message),
-        E::Eof => crate::PyError::new(crate::PyErrorKind::EOFError, "Already at end of stream"),
+        E::Eof => pyre_interpreter::PyError::new(
+            pyre_interpreter::PyErrorKind::EOFError,
+            "Already at end of stream",
+        ),
     }
 }
 
 /// Both stream objects carry liblzma state no state dict can describe, which
 /// is the `tp_basicsize` mismatch `_PyObject_GetState` refuses — so neither
 /// can be pickled, however ordinary the rest of the object looks.
-fn cannot_serialize(name: &str) -> crate::PyError {
-    crate::PyError::type_error(format!("cannot pickle '{name}' object"))
+fn cannot_serialize(name: &str) -> pyre_interpreter::PyError {
+    pyre_interpreter::PyError::type_error(format!("cannot pickle '{name}' object"))
 }
 
 /// `_PyLong_UInt32_Converter`: the value arrives through `__index__`, and one
 /// outside a `uint32_t` is an error rather than a truncation.
-fn uint32_w(obj: PyObjectRef) -> Result<u32, crate::PyError> {
-    crate::baseobjspace::c_uint_w(crate::baseobjspace::space_index(obj)?)
+fn uint32_w(obj: PyObjectRef) -> Result<u32, pyre_interpreter::PyError> {
+    pyre_interpreter::baseobjspace::c_uint_w(pyre_interpreter::baseobjspace::space_index(obj)?)
 }
 
 // ── filter specifiers ───────────────────────────────────────────────────
@@ -120,19 +123,19 @@ const BCJ_KIND: FilterKind = FilterKind {
 /// `lzma_filter_converter`.  Every read here can run a `__getitem__` of the
 /// caller's own, so the spec is held in a shadow-stack slot rather than a
 /// Rust local.
-fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::PyError> {
+fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let spec_slot = shadow_stack_len();
     let spec = pin_root(spec);
     let spec = || shadow_stack_get(spec_slot);
 
-    if unsafe { crate::baseobjspace::lookup(spec(), "__getitem__") }.is_none() {
-        return Err(crate::PyError::type_error(
+    if unsafe { pyre_interpreter::baseobjspace::lookup(spec(), "__getitem__") }.is_none() {
+        return Err(pyre_interpreter::PyError::type_error(
             "Filter specifier must be a dict or dict-like object",
         ));
     }
-    let Some(w_id) = crate::baseobjspace::finditem_str(spec(), "id")? else {
-        return Err(crate::PyError::value_error(
+    let Some(w_id) = pyre_interpreter::baseobjspace::finditem_str(spec(), "id")? else {
+        return Err(pyre_interpreter::PyError::value_error(
             "Filter specifier must have an \"id\" entry",
         ));
     };
@@ -140,17 +143,18 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
     // and one that overflows a *signed* read still converts. Whether the
     // result names a filter is the dispatch's answer below, not this one's;
     // only a width the type cannot hold is an overflow here.
-    let w_index = crate::baseobjspace::space_index(w_id)?;
-    let negative = || crate::PyError::value_error("cannot convert negative integer to unsigned");
-    let id = match crate::baseobjspace::int_w(w_index) {
+    let w_index = pyre_interpreter::baseobjspace::space_index(w_id)?;
+    let negative =
+        || pyre_interpreter::PyError::value_error("cannot convert negative integer to unsigned");
+    let id = match pyre_interpreter::baseobjspace::int_w(w_index) {
         Ok(value) => u64::try_from(value).map_err(|_| negative())?,
-        Err(error) if error.kind == crate::PyErrorKind::OverflowError => {
+        Err(error) if error.kind == pyre_interpreter::PyErrorKind::OverflowError => {
             let big = unsafe { pyre_object::w_long_get_value(w_index) };
             if big.get_sign() < 0 {
                 return Err(negative());
             }
             big.to_u64().ok_or_else(|| {
-                crate::PyError::overflow_error("Python int too large for C lzma_vli")
+                pyre_interpreter::PyError::overflow_error("Python int too large for C lzma_vli")
             })?
         }
         Err(error) => return Err(error),
@@ -165,7 +169,7 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
         | backend::FILTER_ARMTHUMB
         | backend::FILTER_SPARC => BCJ_KIND,
         id => {
-            return Err(crate::PyError::value_error(format!(
+            return Err(pyre_interpreter::PyError::value_error(format!(
                 "Invalid filter ID: {id}"
             )));
         }
@@ -178,7 +182,7 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
     // The "id" entry is already accounted for.
     let mut named = 1i64;
     for name in &kind.optnames[1..] {
-        let Some(value) = crate::baseobjspace::finditem_str(spec(), name)? else {
+        let Some(value) = pyre_interpreter::baseobjspace::finditem_str(spec(), name)? else {
             continue;
         };
         named += 1;
@@ -203,38 +207,40 @@ fn parse_filter_spec(spec: PyObjectRef) -> Result<backend::FilterSpec, crate::Py
     // alone carries it past the dict-or-dict-like gate above but no further.
     // A dict carrying an entry the filter does not name fails there too, and
     // that is what the count catches.
-    let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-    if !unsafe { crate::baseobjspace::isinstance_w(spec(), w_dict_type) } {
-        return Err(crate::PyError::value_error(kind.message));
+    let w_dict_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+    if !unsafe { pyre_interpreter::baseobjspace::isinstance_w(spec(), w_dict_type) } {
+        return Err(pyre_interpreter::PyError::value_error(kind.message));
     }
-    let entries = crate::baseobjspace::len(spec())
-        .and_then(crate::baseobjspace::int_w)
-        .map_err(|_| crate::PyError::value_error(kind.message))?;
+    let entries = pyre_interpreter::baseobjspace::len(spec())
+        .and_then(pyre_interpreter::baseobjspace::int_w)
+        .map_err(|_| pyre_interpreter::PyError::value_error(kind.message))?;
     if entries != named {
-        return Err(crate::PyError::value_error(kind.message));
+        return Err(pyre_interpreter::PyError::value_error(kind.message));
     }
     Ok(parsed)
 }
 
 /// `parse_filter_chain_spec`.
-fn parse_filter_chain(filters: PyObjectRef) -> Result<Vec<backend::FilterSpec>, crate::PyError> {
+fn parse_filter_chain(
+    filters: PyObjectRef,
+) -> Result<Vec<backend::FilterSpec>, pyre_interpreter::PyError> {
     let _roots = push_roots();
     let filters_slot = shadow_stack_len();
     let filters = pin_root(filters);
     let filters = || shadow_stack_get(filters_slot);
 
-    let count = crate::runtime_ops::sequence_len(filters())?;
+    let count = pyre_interpreter::runtime_ops::sequence_len(filters())?;
     // rustpython-common keeps LZMA_FILTERS_MAX private; liblzma's
     // chain length is four, and rustpython-stdlib checks the same bound.
     const LZMA_FILTERS_MAX: usize = 4;
     if count > LZMA_FILTERS_MAX {
-        return Err(crate::PyError::value_error(format!(
+        return Err(pyre_interpreter::PyError::value_error(format!(
             "Too many filters - liblzma supports a maximum of {LZMA_FILTERS_MAX}"
         )));
     }
     let mut specs = Vec::with_capacity(count);
     for index in 0..count {
-        let spec = crate::runtime_ops::sequence_getitem(filters(), index)?;
+        let spec = pyre_interpreter::runtime_ops::sequence_getitem(filters(), index)?;
         specs.push(parse_filter_spec(spec)?);
     }
     Ok(specs)
@@ -243,7 +249,7 @@ fn parse_filter_chain(filters: PyObjectRef) -> Result<Vec<backend::FilterSpec>, 
 /// The chain a `filters` argument names, or `None` when it was left out.
 fn optional_filter_chain(
     filters: PyObjectRef,
-) -> Result<Option<Vec<backend::FilterSpec>>, crate::PyError> {
+) -> Result<Option<Vec<backend::FilterSpec>>, pyre_interpreter::PyError> {
     if unsafe { is_none(filters) } {
         return Ok(None);
     }
@@ -251,9 +257,9 @@ fn optional_filter_chain(
 }
 
 impl W_LZMACompressor {
-    fn compressor(&self) -> Result<&Mutex<backend::Compressor>, crate::PyError> {
+    fn compressor(&self) -> Result<&Mutex<backend::Compressor>, pyre_interpreter::PyError> {
         if self.backend.is_null() {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "Compressor was not initialized",
             ));
         }
@@ -262,9 +268,9 @@ impl W_LZMACompressor {
 }
 
 impl W_LZMADecompressor {
-    fn decompressor(&self) -> Result<&Mutex<backend::Decompressor>, crate::PyError> {
+    fn decompressor(&self) -> Result<&Mutex<backend::Decompressor>, pyre_interpreter::PyError> {
         if self.backend.is_null() {
-            return Err(crate::PyError::value_error(
+            return Err(pyre_interpreter::PyError::value_error(
                 "Decompressor was not initialized",
             ));
         }
@@ -275,7 +281,7 @@ impl W_LZMADecompressor {
 mod compressor_methods {
     use super::*;
 
-    #[crate::pyre_methods(
+    #[pyre_interpreter::pyre_methods(
         doc = "Create a compressor object for compressing data incrementally.\n\n\
                The settings used by the compressor can be specified either as a\n\
                preset compression level (with the 'preset' argument), or in detail\n\
@@ -295,7 +301,7 @@ mod compressor_methods {
             #[default(-1i32)] check: PyIndexCInt,
             #[default(w_none())] preset: PyObjectRef,
             #[default(w_none())] filters: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             // The preset conversion below can run a `__index__` of the
             // caller's own, so the chain is held in a shadow-stack slot from
             // here on rather than in this argument.
@@ -305,14 +311,14 @@ mod compressor_methods {
             let filters = || shadow_stack_get(filters_slot);
 
             if format != backend::FORMAT_XZ && check != -1 && check != backend::CHECK_NONE as i32 {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Integrity checks are only supported by FORMAT_XZ",
                 ));
             }
             let preset_given = !unsafe { is_none(preset) };
             let filters_given = !unsafe { is_none(filters()) };
             if preset_given && filters_given {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Cannot specify both preset and filter chain",
                 ));
             }
@@ -328,13 +334,13 @@ mod compressor_methods {
                 (backend::FORMAT_XZ, check) => check,
                 (backend::FORMAT_ALONE | backend::FORMAT_RAW, _) => backend::CHECK_NONE,
                 _ => {
-                    return Err(crate::PyError::value_error(format!(
+                    return Err(pyre_interpreter::PyError::value_error(format!(
                         "Invalid container format: {format}"
                     )));
                 }
             };
             if format == backend::FORMAT_RAW && !filters_given {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Must specify filters for FORMAT_RAW",
                 ));
             }
@@ -348,9 +354,11 @@ mod compressor_methods {
         }
 
         /// `_lzma_LZMACompressor_compress_impl`.
-        fn compress(&mut self, data: PyBufferStr) -> Result<Vec<u8>, crate::PyError> {
+        fn compress(&mut self, data: PyBufferStr) -> Result<Vec<u8>, pyre_interpreter::PyError> {
             if self.flushed {
-                return Err(crate::PyError::value_error("Compressor has been flushed"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "Compressor has been flushed",
+                ));
             }
             self.compressor()?
                 .lock()
@@ -360,9 +368,11 @@ mod compressor_methods {
 
         /// `_lzma_LZMACompressor_flush_impl` — the object may not be used
         /// afterwards.
-        fn flush(&mut self) -> Result<Vec<u8>, crate::PyError> {
+        fn flush(&mut self) -> Result<Vec<u8>, pyre_interpreter::PyError> {
             if self.flushed {
-                return Err(crate::PyError::value_error("Repeated call to flush()"));
+                return Err(pyre_interpreter::PyError::value_error(
+                    "Repeated call to flush()",
+                ));
             }
             // `LZMACompressor.flush` marks the stream finished before the
             // encoder runs, so a second call is "Repeated" even if the first
@@ -371,7 +381,7 @@ mod compressor_methods {
             self.compressor()?.lock().flush().map_err(lzma_error)
         }
 
-        fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn __getstate__(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             Err(cannot_serialize("_lzma.LZMACompressor"))
         }
     }
@@ -380,7 +390,7 @@ mod compressor_methods {
 mod decompressor_methods {
     use super::*;
 
-    #[crate::pyre_methods(
+    #[pyre_interpreter::pyre_methods(
         doc = "Create a decompressor object for decompressing data incrementally.\n\n\
                For one-shot decompression, use the decompress() function instead."
     )]
@@ -393,7 +403,7 @@ mod decompressor_methods {
             #[default(backend::FORMAT_AUTO)] format: PyIndexCInt,
             #[default(w_none())] memlimit: PyObjectRef,
             #[default(w_none())] filters: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             // The memory-limit conversion below can run a `__index__` of the
             // caller's own, so the chain moves to a shadow-stack slot first.
             let _roots = push_roots();
@@ -405,20 +415,22 @@ mod decompressor_methods {
                 u64::MAX
             } else {
                 if format == backend::FORMAT_RAW {
-                    return Err(crate::PyError::value_error(
+                    return Err(pyre_interpreter::PyError::value_error(
                         "Cannot specify memory limit with FORMAT_RAW",
                     ));
                 }
-                crate::baseobjspace::uint_w(crate::baseobjspace::space_index(memlimit)?)?
+                pyre_interpreter::baseobjspace::uint_w(
+                    pyre_interpreter::baseobjspace::space_index(memlimit)?,
+                )?
             };
             let filters_given = !unsafe { is_none(filters()) };
             if format == backend::FORMAT_RAW && !filters_given {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Must specify filters for FORMAT_RAW",
                 ));
             }
             if format != backend::FORMAT_RAW && filters_given {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "Cannot specify filters except with FORMAT_RAW",
                 ));
             }
@@ -429,7 +441,7 @@ mod decompressor_methods {
                     | backend::FORMAT_ALONE
                     | backend::FORMAT_RAW
             ) {
-                return Err(crate::PyError::value_error(format!(
+                return Err(pyre_interpreter::PyError::value_error(format!(
                     "Invalid container format: {format}"
                 )));
             }
@@ -449,11 +461,11 @@ mod decompressor_methods {
             &mut self,
             data: PyBufferStr,
             #[default(-1i64)] max_length: PyIndexInt,
-        ) -> Result<Vec<u8>, crate::PyError> {
+        ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
             let mut decompressor = self.decompressor()?.lock();
             if decompressor.eof() {
-                return Err(crate::PyError::new(
-                    crate::PyErrorKind::EOFError,
+                return Err(pyre_interpreter::PyError::new(
+                    pyre_interpreter::PyErrorKind::EOFError,
                     "Already at end of stream",
                 ));
             }
@@ -463,7 +475,9 @@ mod decompressor_methods {
                 None
             } else {
                 Some(usize::try_from(max_length).map_err(|_| {
-                    crate::PyError::overflow_error("Python int too large to convert to C ssize_t")
+                    pyre_interpreter::PyError::overflow_error(
+                        "Python int too large to convert to C ssize_t",
+                    )
                 })?)
             };
             decompressor
@@ -473,30 +487,30 @@ mod decompressor_methods {
 
         /// ID of the integrity check used by the input stream.
         #[getter]
-        fn check(&self) -> Result<i64, crate::PyError> {
+        fn check(&self) -> Result<i64, pyre_interpreter::PyError> {
             Ok(self.decompressor()?.lock().check() as i64)
         }
 
         /// True once the end-of-stream marker has been reached.
         #[getter]
-        fn eof(&self) -> Result<bool, crate::PyError> {
+        fn eof(&self) -> Result<bool, pyre_interpreter::PyError> {
             Ok(self.decompressor()?.lock().eof())
         }
 
         /// True when more input is needed before more decompressed data can
         /// be produced.
         #[getter]
-        fn needs_input(&self) -> Result<bool, crate::PyError> {
+        fn needs_input(&self) -> Result<bool, pyre_interpreter::PyError> {
             Ok(self.decompressor()?.lock().needs_input())
         }
 
         /// Data found after the end of the compressed stream.
         #[getter]
-        fn unused_data(&self) -> Result<Vec<u8>, crate::PyError> {
+        fn unused_data(&self) -> Result<Vec<u8>, pyre_interpreter::PyError> {
             Ok(self.decompressor()?.lock().unused_data().to_vec())
         }
 
-        fn __getstate__(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn __getstate__(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             Err(cannot_serialize("_lzma.LZMADecompressor"))
         }
     }
@@ -542,7 +556,7 @@ pub unsafe fn w_lzmadecompressor_dealloc(obj: PyObjectRef) {
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_lzma",
     interpleveldefs: {
         "LZMACompressor" => compressor_methods::type_object(),
@@ -579,7 +593,7 @@ crate::py_module! {
         "PRESET_EXTREME" => backend::PRESET_EXTREME,
     },
     exceptions: {
-        "LZMAError" => crate::builtins::lookup_exc_class("Exception").expect("Exception installed"),
+        "LZMAError" => pyre_interpreter::builtins::lookup_exc_class("Exception").expect("Exception installed"),
     },
     inline_functions: {
         // `_lzma_is_check_supported_impl`.
@@ -590,7 +604,7 @@ crate::py_module! {
         // without the filter id itself.
         fn _encode_filter_properties(
             filter: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let spec = parse_filter_spec(filter)?;
             let properties = backend::encode_filter_properties(&spec).map_err(|error| {
                 // lib_pypy._lzma._encode_filter_properties exposes liblzma's
@@ -614,9 +628,9 @@ crate::py_module! {
         fn _decode_filter_properties(
             filter_id: PyIndexInt,
             encoded_props: PyBufferStr,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let Ok(filter_id) = u64::try_from(filter_id) else {
-                return Err(crate::PyError::value_error(
+                return Err(pyre_interpreter::PyError::value_error(
                     "cannot convert negative integer to unsigned",
                 ));
             };

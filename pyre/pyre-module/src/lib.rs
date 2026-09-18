@@ -39,6 +39,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
     pyre_interpreter::importing::register_builtin_module("_json", module::_json::init);
     pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
+    pyre_interpreter::importing::register_builtin_module("_lzma", module::_lzma::init);
     pyre_interpreter::importing::register_builtin_module(
         "_immutables_map",
         module::_immutables_map::init,
@@ -337,6 +338,10 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         subclass_range_alias(163, typed::<module::_json::W_Encoder>()),
         subclass_range_alias(172, typed::<module::_bz2::W_BZ2Compressor>()),
         subclass_range_alias(173, typed::<module::_bz2::W_BZ2Decompressor>()),
+        // `_lzma`'s two stream objects own their liblzma coder, unconditional
+        // so their ids agree on wasm/native.
+        subclass_range_alias(174, typed::<module::_lzma::W_LZMACompressor>()),
+        subclass_range_alias(175, typed::<module::_lzma::W_LZMADecompressor>()),
         // PyPy zlib stream wrappers own their native stream and lock directly.
         // Keep these unconditional entries ahead of target-gated native types.
         subclass_range_alias(169, typed::<module::zlib::W_Compress>()),
@@ -410,6 +415,18 @@ mod tests {
     /// process-global fnaddr table. The prepass reads the same table
     /// from a host copy of this crate; a missing row here is the same
     /// defect as a build script that forgot to link `pyre-module`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_lzma_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_lzma::compressor_methods::__majit_wrap___new__"
+            ),
+            "moved _lzma #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
     #[test]
     fn jit_trace_fnaddrs_covers_moved_unicodedata_wrapper() {
         let bindings: HashMap<&'static str, i64> =

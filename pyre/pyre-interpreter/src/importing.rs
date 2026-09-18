@@ -797,7 +797,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
-    pyre_install_module!(_lzma);
     pyre_install_module!(_typing);
     pyre_install_module!(_hashlib);
     pyre_install_module!(gc);

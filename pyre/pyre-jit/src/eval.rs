@@ -889,17 +889,13 @@ unsafe fn bz2_decompressor_destructor(obj_addr: usize) {
 
 unsafe fn lzma_compressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_lzma::w_lzmacompressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_lzma::w_lzmacompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
 unsafe fn lzma_decompressor_destructor(obj_addr: usize) {
     unsafe {
-        pyre_interpreter::module::_lzma::w_lzmadecompressor_dealloc(
-            obj_addr as pyre_object::PyObjectRef,
-        )
+        pyre_module::module::_lzma::w_lzmadecompressor_dealloc(obj_addr as pyre_object::PyObjectRef)
     };
 }
 
@@ -4132,12 +4128,12 @@ fn build_gc() -> Box<MiniMarkGC> {
             bz2_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::_lzma::W_LZMACompressor
+            <pyre_module::module::_lzma::W_LZMACompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             lzma_compressor_destructor as majit_gc::trace::DestructorFn,
         ),
         (
-            <pyre_interpreter::module::_lzma::W_LZMADecompressor
+            <pyre_module::module::_lzma::W_LZMADecompressor
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
             lzma_decompressor_destructor as majit_gc::trace::DestructorFn,
         ),

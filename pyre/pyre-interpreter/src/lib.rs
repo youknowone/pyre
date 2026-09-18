@@ -1217,10 +1217,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
         subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
         // zlib / `_lsprof` / `_queue` aliases live on the optional-module
-        // hook (ids 169-171, 176-179). `_lzma`'s two stream objects own
-        // their liblzma coder, unconditional for the same reason.
-        subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
-        subclass_range_alias(175, typed::<crate::module::_lzma::W_LZMADecompressor>()),
+        // hook (ids 169-171, 176-179). `_lzma` aliases 174-175 live on
+        // the same hook.
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they close the ungated block ahead of the
