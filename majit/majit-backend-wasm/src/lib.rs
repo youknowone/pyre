@@ -3004,6 +3004,10 @@ impl WasmBackend {
     /// wasm dependency.
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
+        // Drop the previous `ActiveGcBox` first. Assignment would install
+        // the replacement and then run the old guard's `Drop`, which
+        // `gc_box::clear`s the just-installed allocator.
+        drop(self.gc_box.take());
         self.gc_box = Some(install_gc_box(gc));
     }
 

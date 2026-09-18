@@ -1137,13 +1137,14 @@ pub static FAIL_DESCR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::ne
 /// tables process-global (guest writes an exit index, not a cpu pointer),
 /// so the equivalent is to empty them here. Drop is
 /// `AsmMemoryManager._delete`: the cpu dies with the frame
-/// (`cpu.gc_ll_descr` / shadowstack). Fields drop last-to-first, so
-/// `_cleanup` is declared after `_lock`.
+/// (`cpu.gc_ll_descr` / shadowstack). Struct fields drop in declaration
+/// order, so `_cleanup` is declared first and runs while `_lock` is
+/// still held.
 #[cfg(test)]
 pub fn lock_cpu() -> CpuTestGuard {
     let guard = CpuTestGuard {
-        _lock: FAIL_DESCR_TEST_LOCK.lock(),
         _cleanup: CpuTestCleanup,
+        _lock: FAIL_DESCR_TEST_LOCK.lock(),
     };
     reset_cpu_for_tests();
     guard
@@ -1185,8 +1186,8 @@ impl Drop for CpuTestCleanup {
 
 #[cfg(test)]
 pub struct CpuTestGuard {
-    _lock: parking_lot::MutexGuard<'static, ()>,
     _cleanup: CpuTestCleanup,
+    _lock: parking_lot::MutexGuard<'static, ()>,
 }
 
 /// Global `frame[0]` fail-index space.
