@@ -940,10 +940,10 @@ pub use gateway::{
     make_module_builtin_function_with_arity_and_maybe_sig, make_module_builtin_function_with_doc,
     make_slot_wrapper, make_slot_wrapper_with_arity,
 };
-/// eval.py `HOPELESS = 0x400` — a module-level integer so a
-/// `#[pyre_function]` expansion can name `crate::HOPELESS`.  The bitflags
-/// associated const is an Opaque Charon body and does not fold.
-pub const HOPELESS: u16 = BuiltinCodeFlags::HOPELESS.bits();
+/// A `#[pyre_function]` expansion names `crate::HOPELESS`.  This is the
+/// literal `gateway::HOPELESS`; a const initialised through the bitflags
+/// `bits()` call is an Opaque Charon body and does not fold.
+pub use gateway::HOPELESS;
 pub use jit_fnaddr::*;
 pub use majit_rlib::rbigint::RBigInt as PyBigInt;
 pub use opcode_ops::*;
