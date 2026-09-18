@@ -12603,12 +12603,13 @@ impl<M: Clone> MetaInterp<M> {
         exit_layout
     }
 
-    /// `compile.py _DoneWithThisFrameDescr.get_result` and
-    /// `handle_fail`'s exit read: decode a returned frame's exit slots into the
-    /// typed list every consumer of a compiled run reads.
+    /// `compile.py _DoneWithThisFrameDescr.get_result` and the JUMP arm's
+    /// `restore_values` read: decode a returned frame's exit slots into the
+    /// typed list those two arms consume.
     ///
-    /// The slot types come from the descr the run ended on, so this is the one
-    /// step both outcomes of a compiled entry share.
+    /// A guard-failure does not call this. `compile.py ResumeGuardDescr.handle_fail`
+    /// leaves the values in the deadframe; `resume.py ResumeDataDirectReader.decode_int`
+    /// reads only the slots the resume stream names.
     ///
     /// Only the typed list is built. The machine-word list beside it used to be
     /// built here too and travelled out on the result, but its four readers are
@@ -12616,7 +12617,7 @@ impl<M: Clone> MetaInterp<M> {
     /// built and dropped one per entry; they call [`raw_exit_values`] on the
     /// typed list instead, which is [`Value::as_raw_i64`] per slot and loses
     /// nothing.
-    fn decode_exit_slots(
+    pub(crate) fn decode_exit_slots(
         backend: &BackendImpl,
         frame: &majit_backend::DeadFrame,
         exit_types: &[Type],
@@ -12631,6 +12632,27 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
         typed_values
+    }
+
+    /// Materialize every fail-arg word from the deadframe.
+    ///
+    /// Used only when `compile.py ResumeGuardDescr.handle_fail` takes the
+    /// `must_compile` arm (`start_bridge_tracing`) or a runner still needs a
+    /// dense list. The common blackhole path uses
+    /// `FailArgSource::from_jitframe` instead.
+    pub(crate) fn raw_exit_slots_from_deadframe(
+        &self,
+        frame: &majit_backend::DeadFrame,
+        descr: &dyn majit_ir::FailDescr,
+    ) -> Vec<i64> {
+        let types = descr.fail_arg_types();
+        if let Some(ptr) = frame.jitframe_ptr() {
+            let src = majit_backend::FailArgSource::from_jitframe(ptr, descr, types.len());
+            (0..src.len()).map(|i| src.get(i)).collect()
+        } else {
+            crate::compile::raw_exit_values(&Self::decode_exit_slots(&self.backend, frame, types))
+                .into_vec()
+        }
     }
 
     /// `warmstate.py execute_assembler(loop_token, *args)`: the run
@@ -12714,14 +12736,9 @@ impl<M: Clone> MetaInterp<M> {
         // the descr straight off the deadframe, and for a DoneWithThisFrame it
         // goes to `fail_descr.get_result(cpu, deadframe)` without building any
         // per-exit description; only the general `handle_fail` case needs one.
-        // Every reader below either only reads this list or says explicitly
-        // that it takes ownership, and this is the steady entry path, so the
-        // copy was paid on every call for the benefit of the guard-failure arm
-        // alone.
-        let exit_types: &[Type] = descr.fail_arg_types();
-        // The exit slots are read for both outcomes, so they are decoded before
-        // the split rather than once in each arm.
-        let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
+        // Finish and JUMP decode on their own arms. A guard-failure leaves
+        // the slots in the deadframe: `compile.py ResumeGuardDescr.handle_fail`
+        // does not copy them out.
         // The deadframe decode, amplified. It READS the frame the run returned
         // and builds a fresh list; it does not touch the frame, so it repeats.
         // Each pass drops what it built, which is the same drop the shipping
@@ -12759,6 +12776,8 @@ impl<M: Clone> MetaInterp<M> {
         // and never reaches the general case at all.
         if is_finish {
             Self::finish_compiled_run_io();
+            let typed_values =
+                Self::decode_exit_slots(&self.backend, &frame, descr.fail_arg_types());
             // No layout. A final descr resumes nothing, so every field of one
             // built here is a default: the two guard-only slot lists are empty
             // because they exist for the blackhole resume and the bridge, and
@@ -12804,6 +12823,14 @@ impl<M: Clone> MetaInterp<M> {
         // the JUMP has already re-entered the loop's own LABEL, and what comes
         // back out is the loop-carried state, not a failure to recover from.
         let is_jump_exit = Self::is_jump_exit(is_finish, fail_index);
+        // JUMP still hands typed values to `state.restore_values`. A
+        // guard-failure does not: `resume.py ResumeDataDirectReader.decode_int`
+        // reads named slots off the deadframe.
+        let typed_values = if is_jump_exit {
+            Self::decode_exit_slots(&self.backend, &frame, exit_types)
+        } else {
+            ExitValues::new()
+        };
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
         // Only the layout fallback and the `must_compile` identity read it, and
         // a JUMP exit reaches neither, so the weakref upgrade the resolution

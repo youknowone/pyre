@@ -1972,6 +1972,21 @@ impl DeadFrame {
         }
     }
 
+    /// Pointer for `FailArgSource::from_jitframe`.
+    ///
+    /// Only the GC-owned variant: `from_jitframe` takes an
+    /// `OwnerRootGuard` on the address, matching
+    /// `compile.py ResumeGuardDescr.handle_fail` handing the deadframe to
+    /// `resume.py blackhole_from_resumedata` so
+    /// `resume.py ResumeDataDirectReader.decode_int` can call
+    /// `self.cpu.get_int_value(self.deadframe, num)`. An off-GC
+    /// (`LibcJitFrame`) address must not be registered as a GCREF.
+    #[inline]
+    pub fn jitframe_ptr(&self) -> Option<*const crate::jitframe::JitFrame> {
+        self.as_jitframe()
+            .map(|jf| jf.jf_gcref().0 as *const crate::jitframe::JitFrame)
+    }
+
     /// Mutable counterpart of [`DeadFrame::as_jitframe`].
     #[inline]
     pub fn as_jitframe_mut(&mut self) -> Option<&mut deadframe::JitFrameDeadFrame> {
