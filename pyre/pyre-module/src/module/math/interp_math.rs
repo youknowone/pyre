@@ -4,7 +4,7 @@
 //!
 //! All functions delegate to `pymath::math` for CPython-exact results.
 
-use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntError, RBigIntGcRoot};
+use majit_rlib::rbigint::{live_rbigint, RBigInt as BigInt, RBigIntError, RBigIntGcRoot};
 use pyre_object::*;
 
 /// Infallible f64 extraction with a `0.0` fallback for a non-convertible
@@ -1237,6 +1237,7 @@ pub fn factorial(args: &[PyObjectRef]) -> PyResult {
         let x2 = x >> 1;
         let (f, g, shift) = fac1(x2, gap);
         let f = RBigIntGcRoot::new(f);
+        let g = RBigIntGcRoot::new(g);
         let g = RBigIntGcRoot::new(g.mul(&fac_odd((x2 + 1) | 1, x + 1, gap)));
         (f.mul(&g), (*g).clone(), shift + x2)
     }
@@ -1451,7 +1452,7 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
     // `n` is an unboxed rbigint local across `index(k)`, exactly the kind of
     // local rooted automatically by RPython's GC transform.
     let n_big = RBigIntGcRoot::new(get_bigint(args[0])?);
-    let k_big = get_bigint(args[1])?;
+    let k_big = RBigIntGcRoot::new(get_bigint(args[1])?);
 
     if n_big.int_lt(0) {
         return Err(pyre_interpreter::PyError::value_error(
@@ -1468,11 +1469,11 @@ pub fn comb(args: &[PyObjectRef]) -> PyResult {
         return Ok(w_int_new(0));
     }
 
-    let n_minus_k = &*n_big - &k_big;
-    let k = RBigIntGcRoot::new(if n_minus_k.lt(&k_big) {
+    let n_minus_k = &*n_big - &*k_big;
+    let k = RBigIntGcRoot::new(if n_minus_k.lt(&*k_big) {
         n_minus_k
     } else {
-        k_big
+        k_big.translated_alias()
     });
     if k.is_zero() {
         return Ok(w_int_new(1));
@@ -1564,28 +1565,36 @@ pub fn perm(args: &[PyObjectRef]) -> PyResult {
     let k = RBigIntGcRoot::new(k_big.unwrap_or_else(|| n_big.translated_alias()));
 
     fn product_range(low: &BigInt, high: &BigInt, gap: &BigInt) -> Result<BigInt, RBigIntError> {
-        if low.add(gap).ge(high) {
+        let low = live_rbigint(low);
+        let high = live_rbigint(high);
+        let gap = live_rbigint(gap);
+        if low.add(&*gap).ge(&*high) {
             let mut result = RBigIntGcRoot::new(BigInt::one());
             let mut i = RBigIntGcRoot::new(low.translated_alias());
-            while i.lt(high) {
+            while i.lt(&*high) {
                 result = RBigIntGcRoot::new(result.mul(&i));
                 i = RBigIntGcRoot::new(i.int_add(1));
             }
             return Ok((*result).clone());
         }
-        let mid = RBigIntGcRoot::new(low.add(high).rshift(1, false)?);
-        let left = RBigIntGcRoot::new(product_range(low, &mid, gap)?);
-        Ok(left.mul(&product_range(&mid, high, gap)?))
+        let sum = RBigIntGcRoot::new(low.add(&*high));
+        let mid = RBigIntGcRoot::new(sum.rshift(1, false)?);
+        let left = RBigIntGcRoot::new(product_range(&*low, &mid, &*gap)?);
+        Ok(left.mul(&product_range(&mid, &*high, &*gap)?))
     }
 
-    let low = n_big.sub(&k).int_add(1);
-    let high = n_big.int_add(1);
+    let low = {
+        let diff = RBigIntGcRoot::new(n_big.sub(&k));
+        RBigIntGcRoot::new(diff.int_add(1))
+    };
+    let high = RBigIntGcRoot::new(n_big.int_add(1));
     let result = if k.int_le(100) {
-        product_range(&low, &high, &BigInt::fromint(100))
+        let gap = RBigIntGcRoot::new(BigInt::fromint(100));
+        product_range(&low, &high, &gap)
     } else {
-        let shifted = k.rshift(7, false).map_err(map_rbigint_err)?;
+        let shifted = RBigIntGcRoot::new(k.rshift(7, false).map_err(map_rbigint_err)?);
         let gap = if shifted.int_lt(100) {
-            BigInt::fromint(100)
+            RBigIntGcRoot::new(BigInt::fromint(100))
         } else {
             shifted
         };

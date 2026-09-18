@@ -3592,7 +3592,11 @@ pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyRe
 pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-        let stop = RBigIntGcRoot::new(BigInt::from(current) + BigInt::from(remaining) * step);
+        let current_b = RBigIntGcRoot::new(BigInt::from(current));
+        let remaining_b = RBigIntGcRoot::new(BigInt::from(remaining));
+        let step_b = RBigIntGcRoot::new(BigInt::from(step));
+        let product = RBigIntGcRoot::new(remaining_b.mul(&*step_b));
+        let stop = RBigIntGcRoot::new(current_b.add(&*product));
         // Python evaluates and keeps all three wrapped arguments before
         // W_Range construction. Mirror the GC transform's root slots between
         // those allocating expressions.
