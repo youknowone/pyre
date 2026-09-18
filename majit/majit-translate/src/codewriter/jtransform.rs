@@ -822,6 +822,23 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
         .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
 }
 
+/// `<*mut T as Default>::default` / `<*const T as Default>::default`
+/// is `ptr::null[_mut]()` (`rtype_ptr_null`). Charon spells the
+/// inherent impl `core::ptr::mut_ptr::<Impl>::default`, which is
+/// not a `core.ptr` module attr, so it misses
+/// [`resolves_to_null_ptr_builtin`].
+fn is_raw_ptr_default_null(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if leaf != "default" {
+        return false;
+    }
+    let joined = segments.join("::");
+    (joined.starts_with("core::ptr::") || joined.starts_with("std::ptr::"))
+        && (joined.contains("mut_ptr") || joined.contains("const_ptr"))
+}
+
 pub(crate) fn jit_marker_key_from_target(
     target: &CallTarget,
     driver_roots: &[String],
@@ -5964,7 +5981,7 @@ impl<'a> Transformer<'a> {
         if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
             && matches!(result_ty, ValueType::Ref(_))
-            && resolves_to_null_ptr_builtin(segments)
+            && (resolves_to_null_ptr_builtin(segments) || is_raw_ptr_default_null(segments))
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
@@ -18396,6 +18413,7 @@ mod tests {
     fn ptr_null_builtin_rewrites_to_null_ref_constant() {
         for path in [
             vec!["core", "ptr", "null_mut"],
+            vec!["core", "ptr", "mut_ptr::<Impl>", "default"],
             vec![crate::runtime_names::crates::OBJECT, "pyobject", "PY_NULL"],
         ] {
             let config = GraphTransformConfig::default();
