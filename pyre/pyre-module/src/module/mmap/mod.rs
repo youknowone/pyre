@@ -6,7 +6,7 @@
 //! works on POSIX and on Windows, where the constructor takes a `tagname`
 //! instead of flags/prot.
 
-crate::pyre_module_init!(interp_mmap);
+pyre_interpreter::pyre_module_init!(interp_mmap);
 
 #[cfg(any(unix, windows))]
 pub use interp_mmap::{W_MMap, w_mmap_dealloc};

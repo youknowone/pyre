@@ -64,8 +64,6 @@ pub mod imp;
 pub mod importlib;
 pub mod itertools;
 pub mod marshal;
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-pub mod mmap;
 #[cfg(all(windows, feature = "host_env"))]
 pub mod msvcrt;
 pub mod operator;

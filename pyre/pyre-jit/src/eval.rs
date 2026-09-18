@@ -856,7 +856,7 @@ unsafe fn ssl_socket_destructor(obj_addr: usize) {
 
 #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
 unsafe fn mmap_destructor(obj_addr: usize) {
-    unsafe { pyre_interpreter::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
+    unsafe { pyre_module::module::mmap::w_mmap_dealloc(obj_addr as pyre_object::PyObjectRef) };
 }
 
 unsafe fn zlib_compress_destructor(obj_addr: usize) {
@@ -4414,7 +4414,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // and duplicated fd.
     #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
     {
-        let mmap_descr = <pyre_interpreter::module::mmap::W_MMap
+        let mmap_descr = <pyre_module::module::mmap::W_MMap
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let mmap_tid = gc.register_type(
             TypeInfo::object_subclass_with_custom_trace(

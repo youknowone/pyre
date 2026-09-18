@@ -87,6 +87,8 @@ pub fn install_optional_modules() {
         module::faulthandler::init,
     );
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("mmap", module::mmap::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
@@ -335,6 +337,23 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         "pymath::math::misc::ulp",
         pymath::math::ulp as *const (),
     );
+    #[cfg(all(
+        any(unix, windows),
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
+    {
+        let mmap_type: fn() -> pyre_object::PyObjectRef = module::mmap::interp_mmap::mmap_type;
+        let addr = mmap_type as *const () as usize as i64;
+        if addr != 0 {
+            entries.push((
+                "pyre_interpreter::module::mmap::interp_mmap::mmap_type",
+                addr,
+            ));
+            entries.push(("pyre_interpreter::mmap_type", addr));
+            entries.push(("pyre_module::module::mmap::interp_mmap::mmap_type", addr));
+        }
+    }
 }
 
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -401,6 +420,10 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
             typed::<module::_ssl::W_Certificate>(),
         ));
     }
+    // `mmap.mmap` follows the optional SSL tail on ordinary Unix/Windows
+    // builds. A sandbox build has no `mmap` module at all.
+    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+    aliases.push(subclass_range_alias(195, typed::<module::mmap::W_MMap>()));
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(
         196,
@@ -436,6 +459,17 @@ mod tests {
     /// process-global fnaddr table. The prepass reads the same table
     /// from a host copy of this crate; a missing row here is the same
     /// defect as a build script that forgot to link `pyre-module`.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_mmap_type() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_module::module::mmap::interp_mmap::mmap_type"),
+            "moved mmap_type must publish a residual fnaddr",
+        );
+    }
+
     #[cfg(all(unix, not(feature = "sandbox")))]
     #[test]
     fn jit_trace_fnaddrs_covers_moved_select_wrapper() {

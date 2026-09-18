@@ -1224,12 +1224,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
         // rustls-backed `_ssl` aliases 190-194 live on the optional-module
-        // hook. `mmap.mmap` follows the optional SSL tail on ordinary Unix
-        // builds.
-        // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
-        // contributes no alias rather than sliding into the vacated SSL slot.
-        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
+        // hook. `mmap.mmap` alias 195 lives on the same hook.
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.

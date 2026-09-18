@@ -766,8 +766,8 @@ pub fn install_builtin_modules() {
 
     pyre_install_module!(atexit);
 
-    // Host-access modules — arbitrary FFI (`_ctypes`), real signals,
-    // `mmap`.  `select`, `_socket`/`_ssl`, `pwd`/`grp` and the other
+    // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
+    // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp` and the other
     // optional host modules live in `pyre-module`.  None belong to the
     // mediated ll_os/ll_time surface, so the sandbox interpreter omits
     // them entirely: `import _ctypes` then raises ModuleNotFoundError,
@@ -780,8 +780,6 @@ pub fn install_builtin_modules() {
         // handler table and `raise_signal`, and leaves out the itimers, the
         // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
-        #[cfg(not(target_arch = "wasm32"))]
-        pyre_install_module!(mmap);
         pyre_install_module!(_ctypes);
         #[cfg(all(
             feature = "host_env",
