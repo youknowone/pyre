@@ -149,6 +149,39 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
     unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
 }
 
+/// `setarrayitem_gc` for a type-9 `ItemsBlock`: test `TRACK_YOUNG_PTRS`,
+/// `write_barrier` / `remember_young_pointer` while the flag is set, then
+/// the store. A raw write after a barrier that ran in another function
+/// leaves a window in which a collection can consume the remembered-set
+/// entry and reset the flag before the young pointer lands.
+///
+/// # Safety
+/// `block` is a live `ItemsBlock` and `index` is in range.
+#[inline]
+pub unsafe fn items_block_set_ref(
+    block: *mut ItemsBlock,
+    index: usize,
+    value: PyObjectRef,
+) {
+    if block.is_null() {
+        return;
+    }
+    if value.is_null() {
+        unsafe { *items_block_items_base(block).add(index) = value };
+        return;
+    }
+    let header = unsafe { majit_gc::header::header_of(block as usize) };
+    if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
+        unsafe { *items_block_items_base(block).add(index) = value };
+        return;
+    }
+    if unsafe { (*header).is_forwarded() } {
+        stale_array_abort(block as usize, index);
+    }
+    crate::gc_hook::try_gc_write_barrier_managed(block as *mut u8);
+    unsafe { *items_block_items_base(block).add(index) = value };
+}
+
 /// `rgc.ll_arraymove(array, source_start, dest_start, length)` — runtime
 /// target for the `list.ll_arraymove` oopspec (OS_ARRAYMOVE / 9).
 ///
@@ -749,22 +782,24 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     ) as *mut u8);
     let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
     let base = unsafe { items_block_items_base(block) };
-    // The block may have landed in old-gen (nursery-full fallback) while its
-    // elements are still young. That old→young edge is invisible to a minor
-    // collection unless the block is on the remembered set, so write-barrier
-    // it here. A nursery block carries no TRACK_YOUNG_PTRS and the barrier is
-    // a no-op; an old-gen block is registered so the next minor collection
-    // walks its items (write_barrier_from_array, incminimark.py). Guard
-    // on GC ownership exactly like `list_write_barrier`.
-    if owns_block {
-        crate::gc_hook::try_gc_write_barrier(block as *mut u8);
-    }
     if cap > 0 {
         // Same block-shaped pop_roots reload as the list constructor above.
         let dst = unsafe { std::slice::from_raw_parts_mut(base, cap) };
         crate::gc_roots::shadow_stack_copy_range(save, dst);
     }
-    block
+    // The block may have landed in old-gen (nursery-full fallback) while
+    // its elements are still young. `write_barrier` /
+    // `remember_young_pointer` is not a collection point, so the fill
+    // can precede it; the managed entry is the one every other typed
+    // array uses after a `setarrayitem` into a `malloc_varsize` block.
+    // A nursery block carries no TRACK_YOUNG_PTRS and the barrier is a
+    // no-op. Guard on GC ownership exactly like `list_write_barrier`.
+    if owns_block {
+        crate::gc_hook::try_gc_write_barrier_managed(
+            crate::gc_roots::shadow_stack_get(block_slot) as *mut u8,
+        );
+    }
+    crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock
 }
 
 /// Allocate an exact-`cap` NULL-filled GC-managed `ItemsBlock` of refs for

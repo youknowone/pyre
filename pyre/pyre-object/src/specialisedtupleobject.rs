@@ -202,9 +202,11 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
     let value0 = crate::gc_roots::shadow_stack_get(save_point);
     let value1 = crate::gc_roots::shadow_stack_get(save_point + 1);
     if !raw.is_null() {
+        let raw_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         unsafe {
             std::ptr::write(
-                raw as *mut W_SpecialisedTupleObject_oo,
+                crate::gc_roots::shadow_stack_get(raw_slot) as *mut W_SpecialisedTupleObject_oo,
                 W_SpecialisedTupleObject_oo {
                     ob_header: header,
                     hash: AtomicI64::new(TUPLE_HASH_UNSET),
@@ -214,12 +216,12 @@ pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> P
             );
         }
         // Nursery-full spills this header to old-gen while `value0` /
-        // `value1` may still be young. A young header needs no barrier;
-        // `try_gc_write_barrier_managed` is a no-op there and records the
-        // old-gen store when the bump spilled (incminimark.py
-        // `write_barrier`, `w_tuple_new_array_backed`).
+        // `value1` may still be young. Barrier the published slot after
+        // the store so a collection that ran on the allocator cannot
+        // leave the filled header off `old_objects_pointing_to_young`.
+        let raw = crate::gc_roots::shadow_stack_get(raw_slot) as *mut u8;
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        return raw as PyObjectRef;
+        return crate::gc_roots::shadow_stack_get(raw_slot);
     }
     Box::into_raw(Box::new(W_SpecialisedTupleObject_oo {
         ob_header: header,

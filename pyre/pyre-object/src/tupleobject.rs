@@ -494,8 +494,12 @@ fn w_tuple_new_array_backed_impl(
             .map(crate::gc_roots::shadow_stack_get)
             .unwrap_or(std::ptr::null_mut()) as *mut u8;
         // The header went in before the root was published; only the items
-        // block is still outstanding. Nothing below can collect, so the
-        // remembered tuple keeps the block from here on.
+        // block is still outstanding. The store below is the old-to-young
+        // edge (`set_ref` / `setarrayitem_gc`: barrier, then the field).
+        // A collection that ran on the pre-store remember (null
+        // `wrappeditems`) already consumed that entry and put
+        // `TRACK_YOUNG_PTRS` back, so the post-store barrier is the one
+        // that keeps the filled tuple on `old_objects_pointing_to_young`.
         let header = header();
         unsafe {
             write_tuple_layout(
@@ -506,6 +510,7 @@ fn w_tuple_new_array_backed_impl(
                 user_layout,
             );
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }
     if user_layout {

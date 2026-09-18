@@ -5211,8 +5211,25 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             // `space.bigint_w(self).eq(space.bigint_w(w_other))`
             // (intobject.py:51-53). A `W_LongObject` stores a `BigInt`
             // pointer, so it must be read as a bigint, not as an i64.
-            return pyre_object::functional::range_obj_to_bigint(w_one)
-                == pyre_object::functional::range_obj_to_bigint(w_two);
+            // `range_obj_to_bigint` of a machine int goes through
+            // `RBigInt::fromint` / `Digits::new`, a collecting malloc.
+            // Both operands are native locals, so the second would
+            // still name the pre-collection nursery address after the
+            // first conversion. Publish them and reload after each
+            // conversion (`gct_fv_gc_malloc` pop_roots).
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_one);
+            let _ = pyre_object::gc_roots::pin_root(w_two);
+            // `left` is an owned digit handle read after the second
+            // conversion allocates; keep it in an `RBigIntGcRoot`.
+            let left = RBigIntGcRoot::new(pyre_object::functional::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ));
+            let right = pyre_object::functional::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            );
+            return *left == right;
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal

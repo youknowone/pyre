@@ -12,7 +12,7 @@ use crate::object_array::{
     ItemsBlock, TypedItemsBlock, alloc_list_items_block_gc, alloc_typed_items_block,
     dealloc_list_items_block, gc_float_array_gc_type_id, gc_int_array_gc_type_id,
     grow_list_items_block_gc, grow_typed_items_block, items_block_capacity, items_block_items_base,
-    typed_items_block_items_base,
+    items_block_set_ref, typed_items_block_items_base,
 };
 use crate::pyobject::*;
 use crate::{
@@ -2536,18 +2536,12 @@ pub fn ll_list_obj_getitem_fast(l: &W_ListObject, index: usize) -> PyObjectRef {
 
 /// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
 /// known-in-bounds index (the spare-capacity append's element write).
-/// The element is a GC pointer, but — unlike the runtime helper that once
-/// inlined the barrier here — the list write barrier is run by the caller
-/// (`w_list_append`) as a separate `dont_look_inside` call. The orthodox
-/// fold replaces this leaf with `getfield_gc_r(items) + setarrayitem_gc_r`
-/// and would drop an inlined barrier; keeping the barrier in the caller
-/// lets the fold preserve it as a residual call.
+/// The host body is `setarrayitem_gc` (`items_block_set_ref`). The
+/// orthodox fold replaces this leaf with `getfield_gc_r(items) +
+/// setarrayitem_gc_r`, which carries its own barrier.
 #[majit_macros::oopspec("list.obj_setitem(l, index, item)")]
 pub fn ll_list_obj_setitem_fast(l: &mut W_ListObject, index: usize, item: PyObjectRef) {
-    unsafe {
-        let base = items_block_items_base(l.items);
-        *base.add(index) = item;
-    }
+    unsafe { items_block_set_ref(l.items, index, item) };
 }
 
 /// `rlist.py _ll_list_resize_hint_really` for Object storage.
