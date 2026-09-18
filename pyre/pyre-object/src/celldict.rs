@@ -134,7 +134,10 @@ impl crate::lltype::GcType for IntMutableCell {
 
 /// `typeobject.py:27-28 ObjectMutableCell.__init__`.
 pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
-    crate::lltype::malloc_typed(ObjectMutableCell {
+    // A trace stores into `w_value` with the cell as the barriered object; the
+    // owning dict is not named by that store, so the cell itself has to be
+    // able to enter the remembered set.
+    crate::lltype::malloc_typed_track_young(ObjectMutableCell {
         ob_header: PyObject {
             ob_type: &OBJECT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&OBJECT_MUTABLE_CELL_TYPE),

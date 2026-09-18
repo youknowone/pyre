@@ -246,6 +246,24 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
     )
 }
 
+/// [`alloc_with_gc_header`] for a box whose reference fields are stored to
+/// after construction by code that barriers the box itself — the JIT's
+/// `COND_CALL_GC_WB` ahead of a `SETFIELD_GC` on it.
+///
+/// `GCFLAG_TRACK_YOUNG_PTRS` alone is the old-generation shape: the barrier
+/// puts the box in `old_objects_pointing_to_young`, the next minor traces it
+/// by its registered type id and re-arms the flag. `GCFLAG_NO_HEAP_PTRS` stays
+/// clear, so the box never enters `prebuilt_root_objects` and a major
+/// collection keeps reaching its fields through whatever owner walks them.
+/// The type id must be registered with its vtable before the first barrier.
+#[inline]
+pub fn alloc_with_gc_header_track_young<T>(value: T, type_id: u32) -> *mut T {
+    alloc_with_gc_header_flags(
+        value,
+        GcHeader::with_flags(type_id, crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
+    )
+}
+
 fn alloc_with_gc_header_flags<T>(value: T, header: GcHeader) -> *mut T {
     const {
         assert!(
@@ -326,6 +344,18 @@ mod tests {
         assert_eq!(TYPE_ID_BITS, usize::BITS / 2);
         assert_eq!(FLAG_SHIFT, usize::BITS / 2);
         assert_eq!(FORWARDED_MARKER, (usize::MAX - 41) as u64);
+    }
+
+    #[test]
+    fn alloc_with_gc_header_track_young_sets_only_track_young() {
+        // Leaked, as above.
+        let p = alloc_with_gc_header_track_young(0xABCD_u64, 0x1357);
+        unsafe {
+            let hdr = header_of(p as usize);
+            assert_eq!((*hdr).type_id(), 0x1357);
+            assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            assert!(!(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
+        }
     }
 
     #[test]
