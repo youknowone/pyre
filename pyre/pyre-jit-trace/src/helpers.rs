@@ -1658,26 +1658,6 @@ pub fn emit_box_float_inline(
     new_op
 }
 
-pub fn emit_box_complex_inline(
-    ctx: &mut TraceCtx,
-    raw_real: OpRef,
-    raw_imag: OpRef,
-    size_descr: majit_ir::DescrRef,
-    real_descr: majit_ir::DescrRef,
-    imag_descr: majit_ir::DescrRef,
-) -> OpRef {
-    let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr.clone());
-    ctx.heap_cache_mut().new_object(new_op);
-    note_class_word_after_new(ctx, new_op, &size_descr);
-    let real_idx = real_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_real], real_descr);
-    ctx.heapcache_setfield_cached(new_op, real_idx, raw_real);
-    let imag_idx = imag_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, raw_imag], imag_descr);
-    ctx.heapcache_setfield_cached(new_op, imag_idx, raw_imag);
-    new_op
-}
-
 /// Emit a fresh callee `PyFrame` directly into the trace IR for the
 /// self-recursive single-int-argument fast path.
 ///
