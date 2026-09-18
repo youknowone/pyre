@@ -286,6 +286,7 @@ impl CallDescriptor {
             void_word_abi: self.result_type == 'v' && self.result_size == 8,
             extra_info: self.extra_info.clone(),
             translated_effect_info_id: None,
+            call_stub: OnceLock::new(),
         }
     }
 

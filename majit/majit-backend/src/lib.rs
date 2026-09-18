@@ -3811,18 +3811,12 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
-        // llmodel.py:818 `calldescr.verify_types(..., history.INT + 'S')`.
+        // llmodel.py AbstractLLCPU.bh_call_i `calldescr.verify_types(..., history.INT + 'S')`.
         crate::call_stub::verify_result_type(calldescr.result_type, "iS");
         // SAFETY: `func` is a valid funcptr matching the ABI recovered from
         // `calldescr.arg_classes`.
         unsafe {
-            crate::call_stub::bh_call_i_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_i_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
     /// model.py bh_call_r(func, args_i, args_r, args_f, calldescr).
@@ -3837,17 +3831,11 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
-        // llmodel.py:824 `calldescr.verify_types(..., history.REF)`.
+        // llmodel.py AbstractLLCPU.bh_call_r `calldescr.verify_types(..., history.REF)`.
         crate::call_stub::verify_result_type(calldescr.result_type, "r");
         // SAFETY: see `bh_call_i`.
         let raw = unsafe {
-            crate::call_stub::bh_call_i_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_i_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         };
         GcRef(raw as usize)
     }
@@ -3863,17 +3851,11 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
-        // llmodel.py:830 `calldescr.verify_types(..., history.FLOAT + 'L')`.
+        // llmodel.py AbstractLLCPU.bh_call_f `calldescr.verify_types(..., history.FLOAT + 'L')`.
         crate::call_stub::verify_result_type(calldescr.result_type, "fL");
         // SAFETY: see `bh_call_i`.
         unsafe {
-            crate::call_stub::bh_call_f_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_f_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
     /// model.py bh_call_v(func, args_i, args_r, args_f, calldescr).
@@ -3888,17 +3870,11 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         assert_ne!(func, 0, "bh_call_v: null function pointer");
-        // llmodel.py:837 `calldescr.verify_types(..., history.VOID)`.
+        // llmodel.py AbstractLLCPU.bh_call_v `calldescr.verify_types(..., history.VOID)`.
         crate::call_stub::verify_result_type(calldescr.result_type, "v");
         // SAFETY: see `bh_call_i`.
         unsafe {
-            crate::call_stub::bh_call_v_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_v_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
 

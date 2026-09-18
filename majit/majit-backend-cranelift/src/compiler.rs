@@ -18521,17 +18521,13 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(
+            majit_backend::call_stub::bh_call_i_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             )
         }
     }
@@ -18550,17 +18546,13 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> majit_ir::GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         let raw = unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(
+            majit_backend::call_stub::bh_call_i_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             )
         };
         majit_ir::GcRef(raw as usize)
@@ -18580,17 +18572,13 @@ impl majit_backend::Backend for CraneliftBackend {
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         unsafe {
-            majit_backend::call_stub::bh_call_f_dispatch(
+            majit_backend::call_stub::bh_call_f_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             )
         }
     }
@@ -18613,17 +18601,13 @@ impl majit_backend::Backend for CraneliftBackend {
         // garbage from rax/x0).
         assert_ne!(func, 0, "bh_call_v: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "v");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         unsafe {
-            majit_backend::call_stub::bh_call_v_dispatch(
+            majit_backend::call_stub::bh_call_v_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             );
         }
     }
