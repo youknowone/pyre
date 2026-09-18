@@ -4794,8 +4794,9 @@ fn call_metaclass_with_kwargs(
     if instance.is_null() {
         return PY_NULL;
     }
-    // Heap types are nursery-born. `__init__` is arbitrary Python and
-    // can collect, so the slot is the live word after those calls.
+    // Heap types are born old-gen (`w_type_new` / `try_gc_alloc_stable_raw`).
+    // `__init__` is arbitrary Python and can collect, so the slot is the
+    // live word after those calls.
     let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let instance = pyre_object::gc_roots::pin_root(instance);
     if let Some(w_insttype) = type_call_init_type(instance, w_metaclass)

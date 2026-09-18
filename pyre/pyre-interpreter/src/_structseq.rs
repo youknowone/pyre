@@ -53,8 +53,8 @@ struct StructSeqDescr {
     extra_fields: Vec<String>,
 }
 
-/// Live type → descr. The type pointer sits in a MiniMark root so a
-/// forwarded slot still matches after a collection.
+/// Live type → descr. The type pointer sits in a MiniMark root so the
+/// type stays reachable; heap types are old-gen and do not move.
 struct StructSeqRegEntry {
     cls_slot: Box<usize>,
     descr: StructSeqDescr,

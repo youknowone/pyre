@@ -241,10 +241,10 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     }
 }
 
-/// Process-global empty tuple. `_Py_SINGLETON(tuple_empty)` / PyPy
-/// `W_AbstractTupleObject.is_w` treats every empty tuple as one object,
-/// so `() is ()` holds. A nursery-allocated `()` in `co_consts_w` is
-/// recycled by a minor that misses that slot; the singleton cannot be.
+/// Process-global empty tuple. `W_AbstractTupleObject.is_w` treats every
+/// empty tuple as one object, so `() is ()` holds. A nursery-allocated
+/// `()` in `co_consts_w` is recycled by a minor that misses that slot;
+/// the singleton cannot be.
 static EMPTY_TUPLE: crate::gc_roots::RootedOnceRef = crate::gc_roots::RootedOnceRef::new();
 
 /// The unique empty tuple object.

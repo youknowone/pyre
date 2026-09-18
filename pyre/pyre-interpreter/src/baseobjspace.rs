@@ -8190,7 +8190,7 @@ unsafe fn type_getattr_hook_or_err(
 /// shape: explicit annotations and the lazy cache belong to this type's own
 /// namespace and are never inherited from a base class.
 pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
-    // `w_dict_new` / `__annotate__` can collect. The type is a nursery
+    // `w_dict_new` / `__annotate__` can collect. The type is an old-gen
     // heap object; keep the caller's handle in the shadow stack and
     // re-read it after those allocations (`framework.py` stack map).
     let _roots = pyre_object::gc_roots::push_roots();

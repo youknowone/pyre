@@ -361,7 +361,7 @@ pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
 }
 
 /// True iff `value` falls inside the prebuilt-int cache range AND
-/// the cache is enabled. Mirrors PyPy's `wrapint` in-range branch
+/// the cache is enabled. Mirrors `wrapint` in-range branch
 /// (`intobject.py:891-895`).
 #[inline]
 pub fn w_int_small_cached(value: i64) -> bool {

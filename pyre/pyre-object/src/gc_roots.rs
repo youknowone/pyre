@@ -749,7 +749,10 @@ impl RootedOnceRef {
     }
 
     pub fn get_or_init(&self, init: impl FnOnce() -> PyObjectRef) -> PyObjectRef {
+        // Register before the value is published so a collection on another
+        // thread can rewrite the slot instead of leaving a stale address in it.
         self.once.call_once(|| {
+            self.try_register();
             let value = init();
             unsafe {
                 *self.slot.get() = value as usize;

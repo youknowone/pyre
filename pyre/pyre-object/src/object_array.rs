@@ -404,7 +404,7 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
     unsafe { dealloc_items_block(block) }
 }
 
-// ─── mapdict instance-storage block: stable GcArray(OBJECTPTR) ────────────
+// ─── mapdict instance-storage block: nursery GcArray(OBJECTPTR) ───────────
 //
 // `W_ObjectObject.storage` (`mapdict.py:910` `self.storage`) is a
 // `Ptr(GcArray(OBJECTPTR))`. It carries the same inline-traced shape as
@@ -416,12 +416,7 @@ pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
 // instance's `storage` pointer never needed rewriting. That is not
 // `mapdict.py`. The nursery bump is `malloc_varsize`.
 
-// A stable allocation does not itself start a collection, but it is still a GC
-// operation and can wait behind a collection started by another mutator.
-// Therefore its inputs and fresh result need the same shadow-stack publication
-// as nursery allocation.
-
-/// Allocate a fresh stable `ItemsBlock` holding `values` in its first slots and
+/// Allocate a fresh nursery `ItemsBlock` holding `values` in its first slots and
 /// NULL in the rest, tagged `W_MAPDICT_STORAGE_GC_TYPE_ID` (leaf). The map is
 /// the length authority (mapdict.py), so `cap` is an allocation bound
 /// rather than a length; a live instance passes the larger of its current
