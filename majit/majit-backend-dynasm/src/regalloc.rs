@@ -4164,13 +4164,6 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
     ) {
         self.perform_guard_j2(fail_args, i, vec![], None, output);
-        if self
-            .operations
-            .get(i)
-            .is_some_and(|op| op.opcode == OpCode::GuardNotForced)
-        {
-            self.maybe_spill_callr_ref_after_guard_not_forced(i, output);
-        }
     }
 
     /// x86/regalloc.py `consider_guard_not_forced_2` and
@@ -4204,7 +4197,6 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         self.perform_guard_j2(fail_args, i, vec![], None, output);
-        self.maybe_spill_callr_ref_after_guard_not_forced(i, output);
     }
 
     /// x86/regalloc.py _consider_guard_cc
@@ -4288,9 +4280,6 @@ impl<'a> RegAlloc<'a> {
     /// Guards with no arguments (guard_no_exception, guard_not_forced, etc.)
     fn consider_guard_no_args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         self.perform_guard(op, i, vec![], None, output);
-        if matches!(op.opcode, OpCode::GuardNotForced) {
-            self.maybe_spill_callr_ref_after_guard_not_forced(i, output);
-        }
     }
 
     /// x86/regalloc.py `consider_guard_not_forced_2`.
@@ -4327,7 +4316,6 @@ impl<'a> RegAlloc<'a> {
             &type_index,
         );
         self.perform_guard(op, i, vec![], None, output);
-        self.maybe_spill_callr_ref_after_guard_not_forced(i, output);
     }
 
     /// x86/regalloc.py consider_check_memory_error.
@@ -5234,35 +5222,6 @@ impl<'a> RegAlloc<'a> {
     /// contents are unrelated to the argument value. See llsupport/
     /// regalloc.py:724-734 doc: arglocs "stay valid" only if they were
     /// captured before before_call.
-    fn next_is_guard_not_forced(&self, i: usize) -> bool {
-        self.operations
-            .get(i + 1)
-            .is_some_and(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
-    }
-
-    /// After `GUARD_NOT_FORCED` has recorded fail_locs with the CallR
-    /// result still in `call_result_gpr` (`llsupport/regalloc.py`
-    /// `after_call`), publish that Ref into a jitframe home so a later
-    /// free-threaded safepoint can rewrite it.
-    fn maybe_spill_callr_ref_after_guard_not_forced(
-        &mut self,
-        guard_i: usize,
-        output: &mut Vec<RegAllocOp>,
-    ) {
-        let Some(prev) = guard_i.checked_sub(1).and_then(|i| self.operations.get(i)) else {
-            return;
-        };
-        if prev.opcode.result_type() != Type::Ref {
-            return;
-        }
-        if !prev.opcode.is_call() {
-            return;
-        }
-        let dst = prev.pos().get();
-        self.force_spill_var(dst, Type::Ref);
-        self.flush_moves(output);
-    }
-
     fn consider_call(
         &mut self,
         op: &Op,
@@ -5366,22 +5325,6 @@ impl<'a> RegAlloc<'a> {
         } else {
             self.perform(i, arglocs, result_loc, output);
         }
-        // Residual GCREF results start in call_result_gpr. Upstream
-        // leaves them in eax until the next call's `before_call`
-        // `SAVE_GCREF_REGS` (`llsupport/regalloc.py`). A free-threaded
-        // safepoint can collect before that, so publish the result into
-        // a jitframe home — but not before the following
-        // `GUARD_NOT_FORCED` records fail_locs. `cpu.force` (`llmodel.py`)
-        // reads those locs during the residual, before compiled code
-        // writes the result; a spill slot reused from a collected GCREF
-        // would be nursery poison. With the result still in
-        // `call_result_gpr`, `rd_locs` is the register index and force
-        // reads the zeroed fixed save area (`assembler.py`
-        // `store_info_on_descr`). The GNF consider spills afterwards.
-        if result_tp == Type::Ref && !self.next_is_guard_not_forced(i) {
-            self.force_spill_var(op.pos().get(), Type::Ref);
-            self.flush_moves(output);
-        }
     }
 
     fn consider_call_j2(
@@ -5478,11 +5421,6 @@ impl<'a> RegAlloc<'a> {
             self.perform_with_gcmap_ptr(i, arglocs, result_loc, gcmap, output);
         } else {
             self.perform(i, arglocs, result_loc, output);
-        }
-        if result_tp == Type::Ref && !self.next_is_guard_not_forced(i) {
-            let dst = dst.unwrap_or(op.pos().get());
-            self.force_spill_var(dst, Type::Ref);
-            self.flush_moves(output);
         }
     }
 

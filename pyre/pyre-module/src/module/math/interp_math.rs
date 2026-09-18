@@ -4,7 +4,7 @@
 //!
 //! All functions delegate to `pymath::math` for CPython-exact results.
 
-use majit_rlib::rbigint::{live_rbigint, RBigInt as BigInt, RBigIntError, RBigIntGcRoot};
+use majit_rlib::rbigint::{RBigInt as BigInt, RBigIntError, RBigIntGcRoot, live_rbigint};
 use pyre_object::*;
 
 /// Infallible f64 extraction with a `0.0` fallback for a non-convertible

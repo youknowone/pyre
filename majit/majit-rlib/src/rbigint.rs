@@ -638,7 +638,13 @@ impl RBigInt {
     /// `rbigint.__init__` over a slice of a live source whose `_digits`
     /// slot is already on the shadow stack. `Digits::new` may collect;
     /// the range is re-derived from `src` afterwards.
-    fn new_from_rooted(src: &RBigIntGcRoot, start: usize, end: usize, sign: i64, size: i64) -> Self {
+    fn new_from_rooted(
+        src: &RBigIntGcRoot,
+        start: usize,
+        end: usize,
+        sign: i64,
+        size: i64,
+    ) -> Self {
         debug_assert!(size >= 0);
         debug_assert!(start <= end);
         let len = end - start;
@@ -1607,13 +1613,7 @@ impl RBigInt {
                 return self.translated_alias();
             }
             let this = live_rbigint(self);
-            return Self::new_from_rooted(
-                &this,
-                0,
-                asize as usize,
-                selfsign * othersign,
-                asize,
-            );
+            return Self::new_from_rooted(&this, 0, asize as usize, selfsign * othersign, asize);
         } else if asize == 1 {
             let res = self.uwidedigit(0) * digit as UWideDigit;
             let carry = res >> SHIFT;
@@ -3800,13 +3800,8 @@ fn _extract_digits(a: &RBigInt, startindex: i64, numdigits: i64) -> RBigInt {
         return RBigInt::zero();
     }
     let a = live_rbigint(a);
-    let mut result = RBigInt::new_from_rooted(
-        &a,
-        startindex as usize,
-        stop as usize,
-        1,
-        stop - startindex,
-    );
+    let mut result =
+        RBigInt::new_from_rooted(&a, startindex as usize, stop as usize, 1, stop - startindex);
     result._normalize();
     result
 }
