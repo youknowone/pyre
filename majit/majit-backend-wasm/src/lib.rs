@@ -53,7 +53,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
@@ -1255,23 +1255,14 @@ pub(crate) mod gc_box {
     }
 
     /// [`clear`] only when `generation` is still the live installation.
-    pub(crate) fn clear_if_generation(generation: u64) {
+    pub(crate) fn clear_if_generation(generation: u64) -> bool {
         let live = WASM_ACTIVE_GC_GEN.with(|slot| slot.get());
         if live == generation && generation != 0 {
             clear();
+            true
+        } else {
+            false
         }
-    }
-
-    /// Drop this thread's box and clear the raw mirror.
-    ///
-    /// The box goes first so reentrant ownership queries issued from its drop
-    /// body still resolve old-heap addresses through the mirror. `try_with`
-    /// because this is also the process-exit path.
-    pub(super) fn clear() {
-        let _ = WASM_ACTIVE_GC.try_with(|cell| {
-            *cell.borrow_mut() = None;
-        });
-        let _ = WASM_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
     }
 }
 
@@ -1375,6 +1366,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     );
 }
 
+/// Live per-thread wasm GC boxes. Root hooks are process-global, so they
+/// stay installed until the last box is dropped — clearing one thread must
+/// not unhook another thread's still-active heap.
+static WASM_GC_BOXES: AtomicUsize = AtomicUsize::new(0);
+
 /// Owns the TLS GC box installed by [`install_gc_box`]. Dropping it
 /// uninstalls the box on this thread (`llmodel.py` `cpu.gc_ll_descr`
 /// dies with the cpu) only if this guard still owns the slot.
@@ -1384,7 +1380,9 @@ pub(crate) struct ActiveGcBox {
 
 impl Drop for ActiveGcBox {
     fn drop(&mut self) {
-        gc_box::clear_if_generation(self.generation);
+        if gc_box::clear_if_generation(self.generation) {
+            withdraw_root_hooks_if_last_box();
+        }
     }
 }
 
@@ -1403,6 +1401,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
     let generation = gc_box::store(gc);
+    WASM_GC_BOXES.fetch_add(1, Ordering::Release);
     register_active_hooks(supports_guard_gc_type);
     ActiveGcBox { generation }
 }
@@ -1417,7 +1416,21 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
 /// pointer. `install_gc_box` reinstalls the hooks.
 pub fn clear_gc_allocator() {
     gc_box::clear();
-    majit_gc::set_active_root_hooks(None, None);
+    withdraw_root_hooks_if_last_box();
+}
+
+fn withdraw_root_hooks_if_last_box() {
+    // Withdraw the process-global hooks only when this was the last box.
+    // A leftover MiniMark on a later `WasmFrameData` drop must not see a
+    // test `GcRef` token as a heap pointer, but another thread's box still
+    // needs the hooks.
+    if WASM_GC_BOXES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        .ok()
+        == Some(1)
+    {
+        majit_gc::set_active_root_hooks(None, None);
+    }
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a

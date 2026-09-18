@@ -6059,15 +6059,12 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 /// Loop-free: the MRO override walk lives in residual
 /// [`try_compare_override`] (`look_inside_graph` / `contains_loop`).
 /// `compare_slot_rest` is the same split for non-int layouts.
-pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    // Livevars across every collection in this body (`try_compare_override`,
-    // `lookup_in_type_where`). The translator would emit `push_roots` for
-    // `w_obj1`/`w_obj2`; a forwarding stub here is what
-    // `subclass_special_override` then reads as `w_class == 0x2`.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let cmp_base = pyre_object::gc_roots::pin_roots(&[a, b]);
-    let mut a = pyre_object::gc_roots::shadow_stack_get(cmp_base);
-    let mut b = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
+pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResult {
+    // Do not pin at the head: `pin_roots` is `dont_look_inside`, and a
+    // residual on the walked `int < int` path blocks `compare_op_descent`
+    // and doubles guard-failures. The MayForce C ABI copies are published
+    // in `compare_value_from_tag_inner`; the override arm below publishes
+    // only when `try_compare_override` can collect.
     // `_make_comparison_impl`: only `__eq__`/`__ne__` have `left == right`,
     // so only they take the same-type shortcut.
     unsafe {
@@ -6075,8 +6072,6 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
             let w_res = compare_slot(a, b, op)?;
-            a = pyre_object::gc_roots::shadow_stack_get(cmp_base);
-            b = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
@@ -6114,7 +6109,14 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             // by-layout container cycle is covered separately, by the check in
             // [`compare_slot_rest`].
             crate::stack_check::stack_check()?;
-            if let Some(result) = try_compare_override(a, b, op)? {
+            // `try_compare_override` is residual and can collect. Publish
+            // only on this arm so an exact-builtin pair never records the
+            // pin (`both_exact_builtin_instances_promoted` is false here).
+            let _override_roots = pyre_object::gc_roots::push_roots();
+            let cmp_base = pyre_object::gc_roots::pin_roots(&[a, b]);
+            let a_live = pyre_object::gc_roots::shadow_stack_get(cmp_base);
+            let b_live = pyre_object::gc_roots::shadow_stack_get(cmp_base + 1);
+            if let Some(result) = try_compare_override(a_live, b_live, op)? {
                 return Ok(result);
             }
             a = pyre_object::gc_roots::shadow_stack_get(cmp_base);

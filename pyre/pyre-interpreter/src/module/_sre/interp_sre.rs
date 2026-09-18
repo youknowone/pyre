@@ -1378,6 +1378,10 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // Rust Vec (which would require an O(number of matches) shadow stack).
     let results = RootedObject::pin(w_list_new_empty());
     for snap in &matches {
+        // Per-match bracket: once `w_list_append` makes the item reachable
+        // from `results`, the slots can drop. A function-wide pin of every
+        // match is O(matches × groups) and is not `findall_w`.
+        let _match_roots = pyre_object::gc_roots::push_roots();
         let spans = &snap.spans;
         let w_item = if num_groups == 0 {
             RootedObject::pin(slice_subject(subj, spans[0], w_empty))

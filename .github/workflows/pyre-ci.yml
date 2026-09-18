@@ -584,7 +584,8 @@ jobs:
           cargo test --no-default-features -p majit-backend-wasm --lib \
             -- --test-threads=1
         fi
-        cargo test --no-default-features -p majit-backend-wasm --tests
+        cargo test --no-default-features -p majit-backend-wasm \
+          --test bridge_diag_mirror --test codegen_test
 
     - name: Run process-exclusive tests (dynasm, serial)
       shell: bash

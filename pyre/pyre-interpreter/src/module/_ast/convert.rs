@@ -1808,8 +1808,11 @@ impl ObjectConverter {
                 ));
             }
             let _roots = pyre_object::gc_roots::push_roots();
-            let key_base = pyre_object::gc_roots::pin_roots(&keys);
-            let value_base = pyre_object::gc_roots::pin_roots(&values);
+            // Two slices: publish both before the first normalize, which is
+            // itself a GC safepoint (`pin_roots` multi-slice contract).
+            let key_base = pyre_object::gc_roots::publish_roots(&keys);
+            let value_base = pyre_object::gc_roots::publish_roots(&values);
+            pyre_object::gc_roots::normalize_roots(key_base, keys.len() + values.len());
             // A `None` key is the `**mapping` spread, which has no key node.
             let mut items = Vec::with_capacity(keys.len());
             for index in 0..keys.len() {
