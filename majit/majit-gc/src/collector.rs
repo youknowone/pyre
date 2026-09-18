@@ -1250,19 +1250,11 @@ pub struct MiniMarkGC {
 #[cfg(unix)]
 fn page_is_mapped(addr: usize) -> bool {
     unsafe extern "C" {
-        fn pipe(fds: *mut i32) -> i32;
         fn write(fd: i32, buf: *const u8, n: usize) -> isize;
         fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
     }
     thread_local! {
-        static PIPE: [i32; 2] = {
-            let mut fds = [0i32; 2];
-            if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-                [-1, -1]
-            } else {
-                fds
-            }
-        };
+        static PIPE: [i32; 2] = open_cloexec_pipe();
     }
     PIPE.with(|fds| {
         if fds[0] < 0 {
@@ -1277,6 +1269,48 @@ fn page_is_mapped(addr: usize) -> bool {
             false
         }
     })
+}
+
+/// Probe pipe with `O_CLOEXEC`. A bare `pipe()` leaked into children
+/// (`test_subprocess` / `test_tempfile` saw the extra fds).
+#[cfg(target_os = "linux")]
+fn open_cloexec_pipe() -> [i32; 2] {
+    unsafe extern "C" {
+        fn pipe2(fds: *mut i32, flags: i32) -> i32;
+    }
+    // `O_CLOEXEC` — atomic, no fork race between `pipe` and `fcntl`.
+    const O_CLOEXEC: i32 = 0o2000000;
+    let mut fds = [-1i32; 2];
+    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
+        [-1, -1]
+    } else {
+        fds
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_cloexec_pipe() -> [i32; 2] {
+    unsafe extern "C" {
+        fn close(fd: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        fn pipe(fds: *mut i32) -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    let mut fds = [-1i32; 2];
+    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
+        return [-1, -1];
+    }
+    for fd in fds {
+        if unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } != 0 {
+            unsafe {
+                close(fds[0]);
+                close(fds[1]);
+            }
+            return [-1, -1];
+        }
+    }
+    fds
 }
 
 #[cfg(not(unix))]
