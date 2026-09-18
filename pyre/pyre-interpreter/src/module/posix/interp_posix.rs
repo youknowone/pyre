@@ -4011,44 +4011,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         #[cfg(all(windows, feature = "host_env"))]
         {
-            use windows_sys::Win32::Foundation::{FILETIME, INVALID_HANDLE_VALUE};
-            use windows_sys::Win32::Storage::FileSystem::{
-                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
-                SetFileTime,
-            };
             if dir_fd.is_some() || !follow_symlinks {
                 return Err(crate::PyError::not_implemented(
                     "utime: dir_fd and follow_symlinks=False are unavailable on this platform",
                 ));
             }
-            // `time_t_to_FILE_TIME` (`rwin32file.py`): a FILETIME
-            // counts 100ns ticks from 1601-01-01, so shifting the epoch is what
-            // makes a second before 1970 an ordinary positive tick count rather
-            // than one with no representation. The sub-100ns of a nanosecond is
-            // not a tick the filesystem holds and is floored, as the conversion
-            // floors it — which is why `ns=-1` reads back as `-100`.
-            //
-            // The arithmetic wraps rather than checks: `r_longlong` there, and
-            // the same `__int64` in the C the line is a transcription of. A
-            // second this filesystem cannot hold writes the bits the
-            // multiplication leaves rather than being diagnosed, and a value no
-            // `time_t` can hold has already been refused by `time_from_secs`.
-            const EPOCH_DIFF: i64 = 11_644_473_600;
-            let to_filetime = |t: UTime| -> FILETIME {
-                let ticks = t
-                    .sec
-                    .wrapping_add(EPOCH_DIFF)
-                    .wrapping_mul(10_000_000)
-                    .wrapping_add(t.nsec / 100) as u64;
-                FILETIME {
-                    dwLowDateTime: ticks as u32,
-                    dwHighDateTime: (ticks >> 32) as u32,
-                }
-            };
-            // `rposix.py:1568-1576` reads a clock here when the caller named no
-            // time — `GetSystemTime` into both stamps — and reaches
-            // `time_t_to_FILE_TIME` only for a named pair. `SetFileTime` has no
-            // word for "now", which is what the `utimensat` arm below spells
+            // `rposix.py` reads a clock here when the caller named no time —
+            // `GetSystemTime` into both stamps. `SetFileTime` has no word for
+            // "now", which is what the `utimensat` arm below spells
             // `UTIME_NOW`; the pair arrives at zero while the flag carries the
             // meaning, so reading it here is what keeps `os.utime(path)` off
             // 1970.
@@ -4064,34 +4034,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             } else {
                 (access, modified)
             };
-            let atime = to_filetime(access);
-            let mtime = to_filetime(modified);
             let wide = wide_path(&path.as_bytes)?;
-            // FILE_WRITE_ATTRIBUTES is the access `SetFileTime` takes;
-            // FILE_FLAG_BACKUP_SEMANTICS lets the name open a directory too.
-            let handle = unsafe {
-                CreateFileW(
-                    wide.as_ptr(),
-                    FILE_WRITE_ATTRIBUTES,
-                    0,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                    std::ptr::null_mut(),
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(fs_err_with_filename(
-                    std::io::Error::last_os_error(),
-                    path.w_path(),
-                ));
-            }
-            let wrote = unsafe { SetFileTime(handle, std::ptr::null(), &atime, &mtime) };
-            let error = (wrote == 0).then(std::io::Error::last_os_error);
-            let _ = rustpython_host_env::winapi::close_handle(handle);
-            if let Some(error) = error {
-                return Err(fs_err_with_filename(error, path.w_path()));
-            }
+            rustpython_host_env::nt::set_file_times(
+                &wide,
+                access.sec,
+                access.nsec,
+                modified.sec,
+                modified.nsec,
+            )
+            .map_err(|error| fs_err_with_filename(error, path.w_path()))?;
             return Ok(pyre_object::w_none());
         }
         #[cfg(all(unix, not(feature = "sandbox")))]
@@ -7253,6 +7204,83 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             ),
         );
 
+        // interp_posix.py `pread`: `rposix.pread` plus `eintr_retry=True`.
+        crate::module_ns_store(
+            ns,
+            "pread",
+            crate::make_builtin_function_with_arity(
+                "pread",
+                |args| {
+                    if args.len() < 3 {
+                        return Err(crate::PyError::type_error("pread() requires 3 arguments"));
+                    }
+                    // `@unwrap_spec(fd=c_int, length=int, offset=r_longlong)`.
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let length = crate::baseobjspace::int_w(args[1])?;
+                    let offset = crate::baseobjspace::int_w(args[2])? as libc::off_t;
+                    if length < 0 {
+                        return Err(crate::PyError::os_error_with_errno(
+                            libc::EINVAL,
+                            "pread: negative length",
+                        ));
+                    }
+                    let n = length as usize;
+                    let mut buf = Vec::new();
+                    buf.try_reserve_exact(n)
+                        .map_err(|_| crate::PyError::memory_error(""))?;
+                    buf.resize(n, 0);
+                    loop {
+                        let result = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            host_posix::pread(fd, &mut buf, offset)
+                        };
+                        match result {
+                            Ok(read) => {
+                                buf.truncate(read);
+                                break;
+                            }
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                        }
+                    }
+                    Ok(pyre_object::w_bytes_from_bytes(&buf))
+                },
+                3,
+            ),
+        );
+
+        // interp_posix.py `pwrite`: `space.bufferstr_w` plus `eintr_retry=True`.
+        crate::module_ns_store(
+            ns,
+            "pwrite",
+            crate::make_builtin_function_with_arity(
+                "pwrite",
+                |args| {
+                    if args.len() < 3 {
+                        return Err(crate::PyError::type_error("pwrite() requires 3 arguments"));
+                    }
+                    // `@unwrap_spec(fd=c_int, offset=r_longlong)`.
+                    let fd = crate::baseobjspace::c_int_w(args[0])?;
+                    let data = unsafe { crate::builtins::file_write_buffer_bytes(args[1]) }
+                        .map_err(|_| {
+                            crate::PyError::type_error("pwrite() arg 2 must be bytes-like")
+                        })?;
+                    let offset = crate::baseobjspace::int_w(args[2])? as libc::off_t;
+                    let written = loop {
+                        let result = {
+                            let _blocked = crate::module::thread::before_external_block();
+                            host_posix::pwrite(fd, &data, offset)
+                        };
+                        match result {
+                            Ok(n) => break n,
+                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                        }
+                    };
+                    Ok(pyre_object::w_int_new(written as i64))
+                },
+                3,
+            ),
+        );
+
         // os.sched_yield()
         crate::module_ns_store(
             ns,
@@ -8307,6 +8335,92 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
+            ),
+        );
+
+        // `app_posix.wait3` / `app_posix.wait4` import `_pypy_wait`, which
+        // retries EINTR and wraps the rusage as `resource.struct_rusage`.
+        fn wait_rusage_to_py(
+            ru: rustpython_host_env::resource::RUsage,
+        ) -> Result<PyObjectRef, crate::PyError> {
+            let resource = crate::importing::get_builtin_module("resource").ok_or_else(|| {
+                crate::PyError::runtime_error("resource module is not initialized")
+            })?;
+            let cls = crate::baseobjspace::getattr_str(resource, "struct_rusage")?;
+            let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_utime)));
+            fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_stime)));
+            fields.push(pyre_object::w_int_new(ru.ru_maxrss));
+            fields.push(pyre_object::w_int_new(ru.ru_ixrss));
+            fields.push(pyre_object::w_int_new(ru.ru_idrss));
+            fields.push(pyre_object::w_int_new(ru.ru_isrss));
+            fields.push(pyre_object::w_int_new(ru.ru_minflt));
+            fields.push(pyre_object::w_int_new(ru.ru_majflt));
+            fields.push(pyre_object::w_int_new(ru.ru_nswap));
+            fields.push(pyre_object::w_int_new(ru.ru_inblock));
+            fields.push(pyre_object::w_int_new(ru.ru_oublock));
+            fields.push(pyre_object::w_int_new(ru.ru_msgsnd));
+            fields.push(pyre_object::w_int_new(ru.ru_msgrcv));
+            fields.push(pyre_object::w_int_new(ru.ru_nsignals));
+            fields.push(pyre_object::w_int_new(ru.ru_nvcsw));
+            fields.push(pyre_object::w_int_new(ru.ru_nivcsw));
+            Ok(crate::_structseq::new_instance(cls, fields.take()))
+        }
+
+        fn wait_with_rusage<F>(wait: F) -> Result<PyObjectRef, crate::PyError>
+        where
+            F: Fn() -> std::io::Result<(libc::pid_t, i32, rustpython_host_env::resource::RUsage)>,
+        {
+            loop {
+                let result = {
+                    let _blocked = crate::module::thread::before_external_block();
+                    wait()
+                };
+                match result {
+                    Ok((pid, status, ru)) => {
+                        let rusage = wait_rusage_to_py(ru)?;
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_int_new(pid as i64));
+                        fields.push(pyre_object::w_int_new(status as i64));
+                        fields.push(rusage);
+                        return Ok(pyre_object::w_tuple_new(fields.take()));
+                    }
+                    Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                }
+            }
+        }
+
+        crate::module_ns_store(
+            ns,
+            "wait3",
+            crate::make_builtin_function_with_arity(
+                "wait3",
+                |args| {
+                    if args.is_empty() {
+                        return Err(crate::PyError::type_error("wait3() requires 1 argument"));
+                    }
+                    let options = crate::baseobjspace::c_int_w(args[0])?;
+                    wait_with_rusage(|| host_posix::wait3(options))
+                },
+                1,
+            ),
+        );
+
+        crate::module_ns_store(
+            ns,
+            "wait4",
+            crate::make_builtin_function_with_arity(
+                "wait4",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error("wait4() requires 2 arguments"));
+                    }
+                    let pid = crate::baseobjspace::c_int_w(args[0])? as libc::pid_t;
+                    let options = crate::baseobjspace::c_int_w(args[1])?;
+                    wait_with_rusage(|| host_posix::wait4(pid, options))
+                },
+                2,
             ),
         );
 
@@ -12011,116 +12125,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             }),
         );
 
-        /// PyPy `os_symlink_impl`, including its bounded `_check_dirW` probe.
-        ///
-        /// The probe is intentionally limited to `MAX_PATH`: the upstream C
-        /// helper uses two `WCHAR[MAX_PATH]` arrays and treats an overflowing
-        /// join as "not a directory".  That boundary is observable for an
-        /// existing directory target (and is exercised by CPython 3.14's
-        /// `TestExtractionFilters.test_realpath_limit_attack`), so the
-        /// unbounded `host_nt::symlink` probe is not equivalent here.
-        fn win_symlink(
-            src: &widestring::WideCString,
-            dst: &widestring::WideCString,
-            target_is_directory: bool,
-        ) -> std::io::Result<()> {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            use windows_sys::Win32::{
-                Foundation::{ERROR_INVALID_PARAMETER, GetLastError},
-                Storage::FileSystem::{
-                    CreateSymbolicLinkW, FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesExW,
-                    GetFileExInfoStandard, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
-                    SYMBOLIC_LINK_FLAG_DIRECTORY, WIN32_FILE_ATTRIBUTE_DATA,
-                },
-            };
-
-            fn check_dir(src: &widestring::WideCString, dst: &widestring::WideCString) -> bool {
-                let src = src.as_slice();
-                let dst = dst.as_slice();
-                let max_path = host_nt::MAX_PATH_USIZE;
-
-                // `_dirnameW` first copies the complete destination into its
-                // fixed buffer, then truncates it at the last separator.
-                if dst.len() >= max_path {
-                    return false;
-                }
-                let parent_len = dst
-                    .iter()
-                    .rposition(|&unit| unit == b'\\' as u16 || unit == b'/' as u16)
-                    .unwrap_or(0);
-                let parent = &dst[..parent_len];
-                let absolute = src
-                    .first()
-                    .is_some_and(|&unit| unit == b'\\' as u16 || unit == b'/' as u16)
-                    || (src.first().is_some_and(|&unit| unit != 0)
-                        && src.get(1) == Some(&(b':' as u16)));
-
-                let mut resolved = Vec::with_capacity(max_path);
-                if absolute {
-                    if src.len() >= max_path {
-                        return false;
-                    }
-                    resolved.extend_from_slice(src);
-                } else {
-                    let separator_len = usize::from(!parent.is_empty());
-                    if parent.len() + separator_len + src.len() >= max_path {
-                        return false;
-                    }
-                    resolved.extend_from_slice(parent);
-                    if !parent.is_empty() {
-                        resolved.push(b'\\' as u16);
-                    }
-                    resolved.extend_from_slice(src);
-                }
-                resolved.push(0);
-
-                let mut info: WIN32_FILE_ATTRIBUTE_DATA = unsafe { std::mem::zeroed() };
-                let ok = unsafe {
-                    GetFileAttributesExW(
-                        resolved.as_ptr(),
-                        GetFileExInfoStandard,
-                        (&mut info as *mut WIN32_FILE_ATTRIBUTE_DATA).cast(),
-                    )
-                };
-                ok != 0 && info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
-            }
-
-            // `windows_has_symlink_unprivileged_flag` in `os_symlink_impl` is
-            // process-global semantic state, not per-thread state.
-            static HAS_UNPRIVILEGED_FLAG: AtomicBool = AtomicBool::new(true);
-            let has_unprivileged_flag = HAS_UNPRIVILEGED_FLAG.load(Ordering::Relaxed);
-            let mut flags = if has_unprivileged_flag {
-                SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
-            } else {
-                0
-            };
-            if target_is_directory || check_dir(src, dst) {
-                flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
-            }
-
-            let mut result = unsafe { CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) };
-            if !result
-                && has_unprivileged_flag
-                && unsafe { GetLastError() } == ERROR_INVALID_PARAMETER
-            {
-                flags &= !SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
-                result = unsafe { CreateSymbolicLinkW(dst.as_ptr(), src.as_ptr(), flags) };
-                if result || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
-                    HAS_UNPRIVILEGED_FLAG.store(false, Ordering::Relaxed);
-                }
-            }
-            if result {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }
-
         // os.symlink(src, dst, target_is_directory=False) -> None.
         // `CreateSymbolicLinkW` names the link first and its target second,
         // and a link to a directory is a different kind of reparse point from
         // a link to a file. `os_symlink_impl` picks the kind from the explicit
-        // argument or its bounded existing-target probe.
+        // argument or `host_nt::symlink`'s bounded existing-target probe.
         crate::module_ns_store(
             ns,
             "symlink",
@@ -12151,8 +12160,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     None => false,
                 };
                 let (wide_src, wide_dst) = (wide_path(&src.as_bytes)?, wide_path(&dst.as_bytes)?);
-                win_symlink(&wide_src, &wide_dst, target_is_directory)
-                    .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
+                use std::os::windows::ffi::OsStringExt;
+                let src_path = std::ffi::OsString::from_wide(wide_src.as_slice());
+                let dst_path = std::ffi::OsString::from_wide(wide_dst.as_slice());
+                host_nt::symlink(
+                    src_path.as_ref(),
+                    dst_path.as_ref(),
+                    &wide_src,
+                    &wide_dst,
+                    target_is_directory,
+                )
+                .map_err(|e| fs_err_with_filename2(e, 0, src.w_path(), dst.w_path()))?;
                 Ok(pyre_object::w_none())
             }),
         );
