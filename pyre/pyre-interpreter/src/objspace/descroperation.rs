@@ -2629,6 +2629,64 @@ fn compare_f64(f1: f64, f2: f64, op: CompareOp) -> bool {
     }
 }
 
+/// `tupleobject.py _unroll_condition_cmp`.
+fn tuple_compare_iff(a: PyObjectRef, b: PyObjectRef, _op: CompareOp) -> bool {
+    pyre_object::tupleobject::unroll_condition(a) || pyre_object::tupleobject::unroll_condition(b)
+}
+
+/// `tupleobject.py _compare_tuples` /
+/// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
+#[majit_macros::look_inside_iff(tuple_compare_iff)]
+fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObjectRef, PyError> {
+    // Four native locals live across a collection point here: the two
+    // receivers, and the two elements the loop holds from the `eq_w`
+    // that runs their `__eq__` to the `compare` that reports the first
+    // inequality.  `w_tuple_getitem` is a second such point -- it boxes
+    // an `_ii` / `_ff` payload -- so the element slots are read back
+    // after each one too.  The last two slots start as the receivers
+    // rather than a null so the walker never sees an unpopulated one;
+    // the loop overwrites them before either is read.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(&[a, b, a, b]);
+    roots.normalize(base, 4);
+    let la = unsafe { w_tuple_len(roots.get(base)) };
+    let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
+    if matches!(op, CompareOp::Eq | CompareOp::Ne)
+        && let Some(equal) =
+            unsafe { specialised_tuple_same_class_eq(roots.get(base), roots.get(base + 1))? }
+    {
+        return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
+            !equal
+        } else {
+            equal
+        }));
+    }
+    let min_len = la.min(lb);
+    for i in 0..min_len {
+        roots.set(
+            base + 2,
+            unsafe { w_tuple_getitem(roots.get(base), i as i64) }.unwrap_or(PY_NULL),
+        );
+        roots.set(
+            base + 3,
+            unsafe { w_tuple_getitem(roots.get(base + 1), i as i64) }.unwrap_or(PY_NULL),
+        );
+        // `_compare_tuples`: `if not space.eq_w(items1[p], items2[p]):
+        //     return getattr(space, name)(items1[p], items2[p])`
+        if !crate::baseobjspace::eq_w(roots.get(base + 2), roots.get(base + 3))? {
+            return compare(roots.get(base + 2), roots.get(base + 3), op);
+        }
+    }
+    Ok(w_bool_from(match op {
+        CompareOp::Lt => la < lb,
+        CompareOp::Le => la <= lb,
+        CompareOp::Gt => la > lb,
+        CompareOp::Ge => la >= lb,
+        CompareOp::Eq => la == lb,
+        CompareOp::Ne => la != lb,
+    }))
+}
+
 /// `specialisedtupleobject.py descr_eq`, the arm where both operands
 /// are the SAME specialised class: the value slots compare raw, so neither
 /// side pays the box `getitem` would have to build for an `_ii` / `_ff` slot.
@@ -6147,53 +6205,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         }
         // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
         if is_tuple(a) && is_tuple(b) {
-            // Four native locals live across a collection point here: the two
-            // receivers, and the two elements the loop holds from the `eq_w`
-            // that runs their `__eq__` to the `compare` that reports the first
-            // inequality.  `w_tuple_getitem` is a second such point -- it boxes
-            // an `_ii` / `_ff` payload -- so the element slots are read back
-            // after each one too.  The last two slots start as the receivers
-            // rather than a null so the walker never sees an unpopulated one;
-            // the loop overwrites them before either is read.
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&[a, b, a, b]);
-            roots.normalize(base, 4);
-            let la = w_tuple_len(roots.get(base));
-            let lb = w_tuple_len(roots.get(base + 1));
-            if matches!(op, CompareOp::Eq | CompareOp::Ne)
-                && let Some(equal) =
-                    specialised_tuple_same_class_eq(roots.get(base), roots.get(base + 1))?
-            {
-                return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
-                    !equal
-                } else {
-                    equal
-                }));
-            }
-            let min_len = la.min(lb);
-            for i in 0..min_len {
-                roots.set(
-                    base + 2,
-                    w_tuple_getitem(roots.get(base), i as i64).unwrap_or(PY_NULL),
-                );
-                roots.set(
-                    base + 3,
-                    w_tuple_getitem(roots.get(base + 1), i as i64).unwrap_or(PY_NULL),
-                );
-                // `_compare_tuples`: `if not space.eq_w(items1[p], items2[p]):
-                //     return getattr(space, name)(items1[p], items2[p])`
-                if !crate::baseobjspace::eq_w(roots.get(base + 2), roots.get(base + 3))? {
-                    return compare(roots.get(base + 2), roots.get(base + 3), op);
-                }
-            }
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => la < lb,
-                CompareOp::Le => la <= lb,
-                CompareOp::Gt => la > lb,
-                CompareOp::Ge => la >= lb,
-                CompareOp::Eq => la == lb,
-                CompareOp::Ne => la != lb,
-            }));
+            return compare_tuples(a, b, op);
         }
         // dict equality — `pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_eq` is order-independent: same length

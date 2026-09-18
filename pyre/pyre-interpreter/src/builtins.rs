@@ -18066,38 +18066,40 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
     acc as i64
 }
 
-/// Hash the live wrapped-item storage with an explicit index loop, keeping
-/// the dynamic path out of Rust's generic `Iterator` hierarchy, which has no
-/// RPython owner/repr.
-///
-/// This is the BODY of `tupleobject.py`'s `_descr_hash_jitdriver`, not that
-/// method: the port carries neither its `hash_driver.jit_merge_point(w_type=
-/// space.type(self.wrappeditems[0]))` nor the `_unroll_condition()` fork that
-/// chooses between it and the `@jit.unroll_safe` `_descr_hash_unroll` arm.
-/// Restoring the fork needs `jit.loop_unrolling_heuristic` and an
-/// `UNROLL_CUTOFF`, neither of which exists here yet; until then the
-/// jitdriver arm is the only one, so the short-tuple unrolled path upstream
-/// takes is never taken.
-unsafe fn _hash_tuple_xx_storage(obj: PyObjectRef) -> i64 {
-    let len = w_tuple_len(obj);
-    let mut acc = XXPRIME_5;
-    let mut i = 0_usize;
-    while i < len {
-        // `i < len` bounds the read, so upstream's `wrappeditems[i]` cannot be
-        // absent.  Skipping the lane instead would fold a shorter sequence
-        // while the `acc += len` tail below still counts it, i.e. answer a
-        // hash for a tuple that does not exist.
-        let item = w_tuple_getitem(obj, i as i64)
-            .expect("tuple index below w_tuple_len is always present");
-        let lane = hash_value(item) as u64;
-        acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
-        acc = (acc << 31) | (acc >> 33);
-        acc = acc.wrapping_mul(XXPRIME_1);
-        i += 1;
-    }
-    acc = acc.wrapping_add((len as u64) ^ (XXPRIME_5 ^ 3_527_539));
-    acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
-    acc as i64
+/// Shared xxHash walk of `tupleobject.py` `_descr_hash_unroll` /
+/// `_descr_hash_jitdriver`. Expanded into each arm so the unroll-safe
+/// graph contains the n-loop. The length-mangle tail lives here so both
+/// arms produce the same digest; the `hash_driver.jit_merge_point` on
+/// the long path is not ported yet.
+macro_rules! hash_tuple_xx_storage {
+    ($obj:expr) => {{
+        let len = w_tuple_len($obj);
+        let mut acc = XXPRIME_5;
+        let mut i = 0_usize;
+        while i < len {
+            let item = w_tuple_getitem($obj, i as i64)
+                .expect("tuple index below w_tuple_len is always present");
+            let lane = hash_value(item) as u64;
+            acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+            acc = (acc << 31) | (acc >> 33);
+            acc = acc.wrapping_mul(XXPRIME_1);
+            i += 1;
+        }
+        acc = acc.wrapping_add((len as u64) ^ (XXPRIME_5 ^ 3_527_539));
+        acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
+        acc as i64
+    }};
+}
+
+/// `tupleobject.py _descr_hash_unroll` — `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
+unsafe fn _descr_hash_unroll(obj: PyObjectRef) -> i64 {
+    hash_tuple_xx_storage!(obj)
+}
+
+/// `tupleobject.py _descr_hash_jitdriver`.
+unsafe fn _descr_hash_jitdriver(obj: PyObjectRef) -> i64 {
+    hash_tuple_xx_storage!(obj)
 }
 
 /// CPython/PyPy's deterministic seed expansion
@@ -18401,14 +18403,17 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             return 0xFCA8_6420;
         }
         if is_tuple(obj) {
-            // CPython 3.14 `tuple_hash`: cache the successful aggregate after
-            // the first element walk. This supersedes PyPy's otherwise
-            // structurally equivalent `_descr_hash_unroll` for the requested
-            // 3.14 observable semantics.
+            // 3.14 `tuple_hash` cache on the object; the walk itself is
+            // PyPy's `_unroll_condition` fork (`_descr_hash_unroll` vs
+            // `_descr_hash_jitdriver`).
             if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
                 return hash;
             }
-            let hash = _hash_tuple_xx_storage(obj);
+            let hash = if pyre_object::tupleobject::unroll_condition(obj) {
+                _descr_hash_unroll(obj)
+            } else {
+                _descr_hash_jitdriver(obj)
+            };
             pyre_object::w_tuple_set_cached_hash(obj, hash);
             return hash;
         }

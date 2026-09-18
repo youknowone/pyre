@@ -296,6 +296,19 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "pyopcode.py check_except_star_type_valid",
     ),
     ("exception_match", "baseobjspace.py exception_match"),
+    // `tupleobject.py` short-tuple arms. `_unroll_condition` is
+    // `loop_unrolling_heuristic(..., UNROLL_CUTOFF=10)`; contains/hash
+    // fork to these `@jit.unroll_safe` bodies, and `_compare_tuples`
+    // is `@jit.look_inside_iff(_unroll_condition_cmp)`.
+    (
+        "_descr_contains_unroll_safe",
+        "tupleobject.py _descr_contains_unroll_safe",
+    ),
+    ("_descr_hash_unroll", "tupleobject.py _descr_hash_unroll"),
+    (
+        "_orig_compare_tuples",
+        "rlib/jit.py look_inside_iff unroll_safe(_compare_tuples)",
+    ),
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
