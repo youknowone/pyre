@@ -1132,14 +1132,27 @@ pub(crate) mod gc_box {
 
     static NEXT_GC_BOX_GEN: AtomicU64 = AtomicU64::new(1);
 
+    /// TLS payload whose destructor forgets the MiniMark.
+    /// Thread teardown must not free the nursery
+    /// (`replace_singleton_leaking_old`).
+    struct LeakingNursery(Option<Box<dyn GcAllocator>>);
+
+    impl Drop for LeakingNursery {
+        fn drop(&mut self) {
+            if let Some(gc) = self.0.take() {
+                std::mem::forget(gc);
+            }
+        }
+    }
+
     thread_local! {
         /// llmodel.py self.gc_ll_descr — owned by the active wasm backend on
         /// this thread. Stored as a thread-local so the backend-agnostic
         /// `majit_gc::ActiveGcGuardHooks` shims can reach the live allocator
         /// without taking a wasm dependency. RPython's `cpu.gc_ll_descr`
         /// parity, single-slot per thread.
-        static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
-            const { RefCell::new(None) };
+        static WASM_ACTIVE_GC: RefCell<LeakingNursery> =
+            const { RefCell::new(LeakingNursery(None)) };
         /// Read-only mirror of the box address: the interpreter-safepoint major
         /// holds the mutable borrow while extra-root walkers ask whether a slot
         /// is GC-managed, so that query routes through the raw pointer instead
@@ -1161,7 +1174,7 @@ pub(crate) mod gc_box {
         }
         WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
-            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
+            let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
             // SAFETY: `guard` holds the borrow for the whole `f` call and
             // these are non-reentrant top-level trampolines, so the reborrow
             // is exclusive and outlives `f`.
@@ -1177,7 +1190,7 @@ pub(crate) mod gc_box {
             return None;
         }
         WASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
-            Ok(guard) => guard.as_deref().map(f),
+            Ok(guard) => guard.0.as_deref().map(f),
             // SAFETY: the mirror is published and cleared under the same
             // borrow as the box itself, so a non-null value points at the
             // live allocator, and this query only reads it.
@@ -1187,7 +1200,7 @@ pub(crate) mod gc_box {
 
     /// Whether this thread holds a box at all.
     pub(super) fn present() -> bool {
-        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some())
+        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().0.is_some())
     }
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
@@ -1198,11 +1211,11 @@ pub(crate) mod gc_box {
         let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
         WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
-            if let Some(old) = guard.take() {
+            if let Some(old) = guard.0.take() {
                 std::mem::forget(old);
             }
-            *guard = Some(gc);
-            let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+            guard.0 = Some(gc);
+            let raw = guard.0.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
             WASM_ACTIVE_GC_GEN.with(|slot| slot.set(generation));
         });
@@ -1220,7 +1233,7 @@ pub(crate) mod gc_box {
         WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
         WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
         WASM_ACTIVE_GC.with(|cell| {
-            if let Some(gc) = cell.borrow_mut().take() {
+            if let Some(gc) = cell.borrow_mut().0.take() {
                 std::mem::forget(gc);
             }
         });
@@ -3985,6 +3998,9 @@ impl WasmBackend {
     }
 }
 
+// `Backend: Send` (`model.py` AbstractCPU is stored on MetaInterp).
+// The TLS box is not in this struct; its destructor forgets the MiniMark
+// so a thread hop cannot free the nursery on TLS teardown.
 unsafe impl Send for WasmBackend {}
 
 /// Stamp a position onto every non-Void-result op left unpositioned by the
