@@ -678,8 +678,6 @@ jobs:
     # crates either way — 628s on the longest job in the workflow. The only
     # thing it needs from the rest of CI is the extracted LLBC, which is an
     # artifact download.
-    # 45 left ~5 min of slack: the full-LLBC test is ~11 min typically and
-    # ~18 on a slow runner; rtyper skip is another ~21.
     timeout-minutes: 60
     env:
       # See prepare-charon-llbc: downstream jobs download the prepared Charon
