@@ -423,19 +423,29 @@ fn new_cdata_full(
     let _ = roots.pin_root(w_ctype);
     let keepalive_slot = ctype_slot + 1;
     let _ = roots.pin_root(w_keepalive);
-    // The struct literal is built before `allocate_stable` runs, and that
-    // allocation is itself a collection point, so the movable keepalive is
-    // stored from its slot afterwards rather than from the literal.
-    let obj = W_CData::allocate_stable(W_CData {
+    // `W_CData.__init__` is malloc + setfields. `w_int_new` spells that
+    // as `malloc_typed(W_IntObject { ob_header, payload })` in the same
+    // function so `fuse_boxing_alloc` rewrites it to `NewWithVtable`.
+    // `allocate_stable` is a residual wrapper (`skip-pyre-class-allocate-ctor`);
+    // a call to it after the exchange-buffer malloc is the un-lowered
+    // helper the descent scan stops on. Keepalive is stored after the
+    // allocation because that call is a collection point.
+    let obj = pyre_object::lltype::malloc_typed_stable(W_CData {
+        ob: pyre_object::PyObject {
+            ob_type: &CDATA_TYPE as *const pyre_object::PyType,
+            w_class: pyre_object::pyobject::get_instantiate(&CDATA_TYPE),
+        },
         ctype: roots.get(ctype_slot),
         ptr,
         flavor,
         length,
         datasize,
-        ..Default::default()
-    });
+        w_keepalive: pyre_object::PY_NULL,
+        w_destructor: pyre_object::PY_NULL,
+        special_memory_pressure: 0,
+    }) as PyObjectRef;
     W_CData::from_obj(obj)
-        .expect("allocate_stable hands back this layout")
+        .expect("malloc_typed_stable hands back this layout")
         .w_keepalive = roots.get(keepalive_slot);
     // The cdata is born old-gen; the keepalive it just took may be young, so
     // the barrier has to run again after this write.
