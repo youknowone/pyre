@@ -6744,8 +6744,8 @@ mod tests {
         let i2 = OpRef::int_op(2);
         let i3 = OpRef::int_op(3);
         let inputargs = vec![
-            InputArg::from_type(Type::Int, i0.raw()),
-            InputArg::from_type(Type::Int, i1.raw()),
+            InputArg::from_type_rc(Type::Int, i0.raw()),
+            InputArg::from_type_rc(Type::Int, i1.raw()),
         ];
         let add1 = Op::new(OpCode::IntAdd, &[rb(i0), rb(i1)]);
         add1.pos().set(i2);
