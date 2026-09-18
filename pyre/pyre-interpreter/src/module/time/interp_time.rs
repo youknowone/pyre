@@ -1877,6 +1877,19 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .copied()
         .ok_or_else(|| crate::PyError::type_error("strftime() requires at least one argument"))?;
 
+    // `unwrap_spec(format='text0')`: the format is unwrapped before
+    // `_gettmarg` runs.  `fixedview` there allocates and can run Python, so a
+    // collection may move the `str` wrapper, and `fmt` read afterwards would
+    // name its old address.  The text is copied out while it is still live.
+    let fmt_wtf8 = unsafe {
+        if !is_str(fmt) {
+            return Err(crate::PyError::type_error(
+                "strftime() argument 1 must be str",
+            ));
+        }
+        w_str_get_wtf8(fmt).to_owned()
+    };
+
     let tm = _gettmarg(&args[1..], true)?;
     _checktm(&tm)?;
 
@@ -1891,14 +1904,6 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         ));
     }
 
-    let fmt_wtf8 = unsafe {
-        if !is_str(fmt) {
-            return Err(crate::PyError::type_error(
-                "strftime() argument 1 must be str",
-            ));
-        }
-        w_str_get_wtf8(fmt)
-    };
     // PyPy interp_time.py:1156-1162 tries the locale encoding and, when a
     // lone surrogate makes that impossible, passes the internal UTF-8 bytes
     // through libc and treats the result as the same internal representation.
