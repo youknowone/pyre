@@ -5803,8 +5803,7 @@ impl<M: Clone> MetaInterp<M> {
                 // is the parallel trace-start entry point and must keep the
                 // same invariant.
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-                ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
-                // pyjitpl.py initialize_virtualizable parity.
+                // initialize_virtualizable establishes the virtualizable heap pointer.
                 self.initialize_virtualizable(&mut ctx, live_values);
                 // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
                 // runs after `initialize_state_from_start`, which has already
@@ -6127,8 +6126,7 @@ impl<M: Clone> MetaInterp<M> {
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-        ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
-        // pyjitpl.py initialize_virtualizable parity.
+        // initialize_virtualizable establishes the virtualizable heap pointer.
         self.initialize_virtualizable(&mut ctx, live_values);
         // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
         // runs after `initialize_state_from_start`, which has already
