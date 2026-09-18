@@ -3914,26 +3914,6 @@ impl ConstantOpcodeHandler for PyFrame {
     fn frozenset_constant(&mut self, items: &[Self::Value]) -> Result<Self::Value, PyError> {
         Ok(pyre_object::w_frozenset_from_items(items))
     }
-
-    fn pin_const(&mut self, value: Self::Value) -> Self::Value {
-        pyre_object::gc_roots::pin_root(value)
-    }
-
-    fn pinned_const_slot(&self) -> usize {
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    }
-
-    fn const_at_slot(&self, slot: usize) -> Self::Value {
-        pyre_object::gc_roots::shadow_stack_get(slot)
-    }
-
-    fn with_const_roots<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> Result<R, PyError>,
-    ) -> Result<R, PyError> {
-        let _roots = pyre_object::gc_roots::push_roots();
-        f(self)
-    }
 }
 
 /// `callmethod.py:66-78` fast-path discriminator: bind the receiver only

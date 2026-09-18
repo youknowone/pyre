@@ -1931,36 +1931,26 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Ok(w_dict.get())
 }
 
+/// `new_charindex_tuple` (interp_sre.py) — a `(start, end)` pair.
+/// Spans stored on the match are already character indexes.
+fn new_charindex_tuple(start: i64, end: i64) -> PyObjectRef {
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(w_int_new(start));
+    fields.push(w_int_new(end));
+    w_tuple_new(fields.take())
+}
+
 /// `fget_regs` (interp_sre.py) — `((start, end), ...)` for group
 /// 0..num_groups, matching what `span(i)` reports; unmatched is `(-1, -1)`.
 fn sre_match_regs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let m = sre_match_receiver(args)?;
     let n = unsafe { (*m).spans_len };
-    // Each pair tuple is a nursery object and the next mint can collect,
-    // so every field and pair sits on one bracket. Pin the ints one at a
-    // time: `pin_roots(&[w_int_new(a), w_int_new(b)])` evaluates both
-    // constructors before any slot is published.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let mut pair_slots = Vec::with_capacity(n);
+    let mut result_w = pyre_object::gc_roots::RootedItems::new();
     for gi in 0..n {
         let (start, end) = unsafe { w_sre_match_get_span(m as PyObjectRef, gi) }.unwrap_or((-1, -1));
-        let start_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_int_new(start));
-        let end_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_int_new(end));
-        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![
-            pyre_object::gc_roots::shadow_stack_get(start_slot),
-            pyre_object::gc_roots::shadow_stack_get(end_slot),
-        ]));
-        pair_slots.push(pair_slot);
+        result_w.push(new_charindex_tuple(start, end));
     }
-    Ok(w_tuple_new(
-        pair_slots
-            .into_iter()
-            .map(pyre_object::gc_roots::shadow_stack_get)
-            .collect(),
-    ))
+    Ok(w_tuple_new(result_w.take()))
 }
 
 /// `start_w` (interp_sre.py).

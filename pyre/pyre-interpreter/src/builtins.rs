@@ -12168,21 +12168,15 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             let obj_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(obj);
             let n = w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-            let mut item_slots = Vec::with_capacity(n as usize);
+            let mut items = pyre_object::gc_roots::RootedItems::new();
             for i in 0..n {
                 if let Some(item) =
                     w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i as i64)
                 {
-                    item_slots.push(pyre_object::gc_roots::shadow_stack_len());
-                    let _ = pyre_object::gc_roots::pin_root(item);
+                    items.push(item);
                 }
             }
-            return Ok(w_tuple_new(
-                item_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ));
+            return Ok(w_tuple_new(items.take()));
         }
     }
     let items = collect_iterable(obj)?;
@@ -19042,24 +19036,20 @@ pub fn sort_list_in_place(
         // for the whole operation, so user code cannot alter this sorting
         // slice through the visible list.
         //
-        // Pin from the live list, not from a copied Vec: `pin_root` of an
-        // earlier item can collect, and a Vec of pre-collection words would
-        // then re-publish interior pointers. The list's items block is a
-        // real GC root until we clear it, so each getitem sees the forwarded
-        // word. PyPy's `descr_sort` keeps the snapshot in `sorter.list`
-        // (a wrapped list) for the same reason.
+        // `descr_sort` snapshots via `getitems()` (`we_are_jitted` selects
+        // the copy that keeps identity-bearing boxes explicit) and holds
+        // that snapshot in `sorter.list`. The copy is a bare Vec, so
+        // publish every word then normalize once (`pin_roots`) before any
+        // later allocation can move a still-unpublished sibling.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
-        let n = pyre_object::listobject::w_list_len(list);
+        let saved = pyre_object::listobject::w_list_items_copy_as_vec_mode(
+            list,
+            majit_metainterp::jit::we_are_jitted(),
+        );
         let _roots = pyre_object::gc_roots::push_roots();
-        let item_base = pyre_object::gc_roots::shadow_stack_len();
-        for i in 0..n {
-            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-            let item = pyre_object::listobject::w_list_getitem(list, i as i64)
-                .unwrap_or(pyre_object::PY_NULL);
-            let _ = pyre_object::gc_roots::pin_root(item);
-        }
-        let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        let item_base = pyre_object::gc_roots::pin_roots(&saved);
+        let saved_len = saved.len();
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         pyre_object::listobject::w_list_clear(list);
         // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
