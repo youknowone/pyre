@@ -10427,9 +10427,7 @@ fn live_exception_group_condition(
             ))
         }
         ExceptionGroupCondition::Identity(_) => ExceptionGroupCondition::Identity(
-            pyre_object::gc_roots::shadow_stack_get(
-                cond_slot.expect("identity set is pinned"),
-            ),
+            pyre_object::gc_roots::shadow_stack_get(cond_slot.expect("identity set is pinned")),
         ),
     }
 }
@@ -10655,10 +10653,8 @@ fn exception_group_same_metadata(
     // traceback/cause/context slot compares still name the same objects.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[w_left, w_right]);
-    let left_notes =
-        exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base))?;
-    let right_notes =
-        exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let left_notes = exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base))?;
+    let right_notes = exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     if !match (left_notes, right_notes) {
         (Some(left), Some(right)) => std::ptr::eq(left, right),
         (None, None) => true,
@@ -10758,10 +10754,8 @@ pub(crate) fn exception_group_prep_reraise_star(
     let orig_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_orig);
     let _ = pyre_object::gc_roots::pin_root(w_exc_list);
-    let exceptions = crate::baseobjspace::fixedview(
-        pyre_object::gc_roots::shadow_stack_get(orig_slot + 1),
-        -1,
-    )?;
+    let exceptions =
+        crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(orig_slot + 1), -1)?;
     if exceptions.is_empty() {
         return Ok(pyre_object::w_none());
     }
@@ -10790,8 +10784,10 @@ pub(crate) fn exception_group_prep_reraise_star(
         }
     }
     let reraised_keep: Vec<PyObjectRef> = (0..reraised.len()).map(|i| reraised.get(i)).collect();
-    let reraised_group =
-        exception_group_projection(pyre_object::gc_roots::shadow_stack_get(orig_slot), &reraised_keep)?;
+    let reraised_group = exception_group_projection(
+        pyre_object::gc_roots::shadow_stack_get(orig_slot),
+        &reraised_keep,
+    )?;
     if raised.is_empty() {
         return Ok(reraised_group);
     }

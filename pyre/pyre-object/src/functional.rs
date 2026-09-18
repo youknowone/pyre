@@ -958,15 +958,15 @@ pub fn w_range_new(
     // Reload every bound from its shadow-stack slot before the next
     // `range_obj_to_bigint` — the Rust locals above are not rewritten.
     let length = unsafe {
-        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(
-            crate::gc_roots::shadow_stack_get(start_slot),
-        ));
-        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(
-            crate::gc_roots::shadow_stack_get(stop_slot),
-        ));
-        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(
-            crate::gc_roots::shadow_stack_get(step_slot),
-        ));
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            start_slot,
+        )));
+        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            stop_slot,
+        )));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(crate::gc_roots::shadow_stack_get(
+            step_slot,
+        )));
         let len_big = range_length_big(&start_b, &stop_b, &step_b);
         range_bigint_to_obj(len_big)
     };

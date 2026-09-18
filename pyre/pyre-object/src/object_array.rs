@@ -158,11 +158,7 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
 /// # Safety
 /// `block` is a live `ItemsBlock` and `index` is in range.
 #[inline]
-pub unsafe fn items_block_set_ref(
-    block: *mut ItemsBlock,
-    index: usize,
-    value: PyObjectRef,
-) {
+pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: PyObjectRef) {
     if block.is_null() {
         return;
     }
@@ -796,7 +792,7 @@ pub unsafe fn alloc_tuple_items_block_gc(values: &[PyObjectRef]) -> *mut ItemsBl
     // no-op. Guard on GC ownership exactly like `list_write_barrier`.
     if owns_block {
         crate::gc_hook::try_gc_write_barrier_managed(
-            crate::gc_roots::shadow_stack_get(block_slot) as *mut u8,
+            crate::gc_roots::shadow_stack_get(block_slot) as *mut u8
         );
     }
     crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock
