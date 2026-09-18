@@ -4794,9 +4794,10 @@ fn call_metaclass_with_kwargs(
     if instance.is_null() {
         return PY_NULL;
     }
-    // A fresh type is allocated stable, so it never moves and needs no
-    // read-back -- but until `type_call_init_type` stores it, this local is
-    // its only reference, and `__init__` below runs Python.
+    // Heap types are born old-gen (`w_type_new` / `try_gc_alloc_stable_raw`).
+    // `__init__` is arbitrary Python and can collect, so the slot is the
+    // live word after those calls.
+    let instance_slot = pyre_object::gc_roots::shadow_stack_len();
     let instance = pyre_object::gc_roots::pin_root(instance);
     if let Some(w_insttype) = type_call_init_type(instance, w_metaclass)
         && let Some(init_fn) =
@@ -4859,7 +4860,7 @@ fn call_metaclass_with_kwargs(
         }
     }
 
-    instance
+    pyre_object::gc_roots::shadow_stack_get(instance_slot)
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
@@ -5935,6 +5936,10 @@ fn build_class_inner(
         unsafe {
             (*w).w_class = crate::typedef::w_type();
         }
+        // `setfield_gc` of `w_class` on an old-gen type: remember the
+        // holder so a young class survives the next minor
+        // (`incminimark.py write_barrier`).
+        pyre_object::gc_hook::try_gc_write_barrier(w as *mut u8);
         // typeobject.py `compute_mro(w_self)`, reached only once
         // `check_and_find_best_base` inside `create_all_slots` above accepted
         // the tuple.  `compute_default_mro` cannot raise, so `get_mro`'s

@@ -3316,6 +3316,16 @@ pub fn gc_owns_object(addr: usize) -> bool {
     }
 }
 
+/// Whether `type_id` is one `register_type` actually handed out.
+///
+/// `copy_nursery_object` panics when the header's low half is
+/// `>= types.len()` — that is an interior or a nursery-debug fill, not a
+/// live object start. Root publishers use this to refuse those words
+/// instead of handing them to `_trace_drag_out`.
+pub fn gc_type_id_is_registered(type_id: u32) -> bool {
+    gc_sync::gc_query_reentrant(|gc| (type_id as usize) < gc.types.len())
+}
+
 /// `llop.shrink_array(Bool, p, smallerlength)`: record that the varsize object
 /// at `addr` is shorter than it was, in place.
 ///

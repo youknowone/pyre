@@ -32,6 +32,15 @@ pub struct RBigIntGcRoot {
     registered: bool,
 }
 
+/// Root a *borrowed* handle whose owner already keeps the original local
+/// live. Clone shares the digit array; the clone's `_digits` slot is what
+/// the collector updates. An *owned* local that is read after the next
+/// collecting call must move into [`RBigIntGcRoot::new`] instead — a clone
+/// here leaves the caller's pointer at the pre-move address.
+pub fn live_rbigint(value: &RBigInt) -> RBigIntGcRoot {
+    RBigIntGcRoot::new(value.clone())
+}
+
 impl RBigIntGcRoot {
     pub fn new(value: RBigInt) -> Self {
         let mut value = Box::new(value);
@@ -238,17 +247,8 @@ pub fn alloc_rbigint_nursery_collecting(value: RBigInt) -> *mut RBigInt {
 /// remainders of earlier iterations — dead the moment the next one starts —
 /// never leave the nursery.
 ///
-/// pyre spells that same allocation as `Digits::new`, which routes to
-/// `alloc_fast_nursery_typed` — `malloc_fast`'s *non*-collecting twin. It has
-/// to: a collection there would move digit blocks out from under the unboxed
-/// `RBigInt` handles every arithmetic graph in this file holds across it, and
-/// nothing roots them. It spills to old-gen instead, so a long conversion
-/// fills the nursery once and then promotes every later block, and the next
-/// allocation *after* the conversion pays for all of them in one collection.
-///
-/// Routing `Digits::new` to the collecting allocator is what would close this
-/// deviation outright, and it is not a change this function makes: it would
-/// oblige every caller in the file to root what it holds.
+/// `Digits::new` now follows `malloc_fast` / `collect_and_reserve`. Callers
+/// that keep an unboxed handle live across it wrap it in `live_rbigint`.
 ///
 /// Minting one payload through the collecting allocator restores the upstream
 /// shape at the one point in that loop where the frame's only live edge is

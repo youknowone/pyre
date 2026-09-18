@@ -214,16 +214,59 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// syntactically and declines to emit one for an aliased return type.
 #[majit_macros::dont_look_inside]
 pub fn w_int_gc_alloc(value: i64) -> *mut PyObject {
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE);
+    w_int_gc_alloc_in(value, false)
+}
+
+/// Code-constant ints live as long as the owning `PyCode`
+/// (`pycode.py` `_immutable_fields_ = ["co_consts_w[*]"]`). PyPy's
+/// `wrapint` is young because `PyCode` is a young `W_Root` and the
+/// list is copied with it. pyre births `PyCode` old-gen
+/// (`malloc_typed_stable`), so a nursery box in `co_consts_w` is an
+/// old-to-young edge a missed remembered-set scan recycles.
+#[majit_macros::dont_look_inside]
+pub fn w_int_new_stable(value: i64) -> PyObjectRef {
+    if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::fits_tagged(value) {
+        return crate::tagged_int::tag_int(value);
+    }
+    if WITHPREBUILTINT && (PREBUILTINTFROM..PREBUILTINTTO).contains(&value) {
+        let idx = (value - PREBUILTINTFROM) as usize;
+        return (&SMALL_INTS.0[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
+    }
+    if crate::gc_interp::enabled() {
+        let boxed = w_int_gc_alloc_in(value, true);
+        if !boxed.is_null() {
+            return boxed;
+        }
+    }
+    crate::lltype::malloc_typed_stable(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: value,
+    }) as PyObjectRef
+}
+
+fn w_int_gc_alloc_in(value: i64, stable: bool) -> *mut PyObject {
+    // Class word first: `get_instantiate` can allocate. The residual
+    // return is a GCREF (`*mut PyObject`), so the bump is
+    // `malloc_fixedsize` — same as `w_tuple_new`.
+    let w_class = get_instantiate(&INT_TYPE);
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE)
+    } else {
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_INT_GC_TYPE_ID, W_INT_OBJECT_SIZE)
+    };
     if raw.is_null() {
         return crate::PY_NULL;
     }
     unsafe {
         let p = raw as *mut W_IntObject;
         (*p).ob_header.ob_type = &INT_TYPE as *const PyType;
-        (*p).ob_header.w_class = get_instantiate(&INT_TYPE);
+        (*p).ob_header.w_class = w_class;
         (*p).intval = value;
     }
+    crate::gc_hook::try_gc_write_barrier_managed(raw);
     raw as PyObjectRef
 }
 
@@ -275,7 +318,7 @@ pub fn w_int_subclass_new(value: i64) -> PyObjectRef {
         map: 0,
         storage: std::ptr::null_mut(),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         W_INT_USER_GC_TYPE_ID,
         std::mem::size_of::<W_IntObjectUser>(),
     );
@@ -318,7 +361,7 @@ pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
 }
 
 /// True iff `value` falls inside the prebuilt-int cache range AND
-/// the cache is enabled. Mirrors PyPy's `wrapint` in-range branch
+/// the cache is enabled. Mirrors `wrapint` in-range branch
 /// (`intobject.py:891-895`).
 #[inline]
 pub fn w_int_small_cached(value: i64) -> bool {

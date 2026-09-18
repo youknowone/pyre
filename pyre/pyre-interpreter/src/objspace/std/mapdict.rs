@@ -5878,10 +5878,9 @@ pub unsafe fn instance_walk_boxed_storage(obj: PyObjectRef, f: &mut dyn FnMut(*m
         }
         // Both forms are needed, unlike in `list_object_custom_trace`, which
         // picks one: handing over the field slot only forwards the block
-        // pointer, and the block is `alloc_stable`, so a minor never descends
-        // into it to reach the values.  Walking the items here is what keeps
-        // an attribute value alive; a list's items block can be young, which
-        // is what makes the either/or correct there and wrong here.
+        // pointer. A young block is then scanned by its own walker; an
+        // old-gen spill is not entered by a minor, so walking the items
+        // here keeps an attribute value alive.
         //
         // The block's own tid registers `items_have_gc_ptrs`, which is not a
         // reason to drop this walk: a declared walker is not a guarantee that

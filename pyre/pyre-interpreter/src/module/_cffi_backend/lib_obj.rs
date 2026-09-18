@@ -559,11 +559,12 @@ fn lib_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     )))
 }
 
-static LIB_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static LIB_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.Lib`.
 pub fn lib_type() -> PyObjectRef {
-    *LIB_TYPE_OBJ.get_or_init(|| {
+    LIB_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.Lib",
             init_lib_type,
@@ -579,8 +580,8 @@ pub fn lib_type() -> PyObjectRef {
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
             pyre_object::w_type_set_dispatch_own_getattribute(tp);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_lib_type(ns: PyObjectRef) {

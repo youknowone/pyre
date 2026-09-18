@@ -191,8 +191,9 @@ fn get_sizeof(w_obj: PyObjectRef) -> crate::PyResult {
 /// by installing a single `sys.namespace` type with `__dict__` in its
 /// typedef slots so every stub instance supports `setattr`.
 fn sys_namespace_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    let raw = *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("sys.namespace", |ns| {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -208,9 +209,8 @@ fn sys_namespace_type() -> PyObjectRef {
         // (typeobject.py:253-257), so flip `hasdict` directly — the
         // `create_dict_slot` flag flip (typeobject.py).
         unsafe { w_type_set_hasdict(tp, true) };
-        tp as usize
-    });
-    raw as PyObjectRef
+        tp
+    })
 }
 
 fn sys_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
@@ -503,8 +503,9 @@ pub(crate) unsafe fn is_simple_namespace(obj: PyObjectRef) -> bool {
 /// remains PyPy-shaped: the values live in the instance dict, not a side
 /// table or a second native mapping.
 pub(crate) fn simple_namespace_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    let raw = *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         // PyPy owns this as the app-level class
         // `lib_pypy._structseq.SimpleNamespace`, so it keeps `object`'s
         // TypeDef/Layout instead of introducing an interpreter TypeDef merely
@@ -639,9 +640,8 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
             w_type_set_hasdict(tp, true);
             pyre_object::w_type_set_text_signature(tp, "(mapping_or_iterable=(), /, **kwargs)");
         }
-        tp as usize
-    });
-    raw as PyObjectRef
+        tp
+    })
 }
 
 /// CPython 3.14 `namespace_repr`, layered over PyPy's recursion guard.  Exact
@@ -1200,10 +1200,11 @@ fn sys_set_coroutine_origin_tracking_depth(args: &[PyObjectRef]) -> crate::PyRes
 }
 
 fn asyncgen_hooks_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq("asyncgen_hooks", &["firstiter", "finalizer"]) as usize
-    }) as PyObjectRef
+    static TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq("asyncgen_hooks", &["firstiter", "finalizer"])
+    })
 }
 
 fn sys_get_asyncgen_hooks_impl(_args: &[PyObjectRef]) -> crate::PyResult {
@@ -2170,8 +2171,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // Built once, like [`stat_result_seq_type`]: the type is the
                 // answer's identity, so making a fresh one per call would leave
                 // `type(sys.getwindowsversion())` a different class each time.
-                static SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                let cls = *SEQ_TYPE.get_or_init(|| {
+                static SEQ_TYPE: pyre_object::gc_roots::RootedOnceRef =
+                    pyre_object::gc_roots::RootedOnceRef::new();
+                let cls = SEQ_TYPE.get_or_init(|| {
                     crate::_structseq::disallow_instantiation(
                         crate::_structseq::make_struct_seq_with_extra(
                             "sys.getwindowsversion",
@@ -2184,8 +2186,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "platform_version",
                             ],
                         ),
-                    ) as usize
-                }) as PyObjectRef;
+                    )
+                });
                 let (major, minor, build) =
                     version_ex_triple().unwrap_or((info.major, info.minor, info.build));
                 let _roots = pyre_object::gc_roots::push_roots();

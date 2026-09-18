@@ -211,11 +211,12 @@ fn library_close(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 // ── the Python type ─────────────────────────────────────────────────────
 
-static CLIBRARY_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static CLIBRARY_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.CLibrary`.
 pub fn clibrary_type() -> PyObjectRef {
-    *CLIBRARY_TYPE_OBJ.get_or_init(|| {
+    CLIBRARY_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.CLibrary",
             init_clibrary_type,
@@ -226,8 +227,8 @@ pub fn clibrary_type() -> PyObjectRef {
             unsafe { &*<W_Library as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,
         );
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_clibrary_type(ns: PyObjectRef) {

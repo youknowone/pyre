@@ -629,8 +629,9 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
         &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
             as *mut majit_ir::GcRef,
     );
-    // W_BaseException is currently malloc_typed-immortal, so forwarding its
-    // carrier above does not make the collector visit traceback/context/args.
+    // Forwarding the exception carrier still does not walk its
+    // traceback/context/args slots; those sit behind the exception
+    // object's own offsets.
     // Preserve the children of the exception parked by
     // `ExecutionContext.pop_gen_or_coroutine`, just as the EC root walker does
     // for its active `sys_exc_value` slot.
@@ -1585,6 +1586,16 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut frame.f_backref as *mut *mut PyFrame as *mut majit_ir::GcRef);
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
+    // PyCode is born old-gen (`malloc_typed_stable`). Visiting the field
+    // greys it but a minor does not scan an old object; walk `co_consts_w`
+    // here the way `walk_pyframe_roots` already does for stdalloc frames.
+    let mut code_adapter = |slot: &mut majit_ir::GcRef| f(slot as *mut majit_ir::GcRef);
+    unsafe {
+        pyre_interpreter::eval::walk_raw_code_roots(
+            frame.pycode as pyre_object::PyObjectRef,
+            &mut code_adapter,
+        );
+    }
     f(&mut frame.vable_token as *mut usize as *mut majit_ir::GcRef);
 
     // locals_cells_stack_w: visit the field slot for every GC array so major
@@ -5427,6 +5438,7 @@ fn build_gc_global() {
 pub fn reset_gc_fresh_for_test() {
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
+    pyre_interpreter::pycode::clear_prebuilt_code_roots_for_test();
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.
@@ -6196,6 +6208,13 @@ fn pyre_object_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // object, which the visit above skips. See `pyre_object_root_walker_area`.
         let value = gcref.0 as pyre_object::PyObjectRef;
         unsafe { pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor) };
+        // `pycode.py PyCode` is a young `W_Root`; a shadow-stack livevar
+        // is copied then scanned. pyre births the
+        // wrapper old-gen (`malloc_typed_stable`), so the visit above is
+        // a no-op and `walk_raw_immortal_roots` skips managed objects.
+        // Walk `co_consts_w` here or a minor during `w_code_new` fill
+        // reclaims the constants.
+        unsafe { pyre_interpreter::eval::walk_raw_code_roots(value, visitor) };
     });
 }
 
@@ -6214,6 +6233,15 @@ unsafe fn pyre_object_root_walker_area(
             // the live one.
             let value: pyre_object::PyObjectRef = *slot;
             pyre_interpreter::eval::walk_raw_immortal_roots(value, visitor);
+            // Same old-gen `PyCode` hole as `pyre_object_root_walker`:
+            // a pinned wrapper is already old, so the slot visit does
+            // not scan `co_consts_w`.
+            pyre_interpreter::eval::walk_raw_code_roots(value, visitor);
+            // A pinned class-namespace / `dict.copy()` is old enough
+            // after the first minor that greying the dict is a no-op;
+            // strategy storage still holds young functions. Descend
+            // the way type-dict prebuilt walking already does.
+            pyre_interpreter::eval::walk_raw_dict_roots(value, visitor);
         });
     }
 }

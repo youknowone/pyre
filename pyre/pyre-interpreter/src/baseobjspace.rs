@@ -909,14 +909,15 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
-    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if let Some(&base_exc) = BASE_EXC.get() {
-        return issubtype_w(w_cls, base_exc as PyObjectRef);
+    static BASE_EXC: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    if let Some(base_exc) = BASE_EXC.get() {
+        return issubtype_w(w_cls, base_exc);
     }
     let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
         return false;
     };
-    let _ = BASE_EXC.set(base_exc as usize);
+    BASE_EXC.set(base_exc);
     issubtype_w(w_cls, base_exc)
 }
 
@@ -2517,6 +2518,10 @@ unsafe fn getitem_str(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 
 #[inline(never)]
 unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let _obj_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let is_bytes = pyre_object::bytesobject::is_bytes(obj);
     if is_slice(index) {
         // stringmethods.py / bytearrayobject.py `descr_getitem`: unpack the
@@ -2524,18 +2529,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         // mutate a bytearray), then use `adjust_indices`' explicit slice
         // length.  Iterating by that count also avoids overflowing on the
         // final `start + step` for a step near `sys.maxsize`.
-        let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`; the operand is
-            // rooted for that window and neither `bytes` nor `bytearray`
-            // moves.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            crate::sliceobject::slice_unpack(
-                w_slice_get_start(index),
-                w_slice_get_stop(index),
-                w_slice_get_step(index),
-            )?
-        };
+        let (rs, rp, st) = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let len = pyre_object::bytesobject::bytes_like_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -2572,18 +2571,12 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     // `descr_getitem`: getindex_w(index, IndexError, "byte") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
+    let mut obj = obj;
     let idx = if is_int(index) {
         w_int_get_value(index)
     } else if pyre_object::pyobject::is_int_or_long(index) || lookup(index, "__index__").is_some() {
-        let indexed = {
-            // `__index__` is user code: `BINARY_SUBSCR` pops the receiver
-            // before dispatching here, so nothing else roots it across the
-            // call. A bytes-like operand never moves, so the root is for liveness alone
-            // and the address in hand stays correct.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            space_index(index)?
-        };
+        let indexed = space_index(index)?;
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if is_int(indexed) {
             w_int_get_value(indexed)
         } else {
@@ -2926,17 +2919,23 @@ unsafe fn range_compute_slice(obj: PyObjectRef, slice: PyObjectRef) -> PyResult 
     let substop = RBigIntGcRoot::new(&*rstart_b + &*sl_stop * &*rstep_b);
     let _roots = pyre_object::gc_roots::push_roots();
     let w_substart = pyre_object::range_bigint_to_obj(substart.translated_alias());
-    let w_substart = pyre_object::gc_roots::pin_root(w_substart);
+    let _ = pyre_object::gc_roots::pin_root(w_substart);
+    let substart_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_substep = pyre_object::range_bigint_to_obj(substep.translated_alias());
-    let w_substep = pyre_object::gc_roots::pin_root(w_substep);
+    let _ = pyre_object::gc_roots::pin_root(w_substep);
+    let substep_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // functional.py:523-526 tests `if w_stop`, i.e. whether the wrapped
     // pointer exists, not whether its integer payload is zero.  The wrapped
     // result of compute_slice_indices3 is always present, so compute the stop
     // lane even when its value is 0 (notably for `r[-1:-3:-1]`).
     let w_substop = pyre_object::range_bigint_to_obj(substop.translated_alias());
-    let w_substop = pyre_object::gc_roots::pin_root(w_substop);
+    let _ = pyre_object::gc_roots::pin_root(w_substop);
+    let substop_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     Ok(pyre_object::w_range_new(
-        w_substart, w_substop, w_substep, false,
+        pyre_object::gc_roots::shadow_stack_get(substart_slot),
+        pyre_object::gc_roots::shadow_stack_get(substop_slot),
+        pyre_object::gc_roots::shadow_stack_get(substep_slot),
+        false,
     ))
 }
 
@@ -3593,7 +3592,11 @@ pub(crate) fn list_reverse_iter_length_hint_method(args: &[PyObjectRef]) -> PyRe
 pub(crate) fn range_iter_reduce_method(args: &[PyObjectRef]) -> PyResult {
     unsafe {
         let (current, remaining, step) = pyre_object::w_range_iter_fields(args[0]);
-        let stop = RBigIntGcRoot::new(BigInt::from(current) + BigInt::from(remaining) * step);
+        let current_b = RBigIntGcRoot::new(BigInt::from(current));
+        let remaining_b = RBigIntGcRoot::new(BigInt::from(remaining));
+        let step_b = RBigIntGcRoot::new(BigInt::from(step));
+        let product = RBigIntGcRoot::new(remaining_b.mul(&*step_b));
+        let stop = RBigIntGcRoot::new(current_b.add(&*product));
         // Python evaluates and keeps all three wrapped arguments before
         // W_Range construction. Mirror the GC transform's root slots between
         // those allocating expressions.
@@ -5014,19 +5017,17 @@ unsafe fn setitem_bytearray_slice(
     // Both steps run Python — draining an arbitrary iterable source, then
     // every slice component's `__index__` — and `STORE_SUBSCR` popped the
     // receiver and the slice before dispatching here, so root them across the
-    // pair. A bytearray does not move; the root is for liveness alone.
-    let (sequence2, rs, rp, st) = {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
-        let sequence2 = bytearray_assign_source(value)?;
-        let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
-        let (rs, rp, st) = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
-        (sequence2, rs, rp, st)
-    };
+    // pair and reload the receiver after those callbacks.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, index]);
+    let sequence2 = bytearray_assign_source(value)?;
+    let index = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let (rs, rp, st) = crate::sliceobject::slice_unpack(
+        w_slice_get_start(index),
+        w_slice_get_stop(index),
+        w_slice_get_step(index),
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
     let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
@@ -5036,6 +5037,7 @@ unsafe fn setitem_bytearray_slice(
     if sequence2.len() as i64 != slicelength {
         crate::builtins::bytearray_check_exports(obj)?;
     }
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let vec = pyre_object::bytearrayobject::w_bytearray_vec_mut(obj);
     let old_size = vec.len();
     if step == 1 {
@@ -5209,8 +5211,25 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             // `space.bigint_w(self).eq(space.bigint_w(w_other))`
             // (intobject.py:51-53). A `W_LongObject` stores a `BigInt`
             // pointer, so it must be read as a bigint, not as an i64.
-            return pyre_object::functional::range_obj_to_bigint(w_one)
-                == pyre_object::functional::range_obj_to_bigint(w_two);
+            // `range_obj_to_bigint` of a machine int goes through
+            // `RBigInt::fromint` / `Digits::new`, a collecting malloc.
+            // Both operands are native locals, so the second would
+            // still name the pre-collection nursery address after the
+            // first conversion. Publish them and reload after each
+            // conversion (`gct_fv_gc_malloc` pop_roots).
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_one);
+            let _ = pyre_object::gc_roots::pin_root(w_two);
+            // `left` is an owned digit handle read after the second
+            // conversion allocates; keep it in an `RBigIntGcRoot`.
+            let left = RBigIntGcRoot::new(pyre_object::functional::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ));
+            let right = pyre_object::functional::range_obj_to_bigint(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            );
+            return *left == right;
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal
@@ -8188,32 +8207,37 @@ unsafe fn type_getattr_hook_or_err(
 /// shape: explicit annotations and the lazy cache belong to this type's own
 /// namespace and are never inherited from a base class.
 pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
+    // `w_dict_new` / `__annotate__` can collect. The type is an old-gen
+    // heap object; keep the caller's handle in the shadow stack and
+    // re-read it after those allocations (`framework.py` stack map).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+
     // `type.__annotations__` is the getset descriptor implementing this
     // operation, not annotations owned by the static builtin `type` itself.
     // Static builtin types cannot acquire annotations, so reject them before
     // consulting their namespace.  Heap types below may have an explicit
     // class-body entry with this name.
-    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
+    if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj()) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotations__'",
-            unsafe { w_type_get_name(obj) },
+            unsafe { w_type_get_name(obj()) },
         )));
     }
 
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations__") {
+    if let Some(value) = crate::type_dict_lookup(obj(), "__annotations__") {
         return Ok(value);
     }
-    if let Some(value) = crate::type_dict_lookup(obj, "__annotations_cache__") {
+    if let Some(value) = crate::type_dict_lookup(obj(), "__annotations_cache__") {
         return Ok(value);
     }
 
     // The callable is reached through `getattr(type, '__annotate__')`, so an
     // annotation-free class picks up the `__annotate_func__ = None` entry
     // `type_get_annotate` stamps on the miss.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let annotate_fn = type_get_annotate(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
+    let annotate_fn = type_get_annotate(obj())?;
     let annotate_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotate_fn);
     let annotations = if callable_w(pyre_object::gc_roots::shadow_stack_get(annotate_slot)) {
@@ -8233,14 +8257,8 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     } else {
         pyre_object::w_dict_new()
     };
-    crate::type_dict_store(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-        "__annotations_cache__",
-        annotations,
-    );
-    pyre_object::gc_hook::try_gc_write_barrier(
-        pyre_object::gc_roots::shadow_stack_get(obj_slot) as *mut u8
-    );
+    crate::type_dict_store(obj(), "__annotations_cache__", annotations);
+    pyre_object::gc_hook::try_gc_write_barrier(obj() as *mut u8);
     Ok(annotations)
 }
 
@@ -19911,15 +19929,19 @@ unsafe fn generator_invoke_execute_frame(
         )));
     }
     w_generator_set_running(gen_obj, true);
+    let _gen_roots = pyre_object::gc_roots::push_roots();
+    let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(gen_obj);
     let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
     if !ec.is_null() {
-        (*ec).push_gen_or_coroutine(gen_obj);
+        (*ec).push_gen_or_coroutine(pyre_object::gc_roots::shadow_stack_get(gen_slot));
     }
     // generator.py:_invoke_execute_frame uses the execution context of the
     // thread resuming the generator.  Like PyPy, the suspended frame stores no
     // EC of its own; `execute_generator_frame` reads the thread-owned slot at
     // this activation boundary.
     let result = frame.execute_generator_frame(w_inputvalue, operr, throw_args);
+    let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     let result = match result {
         Err(e) => {
             generator_frame_is_finished(gen_obj, frame, prompt_finalization);
@@ -19949,6 +19971,7 @@ unsafe fn generator_invoke_execute_frame(
     };
     // generator.py:142-145 `finally`.
     frame.f_backref = std::ptr::null_mut();
+    let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
     w_generator_set_running(gen_obj, false);
     if !ec.is_null() {
         (*ec).pop_gen_or_coroutine(gen_obj);
@@ -20540,11 +20563,15 @@ fn gen_close_iter(w_yf: PyObjectRef, prompt_finalizers: bool) -> PyResult {
 fn generator_close_iter(gen_obj: PyObjectRef) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let gen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let gen_obj = pyre_object::gc_roots::pin_root(gen_obj);
         debug_assert!(!w_generator_is_running(gen_obj));
         let w_yf = generator_get_delegate(gen_obj);
         generator_set_delegate(gen_obj, PY_NULL);
         w_generator_set_running(gen_obj, true);
         let result = gen_close_iter(w_yf, true);
+        let gen_obj = pyre_object::gc_roots::shadow_stack_get(gen_slot);
         w_generator_set_running(gen_obj, false);
         result
     }
@@ -21868,15 +21895,17 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             crate::builtins::bytearray_check_exports(obj)?;
             if is_slice(index) {
                 let (rs, rp, st) = {
-                    // Rooted for the components' `__index__` calls; a
-                    // bytearray does not move, so this is liveness alone.
+                    // Each slice component runs `__index__`; a nursery
+                    // bytearray moves under that callback.
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let _ = pyre_object::gc_roots::pin_root(obj);
-                    crate::sliceobject::slice_unpack(
+                    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                    let unpacked = crate::sliceobject::slice_unpack(
                         w_slice_get_start(index),
                         w_slice_get_stop(index),
                         w_slice_get_step(index),
-                    )?
+                    )?;
+                    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                    unpacked
                 };
                 let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
                 let (start, stop, step, slicelength) =
@@ -21915,8 +21944,10 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
             }
             let i = {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let _ = pyre_object::gc_roots::pin_root(obj);
-                subscript_index_w("bytearray", index)?
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+                let i = subscript_index_w("bytearray", index)?;
+                obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                i
             };
             let len = pyre_object::bytearrayobject::w_bytearray_len(obj) as i64;
             let idx = if i < 0 { len + i } else { i };

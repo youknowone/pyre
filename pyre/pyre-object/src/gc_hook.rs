@@ -220,15 +220,11 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
 /// A nursery-full request spills to the old generation rather than collecting,
 /// so the block this hands back is never worse placed than the stable twin's.
 ///
-/// Not for a constructor a compiled trace calls directly.  One bound in
-/// `jit_fnaddr` hands its block back in a machine register the gcmap does not
-/// describe as a reference, so a minor collection between the return and the
-/// store leaves the caller naming moved bytes, and the non-moving old
-/// generation is what stands in for that missing root today.
-/// `PYPY_GC_NURSERY=64K` tells the two apart in one run: routing
-/// `w_int_gc_alloc` here puts recycled nursery bytes in an old-gen
-/// `W_BaseException.w_start` (`type_name_surrogate_reject`,
-/// `site=minor_fixed_field_target`).
+/// A compiled residual whose result is `Type::Ref` is spilled to the
+/// jitframe immediately after the call (`regalloc.rs` `consider_call`),
+/// so the next collecting call's gcmap rewrites it. Constructors that
+/// return an integer-class word (`i64` ABI with no Ref descr) still
+/// need the stable twin.
 ///
 /// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the same reason as its
 /// twin: the hook dispatch is process-global state the trace carries nothing by
@@ -249,7 +245,8 @@ majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
 /// for callers that hold no unrooted GC pointer across the allocation and run at
 /// a JIT safepoint (gcmap-rooted). The elidable bigint payload helpers were the
 /// first; the rooted sibling now also carries every list header
-/// (`w_list_new_with_strategy`), heap-type headers (`w_type_new`),
+/// (`w_list_new_with_strategy`), heap-type headers (`w_type_new` is
+/// old-gen; this hook is the collecting nursery sibling),
 /// `w_weakref_new`, and builtin `str()`'s `w_str_from_wtf8_managed_collecting`.
 pub fn register_gc_alloc_collecting_hook(hook: GcAllocHookFn) {
     GC_ALLOC_COLLECTING_HOOK.set(Some(hook));
@@ -700,6 +697,47 @@ pub extern "C" fn try_gc_owns_object(addr: *mut u8) -> bool {
 #[inline]
 pub fn try_gc_current_object_address(addr: *mut u8) -> *mut u8 {
     majit_gc::gc_current_object_address(addr as usize) as *mut u8
+}
+
+/// Follow a forwarding stub and return the address only when it still
+/// names a managed live object whose fields may be loaded.
+///
+/// `gc_current_object_address` is a nursery-range check plus an optional
+/// stub follow (`_trace_drag_out`). After a `gc_nursery_debug` rotation the
+/// evacuated slot sits outside the published nursery, so that helper
+/// returns the old address unchanged. MiniMark's `is_managed_heap_object`
+/// (current nursery ∪ old-gen) is the liveness gate for that case. When
+/// the slot is still inside the current nursery, a debug fill
+/// (`tid == 0xaaaaaaaaaaaaaaaa`) or a leftover forwarding marker is not a
+/// live header.
+#[inline]
+pub fn try_gc_live_object_address(addr: *mut u8) -> *mut u8 {
+    if addr.is_null() {
+        return std::ptr::null_mut();
+    }
+    let live = try_gc_current_object_address(addr);
+    if live.is_null() || !try_gc_owns_object(live) {
+        return std::ptr::null_mut();
+    }
+    if majit_gc::gc_is_nursery_object(live as usize) {
+        // SAFETY: `try_gc_owns_object` placed `live` in the current nursery,
+        // so a `GcHeader` sits immediately before the payload.
+        let hdr = unsafe { majit_gc::header::header_of(live as usize) };
+        let tid_and_flags = unsafe { (*hdr).tid_and_flags };
+        // incminimark.py arena_reset mode 3 / `NURSERY_POISON_WORD`.
+        const NURSERY_POISON_WORD: u64 = (u64::MAX / 0xff) * 0xaa;
+        if tid_and_flags == NURSERY_POISON_WORD || unsafe { (*hdr).is_forwarded() } {
+            return std::ptr::null_mut();
+        }
+        // After a nursery-debug reuse an evacuated address can land
+        // sixteen bytes inside a new object. That interior's "header"
+        // is a payload word, so `type_id` is the low half of a pointer
+        // (`>= types.len()`), not a registered tid.
+        if !majit_gc::gc_type_id_is_registered(unsafe { (*hdr).type_id() }) {
+            return std::ptr::null_mut();
+        }
+    }
+    live
 }
 
 /// minimark.py `identityhash` hook.

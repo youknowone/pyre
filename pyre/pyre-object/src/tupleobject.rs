@@ -101,6 +101,13 @@ pub const W_TUPLE_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObject>();
 pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 187;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
+impl crate::lltype::GcType for W_TupleObject {
+    fn type_id() -> u32 {
+        W_TUPLE_GC_TYPE_ID
+    }
+    const SIZE: usize = W_TUPLE_OBJECT_SIZE;
+}
+
 impl crate::lltype::GcType for W_TupleObjectUser {
     fn type_id() -> u32 {
         W_TUPLE_USER_GC_TYPE_ID
@@ -234,6 +241,29 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     }
 }
 
+/// Process-global empty tuple. `W_AbstractTupleObject.is_w` treats every
+/// empty tuple as one object, so `() is ()` holds. A nursery-allocated
+/// `()` in `co_consts_w` is recycled by a minor that misses that slot;
+/// the singleton cannot be.
+static EMPTY_TUPLE: crate::gc_roots::RootedOnceRef = crate::gc_roots::RootedOnceRef::new();
+
+/// The unique empty tuple object.
+#[majit_macros::dont_look_inside]
+pub fn w_empty_tuple() -> PyObjectRef {
+    EMPTY_TUPLE.get_or_init(|| {
+        let wrappeditems = unsafe { crate::object_array::alloc_tuple_items_block(&[]) };
+        crate::lltype::malloc_typed_stable(W_TupleObject {
+            ob_header: PyObject {
+                ob_type: &TUPLE_TYPE as *const PyType,
+                w_class: get_instantiate(&TUPLE_TYPE),
+            },
+            hash: AtomicI64::new(TUPLE_HASH_UNSET),
+            wrappeditems,
+            w_dict: PY_NULL,
+        }) as PyObjectRef
+    })
+}
+
 /// Allocate a new tuple from a Vec of items.
 ///
 /// Arity-2 tuples are routed through `makespecialisedtuple2`
@@ -247,6 +277,9 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// residual returning the fresh object pointer.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    if items.is_empty() {
+        return w_empty_tuple();
+    }
     if items.len() == 2 {
         // PyPy can use `_ff` here because its object space gives plain floats
         // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
@@ -290,7 +323,18 @@ pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
 /// Residualized for the same GC-allocator reason as `w_tuple_new`.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
-    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
+    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false, false)
+}
+
+/// Code-constant tuples live as long as the owning `PyCode`, which is
+/// born old-gen. Allocate the header the same way so a missed
+/// remembered-set scan cannot recycle a `fromlist` / nested const.
+#[majit_macros::dont_look_inside]
+pub fn w_tuple_new_stable(items: Vec<PyObjectRef>) -> PyObjectRef {
+    if items.is_empty() {
+        return w_empty_tuple();
+    }
+    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false, true)
 }
 
 /// Build the array-backed layout used by a tuple user subclass. This is the
@@ -301,14 +345,18 @@ pub fn w_tuple_subclass_new_array_backed(
     items: Vec<PyObjectRef>,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    w_tuple_new_array_backed_impl(items, w_class, true)
+    w_tuple_new_array_backed_impl(items, w_class, true, false)
 }
 
 fn w_tuple_new_array_backed_impl(
     items: Vec<PyObjectRef>,
     w_class: PyObjectRef,
     user_layout: bool,
+    stable: bool,
 ) -> PyObjectRef {
+    if !user_layout && items.is_empty() {
+        return w_empty_tuple();
+    }
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`):
     //   livevars = self.push_roots(hop)
     //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])
@@ -349,7 +397,11 @@ fn w_tuple_new_array_backed_impl(
     } else {
         (W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
     };
-    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(type_id, object_size);
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable_raw(type_id, object_size)
+    } else {
+        crate::gc_hook::try_gc_alloc_nursery_raw(type_id, object_size)
+    };
     // The freshly allocated tuple header is itself a translated livevar across
     // the items-block allocation and the write barrier below, and the nursery
     // allocator's block moves, so publishing it is what keeps the address this
@@ -442,8 +494,12 @@ fn w_tuple_new_array_backed_impl(
             .map(crate::gc_roots::shadow_stack_get)
             .unwrap_or(std::ptr::null_mut()) as *mut u8;
         // The header went in before the root was published; only the items
-        // block is still outstanding. Nothing below can collect, so the
-        // remembered tuple keeps the block from here on.
+        // block is still outstanding. The store below is the old-to-young
+        // edge (`set_ref` / `setarrayitem_gc`: barrier, then the field).
+        // A collection that ran on the pre-store remember (null
+        // `wrappeditems`) already consumed that entry and put
+        // `TRACK_YOUNG_PTRS` back, so the post-store barrier is the one
+        // that keeps the filled tuple on `old_objects_pointing_to_young`.
         let header = header();
         unsafe {
             write_tuple_layout(
@@ -454,6 +510,7 @@ fn w_tuple_new_array_backed_impl(
                 user_layout,
             );
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         return raw as PyObjectRef;
     }
     if user_layout {

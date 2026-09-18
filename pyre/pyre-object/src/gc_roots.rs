@@ -683,6 +683,13 @@ impl RootedItems {
         self.len
     }
 
+    /// Live word in slot `i`. A relocation rewrote the slot in place.
+    #[inline]
+    pub fn get(&self, i: usize) -> PyObjectRef {
+        debug_assert!(i < self.len);
+        self.scope.get(self.base + i)
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -696,6 +703,78 @@ impl RootedItems {
         (0..self.len)
             .map(|i| self.scope.get(self.base + i))
             .collect()
+    }
+}
+
+/// Process-global GCREF slot, the translator's static root for a cached
+/// heap type. `OnceLock<usize>` stores an address the collector cannot
+/// rewrite; this slot is registered with MiniMark on first init.
+pub struct RootedOnceRef {
+    slot: std::cell::UnsafeCell<usize>,
+    once: std::sync::Once,
+    registered: std::sync::atomic::AtomicBool,
+}
+
+// The slot is written once under `Once`, then only by the collector.
+unsafe impl Sync for RootedOnceRef {}
+unsafe impl Send for RootedOnceRef {}
+
+impl RootedOnceRef {
+    pub const fn new() -> Self {
+        Self {
+            slot: std::cell::UnsafeCell::new(0),
+            once: std::sync::Once::new(),
+            registered: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn try_register(&self) {
+        if self
+            .registered
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let ok = unsafe { crate::gc_hook::try_gc_add_root(self.slot.get() as *mut *mut u8) };
+        if !ok {
+            self.registered
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub fn get_or_init(&self, init: impl FnOnce() -> PyObjectRef) -> PyObjectRef {
+        // Register before the value is published so a collection on another
+        // thread can rewrite the slot instead of leaving a stale address in it.
+        self.once.call_once(|| {
+            self.try_register();
+            let value = init();
+            unsafe {
+                *self.slot.get() = value as usize;
+            }
+        });
+        self.try_register();
+        unsafe { *self.slot.get() as PyObjectRef }
+    }
+
+    pub fn get(&self) -> Option<PyObjectRef> {
+        if !self.once.is_completed() {
+            return None;
+        }
+        self.try_register();
+        Some(unsafe { *self.slot.get() as PyObjectRef })
+    }
+
+    pub fn set(&self, value: PyObjectRef) {
+        self.once.call_once(|| unsafe {
+            *self.slot.get() = value as usize;
+        });
+        self.try_register();
     }
 }
 

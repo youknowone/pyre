@@ -216,6 +216,14 @@ pub fn w_long_new(value: BigInt) -> PyObjectRef {
     w_long_from_raw(alloc_bigint_nursery(value))
 }
 
+/// Code-constant longs: wrapper and digit array both old-gen, matching
+/// `pycode.py` `_immutable_fields_ = ["co_consts_w[*]"]` on an old-gen
+/// `PyCode`.
+#[majit_macros::dont_look_inside]
+pub fn w_long_new_stable(value: BigInt) -> PyObjectRef {
+    w_long_from_raw(alloc_bigint_stable(value))
+}
+
 /// Wrap a fresh rbigint handle without canonicalizing a shallow copy whose
 /// digit array happens to belong to a prebuilt value.
 #[majit_macros::dont_look_inside]
@@ -340,6 +348,11 @@ pub unsafe fn w_long_is_zero(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_long_get_value(obj: PyObjectRef) -> &'static BigInt {
     unsafe {
+        // Follow a nursery forwarding stub. The returned reference is only
+        // valid until the next collecting allocation: the payload can move.
+        // A caller that keeps the value across `Digits::new` must
+        // `translated_alias` it into an `RBigIntGcRoot`.
+        let obj = crate::gc_hook::try_gc_current_object_address(obj as *mut u8) as PyObjectRef;
         let long_obj = obj as *const W_LongObject;
         &*(*long_obj).value
     }

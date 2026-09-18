@@ -231,11 +231,12 @@ comparison!(mini_le, |o| o != Ordering::Greater);
 comparison!(mini_gt, |o| o == Ordering::Greater);
 comparison!(mini_ge, |o| o != Ordering::Less);
 
-static BUFFER_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+static BUFFER_TYPE_OBJ: pyre_object::gc_roots::RootedOnceRef =
+    pyre_object::gc_roots::RootedOnceRef::new();
 
 /// `_cffi_backend.buffer`.
 pub fn buffer_type() -> PyObjectRef {
-    *BUFFER_TYPE_OBJ.get_or_init(|| {
+    BUFFER_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_layout(
             "_cffi_backend.buffer",
             init_buffer_type,
@@ -250,8 +251,8 @@ pub fn buffer_type() -> PyObjectRef {
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
             pyre_object::w_type_set_weakrefable(tp, true);
         }
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn init_buffer_type(ns: PyObjectRef) {

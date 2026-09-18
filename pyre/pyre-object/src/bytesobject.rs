@@ -307,15 +307,22 @@ impl crate::lltype::GcType for W_BytesObject {
 ///
 /// The `data` block is a varsize GcArray in the managed heap, so the sweep
 /// reclaims it with no drop glue to run. The `W_BytesObject` body is
-/// allocated in GC old-gen (`try_gc_alloc_stable_raw`) so the collector traces
-/// through it and greys the box, mirroring `w_list_new`/`w_set_new`. Falls back
+/// allocated on the nursery bump (`try_gc_alloc_nursery_raw`) so the collector
+/// traces through it and greys the box, mirroring `w_tuple_new`/`w_set_new`. Falls back
 /// to `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
 ///
 /// `dont_look_inside` (`rlib/jit.py`): the tracer cannot model the box
 /// allocation, so the JIT residualises the call.
 #[majit_macros::dont_look_inside]
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
-    build_bytes(bytes.len(), alloc_bytes_block(bytes))
+    build_bytes(bytes.len(), alloc_bytes_block(bytes), false)
+}
+
+/// Code-constant bytes live as long as the owning `PyCode`
+/// (`pycode.py` `_immutable_fields_ = ["co_consts_w[*]"]`).
+#[majit_macros::dont_look_inside]
+pub fn w_bytes_from_bytes_stable(bytes: &[u8]) -> PyObjectRef {
+    build_bytes(bytes.len(), alloc_bytes_block(bytes), true)
 }
 
 /// Word-ABI residual of [`w_bytes_from_bytes`] for a 4-byte payload.
@@ -329,7 +336,7 @@ pub fn jit_w_bytes_from_u8x4(b0: u8, b1: u8, b2: u8, b3: u8) -> PyObjectRef {
 }
 
 /// Wrap `data`, the block the bytes were copied into, in its `W_BytesObject`.
-fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
+fn build_bytes(len: usize, data: *mut BytesBlock, stable: bool) -> PyObjectRef {
     // `build_list_storage` (listobject.rs) states the rule the block obeys:
     // old-gen is mark-sweep, so a block with no heap edge yet is sweepable
     // rather than merely immobile, and it has to be rooted across every later
@@ -342,7 +349,11 @@ fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&BYTES_TYPE));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
+    let raw = if stable {
+        crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE)
+    } else {
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE)
+    };
     let body = W_BytesObject {
         ob_header: PyObject {
             ob_type: &BYTES_TYPE as *const PyType,
@@ -358,6 +369,7 @@ fn build_bytes(len: usize, data: *mut BytesBlock) -> PyObjectRef {
         unsafe {
             std::ptr::write(raw as *mut W_BytesObject, body);
         }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(body) as PyObjectRef
@@ -375,7 +387,7 @@ pub fn w_bytes_from_block(data: *const BytesBlock) -> PyObjectRef {
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&BYTES_TYPE));
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_BYTES_GC_TYPE_ID, W_BYTES_OBJECT_SIZE);
     let data = crate::gc_roots::shadow_stack_get(data_slot) as *const BytesBlock;
     let body = W_BytesObject {
         ob_header: PyObject {
@@ -424,7 +436,7 @@ pub fn w_bytes_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> PyObje
     let data_slot = crate::gc_roots::shadow_stack_len();
     let data = alloc_bytes_block(bytes);
     let _ = crate::gc_roots::pin_root(data as PyObjectRef);
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_BytesObject as crate::lltype::GcType>::type_id(),
         <W_BytesObject as crate::lltype::GcType>::SIZE,
     );

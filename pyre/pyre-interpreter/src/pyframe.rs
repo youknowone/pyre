@@ -1288,7 +1288,7 @@ unsafe fn alloc_frame_locals_array(
     if allocation == FrameLocalsArrayAllocation::OldGenGc {
         let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
             + len * std::mem::size_of::<pyre_object::PyObjectRef>();
-        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+        let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
             pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
             payload,
         );
@@ -1301,6 +1301,8 @@ unsafe fn alloc_frame_locals_array(
                     items.add(i).write(fill);
                 }
             }
+            // Nursery-full spill is old-gen; remember young `fill` values.
+            remember_frame_locals_array(arr);
             return arr;
         }
     }
@@ -1914,10 +1916,14 @@ unsafe fn clone_debugdata_ptr(
         if ptr.is_null() {
             std::ptr::null_mut()
         } else if allocation == FrameLocalsArrayAllocation::OldGenGc {
-            let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+            let _roots = pyre_object::gc_roots::push_roots();
+            let src_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(ptr as pyre_object::PyObjectRef);
+            let raw = pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                 FRAME_DEBUG_DATA_GC_TYPE_ID,
                 std::mem::size_of::<FrameDebugData>(),
             );
+            let ptr = pyre_object::gc_roots::shadow_stack_get(src_slot) as *mut FrameDebugData;
             if !raw.is_null() {
                 std::ptr::write(raw as *mut FrameDebugData, (*ptr).clone());
                 // The clone may carry young locals / trace callback refs.
@@ -3631,7 +3637,7 @@ impl PyFrame {
             let frame_anchor = crate::eval::FrameAnchor::new(self);
             let allocation = unsafe { (*frame_anchor.live()).aux_allocation() };
             let raw = if allocation == FrameLocalsArrayAllocation::OldGenGc {
-                pyre_object::gc_hook::try_gc_alloc_stable_raw(
+                pyre_object::gc_hook::try_gc_alloc_nursery_raw(
                     FRAME_DEBUG_DATA_GC_TYPE_ID,
                     std::mem::size_of::<FrameDebugData>(),
                 ) as *mut FrameDebugData
@@ -3654,7 +3660,13 @@ impl PyFrame {
                 raw
             };
             unsafe { (*frame_anchor.live()).debugdata = debugdata };
-            let debugdata = unsafe { (*frame_anchor.live()).debugdata };
+            // Old-gen frame → nursery `debugdata` is an old-to-young
+            // field store (`incminimark.py write_barrier`). Remembering
+            // only the payload leaves the frame off
+            // `old_objects_pointing_to_young`.
+            let live_frame = frame_anchor.live() as *mut Self;
+            pyre_object::gc_hook::try_gc_write_barrier(live_frame as *mut u8);
+            let debugdata = unsafe { (*live_frame).debugdata };
             remember_frame_debug_data(debugdata);
             return unsafe { &mut *debugdata };
         }
@@ -3829,6 +3841,12 @@ impl PyFrame {
             "PyFrame::__init__: initialize_frame_scopes raised — caller should use createframe",
         );
         remember_frame_locals_array(self.locals_cells_stack_w);
+        // Old-gen frame → nursery locals array is an old-to-young field
+        // store (`incminimark.py write_barrier`). Remembering only the
+        // array leaves the frame off `old_objects_pointing_to_young`.
+        if pyre_object::gc_hook::try_gc_owns_object(self as *mut PyFrame as *mut u8) {
+            pyre_object::gc_hook::try_gc_write_barrier(self as *mut PyFrame as *mut u8);
+        }
     }
 
     /// PyPy-compatible `__repr__`.
@@ -4214,15 +4232,22 @@ impl PyFrame {
         // Root the fresh globals across the `__name__` store; the frame
         // construction below roots them again for its own span.
         let _root = pyre_object::gc_roots::push_roots();
-        let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_globals);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__main__"));
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                w_globals,
+                pyre_object::gc_roots::shadow_stack_get(globals_slot),
                 "__name__",
-                pyre_object::w_str_new("__main__"),
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
             );
         }
-        Self::new_with_context_and_globals(code, execution_context, w_globals)
+        Self::new_with_context_and_globals(
+            code,
+            execution_context,
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+        )
     }
 
     /// `new_with_context` over a globals dict the caller already owns.
@@ -4242,7 +4267,7 @@ impl PyFrame {
         // frame's debug data, and both locations root it once they return.
         let _root = pyre_object::gc_roots::push_roots();
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-        let w_code = crate::box_code_object(code);
+        let w_code = pyre_object::gc_roots::pin_root(crate::box_code_object(code));
         let ctx_ptr = Rc::into_raw(execution_context);
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
@@ -4403,6 +4428,14 @@ impl PyFrame {
         unsafe { &mut *(pyre_object::gc_hook::try_gc_current_object_address(addr) as *mut Self) }
     }
 
+    /// Shared-ref twin of [`Self::live_mut`]: follow a nursery forwarding
+    /// stub so a `&self` peek reads the same frame `push` / `pop` write.
+    #[inline]
+    fn live(&self) -> &Self {
+        let addr = self as *const Self as *mut u8;
+        unsafe { &*(pyre_object::gc_hook::try_gc_current_object_address(addr) as *const Self) }
+    }
+
     #[inline]
     pub fn push(&mut self, value: PyObjectRef) {
         // Both writes below — the stack slot and the depth — have to land on
@@ -4414,24 +4447,24 @@ impl PyFrame {
         frame.valuestackdepth = idx + 1;
     }
 
-    /// Reads and writes through the caller's `&mut self`, without the
-    /// [`Self::live_mut`] reload [`Self::push`] takes.
+    /// Reload the frame the way RPython's GC transform reloads the
+    /// `popvalue` livevar after a safepoint (`pyframe.py popvalue_maybe_none`).
     ///
-    /// That is sound because the opcode bodies keep `pyopcode.py`'s
-    /// `pop; op; push` order: every pop runs before the operation that can
-    /// collect, and the push that follows the operation reloads for itself.
-    /// A body that allocates between two pops breaks the premise — the second
-    /// pop would read the abandoned copy — and owes the reload at its own call
-    /// site.
+    /// A between-opcode collection (`eval_loop` safepoint) or a pin that
+    /// grows the shadow stack can relocate a nursery frame (or only its
+    /// `locals_cells_stack_w` array, with the field updated on the live
+    /// copy). Reading through the caller's abandoned `&mut self` would pop
+    /// a recycled nursery word.
     #[inline]
     pub fn pop(&mut self) -> PyObjectRef {
-        if self.valuestackdepth <= self.stack_base() {
-            report_stack_underflow(self);
+        let frame = self.live_mut();
+        if frame.valuestackdepth <= frame.stack_base() {
+            report_stack_underflow(frame);
         }
-        let depth = self.valuestackdepth - 1;
-        let value = locals_w!(self)[depth];
-        self.set_locals_w(depth, PY_NULL);
-        self.valuestackdepth = depth;
+        let depth = frame.valuestackdepth - 1;
+        let value = locals_w!(frame)[depth];
+        frame.set_locals_w(depth, PY_NULL);
+        frame.valuestackdepth = depth;
         value
     }
 
@@ -4444,16 +4477,18 @@ impl PyFrame {
         // `locals_cells_stack_w` read ahead of the subtraction's overflow
         // check, and that check's branch then carries the array out of the
         // block on a link — which `_check_no_vable_array` rejects.
-        let index = self.valuestackdepth - 1;
-        locals_w!(self)[index]
+        let frame = self.live();
+        let index = frame.valuestackdepth - 1;
+        locals_w!(frame)[index]
     }
 
     #[inline]
     #[allow(dead_code)]
     pub fn peek_at(&self, depth: usize) -> PyObjectRef {
         // Hoisted for the reason given on [`Self::peek`].
-        let index = self.valuestackdepth - 1 - depth;
-        locals_w!(self)[index]
+        let frame = self.live();
+        let index = frame.valuestackdepth - 1 - depth;
+        locals_w!(frame)[index]
     }
 
     /// Null the locals_cells_stack slots at and above `depth`, the
@@ -6364,12 +6399,12 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         ConstantData::Integer { value } => {
             let value = crate::compiler_bigint_to_rbigint(value);
             match value.toint() {
-                Ok(value) => pyre_object::intobject::w_int_new(value),
-                Err(_) => pyre_object::longobject::w_long_new(value),
+                Ok(value) => pyre_object::intobject::w_int_new_stable(value),
+                Err(_) => pyre_object::longobject::w_long_new_stable(value),
             }
         }
         // `eval.rs` `float_constant`.
-        ConstantData::Float { value } => pyre_object::floatobject::w_float_new(*value),
+        ConstantData::Float { value } => pyre_object::floatobject::w_float_new_stable(*value),
         // `eval.rs` `bool_constant` — bools must surface as
         // W_BoolObject (`is space.w_True/w_False`), not W_IntObject.
         ConstantData::Boolean { value } => pyre_object::w_bool_from(*value),
@@ -6377,7 +6412,7 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         // matching `space.newtext` per `unicodeobject.py wrapunicode`.
         ConstantData::Str { value } => pyre_object::unicodeobject::box_str_constant(value),
         // `eval.rs` `bytes_constant`.
-        ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes(value),
+        ConstantData::Bytes { value } => pyre_object::bytesobject::w_bytes_from_bytes_stable(value),
         // Reached only for a code constant nested inside a container constant;
         // top-level `LOAD_CONST` routes through `co_consts_w` in `bh_load_const_fn`
         // so the blackhole shares the interpreter's wrapper.  The exceptions are
@@ -6402,7 +6437,7 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
             for element in elements {
                 items.push(pyobject_from_constant(element));
             }
-            crate::runtime_ops::build_tuple_from_refs(&items.take())
+            pyre_object::w_tuple_new_stable(items.take())
         }
         // `load_const_value`'s `Slice` arm (`pyopcode.rs`) — recurse over
         // `[start, stop, step]` before invoking `slice_constant` (`eval.rs`).
@@ -6415,7 +6450,11 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
             let _ = roots.pin_root(pyobject_from_constant(&elements[0]));
             let _ = roots.pin_root(pyobject_from_constant(&elements[1]));
             let _ = roots.pin_root(pyobject_from_constant(&elements[2]));
-            pyre_object::w_slice_new(roots.get(base), roots.get(base + 1), roots.get(base + 2))
+            pyre_object::w_slice_new_stable(
+                roots.get(base),
+                roots.get(base + 1),
+                roots.get(base + 2),
+            )
         }
         // `load_const_value`'s `Frozenset` arm (`pyopcode.rs`) — recurse +
         // delegate to `frozenset_constant` (`eval.rs`).

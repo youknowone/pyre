@@ -7,7 +7,6 @@ use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::Wtf8Buf;
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::OnceLock;
 
 /// Short-lived normalizer for the three-argument generator `throw` surface.
 ///
@@ -28,14 +27,15 @@ pub(crate) struct ExceptionNormalization {
 /// absence forever.
 #[majit_macros::dont_look_inside]
 pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool {
-    static STOP_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    static STOP_ITERATION_CLASS: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let stop_iteration = match STOP_ITERATION_CLASS.get() {
-        Some(&class) => class as PyObjectRef,
+        Some(class) => class,
         None => {
             let Some(class) = crate::builtins::lookup_exc_class("StopIteration") else {
                 return false;
             };
-            let _ = STOP_ITERATION_CLASS.set(class as usize);
+            STOP_ITERATION_CLASS.set(class);
             class
         }
     };
@@ -49,14 +49,15 @@ pub fn exception_object_matches_stop_iteration(exc_object: PyObjectRef) -> bool 
 /// `jit_fnaddr`, both of which a refactor would break silently.
 #[majit_macros::dont_look_inside]
 pub fn exception_object_matches_stop_async_iteration(exc_object: PyObjectRef) -> bool {
-    static STOP_ASYNC_ITERATION_CLASS: OnceLock<usize> = OnceLock::new();
+    static STOP_ASYNC_ITERATION_CLASS: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
     let stop_async_iteration = match STOP_ASYNC_ITERATION_CLASS.get() {
-        Some(&class) => class as PyObjectRef,
+        Some(class) => class,
         None => {
             let Some(class) = crate::builtins::lookup_exc_class("StopAsyncIteration") else {
                 return false;
             };
-            let _ = STOP_ASYNC_ITERATION_CLASS.set(class as usize);
+            STOP_ASYNC_ITERATION_CLASS.set(class);
             class
         }
     };
@@ -1672,12 +1673,14 @@ impl PyError {
         // below: `exc` lives only in this Rust local while `w_list_new` (and the
         // setters) run, so a collection there could sweep the unrooted
         // (non-moving oldgen) exception before it is written through.
+        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
         let exc = pyre_object::gc_roots::pin_root(exc);
         if !self.message.is_empty() {
             let msg_slot = pyre_object::gc_roots::shadow_stack_len();
             let msg = pyre_object::w_str_from_wtf8_managed(self.message.clone());
             let msg = pyre_object::gc_roots::pin_root(msg);
             let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![msg]);
+            let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
             unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
             // `ImportError` / `ModuleNotFoundError` expose the message through a
             // dedicated `msg` slot (`ImportError.__init__` stores `args[0]`
@@ -1712,6 +1715,7 @@ impl PyError {
         // above pop when this scope ends, and `walk_gc_refs` keeps forwarding
         // both fields afterwards, so leaving the pre-move address here would
         // hand the collector a moved-from slot.
+        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
         if !self.w_name_context.is_null() {
             let w_name_context = pyre_object::gc_roots::shadow_stack_get(name_ctx_slot);
             self.w_name_context = w_name_context;
@@ -2436,8 +2440,8 @@ fn wrap_pos(num: i64) -> PyObjectRef {
 }
 
 fn unraisable_hook_args_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         crate::_structseq::make_struct_seq(
             "sys.UnraisableHookArgs",
             &[
@@ -2447,8 +2451,8 @@ fn unraisable_hook_args_type() -> PyObjectRef {
                 "err_msg",
                 "object",
             ],
-        ) as usize
-    }) as PyObjectRef
+        )
+    })
 }
 
 /// Resolve an exception instance's actual Python class name for display.

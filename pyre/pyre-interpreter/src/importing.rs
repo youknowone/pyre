@@ -4398,13 +4398,17 @@ fn load_source_module(
             (crate::box_code_object(code), cache_key.is_some())
         }
     };
-    // The whole unit was named by this path, so recurse through the eager
-    // nested PyCode constants like PyPy `update_code_filenames`.
-    unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
-    // Root before any allocation (fresh_module_globals, the cache write) can
-    // collect the freshly boxed code out from under us.
+    // Root before `update_code_filenames` / later allocations can collect.
+    // `set_compilation_unit_filename_bytes` walks nested codes and may
+    // allocate; the pin is the shadow-stack livevar PyPy's gctransform
+    // keeps across `importing.py update_code_filenames`.
     let code_slot = roots.base();
     let _ = roots.pin_root(w_code);
+    // The whole unit was named by this path, so recurse through the eager
+    // nested PyCode constants like PyPy `update_code_filenames`.
+    unsafe {
+        crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
+    };
     if let (true, Some(key)) = (store, cache_key) {
         crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
     }
@@ -5191,14 +5195,36 @@ pub fn import_name(
     w_fromlist: PyObjectRef,
     w_flag: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `lookup_dunder_import` reads the builtin dict and can collect.
+    // The three incoming GCREFs are native copies the collector does
+    // not update, so they live on the shadow stack across that lookup
+    // (`pyopcode.py IMPORT_NAME` livevars).
+    let _import_name_roots = pyre_object::gc_roots::push_roots();
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_modulename);
+    let fromlist_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_fromlist);
+    let flag_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_flag);
     let w_import = lookup_dunder_import(frame)?;
-
+    let import_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_import);
     let w_locals = import_locals(frame);
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_locals);
     let w_globals = frame.get_w_globals();
+    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_globals);
     crate::call::call_args_in_frame(
         frame,
-        w_import,
-        &[w_modulename, w_globals, w_locals, w_fromlist, w_flag],
+        pyre_object::gc_roots::shadow_stack_get(import_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+            pyre_object::gc_roots::shadow_stack_get(locals_slot),
+            pyre_object::gc_roots::shadow_stack_get(fromlist_slot),
+            pyre_object::gc_roots::shadow_stack_get(flag_slot),
+        ],
     )
 }
 

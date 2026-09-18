@@ -133,6 +133,35 @@ pub const fn new_pytype(name: &'static str) -> PyType {
 /// Called by `init_typeobjects()` for each built-in type.
 pub fn set_instantiate(tp: &PyType, w_typeobject: PyObjectRef) {
     tp.instantiate.store(w_typeobject, Ordering::Release);
+    let addr = tp as *const PyType as usize;
+    let mut slots = instantiate_slots().lock().unwrap();
+    if !slots.contains(&addr) {
+        slots.push(addr);
+    }
+}
+
+fn instantiate_slots() -> &'static std::sync::Mutex<Vec<usize>> {
+    static SLOTS: OnceLock<std::sync::Mutex<Vec<usize>>> = OnceLock::new();
+    SLOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Forward every `PyType.instantiate` slot.
+///
+/// RPython keeps each builtin type on the space (`space.w_tuple`, …) as
+/// a prebuilt GCREF. pyre caches the same pointer on the static `PyType`.
+/// A collection that moves a managed wrapper must rewrite the slot, or
+/// `get_instantiate` / `w_class` keep a stale nursery address.
+pub fn walk_instantiate_slots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let slots = instantiate_slots().lock().unwrap();
+    for &addr in slots.iter() {
+        let tp = unsafe { &*(addr as *const PyType) };
+        let mut w = tp.instantiate.load(Ordering::Acquire);
+        if w.is_null() {
+            continue;
+        }
+        visitor(&mut w);
+        tp.instantiate.store(w, Ordering::Release);
+    }
 }
 
 /// Read the cached W_TypeObject from a PyType.

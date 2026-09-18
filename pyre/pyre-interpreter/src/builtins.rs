@@ -2599,7 +2599,9 @@ fn memoryview_from_flags(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `memoryview.hex` — the view's bytes as a hex string, reusing the
 /// bytes `hex(sep, bytes_per_sep)` formatter on a gathered copy.
 fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let mv = args.first().copied().unwrap_or(w_none());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mv = pyre_object::gc_roots::pin_root(args.first().copied().unwrap_or(w_none()));
     let w_bytes = unsafe {
         memoryview_check_released(mv)?;
         pyre_object::bytesobject::w_bytes_from_bytes(&memoryview_gather_bytes(mv))
@@ -2613,6 +2615,7 @@ fn memoryview_hex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // live view, so retain the identical release guard across the formatter.
     unsafe { pyre_object::memoryview::w_memoryview_exports_incref(mv) };
     let result = crate::typedef::bytes_method_hex(&fwd);
+    let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
     unsafe { pyre_object::memoryview::w_memoryview_exports_decref(mv) };
     result
 }
@@ -2649,9 +2652,13 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
             // temporary export.  The digest is deliberately discarded; the
             // call validates hashability and, crucially, prevents a
             // re-entrant `mv.release()` from freeing the bytes being hashed.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mv_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mv = pyre_object::gc_roots::pin_root(mv);
             let backing = pyre_object::memoryview::w_memoryview_obj(mv);
             pyre_object::memoryview::w_memoryview_exports_incref(mv);
             let backing_hash = crate::baseobjspace::hash_w_strict(backing);
+            let mv = pyre_object::gc_roots::shadow_stack_get(mv_slot);
             pyre_object::memoryview::w_memoryview_exports_decref(mv);
             backing_hash?;
             // `compute_hash(self.view.as_str())` — the same content digest the
@@ -10261,20 +10268,14 @@ enum ExceptionGroupCondition {
     Class(PyObjectRef),
     Callable(PyObjectRef),
     /// `app_group.py _exception_group_projection`'s `resultset`, which upstream
-    /// keeps as an `identity_dict` of the leaf objects.
-    ///
-    /// Addresses stand in for the objects here, and that is sound only because
-    /// every member is an exception: `w_exception_new_empty_impl` allocates one
-    /// through `try_gc_alloc_stable_raw`, the non-moving oldgen, precisely so a
-    /// carrier may hold it as a bare word across allocating code, and
-    /// `check_new_args` refuses a group member that is not a `BaseException`.
-    /// The walk between collecting these and testing the last child runs
-    /// arbitrary Python -- an overridden `derive`, a metaclass
-    /// `__instancecheck__`, a callable condition -- so were a leaf ever
-    /// nursery-allocated, a minor collection there would relocate one not yet
-    /// tested and this set would silently drop it.
-    /// `except_star_projection_gc_roots` is the guard on that invariant.
-    Identity(Vec<usize>),
+    /// keeps as an `identity_dict` of the leaf objects. A list is the same
+    /// single heap object: `collect_leaves` appends through `w_list_append`
+    /// (write-barriered) and a nested `isinstance` / `derive` collection
+    /// forwards the list rather than a `RootedItems` index run. Nested
+    /// `RootedItems` brackets steal those slots (`RootedItems` one-set rule)
+    /// so `matches` would read the original group and `split` would keep every
+    /// leaf. `except_star_projection_gc_roots` is the guard.
+    Identity(PyObjectRef),
 }
 
 impl ExceptionGroupCondition {
@@ -10288,9 +10289,17 @@ impl ExceptionGroupCondition {
                 let result = crate::call::call_function_impl_result(callable, &[exc])?;
                 crate::baseobjspace::is_true(result)
             }
-            Self::Identity(ref addresses) => Ok(addresses.contains(&(exc as usize))),
+            Self::Identity(leaves) => Ok(exception_group_list_contains_ptr(leaves, exc)),
         }
     }
+}
+
+fn exception_group_list_contains_ptr(w_list: PyObjectRef, item: PyObjectRef) -> bool {
+    let n = unsafe { pyre_object::w_list_len(w_list) };
+    (0..n).any(|i| {
+        unsafe { pyre_object::w_list_getitem(w_list, i as i64) }
+            .is_some_and(|elt| std::ptr::eq(elt, item))
+    })
 }
 
 fn exception_group_condition(
@@ -10385,8 +10394,9 @@ fn exception_group_derive_and_copy(
 
 fn exception_group_condition_obj(condition: &ExceptionGroupCondition) -> Option<PyObjectRef> {
     match *condition {
-        ExceptionGroupCondition::Class(obj) | ExceptionGroupCondition::Callable(obj) => Some(obj),
-        ExceptionGroupCondition::Identity(_) => None,
+        ExceptionGroupCondition::Class(obj)
+        | ExceptionGroupCondition::Callable(obj)
+        | ExceptionGroupCondition::Identity(obj) => Some(obj),
     }
 }
 
@@ -10416,9 +10426,9 @@ fn live_exception_group_condition(
                 cond_slot.expect("callable condition is pinned"),
             ))
         }
-        ExceptionGroupCondition::Identity(ref addresses) => {
-            ExceptionGroupCondition::Identity(addresses.clone())
-        }
+        ExceptionGroupCondition::Identity(_) => ExceptionGroupCondition::Identity(
+            pyre_object::gc_roots::shadow_stack_get(cond_slot.expect("identity set is pinned")),
+        ),
     }
 }
 
@@ -10437,19 +10447,25 @@ fn exception_group_subgroup_inner(
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     // A selected child can be a freshly derived subgroup and the next child
     // allocates again, so each is pinned as it arrives (`build_list_storage`).
+    let mut children = pyre_object::gc_roots::RootedItems::new();
+    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+        children.push(exc);
+    }
     let mut selected = pyre_object::gc_roots::RootedItems::new();
     let mut modified = false;
-    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+    for i in 0..children.len() {
+        let exc = children.get(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
+            let exc = children.get(i);
             let subgroup = exception_group_subgroup_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(subgroup) } {
                 selected.push(subgroup);
             }
-            if !std::ptr::eq(subgroup, exc) {
+            if !std::ptr::eq(subgroup, children.get(i)) {
                 modified = true;
             }
-        } else if live_condition().matches(exc)? {
-            selected.push(exc);
+        } else if live_condition().matches(children.get(i))? {
+            selected.push(children.get(i));
         } else {
             modified = true;
         }
@@ -10481,11 +10497,17 @@ fn exception_group_split_inner(
     // arrives; both sides share one bracket, because two open brackets pin onto
     // the same shadow stack and would read each other's slots back
     // (`build_list_storage`).
+    let mut children = pyre_object::gc_roots::RootedItems::new();
+    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+        children.push(exc);
+    }
     let mut kept = pyre_object::gc_roots::RootedItems::new();
     let mut matching_at = Vec::new();
     let mut nonmatching_at = Vec::new();
-    for exc in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
+    for i in 0..children.len() {
+        let exc = children.get(i);
         if crate::baseobjspace::isinstance(exc, base_group)? {
+            let exc = children.get(i);
             let (yes, no) = exception_group_split_inner(exc, &live_condition())?;
             if !unsafe { pyre_object::is_none(yes) } {
                 matching_at.push(kept.len());
@@ -10503,25 +10525,25 @@ fn exception_group_split_inner(
             kept.push(exc);
         }
     }
-    let kept_items = kept.take();
-    let side = |at: &[usize]| -> Vec<PyObjectRef> { at.iter().map(|&i| kept_items[i]).collect() };
-    // Deriving one side allocates, so the group derived for the other side is
-    // pinned across it.
+    // `app_group.py` `split` walks `self.exceptions` and derives each
+    // side from the live list. Do not `take()` the rooted items: the
+    // first `derive` can collect, and a snapshot Vec would then be stale.
     let mut derived = pyre_object::gc_roots::RootedItems::new();
     let yes = if matching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self(), side(&matching_at))?
+        let items: Vec<PyObjectRef> = matching_at.iter().map(|&i| kept.get(i)).collect();
+        exception_group_derive_and_copy(w_self(), items)?
     };
     derived.push(yes);
     let no = if nonmatching_at.is_empty() {
         pyre_object::w_none()
     } else {
-        exception_group_derive_and_copy(w_self(), side(&nonmatching_at))?
+        let items: Vec<PyObjectRef> = nonmatching_at.iter().map(|&i| kept.get(i)).collect();
+        exception_group_derive_and_copy(w_self(), items)?
     };
     derived.push(no);
-    let sides = derived.take();
-    Ok((sides[0], sides[1]))
+    Ok((derived.get(0), derived.get(1)))
 }
 
 /// `ceval.c _PyEval_ExceptionGroupMatch`, answering `CHECK_EG_MATCH`.
@@ -10536,27 +10558,53 @@ pub(crate) fn exception_group_match(
     w_exc: PyObjectRef,
     w_type: PyObjectRef,
 ) -> Result<(PyObjectRef, PyObjectRef, bool), crate::PyError> {
-    let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if crate::eval::check_exc_match_against(w_exc, w_type) {
-        if crate::baseobjspace::isinstance(w_exc, base_group)? {
-            return Ok((w_exc, pyre_object::w_none(), false));
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[
+        w_exc,
+        w_type,
+        lookup_exc_class("BaseExceptionGroup").unwrap(),
+    ]);
+    let w_exc = || pyre_object::gc_roots::shadow_stack_get(base);
+    let w_type = || pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let base_group = || pyre_object::gc_roots::shadow_stack_get(base + 2);
+    if crate::eval::check_exc_match_against(w_exc(), w_type()) {
+        if crate::baseobjspace::isinstance(w_exc(), base_group())? {
+            return Ok((w_exc(), pyre_object::w_none(), false));
         }
         let message = unsafe { pyre_object::w_str_new("") };
-        let exceptions = pyre_object::w_tuple_new(vec![w_exc]);
-        let group = exception_group_new(&[base_group, message, exceptions])?;
+        let message_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(message);
+        let exceptions = pyre_object::w_tuple_new(vec![w_exc()]);
+        let exceptions_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(exceptions);
+        let group = exception_group_new(&[
+            base_group(),
+            pyre_object::gc_roots::shadow_stack_get(message_slot),
+            pyre_object::gc_roots::shadow_stack_get(exceptions_slot),
+        ])?;
         return Ok((group, pyre_object::w_none(), true));
     }
-    if crate::baseobjspace::isinstance(w_exc, base_group)? {
+    if crate::baseobjspace::isinstance(w_exc(), base_group())? {
         // Partial match: call the (overridable) `split` method and validate it
         // returns a 2-tuple of (match, rest).
-        let split = crate::baseobjspace::getattr_str(w_exc, "split")?;
-        let pair = crate::call::call_function_impl_result(split, &[w_type])?;
-        if !unsafe { pyre_object::is_tuple(pair) } {
-            let name = crate::baseobjspace::object_functionstr_type_name(pair);
+        let split = crate::baseobjspace::getattr_str(w_exc(), "split")?;
+        let split_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(split);
+        let pair = crate::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(split_slot),
+            &[w_type()],
+        )?;
+        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pair);
+        if !unsafe { pyre_object::is_tuple(pyre_object::gc_roots::shadow_stack_get(pair_slot)) } {
+            let name = crate::baseobjspace::object_functionstr_type_name(
+                pyre_object::gc_roots::shadow_stack_get(pair_slot),
+            );
             return Err(crate::PyError::type_error(format!(
                 "split must return a tuple, not {name}"
             )));
         }
+        let pair = pyre_object::gc_roots::shadow_stack_get(pair_slot);
         let n = unsafe { pyre_object::w_tuple_len(pair) };
         if n < 2 {
             return Err(crate::PyError::type_error(format!(
@@ -10569,7 +10617,7 @@ pub(crate) fn exception_group_match(
         let rest = unsafe { pyre_object::w_tuple_getitem(pair, 1) }.unwrap();
         return Ok((matching, rest, false));
     }
-    Ok((pyre_object::w_none(), w_exc, false))
+    Ok((pyre_object::w_none(), w_exc(), false))
 }
 
 fn exception_group_notes(w_exc: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -10600,8 +10648,13 @@ fn exception_group_same_metadata(
     w_left: PyObjectRef,
     w_right: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
-    let left_notes = exception_group_notes(w_left)?;
-    let right_notes = exception_group_notes(w_right)?;
+    // `_is_same_exception_metadata` reads `__notes__` through getattr, which
+    // can collect; both operands stay on the shadow stack so the later raw
+    // traceback/cause/context slot compares still name the same objects.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_left, w_right]);
+    let left_notes = exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base))?;
+    let right_notes = exception_group_notes(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     if !match (left_notes, right_notes) {
         (Some(left), Some(right)) => std::ptr::eq(left, right),
         (None, None) => true,
@@ -10611,38 +10664,58 @@ fn exception_group_same_metadata(
     }
     Ok(unsafe {
         exception_group_meta_ref_eq(
-            pyre_object::interp_exceptions::w_exception_get_traceback(w_left),
-            pyre_object::interp_exceptions::w_exception_get_traceback(w_right),
+            pyre_object::interp_exceptions::w_exception_get_traceback(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ),
+            pyre_object::interp_exceptions::w_exception_get_traceback(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ),
         ) && exception_group_meta_ref_eq(
-            pyre_object::interp_exceptions::w_exception_get_cause(w_left),
-            pyre_object::interp_exceptions::w_exception_get_cause(w_right),
+            pyre_object::interp_exceptions::w_exception_get_cause(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ),
+            pyre_object::interp_exceptions::w_exception_get_cause(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ),
         ) && exception_group_meta_ref_eq(
-            pyre_object::interp_exceptions::w_exception_get_context(w_left),
-            pyre_object::interp_exceptions::w_exception_get_context(w_right),
+            pyre_object::interp_exceptions::w_exception_get_context(
+                pyre_object::gc_roots::shadow_stack_get(base),
+            ),
+            pyre_object::interp_exceptions::w_exception_get_context(
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+            ),
         )
     })
 }
 
-fn exception_group_collect_leaf_addresses(
+fn exception_group_collect_leaves(
     w_exc: PyObjectRef,
-    addresses: &mut Vec<usize>,
+    w_leaves: PyObjectRef,
 ) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_none(w_exc) } {
         return Ok(());
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_exc, w_leaves]);
+    let w_exc = || pyre_object::gc_roots::shadow_stack_get(base);
+    let w_leaves = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if crate::baseobjspace::isinstance(w_exc, base_group)? {
-        let (_, exceptions) = exception_group_fields(w_exc)?;
-        for child in unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) } {
-            exception_group_collect_leaf_addresses(child, addresses)?;
+    if crate::baseobjspace::isinstance(w_exc(), base_group)? {
+        let (_, exceptions) = exception_group_fields(w_exc())?;
+        let children = unsafe { pyre_object::w_tuple_items_copy_as_vec(exceptions) };
+        let kids = pyre_object::gc_roots::pin_roots(&children);
+        for i in 0..children.len() {
+            exception_group_collect_leaves(
+                pyre_object::gc_roots::shadow_stack_get(kids + i),
+                w_leaves(),
+            )?;
         }
-    } else if unsafe { pyre_object::is_exception(w_exc) } {
-        let address = w_exc as usize;
-        if !addresses.contains(&address) {
-            addresses.push(address);
+    } else if unsafe { pyre_object::is_exception(w_exc()) } {
+        if !exception_group_list_contains_ptr(w_leaves(), w_exc()) {
+            unsafe { pyre_object::w_list_append(w_leaves(), w_exc()) };
         }
     } else {
-        let name = crate::baseobjspace::object_functionstr_type_name(w_exc);
+        let name = crate::baseobjspace::object_functionstr_type_name(w_exc());
         return Err(crate::PyError::type_error(format!(
             "expected BaseException, got {name}"
         )));
@@ -10654,12 +10727,22 @@ fn exception_group_projection(
     w_group: PyObjectRef,
     keep: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
-    let mut addresses = Vec::new();
-    for w_exc in keep.iter().copied() {
-        exception_group_collect_leaf_addresses(w_exc, &mut addresses)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let group_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_group);
+    let keep_base = pyre_object::gc_roots::pin_roots(keep);
+    let leaves_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(Vec::new()));
+    for i in 0..keep.len() {
+        exception_group_collect_leaves(
+            pyre_object::gc_roots::shadow_stack_get(keep_base + i),
+            pyre_object::gc_roots::shadow_stack_get(leaves_slot),
+        )?;
     }
-    let (matching, _) =
-        exception_group_split_inner(w_group, &ExceptionGroupCondition::Identity(addresses))?;
+    let (matching, _) = exception_group_split_inner(
+        pyre_object::gc_roots::shadow_stack_get(group_slot),
+        &ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(leaves_slot)),
+    )?;
     Ok(matching)
 }
 
@@ -10667,27 +10750,44 @@ pub(crate) fn exception_group_prep_reraise_star(
     w_orig: PyObjectRef,
     w_exc_list: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let exceptions = crate::baseobjspace::fixedview(w_exc_list, -1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let orig_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_orig);
+    let _ = pyre_object::gc_roots::pin_root(w_exc_list);
+    let exceptions =
+        crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(orig_slot + 1), -1)?;
     if exceptions.is_empty() {
         return Ok(pyre_object::w_none());
     }
+    let items = pyre_object::gc_roots::pin_roots(&exceptions);
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
-    if !crate::baseobjspace::isinstance(w_orig, base_group)? {
-        return Ok(exceptions[0]);
+    if !crate::baseobjspace::isinstance(
+        pyre_object::gc_roots::shadow_stack_get(orig_slot),
+        base_group,
+    )? {
+        return Ok(pyre_object::gc_roots::shadow_stack_get(items));
     }
 
-    let mut raised = Vec::new();
-    let mut reraised = Vec::new();
-    for w_exc in exceptions {
+    let mut raised = pyre_object::gc_roots::RootedItems::new();
+    let mut reraised = pyre_object::gc_roots::RootedItems::new();
+    for i in 0..exceptions.len() {
+        let w_exc = pyre_object::gc_roots::shadow_stack_get(items + i);
         if !unsafe { pyre_object::is_none(w_exc) } {
-            if exception_group_same_metadata(w_exc, w_orig)? {
+            if exception_group_same_metadata(
+                w_exc,
+                pyre_object::gc_roots::shadow_stack_get(orig_slot),
+            )? {
                 reraised.push(w_exc);
             } else {
                 raised.push(w_exc);
             }
         }
     }
-    let reraised_group = exception_group_projection(w_orig, &reraised)?;
+    let reraised_keep: Vec<PyObjectRef> = (0..reraised.len()).map(|i| reraised.get(i)).collect();
+    let reraised_group = exception_group_projection(
+        pyre_object::gc_roots::shadow_stack_get(orig_slot),
+        &reraised_keep,
+    )?;
     if raised.is_empty() {
         return Ok(reraised_group);
     }
@@ -10695,7 +10795,7 @@ pub(crate) fn exception_group_prep_reraise_star(
         raised.push(reraised_group);
     }
     if raised.len() == 1 {
-        return Ok(raised[0]);
+        return Ok(raised.get(0));
     }
     // Construct through BaseExceptionGroup so a merged result that carries a
     // bare BaseException (e.g. a reraised KeyboardInterrupt alongside a freshly
@@ -10703,7 +10803,7 @@ pub(crate) fn exception_group_prep_reraise_star(
     // ExceptionGroup only when every leaf is an Exception.
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
     let message = unsafe { pyre_object::w_str_new("") };
-    let list = pyre_object::w_list_new(raised);
+    let list = pyre_object::w_list_new((0..raised.len()).map(|i| raised.get(i)).collect());
     exception_group_new(&[base_group, message, list])
 }
 
@@ -19320,16 +19420,17 @@ pub fn file_wrapper_type() -> PyObjectRef {
     // A Python type is process-global, exactly as PyPy's W_TypeObject is.
     // Storing it in TLS would manufacture one incompatible TextIOWrapper type
     // per host thread and break cross-thread isinstance/type identity.
-    static FILE_WRAPPER_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *FILE_WRAPPER_TYPE.get_or_init(|| {
+    static FILE_WRAPPER_TYPE: pyre_object::gc_roots::RootedOnceRef =
+        pyre_object::gc_roots::RootedOnceRef::new();
+    FILE_WRAPPER_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_io.TextIOWrapper", init_file_wrapper_type);
         // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
         // TextIOWrapper heap spec.  This legacy wrapper accessor must publish
         // the same owner as `_io::textio::type_object`.
         crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 /// PyPy: pypy/module/_io/interp_iobase.py W_IOBase.

@@ -8,11 +8,10 @@
 //! `lib_pypy/_contextvars.py`, but `Python/context.c` ships it as a C function.
 
 use pyre_object::*;
-use std::sync::OnceLock;
 
 pub(crate) fn context_var_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
             let signature =
                 crate::gateway::Signature::new(vec!["cls", "name", "default"], None, None, 1, 2);
@@ -82,8 +81,8 @@ pub(crate) fn context_var_type() -> PyObjectRef {
         });
         unsafe { typeobject::w_type_set_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn context_var_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -317,8 +316,8 @@ fn context_var_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 fn token_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_contextvars.Token", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -378,13 +377,13 @@ fn token_type() -> PyObjectRef {
         });
         unsafe { typeobject::w_type_set_hasdict(tp, true) };
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn token_missing_type() -> PyObjectRef {
-    static TYPE: OnceLock<usize> = OnceLock::new();
-    *TYPE.get_or_init(|| {
+    static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
+    TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("_contextvars.Token.MISSING", |ns| unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -397,8 +396,8 @@ fn token_missing_type() -> PyObjectRef {
             );
         });
         unsafe { typeobject::w_type_set_acceptable_as_base_class(tp, false) };
-        tp as usize
-    }) as PyObjectRef
+        tp
+    })
 }
 
 fn token_missing() -> PyObjectRef {

@@ -2799,6 +2799,11 @@ pub enum DispatchError {
     /// a Python pc here would make a later side exit resume at a guessed
     /// block head, so the walker declines before the trace is installed.
     GuardResumeCoordinateUnavailable { pc: usize },
+    /// `walker_guard_exact_w_class` would pin a `w_class` the recorded
+    /// operand does not carry: the snapshot is not a live heap object,
+    /// or its `w_class` is not the expected type. Returning `Ok` here
+    /// would fold as if the pin succeeded.
+    GuardExactWClassOperandMismatch { pc: usize },
     /// `last_exception/>i` fired but no concrete standing exception was
     /// available. RPython parity: `pyjitpl.py opimpl_last_exception`:
     ///
@@ -3007,6 +3012,7 @@ impl DispatchError {
             Self::VableEscapedDuringResidualCall { .. } => "VableEscapedDuringResidualCall",
             Self::GuardSnapshotVableUntyped { .. } => "GuardSnapshotVableUntyped",
             Self::GuardResumeCoordinateUnavailable { .. } => "GuardResumeCoordinateUnavailable",
+            Self::GuardExactWClassOperandMismatch { .. } => "GuardExactWClassOperandMismatch",
             Self::LastExceptionWithoutActiveException { .. } => {
                 "LastExceptionWithoutActiveException"
             }
@@ -3091,6 +3097,7 @@ impl DispatchError {
             | Self::VableEscapedDuringResidualCall { pc, .. }
             | Self::GuardSnapshotVableUntyped { pc, .. }
             | Self::GuardResumeCoordinateUnavailable { pc, .. }
+            | Self::GuardExactWClassOperandMismatch { pc, .. }
             | Self::LastExceptionWithoutActiveException { pc, .. }
             | Self::JitMergePointGreenKeyUnresolved { pc, .. }
             | Self::PortalFrameTracerArmed { pc, .. }
@@ -9128,6 +9135,23 @@ fn walker_concrete_ref_object<Sym: WalkSym>(
     }
 }
 
+/// The recorded snapshot after following a nursery forwarding stub, or
+/// `None` when the address is no longer a live heap object (evacuated
+/// nursery-debug slot, unowned old address).
+pub(crate) fn walker_live_heap_object(
+    obj: pyre_object::PyObjectRef,
+) -> Option<pyre_object::PyObjectRef> {
+    if obj.is_null() {
+        return None;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return None;
+    }
+    let live = pyre_object::gc_hook::try_gc_live_object_address(obj as *mut u8)
+        as pyre_object::PyObjectRef;
+    if live.is_null() { None } else { Some(live) }
+}
+
 /// Resolve the walker's execution-context OpRef from the outer portal's
 /// separately carried second red (`interp_jit.py reds = ['frame', 'ec']`).
 ///
@@ -10357,6 +10381,10 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     w_descr: pyre_object::PyObjectRef,
     field: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
+    // `rewrite.py` `_gcref_index` / `quasiimmut.py`: put the descriptor
+    // in the ConstPtr gcrefs table so a nursery move updates the constant.
+    // There is no `can_move` gate on this pin (`rpython/jit` uses
+    // `can_move` only in backend `convert_to_imm`).
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
     crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
     walker_flush_guard_not_invalidated(ctx, op_pc)
@@ -10635,11 +10663,11 @@ enum WalkerStoreAttrSpecialization {
 /// cannot be pinned by [`walker_guard_exact_w_class`], so it declines here
 /// rather than emitting a guard that would fail on its own recorded operand.
 ///
-/// # Safety
-/// `obj` must be a non-null, untagged heap object.
-unsafe fn walker_exact_builtin_class(
-    obj: pyre_object::PyObjectRef,
-) -> Option<pyre_object::PyObjectRef> {
+/// A recorded snapshot may sit in an evacuated nursery after a collection
+/// during the walk; [`walker_live_heap_object`] follows the stub or
+/// declines so this does not load fields from a debug-poisoned slot.
+fn walker_exact_builtin_class(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
+    let obj = walker_live_heap_object(obj)?;
     unsafe {
         let w_class = (*obj).w_class;
         if w_class.is_null() {
@@ -10663,12 +10691,15 @@ fn walker_numeric_builtin_class(obj: pyre_object::PyObjectRef) -> pyre_object::P
     }
     if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
         pyre_object::PY_NULL
-    } else if unsafe { pyre_object::is_bool(obj) } {
-        pyre_object::PY_NULL
-    } else if unsafe { pyre_object::is_float(obj) } {
-        pyre_object::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE)
     } else {
-        pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE)
+        let Some(live) = walker_live_heap_object(obj) else {
+            return pyre_object::PY_NULL;
+        };
+        if unsafe { pyre_object::is_bool(live) } {
+            pyre_object::PY_NULL
+        } else {
+            walker_exact_builtin_class(live).unwrap_or(pyre_object::PY_NULL)
+        }
     }
 }
 
@@ -10769,16 +10800,24 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     // pins a single value.  Pinning the canonical against an operand that carries
     // the null spelling emits a guard the recorded operand itself fails, and nothing
     // writes the slot afterwards, so it fails on every execution without ever
-    // converging — one bridge per `trace_eagerness` bucket.  Establishing that the
-    // operand carries what is pinned is the caller's, which is what this checks.
-    debug_assert!(
-        walker_concrete_ref_object(ctx, obj).is_none_or(|concrete| {
-            (pyre_object::tagged_int::CAN_BE_TAGGED
-                && pyre_object::tagged_int::is_tagged_int(concrete))
-                || std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
-        }),
-        "guard_exact_w_class at pc={op_pc} would pin a `w_class` its recorded operand does not carry",
-    );
+    // converging — one bridge per `trace_eagerness` bucket.
+    //
+    // A recorded snapshot can also be an evacuated nursery address
+    // (`gc_nursery_debug` fill).  Refuse to load `w_class` unless
+    // [`walker_live_heap_object`] still names a live object that carries
+    // the class being pinned.
+    if let Some(concrete) = walker_concrete_ref_object(ctx, obj) {
+        let tagged = pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete);
+        if !tagged {
+            let Some(live) = walker_live_heap_object(concrete) else {
+                return Err(DispatchError::GuardExactWClassOperandMismatch { pc: op_pc });
+            };
+            if !std::ptr::eq(unsafe { (*live).w_class }, expected_typeobj) {
+                return Err(DispatchError::GuardExactWClassOperandMismatch { pc: op_pc });
+            }
+        }
+    }
     walker_pin_instance_w_class(ctx, op_pc, obj, expected_typeobj)?;
     // Do not stamp `class_now_known` here. Exact `w_class` is a stronger
     // proof, but `optimize_GETFIELD` / peel import can fold the

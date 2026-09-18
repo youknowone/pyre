@@ -111,8 +111,8 @@ impl crate::lltype::GcType for W_BytearrayObject {
 /// The `data` buffer lives in a GC-managed non-moving storage box (reusing the
 /// shared `bytes` data box tid — identical `Vec<u8>` type); the sweep reclaims
 /// it through the box tid's drop glue. The `W_BytearrayObject` body is allocated
-/// in GC old-gen (`try_gc_alloc_stable_raw`) so the collector traces through it
-/// and greys the box, mirroring `w_list_new`/`w_set_new`. Falls back to
+/// on the nursery bump (`try_gc_alloc_nursery_raw`) so the collector traces
+/// through it and greys the box, mirroring `w_tuple_new`/`w_set_new`. Falls back to
 /// `malloc_typed`/`malloc_raw` when no GC hook is installed (unit tests).
 ///
 /// Not a residual boundary itself: its only callers are the two
@@ -133,7 +133,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
     let class_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(get_instantiate(&BYTEARRAY_TYPE));
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
     let data = crate::gc_roots::shadow_stack_get(data_slot) as *mut Vec<u8>;
     let body = W_BytearrayObject {
         ob_header: PyObject {
@@ -198,7 +198,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_class);
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         <W_BytearrayObject as crate::lltype::GcType>::type_id(),
         <W_BytearrayObject as crate::lltype::GcType>::SIZE,
     );
