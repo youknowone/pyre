@@ -3678,6 +3678,7 @@ fn rewrite_body(
         recursive_entry: recursive_entry.cloned(),
         finish_return: finish_return.cloned(),
     };
+    let traced_loop_at = traced_loop_stmt_index(&cloned_block.stmts);
     rewriter.visit_block_mut(&mut cloned_block);
 
     // warmspot.py ll_portal_runner: maybe enter from the function's start,
@@ -3720,50 +3721,54 @@ fn rewrite_body(
         quote! {}
     };
 
-    let stmts = insert_before_first_loop(cloned_block.stmts, entry_door);
+    let stmts = insert_before_traced_loop(cloned_block.stmts, entry_door, traced_loop_at);
     quote! { #(#stmts)* }
 }
 
-/// `ll_portal_runner` sits after driver/pc/state exist and before the
-/// interpreter loop. Prepending it to the function body names those
-/// bindings before they are declared.
-fn insert_before_first_loop(stmts: Vec<syn::Stmt>, door: TokenStream) -> Vec<syn::Stmt> {
+/// `ll_portal_runner` sits after driver/pc/state exist and immediately
+/// before the loop that contains `jit_merge_point`, not a preceding
+/// setup loop.
+fn insert_before_traced_loop(
+    stmts: Vec<syn::Stmt>,
+    door: TokenStream,
+    traced_loop_at: Option<usize>,
+) -> Vec<syn::Stmt> {
     if door.is_empty() {
         return stmts;
     }
     let door_stmt: syn::Stmt =
         syn::parse2(door).expect("function-entry door must parse as a statement");
-    let mut out = Vec::with_capacity(stmts.len() + 1);
-    let mut inserted = false;
-    for stmt in stmts {
-        if !inserted && stmt_is_loop(&stmt) {
-            out.push(door_stmt.clone());
-            inserted = true;
-        }
-        out.push(stmt);
-    }
-    if !inserted {
-        out.insert(0, door_stmt);
-    }
+    let at = traced_loop_at.unwrap_or(0).min(stmts.len());
+    let mut out = stmts;
+    out.insert(at, door_stmt);
     out
 }
 
-fn stmt_is_loop(stmt: &syn::Stmt) -> bool {
-    match stmt {
-        syn::Stmt::Expr(expr, _) => expr_is_loop(expr),
-        syn::Stmt::Local(local) => local
-            .init
-            .as_ref()
-            .is_some_and(|init| expr_is_loop(&init.expr)),
-        _ => false,
-    }
+fn traced_loop_stmt_index(stmts: &[syn::Stmt]) -> Option<usize> {
+    stmts.iter().position(stmt_is_traced_loop)
 }
 
-fn expr_is_loop(expr: &syn::Expr) -> bool {
-    matches!(
-        expr,
-        syn::Expr::While(_) | syn::Expr::Loop(_) | syn::Expr::ForLoop(_)
-    )
+fn stmt_is_traced_loop(stmt: &syn::Stmt) -> bool {
+    let syn::Stmt::Expr(expr, _) = stmt else {
+        return false;
+    };
+    let body = match expr {
+        syn::Expr::Loop(l) => &l.body,
+        syn::Expr::While(w) => &w.body,
+        _ => return false,
+    };
+    body.stmts.iter().any(|s| match s {
+        syn::Stmt::Macro(m) => m.mac.path.segments.last().is_some_and(|seg| {
+            seg.ident == "jit_merge_point"
+        }),
+        syn::Stmt::Expr(syn::Expr::Macro(m), _) => m
+            .mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "jit_merge_point"),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -4481,6 +4486,49 @@ mod tests {
         assert!(
             pc_at < door_at && driver_at < door_at && state_at < door_at,
             "the door must sit after driver/pc/state are bound. Expansion was:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn function_entry_door_sits_before_the_merge_point_loop() {
+        let config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                while pc < 1 {
+                    let _setup_loop = ();
+                    pc += 1;
+                }
+                while pc < program.len() {
+                    let _dispatch_loop = ();
+                    jit_merge_point!(driver, program, pc; state);
+                    let op = program[pc];
+                    pc += 1;
+                    match op {
+                        0 => { state.acc += 1; }
+                        _ => break,
+                    }
+                }
+                state.acc
+            }
+        };
+        let expanded = transform_jit_interp(config, func).to_string();
+        let door_at = expanded
+            .find("function_entry_structured")
+            .expect("door present");
+        let setup_at = expanded.find("_setup_loop").expect("setup loop");
+        assert!(
+            setup_at < door_at,
+            "the door must sit after a setup loop, not before it. Expansion was:\n{expanded}"
         );
     }
 }
