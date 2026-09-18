@@ -5139,19 +5139,29 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     fn check_eg_match(&mut self) -> Result<(), PyError> {
+        // `pyopcode.py CHECK_EG_MATCH`: pop the type, peek the exception so it
+        // stays on the value stack for the whole match, then either push None
+        // or `settopvalue(rest)` + push the match.
         let exc_type = self.pop();
         validate_check_eg_match_class(exc_type)?;
-        let exc_value = self.pop();
+        let exc_value = self.peek();
         let anchor = FrameAnchor::new(self);
         let (matching, rest, wrapped_naked) = if unsafe { pyre_object::is_none(exc_value) } {
             (pyre_object::w_none(), pyre_object::w_none(), false)
         } else {
             crate::builtins::exception_group_match(exc_value, exc_type)?
         };
-        Self::push_anchored(&anchor, rest)?;
-        Self::push_anchored(&anchor, matching)?;
-        if !unsafe { pyre_object::is_none(matching) } {
-            set_current_exception(matching);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let result_base = pyre_object::gc_roots::pin_roots(&[matching, rest]);
+        let matching = || pyre_object::gc_roots::shadow_stack_get(result_base);
+        let rest = || pyre_object::gc_roots::shadow_stack_get(result_base + 1);
+        let frame = unsafe { &mut *anchor.live() };
+        if unsafe { pyre_object::is_none(matching()) } {
+            frame.push(matching());
+        } else {
+            frame.settopvalue(rest(), 0);
+            frame.push(matching());
+            set_current_exception(matching());
         }
         if wrapped_naked {
             // The wrapper this opcode just built has an empty traceback, and the
@@ -5163,7 +5173,7 @@ impl OpcodeStepExecutor for PyFrame {
             let frame = unsafe { &mut *anchor.live() };
             unsafe {
                 crate::pytraceback::record_application_traceback(
-                    matching,
+                    matching(),
                     frame as *mut PyFrame,
                     frame.last_instr as i64,
                 );
