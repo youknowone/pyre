@@ -3181,6 +3181,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_small_int_const",
         pyre_object::intobject::jit_w_small_int_const,
     );
+    upa3(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
+        "pyre_interpreter::objspace::descroperation::call_descr_obj_arg",
+        crate::objspace::descroperation::call_descr_obj_arg,
+    );
     cpa1(
         &mut entries,
         "pyre_object::floatobject::jit_w_float_new",

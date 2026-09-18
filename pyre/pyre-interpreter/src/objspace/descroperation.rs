@@ -4347,11 +4347,26 @@ fn binop_shortcut_fn(vtable: &BinopShortcutVtable, op: BinopDunder) -> Option<Bi
     }
 }
 
+/// `descroperation.py shortcut_binop`: `space.lookup` + `get_and_call_function`.
+///
+/// Each arm passes a literal to `box_str_constant` so the fold can see
+/// the name.  `interned_special_name` residualizes the intern table.
+unsafe fn shortcut_binop(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    w_name: PyObjectRef,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let Some(w_typ) = crate::typedef::r#type(a) else {
+        return Ok(None);
+    };
+    let Some((_, w_impl)) = lookup_where_interned(w_typ.as_ptr(), w_name) else {
+        return Ok(None);
+    };
+    invoke_binop(w_impl, a, b)
+}
+
 /// `_make_binop_impl` first arm: `type(w1) is type(w2)`, then
-/// `use_special_method_shortcut` — `getattr(self, shortcut___mod__)`
-/// after the RPython type is known.  The typeptr from `guard_class` is
-/// the dispatch; a `ConstPtr` compare against `&INT_TYPE` is not in
-/// upstream and the walk cannot name that static.
+/// `shortcut_binop` (`lookup` + `get_and_call_function`).
 pub(crate) fn try_binop_shortcut(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -4361,23 +4376,52 @@ pub(crate) fn try_binop_shortcut(
         if !same_unoverridden_rpy_type(a, b) {
             return Ok(None);
         }
-        // `getattr(self, shortcut___mod__)` after `type(w1) is type(w2)`.
-        // Load the class-attribute table off the live typeptr — no
-        // `ConstPtr` compare against `&INT_TYPE`.  After `guard_class`
-        // the load folds and the taken descr (`int_mod`, …) is look-inside.
-        let raw = get_shortcut_binop(&*rpy_type_of(a));
-        if raw.is_null() {
-            return Ok(None);
-        }
-        let Some(func) = binop_shortcut_fn(&*(raw as *const BinopShortcutVtable), op) else {
-            return Ok(None);
+        let w_name = match op {
+            BinopDunder::Add => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"))
+            }
+            BinopDunder::Sub => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__sub__"))
+            }
+            BinopDunder::Mul => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__"))
+            }
+            BinopDunder::FloorDiv => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__floordiv__"))
+            }
+            BinopDunder::Mod => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mod__"))
+            }
+            BinopDunder::LShift => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__lshift__"))
+            }
+            BinopDunder::RShift => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rshift__"))
+            }
+            BinopDunder::And => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__and__"))
+            }
+            BinopDunder::Or => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__or__"))
+            }
+            BinopDunder::Xor => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__xor__"))
+            }
+            BinopDunder::TrueDiv => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__truediv__"))
+            }
+            BinopDunder::Pow => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__"))
+            }
+            BinopDunder::DivMod => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__divmod__"))
+            }
+            BinopDunder::MatMul => {
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__matmul__"))
+            }
         };
-        let w_res = func(a, b)?;
-        if !is_not_implemented(w_res) {
-            return Ok(Some(w_res));
-        }
+        shortcut_binop(a, b, w_name)
     }
-    Ok(None)
 }
 
 /// `_make_binop_impl` first arm, then the shared `_impl` body.
@@ -5267,6 +5311,32 @@ pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Opti
     crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), dunder))
 }
 
+/// Residual 3-word call: `get_and_call_function` takes a slice, which
+/// the walk cannot pass.  Rust builds the one-argument list here.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn call_descr_obj_arg(
+    w_impl: PyObjectRef,
+    w_obj1: PyObjectRef,
+    w_obj2: PyObjectRef,
+) -> PyObjectRef {
+    let Some(w_type) = crate::typedef::r#type(w_obj1) else {
+        return w_not_implemented();
+    };
+    match crate::baseobjspace::get_and_call_function(
+        w_impl,
+        w_obj1,
+        w_type.as_ptr(),
+        &[w_obj2],
+    ) {
+        Ok(w_res) => w_res,
+        Err(e) => {
+            crate::call::set_call_error(e);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
 /// descroperation.py `_invoke_binop` — three object words, no slice.
 fn invoke_binop(
     w_impl: PyObjectRef,
@@ -5276,12 +5346,13 @@ fn invoke_binop(
     if w_impl.is_null() {
         return Ok(None);
     }
-    let Some(w_type) = crate::typedef::r#type(w_obj1) else {
+    let w_res = unsafe { call_descr_obj_arg(w_impl, w_obj1, w_obj2) };
+    if w_res.is_null() {
+        if let Some(e) = crate::call::take_call_error() {
+            return Err(e);
+        }
         return Ok(None);
-    };
-    let w_res = unsafe {
-        crate::baseobjspace::get_and_call_function(w_impl, w_obj1, w_type.as_ptr(), &[w_obj2])?
-    };
+    }
     Ok(unsafe { (!is_not_implemented(w_res)).then_some(w_res) })
 }
 
