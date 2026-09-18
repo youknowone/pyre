@@ -1107,7 +1107,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         "inet_pton() requires 2 arguments",
                     ));
                 }
-                let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let af = crate::baseobjspace::c_int_w(args[0])?;
                 let ip = unsafe {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error(
@@ -1145,7 +1145,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         "inet_ntop() requires 2 arguments",
                     ));
                 }
-                let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let af = crate::baseobjspace::c_int_w(args[0])?;
                 let data = unsafe {
                     if !pyre_object::bytesobject::is_bytes_like(args[1]) {
                         return Err(crate::PyError::type_error(
@@ -4417,7 +4417,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
             let fd = socket_fd(obj)?;
             let backlog = if args.len() >= 2 {
-                (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int
+                crate::baseobjspace::c_int_w(args[1])?
             } else {
                 128
             };
@@ -4639,7 +4639,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 crate::PyError::type_error("send: buffer must be bytes-like")
             })?;
             let flags = if args.len() >= 3 {
-                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+                crate::baseobjspace::c_int_w(args[2])?
             } else {
                 0
             };
@@ -4668,7 +4668,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 crate::PyError::type_error("sendall: buffer must be bytes-like")
             })?;
             let flags = if args.len() >= 3 {
-                (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int
+                crate::baseobjspace::c_int_w(args[2])?
             } else {
                 0
             };
@@ -5631,7 +5631,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     return Err(crate::PyError::type_error("shutdown() missing how"));
                 }
                 let fd = socket_fd(args[0])?;
-                let how = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
+                let how = crate::baseobjspace::c_int_w(args[1])?;
                 let r = unsafe { rffi::shutdown(fd, how) };
                 if r != 0 {
                     return Err(socket_last_error());
@@ -5694,8 +5694,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 ));
             }
             let fd = socket_fd(args[0])?;
-            let level = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
-            let name = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
+            let level = crate::baseobjspace::c_int_w(args[1])?;
+            let name = crate::baseobjspace::c_int_w(args[2])?;
             let val = args[3];
             // `sock_setsockopt` sends an int for this option through
             // `WSAIoctl` and keeps the value, because the option number is an
@@ -5754,13 +5754,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 ));
             }
             let fd = socket_fd(args[0])?;
-            let level = (unsafe { pyre_object::w_int_get_value(args[1]) }) as libc::c_int;
-            let name = (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int;
+            let level = crate::baseobjspace::c_int_w(args[1])?;
+            let name = crate::baseobjspace::c_int_w(args[2])?;
             // `interp_socket.py getsockopt_w` — `buflen == 0`
             // (including when omitted) reads an int option; otherwise the
             // length must be in `1..=1024` and a bytes buffer is returned.
             let buflen = if args.len() >= 4 {
-                unsafe { pyre_object::w_int_get_value(args[3]) }
+                crate::baseobjspace::c_int_w(args[3])? as i64
             } else {
                 0
             };
@@ -5922,7 +5922,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 if args.len() < 2 {
                     return Err(crate::PyError::type_error("setblocking() missing argument"));
                 }
-                let blocking = unsafe { pyre_object::w_int_get_value(args[1]) } != 0;
+                let blocking = crate::baseobjspace::is_true(args[1])?;
                 let fd = socket_fd(args[0])?;
                 let timeout = if blocking { -1.0 } else { 0.0 };
                 socket_apply_timeout(fd, timeout)?;
