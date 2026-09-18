@@ -13833,10 +13833,29 @@ impl<'a> Lowering<'a> {
                             }
                         }
                     };
+                    // `Default::default` is one symbolic path for every
+                    // Self. Stamp a raw-pointer dest so jtransform's
+                    // `rtype_ptr_null` arm can fold it without also
+                    // folding `Vec::default` (`Ref(None)`).
+                    let call_result_ty = if args.is_empty()
+                        && crate::codewriter::jtransform::is_generic_default_path(
+                            match &target {
+                                CallTarget::FunctionPath { segments } => segments.as_slice(),
+                                _ => &[],
+                            },
+                        )
+                        && tyref_is_raw_ptr(&call.dest.ty, self.llbc)
+                    {
+                        ValueType::Ref(Some(
+                            crate::codewriter::jtransform::RAW_PTR_DEFAULT_OWNER.into(),
+                        ))
+                    } else {
+                        result_ty.clone()
+                    };
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
-                        result_ty: result_ty.clone(),
+                        result_ty: call_result_ty,
                     }
                 }
             }
@@ -29987,6 +30006,16 @@ fn raw_ptr_pointee_container_root(node: &serde_json::Value, llbc: &Llbc) -> Opti
     let rendered = charon_type_value_to_ast_string(pointee, llbc, 0);
     (rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") || rendered.starts_with('['))
         .then_some(rendered)
+}
+
+/// Whether `ty` is a Charon `RawPtr` (`*mut T` / `*const T`), including
+/// `PyObjectRef`. Used to stamp [`crate::codewriter::jtransform::RAW_PTR_DEFAULT_OWNER`]
+/// on a generic `Default::default` so only nullptr Self folds.
+fn tyref_is_raw_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| n.as_object())
+        .is_some_and(|o| o.contains_key("RawPtr"))
 }
 
 /// Whether `ty` is a raw pointer onto a byte-sized integer literal —
