@@ -7729,7 +7729,7 @@ use crate::module::posix::interp_posix_wasm as wasm_fd;
 /// Kept in sync with the `errno` module's host_env-off fallback so the errno →
 /// OSError-subclass remap selects the subclass a given `errno.X` value implies.
 #[cfg(target_arch = "wasm32")]
-pub(crate) mod wasm_errno {
+pub mod wasm_errno {
     pub const EAGAIN: i32 = 35;
     pub const EWOULDBLOCK: i32 = 35;
     pub const EINPROGRESS: i32 = 36;
