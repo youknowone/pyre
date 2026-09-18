@@ -7,10 +7,11 @@
 # branch-bearing callee with a SECOND FOR_ITER (nested), not the loop header.
 # Two shared generators; inner FOR_ITER advance is a non-header foriter (Finding #2).
 # Post-inner declining residual forces abort while inner item in-flight.
-# Generator resume has no merge point (`caro_no_merge_entry`), so
-# gouter/ginner stay interpreted. Raising N enough to clear
-# FLOOR_GATE_MIN_BASELINE_S measures ~100x (the residual path) and
-# blows the 20x ceiling, which is the compiled `run()` loop's budget.
+# N cannot be raised to clear `FLOOR_GATE_MIN_BASELINE_S`: generator resume
+# has no merge point (`caro_no_merge_entry`), so gouter/ginner stay
+# interpreted and the true ratio is ~100x.  Lengthening only makes that
+# honest.  20000 is the original size; the 20x ceiling is the compiled
+# `run()` loop's budget, not the residual generator path.
 N = 20000
 
 

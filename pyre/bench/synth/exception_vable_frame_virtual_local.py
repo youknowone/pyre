@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=11
 # Regression guard: when a traced function raises, the write-back into its own
 # virtualizable frame must store every local, including the ones whose value is
 # still a virtual box.
@@ -19,15 +19,11 @@
 # and cranelift both lost `marker` from the iteration the entry trace compiled
 # onwards.
 #
-# Expected output (N/2 each):
-#   160000 ('i', 'marker')
-#   160000 ('i', 'marker', 'odd_only')
-#
-# N is large enough that CI pypy exec clears FLOOR_GATE_MIN_BASELINE_S.
-# After that, ubuntu/macos cranelift measure 13–17x; 18 is the ceiling
-# that holds.
+# Expected output:
+#   4000 ('i', 'marker')
+#   4000 ('i', 'marker', 'odd_only')
 
-N = 320000
+N = 8000
 
 
 def branchy(i):

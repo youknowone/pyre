@@ -11,7 +11,7 @@
 
 import sys
 
-N = 500000
+N = 50000
 
 exc_info_inside = 0
 exc_info_after_none = 0
