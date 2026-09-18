@@ -5485,7 +5485,7 @@ pub fn has_real_kwargs(kwargs: Option<PyObjectRef>) -> bool {
 /// [`call_forwarding_args`] rebuilds the keywords with: `w_dict_str_entries`
 /// drops a `**{'\udc80': v}` key outright, which would make this report a
 /// keyword-free call and let the keyword be silently discarded.
-pub(crate) fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
+pub fn real_kwarg_count(kwargs: Option<PyObjectRef>) -> usize {
     let Some(dict) = kwargs else {
         return 0;
     };
@@ -5630,7 +5630,7 @@ pub(crate) fn resolve_pos_or_kw(
 /// argument (2 given)"); only the positional message names an exact count,
 /// and only when every positional slot is required (`itertools.batched([], 1,
 /// 2)` reports "takes exactly 2 positional arguments (3 given)").
-pub(crate) fn clinic_arity(
+pub fn clinic_arity(
     fn_name: &str,
     npos: usize,
     nkw: usize,

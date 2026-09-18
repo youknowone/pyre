@@ -21,6 +21,8 @@ pub mod _codecs_tw;
 #[allow(non_snake_case)]
 pub mod _csv;
 #[allow(non_snake_case)]
+pub mod _hashlib;
+#[allow(non_snake_case)]
 pub mod _heapq;
 #[allow(non_snake_case)]
 pub mod _immutables_map;

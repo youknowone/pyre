@@ -36,6 +36,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_codecs_jp", module::_codecs_jp::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_kr", module::_codecs_kr::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_tw", module::_codecs_tw::init);
+    pyre_interpreter::importing::register_builtin_module("_hashlib", module::_hashlib::init);
     pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
     pyre_interpreter::importing::register_builtin_module("_json", module::_json::init);
     pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
@@ -376,6 +377,10 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         subclass_range_alias(157, typed::<module::unicodedata::W_UCD>()),
         subclass_range_alias(162, typed::<module::_json::W_Scanner>()),
         subclass_range_alias(163, typed::<module::_json::W_Encoder>()),
+        // `_hashlib`'s per-object digest/HMAC contexts follow their Python
+        // owners and have sweep-time native-state destructors in build_gc.
+        subclass_range_alias(164, typed::<module::_hashlib::W_HashState>()),
+        subclass_range_alias(165, typed::<module::_hashlib::W_Hmac>()),
         subclass_range_alias(172, typed::<module::_bz2::W_BZ2Compressor>()),
         subclass_range_alias(173, typed::<module::_bz2::W_BZ2Decompressor>()),
         // `_lzma`'s two stream objects own their liblzma coder, unconditional
@@ -459,6 +464,18 @@ mod tests {
     /// process-global fnaddr table. The prepass reads the same table
     /// from a host copy of this crate; a missing row here is the same
     /// defect as a build script that forgot to link `pyre-module`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_hashlib_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__"
+            ),
+            "moved _hashlib #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     #[test]
     fn jit_trace_fnaddrs_covers_moved_mmap_type() {
