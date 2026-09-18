@@ -16,6 +16,36 @@
 pub mod codegen;
 pub mod failguard;
 
+/// The wasm host compiles and resumes on the thread that ran the
+/// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
+/// harness is N threads against one process-global cpu
+/// (`FAIL_DESCR_REGISTRY`, ExtraHeap, `cpu.gc_ll_descr`). PyPy never
+/// interleaves those. Cargo.toml has no per-package `test-threads`;
+/// `#[serial]` only serializes bodies (TLS teardown still races).
+/// This constructor runs before libtest's `main` reads
+/// `RUST_TEST_THREADS`, so this crate's test binary is one thread
+/// without the caller passing `--test-threads`. Other crates stay
+/// parallel (`cargo test --all` is one process per crate).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod serial_cpu_tests {
+    extern "C" fn set_one_test_thread() {
+        // SAFETY: constructor runs before `main`, single-threaded.
+        // libtest reads `RUST_TEST_THREADS` in `main`.
+        unsafe { std::env::set_var("RUST_TEST_THREADS", "1") };
+    }
+
+    #[used]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "ios"),
+        unsafe(link_section = "__DATA,__mod_init_func")
+    )]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+        unsafe(link_section = ".init_array")
+    )]
+    static SET_ONE_TEST_THREAD: extern "C" fn() = set_one_test_thread;
+}
+
 #[cfg(target_arch = "wasm32")]
 mod glue;
 
