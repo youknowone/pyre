@@ -12126,6 +12126,33 @@ pub(super) fn user_binop_forward_dunder(
 /// return NotImplemented (`A().__add__(1)`).
 /// Decode a concrete attribute name only when it is a `str`.
 /// `w_str_get_wtf8` requires `W_UnicodeObject`.
+fn walker_guard_red_str_name<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    name_opref: OpRef,
+) -> Result<(), DispatchError> {
+    if name_opref.is_constant() {
+        return Ok(());
+    }
+    let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref) else {
+        return Ok(());
+    };
+    if !unsafe { pyre_object::is_str(concrete_name) } {
+        return Ok(());
+    }
+    let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
+    walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        majit_ir::OpCode::GuardValue,
+        &[name_opref, name_const],
+    )?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(name_opref, name_const);
+    Ok(())
+}
+
 fn walker_concrete_str_name<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     name_opref: OpRef,
@@ -14655,6 +14682,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 let obj = args[0];
                 let name_opref = args[1];
                 let unicode_name = walker_concrete_str_name(ctx, name_opref);
+                walker_guard_red_str_name(ctx, op.pc, name_opref)?;
                 if let Some(outcome) =
                     super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
                         ctx,
@@ -14679,23 +14707,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 );
             };
             let unicode_name = walker_concrete_str_name(ctx, name_opref);
-            if let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref)
-                && !name_opref.is_constant()
-                && unsafe {
-                    pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE)
-                }
-            {
-                let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op.pc,
-                    majit_ir::OpCode::GuardValue,
-                    &[name_opref, name_const],
-                )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .replace_box(name_opref, name_const);
-            }
+            walker_guard_red_str_name(ctx, op.pc, name_opref)?;
             if let Some(outcome) =
                 super::specialize::try_walker_trace_immutable_type_attr_raise_with_name(
                     ctx,
@@ -15567,6 +15579,9 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             )
         {
             let obj = ref_args.first().copied();
+            if let Some(&name_opref) = ref_args.get(1) {
+                walker_guard_red_str_name(ctx, op.pc, name_opref)?;
+            }
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
             if str_name.is_some() {
                 guard_concrete_int_slice(ctx, op.pc, &int_args, &int_arg_concretes)?;
