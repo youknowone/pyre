@@ -6083,6 +6083,7 @@ impl<'a> Transformer<'a> {
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
                     // typed the unit `()` shell (see `effective_call_result_ty`).
+                    let libc_raw = libc_raw_alloc_oopspec(target);
                     let effective_result_ty =
                         self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
                     let result_ir_type = self
@@ -6097,7 +6098,6 @@ impl<'a> Transformer<'a> {
                     // `declares_cannot_raise` and a
                     // `#[dont_look_inside_cannot_raise]` residual emits
                     // GUARD_NO_EXCEPTION.
-                    let libc_raw = libc_raw_alloc_oopspec(target);
                     let extraeffect = libc_raw
                         .as_ref()
                         .map(|(_, extra)| *extra)
@@ -19209,6 +19209,89 @@ mod tests {
             descriptor.extra_info.extraeffect,
             ExtraEffect::CanRaise
         );
+    }
+
+    /// `jtransform.py rewrite_op_cast_ptr_to_int` keeps a GC cast as the
+    /// `cast_ptr_to_int` op. The host-callable `lltype.cast_ptr_to_int`
+    /// path must become that op, not a residual helper.
+    #[test]
+    fn lltype_cast_ptr_to_int_call_becomes_unop() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_ptr_to_int_call");
+        let ptr = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![ptr.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&ptr),
+            &ValueType::Int,
+            "cast_ptr_to_int_call",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::UnaryOp { op, operand, .. },
+                        ..
+                    }] if op == "cast_ptr_to_int" && operand == &ptr
+                ));
+            }
+            _ => panic!("expected UnaryOp rewrite"),
+        }
+    }
+
+    /// A raw pointer is already kind `'int'` (`history.py getkind`).
+    /// `rewrite_op_cast_ptr_to_int` returns None and aliases the operand.
+    #[test]
+    fn lltype_cast_ptr_to_int_of_int_aliases() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_raw_to_int");
+        let raw = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![raw.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&raw),
+            &ValueType::Int,
+            "cast_raw_to_int",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, raw),
+            _ => panic!("expected Identity alias"),
+        }
     }
 
     /// `Transformer._handle_str2unicode_call` records the Str2Unicode
