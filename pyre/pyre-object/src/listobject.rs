@@ -4801,6 +4801,30 @@ pub unsafe fn w_list_find_or_count_fast(
     }
 }
 
+/// `x in xs` on an exact `list` whose strategy is `IntegerListStrategy`
+/// and whose needle is a plain `int`.  `listobject.py
+/// IntegerListStrategy.find_or_count` scans the unboxed pool; int
+/// equality cannot run Python.  Not elidable: the list is mutable.
+pub extern "C" fn jit_list_contains_int(haystack: i64, needle: i64) -> i64 {
+    unsafe {
+        match w_list_find_or_count_fast(
+            haystack as PyObjectRef,
+            needle as PyObjectRef,
+            0,
+            i64::MAX,
+            false,
+        ) {
+            ListFindFast::Found(_) => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Current list strategy.  `obj` must be a live `W_ListObject`.
+pub unsafe fn w_list_strategy(obj: PyObjectRef) -> ListStrategy {
+    (*(obj as *const W_ListObject)).strategy
+}
+
 /// listobject.py setslice — strategy-preserving.
 ///
 /// When replacement is a list with the same strategy, operates on typed
@@ -5897,6 +5921,16 @@ mod tests {
             assert_eq!(w_list_len(list), 3);
             let value = w_list_getitem(list, 2).unwrap();
             assert!(crate::pyobject::is_float(value));
+        }
+    }
+
+    #[test]
+    fn test_jit_list_contains_int_matches_integer_strategy_find() {
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            assert_eq!(jit_list_contains_int(list as i64, w_int_new(2) as i64), 1);
+            assert_eq!(jit_list_contains_int(list as i64, w_int_new(9) as i64), 0);
         }
     }
 

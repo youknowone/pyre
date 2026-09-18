@@ -21482,6 +21482,16 @@ fn contains_set(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
 /// `W_ListObject.descr_contains` via `find_or_count`.
 #[inline(never)]
 fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    if unsafe {
+        pyre_object::listobject::w_list_strategy(haystack)
+            == pyre_object::listobject::ListStrategy::Integer
+            && pyre_object::listobject::is_plain_int1(needle)
+            && pyre_object::is_int(needle)
+    } {
+        return Ok(
+            pyre_object::listobject::jit_list_contains_int(haystack as i64, needle as i64) != 0,
+        );
+    }
     Ok(matches!(
         crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false)?,
         crate::listobject::FindOrCountResult::Index(_)

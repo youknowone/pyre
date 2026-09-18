@@ -3286,6 +3286,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_bytes_contains_byte",
         pyre_object::bytesobject::jit_bytes_contains_byte,
     );
+    cpa2(
+        &mut entries,
+        "pyre_object::listobject::jit_list_contains_int",
+        "pyre_object::jit_list_contains_int",
+        pyre_object::listobject::jit_list_contains_int,
+    );
     cpa1(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_is_true",
@@ -5890,6 +5896,11 @@ mod tests {
         assert_eq!(
             bindings["pyre_object::bytesobject::jit_bytes_contains_byte"],
             bytes_byte
+        );
+        let list_int = pyre_object::listobject::jit_list_contains_int as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::listobject::jit_list_contains_int"],
+            list_int
         );
     }
 

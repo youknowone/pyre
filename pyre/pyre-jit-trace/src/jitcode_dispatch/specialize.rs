@@ -22781,9 +22781,10 @@ fn walker_str_pair_operands<Sym: WalkSym>(
 /// A declining residual would re-run those side effects.
 ///
 /// Exact `str`/`bytes` plus a needle whose membership is an elidable
-/// find (another exact `str`/`bytes`, or a byte in `range(256)`) is
-/// callback-free.  `dict`/`set` stay on the residual: a stored element's
-/// `__eq__` can still run on a hash collision.
+/// find (another exact `str`/`bytes`, or a byte in `range(256)`), and
+/// an exact `IntegerListStrategy` list plus a plain `int`, are
+/// callback-free.  `dict`/`set` stay on the residual: a stored
+/// element's `__eq__` can still run on a hash collision.
 fn walker_contains_descent_callback_free(
     needle: pyre_object::PyObjectRef,
     haystack: pyre_object::PyObjectRef,
@@ -22803,6 +22804,14 @@ fn walker_contains_descent_callback_free(
         return unsafe {
             pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
         } && (0..=255).contains(&unsafe { pyre_object::w_int_get_value(needle) });
+    }
+    if exact(haystack, &pyre_object::pyobject::LIST_TYPE) {
+        return unsafe {
+            pyre_object::listobject::w_list_strategy(haystack)
+                == pyre_object::listobject::ListStrategy::Integer
+                && pyre_object::listobject::is_plain_int1(needle)
+                && pyre_object::is_int(needle)
+        };
     }
     false
 }

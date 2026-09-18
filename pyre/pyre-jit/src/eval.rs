@@ -5841,6 +5841,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
             uni::jit_str_contains as *const () as usize as i64,
             pyre_object::bytesobject::jit_bytes_contains as *const () as usize as i64,
             pyre_object::bytesobject::jit_bytes_contains_byte as *const () as usize as i64,
+            pyre_object::listobject::jit_list_contains_int as *const () as usize as i64,
             uni::jit_str_repeat as *const () as usize as i64,
             uni::jit_str_is_true as *const () as usize as i64,
             uni::jit_int_str as *const () as usize as i64,
