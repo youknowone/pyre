@@ -1354,10 +1354,16 @@ pub fn str_method_rsplit(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
 /// `case::casefold_wtf8`, which applies the same
 /// `CaseFolding.txt` status-C+F mapping to each scalar code point and
 /// passes lone surrogates through unchanged.
+/// `unicodeobject.py W_UnicodeObject._casefold_unicode` is `@jit.elidable`.
+#[majit_macros::elidable]
+unsafe fn casefold_unicode(obj: PyObjectRef) -> PyObjectRef {
+    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
+    w_str_from_wtf8_managed(case::casefold_wtf8(&s))
+}
+
 pub fn str_method_casefold(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "casefold")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
-    Ok(w_str_from_wtf8_managed(case::casefold_wtf8(&s)))
+    Ok(unsafe { casefold_unicode(args[0]) })
 }
 
 /// `pypy/objspace/std/unicodeobject.py W_UnicodeObject
@@ -1901,22 +1907,28 @@ pub fn str_method_rfind(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     Ok(w_int_new(str_unwrap_and_search(args, false)?.unwrap_or(-1)))
 }
 
+/// `unicodeobject.py W_UnicodeObject._upper_unicode` is `@jit.elidable`.
+#[majit_macros::elidable]
+unsafe fn upper_unicode(obj: PyObjectRef) -> PyObjectRef {
+    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
+    w_str_from_wtf8_managed(wtf8_map_str_runs(&s, str::to_uppercase))
+}
+
 pub fn str_method_upper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "upper")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
-    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(
-        &s,
-        str::to_uppercase,
-    )))
+    Ok(unsafe { upper_unicode(args[0]) })
+}
+
+/// `unicodeobject.py W_UnicodeObject._lower_unicode` is `@jit.elidable`.
+#[majit_macros::elidable]
+unsafe fn lower_unicode(obj: PyObjectRef) -> PyObjectRef {
+    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
+    w_str_from_wtf8_managed(wtf8_map_str_runs(&s, str::to_lowercase))
 }
 
 pub fn str_method_lower(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "lower")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
-    Ok(w_str_from_wtf8_managed(wtf8_map_str_runs(
-        &s,
-        str::to_lowercase,
-    )))
+    Ok(unsafe { lower_unicode(args[0]) })
 }
 
 /// PyPy: unicodeobject.py descr_format
@@ -5563,12 +5575,25 @@ fn wtf8_rfind_bounded(haystack: &[u8], needle: &[u8], lo: usize, hi: usize) -> O
     if res == -1 { None } else { Some(res as usize) }
 }
 
-/// PyPy `_unwrap_and_search` (unicodeobject.py) — the shared
-/// path for find/rfind/index/rindex. `start`/`end` (args[2]/args[3])
-/// are codepoint indices: `unwrap_start_stop` adds the length to a
-/// negative value and lower-clamps to 0. The search runs over the
-/// WTF-8 bytes inside that window and the byte offset is converted back
-/// to a codepoint index. Returns None when not found.
+/// `rstring.py _search_elidable` is `@jit.elidable`.  The walk is
+/// `_search_normal` after the code-point window is already byte offsets.
+#[majit_macros::elidable]
+unsafe fn search_elidable(
+    value: PyObjectRef,
+    other: PyObjectRef,
+    start: usize,
+    end: usize,
+    mode: SearchMode,
+) -> isize {
+    rstring_search_normal(
+        unsafe { w_str_get_wtf8(value) }.as_bytes(),
+        unsafe { w_str_get_wtf8(other) }.as_bytes(),
+        start,
+        end,
+        mode,
+    )
+}
+
 /// `unicodeobject.py _unwrap_and_search` — the shared path for
 /// find/rfind/index/rindex. `start`/`end` (args[2]/args[3]) flow through
 /// `unwrap_start_stop`, so `None` / omitted arguments default, any
@@ -5581,9 +5606,6 @@ fn str_unwrap_and_search(
     forward: bool,
 ) -> Result<Option<i64>, crate::PyError> {
     let obj = args[0];
-    let s = unsafe { pyre_object::w_str_get_wtf8(obj) };
-    let sub = unsafe { pyre_object::w_str_get_wtf8(args[1]) }.as_bytes();
-    let h = s.as_bytes();
     let length = unsafe { pyre_object::w_str_len(obj) } as i64;
 
     let w_start = if args.len() >= 3 { args[2] } else { w_none() };
@@ -5601,7 +5623,7 @@ fn str_unwrap_and_search(
         unsafe { pyre_object::w_str_index_to_byte(obj, start as usize) }
     };
     let end_index = if end >= length {
-        h.len()
+        unsafe { pyre_object::w_str_get_wtf8(obj) }.len()
     } else {
         unsafe { pyre_object::w_str_index_to_byte(obj, end as usize) }
     };
@@ -5609,12 +5631,17 @@ fn str_unwrap_and_search(
         return Ok(None);
     }
 
-    let res_index = if forward {
-        wtf8_find_bounded(h, sub, start_index, end_index)
+    let mode = if forward {
+        SearchMode::Find
     } else {
-        wtf8_rfind_bounded(h, sub, start_index, end_index)
+        SearchMode::RFind
     };
-    Ok(res_index.map(|ri| unsafe { pyre_object::w_str_byte_to_index(obj, ri) } as i64))
+    let res = unsafe { search_elidable(obj, args[1], start_index, end_index, mode) };
+    Ok(if res < 0 {
+        None
+    } else {
+        Some(unsafe { pyre_object::w_str_byte_to_index(obj, res as usize) } as i64)
+    })
 }
 
 /// PyPy: unicodeobject.py descr_count
@@ -5660,25 +5687,43 @@ pub fn str_method_rindex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
 }
 
+/// `unicodeobject.py W_UnicodeObject._title_unicode` is `@jit.elidable`.
+#[majit_macros::elidable]
+unsafe fn title_unicode(obj: PyObjectRef) -> PyObjectRef {
+    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
+    w_str_from_wtf8_managed(case::title_wtf8(&s))
+}
+
 /// PyPy: unicodeobject.py descr_title
 pub fn str_method_title(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "title")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
-    Ok(w_str_from_wtf8_managed(case::title_wtf8(&s)))
+    Ok(unsafe { title_unicode(args[0]) })
+}
+
+/// `unicodeobject.py W_UnicodeObject._capitalize_unicode` is `@jit.elidable`.
+#[majit_macros::elidable]
+unsafe fn capitalize_unicode(obj: PyObjectRef) -> PyObjectRef {
+    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
+    w_str_from_wtf8_managed(case::capitalize_wtf8(&s))
 }
 
 /// PyPy: unicodeobject.py descr_capitalize
 pub fn str_method_capitalize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "capitalize")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
-    Ok(w_str_from_wtf8_managed(case::capitalize_wtf8(&s)))
+    Ok(unsafe { capitalize_unicode(args[0]) })
+}
+
+/// `unicodeobject.py W_UnicodeObject._swapcase_unicode` is `@jit.elidable`.
+#[majit_macros::elidable]
+unsafe fn swapcase_unicode(obj: PyObjectRef) -> PyObjectRef {
+    let s = unsafe { w_str_get_wtf8(obj) }.to_wtf8_buf();
+    w_str_from_wtf8_managed(case::swapcase_wtf8(&s))
 }
 
 /// PyPy: unicodeobject.py descr_swapcase
 pub fn str_method_swapcase(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     require_no_args(args, "swapcase")?;
-    let s = unsafe { w_str_get_wtf8(args[0]) }.to_wtf8_buf();
-    Ok(w_str_from_wtf8_managed(case::swapcase_wtf8(&s)))
+    Ok(unsafe { swapcase_unicode(args[0]) })
 }
 
 /// Resolve the fillchar arg for `center`/`ljust`/`rjust`. Defaults to `' '`
