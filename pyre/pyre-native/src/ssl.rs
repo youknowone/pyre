@@ -24,8 +24,9 @@ use sha1::{Digest, Sha1};
 #[cfg(not(feature = "host_env"))]
 use x509_parser::prelude::FromDer;
 
+use rustpython_host_env::ssl as host_ssl;
 #[cfg(feature = "host_env")]
-use rustpython_host_env::ssl::{self as host_ssl, cipher, keylog, msg, providers::CryptoExt};
+use rustpython_host_env::ssl::{cipher, keylog, msg, providers::CryptoExt};
 
 #[cfg(not(feature = "host_env"))]
 static INSTALL_PROVIDER: Once = Once::new();
@@ -59,53 +60,11 @@ pub fn ensure_provider() {
 ///
 /// host_env owns the buffer/`start` compaction; the pointer wrappers below
 /// keep the interpreter off that type graph.
-#[cfg(feature = "host_env")]
 pub type MemoryBio = host_ssl::MemoryBio;
-
-/// In-memory encrypted transport used by `SSLObject`.
-///
-/// Keeping the unread suffix as `(Vec, start)` avoids the repeated whole-buffer
-/// shifts in RustPython's `Vec::drain(..n)` implementation.  Compaction happens
-/// only after a substantial prefix has been consumed.
-#[cfg(not(feature = "host_env"))]
-pub struct MemoryBio {
-    buffer: Vec<u8>,
-    start: usize,
-    eof_written: bool,
-}
-
-#[cfg(not(feature = "host_env"))]
-impl MemoryBio {
-    fn pending(&self) -> usize {
-        self.buffer.len() - self.start
-    }
-
-    fn compact(&mut self) {
-        if self.start == self.buffer.len() {
-            self.buffer.clear();
-            self.start = 0;
-        } else if self.start >= 4096 && self.start * 2 >= self.buffer.len() {
-            self.buffer.copy_within(self.start.., 0);
-            self.buffer.truncate(self.buffer.len() - self.start);
-            self.start = 0;
-        }
-    }
-}
 
 #[inline(never)]
 pub fn memory_bio_new() -> *mut MemoryBio {
-    #[cfg(feature = "host_env")]
-    {
-        Box::into_raw(Box::new(MemoryBio::new()))
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        Box::into_raw(Box::new(MemoryBio {
-            buffer: Vec::new(),
-            start: 0,
-            eof_written: false,
-        }))
-    }
+    Box::into_raw(Box::new(MemoryBio::new()))
 }
 
 /// # Safety
@@ -122,84 +81,35 @@ pub unsafe fn memory_bio_free(bio: *mut MemoryBio) {
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_read(bio: *mut MemoryBio, size: usize) -> Vec<u8> {
-    let bio = unsafe { &mut *bio };
-    #[cfg(feature = "host_env")]
-    {
-        bio.read(size)
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        let count = size.min(bio.pending());
-        let end = bio.start + count;
-        let out = bio.buffer[bio.start..end].to_vec();
-        bio.start = end;
-        bio.compact();
-        out
-    }
+    unsafe { (*bio).read(size) }
 }
 
 /// # Safety
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_write(bio: *mut MemoryBio, data: &[u8]) -> Result<usize, &'static str> {
-    let bio = unsafe { &mut *bio };
-    #[cfg(feature = "host_env")]
-    {
-        bio.write(data)
-            .map_err(|_| "cannot write() after write_eof()")
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        if bio.eof_written {
-            return Err("cannot write() after write_eof()");
-        }
-        bio.compact();
-        bio.buffer.extend_from_slice(data);
-        Ok(data.len())
-    }
+    unsafe { (*bio).write(data) }.map_err(|_| "cannot write() after write_eof()")
 }
 
 /// # Safety
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_write_eof(bio: *mut MemoryBio) {
-    #[cfg(feature = "host_env")]
-    unsafe {
-        (*bio).write_eof()
-    };
-    #[cfg(not(feature = "host_env"))]
-    unsafe {
-        (*bio).eof_written = true
-    };
+    unsafe { (*bio).write_eof() };
 }
 
 /// # Safety
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_pending(bio: *const MemoryBio) -> usize {
-    #[cfg(feature = "host_env")]
-    {
-        unsafe { (*bio).pending() }
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        unsafe { (*bio).pending() }
-    }
+    unsafe { (*bio).pending() }
 }
 
 /// # Safety
 /// `bio` must point to a live [`MemoryBio`].
 #[inline(never)]
 pub unsafe fn memory_bio_eof(bio: *const MemoryBio) -> bool {
-    let bio = unsafe { &*bio };
-    #[cfg(feature = "host_env")]
-    {
-        bio.eof()
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        bio.eof_written && bio.pending() == 0
-    }
+    unsafe { (*bio).eof() }
 }
 
 /// Mutable Python-visible SSL context settings plus rustls trust material.
@@ -259,57 +169,14 @@ enum EcdhCurve {
     X25519,
 }
 
-#[cfg(feature = "host_env")]
 pub use host_ssl::{
     CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED, PROTO_TLSV1_2, PROTO_TLSV1_3, PROTOCOL_TLS,
     PROTOCOL_TLS_CLIENT, PROTOCOL_TLS_SERVER, PROTOCOL_TLSV1, PROTOCOL_TLSV1_1, PROTOCOL_TLSV1_2,
-    PROTOCOL_TLSV1_3,
+    PROTOCOL_TLSV1_3, SSL3_MT_CHANGE_CIPHER_SPEC, SSL3_RT_ALERT, SSL3_RT_APPLICATION_DATA,
+    SSL3_RT_CHANGE_CIPHER_SPEC, SSL3_RT_HANDSHAKE, SSL3_RT_HEADER, TLS_ERROR_CERT_VERIFY_BASE,
+    TLS_ERROR_EOF, TLS_ERROR_NO_MEMORY, TLS_ERROR_SSL, TLS_ERROR_WANT_READ, TLS_ERROR_WANT_WRITE,
+    TLS_ERROR_ZERO_RETURN,
 };
-
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLS: i32 = 2;
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLS_CLIENT: i32 = 16;
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLS_SERVER: i32 = 17;
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLSV1: i32 = 3;
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLSV1_1: i32 = 4;
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLSV1_2: i32 = 5;
-#[cfg(not(feature = "host_env"))]
-pub const PROTOCOL_TLSV1_3: i32 = 6;
-#[cfg(not(feature = "host_env"))]
-pub const CERT_NONE: i32 = 0;
-#[cfg(not(feature = "host_env"))]
-pub const CERT_OPTIONAL: i32 = 1;
-#[cfg(not(feature = "host_env"))]
-pub const CERT_REQUIRED: i32 = 2;
-#[cfg(not(feature = "host_env"))]
-pub const PROTO_TLSV1_2: i32 = 0x0303;
-#[cfg(not(feature = "host_env"))]
-pub const PROTO_TLSV1_3: i32 = 0x0304;
-
-#[cfg(feature = "host_env")]
-pub use host_ssl::msg::{
-    SSL3_MT_CHANGE_CIPHER_SPEC, SSL3_RT_ALERT, SSL3_RT_CHANGE_CIPHER_SPEC, SSL3_RT_HANDSHAKE,
-    SSL3_RT_HEADER,
-};
-#[cfg(feature = "host_env")]
-pub const SSL3_RT_APPLICATION_DATA: i32 = host_ssl::msg::SSL3_RT_APPLICATION_DATA as i32;
-#[cfg(not(feature = "host_env"))]
-pub const SSL3_RT_CHANGE_CIPHER_SPEC: i32 = 20;
-#[cfg(not(feature = "host_env"))]
-pub const SSL3_RT_ALERT: i32 = 21;
-#[cfg(not(feature = "host_env"))]
-pub const SSL3_RT_HANDSHAKE: i32 = 22;
-#[cfg(not(feature = "host_env"))]
-pub const SSL3_RT_APPLICATION_DATA: i32 = 23;
-#[cfg(not(feature = "host_env"))]
-pub const SSL3_RT_HEADER: i32 = 256;
-#[cfg(not(feature = "host_env"))]
-pub const SSL3_MT_CHANGE_CIPHER_SPEC: i32 = 0x0101;
 
 bitflags::bitflags! {
     /// `SSL_OP_*` bits the `_ssl` module publishes.  Both `SslOp::DEFAULT` and
@@ -537,25 +404,7 @@ context_scalar!(
 /// Parse `[len][proto]...` the way `ssl.py` hands it to `_set_alpn_protocols`.
 #[inline(never)]
 pub fn parse_length_prefixed_alpn(data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
-    #[cfg(feature = "host_env")]
-    {
-        host_ssl::parse_length_prefixed_alpn(data).map_err(|_| "invalid ALPN protocol list")
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        let mut protocols = Vec::new();
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let len = data[offset] as usize;
-            offset += 1;
-            if len == 0 || offset + len > data.len() {
-                return Err("invalid ALPN protocol list");
-            }
-            protocols.push(data[offset..offset + len].to_vec());
-            offset += len;
-        }
-        Ok(protocols)
-    }
+    host_ssl::parse_length_prefixed_alpn(data).map_err(|_| "invalid ALPN protocol list")
 }
 
 /// Store the wire-format ALPN list after the interpreter has validated it.
@@ -1519,7 +1368,6 @@ pub struct OidInfo {
     pub oid: Option<&'static str>,
 }
 
-#[cfg(feature = "host_env")]
 fn oid_info(entry: &'static host_ssl::oid::OidEntry) -> OidInfo {
     OidInfo {
         nid: entry.nid,
@@ -1529,94 +1377,19 @@ fn oid_info(entry: &'static host_ssl::oid::OidEntry) -> OidInfo {
     }
 }
 
-#[cfg(not(feature = "host_env"))]
-const OIDS: &[OidInfo] = &[
-    OidInfo {
-        nid: 13,
-        short_name: "CN",
-        long_name: "commonName",
-        oid: Some("2.5.4.3"),
-    },
-    OidInfo {
-        nid: 14,
-        short_name: "C",
-        long_name: "countryName",
-        oid: Some("2.5.4.6"),
-    },
-    OidInfo {
-        nid: 15,
-        short_name: "L",
-        long_name: "localityName",
-        oid: Some("2.5.4.7"),
-    },
-    OidInfo {
-        nid: 16,
-        short_name: "ST",
-        long_name: "stateOrProvinceName",
-        oid: Some("2.5.4.8"),
-    },
-    OidInfo {
-        nid: 17,
-        short_name: "O",
-        long_name: "organizationName",
-        oid: Some("2.5.4.10"),
-    },
-    OidInfo {
-        nid: 18,
-        short_name: "OU",
-        long_name: "organizationalUnitName",
-        oid: Some("2.5.4.11"),
-    },
-    OidInfo {
-        nid: 129,
-        short_name: "serverAuth",
-        long_name: "TLS Web Server Authentication",
-        oid: Some("1.3.6.1.5.5.7.3.1"),
-    },
-    OidInfo {
-        nid: 130,
-        short_name: "clientAuth",
-        long_name: "TLS Web Client Authentication",
-        oid: Some("1.3.6.1.5.5.7.3.2"),
-    },
-];
-
 #[inline(never)]
 pub fn oid_by_nid(nid: i32) -> Option<OidInfo> {
-    #[cfg(feature = "host_env")]
-    {
-        host_ssl::oid::find_by_nid(nid).map(oid_info)
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        OIDS.iter().copied().find(|entry| entry.nid == nid)
-    }
+    host_ssl::oid::find_by_nid(nid).map(oid_info)
 }
 
 #[inline(never)]
 pub fn oid_by_oid_string(oid: &str) -> Option<OidInfo> {
-    #[cfg(feature = "host_env")]
-    {
-        host_ssl::oid::find_by_oid_string(oid).map(oid_info)
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        OIDS.iter().copied().find(|entry| entry.oid == Some(oid))
-    }
+    host_ssl::oid::find_by_oid_string(oid).map(oid_info)
 }
 
 #[inline(never)]
 pub fn oid_by_name(name: &str) -> Option<OidInfo> {
-    #[cfg(feature = "host_env")]
-    {
-        host_ssl::oid::find_by_name(name).map(oid_info)
-    }
-    #[cfg(not(feature = "host_env"))]
-    {
-        OIDS.iter()
-            .copied()
-            .find(|entry| entry.short_name == name || entry.long_name == name)
-    }
+    host_ssl::oid::find_by_name(name).map(oid_info)
 }
 
 #[derive(Clone, Copy)]
@@ -3001,21 +2774,6 @@ fn enabled_versions(
         }
     }
 }
-
-pub const TLS_ERROR_SSL: i32 = 1;
-pub const TLS_ERROR_WANT_READ: i32 = 2;
-pub const TLS_ERROR_WANT_WRITE: i32 = 3;
-pub const TLS_ERROR_ZERO_RETURN: i32 = 6;
-pub const TLS_ERROR_EOF: i32 = 8;
-/// Not an `SSL_ERROR_*` code: the destination buffer a read has to allocate
-/// before it can enter the TLS engine, refused by the allocator.  `read` maps
-/// it to `MemoryError`, which is what `PyBytes_FromStringAndSize` failing
-/// gives `_ssl__SSLSocket_read_impl`.
-pub const TLS_ERROR_NO_MEMORY: i32 = 9;
-/// Internal discriminator carrying an OpenSSL-compatible X509 verification
-/// code to the interpreter without changing Python's public `errno` (which
-/// remains SSL_ERROR_SSL == 1).
-pub const TLS_ERROR_CERT_VERIFY_BASE: i32 = 1_000;
 
 pub type TlsResult<T> = Result<T, (i32, String)>;
 

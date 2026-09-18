@@ -8562,15 +8562,6 @@ impl<S: JitState> JitDriver<S> {
     /// Returns `Some(resume_pc)` only when compiled code ran and left a
     /// resume point. FINISH is published on the same latch as
     /// [`Self::back_edge`].
-    /// Skip the next generated function-entry door.
-    ///
-    /// `warmspot.py` has no equivalent: a portal has one runner. An embedder
-    /// that still has a second, loop-header door and cannot yet coexist two
-    /// artifacts for one program uses this to yield that other door.
-    pub fn suppress_function_entry(&mut self) {
-        self.function_entry_suppressed = true;
-    }
-
     pub fn function_entry_structured(
         &mut self,
         green_key_hash: u64,
@@ -8591,11 +8582,33 @@ impl<S: JitState> JitDriver<S> {
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
             }
             FunctionEntryStep::Proceed => {
+                if !state.can_trace() {
+                    return None;
+                }
+                // warmstate.py bound_reached: decay, then refuse a nearly
+                // full stack, then start the function-entry trace.
+                // Do not call `bound_reached` itself: that consumes
+                // `single_pass_label_entry_key` reserved for the next
+                // back edge. `force_start_tracing` republishes the
+                // frame decoder and leaves that handoff alone.
+                self.meta.warm_state_mut().decay_counters();
+                if majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full() {
+                    return None;
+                }
                 self.force_start_tracing(cell_key, target_pc, state, env);
                 None
             }
             FunctionEntryStep::NotHot => None,
         }
+    }
+
+    /// Skip the next generated function-entry door.
+    ///
+    /// `warmspot.py` has no equivalent: a portal has one runner. An embedder
+    /// that still has a second, loop-header door and cannot yet coexist two
+    /// artifacts for one program uses this to yield that other door.
+    pub fn suppress_function_entry(&mut self) {
+        self.function_entry_suppressed = true;
     }
 
     /// Turn the raw green-key hash a door arrives with into the key that names

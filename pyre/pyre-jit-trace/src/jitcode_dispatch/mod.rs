@@ -3447,8 +3447,8 @@ pub fn census_report() -> String {
 }
 
 /// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
-/// set by [`crate::trace::drive_bridge_carrier_walk`] when a depth-2 inlined
-/// callee's sub-walk ended in `SubRaise`.
+/// set by [`crate::trace::drive_bridge_carrier_walk`] when an inlined callee's
+/// sub-walk ended in `SubRaise` and no paused middle caught it.
 /// [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it once when it sets
 /// up the root walk.  With `catch_target` set the root frame's `except` handler
 /// covers the CALL and the walk enters at that handler with the caught
@@ -3457,7 +3457,8 @@ pub fn census_report() -> String {
 /// on its own.  `None` means the root frame has no covering handler: the
 /// framestack this trace models is exhausted, so the walk ends immediately with
 /// `compile_exit_frame_with_exception` and the interpreter unwinds the
-/// remaining Python frames.
+/// remaining Python frames.  A middle that catches is entered at its handler
+/// by the carrier walk itself (`ChangeFrame`) and never writes this seed.
 #[derive(Clone, Copy)]
 pub(crate) struct CarrierRaiseSeed {
     pub exc: OpRef,

@@ -123,9 +123,16 @@ fn lookup<'a>(
     if let Some(fields) = registered.get(class_key) {
         return Some(fields);
     }
-    registered
-        .iter()
-        .find_map(|(key, fields)| class_key.ends_with(&format!("::{key}")).then_some(fields))
+    // `::` boundary, same as `names_same_type`. Two matching keys
+    // (`Frame` and `a::Frame` both suffix-match `x::a::Frame`) is
+    // ambiguous — fail closed instead of picking insertion order.
+    let mut matches = registered.iter().filter(|(key, _)| {
+        class_key
+            .strip_suffix(key.as_str())
+            .is_some_and(|prefix| prefix.ends_with("::"))
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first.1)
 }
 
 #[cfg(test)]
@@ -212,6 +219,25 @@ mod tests {
             panic!("_virtualizable_ must be a list");
         };
         assert_eq!(items, vec![ConstValue::byte_str("x")]);
+        register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
+    }
+
+    #[test]
+    fn lookup_fails_closed_when_two_suffixes_match() {
+        REGISTERED.with(|registered| {
+            *registered.borrow_mut() = [
+                ("Frame".to_string(), vec!["leaf".to_string()]),
+                ("a::Frame".to_string(), vec!["nested".to_string()]),
+            ]
+            .into_iter()
+            .collect();
+        });
+        let host = HostObject::new_class("Frame", vec![]);
+        stamp_host_virtualizable(&host, "x::a::Frame");
+        assert!(
+            host.class_get("_virtualizable_").is_none(),
+            "Frame and a::Frame both suffix-match x::a::Frame"
+        );
         register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
 }

@@ -25,7 +25,7 @@ use std::sync::{
 
 use crate::jitprof::Instant;
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
-use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
+use majit_backend::{Backend, ExitRecoveryLayout, FailArgSource, JitCellToken};
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
 #[cfg(all(
@@ -4832,12 +4832,13 @@ impl<M: Clone> MetaInterp<M> {
             }
             virtualizable_ptr = majit_gc::shadow_stack::get(root).0 as *mut u8;
             majit_gc::shadow_stack::pop_to(root);
-            if let Some(ctx) = self.tracing.as_mut() {
-                ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
-            }
+            // Both `force_start_tracing` and `setup_tracing` call this
+            // before `self.tracing = Some(ctx)`. Write the forwarded
+            // pointer onto the ctx being initialized, not the empty slot.
+            ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
             // `initial_inputarg_consts` was copied from `live_values` before
-            // this force. `ctx` is not in `self.tracing` yet, so
-            // `walk_active_trace_refs` cannot forward those ConstPtrs.
+            // this force. `walk_active_trace_refs` cannot forward those
+            // ConstPtrs until `self.tracing` is assigned.
             // `orig_vable_ptr_from_trace_ctx` reads that slot first.
             let vable_const_index = ctx
                 .driver_descriptor()
@@ -6649,9 +6650,14 @@ impl<M: Clone> MetaInterp<M> {
             .as_mut()
             .expect("vable op requires active tracing");
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
-        let result = f(ctx);
-        ctx.clear_replace_frames();
-        result
+        struct ClearReplaceFrames(*mut TraceCtx);
+        impl Drop for ClearReplaceFrames {
+            fn drop(&mut self) {
+                unsafe { (*self.0).clear_replace_frames() };
+            }
+        }
+        let _clear = ClearReplaceFrames(ctx);
+        f(ctx)
     }
 
     /// `vable_struct_ptr` is the live struct pointer for the
@@ -7343,9 +7349,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         // Bridge traces start from rebuilt resume state, not a fresh portal
         // entry, so `initial_inputarg_consts` is not seeded with the
-        // virtualizable inputarg's ConstPtr.  `pending_vable_ptr` is retained only as
-        // the legacy/test fallback when neither the rebuilt boxes nor their
-        // heap mirror were installed.
+        // virtualizable inputarg's ConstPtr.  When neither the rebuilt
+        // boxes nor their heap mirror were installed, there is no
+        // trace-bound identity to name — do not fall back to the
+        // ambient host seed.
         std::ptr::null()
     }
 
@@ -13323,7 +13330,7 @@ impl<M: Clone> MetaInterp<M> {
     ///    `optimizeopt/unroll.py` peeled-entry LABEL is the JUMP target.
     /// 2. Non-peeled loops — there is no peeled-entry token; the JUMP target
     ///    is the loop's `TreeLoop.inputargs` (`history.py`). Their types
-    ///    live on `root_trace.inputargs[i].tp`.
+    ///    live on `root_trace.inputargs[i].tp.get()`.
     pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
         let compiled = self.compiled_loops.get(&green_key)?;
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
@@ -16146,7 +16153,7 @@ impl<M: Clone> MetaInterp<M> {
             green_key,
             trace_id,
             fail_index,
-            fail_values,
+            fail_values.into(),
             &crate::resume::NullAllocator,
         )
     }
@@ -16161,7 +16168,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-        fail_values: &[i64],
+        fail_values: FailArgSource<'_>,
         allocator: &dyn crate::resume::BlackholeAllocator,
     ) -> Option<(Vec<i64>, Vec<i64>)> {
         if crate::majit_log_enabled() {
@@ -16288,24 +16295,42 @@ impl<M: Clone> MetaInterp<M> {
                 .green_key();
             let trace_id = descr.trace_id();
             let fail_index = descr.fail_index();
-            let fail_values = descr
-                .fail_arg_types()
-                .iter()
-                .enumerate()
-                .map(|(index, tp)| match tp {
-                    Type::Int => self.backend.get_int_value(&deadframe, index),
-                    Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
-                    Type::Float => self.backend.get_float_value(&deadframe, index).to_bits() as i64,
-                    Type::Void => 0,
-                })
-                .collect::<Vec<_>>();
+            // compile.py `force_from_resumedata(..., deadframe)`: TAGBOX
+            // reads `cpu.get_*_value` off the live jitframe. A copied
+            // `Vec` of those words is not a GC root; the jitframe slots
+            // are. Prefer `FailArgSource::from_jitframe` so a collection
+            // during materialization forwards in place.
+            let n_fail_args = descr.fail_arg_types().len();
+            let copied_fail_args;
+            let fail_values = if let Some(jf) = deadframe.as_jitframe() {
+                FailArgSource::from_jitframe(
+                    jf.jf_gcref().0 as *const majit_backend::jitframe::JitFrame,
+                    descr,
+                    n_fail_args,
+                )
+            } else {
+                copied_fail_args = descr
+                    .fail_arg_types()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tp)| match tp {
+                        Type::Int => self.backend.get_int_value(&deadframe, index),
+                        Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
+                        Type::Float => {
+                            self.backend.get_float_value(&deadframe, index).to_bits() as i64
+                        }
+                        Type::Void => 0,
+                    })
+                    .collect::<Vec<_>>();
+                FailArgSource::Slice(&copied_fail_args)
+            };
             // compile.py: faildescr.handle_async_forcing(deadframe)
             let cache = self.handle_async_forcing_with_allocator(
                 Some(descr),
                 green_key,
                 trace_id,
                 fail_index,
-                &fail_values,
+                fail_values,
                 allocator,
             );
             // compile.py: cpu.set_savedata_ref(deadframe, AllVirtuals(cache).hide())

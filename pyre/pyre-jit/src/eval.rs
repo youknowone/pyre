@@ -5975,7 +5975,7 @@ unsafe extern "C" fn force_pyframe(frame: *mut pyre_interpreter::PyFrame) {
         // so an ordinary Return may keep the frame armed and force it lazily;
         // GUARD_NOT_FORCED_2's finish gcmap describes the retained contents.
         //
-        // Comparing against `MetaInterp::vable_ptr` as well named the WRONG
+        // Comparing against `MetaInterp::pending_vable_ptr` as well named the WRONG
         // frame.  That cell is rewritten by every `sync_before`, including the
         // entry a callee's own compiled loop takes from inside the caller's
         // running loop, and nothing restores it when the callee returns — so
