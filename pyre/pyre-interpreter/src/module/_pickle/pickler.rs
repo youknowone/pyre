@@ -1715,6 +1715,9 @@ fn write_long(buf: &mut Framer, enc: &[u8]) {
     buf.extend_from_slice(enc);
 }
 
+/// `interp_pickle.py _Framer.write_binfloat` is `@jit.unroll_safe`.
+/// The 8-byte walk is `f.to_be_bytes()` here; the hint matches the decorator.
+#[majit_macros::unroll_safe]
 fn save_float(ctx: &PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Result<(), PyError> {
     if ctx.bin {
         let f = crate::baseobjspace::float_w(w_obj)?;

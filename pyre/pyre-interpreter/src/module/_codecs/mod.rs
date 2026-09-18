@@ -114,6 +114,8 @@ pub(crate) fn walk_codec_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 }
 
 // PyPy `interp_codecs.py normalize`.
+/// `interp_codecs.py normalize` is `@jit.elidable`.
+#[majit_macros::elidable]
 fn normalize(encoding: &str) -> String {
     let mut chars = String::new();
     let mut punct = false;
