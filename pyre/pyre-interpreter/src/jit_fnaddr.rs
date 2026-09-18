@@ -3268,6 +3268,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_str_compare",
         pyre_object::jit_str_compare,
     );
+    cpa2(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_str_contains",
+        "pyre_object::jit_str_contains",
+        pyre_object::unicodeobject::jit_str_contains,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::bytesobject::jit_bytes_contains",
+        "pyre_object::jit_bytes_contains",
+        pyre_object::bytesobject::jit_bytes_contains,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::bytesobject::jit_bytes_contains_byte",
+        "pyre_object::jit_bytes_contains_byte",
+        pyre_object::bytesobject::jit_bytes_contains_byte,
+    );
     cpa1(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_is_true",
@@ -5848,6 +5866,30 @@ mod tests {
         assert_eq!(
             bindings["pyre_interpreter::typedef::__majit_wrap_int_descr_bit_length"],
             expected,
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_str_and_bytes_contains_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let str_contains =
+            pyre_object::unicodeobject::jit_str_contains as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::unicodeobject::jit_str_contains"],
+            str_contains
+        );
+        assert_eq!(bindings["pyre_object::jit_str_contains"], str_contains);
+        let bytes_contains =
+            pyre_object::bytesobject::jit_bytes_contains as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::bytesobject::jit_bytes_contains"],
+            bytes_contains
+        );
+        let bytes_byte =
+            pyre_object::bytesobject::jit_bytes_contains_byte as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::bytesobject::jit_bytes_contains_byte"],
+            bytes_byte
         );
     }
 

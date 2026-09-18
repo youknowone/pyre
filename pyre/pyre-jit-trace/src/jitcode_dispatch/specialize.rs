@@ -10997,7 +10997,7 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
         ) else {
             return Ok(None);
         };
-        if !walker_exact_contains_haystack(haystack_obj) {
+        if !walker_contains_descent_callback_free(needle_obj, haystack_obj) {
             return Ok(None);
         }
         return try_walker_orthodox_descent(
@@ -22775,20 +22775,36 @@ fn walker_str_pair_operands<Sym: WalkSym>(
     Some((lhs, rhs, lhs_obj, rhs_obj))
 }
 
-/// Exact builtin containers whose `contains_slot` arm is a call to a
-/// loop-free helper (`descr_contains` / elidable find / strategy lookup).
-/// A subclass keeps the residual so `__contains__` override dispatch stays
-/// on the body's own probe rather than this descent's admission.
-fn walker_exact_contains_haystack(obj: pyre_object::PyObjectRef) -> bool {
-    let exact = |tp: &pyre_object::pyobject::PyType| unsafe {
+/// Admission for `COMPARE_OP_DESCENT` on tags 6/7.  Same job as the
+/// exact-numeric gate on tags 0..=5: do not start a sub-walk whose body
+/// can run Python (`__hash__` / `__eq__` / a subclass `__contains__`).
+/// A declining residual would re-run those side effects.
+///
+/// Exact `str`/`bytes` plus a needle whose membership is an elidable
+/// find (another exact `str`/`bytes`, or a byte in `range(256)`) is
+/// callback-free.  `dict`/`set` stay on the residual: a stored element's
+/// `__eq__` can still run on a hash collision.
+fn walker_contains_descent_callback_free(
+    needle: pyre_object::PyObjectRef,
+    haystack: pyre_object::PyObjectRef,
+) -> bool {
+    let exact = |obj: pyre_object::PyObjectRef, tp: &pyre_object::pyobject::PyType| unsafe {
         pyre_object::is_exact_type(obj, tp)
             && std::ptr::eq((*obj).w_class, pyre_object::get_instantiate(tp))
     };
-    exact(&pyre_object::pyobject::STR_TYPE)
-        || exact(&pyre_object::bytesobject::BYTES_TYPE)
-        || exact(&pyre_object::pyobject::DICT_TYPE)
-        || exact(&pyre_object::setobject::SET_TYPE)
-        || exact(&pyre_object::setobject::FROZENSET_TYPE)
+    if exact(haystack, &pyre_object::pyobject::STR_TYPE) {
+        return exact(needle, &pyre_object::pyobject::STR_TYPE)
+            && unsafe { pyre_object::w_str_get_value_opt(needle).is_some() };
+    }
+    if exact(haystack, &pyre_object::bytesobject::BYTES_TYPE) {
+        if exact(needle, &pyre_object::bytesobject::BYTES_TYPE) {
+            return true;
+        }
+        return unsafe {
+            pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
+        } && (0..=255).contains(&unsafe { pyre_object::w_int_get_value(needle) });
+    }
+    false
 }
 
 /// `guard_class(&STR_TYPE)` + the exact canonical `w_class` guard, the pair
