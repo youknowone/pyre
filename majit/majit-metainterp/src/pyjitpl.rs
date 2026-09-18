@@ -4620,14 +4620,12 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_frontend_boxes.as_deref()
     }
 
-    /// Seed the live heap pointer on the active `TraceCtx`.
-    /// `vinfo.unwrap_virtualizable_box` is the reader; this only publishes
-    /// the host's current object so initialize / residual can unwrap it.
+    /// Seed `pending_vable_ptr` with the host's current virtualizable.
+    /// `initialize_virtualizable` consumes this before `TraceCtx` exists;
+    /// an already-active trace keeps the pointer its own boxes name
+    /// (`virtualizable.py write_boxes`).
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
         self.pending_vable_ptr = ptr;
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.set_virtualizable_heap_ptr(ptr);
-        }
     }
 
     /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`.
