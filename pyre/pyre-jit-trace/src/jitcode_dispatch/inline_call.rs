@@ -13075,29 +13075,12 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     // LOAD_ATTR helpers are fold-or-residual only.  Walking
     // `getattr_str` / `getattr_str_impl` records the whole MRO protocol
     // into the caller trace and the walk does not bound its allocations.
-    let callee = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
     // getattr/setattr/setitem/iter protocol bodies are unbounded even
     // when the caller is already an inline_subwalk (an inlined Python
     // function).  Only the exact-int `*_inner` helpers stay walkable
     // there; residualizing those makes `compare_op_descent` decline.
-    let is_bounded_inner =
-        super::specialize::jitcode_leaf_is(sub_index, "compare_value_from_tag_inner")
-            || super::specialize::jitcode_leaf_is(sub_index, "binary_value_from_tag_inner")
-            || callee.as_deref().is_some_and(|n| {
-                super::specialize::name_leaf_is(n, "compare_value_from_tag_inner")
-                    || super::specialize::name_leaf_is(n, "binary_value_from_tag_inner")
-            });
-    let is_unbounded = callee
-        .as_deref()
-        .is_some_and(super::specialize::name_is_unbounded_helper_body)
-        || super::specialize::jitcode_is_space_getattr(sub_index, sub_body)
-        || super::specialize::jitcode_is_frame_load_attr(sub_index)
-        || super::specialize::jitcode_leaf_is(sub_index, "getattr_str_impl")
-        || super::specialize::jitcode_is_pathed(
-            sub_index,
-            sub_body,
-            "pyre_interpreter::baseobjspace::getattr_str_impl",
-        );
+    let is_bounded_inner = super::specialize::jitcode_is_from_tag_inner(sub_index, sub_body);
+    let is_unbounded = super::specialize::jitcode_is_unbounded_helper_body(sub_index, sub_body);
     if is_unbounded && !(ctx.fbw_mode.inline_subwalk && is_bounded_inner) {
         return residualize_inline_call_via_fnaddr(
             ctx,
@@ -14483,7 +14466,6 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         })?;
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
-    let callee_name = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
 
     if dst_bank == 'r'
         && args.len() == 1
@@ -14607,16 +14589,14 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     // Fold here so `f_lasti` / mapdict still run; a declined fold must
     // residualize — descending the MRO graph is unbounded.
     if dst_bank == 'r' {
-        let callee = callee_name.as_deref().unwrap_or("");
-        let is_getattr = super::specialize::name_is_getattr_family(callee)
+        let is_frame_load_attr =
+            super::specialize::jitcode_is_frame_load_attr(sub_index, &sub_body);
+        let is_getattr = is_frame_load_attr
             || super::specialize::jitcode_is_space_getattr(sub_index, &sub_body)
-            || super::specialize::jitcode_is_frame_load_attr(sub_index);
+            || super::specialize::jitcode_is_getattr_str_impl(sub_index, &sub_body);
         if is_getattr {
             let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-            let getattr_pair = if args.len() == 3
-                && (super::specialize::name_is_frame_load_attr(callee)
-                    || super::specialize::jitcode_is_frame_load_attr(sub_index))
-            {
+            let getattr_pair = if args.len() == 3 && is_frame_load_attr {
                 Some((args[1], args[2]))
             } else if args.len() >= 2 {
                 Some((args[0], args[1]))
@@ -14664,15 +14644,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     // Jitted STORE_ATTR is `setattr_str` (`PyResult`, so `>r` as well as
     // void).  Fold the mapdict write or residualize; do not walk the MRO.
     if dst_bank == 'r' || dst_bank == 'v' {
-        let callee = callee_name.as_deref().unwrap_or("");
-        if super::specialize::name_is_setattr_family(callee)
-            || super::specialize::jitcode_leaf_is(sub_index, "setattr")
-            || super::specialize::jitcode_leaf_is(sub_index, "setattr_str")
-            || super::specialize::jitcode_is_pathed(
-                sub_index,
-                &sub_body,
-                "pyre_interpreter::baseobjspace::setattr_str",
-            )
+        if super::specialize::jitcode_is_space_setattr(sub_index, &sub_body)
+            || super::specialize::jitcode_is_space_delattr(sub_index, &sub_body)
         {
             let (obj, name_opref, value) = if args.len() == 4 {
                 (args[1], args[2], args[3])
@@ -14798,15 +14771,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     // void).  Fold the list store or residualize; do not walk the
     // protocol body.
     if dst_bank == 'r' || dst_bank == 'v' {
-        let callee = callee_name.as_deref().unwrap_or("");
-        if super::specialize::name_is_setitem_family(callee)
-            || super::specialize::jitcode_leaf_is(sub_index, "setitem")
-            || super::specialize::jitcode_is_pathed(
-                sub_index,
-                &sub_body,
-                "pyre_interpreter::baseobjspace::setitem",
-            )
-        {
+        if super::specialize::jitcode_is_space_setitem(sub_index, &sub_body) {
             let folded = args.len() >= 3
                 && spec_gate(SpecFold::StoreSubscr, || {
                     super::specialize::try_walker_specialize_store_subscr(ctx, op.pc, &args)
@@ -14834,10 +14799,7 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     // The eval-loop path may land on `is_true_slot` / `is_true_lookup`.
     if dst_bank == 'i'
         && args.len() == 1
-        && (callee_name
-            .as_deref()
-            .is_some_and(super::specialize::name_is_space_is_true)
-            || super::specialize::jitcode_is_space_is_true(sub_index, &sub_body))
+        && super::specialize::jitcode_is_space_is_true(sub_index, &sub_body)
     {
         let dst = code[op.pc + 1 + 2 + arg_width] as usize;
         if let Some(truth) = spec_gate(SpecFold::TruthInt, || {
@@ -15088,7 +15050,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
-    let callee_name = super::specialize::inline_callee_name(ctx, descr_index, sub_index);
 
     if dst_bank == 'r'
         && int_args.len() == 1
@@ -15401,18 +15362,15 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // `getattr_str` / `getattr_str_impl` / `load_attr` take the name as a
     // Rust `&str`.  Fold or residualize; never walk the MRO body.
     if dst_bank == 'r' {
-        let callee = callee_name.as_deref().unwrap_or("");
-        let is_getattr = super::specialize::name_is_getattr_family(callee)
+        let is_frame_load_attr =
+            super::specialize::jitcode_is_frame_load_attr(sub_index, &sub_body);
+        let is_getattr = is_frame_load_attr
             || super::specialize::jitcode_is_space_getattr(sub_index, &sub_body)
-            || super::specialize::jitcode_is_frame_load_attr(sub_index)
-            || super::specialize::jitcode_leaf_is(sub_index, "getattr_str_impl");
+            || super::specialize::jitcode_is_getattr_str_impl(sub_index, &sub_body);
         if is_getattr {
             let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
-            let obj = if ref_args.len() == 2
-                && (super::specialize::name_is_frame_load_attr(callee)
-                    || super::specialize::jitcode_is_frame_load_attr(sub_index))
-            {
+            let obj = if ref_args.len() == 2 && is_frame_load_attr {
                 ref_args.get(1).copied()
             } else {
                 ref_args.first().copied()
@@ -15485,16 +15443,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // is the `&str` slice, R-list is `(obj, value)`.  Fold or residualize;
     // do not walk the MRO.
     if dst_bank == 'r' || dst_bank == 'v' {
-        let callee = callee_name.as_deref().unwrap_or("");
-        if super::specialize::name_is_setattr_family(callee)
-            || super::specialize::jitcode_leaf_is(sub_index, "setattr")
-            || super::specialize::jitcode_leaf_is(sub_index, "setattr_str")
-            || super::specialize::jitcode_is_pathed(
-                sub_index,
-                &sub_body,
-                "pyre_interpreter::baseobjspace::setattr_str",
-            )
-        {
+        if super::specialize::jitcode_is_space_setattr(sub_index, &sub_body) {
             let obj = ref_args.first().copied();
             let value = ref_args.get(1).copied();
             let str_name = super::specialize::resolved_attr_name_from_str_slice(&int_arg_concretes);
@@ -15568,16 +15517,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 folded,
             );
         }
-        if super::specialize::name_leaf_is(callee, "delattr")
-            || super::specialize::name_leaf_is(callee, "delattr_str")
-            || super::specialize::jitcode_leaf_is(sub_index, "delattr")
-            || super::specialize::jitcode_leaf_is(sub_index, "delattr_str")
-            || super::specialize::jitcode_is_pathed(
-                sub_index,
-                &sub_body,
-                "pyre_interpreter::baseobjspace::delattr_str",
-            )
-        {
+        if super::specialize::jitcode_is_space_delattr(sub_index, &sub_body) {
             let obj = ref_args.first().copied();
             if let Some(&name_opref) = ref_args.get(1) {
                 walker_guard_red_str_name(ctx, op.pc, name_opref)?;
@@ -15615,12 +15555,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     // Flatten lowers COMPARE_OP to `inline_call_ir_r` of
     // `compare_value_from_tag`.  The residual COMPARE_OP arm never sees
     // that call, so the orthodox descent / exact-int folds have to run
-    // here — the same helper both spellings reach. The eval-loop path
-    // calls `compare_value` with a `ComparisonOperator` discriminant.
-    let is_compare_from_tag = callee_name
-        .as_deref()
-        .is_some_and(super::specialize::name_is_compare_value)
-        || super::specialize::jitcode_is_compare_value_from_tag(sub_index, &sub_body);
+    // here — the same helper both spellings reach.  The eval-loop
+    // `compare_value` takes a `ComparisonOperator` discriminant, not a
+    // tag; it is walked and reaches this helper through its own call.
+    let is_compare_from_tag =
+        super::specialize::jitcode_is_compare_value_from_tag(sub_index, &sub_body);
     if is_compare_from_tag
         && dst_bank == 'r'
         && ref_args.len() == 2

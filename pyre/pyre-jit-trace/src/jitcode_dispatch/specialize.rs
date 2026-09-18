@@ -9922,158 +9922,152 @@ pub(crate) fn binary_value_from_tag_jitcode()
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
 }
 
-/// True when `sub_body` is the `binary_value_from_tag` helper the
-/// codewriter inlines for BINARY.  The per-index name table can miss a
-/// helper that `pathed_jitcode_cached` still owns, and a name-only
-/// check then skipped descent so a declined sub-walk residualized
-/// `CallMayForce` (`binary_value_from_tag`) on fib bridges.
+/// True when the inlined callee is the graph keyed `path`.
+///
+/// `call.py get_jitcode` keys `CallControl.jitcodes` by graph.  A JitCode's
+/// `name` is only the key's last segment and many graphs share one (nine
+/// are named `setitem`, eight of them dict-strategy methods), so identity
+/// is the graph key, never the name.
 pub(crate) fn jitcode_is_pathed(
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
     path: &str,
 ) -> bool {
-    let leaf = path.rsplit("::").next().unwrap_or(path);
-    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-        .is_some_and(|jc| jc.name == path || jc.name == leaf || jc.name.ends_with(path))
-    {
+    if crate::jitcode_runtime::compute_pathed_jitcode_index(path) == Some(sub_index) {
         return true;
     }
-    crate::jitcode_runtime::pathed_jitcode_cached(path).is_some_and(|jc| {
-        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
-    })
+    crate::jitcode_runtime::pathed_jitcode_cached(path)
+        .is_some_and(|jc| std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr()))
 }
 
-/// Leaf-name match that does not treat `foo_bar` as `bar`.
-pub(crate) fn name_leaf_is(name: &str, leaf: &str) -> bool {
-    name == leaf || name.rsplit("::").next() == Some(leaf)
-}
-
-pub(crate) fn jitcode_leaf_is(sub_index: usize, leaf: &str) -> bool {
-    crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
-        .is_some_and(|jc| name_leaf_is(&jc.name, leaf))
-}
-
-/// Runtime descr-pool name first (`binary_value_from_tag` identification),
-/// then the ALL_JITCODES slot.  Flatten's `inline_call` operand is a
-/// per-fn JitCode descr; its index is not always the global table's.
-pub(crate) fn inline_callee_name<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    descr_index: usize,
+fn jitcode_is_any_pathed(
     sub_index: usize,
-) -> Option<String> {
-    if let Some(jc) = ctx.raw_descrs.runtime_jitcode_at(descr_index) {
-        return Some(jc.name().to_owned());
-    }
-    crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).map(|jc| jc.name.clone())
+    sub_body: &super::SubJitCodeBody,
+    paths: &[&str],
+) -> bool {
+    paths
+        .iter()
+        .any(|path| jitcode_is_pathed(sub_index, sub_body, path))
 }
 
 /// `space.getattr` / `getattr_str` — the two spellings of the same
 /// `DescrOperation.getattr` body.  The jitted `LOAD_ATTR` path calls
 /// `getattr_str` (`eval.rs load_attr`); flatten's 2-arg HLOp calls
 /// `getattr`.
-pub(crate) fn name_is_space_getattr(name: &str) -> bool {
-    name_leaf_is(name, "getattr") || name_leaf_is(name, "getattr_str")
-}
+pub(super) const SPACE_GETATTR_PATHS: &[&str] = &[
+    "pyre_interpreter::baseobjspace::getattr",
+    "pyre_interpreter::baseobjspace::getattr_str",
+];
 
-/// Callers of `space.getattr` plus the shared impl.  The impl body is the
-/// whole MRO walk; a declined fold must residualize it, not descend.
-pub(crate) fn name_is_getattr_family(name: &str) -> bool {
-    name_is_space_getattr(name)
-        || name_leaf_is(name, "getattr_str_impl")
-        || name_leaf_is(name, "load_attr")
-}
+/// `getattr_str`'s shared body, `(obj, name, call_getattr, suppress)`.
+pub(super) const GETATTR_STR_IMPL_PATH: &str = "pyre_interpreter::baseobjspace::getattr_str_impl";
 
-pub(crate) fn jitcode_is_space_getattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_pathed(
-        sub_index,
-        sub_body,
-        "pyre_interpreter::baseobjspace::getattr",
-    ) || jitcode_is_pathed(
-        sub_index,
-        sub_body,
-        "pyre_interpreter::baseobjspace::getattr_str",
-    ) || jitcode_leaf_is(sub_index, "getattr")
-        || jitcode_leaf_is(sub_index, "getattr_str")
-}
+/// `pyopcode.py LOAD_ATTR` trait methods — `(frame, obj, name)`.
+pub(super) const FRAME_LOAD_ATTR_PATHS: &[&str] = &[
+    "OpcodeStepExecutor::load_attr",
+    "SharedOpcodeHandler::load_attr",
+];
 
-pub(crate) fn name_is_frame_load_attr(name: &str) -> bool {
-    name_leaf_is(name, "load_attr")
-}
+/// `space.setattr` / `setattr_str` — `(obj, name, value)`.
+pub(super) const SPACE_SETATTR_PATHS: &[&str] = &[
+    "pyre_interpreter::baseobjspace::setattr",
+    "pyre_interpreter::baseobjspace::setattr_str",
+];
 
-pub(crate) fn name_is_setattr_family(name: &str) -> bool {
-    name_leaf_is(name, "setattr")
-        || name_leaf_is(name, "setattr_str")
-        || name_leaf_is(name, "delattr")
-        || name_leaf_is(name, "delattr_str")
-}
+/// `space.delattr` / `delattr_str` — `(obj, name)`.
+pub(super) const SPACE_DELATTR_PATHS: &[&str] = &[
+    "pyre_interpreter::baseobjspace::delattr",
+    "pyre_interpreter::baseobjspace::delattr_str",
+];
 
-pub(crate) fn name_is_setitem_family(name: &str) -> bool {
-    name_leaf_is(name, "setitem") || name_leaf_is(name, "setitem_slot")
-}
+/// `space.setitem` and its slot tail — `(obj, index, value)`.
+pub(super) const SPACE_SETITEM_PATHS: &[&str] = &[
+    "pyre_interpreter::baseobjspace::setitem",
+    "pyre_interpreter::baseobjspace::setitem_slot",
+];
 
-pub(crate) fn name_is_space_iter(name: &str) -> bool {
-    name.ends_with("baseobjspace::iter")
-}
-
-/// `PyFrame::load_attr` / `SharedOpcodeHandler::load_attr` — `(frame, obj, name)`.
-pub(crate) fn jitcode_is_frame_load_attr(sub_index: usize) -> bool {
-    jitcode_leaf_is(sub_index, "load_attr")
-}
-
-pub(crate) fn name_is_space_is_true(name: &str) -> bool {
-    name_leaf_is(name, "is_true")
-        || name_leaf_is(name, "is_true_slot")
-        || name_leaf_is(name, "is_true_lookup")
-}
+pub(super) const SPACE_ITER_PATH: &str = "pyre_interpreter::baseobjspace::iter";
 
 /// `space.is_true` and the two layout/lookup helpers it dispatches to.
+pub(super) const SPACE_IS_TRUE_PATHS: &[&str] = &[
+    "pyre_interpreter::baseobjspace::is_true",
+    "pyre_interpreter::baseobjspace::is_true_slot",
+    "pyre_interpreter::baseobjspace::is_true_lookup",
+];
+
+pub(crate) fn jitcode_is_space_getattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_any_pathed(sub_index, sub_body, SPACE_GETATTR_PATHS)
+}
+
+pub(crate) fn jitcode_is_getattr_str_impl(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    jitcode_is_pathed(sub_index, sub_body, GETATTR_STR_IMPL_PATH)
+}
+
+pub(crate) fn jitcode_is_frame_load_attr(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    jitcode_is_any_pathed(sub_index, sub_body, FRAME_LOAD_ATTR_PATHS)
+}
+
+pub(crate) fn jitcode_is_space_setattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_any_pathed(sub_index, sub_body, SPACE_SETATTR_PATHS)
+}
+
+pub(crate) fn jitcode_is_space_delattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_any_pathed(sub_index, sub_body, SPACE_DELATTR_PATHS)
+}
+
+pub(crate) fn jitcode_is_space_setitem(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
+    jitcode_is_any_pathed(sub_index, sub_body, SPACE_SETITEM_PATHS)
+}
+
 pub(crate) fn jitcode_is_space_is_true(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_pathed(
-        sub_index,
-        sub_body,
-        "pyre_interpreter::baseobjspace::is_true",
-    ) || jitcode_is_pathed(
-        sub_index,
-        sub_body,
-        "pyre_interpreter::baseobjspace::is_true_slot",
-    ) || jitcode_is_pathed(
-        sub_index,
-        sub_body,
-        "pyre_interpreter::baseobjspace::is_true_lookup",
-    ) || jitcode_leaf_is(sub_index, "is_true")
-        || jitcode_leaf_is(sub_index, "is_true_slot")
-        || jitcode_leaf_is(sub_index, "is_true_lookup")
+    jitcode_is_any_pathed(sub_index, sub_body, SPACE_IS_TRUE_PATHS)
 }
 
-pub(crate) fn name_is_compare_value(name: &str) -> bool {
-    name_leaf_is(name, "compare_value_from_tag") || name_leaf_is(name, "compare_value")
+/// The exact-int `*_from_tag_inner` bodies an inlined caller still walks.
+pub(crate) fn jitcode_is_from_tag_inner(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    jitcode_is_any_pathed(
+        sub_index,
+        sub_body,
+        &[
+            "pyre_interpreter::opcode_ops::compare_value_from_tag_inner",
+            "pyre_interpreter::opcode_ops::binary_value_from_tag_inner",
+        ],
+    )
 }
 
-pub(crate) fn name_is_unbounded_helper_body(name: &str) -> bool {
-    name_is_getattr_family(name)
-        || name_is_setattr_family(name)
-        || name_is_setitem_family(name)
-        || name_is_space_iter(name)
-        || name_leaf_is(name, "compare_value_from_tag_inner")
-        || name_leaf_is(name, "binary_value_from_tag_inner")
+/// Protocol bodies whose declined fold residualizes instead of descending.
+pub(crate) fn jitcode_is_unbounded_helper_body(
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    jitcode_is_space_getattr(sub_index, sub_body)
+        || jitcode_is_getattr_str_impl(sub_index, sub_body)
+        || jitcode_is_frame_load_attr(sub_index, sub_body)
+        || jitcode_is_space_setattr(sub_index, sub_body)
+        || jitcode_is_space_delattr(sub_index, sub_body)
+        || jitcode_is_space_setitem(sub_index, sub_body)
+        || jitcode_is_pathed(sub_index, sub_body, SPACE_ITER_PATH)
+        || jitcode_is_from_tag_inner(sub_index, sub_body)
 }
 
+/// `compare_value_from_tag(a, b, tag)` only.  `compare_value` takes a
+/// `ComparisonOperator`, whose discriminant order is not the tag order
+/// (`Equal` is 2, tag 2 is `>`); its body calls `compare_value_from_tag`,
+/// so walking it reaches this helper with the real tag.
 pub(crate) fn jitcode_is_compare_value_from_tag(
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
 ) -> bool {
-    if crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index).is_some_and(|jc| {
-        name_leaf_is(&jc.name, "compare_value_from_tag") || name_leaf_is(&jc.name, "compare_value")
-    }) {
-        return true;
-    }
-    crate::jitcode_runtime::pathed_jitcode_cached(COMPARE_OP_DESCENT.path).is_some_and(|jc| {
-        jc.index() == sub_index || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
-    }) || jitcode_is_pathed(
-        sub_index,
-        sub_body,
-        "pyre_interpreter::opcode_ops::compare_value",
-    )
+    jitcode_is_pathed(sub_index, sub_body, COMPARE_OP_DESCENT.path)
 }
 
 /// Guard a non-constant attribute name and run the LOAD_ATTR specializations
