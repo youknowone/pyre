@@ -21385,6 +21385,109 @@ pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
 /// `__contains__` slot so a subclass override's `super().__contains__`
 /// resolves to the inherited builtin scan instead of re-entering override
 /// dispatch (which would recurse).
+/// `unicodeobject.py descr_contains` — `value.find(sub) >= 0`.
+/// The find is [`pyre_object::unicodeobject::jit_str_contains`], elidable
+/// on two exact `str`s.  Isolated so `contains_slot` stays loop-free and
+/// look-inside can enter this arm.
+#[inline(never)]
+fn contains_str(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    use pyre_object::*;
+    if !unsafe { is_str(needle) } {
+        return Err(PyError::type_error(format!(
+            "'in <string>' requires string as left operand, not {}",
+            crate::type_methods::arg_type_name(needle)
+        )));
+    }
+    Ok(pyre_object::unicodeobject::jit_str_contains(haystack as i64, needle as i64) != 0)
+}
+
+/// `stringmethods.py descr_contains` on bytes/bytearray.
+#[inline(never)]
+fn contains_bytes_like(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    use pyre_object::*;
+    unsafe {
+        let receiver = simple_buffer_bytes(haystack)?
+            .expect("bytes/bytearray receiver always exports a buffer");
+        let result = if is_int(needle) || is_long(needle) {
+            let v = if is_int(needle) {
+                pyre_object::w_int_get_value(needle)
+            } else {
+                -1
+            };
+            if !(0..=255).contains(&v) {
+                Err(PyError::value_error("byte must be in range(0, 256)"))
+            } else if is_bytes(haystack) {
+                Ok(pyre_object::bytesobject::jit_bytes_contains_byte(haystack as i64, v) != 0)
+            } else {
+                Ok(receiver.as_bytes().contains(&(v as u8)))
+            }
+        } else {
+            match simple_buffer_bytes(needle) {
+                Ok(Some(sub)) => {
+                    let value = if is_bytes(haystack) && is_bytes(needle) {
+                        pyre_object::bytesobject::jit_bytes_contains(haystack as i64, needle as i64)
+                            != 0
+                    } else {
+                        sub.as_bytes().is_empty()
+                            || receiver
+                                .as_bytes()
+                                .windows(sub.as_bytes().len())
+                                .any(|window| window == sub.as_bytes())
+                    };
+                    sub.release();
+                    Ok(value)
+                }
+                Ok(None) => {
+                    let tname = match crate::typedef::r#type(needle) {
+                        Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
+                        None => "object".to_string(),
+                    };
+                    Err(PyError::type_error(format!(
+                        "a bytes-like object is required, not '{tname}'"
+                    )))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        receiver.release();
+        result
+    }
+}
+
+/// `dictmultiobject.py descr_contains` — `getitem(w_key) is not None`.
+#[inline(never)]
+fn contains_dict(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let needle_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(needle);
+    match unsafe {
+        pyre_object::dictmultiobject::w_dict_lookup_checked(
+            haystack,
+            pyre_object::gc_roots::shadow_stack_get(needle_slot),
+        )
+    } {
+        Ok(v) => Ok(v.is_some()),
+        Err(_) => Err(take_pending_dict_key_error(
+            pyre_object::gc_roots::shadow_stack_get(needle_slot),
+        )),
+    }
+}
+
+/// `setobject.py W_BaseSetObject.descr_contains`.
+#[inline(never)]
+fn contains_set(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    crate::typedef::set_descr_contains(haystack, needle)
+}
+
+/// `W_ListObject.descr_contains` via `find_or_count`.
+#[inline(never)]
+fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    Ok(matches!(
+        crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false)?,
+        crate::listobject::FindOrCountResult::Index(_)
+    ))
+}
+
 pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
     use pyre_object::*;
     // `pypy/objspace/std/dictproxyobject.py descr_contains` →
@@ -21508,14 +21611,7 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
     }
     unsafe {
         if is_list(haystack) {
-            // `W_ListObject.descr_contains`: membership is the same
-            // strategy-aware `find_or_count` operation used by count/index.
-            // In particular FloatListStrategy preserves an erased NaN's
-            // identity shortcut with its bit-pattern comparison.
-            return Ok(matches!(
-                crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false,)?,
-                crate::listobject::FindOrCountResult::Index(_)
-            ));
+            return contains_list(haystack, needle);
         }
         if is_tuple(haystack) {
             return if pyre_object::tupleobject::unroll_condition(haystack) {
@@ -21525,89 +21621,16 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             };
         }
         if is_str(haystack) {
-            // `x in s` requires a str left operand; any other type is a
-            // TypeError rather than an elementwise scan.
-            if !is_str(needle) {
-                return Err(PyError::type_error(format!(
-                    "'in <string>' requires string as left operand, not {}",
-                    crate::type_methods::arg_type_name(needle)
-                )));
-            }
-            // Substring test over the WTF-8 bytes: the encoding is
-            // self-synchronizing, so a byte-level match coincides with a
-            // codepoint-level match and lone surrogates compare correctly.
-            let h = pyre_object::w_str_get_wtf8(haystack).as_bytes();
-            let n = pyre_object::w_str_get_wtf8(needle).as_bytes();
-            return Ok(n.is_empty() || h.windows(n.len()).any(|w| w == n));
+            return contains_str(haystack, needle);
         }
-        // bytes / bytearray: stringmethods.py descr_contains via
-        // `_op_val(allow_char=True)` — an int needle is a single byte value
-        // (range-checked), a bytes-like needle is matched as a substring (an
-        // empty needle is always present), and any other type is a TypeError.
-        // `_op_val` falls back to `buffer_w(BUF_SIMPLE)`, so any buffer-protocol
-        // object (e.g. a memoryview) is also accepted as the needle.
         if pyre_object::bytesobject::is_bytes_like(haystack) {
-            let receiver = simple_buffer_bytes(haystack)?
-                .expect("bytes/bytearray receiver always exports a buffer");
-            let result = if is_int(needle) || is_long(needle) {
-                // `_single_char`: `int_w` then `0 <= c < 256`; a bignum is
-                // necessarily out of range (its `int_w` overflows upstream).
-                let v = if is_int(needle) {
-                    pyre_object::w_int_get_value(needle)
-                } else {
-                    -1
-                };
-                if !(0..=255).contains(&v) {
-                    Err(PyError::value_error("byte must be in range(0, 256)"))
-                } else {
-                    Ok(receiver.as_bytes().contains(&(v as u8)))
-                }
-            } else {
-                match simple_buffer_bytes(needle) {
-                    Ok(Some(sub)) => {
-                        let value = sub.as_bytes().is_empty()
-                            || receiver
-                                .as_bytes()
-                                .windows(sub.as_bytes().len())
-                                .any(|window| window == sub.as_bytes());
-                        sub.release();
-                        Ok(value)
-                    }
-                    Ok(None) => {
-                        let tname = match crate::typedef::r#type(needle) {
-                            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-                            None => "object".to_string(),
-                        };
-                        Err(PyError::type_error(format!(
-                            "a bytes-like object is required, not '{tname}'"
-                        )))
-                    }
-                    Err(error) => Err(error),
-                }
-            };
-            receiver.release();
-            return result;
+            return contains_bytes_like(haystack, needle);
         }
-        // dict: key containment (dictmultiobject.py __contains__)
         if is_dict(haystack) {
-            // `w_dict_lookup_checked` runs the key's `__eq__` and may collect;
-            // `needle` is a raw local read again on the error path, so pin it.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let needle_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(needle);
-            return match pyre_object::dictmultiobject::w_dict_lookup_checked(
-                haystack,
-                pyre_object::gc_roots::shadow_stack_get(needle_slot),
-            ) {
-                Ok(v) => Ok(v.is_some()),
-                Err(_) => Err(take_pending_dict_key_error(
-                    pyre_object::gc_roots::shadow_stack_get(needle_slot),
-                )),
-            };
+            return contains_dict(haystack, needle);
         }
-        // set / frozenset (setobject.py W_BaseSetObject.descr_contains)
         if pyre_object::is_set_or_frozenset(haystack) {
-            return crate::typedef::set_descr_contains(haystack, needle);
+            return contains_set(haystack, needle);
         }
     }
     // Instance __contains__ — PyPy: descroperation.py contains_w

@@ -10974,9 +10974,10 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
 /// (`descroperation.rs compare`), and the `bool`-vs-`int` subtype ordering
 /// it keeps is decided on the promoted classes.
 ///
-/// Tags 0..=5 are the six rich comparisons.  `in` / `not in` (6, 7) take
-/// `contains`, `is` / `is_not` (8, 9) have their own fold, and
-/// CHECK_EXC_MATCH (10) its own; none of them is this body's comparison.
+/// Tags 0..=5 are the six rich comparisons.  `in` / `not in` (6, 7)
+/// descend the same [`COMPARE_OP_DESCENT`] helper — `compare_value_from_tag`
+/// routes those tags to `baseobjspace::contains`.  `is` / `is_not` (8, 9)
+/// have their own fold, and CHECK_EXC_MATCH (10) its own.
 pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10986,11 +10987,31 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || r_args.len() != 2
-        || dst_bank != 'r'
-        || !(0..=5).contains(&op_tag)
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_contains(op_tag) {
+        let (Some(needle_obj), Some(haystack_obj)) = (
+            walker_concrete_ref_object(ctx, r_args[0]),
+            walker_concrete_ref_object(ctx, r_args[1]),
+        ) else {
+            return Ok(None);
+        };
+        if !walker_exact_contains_haystack(haystack_obj) {
+            return Ok(None);
+        }
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[(tag, op_tag)],
+            &[(r_args[0], needle_obj), (r_args[1], haystack_obj)],
+            &[],
+            dst,
+            dst_bank,
+            &COMPARE_OP_DESCENT,
+        );
+    }
+    if !(0..=5).contains(&op_tag) {
         return Ok(None);
     }
     let mut operands = [(OpRef::NONE, std::ptr::null_mut()); 2];
@@ -22752,6 +22773,22 @@ fn walker_str_pair_operands<Sym: WalkSym>(
         return None;
     }
     Some((lhs, rhs, lhs_obj, rhs_obj))
+}
+
+/// Exact builtin containers whose `contains_slot` arm is a call to a
+/// loop-free helper (`descr_contains` / elidable find / strategy lookup).
+/// A subclass keeps the residual so `__contains__` override dispatch stays
+/// on the body's own probe rather than this descent's admission.
+fn walker_exact_contains_haystack(obj: pyre_object::PyObjectRef) -> bool {
+    let exact = |tp: &pyre_object::pyobject::PyType| unsafe {
+        pyre_object::is_exact_type(obj, tp)
+            && std::ptr::eq((*obj).w_class, pyre_object::get_instantiate(tp))
+    };
+    exact(&pyre_object::pyobject::STR_TYPE)
+        || exact(&pyre_object::bytesobject::BYTES_TYPE)
+        || exact(&pyre_object::pyobject::DICT_TYPE)
+        || exact(&pyre_object::setobject::SET_TYPE)
+        || exact(&pyre_object::setobject::FROZENSET_TYPE)
 }
 
 /// `guard_class(&STR_TYPE)` + the exact canonical `w_class` guard, the pair
