@@ -3260,7 +3260,9 @@ where
 /// 1. `Arc::ptr_eq` against the PyFrame vinfo
 ///    `array_field_descrs` / `array_descrs` / `static_field_descrs`,
 ///    emitted by `record_graph_op` for vable get/setfield +
-///    get/setarrayitem ops (`jtransform.py:846-927`, `:1880-1906`).
+///    get/setarrayitem ops (`jtransform.py rewrite_op_getfield` /
+///    `rewrite_op_setfield`, `do_fixed_list_getitem` /
+///    `do_fixed_list_setitem`).
 /// 2. `as_any` downcast to pyre's local [`CallDescrStub`], for graph-
 ///    side `residual_call_*` recorders that thread the
 ///    interned stub via [`intern_call_descr_stub`].  The downcast
