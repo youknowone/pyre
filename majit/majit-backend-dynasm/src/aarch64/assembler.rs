@@ -3864,6 +3864,12 @@ impl<'a> AssemblerARM64<'a> {
             // result-less operation, but it is the initialization contract
             // for NEW_ARRAY_CLEAR when malloc_zero_filled=false.
             OpCode::ZeroArray => self.genop_discard_zero_array(op, arglocs),
+            // aarch64/opassembler.py `emit_op_load_effective_address`.
+            // rewrite.py turns COPYSTRCONTENT into LEA + memcpy; a silent
+            // no-op here leaves the memcpy address in an unwritten register.
+            OpCode::LoadEffectiveAddress => {
+                self.genop_load_effective_address(&arglocs, result_loc);
+            }
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
@@ -7248,6 +7254,62 @@ impl<'a> AssemblerARM64<'a> {
     // ================================================================
     // genop_* — string/array operations
     // ================================================================
+
+    /// aarch64/opassembler.py `emit_op_load_effective_address` /
+    /// `_gen_address`: `result = base + (index << scale) + static_offset`.
+    /// `resoperation.py` args `[v_gcptr, v_index, c_baseofs, c_shift]`.
+    fn genop_load_effective_address(&mut self, arglocs: &[Loc], result_loc: Option<&Loc>) {
+        let Some(Loc::Reg(dst)) = result_loc else {
+            panic!("LoadEffectiveAddress result_loc must be Loc::Reg, got {result_loc:?}");
+        };
+        let [base, index, baseofs, shift] = match arglocs {
+            [a, b, c, d, ..] => [a, b, c, d],
+            other => panic!("LoadEffectiveAddress expects 4 arglocs, got {other:?}"),
+        };
+        let shift_amt = match shift {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => i.value,
+            other => panic!(
+                "LoadEffectiveAddress shift must be Immed (rewrite.py ConstInt), got {other:?}"
+            ),
+        };
+        let ofs = match baseofs {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => i.value,
+            other => panic!(
+                "LoadEffectiveAddress baseofs must be Immed (rewrite.py ConstInt), got {other:?}"
+            ),
+        };
+        let base_reg = self.load_loc_to_reg(base, 16);
+        let index_reg = self.load_loc_to_reg(index, 17);
+        if shift_amt > 0 {
+            if !(0..=3).contains(&shift_amt) {
+                panic!(
+                    "LoadEffectiveAddress shift must be 0..=3 (rewrite.py itemscale), got {shift_amt}"
+                );
+            }
+            // `_gen_address`: LSL into ip0 (x16) when scale > 0.  Reload
+            // the base first if it was staged in that same scratch.
+            let scaled = 16u8;
+            if base_reg == scaled {
+                dynasm!(self.mc ; .arch aarch64 ; mov X(dst.value), X(base_reg));
+                dynasm!(self.mc ; .arch aarch64
+                    ; lsl X(scaled), X(index_reg), shift_amt as u32
+                    ; add X(dst.value), X(dst.value), X(scaled)
+                );
+            } else {
+                dynasm!(self.mc ; .arch aarch64
+                    ; lsl X(scaled), X(index_reg), shift_amt as u32
+                    ; add X(dst.value), X(base_reg), X(scaled)
+                );
+            }
+        } else {
+            dynasm!(self.mc ; .arch aarch64 ; add X(dst.value), X(base_reg), X(index_reg));
+        }
+        if ofs == 0 {
+            return;
+        }
+        self.emit_mov_imm64(16, ofs);
+        dynasm!(self.mc ; .arch aarch64 ; add X(dst.value), X(dst.value), x16);
+    }
 
     /// NEWSTR: allocate a byte string of given length.
     /// `base_size` / `item_size` come from the injected ArrayDescr
