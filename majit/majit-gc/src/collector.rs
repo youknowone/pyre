@@ -1618,9 +1618,24 @@ impl MiniMarkGC {
     }
 
     /// Valid-object nursery check for arbitrary GC fields/roots.
+    ///
+    /// A `GcRef` names the payload; the header sits immediately before it
+    /// (`header.rs` / incminimark `size_gc_header`). `is_in_nursery` is a
+    /// range check on the payload, so a word equal to `nursery_start` (or
+    /// any host pointer that reused a retired nursery page) would still
+    /// pass it — and `copy_nursery_object` would then write a forwarding
+    /// header at `addr - SIZE`, which is *outside* the arena. RPython
+    /// never sees this because `_trace_drag_out` receives a typed GC
+    /// pointer; pyre's `GcRef` is a raw `usize`.
     #[inline]
     fn is_nursery_object_start(&self, addr: usize) -> bool {
-        self.is_valid_gc_object(addr) && self.is_in_nursery(addr)
+        if !self.is_valid_gc_object(addr) || !self.is_in_nursery(addr) {
+            return false;
+        }
+        // Payload invariant: the header sits at `addr - SIZE` and must
+        // lie inside the arena. A GcRef equal to `nursery_start` would
+        // write *before* the mapping (ExtraHeap mutex / host allocator).
+        addr >= (self.nursery.start_ptr() as usize).saturating_add(GcHeader::SIZE)
     }
 
     /// Allocate a fixed-size object with the given type ID and size (excluding header).
@@ -4935,6 +4950,16 @@ impl MiniMarkGC {
         // Keep the header access as a raw pointer rather than `&mut GcHeader`.
         // The later `alloc_and_copy` performs a raw read over this same byte
         // range, so re-materialize references only for scoped accesses.
+        //
+        // The header must sit inside this nursery. A payload at
+        // `nursery_start` (or a host pointer that only *looks* in-range)
+        // would write `obj_addr - SIZE` into the mapping before the
+        // arena. RPython's `header(obj)` is only ever asked of a typed
+        // GC payload.
+        let start = self.nursery.start_ptr() as usize;
+        if obj_addr < start.saturating_add(GcHeader::SIZE) || !self.is_in_nursery(obj_addr) {
+            return GcRef(obj_addr);
+        }
         let hdr_ptr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
 
         // `_trace_drag_out` tests forwarding before PINNED: the forwarding
