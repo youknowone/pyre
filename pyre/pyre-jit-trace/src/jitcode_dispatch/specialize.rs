@@ -21057,7 +21057,9 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     // invalidate the array heapcache, so `buf[i] = v; x = buf[i]`
     // reloads the pre-store box (`array_deopt_resume`).  `rlist.py
     // ll_setitem_fast` is the walker-native SETARRAYITEM emit below.
-    let _ = (ctx, op_pc, list_op, key_op, value_op, list_obj, key_obj, value_obj, sid, index);
+    let _ = (
+        ctx, op_pc, list_op, key_op, value_op, list_obj, key_obj, value_obj, sid, index,
+    );
     return Ok(None);
     #[allow(unreachable_code)]
     let Some((sub_body, sym_ptr)) = orthodox_list_setitem_body_and_sym(ctx) else {
