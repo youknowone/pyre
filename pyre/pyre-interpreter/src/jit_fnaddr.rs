@@ -1090,6 +1090,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // each declared path here so a residual call never falls back to a
     // symbolic hash.  The addresses are the word-ABI bridges above, not the
     // raw functions, for the reason their doc gives.
+    pa2(
+        &mut entries,
+        "pyre_interpreter::loop_headers::code_pc_is_loop_header",
+        "pyre_interpreter::code_pc_is_loop_header",
+        crate::loop_headers::code_pc_is_loop_header,
+    );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::loop_headers::cached_loop_region_for_iter_bodies_all_jit_safe",
+        "pyre_interpreter::cached_loop_region_for_iter_bodies_all_jit_safe",
+        crate::loop_headers::cached_loop_region_for_iter_bodies_all_jit_safe,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::loop_headers::cached_function_entry_trace_is_jit_safe",
+        "pyre_interpreter::cached_function_entry_trace_is_jit_safe",
+        crate::loop_headers::cached_function_entry_trace_is_jit_safe,
+    );
     cp1(
         &mut entries,
         "majit_gc::shadow_stack::push",

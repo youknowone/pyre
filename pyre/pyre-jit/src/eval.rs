@@ -23,8 +23,6 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use vecset::VecSet;
-
 use majit_backend::Backend;
 use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
@@ -6547,8 +6545,10 @@ impl PyPyJitDriver {
         if code_ptr.is_null() {
             return false;
         }
-        let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
-        if !cached_loop_header_pcs(code).contains(&next_instr) {
+        if !pyre_interpreter::code_pc_is_loop_header(
+            code_ptr.cast::<pyre_interpreter::CodeObject>(),
+            next_instr,
+        ) {
             return false;
         }
         let env = PyreEnv;
@@ -8420,583 +8420,6 @@ fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> Unsuppor
     shape
 }
 
-/// True for opcodes that may appear in a `FOR_ITER` loop body without ever
-/// reaching the orthodox-sub-walk `list.append`/`STORE_SUBSCR` path whose
-/// walk-abort silently drops an iteration (#57). This is an ALLOW-LIST:
-/// arithmetic/comparison (implicit dunder dispatch resumes past the call on
-/// abort — verified), local/const reads and frame-slot writes, stack
-/// manipulation, read-only attribute loads, and intra-body control flow. Every
-/// other opcode — heap-mutating stores outside the direct-store widening and
-/// unsupported mutators — is treated as unsafe so the frame keeps running in
-/// the interpreter. Unknown/future opcodes default to unsafe.
-fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
-    use pyre_interpreter::Instruction as I;
-    matches!(
-        instr,
-        // local / const: frame slots and constants, no heap mutation
-        I::LoadFast { .. }
-            | I::LoadFastBorrow { .. }
-            | I::LoadFastLoadFast { .. }
-            | I::LoadFastBorrowLoadFastBorrow { .. }
-            | I::LoadFastCheck { .. }
-            | I::LoadFastAndClear { .. }
-            | I::StoreFast { .. }
-            | I::StoreFastLoadFast { .. }
-            | I::StoreFastStoreFast { .. }
-            | I::LoadConst { .. }
-            | I::LoadSmallInt { .. }
-            | I::LoadCommonConstant { .. }
-            // arithmetic / comparison: implicit dunder dispatch recovers on abort
-            | I::BinaryOp { .. }
-            | I::CompareOp { .. }
-            | I::IsOp { .. }
-            | I::UnaryNegative
-            | I::UnaryNot
-            | I::UnaryInvert
-            | I::ToBool
-            // stack manipulation
-            | I::Copy { .. }
-            | I::Swap { .. }
-            | I::PopTop
-            | I::PushNull
-            | I::Nop
-            | I::NotTaken
-            // intra-body control flow
-            | I::PopJumpIfFalse { .. }
-            | I::PopJumpIfTrue { .. }
-            | I::PopJumpIfNone { .. }
-            | I::PopJumpIfNotNone { .. }
-            | I::JumpForward { .. }
-            | I::JumpBackward { .. }
-            | I::JumpBackwardNoInterrupt { .. }
-            // `return` out of the loop.  It pops TOS and ends the frame: no
-            // heap mutation, no sub-walk, so it cannot reach the
-            // append/STORE_SUBSCR path this gate exists for.  The list already
-            // admits `RaiseVarargs` / `Reraise`, which leave the frame by a
-            // strictly more involved route.
-            | I::ReturnValue
-            // nested FOR_ITER: the inner loop's iterator setup and iteration
-            | I::GetIter
-            | I::ForIter { .. }
-            | I::EndFor
-            // sequence unpacking / tuple/slice build: stack-only operations
-            // that produce immutable objects, no heap mutation
-            | I::UnpackSequence { .. }
-            | I::UnpackEx { .. }
-            | I::BuildTuple { .. }
-            | I::BuildSlice { .. }
-            // read-only subscript/membership: lowered to residual calls,
-            // no heap mutation
-            | I::BinarySlice
-            | I::ContainsOp { .. }
-            // string formatting: produces immutable strings
-            | I::FormatSimple
-            // `f"{v:spec}"`. `codewriter.rs` lowers it to one
-            // `format_with_spec` MayForce residual over (value, spec) that
-            // pushes a fresh string -- the `FormatSimple` arm with a second
-            // operand. A user `__format__` may run Python, exactly as a user
-            // `__str__` may under the `ConvertValue` below it.
-            | I::FormatWithSpec
-            | I::ConvertValue { .. }
-            | I::BuildString { .. }
-            // misc read-only: len(), iterator cleanup, local delete,
-            // closure variable read
-            | I::GetLen
-            | I::PopIter
-            | I::DeleteFast { .. }
-            | I::LoadDeref { .. }
-            // An aborting method call resumes exactly via forward-exc-delivery / CALL-forward.
-            | I::LoadAttr { .. }
-            // `LOAD_SUPER_ATTR` is the same read as `LOAD_ATTR` with the MRO
-            // start moved one class along: `codewriter.rs` lowers it to a
-            // single MayForce `load_super_attr` residual (plus, in the method
-            // form, two pure `super_attr_unwrap` residuals over its result),
-            // and it mutates nothing.  The `while`-loop spelling of the same
-            // body already traces — `bench/synth/load_super_attr.py` — so what
-            // this listing decides is only whether the `for` spelling gets the
-            // same trace, and a `for` body holding one ran ~1.3us/iteration
-            // against ~0.015 for the identical body calling `self.plain()`.
-            | I::LoadSuperAttr { .. }
-            // function calls and global reads: the Layer 2 dynamic defense
-            // (body_effect_candidate + fbw_foriter_inflight_take) handles
-            // walk-abort safety, and inline sub-walks are declined when a
-            // FOR_ITER item is in-flight (try_walker_inline_user_call).
-            | I::Call { .. }
-            | I::CallKw { .. }
-            // CALL_FUNCTION_EX is the same MayForce call boundary as CALL and
-            // CALL_KW.  The codewriter lowers it through
-            // RuntimeHelperKind::CallFunctionEx, and
-            // fbw_callee_body_replay_scan defers CallFn, CallKw, and
-            // CallFunctionEx together; omitting only the starred-call spelling
-            // here added no safety beyond the Layer 2 defense above.
-            | I::CallFunctionEx
-            | I::LoadGlobal { .. }
-            // IMPORT_NAME is the same Python-call boundary as CALL: it
-            // resolves builtins.__import__ and invokes it.  The Layer 2
-            // effect journal above is the replay-safety authority for both;
-            // rejecting only the opcode spelling kept otherwise identical
-            // `for` loops interpreted while PyPy traces them.
-            | I::ImportName { .. }
-            // `IMPORT_FROM` is the second half of that same boundary and
-            // always follows an `IMPORT_NAME`, so admitting only the first
-            // left `from X import Y` rejected and `ImportName`'s admission
-            // inert for that spelling. It peeks the module the previous
-            // opcode pushed and pushes the resolved name through one
-            // `import_from` MayForce residual.
-            //
-            // `importing.rs import_from` stores nothing: it is a
-            // `getattr(module, name)` on that module, and on AttributeError a
-            // `sys.modules` lookup for `<__name__>.<name>`.
-            // Both getattrs run the attribute protocol, so a user
-            // `__getattribute__` / `__getattr__` on a module subclass or a
-            // non-module `from` target can run Python and mutate whatever it
-            // reaches -- the same MayForce footing as `LoadAttr` above and
-            // `Call` below.  The residual returns Ref rather than Void, so
-            // `body_effect_candidate` discriminates such an entry by
-            // `entered_user_frame`, and a mid-body abort resumes forward
-            // through `try_commit_midbody_abort` rather than replaying it.
-            // `bench/synth/foriter_import_from_submodule` takes the
-            // `sys.modules` fallback every iteration and pins the count.
-            | I::ImportFrom { .. }
-            | I::Resume { .. }
-            // container builders: produce new heap objects but do not mutate
-            // existing ones; walk-abort just drops the incomplete object
-            | I::BuildList { .. }
-            | I::BuildSet { .. }
-            | I::BuildMap { .. }
-            // MAKE_FUNCTION is another fresh-object builder: codewriter.rs
-            // lowers RuntimeHelperKind::MakeFunction as a Plain allocation that
-            // runs no user code and cannot raise. SET_FUNCTION_ATTRIBUTE only
-            // initializes that newly-built function's typed fields, likewise
-            // without user code or an exception, so replay drops or rebuilds
-            // the incomplete function rather than mutating a pre-existing
-            // object. MakeCell belongs to the containing frame's prologue and
-            // CopyFreeVars to the nested function's prologue, not to this
-            // definition sequence.
-            | I::MakeFunction { .. }
-            | I::SetFunctionAttribute { .. }
-            // In-frame exception raise / handling. These opcodes already trace
-            // in the while-loop form (whose body bypasses this FOR_ITER-only
-            // scan): the raised exception is virtualized and a walk abort
-            // rewinds partial trace state. The finally-duplicated FOR_ITER
-            // hazard is gated separately by for_iter_frame_is_finally_duplicated.
-            | I::RaiseVarargs { .. }
-            | I::PushExcInfo
-            | I::CheckExcMatch
-            | I::PopExcept
-            | I::Reraise { .. }
-            // `LOAD_SPECIAL` and `WITH_EXCEPT_START` are NOT admitted. The
-            // opcodes themselves are safe — neither runs user code, and the
-            // calls they set up are ordinary `Call` boundaries admitted above —
-            // but admitting them puts `with` inside `for` in the JIT, and a
-            // `@contextmanager` generator used that way loses a `GeneratorExit`
-            // to the caller: `test.test_pow` `test_negative_exponent` (nested
-            // `for` around `with self.subTest(...)`) errors with a bare
-            // `GeneratorExit`, at a coordinate that moves between runs and is
-            // clean under `PYRE_JIT=0`. `bench/synth/foriter_load_special_with`
-            // records the shape's answer while the frame stays interpreted;
-            // `bench/synth/exception_with_exit_self_null_slot` is the `while`
-            // form, which never depended on this gate.
-            //
-            // 2026-08-24: the witness above no longer fires.  Admitting both
-            // opcodes on this tree and rebuilding, `test.test_pow` is OK 3/3
-            // with no `GeneratorExit` anywhere in the output, and 14 further
-            // `with`/generator-heavy modules — `test_long`, `test_contextlib`,
-            // `test_contextlib_async`, `test_with`, `test_unittest`,
-            // `test_exceptions`, `test_exception_variations`, `test_except_star`,
-            // `test_raise`, `test_decimal`, `test_generator_stop`,
-            // `test_coroutines`, `test_yield_from` — are clean too.  The
-            // admission is not inert: it takes `foriter_load_special_with` from
-            // `loops_compiled=2` to `3` and the fixture still prints its
-            // recorded answer.  Two `with` root causes landed in between, either
-            // of which could account for it: the `bh_with_except_start_fn`
-            // null-receiver tag that was aborting every bridge out of a `with`
-            // handler at op 1, and the blackhole `guard_class` no-op stub that
-            // lost a second suppressing `__exit__`.
-            //
-            // The gate stays shut anyway, because admitting it is not a
-            // one-file change: `loops_aborted` goes 0 -> 9 on that fixture, so
-            // all three backends' jitstats need re-recording, and the method
-            // note on the original defect is that two green synthetic gate runs
-            // on three backends missed it while the cpython suite caught it —
-            // so the full 209-module suite is the evidence to produce, not a
-            // subset.  Neither is measurable on a host that cannot build
-            // release.
-            // oparg prefix + inline-cache padding (no-ops in the body scan)
-            | I::ExtendedArg
-            | I::Cache
-    )
-}
-
-/// True iff every `FOR_ITER` loop body in `code` is admissible. The BASE rule is
-/// `for_iter_body_op_is_jit_safe`. A nested `FOR_ITER` appears as a body
-/// instruction of its enclosing loop, and its own body is scanned when the
-/// outer instruction walk reaches it. The iterable setup (`range(n)`,
-/// `GET_ITER`) precedes the `FOR_ITER` and is therefore not part of any body
-/// range.
-///
-/// This whole gate is a conservative adaptation, not an upstream mechanism.
-/// Mid-body walk aborts now resume exactly through `try_commit_midbody_abort`:
-/// forward-exception-delivery handles propagated exceptions and CALL-forward
-/// re-runs the outer call, instead of using the FBW refuse-drop path. This
-/// matches the forward-only resume of `blackhole_from_resumedata`
-/// (resume.py:1312), which never drops or doubles an iteration.
-///
-/// The direct heap-mutation opcodes `STORE_SUBSCR`, `STORE_ATTR`, `STORE_NAME`,
-/// `STORE_GLOBAL`, `STORE_DEREF`, `DELETE_SUBSCR`, `DELETE_ATTR`, and the
-/// `LOAD_NAME` that reads module globals are admitted in any body, including one
-/// with a call, branch or nested loop. A mid-body abort after a committed
-/// un-journaled store, cell write, or delete now resumes exactly through
-/// `try_commit_midbody_abort`:
-/// forward-exception-delivery or CALL-forward replaces the FBW refuse-drop that
-/// skipped the iteration tail. The mutation therefore commits exactly once and
-/// the tail is never dropped, matching the forward-only resume of
-/// `blackhole_from_resumedata`. STORE_DEREF's cell slot and every subsequent
-/// operand-stack slot are reconstructed independently, including both method
-/// slots consumed by a tail CALL. A mutation that raises, or a later exception
-/// after the cell write, propagates through forward-exception-delivery; Fix A's
-/// exit-frame traceback recording preserves its traceback exactly. `LOAD_ATTR`
-/// is admitted because a mid-body abort from its method call follows the same
-/// exact-resume path rather than dropping the remainder of the iteration.
-///
-/// `LIST_EXTEND` has the same contract. `pyopcode.py LIST_EXTEND` calls
-/// `space.call_method(v, 'extend', w)` and only translates the non-iterable
-/// error. An iterable may mutate the list before it raises, so replay is not
-/// sound; a mid-body abort therefore keeps that partial or complete mutation
-/// and resumes forward through `try_commit_midbody_abort` or exception
-/// delivery. CALL-forward remains limited to the before-run case. The extend
-/// is consequently applied exactly once and no iteration tail is dropped.
-/// `SET_ADD` and `MAP_ADD` — the set/dict comprehension accumulators — are
-/// admitted on the same footing, because upstream spells them as operations this
-/// body scan already admits and gives them no accumulator status of their own:
-/// `pyopcode.py SET_ADD` is `space.call_method(w_set, 'add', w_value)`, the
-/// `LOAD_ATTR` + `CALL` pair above, and `pyopcode.py MAP_ADD` is
-/// `space.setitem(w_dict, w_key, w_value)`, i.e. `STORE_SUBSCR`. Neither is
-/// folded here — the codewriter lowers both to a void `residual_call_r_v`
-/// (`bh_set_add_fn` / `bh_map_add_fn`), so they carry exactly the body-effect
-/// accounting of the residual they are, and a mid-body abort resumes through the
-/// same `try_commit_midbody_abort` path as the store family.
-/// A function-entry trace starts before bytecode dispatch and can therefore
-/// reach any `FOR_ITER` body in the code object. This is a trace-start policy,
-/// not frame admission: declining it leaves the interpreted frame running so
-/// each back-edge can make its own region-scoped decision.
-fn function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let instructions = &code.instructions;
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in instructions.iter().copied().enumerate() {
-        let (instr, _) = arg_state.get(unit);
-        if matches!(instr, I::ForIter { .. }) && !for_iter_body_is_jit_safe_at(code, pc) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Return the pc ranges that make up the natural loop region whose header is
-/// `loop_header_pc`: the header, plus every instruction that can reach one of
-/// its backedges without passing through the header again. An empty result
-/// means `loop_header_pc` has no backedge and so names no region.
-///
-/// This is the natural loop of the backedge, computed over
-/// [`crate::jit::codewriter::code_successors`], which already carries the
-/// exception edges — so an out-of-line handler that rejoins the body is in the
-/// region exactly when control really can return through it, with no appeal to
-/// where the handler was laid out. A `return` leg is reachable from the header
-/// but reaches no backedge, so it stays outside.
-///
-/// It is deliberately not the header's strongly connected component. An inner
-/// loop's SCC is its *outer* loop: leaving the inner loop, finishing the outer
-/// body and taking the outer backedge does return to the inner header, so the
-/// intersection of "reaches" and "is reached by" swallows the enclosing loop
-/// and gates the inner backedge on `FOR_ITER`s outside it. Stopping the walk at
-/// the header is what keeps a nested loop scoped to itself.
-///
-/// The result is a set of ranges rather than one span because a handler is laid
-/// out after the code that follows its `try`, not next to the body it protects.
-/// Whatever sits between the two belongs to neither and cannot run in this
-/// backedge's trace.
-///
-/// Reading the ranges off the exception table's own `(start, end, target)`
-/// extents does not work, and is not what carries the handlers here. A
-/// rejoining jump is emitted after the block's `PopBlock` / `PopExcept`, so
-/// `assemble_exception_table` stamps it with the popped handler and no entry
-/// covers it — the extents name where a handler protects, never where control
-/// re-enters from. The successor edges do carry it, because the handler's own
-/// instructions reach the backedge.
-fn loop_region_ranges(
-    code: &pyre_interpreter::CodeObject,
-    loop_header_pc: usize,
-) -> Vec<std::ops::RangeInclusive<usize>> {
-    use pyre_interpreter::Instruction as I;
-
-    let num_instrs = code.instructions.len();
-    if loop_header_pc >= num_instrs {
-        return Vec::new();
-    }
-
-    let mut backedge_sources: Vec<usize> = Vec::new();
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instr, op_arg) = arg_state.get(unit);
-        let target = match instr {
-            I::JumpBackward { delta } => {
-                Some(skip_caches(code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            I::JumpBackwardNoInterrupt { delta } => {
-                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            _ => None,
-        };
-        if target == Some(loop_header_pc) {
-            backedge_sources.push(pc);
-        }
-    }
-    if backedge_sources.is_empty() {
-        return Vec::new();
-    }
-
-    let succ = crate::jit::codewriter::code_successors(code);
-    let mut pred: Vec<Vec<usize>> = vec![Vec::new(); num_instrs];
-    for (pc, nexts) in succ.iter().enumerate() {
-        for &next in nexts {
-            pred[next].push(pc);
-        }
-    }
-
-    // Seeding the header first is what bounds the walk: it is already in the
-    // region, so no predecessor edge is ever followed out through it.
-    let mut in_region = vec![false; num_instrs];
-    in_region[loop_header_pc] = true;
-    let mut stack: Vec<usize> = Vec::new();
-    for source in backedge_sources {
-        if source < num_instrs && !in_region[source] {
-            in_region[source] = true;
-            stack.push(source);
-        }
-    }
-    while let Some(pc) = stack.pop() {
-        for &prev in &pred[pc] {
-            if !in_region[prev] {
-                in_region[prev] = true;
-                stack.push(prev);
-            }
-        }
-    }
-
-    let mut ranges: Vec<std::ops::RangeInclusive<usize>> = Vec::new();
-    let mut run_start: Option<usize> = None;
-    for pc in 0..num_instrs {
-        match (in_region[pc], run_start) {
-            (true, None) => run_start = Some(pc),
-            (false, Some(start)) => {
-                ranges.push(start..=pc - 1);
-                run_start = None;
-            }
-            _ => {}
-        }
-    }
-    if let Some(start) = run_start {
-        ranges.push(start..=num_instrs - 1);
-    }
-    ranges
-}
-/// Apply the FOR_ITER safety gate only to loops inside the natural loop region
-/// whose backedge is being considered. `interp_jit.py:118-120` invokes
-/// `can_enter_jit` for that backedge. Later disjoint loops remain outside the
-/// region, while out-of-line handlers that rejoin this loop are included.
-fn loop_region_for_iter_bodies_all_jit_safe(
-    code: &pyre_interpreter::CodeObject,
-    loop_header_pc: usize,
-) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let ranges = loop_region_ranges(code, loop_header_pc);
-    if ranges.is_empty() {
-        return true;
-    }
-    let mut scan_state = pyre_interpreter::OpArgState::default();
-    for (pc, unit) in code.instructions.iter().copied().enumerate() {
-        let (instr, _) = scan_state.get(unit);
-        if !ranges.iter().any(|range| range.contains(&pc)) {
-            continue;
-        }
-        if matches!(instr, I::ForIter { .. }) && !for_iter_body_is_jit_safe_at(code, pc) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Whether `PYRE_FOR_ITER_GATE_DIAG` is set. The per-opcode decline and the
-/// whole-region decline print under one flag, so they read one accessor.
-fn for_iter_gate_diag_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_FOR_ITER_GATE_DIAG").is_some())
-}
-
-fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) -> bool {
-    use pyre_interpreter::Instruction as I;
-    let instructions = &code.instructions;
-    let Some((I::ForIter { delta }, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc)
-    else {
-        return true;
-    };
-    let exit =
-        pyre_interpreter::jump_target_forward(instructions, pc + 1, delta.get(op_arg).as_usize());
-    // The `LIST_APPEND` opcode (the inlined-comprehension accumulator) is
-    // admitted wherever it appears, like `SET_ADD` and `MAP_ADD` beside it.
-    // That is a statement about the one opcode, not about the body around it:
-    // the scan below still walks every body instruction and refuses the whole
-    // FOR_ITER on the first one outside the permitted set.
-    //
-    // It used to be admitted only for a call-free body, over two hazards.
-    // Both were re-measured on 2026-08-20 and neither reproduces:
-    //
-    // * GC liveness — a per-element call binds a freshly constructed object,
-    //   and `extra_tests/parity_tests/weakref_gc_lifeline.py` was said to see
-    //   the last element survive the collection that should have run its
-    //   weakref callback. That fixture is OK 10/10 per backend with the scan
-    //   gone, and the whole parity suite passes under the runner's
-    //   `--gc-poison` (`MAJIT_GC_NURSERY_POISON=1`) as well.
-    // * The in-flight delivery gap (single-executor tracing, gh#73/#34) —
-    //   the scan only narrowed how often it was reached, never bounded it.
-    //   Its cause here was a misclassification, not an unrecoverable effect:
-    //   `writes_live_heap` holds for EVERY `CallFn`, so `_operator.index` —
-    //   which `space.index` answers by returning an int argument unchanged,
-    //   ahead of any `__index__` lookup — was booked as a body effect, which
-    //   refused the consumed item's delivery AND broke the gh#467
-    //   CALL-forward odometer. `randrange`'s `_index(start)` is how
-    //   `for_iter_call_bearing_comprehension.py` reached it. That call is now
-    //   a replay-safe observed class (`residual_call.rs`), the walk's
-    //   `effects` at the abort reads 0 rather than 1, and the abort commits a
-    //   forward resume instead of falling back to the legacy replay.
-    //
-    // The stake, same binary, `[uf(x) for x in it]` against the semantically
-    // identical `for x in it: l.append(uf(x))`: the statement loop runs 45x
-    // faster than `PYRE_JIT=0` either way, while the comprehension went from
-    // 0.69x — the JIT costing more than it saved, because a declined caller
-    // frame makes every callee pay full entry cost while nothing compiles —
-    // to 9.60x.
-    //
-    // Upstream has no counterpart to any of this: `interp_jit.py`'s
-    // `jit_merge_point` is unconditional, and `pyopcode.py` spells
-    // `LIST_APPEND` as `space.call_method(v, 'append', w)`, an operation this
-    // body scan already admits. The scan existed only to protect pyre's
-    // tracer-level `LIST_APPEND` fold.
-    //
-    // A value-producing but call-free body — arithmetic, subscript, or
-    // an Object-strategy element (`[(i, i) …]`, `[None …]`, `["s" …]`,
-    // `[{i: i} …]`, `[f"{i}" …]`) — was already admitted. The only residual an
-    // Object-strategy append leaves in the folded body is the idempotent
-    // `list_write_barrier`, exempt from the FBW body-effect accounting (it is
-    // not a body effect, mirroring RPython's `COND_CALL_GC_WB`, which pyjitpl
-    // never executes and the optimizer never treats as a side effect).
-    //
-    // A non-empty nested `BUILD_LIST` element (`[[i] …]`) is admitted too: the
-    // fold virtualizes the inner list, whose separately allocated backing
-    // block (`NewArray` / `NewArrayClear`) carries no jitcode-liveness slot,
-    // and with the trace-time single-executor forks retired the append body no
-    // longer runs under a speculative-replay sub-walk, so the block is bound
-    // at every guard-exit deopt and the shape compiles bit-exact on all
-    // backends (`bench/synth/nested_list_comprehension_hot.py`).
-    let mut body_state = pyre_interpreter::OpArgState::default();
-    let mut body_pc = pc + 1;
-    while body_pc < exit && body_pc < instructions.len() {
-        let (body_instr, body_arg) = body_state.get(instructions[body_pc]);
-        if let I::ForIter { delta } = body_instr {
-            // Validate the nested body exactly once, under its own
-            // lexical FOR_ITER.  Scanning it again as part of the
-            // outer body conflates unrelated calls with its
-            // LIST_APPEND and declines safe PEP 709 comprehensions.
-            body_pc = pyre_interpreter::jump_target_forward(
-                instructions,
-                body_pc + 1,
-                delta.get(body_arg).as_usize(),
-            );
-            body_state = pyre_interpreter::OpArgState::default();
-            continue;
-        }
-        // CALL_INTRINSIC_1 names several unrelated operations. UnaryPositive
-        // and ListToTuple are the two variants codewriter.rs actually lowers:
-        // the first follows the same implicit-dunder exact-resume path as
-        // UnaryNegative, while the second returns a fresh tuple. Admit those
-        // two, but not the def-time/import/error-path variants whose lowering
-        // deliberately aborts permanently.
-        let supported_call_intrinsic_1 = matches!(
-            body_instr,
-            I::CallIntrinsic1 { func }
-                if matches!(
-                    func.get(body_arg),
-                    pyre_interpreter::bytecode::IntrinsicFunction1::UnaryPositive
-                        | pyre_interpreter::bytecode::IntrinsicFunction1::ListToTuple
-                )
-        );
-        let permitted = for_iter_body_op_is_jit_safe(body_instr)
-            || supported_call_intrinsic_1
-            || matches!(
-                body_instr,
-                I::StoreSubscr
-                    | I::StoreAttr { .. }
-                    | I::StoreName { .. }
-                    | I::StoreGlobal { .. }
-                    | I::StoreDeref { .. }
-                    | I::DeleteSubscr
-                    | I::DeleteAttr { .. }
-                    | I::LoadName { .. }
-                    // `call_method(set, 'add', v)` / `setitem(d, k, v)`
-                    // spelled as one opcode; void residuals, not folds.
-                    | I::ListExtend { .. }
-                    | I::SetAdd { .. }
-                    | I::MapAdd { .. }
-                    // The other three container-update opcodes lower the same
-                    // way as `LIST_EXTEND`: pop the source, peek the container,
-                    // emit one void accumulate residual, and the codewriter and
-                    // `liveness` already treat all four as one class. Each also
-                    // targets a container built in the same expression -- a set
-                    // or dict display, or a call's `**kwargs` dict -- so a walk
-                    // abort drops an incomplete fresh object rather than
-                    // replaying a mutation of a pre-existing one. A set display
-                    // that must yield a mutable set compiles to `BUILD_SET 0` +
-                    // `SET_UPDATE 1` even when every element is constant, so
-                    // declining these took every loop that builds one out of
-                    // the JIT.
-                    | I::SetUpdate { .. }
-                    | I::DictUpdate { .. }
-                    | I::DictMerge { .. }
-                    // `LOAD_BUILD_CLASS` pushes `frame.get_builtin()` and
-                    // touches nothing else. `codewriter.rs` lowers it as a
-                    // frame-only Ref read under a compile-time assert that
-                    // `HONOR_BUILTINS` is false, so which frame asks does not
-                    // change the answer. A loop body that defines a class
-                    // holds one.
-                    //
-                    // `DELETE_NAME` and `DELETE_GLOBAL` deliberately stay out,
-                    // even though they reach the same
-                    // `try_walker_force_quasi_immut_namespace_write` as the
-                    // two stores above. A repeated store settles: after the
-                    // first write `store_would_bump_version` stops bumping and
-                    // the loop compiles. A delete removes the cell, so it
-                    // bumps every iteration and forces every iteration --
-                    // `x = i * 2; total += x` compiles with 0 aborts, and the
-                    // same loop with `del x` appended traces 5 times and
-                    // aborts all 5 on the force, compiling nothing.
-                    | I::LoadBuildClass
-            )
-            || matches!(body_instr, I::ListAppend { .. });
-        if !permitted {
-            if for_iter_gate_diag_enabled() {
-                eprintln!(
-                    "[for-iter-gate-opcode] code={} source={} for_iter_pc={pc} body_pc={body_pc} opcode={body_instr:?}",
-                    code.qualname, code.source_path
-                );
-            }
-            return false;
-        }
-        body_pc += 1;
-    }
-    true
-}
-
 /// True when `code` holds more than one `FOR_ITER` and at least one of them
 /// sits in the *exceptional copy* of a `finally` body — the signature of a loop
 /// DUPLICATED into a `finally` block's normal and exceptional copies (3.14
@@ -9022,7 +8445,7 @@ fn for_iter_body_is_jit_safe_at(code: &pyre_interpreter::CodeObject, pc: usize) 
 ///
 /// A single `FOR_ITER` keeps JITting because the count stays at one, and
 /// genuinely nested `FOR_ITER` frames are already declined by
-/// [`function_entry_trace_is_jit_safe`].
+/// [`pyre_interpreter::function_entry_trace_is_jit_safe`].
 fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> bool {
     let entries: Vec<_> =
         pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
@@ -10284,50 +9707,6 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     }
 }
 
-/// Loop-header PC set for `code`, from the `CallControl` that owns the
-/// per-graph codewriter caches (call.py `self.jitcodes = {}`).
-///
-/// The set is scanned once per graph and kept there, matching the point in
-/// upstream where loop headers are fixed: `jtransform.py:1714-1723`
-/// rewrites `can_enter_jit` into a `loop_header` operation while the
-/// codewriter builds that graph's `JitCode`, so the running interpreter
-/// only ever reads an already-derived answer. Recomputing the scan per
-/// back-edge would re-walk the whole bytecode and rebuild the successor
-/// map on every loop iteration of every interpreted frame.
-fn cached_loop_header_pcs(code: &pyre_interpreter::CodeObject) -> std::sync::Arc<VecSet<usize>> {
-    // The `&mut CallControl` borrow ends with this statement — the set is
-    // handed back as a shared `Arc`, so no caller holds it across a
-    // re-entry into `callcontrol()`.
-    crate::jit::codewriter::CodeWriter::instance()
-        .callcontrol()
-        .get_loop_header_pcs(code)
-}
-
-fn cached_loop_region_for_iter_bodies_all_jit_safe(
-    code: &pyre_interpreter::CodeObject,
-    loop_header_pc: usize,
-) -> bool {
-    let key = (code as *const _ as usize, loop_header_pc);
-    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
-    if let Some(&safe) = callcontrol.loop_region_jit_safe.get(&key) {
-        return safe;
-    }
-    let safe = loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc);
-    callcontrol.loop_region_jit_safe.insert(key, safe);
-    safe
-}
-
-fn cached_function_entry_trace_is_jit_safe(code: &pyre_interpreter::CodeObject) -> bool {
-    let key = code as *const _ as usize;
-    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
-    if let Some(&safe) = callcontrol.function_entry_trace_jit_safe.get(&key) {
-        return safe;
-    }
-    let safe = function_entry_trace_is_jit_safe(code);
-    callcontrol.function_entry_trace_jit_safe.insert(key, safe);
-    safe
-}
-
 /// warmspot.py portal_runner parity: execute a frame through the JIT-enabled
 /// interpreter. Used by bhimpl_recursive_call (blackhole.py:1074-1093) for
 /// recursive portal depth. Returns PyObjectRef (NULL on void/exception).
@@ -10978,14 +10357,17 @@ fn maybe_compile_and_run(
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
-    if !cached_loop_region_for_iter_bodies_all_jit_safe(code, loop_header_pc) {
+    if !pyre_interpreter::cached_loop_region_for_iter_bodies_all_jit_safe(
+        code as *const _,
+        loop_header_pc,
+    ) {
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_for_iter_region();
         const DENIAL: &str = "BackedgeGate::ForIter/UnsafeLoopRegion";
         let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
             code as *const _ as usize,
             DENIAL,
         );
-        if first_decline && for_iter_gate_diag_enabled() {
+        if first_decline && pyre_interpreter::for_iter_gate_diag_enabled() {
             eprintln!(
                 "[for-iter-gate-decline] code={} source={} loop_header_pc={loop_header_pc} predicate={DENIAL}",
                 code.qualname, code.source_path
@@ -12692,7 +12074,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // this newly armed trace when one of those bodies is unsafe; the frame
     // continues in `eval_loop_jit`, where its back-edges tick independently
     // and consult their own natural loop regions.
-    if !cached_function_entry_trace_is_jit_safe(code) {
+    if !pyre_interpreter::cached_function_entry_trace_is_jit_safe(code as *const _) {
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_function_entry();
         return None;
     }
@@ -15378,6 +14760,10 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyre_interpreter::{
+        for_iter_body_is_jit_safe_at, function_entry_trace_is_jit_safe,
+        loop_region_for_iter_bodies_all_jit_safe, loop_region_ranges,
+    };
 
     #[test]
     fn opcode_method_name_underscores_numeric_suffixes() {
