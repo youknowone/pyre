@@ -677,15 +677,13 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 // depth 1.  PyPy's MIFrame keeps that register
                 // (`pyopcode.py opcode_for_iter` peeks; it never
                 // reconstructs the slot from `vstack_last_ref`).  A
-                // ResultToTos replay whose last-ref is not an iterator
-                // — NONE, a wrapint, a setattr dest — must not replace
-                // a surviving iterator.  GET_ITER at the loop header
-                // is the common visitor: the opcode already ran, and
-                // last-ref names a later boxed int.
+                // later iterator in last-ref (a nested `iter()` in the
+                // body) also answers `__next__`; keep the surviving
+                // TOS unless last-ref is the same box GET_ITER just
+                // wrote.
                 let existing = ctx.frame_state.borrow().vstack_boxes[new_depth - 1];
-                let keep_iterator = new_depth == 1
-                    && last_ref_is_fresh_iterator(ctx, existing)
-                    && !last_ref_is_fresh_iterator(ctx, top);
+                let keep_iterator =
+                    new_depth == 1 && last_ref_is_fresh_iterator(ctx, existing) && top != existing;
                 if !keep_iterator {
                     ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
                 }

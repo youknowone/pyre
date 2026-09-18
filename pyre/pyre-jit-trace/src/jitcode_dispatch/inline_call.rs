@@ -15670,43 +15670,6 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         })? {
             return Ok((outcome, op.next_pc));
         }
-        if let Ok(setup) =
-            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
-            && let Some(call_descr) = setup.descr.as_call_descr()
-        {
-            if spec_gate(SpecFold::CompareOpInt, || {
-                super::specialize::try_walker_specialize_compare_op_int(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-            if spec_gate(SpecFold::CompareOpLongInt, || {
-                super::specialize::try_walker_specialize_compare_op_long_int(
-                    ctx,
-                    op.pc,
-                    op_tag,
-                    &ref_args,
-                    &setup.allboxes,
-                    call_descr,
-                    dst,
-                    dst_bank,
-                )
-            })?
-            .is_some()
-            {
-                return Ok((DispatchOutcome::Continue, op.next_pc));
-            }
-        }
     }
     // A declined compare fold must not walk `compare_value_from_tag`:
     // that body is the whole rich-compare protocol and is unbounded.
