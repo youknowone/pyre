@@ -266,6 +266,15 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     w_tuple_new_array_backed(items)
 }
 
+/// Word-ABI residual of a 1-tuple.
+///
+/// `w_tuple_new(vec![item])` builds a `Vec`, which the walk cannot lower.
+/// One `PyObjectRef` argument is a single residual slot.
+#[majit_macros::dont_look_inside]
+pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
+    w_tuple_new(vec![item])
+}
+
 /// Allocate the array-backed `W_TupleObject` directly, bypassing
 /// arity-2 specialisation. Useful for tests and call sites that need
 /// the canonical layout.

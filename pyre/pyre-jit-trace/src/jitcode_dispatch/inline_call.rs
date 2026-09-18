@@ -4781,6 +4781,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -4793,7 +4795,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             op.pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             "builtin_wrapper_call_site",
-            None,
+            vstack,
             &[],
             None,
         )
@@ -5099,6 +5101,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             return Err(error);
         }
     };
+    // Look-inside of `str.startswith` / `str.endswith` is
+    // `try_walker_inline_*`, not the residual prefix-match fold.  Recording
+    // it on `str_startswith` / `str_endswith` made
+    // `PYRE_FBW_NO_SPECIALIZE=str_startswith` report `fired` after the walk
+    // had already replaced the call.  `spec_suppression` leaves these
+    // descent entry points live even under `all`; the residual `spec_gate`
+    // still covers leftover `jit_str_startswith` / `jit_str_endswith`.
     match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {

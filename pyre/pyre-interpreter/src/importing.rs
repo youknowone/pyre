@@ -5205,6 +5205,49 @@ pub fn import_name(
 // ── __import__ ───────────────────────────────────────────────────────
 // PyPy equivalent: _frozen_importlib/interp_import.py `interp___import__`
 
+/// `_gcd_import` cache probe: `sys.modules` plus `__spec__._initializing`.
+///
+/// `interp_import.py _gcd_import` raises `FastPathGiveUp` on a miss, a
+/// missing `__spec__`, or a truthy `_initializing`.  A `__spec__` without
+/// `_initializing` counts as initialised (a builtin module).
+enum GcdCache {
+    Miss,
+    Ready(PyObjectRef),
+    Initializing(PyObjectRef),
+}
+
+fn gcd_import_cache_probe(name: &str) -> Result<GcdCache, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
+    // would fall back to the interpreter cache, resurrecting a builtin the
+    // sentinel is meant to block.  Give up so the slow path raises
+    // `import of {name} halted; None in sys.modules`.
+    if sys_modules_blocks(name) {
+        return Ok(GcdCache::Miss);
+    }
+    let Some(w_module) = check_sys_modules(name) else {
+        return Ok(GcdCache::Miss);
+    };
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_module);
+    let Some(w_spec) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
+    else {
+        return Ok(GcdCache::Miss);
+    };
+    let spec_slot = shadow_stack_len();
+    let _ = pin_root(w_spec);
+    if let Some(w_initializing) =
+        crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
+        && crate::baseobjspace::is_true(w_initializing)?
+    {
+        return Ok(GcdCache::Initializing(shadow_stack_get(mod_slot)));
+    }
+    Ok(GcdCache::Ready(shadow_stack_get(mod_slot)))
+}
+
 /// `_gcd_import` fast path: the already-imported module for `name`, after
 /// waiting for another thread to finish initialising it.
 ///
@@ -5221,38 +5264,166 @@ pub fn import_name(
 /// missing `__spec__`, or an entry removed/replaced while we waited.  A
 /// `__spec__` without `_initializing` counts as initialised (a builtin module).
 fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
-    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+    match gcd_import_cache_probe(name)? {
+        GcdCache::Miss => Ok(None),
+        GcdCache::Ready(w_module) => Ok(Some(w_module)),
+        GcdCache::Initializing(w_module) => {
+            // The wait is a Python call into `_lock_unlock_module`.  Keep it
+            // off the look-inside graph so `test_import.test_import_in_function`
+            // can see only the initialized-module arm (`guard_not_invalidated`).
+            wait_initializing_module(name, w_module)
+        }
+    }
+}
 
-    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
-    // would fall back to the interpreter cache, resurrecting a builtin the
-    // sentinel is meant to block.  Give up so the slow path raises
-    // `import of {name} halted; None in sys.modules`.
-    if sys_modules_blocks(name) {
-        return Ok(None);
+/// JIT residual view of `_gcd_import`: initialized `sys.modules` entry,
+/// or `None` on every `FastPathGiveUp` case *and* on any shape whose
+/// `__spec__` / `_initializing` read would run Python.
+///
+/// The residual is a non-forcing `CallR` so
+/// `test_import.test_import_in_function` stays `guard_not_invalidated`
+/// only.  A non-default module `__getattribute__`, a data descriptor, or a
+/// non-bool `_initializing` declines; the original `IMPORT_NAME` then
+/// runs `dunder_import` (including hooks and the 3.14 wait).
+///
+/// Exact `module` uses `Module.descr_getattribute`, not
+/// `object.__getattribute__`.  The object-default check would decline every
+/// real module and force the slow `CallMayForce` importer on every
+/// `import math`.
+pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
+    if sys_modules_blocks_no_callback(name)? {
+        return None;
     }
-    let Some(w_module) = check_sys_modules(name) else {
-        return Ok(None);
-    };
-    let _roots = push_roots();
-    let mod_slot = shadow_stack_len();
-    let _ = pin_root(w_module);
-    let Some(w_spec) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
-    else {
-        return Ok(None);
-    };
-    let spec_slot = shadow_stack_len();
-    let _ = pin_root(w_spec);
-    if let Some(w_initializing) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
-        && crate::baseobjspace::is_true(w_initializing)?
-    {
-        // The wait is a Python call into `_lock_unlock_module`.  Keep it off
-        // the look-inside graph so `test_import.test_import_in_function` can
-        // see only the initialized-module arm (`guard_not_invalidated`).
-        return wait_initializing_module(name, shadow_stack_get(mod_slot));
+    let w_module = check_sys_modules_no_callback(name)??;
+    if !unsafe { pyre_object::is_module(w_module) } {
+        return None;
     }
-    Ok(Some(shadow_stack_get(mod_slot)))
+    let w_type = unsafe { (*w_module).w_class };
+    if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
+        return None;
+    }
+    // `getattr` consults a data descriptor before the instance dict.
+    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, "__spec__") } {
+        return None;
+    }
+    let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
+    if dict.is_null() {
+        return None;
+    }
+    let w_spec = match dict_getitem_str_no_callback(dict, "__spec__")? {
+        None => {
+            // Dict miss is `getattr` `AttributeError` only when the type
+            // does not still bind `__spec__`.
+            if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__spec__") }.is_some() {
+                return None;
+            }
+            return None;
+        }
+        Some(spec) if spec.is_null() || unsafe { pyre_object::is_none(spec) } => {
+            // `getattr(None, "_initializing")` is `AttributeError`;
+            // `_gcd_import` then treats the module as initialized.
+            return Some(w_module);
+        }
+        Some(spec) => spec,
+    };
+    let spec_type = unsafe { (*w_spec).w_class };
+    if unsafe { crate::baseobjspace::getattribute_if_not_from_object(spec_type) }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(spec_type, "_initializing") } {
+        return None;
+    }
+    if !unsafe { crate::objspace::std::mapdict::has_mapdict_storage(w_spec) } {
+        return None;
+    }
+    let spec_dict = crate::objspace::std::mapdict::_obj_getdict(w_spec);
+    if spec_dict.is_null() {
+        return None;
+    }
+    match dict_getitem_str_no_callback(spec_dict, "_initializing")? {
+        None => {
+            // Dict miss is "initialized" only when getattr would not still
+            // bind a type-level non-data descriptor.
+            if unsafe { crate::baseobjspace::lookup_in_type(spec_type, "_initializing") }.is_some()
+            {
+                None
+            } else {
+                Some(w_module)
+            }
+        }
+        Some(flag) if unsafe { pyre_object::is_bool(flag) } => {
+            if unsafe { pyre_object::w_bool_get_value(flag) } {
+                None
+            } else {
+                Some(w_module)
+            }
+        }
+        Some(_) => None,
+    }
+}
+
+/// `w_dict_getitem_str` without running a stored key's `__eq__`.
+///
+/// Object-strategy dicts can hold a non-string key whose hash collides with
+/// `key`; the infallible getitem then calls that `__eq__` and swallows a
+/// raise as a miss.  A broken callback-free probe is `None` so the residual
+/// declines instead of executing the hook and letting `IMPORT_NAME` run it
+/// again.
+fn dict_getitem_str_no_callback(dict: PyObjectRef, key: &str) -> Option<Option<PyObjectRef>> {
+    pyre_object::dict_eq_hook::begin_callback_free_probe();
+    let hit = unsafe { pyre_object::w_dict_getitem_str(dict, key) };
+    if pyre_object::dict_eq_hook::end_callback_free_probe() {
+        None
+    } else {
+        Some(hit)
+    }
+}
+
+/// `interp___import__` `space.findattr(w_mod, "__path__")` without hooks.
+/// `None` is hooky (decline the residual). `Some(false)` is a genuine
+/// attribute miss. `Some(true)` is a present `__path__`, including Python
+/// `None`: `findattr` then returns `w_None`, which is not RPython `None`,
+/// so `_handle_fromlist` still runs.
+pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
+    let w_type = unsafe { (*w_module).w_class };
+    if unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_lookup_is_data_descr(w_type, "__path__") } {
+        return None;
+    }
+    let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
+    if dict.is_null() {
+        return None;
+    }
+    match dict_getitem_str_no_callback(dict, "__path__")? {
+        None => {
+            if unsafe { crate::baseobjspace::lookup_in_type(w_type, "__path__") }.is_some() {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Some(_) => Some(true),
+    }
+}
+
+fn check_sys_modules_no_callback(name: &str) -> Option<Option<PyObjectRef>> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return Some(sys_modules_registry_get(name));
+    }
+    let entry = dict_getitem_str_no_callback(dict, name)?;
+    Some(entry.filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) }))
+}
+
+fn sys_modules_blocks_no_callback(name: &str) -> Option<bool> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return Some(false);
+    }
+    let hit = dict_getitem_str_no_callback(dict, name)?;
+    Some(hit.is_some_and(|m| !m.is_null() && unsafe { pyre_object::is_none(m) }))
 }
 
 /// Concurrent-import tail of `_gcd_import`: wait for `__spec__._initializing`
@@ -6545,12 +6716,17 @@ pub(crate) fn spec_file_origin(w_spec: PyObjectRef) -> Result<Option<PyObjectRef
     if unsafe { pyre_object::is_none(w_spec) } {
         return Ok(None);
     }
-    // `has_location` is a property whose getter runs Python and allocates, so
-    // pin the spec and read it back before the `origin` lookup.
+    // `ModuleSpec.has_location` is the `_set_fileattr` field
+    // (`_bootstrap.py has_location`).  Reading the property name would
+    // enter that one-line Python getter on every failed `IMPORT_FROM`,
+    // and the getter then compiles as a map-specialized function-entry
+    // whose map guard fails across specs.  `_PyModuleSpec_GetFileOrigin`
+    // uses `GetOptionalAttr(has_location)`; on the stdlib `ModuleSpec`
+    // that is this field, including `spec.has_location = False`.
     let _scope = pyre_object::gc_roots::push_roots();
     let spec_slot = pyre_object::gc_roots::shadow_stack_len();
     let w_spec = pyre_object::gc_roots::pin_root(w_spec);
-    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "has_location") {
+    let w_has_location = match crate::baseobjspace::getattr_str(w_spec, "_set_fileattr") {
         Ok(v) => v,
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(None),
         Err(e) => return Err(e),
@@ -7075,6 +7251,91 @@ mod tests {
         assert!(!exists_and_is_executable(&executable));
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(exists_and_is_executable(&executable));
+    }
+
+    #[test]
+    fn import_cache_probe_accepts_exact_module_with_spec() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_probe_mod");
+        let spec_cls = crate::typedef::make_builtin_type("ImportCacheProbeSpec", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        let spec = pyre_object::objectobject::w_instance_new(spec_cls);
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };
+        set_sys_module("import_cache_probe_mod", module);
+        let w_type = unsafe { (*module).w_class };
+        assert!(
+            unsafe { crate::baseobjspace::module_getattribute_if_not_from_default(w_type) }
+                .is_none(),
+            "exact module keeps Module.descr_getattribute"
+        );
+        assert!(
+            sys_module_if_initialized("import_cache_probe_mod").is_some(),
+            "exact module with a dict-only spec must take the import-cache residual"
+        );
+    }
+
+    #[test]
+    fn import_cache_probe_declines_nondata_initializing_descriptor() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_nondescript_mod");
+        let spec_cls = crate::typedef::make_builtin_type("ImportCacheNonDataSpec", |_| {});
+        unsafe { pyre_object::w_type_set_hasdict(spec_cls, true) };
+        let descr = crate::gateway::make_builtin_function("_initializing", |_| {
+            Ok(pyre_object::w_bool_from(true))
+        });
+        crate::type_dict_store(spec_cls, "_initializing", descr);
+        unsafe { crate::baseobjspace::mutated(spec_cls, Some("_initializing")) };
+        let spec = pyre_object::objectobject::w_instance_new(spec_cls);
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };
+        set_sys_module("import_cache_nondescript_mod", module);
+        unsafe {
+            assert!(
+                !crate::baseobjspace::type_lookup_is_data_descr(spec_cls, "_initializing"),
+                "a function is a non-data descriptor"
+            );
+            assert!(
+                crate::baseobjspace::lookup_in_type(spec_cls, "_initializing").is_some(),
+                "the type still exposes _initializing after the dict miss"
+            );
+        }
+        assert!(
+            sys_module_if_initialized("import_cache_nondescript_mod").is_none(),
+            "getattr would bind the type-level _initializing; the residual must decline"
+        );
+    }
+
+    #[test]
+    fn import_cache_probe_accepts_none_spec_as_initialized() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_none_spec_mod");
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", pyre_object::w_none()) };
+        set_sys_module("import_cache_none_spec_mod", module);
+        assert!(
+            sys_module_if_initialized("import_cache_none_spec_mod").is_some(),
+            "_gcd_import treats getattr(None, '_initializing') as initialized"
+        );
+    }
+
+    #[test]
+    fn import_cache_path_probe_sees_dict_path_as_package() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let module = pyre_object::module::w_module_new("import_cache_pkg_mod");
+        let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+        unsafe {
+            pyre_object::w_dict_setitem_str(dict, "__path__", pyre_object::w_list_new_empty())
+        };
+        assert_eq!(module_is_package_no_callback(module), Some(true));
+        unsafe { pyre_object::w_dict_setitem_str(dict, "__path__", pyre_object::w_none()) };
+        assert_eq!(module_is_package_no_callback(module), Some(true));
+        unsafe { pyre_object::w_dict_delitem_str(dict, "__path__") };
+        assert_eq!(module_is_package_no_callback(module), Some(false));
     }
 
     #[test]

@@ -291,6 +291,42 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("build_map_from_refs", "pyopcode.py BUILD_MAP pair store"),
     ("match_keys_value", "pyopcode.py MATCH_KEYS"),
     ("match_class_value", "pyopcode.py _match_class"),
+    // `rlib/jit.py look_inside_iff.inner` does `func = unroll_safe(func)`.
+    // Harvested names are the inlined originals (`_orig_*`), not the
+    // dispatch wrappers.
+    //
+    // `rstruct/formatiterator.py FormatIterator.interpret` is
+    // `@jit.look_inside_iff(lambda self, fmt: jit.isconstant(fmt))`.
+    // `do_pack` / `do_unpack` take the same predicate so a constant
+    // format reaches `interpret` instead of residualizing at the
+    // pack/unpack entry. `PackFormatIterator.operate` and
+    // `UnpackFormatIterator.operate` (`pypy/module/struct/formatiterator.py`)
+    // are `@jit.unroll_safe`; `pack_values` / `unpack_units` are those
+    // unit walks.
+    //
+    // Evidence: `struct_pack_unpack` jitstats on dynasm/cranelift/wasm
+    // keep `fbw_rolled_back_with_effects=0` (a `JITSTATS_BADNESS_FIELDS`
+    // member, gated corpus-wide).
+    (
+        "_orig_parse_format",
+        "rlib/jit.py look_inside_iff unroll_safe(FormatIterator.interpret)",
+    ),
+    (
+        "_orig_do_pack",
+        "rlib/jit.py look_inside_iff unroll_safe(do_pack)",
+    ),
+    (
+        "_orig_do_unpack",
+        "rlib/jit.py look_inside_iff unroll_safe(do_unpack)",
+    ),
+    (
+        "pack_values",
+        "formatiterator.py PackFormatIterator.operate",
+    ),
+    (
+        "unpack_units",
+        "formatiterator.py UnpackFormatIterator.operate",
+    ),
 ];
 
 /// `builtins::leading_non_null_count` has carried its own `unroll_safe`

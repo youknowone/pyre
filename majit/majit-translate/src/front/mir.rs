@@ -3597,6 +3597,9 @@ struct Lowering<'a> {
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
+    block_entry_string_byte_view_locals: Vec<bit_set::BitSet>,
+    block_byte_view_seen: Vec<bit_set::BitSet>,
+    block_byte_view_conflict: Vec<bit_set::BitSet>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -3707,6 +3710,8 @@ struct Lowering<'a> {
     /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
     /// uses this provenance to emit exactly that pair of flowspace ops.
+    /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
+    /// same shape as [`Lowering::positional_aggregate_locals`].
     string_byte_view_locals: Vec<usize>,
     /// MIR locals holding the `ll_items(l)` view returned by the string-list
     /// slice adapters, each paired with the list's LOGICAL length.  Rust
@@ -4129,6 +4134,15 @@ impl<'a> Lowering<'a> {
             block_entry_positional_aggregate_locals,
             block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
             block_positional_conflict: vec![
+                bit_set::BitSet::with_capacity(n_locals);
+                body.body.len()
+            ],
+            block_entry_string_byte_view_locals: vec![
+                bit_set::BitSet::with_capacity(n_locals);
+                body.body.len()
+            ],
+            block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
+            block_byte_view_conflict: vec![
                 bit_set::BitSet::with_capacity(n_locals);
                 body.body.len()
             ],
@@ -4937,6 +4951,9 @@ impl<'a> Lowering<'a> {
         self.local_var = self.block_entry_local_var[mir_bb].unpack();
         self.positional_aggregate_locals =
             self.block_entry_positional_aggregate_locals[mir_bb].clone();
+        self.string_byte_view_locals = self.block_entry_string_byte_view_locals[mir_bb]
+            .iter()
+            .collect();
 
         // 1. Statements -> SpaceOperations on the corresponding block.
         for (s_idx, st) in bb.statements.iter().enumerate() {
@@ -5043,6 +5060,29 @@ impl<'a> Lowering<'a> {
                 // later emit a symmetric `FieldRead __pos_<N>` carrying
                 // the same owner (see `resolve_place`).
                 let positional_owner = self.positional_aggregate_owner(&rvalue, &dest_ty);
+                // `as_bytes()` marks its dest; a later `Copy` / `&*view`
+                // assign must keep the mark so `slice::len` / `Rvalue::Len`
+                // still emit `__strlen` rather than `arraylen_gc`.
+                let dest_local = i as usize;
+                let inherit_byte_view = match &rvalue {
+                    Rvalue::Use(op) => self.operand_is_string_byte_view(op),
+                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => self
+                        .string_byte_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(place, local)),
+                    _ => false,
+                };
+                if inherit_byte_view {
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                } else {
+                    // Last-write-wins, same as `positional_aggregate_locals`
+                    // below: a later assign of an ordinary `&[u8]` must not
+                    // keep `strlen`/`strgetitem` on a `W_UnicodeObject`.
+                    self.string_byte_view_locals
+                        .retain(|&local| local != dest_local);
+                }
                 let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
@@ -6006,6 +6046,15 @@ impl<'a> Lowering<'a> {
                 {
                     return Ok((None, logical_len.clone()));
                 }
+                let len_leaf = if self
+                    .string_byte_view_locals
+                    .iter()
+                    .any(|local| place_references_local(&place, *local))
+                {
+                    "__strlen"
+                } else {
+                    "__len"
+                };
                 let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
@@ -6013,7 +6062,7 @@ impl<'a> Lowering<'a> {
                 Ok((
                     Some(OpKind::Call {
                         target: CallTarget::FunctionPath {
-                            segments: vec!["__len".to_string()],
+                            segments: vec![len_leaf.to_string()],
                         },
                         args: crate::model::call_args(vec![base]),
                         result_ty: ValueType::Int,
@@ -8792,7 +8841,6 @@ impl<'a> Lowering<'a> {
                 )));
             }
         };
-
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
         // `base()` and the read-back all leave the jitcode here, before any
         // operand is resolved -- the guard and its borrow bind no Variable,
@@ -8886,6 +8934,16 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // Captured before `call.args` is consumed: `slice::len` on
+        // `Copy(*byte_view)` must see the mark `Rvalue::Len` already follows.
+        let first_arg_is_string_byte_view = call
+            .args
+            .first()
+            .is_some_and(|op| self.operand_is_string_byte_view(op));
+        let second_arg_is_string_byte_view = call
+            .args
+            .get(1)
+            .is_some_and(|op| self.operand_is_string_byte_view(op));
         // Second argument's MIR-declared type — `bool::then`'s closure env
         // operand.  Captured before the operands are consumed so the
         // `front::bool_then` recording can resolve the closure ADT's
@@ -9144,7 +9202,7 @@ impl<'a> Lowering<'a> {
                         &call.dest.ty,
                     )
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9198,7 +9256,7 @@ impl<'a> Lowering<'a> {
                         || self.is_arguments_from_str(&reg)
                         || self.is_rbigint_translated_alias(&reg, first_arg_ty.as_ref()))
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9225,7 +9283,7 @@ impl<'a> Lowering<'a> {
                         .is_some_and(|t| tyref_is_string_value(t, self.llbc))
                     && tyref_is_string_value(&call.dest.ty, self.llbc)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9263,7 +9321,7 @@ impl<'a> Lowering<'a> {
                 // the receiver instead of emitting a `deref` method call
                 // the rtyper cannot route on the classdef-less receiver.
                 if args.len() == 1 && self.is_container_identity_deref(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9297,7 +9355,21 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && self.is_string_to_str_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `w_str_get_wtf8(obj)` is `_utf8`.  pyre_cpu's `bh_str*`
+                // family reads the `W_UnicodeObject` itself (byte_len +
+                // the `value` indirection), so the field is identity on
+                // the object — the same model `as_bytes` uses one step
+                // down.  Alias and mark the dest as a byte view so
+                // `as_bytes()[i]` / `len` become `strgetitem` / `strlen`
+                // on the object, not on a fat `&Wtf8`.
+                if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9319,10 +9391,7 @@ impl<'a> Lowering<'a> {
                 // UTF-8/WTF-8 storage exposed explicitly by `as_bytes`.
                 if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
                 {
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9350,7 +9419,7 @@ impl<'a> Lowering<'a> {
                         && str_builder_ctor_leaf(self.llbc, &reg).is_some()
                         && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9365,7 +9434,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && self.is_option_value_identity(&reg, first_arg_ty.as_ref(), &call.dest.ty)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9403,7 +9472,7 @@ impl<'a> Lowering<'a> {
                 // identity before the scalar element arm; Range/RangeFrom/
                 // RangeTo remain real getslice operations.
                 if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -9455,6 +9524,14 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `as_bytes()[a..b]` is rewritten by `front::slice_index` to
+                // `__getslice_*`, a GC-array/list slice — not
+                // `_ll_stringslice` (`rstr.py`), which would allocate a
+                // new string of length `stop-start`.  Do not mark the dest
+                // as a string byte view: `strlen` / string `eq` expect a
+                // `W_UnicodeObject`, and this dest is the slice object.
+                // `ArrayLen` on the getslice result is the length of
+                // `[a..b]`.
                 // `ArrayRead` addresses its element as `base + index *
                 // itemsize`.  A scalar host element carries its spelling as
                 // the array identity so the descr computes the exact width;
@@ -9800,7 +9877,7 @@ impl<'a> Lowering<'a> {
                     && self.string_array_remove_owner().is_some()
                     && regular_call_is_ptr_add(&reg, self.llbc)
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10299,7 +10376,7 @@ impl<'a> Lowering<'a> {
                         });
                         self.local_var[dest_local] = Some(res);
                     } else {
-                        self.local_var[dest_local] = Some(args[0].clone());
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -10318,7 +10395,7 @@ impl<'a> Lowering<'a> {
                 // integer/raw-address uses elsewhere must keep their runtime
                 // normalization.
                 if args.len() == 1 && self.is_gc_current_object_address_adapter(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10331,7 +10408,7 @@ impl<'a> Lowering<'a> {
                 // unicode `hash`, `rstr.py:1238`), so alias the view to the
                 // field pointer exactly like the raw-pointer casts above.
                 if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10361,7 +10438,7 @@ impl<'a> Lowering<'a> {
                             ordering.unwrap_or("unknown")
                         )));
                     }
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10455,7 +10532,7 @@ impl<'a> Lowering<'a> {
                 // ([`is_items_block_base_ptr_add`] keys on the enclosing
                 // accessor so a dereferenced `.add` elsewhere is untouched).
                 if args.len() == 2 && self.is_items_block_base_ptr_add(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10524,7 +10601,7 @@ impl<'a> Lowering<'a> {
                 // (an object list's logical length can differ from its items
                 // block capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10828,18 +10905,30 @@ impl<'a> Lowering<'a> {
                 }
                 // `<[T]>::is_empty` is `arraylen_gc(s) == 0`.  Keep both
                 // operations in the graph instead of residualizing the
-                // graph-less std helper.
+                // graph-less std helper.  A string-byte-view (`as_bytes()`)
+                // is `ll_strlen == 0`, not a GcArray header read.
                 if args.len() == 1 && self.is_slice_is_empty(&reg) {
                     let len = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(len.clone()),
-                        kind: OpKind::ArrayLen {
+                    let len_kind = if first_arg_is_string_byte_view {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        }
+                    } else {
+                        OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
                             nolength: false,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(len.clone()),
+                        kind: len_kind,
                     });
                     let zero = self
                         .graph
@@ -10871,17 +10960,32 @@ impl<'a> Lowering<'a> {
                 // as `Rvalue::Len(place)` eventually does, so a gateway
                 // wrapper's red `&[PyObjectRef]` argument never detours
                 // through an unregistered host residual.
+                //
+                // A string-byte-view (`as_bytes()`) is the same place
+                // `Rvalue::Len` rewrites to `__strlen`: the view is the
+                // `W_UnicodeObject`, not a GcArray header.
                 if args.len() == 1 && self.is_slice_len(&reg) {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayLen {
+                    let kind = if first_arg_is_string_byte_view {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        }
+                    } else {
+                        OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
                             nolength: false,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind,
                     });
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
@@ -11007,7 +11111,7 @@ impl<'a> Lowering<'a> {
                 // annotation.  Same shape as the reflexive identity aliases
                 // below.
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11020,7 +11124,7 @@ impl<'a> Lowering<'a> {
                 // (its items live behind a getfield, not the receiver) — see
                 // `is_container_as_ptr_identity`.
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11037,7 +11141,7 @@ impl<'a> Lowering<'a> {
                     && self.is_fmt_format_call(&reg)
                     && self.traces_to_str_const(&args[0])
                 {
-                    self.local_var[dest_local] = Some(args[0].clone());
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11335,6 +11439,64 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `as_bytes()[a..b] == as_bytes()[c..d]` is `s[a:b] == t[c:d]`.
+                // Rust types the byte view as `[u8]`, so `==` resolves to
+                // `core::slice::cmp::<Impl>::eq` rather than `<str as
+                // PartialEq>::eq`.  Both operands are the frontend's string
+                // identity (`string_byte_view_locals`); emit the same
+                // `BinOp("eq")` that becomes `ll_streq`.
+                if args.len() == 2
+                    && fmt_path_ends_with(&segments, &["slice", "cmp", "<Impl>", "eq"])
+                    && first_arg_is_string_byte_view
+                    && second_arg_is_string_byte_view
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: args[0].clone(),
+                            rhs: args[1].clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Wtf8::len` is `len(s)` / `ll_strlen`.  After `as_bytes()`
+                // the same length is `Rvalue::Len`; this arm covers the
+                // inherent method on the Wtf8 receiver itself.  Only a
+                // marked string-byte-view is a `W_UnicodeObject`; a host
+                // `&Wtf8` stays residual.
+                if args.len() == 1
+                    && first_arg_is_string_byte_view
+                    && (fmt_path_ends_with(&segments, &["Wtf8", "len"])
+                        || fmt_path_ends_with(&segments, &["rustpython_wtf8", "Wtf8", "len"]))
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__strlen".to_string()],
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `&a == &b` / `&a != &b` on two string-family references
                 // (`&Wtf8`, `&str`, `&String`) resolves to the blanket
                 // `impl PartialEq<&B> for &A` (`core::cmp::impls`), whose body
@@ -11357,9 +11519,12 @@ impl<'a> Lowering<'a> {
                     && owner_b == "impls"
                     && owner_c == "<Impl>"
                     && matches!(leaf.as_str(), "eq" | "ne")
-                    && [first_arg_ty.as_ref(), second_arg_ty.as_ref()]
+                    && ([first_arg_ty.as_ref(), second_arg_ty.as_ref()]
                         .iter()
                         .all(|t| t.is_some_and(|t| tyref_is_string_value(t, self.llbc)))
+                        || arg_locals.iter().all(|local| {
+                            local.is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                        }))
                 {
                     let res = self
                         .graph
@@ -11489,7 +11654,7 @@ impl<'a> Lowering<'a> {
                         .and_then(|id| self.llbc.type_by_id(id))
                         .is_some_and(|td| type_decl_is_fieldless_enum(td, self.llbc));
                     if pointee_fieldless {
-                        self.local_var[dest_local] = Some(args[0].clone());
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -12393,6 +12558,13 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // Last-write-wins: a residual Call is not `as_bytes` /
+        // `w_str_get_wtf8`.  Those arms mark dest and return above.
+        // `as_bytes()[a..b]` falls through as `__getslice_*`, not a
+        // string slice (`_ll_stringslice`), so the dest is not a
+        // string byte view.
+        self.string_byte_view_locals
+            .retain(|&local| local != dest_local);
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -14086,6 +14258,18 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
+    /// `w_str_get_wtf8(obj)` — `_utf8`.  pyre_cpu treats the
+    /// `W_UnicodeObject` as the STR, so the field is identity.
+    fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
+    }
+
     /// `String::as_bytes` / `<str>::as_bytes` / `Wtf8::as_bytes` /
     /// `Wtf8Buf::as_bytes` — the byte view of a string.  A string is its
     /// byte sequence in the lifted value model (`String`/`&str`/`Wtf8`
@@ -14431,6 +14615,49 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "pyre_object::object_array::<Impl>::len")
+    }
+
+    /// `as_bytes()` aliases the dest to the `W_UnicodeObject` and marks
+    /// that local; a later `slice::len` / `slice::is_empty` often
+    /// receives `Copy(*local)` rather than the local itself, so the
+    /// mark must follow the projection the same way `Rvalue::Len` does.
+    /// Last-write-wins for a call dest aliased to `args[0]`.  Inherit the
+    /// mark when the receiver is already a string byte view (`x = x.as_slice()`
+    /// after `as_bytes`); drop it when the receiver is an ordinary `&[u8]`.
+    fn alias_dest_to_arg0(&mut self, dest_local: usize, arg: Variable, inherit_byte_view: bool) {
+        if inherit_byte_view {
+            if !self.string_byte_view_locals.contains(&dest_local) {
+                self.string_byte_view_locals.push(dest_local);
+            }
+        } else {
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+        }
+        self.local_var[dest_local] = Some(arg);
+    }
+
+    fn alias_dest_to_arg0_inherit(
+        &mut self,
+        dest_local: usize,
+        arg: Variable,
+        arg_locals: &[Option<usize>],
+    ) {
+        let inherit = arg_locals
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|local| self.string_byte_view_locals.contains(&local));
+        self.alias_dest_to_arg0(dest_local, arg, inherit);
+    }
+
+    fn operand_is_string_byte_view(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self
+                .string_byte_view_locals
+                .iter()
+                .any(|&local| place_references_local(place, local)),
+            Operand::Const(_) => false,
+        }
     }
 
     fn is_slice_len(&self, reg: &RegularCall) -> bool {
@@ -18909,6 +19136,7 @@ impl<'a> Lowering<'a> {
                     ))
                 })?;
             self.merge_positional_aggregate_state(target_bb, local_idx);
+            self.merge_string_byte_view_state(target_bb, local_idx);
             args.push(var);
         }
         Ok(args)
@@ -18963,6 +19191,27 @@ impl<'a> Lowering<'a> {
         if current != incoming {
             self.block_positional_conflict[target_bb].insert(local_idx);
             self.block_entry_positional_aggregate_locals[target_bb].remove(&local_idx);
+        }
+    }
+
+    fn merge_string_byte_view_state(&mut self, target_bb: usize, local_idx: usize) {
+        if target_bb >= self.block_byte_view_seen.len()
+            || self.block_byte_view_conflict[target_bb].contains(local_idx)
+        {
+            return;
+        }
+        let incoming = self.string_byte_view_locals.contains(&local_idx);
+        if !self.block_byte_view_seen[target_bb].contains(local_idx) {
+            self.block_byte_view_seen[target_bb].insert(local_idx);
+            if incoming {
+                self.block_entry_string_byte_view_locals[target_bb].insert(local_idx);
+            }
+            return;
+        }
+        let current = self.block_entry_string_byte_view_locals[target_bb].contains(local_idx);
+        if current != incoming {
+            self.block_byte_view_conflict[target_bb].insert(local_idx);
+            self.block_entry_string_byte_view_locals[target_bb].remove(local_idx);
         }
     }
 }

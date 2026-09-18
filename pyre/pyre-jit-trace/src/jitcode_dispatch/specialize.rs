@@ -17242,9 +17242,21 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
 
 /// Runtime residual for [`try_walker_specialize_import_cached`].
 ///
-/// Re-runs `dunder_import` at level 0 with an empty fromlist so a replaced
-/// `sys.modules` entry is visible; the caller `GuardValue`s the result.
-extern "C" fn jit_import_cached(name: i64) -> i64 {
+/// Reads the current initialized `sys.modules` entry and nothing else.
+/// A miss, a replaced module, a missing `__spec__`, or a still-initializing
+/// module returns null so the record-time `GuardValue` side-exits to the
+/// original `IMPORT_NAME`.  That is `interp_import.py _gcd_import`'s
+/// `FastPathGiveUp`.  Running `dunder_import` here would execute a finder
+/// on a miss, then swallow the error as null and let the result guard
+/// retry the same import.
+///
+/// A non-`AttributeError` from `__spec__` / `_initializing` is published
+/// for the trailing `GuardNoException`, matching `_gcd_import`'s re-raise.
+///
+/// `fromlist_empty != 0` is `import a.b` (no fromlist): `__import__`
+/// answers the top-level package, so a dotted name returns the initialized
+/// `sys.modules["a"]` after the leaf is confirmed present.
+extern "C" fn jit_import_cached(name: i64, fromlist_empty: i64) -> i64 {
     let w_name = name as pyre_object::PyObjectRef;
     if w_name.is_null() {
         return 0;
@@ -17252,17 +17264,27 @@ extern "C" fn jit_import_cached(name: i64) -> i64 {
     let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return 0;
     };
-    let exec = pyre_interpreter::call::getexecutioncontext();
-    match pyre_interpreter::importing::dunder_import(
-        s,
-        pyre_object::w_none(),
-        pyre_object::w_none(),
-        pyre_object::w_none(),
-        0,
-        exec,
-    ) {
-        Ok(module) => module as i64,
-        Err(_) => 0,
+    match import_cached_lookup(s, fromlist_empty != 0) {
+        Some(module) => module as i64,
+        None => 0,
+    }
+}
+
+fn import_cached_lookup(name: &str, fromlist_empty: bool) -> Option<pyre_object::PyObjectRef> {
+    let leaf = pyre_interpreter::importing::sys_module_if_initialized(name)?;
+    if fromlist_empty {
+        if let Some(dot) = name.find('.') {
+            return pyre_interpreter::importing::sys_module_if_initialized(&name[..dot]);
+        }
+        return Some(leaf);
+    }
+    // `interp___import__` else-arm: a fromlist on a non-package returns
+    // the cached module.  Recheck `__path__` here (`findattr`) so a later
+    // package conversion is a residual miss, not a baked "not a package".
+    if pyre_interpreter::importing::module_is_package_no_callback(leaf)? {
+        None
+    } else {
+        Some(leaf)
     }
 }
 
@@ -17273,20 +17295,23 @@ extern "C" fn jit_import_cached(name: i64) -> i64 {
 /// PyPy's `test_import.test_import_in_function` wants the IMPORT_NAME region
 /// to be `guard_not_invalidated` only.  Look-inside of the generated
 /// `__import__` wrapper is still refused (un-lowered helpers in the body), so
-/// the walker records `jit_import_cached` and `GuardValue`s the module
-/// observed at record time.  A replaced `sys.modules` entry side-exits.
+/// the walker records an impure `jit_import_cached` `sys.modules` read
+/// and `GuardValue`s the module observed at record time.  A replaced or
+/// deleted entry side-exits to the original `IMPORT_NAME`.
 ///
-/// A non-empty fromlist is accepted only when the cached module is not a
-/// package (`__path__` missing), matching `interp___import__`.  Relative
-/// imports, a non-zero level, a rebound `__import__`, or a cache miss decline
-/// (SAFE).
+/// A non-empty exact-tuple fromlist is admitted only when the cached
+/// module is not a package: `interp___import__` then returns `w_mod`.
+/// `__path__` is re-probed on every residual call (hook-free `findattr`)
+/// so a later package conversion misses instead of baking "not a package".
+/// A package, a hooky `__path__`, a relative import, a non-zero level, a
+/// rebound `__import__`, or a cache miss decline (SAFE).
 pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
     dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // `simple_call(__import__, NULL, name, globals, locals, fromlist, level)`
     if r_args.len() != 7 {
         return Ok(None);
@@ -17338,24 +17363,29 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_mod = jit_import_cached(w_name as i64);
-    if w_mod == 0 {
+    // `interp___import__` uses `space.is_true(w_fromlist)`.  Only None
+    // and an exact tuple are classified here: a list can change
+    // emptiness after GuardValue on the pointer, and a tuple subclass
+    // can override `__bool__`.  Exact-tuple emptiness is `len == 0`,
+    // the same answer `is_true` gives without a hook.
+    if !w_fromlist.is_null()
+        && !unsafe { pyre_object::is_none(w_fromlist) }
+        && !unsafe { pyre_object::is_exact_tuple(w_fromlist) }
+    {
         return Ok(None);
     }
-    let w_mod = w_mod as pyre_object::PyObjectRef;
-    let fromlist_empty = w_fromlist.is_null() || unsafe { pyre_object::is_none(w_fromlist) };
-    let fromlist_empty = fromlist_empty
-        || unsafe {
-            pyre_object::is_tuple(w_fromlist) && pyre_object::w_tuple_len(w_fromlist) == 0
-        };
-    if !fromlist_empty {
-        // Package fromlist goes through `_handle_fromlist`.  A non-package
-        // answers the module itself (`interp___import__`).
-        match pyre_interpreter::baseobjspace::findattr_result(w_mod, "__path__") {
-            Ok(None) => {}
-            _ => return Ok(None),
-        }
-    }
+    let fromlist_empty = w_fromlist.is_null()
+        || unsafe { pyre_object::is_none(w_fromlist) }
+        || unsafe { pyre_object::w_tuple_len(w_fromlist) == 0 };
+    // Record-time probe: dict-only, no Python hooks.  FastPathGiveUp and
+    // hook-shaped objects decline so the generic importer (CallMayForce)
+    // runs once.
+    let Some(s) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
+        return Ok(None);
+    };
+    let Some(w_mod) = import_cached_lookup(s, fromlist_empty) else {
+        return Ok(None);
+    };
 
     let callable_op = r_args[0];
     if !callable_op.is_constant() {
@@ -17409,18 +17439,18 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[level_raw, zero])?;
 
     let helper = jit_import_cached as *const ();
-    let result = ctx.trace_ctx.call_typed_with_effect_pure(
+    // Impure `CallR`: `sys.modules` is mutable.  The helper only reads
+    // module/spec dicts on exact `module` objects whose `__getattribute__`
+    // is the module default, so it cannot raise or force a virtualizable.
+    // Hook-shaped objects declined above; `IMPORT_NAME` keeps CallMayForce.
+    let fromlist_empty_op = ctx.trace_ctx.const_int(i64::from(fromlist_empty));
+    let result = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallR,
         helper,
-        &[name_op],
-        &[majit_ir::Type::Ref],
+        &[name_op, fromlist_empty_op],
+        &[majit_ir::Type::Ref, majit_ir::Type::Int],
         majit_ir::Type::Ref,
         majit_metainterp::cannot_raise_effect_info(),
-        &[
-            majit_ir::Value::Int(helper as usize as i64),
-            majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
-        ],
-        majit_ir::Value::Ref(majit_ir::GcRef(w_mod as usize)),
     );
     ctx.trace_ctx.set_opref_concrete(
         result,
@@ -17430,7 +17460,7 @@ pub(crate) fn try_walker_specialize_import_cached<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[result, expected])?;
     ctx.trace_ctx.heap_cache_mut().replace_box(result, expected);
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-    Ok(Some(()))
+    Ok(Some(DispatchOutcome::Continue))
 }
 
 /// `divmod(a, b)` on two exact `W_IntObject` operands: emit the inline pair
@@ -18339,6 +18369,8 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
         collect_outer_active_boxes(
             sym,
             ctx.trace_ctx,
@@ -18351,7 +18383,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             op_pc as i32,
             OuterActiveBoxesEntryTwin::Plain,
             call_site_label,
-            None,
+            vstack,
             &[],
             // Not a branch-guard reconstruction: this is the pre-call site
             // snapshot, so there is no kept operand-stack slot to report as
