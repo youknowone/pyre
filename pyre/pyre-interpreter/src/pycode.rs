@@ -3314,8 +3314,8 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
         // `pyopcode.py getconstant_w`: return the slot. Follow a
         // nursery forwarding stub the way a translated load would;
         // do not re-realize — that changes LOAD_CONST identity.
-        let live = pyre_object::gc_hook::try_gc_current_object_address(existing as *mut u8)
-            as PyObjectRef;
+        let live =
+            pyre_object::gc_hook::try_gc_current_object_address(existing as *mut u8) as PyObjectRef;
         if !live.is_null() && live != existing {
             let table = unsafe { live_co_consts_w(roots.get(code_slot) as *mut PyCode) };
             unsafe { (&mut *table).set_ref(idx, live) };

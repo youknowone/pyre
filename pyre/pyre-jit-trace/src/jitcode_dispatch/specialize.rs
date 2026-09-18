@@ -18430,6 +18430,20 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
 
+    // `abort/` in a helper body is an un-lowered `OpKind` — the same class
+    // as a symbolic residual (`try_execute_residual_call_via_executor` →
+    // `OrthodoxSubWalkTraceUnsupported`). Propagating `AbortMarkerReached`
+    // kills the enclosing portal/bridge walk; the fold contract
+    // (`try_walker_orthodox_list_append` / `_opcode`) is to residualize
+    // the helper instead, matching `inline_call.rs` rolling a declined
+    // descent back to the ordinary residual.
+    let walk_result = match walk_result {
+        Err(DispatchError::AbortMarkerReached { pc }) => {
+            Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
+        }
+        other => other,
+    };
+
     Ok((walk_result?, walk_start))
 }
 
@@ -18489,6 +18503,50 @@ pub(crate) fn run_codewriter_helper_inline_call<Sym: WalkSym>(
 /// propagates as `DispatchError` (graceful interpreter fallback), never a wrong
 /// trace.
 #[allow(clippy::too_many_arguments)]
+/// `rlist.py _ll_list_resize_ge` no-op + `ll_setitem_fast` for Integer
+/// storage that already has a free slot. Mirrors the have-space arm the
+/// `w_list_append_inner` helper records at bytes 135-158.
+fn emit_integer_append_spare_capacity<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    list_op: OpRef,
+    value_op: OpRef,
+) -> Result<(), DispatchError> {
+    let len = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_int_items_len_descr(),
+    );
+    let one = ctx.trace_ctx.const_int(1);
+    let newsize = ctx.trace_ctx.record_op(OpCode::IntAdd, &[len, one]);
+    let block = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        list_op,
+        crate::descr::list_int_items_block_descr(),
+    );
+    let cap =
+        crate::state::opimpl_arraylen_gc(ctx.trace_ctx, block, crate::state::int_gcarray_descr());
+    let need_grow = ctx.trace_ctx.record_op(OpCode::IntLt, &[cap, newsize]);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardFalse, &[need_grow], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+
+    let len_descr = crate::descr::list_int_items_len_descr();
+    let len_idx = len_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[list_op, newsize], len_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(list_op, len_idx, newsize);
+
+    let item = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        value_op,
+        crate::descr::int_intval_descr(),
+    );
+    crate::state::trace_int_block_setitem_value(ctx.trace_ctx, block, len, item);
+    Ok(())
+}
+
 pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -18628,6 +18686,32 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(w_class_ref, w_class_const);
+    }
+
+    // Integer spare-capacity append is `_ll_list_resize_ge` as a no-op plus
+    // `ll_setitem_fast` (`rlist.py`). The helper body lowers that diamond to
+    // `goto_if_not_int_lt → abort/` on the grow edge (`w_list_append_inner`
+    // pc=159: `conditional_call` of `look_inside_iff` resize did not emit
+    // `conditional_call_ir_v`). Emit the no-op-resize store here — the same
+    // `setfield_gc_i` / `setarrayitem_gc_i` the have-space arm already
+    // records — and keep grow on the residual decline. Guard `arraylen <
+    // newsize` is false so a later realloc deopts instead of writing past
+    // the block.
+    let spare_int = unsafe {
+        pyre_object::w_list_uses_int_storage(inner_self)
+            && pyre_object::w_list_can_append_without_realloc(inner_self)
+            && pyre_object::is_plain_int1(value)
+            && !(pyre_object::tagged_int::CAN_BE_TAGGED
+                && pyre_object::tagged_int::is_tagged_int(value))
+            && !pyre_object::pyobject::is_long(value)
+    };
+    if spare_int {
+        emit_integer_append_spare_capacity(ctx, op, self_ref, value_op)?;
+        fbw_list_journal_push_append(inner_self, len_before, allocated_before);
+        if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
+            unsafe { pyre_object::w_list_append(inner_self, value) };
+        }
+        return Ok(());
     }
 
     // Pre-publish the ONE append-site resume coordinate the sub-walk's guards
