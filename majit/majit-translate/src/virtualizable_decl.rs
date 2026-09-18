@@ -26,6 +26,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use crate::codewriter::call::names_same_type;
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::model::{ConstValue, HostObject};
 
@@ -123,16 +124,19 @@ fn lookup<'a>(
     if let Some(fields) = registered.get(class_key) {
         return Some(fields);
     }
-    // `::` boundary, same as `names_same_type`. Two matching keys
-    // (`Frame` and `a::Frame` both suffix-match `x::a::Frame`) is
-    // ambiguous — fail closed instead of picking insertion order.
-    let mut matches = registered.iter().filter(|(key, _)| {
-        class_key
-            .strip_suffix(key.as_str())
-            .is_some_and(|prefix| prefix.ends_with("::"))
-    });
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first.1)
+    let mut matches = registered
+        .iter()
+        .filter(|(key, _)| names_same_type(class_key, key));
+    match (matches.next(), matches.next()) {
+        (None, _) => None,
+        (Some((_, fields)), None) => Some(fields),
+        (Some((first, _)), Some((second, _))) => {
+            panic!(
+                "ambiguous _virtualizable_ for class key {class_key}: \
+                 registered keys `{first}` and `{second}` both match"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -223,7 +227,15 @@ mod tests {
     }
 
     #[test]
-    fn lookup_fails_closed_when_two_suffixes_match() {
+    #[should_panic(expected = "ambiguous _virtualizable_ for class key x::a::Frame")]
+    fn lookup_panics_when_two_suffixes_match() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
+            }
+        }
+        let _restore = Restore;
         REGISTERED.with(|registered| {
             *registered.borrow_mut() = [
                 ("Frame".to_string(), vec!["leaf".to_string()]),
@@ -234,10 +246,5 @@ mod tests {
         });
         let host = HostObject::new_class("Frame", vec![]);
         stamp_host_virtualizable(&host, "x::a::Frame");
-        assert!(
-            host.class_get("_virtualizable_").is_none(),
-            "Frame and a::Frame both suffix-match x::a::Frame"
-        );
-        register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
 }

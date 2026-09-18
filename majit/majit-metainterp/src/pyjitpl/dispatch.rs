@@ -13,7 +13,7 @@ use majit_ir::{OpCode, OpRef, Type, Value};
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
-use crate::trace_ctx::{VableArrayStore, VableEntryWrite};
+use crate::trace_ctx::{ClearReplaceFrames, VableArrayStore, VableEntryWrite};
 use crate::{TraceAction, TraceCtx};
 
 /// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]
@@ -3232,13 +3232,7 @@ where
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
-        struct ClearReplaceFrames(*mut TraceCtx);
-        impl Drop for ClearReplaceFrames {
-            fn drop(&mut self) {
-                unsafe { (*self.0).clear_replace_frames() };
-            }
-        }
-        let _clear = ClearReplaceFrames(ctx);
+        let _clear = ClearReplaceFrames::new(ctx);
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local
@@ -3942,13 +3936,7 @@ where
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
-        struct ClearReplaceFrames(*mut TraceCtx);
-        impl Drop for ClearReplaceFrames {
-            fn drop(&mut self) {
-                unsafe { (*self.0).clear_replace_frames() };
-            }
-        }
-        let _clear = ClearReplaceFrames(ctx);
+        let _clear = ClearReplaceFrames::new(ctx);
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {

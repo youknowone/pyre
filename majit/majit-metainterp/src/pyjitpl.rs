@@ -153,7 +153,7 @@ use crate::resume::{
     MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
 };
-use crate::trace_ctx::TraceCtx;
+use crate::trace_ctx::{ClearReplaceFrames, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 
 #[inline]
@@ -6650,13 +6650,7 @@ impl<M: Clone> MetaInterp<M> {
             .as_mut()
             .expect("vable op requires active tracing");
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
-        struct ClearReplaceFrames(*mut TraceCtx);
-        impl Drop for ClearReplaceFrames {
-            fn drop(&mut self) {
-                unsafe { (*self.0).clear_replace_frames() };
-            }
-        }
-        let _clear = ClearReplaceFrames(ctx);
+        let _clear = ClearReplaceFrames::new(ctx);
         f(ctx)
     }
 

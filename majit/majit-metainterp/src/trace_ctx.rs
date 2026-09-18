@@ -1417,6 +1417,30 @@ impl TraceCtx {
         self.replace_frames = None;
     }
 
+    /// [`ClearReplaceFrames`] over `self`.
+    pub fn clear_replace_frames_guard(&mut self) -> impl Drop + use<> {
+        ClearReplaceFrames::new(self)
+    }
+}
+
+/// Clears the replace-frames hook on drop, including unwind.
+pub struct ClearReplaceFrames(*mut TraceCtx);
+
+impl ClearReplaceFrames {
+    pub fn new(ctx: &mut TraceCtx) -> Self {
+        Self(ctx)
+    }
+}
+
+impl Drop for ClearReplaceFrames {
+    fn drop(&mut self) {
+        // SAFETY: `new` stores a pointer to a live `TraceCtx`; drop only
+        // writes the hook slot to `None`.
+        unsafe { (*self.0).clear_replace_frames() };
+    }
+}
+
+impl TraceCtx {
     /// `fielddescr.get_vinfo()`. Codewriter emits the vinfo's own
     /// FieldDescr, which already holds the Weak backref.
     fn vinfo_from_fielddescr(
