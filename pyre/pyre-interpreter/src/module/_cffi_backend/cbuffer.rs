@@ -249,6 +249,7 @@ pub fn buffer_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
             pyre_object::w_type_set_weakrefable(tp, true);
+            pyre_object::w_type_set_typedef_buffer(tp, Some(pyre_object::TypeDefBuffer::ReadWrite));
         }
         tp as usize
     }) as PyObjectRef
