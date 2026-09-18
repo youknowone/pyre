@@ -4450,6 +4450,36 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "pyre_interpreter::objspace::descroperation::_float_radians",
             "float_mul",
         ),
+        ("pyre_interpreter::objspace::descroperation::_float_log", ""),
+        ("pyre_interpreter::objspace::descroperation::_float_pow", ""),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_fmod",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_copysign",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_remainder",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_float_atan2",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_from_floor",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_from_ceil",
+            "",
+        ),
+        (
+            "pyre_interpreter::objspace::descroperation::_int_from_trunc",
+            "",
+        ),
         (
             "pyre_interpreter::objspace::descroperation::_int_abs",
             "int_sub",

@@ -3179,6 +3179,10 @@ pub const FLOAT_MATH1_LGAMMA: i64 = 22;
 pub const FLOAT_MATH1_ULP: i64 = 23;
 pub const FLOAT_MATH1_DEGREES: i64 = 24;
 pub const FLOAT_MATH1_RADIANS: i64 = 25;
+pub const FLOAT_MATH1_LOG: i64 = 26;
+/// Discovery only: `kind` is a hub parameter, so these arms stay in the graph.
+pub const FLOAT_MATH1_MATH2: i64 = 27;
+pub const FLOAT_MATH1_INT_FROM_FLOAT: i64 = 28;
 
 /// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
@@ -3210,7 +3214,42 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_ULP => _float_ulp(x),
         FLOAT_MATH1_DEGREES => _float_degrees(x),
         FLOAT_MATH1_RADIANS => _float_radians(x),
+        FLOAT_MATH1_LOG => _float_log(x),
+        FLOAT_MATH1_MATH2 => _float_math2(x, x, 0),
+        FLOAT_MATH1_INT_FROM_FLOAT => _int_from_float(x, 0),
         _ => _float_abs(x),
+    }
+}
+
+pub const FLOAT_MATH2_POW: i64 = 0;
+pub const FLOAT_MATH2_FMOD: i64 = 1;
+pub const FLOAT_MATH2_COPYSIGN: i64 = 2;
+pub const FLOAT_MATH2_REMAINDER: i64 = 3;
+pub const FLOAT_MATH2_ATAN2: i64 = 4;
+
+/// Hub so the two-arg unboxed leaves are jitcodes.
+#[inline(never)]
+pub fn _float_math2(x: f64, y: f64, kind: i64) -> PyResult {
+    match kind {
+        FLOAT_MATH2_FMOD => _float_fmod(x, y),
+        FLOAT_MATH2_COPYSIGN => _float_copysign(x, y),
+        FLOAT_MATH2_REMAINDER => _float_remainder(x, y),
+        FLOAT_MATH2_ATAN2 => _float_atan2(x, y),
+        _ => _float_pow(x, y),
+    }
+}
+
+pub const INT_FROM_FLOAT_FLOOR: i64 = 0;
+pub const INT_FROM_FLOAT_CEIL: i64 = 1;
+pub const INT_FROM_FLOAT_TRUNC: i64 = 2;
+
+/// Hub so the `math.floor`/`ceil`/`trunc` int leaves are jitcodes.
+#[inline(never)]
+pub fn _int_from_float(x: f64, kind: i64) -> PyResult {
+    match kind {
+        INT_FROM_FLOAT_CEIL => _int_from_ceil(x),
+        INT_FROM_FLOAT_TRUNC => _int_from_trunc(x),
+        _ => _int_from_floor(x),
     }
 }
 
@@ -6880,6 +6919,54 @@ float_math1_leaf!(_float_ulp, |x| pymath::math::ulp(x));
 // pymath::math::{degrees,radians} is `x * (180/π)` / `x * (π/180)`.
 float_math1_leaf!(_float_degrees, |x| x * (180.0 / std::f64::consts::PI));
 float_math1_leaf!(_float_radians, |x| x * (std::f64::consts::PI / 180.0));
+float_math1_leaf!(_float_log, |x| x.ln());
+
+/// Unboxed two-arg `W_FloatObject` leaf. `|x, y| $compute` names the
+/// parameters; it is not a Rust closure.
+macro_rules! float_math2_leaf {
+    ($fn:ident, |$x:ident, $y:ident| $compute:expr) => {
+        #[inline(never)]
+        pub(crate) fn $fn($x: f64, $y: f64) -> PyResult {
+            Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                ob_header: PyObject {
+                    ob_type: &FLOAT_TYPE as *const PyType,
+                    w_class: get_instantiate(&FLOAT_TYPE),
+                },
+                floatval: $compute,
+                w_dict: PY_NULL,
+                w_slots: PY_NULL,
+            }) as PyObjectRef)
+        }
+    };
+}
+
+float_math2_leaf!(_float_pow, |x, y| x.powf(y));
+float_math2_leaf!(_float_fmod, |x, y| x % y);
+float_math2_leaf!(_float_copysign, |x, y| x.copysign(y));
+float_math2_leaf!(_float_remainder, |x, y| {
+    pymath::math::remainder(x, y).unwrap_or(f64::NAN)
+});
+float_math2_leaf!(_float_atan2, |x, y| x.atan2(y));
+
+/// `math.floor`/`ceil`/`trunc` after the signed-range pin: `W_IntObject`.
+macro_rules! int_from_float_leaf {
+    ($fn:ident, |$x:ident| $compute:expr) => {
+        #[inline(never)]
+        pub(crate) fn $fn($x: f64) -> PyResult {
+            Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+                ob_header: PyObject {
+                    ob_type: &INT_TYPE as *const PyType,
+                    w_class: get_instantiate(&INT_TYPE),
+                },
+                intval: $compute,
+            }) as PyObjectRef)
+        }
+    };
+}
+
+int_from_float_leaf!(_int_from_floor, |x| x.floor() as i64);
+int_from_float_leaf!(_int_from_ceil, |x| x.ceil() as i64);
+int_from_float_leaf!(_int_from_trunc, |x| x as i64);
 
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
 #[inline(never)]

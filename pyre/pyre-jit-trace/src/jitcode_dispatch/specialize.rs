@@ -9973,6 +9973,60 @@ math1_descent!(
     "float_radians_commit",
     "FLOAT-RADIANS-SUBWALK"
 );
+math1_descent!(
+    FLOAT_LOG_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_log",
+    "float_log_commit",
+    "FLOAT-LOG-SUBWALK"
+);
+math1_descent!(
+    FLOAT_POW_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_pow",
+    "float_pow_commit",
+    "FLOAT-POW-SUBWALK"
+);
+math1_descent!(
+    FLOAT_FMOD_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_fmod",
+    "float_fmod_commit",
+    "FLOAT-FMOD-SUBWALK"
+);
+math1_descent!(
+    FLOAT_COPYSIGN_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_copysign",
+    "float_copysign_commit",
+    "FLOAT-COPYSIGN-SUBWALK"
+);
+math1_descent!(
+    FLOAT_REMAINDER_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_remainder",
+    "float_remainder_commit",
+    "FLOAT-REMAINDER-SUBWALK"
+);
+math1_descent!(
+    FLOAT_ATAN2_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_float_atan2",
+    "float_atan2_commit",
+    "FLOAT-ATAN2-SUBWALK"
+);
+math1_descent!(
+    INT_FROM_FLOOR_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_int_from_floor",
+    "int_from_floor_commit",
+    "INT-FROM-FLOOR-SUBWALK"
+);
+math1_descent!(
+    INT_FROM_CEIL_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_int_from_ceil",
+    "int_from_ceil_commit",
+    "INT-FROM-CEIL-SUBWALK"
+);
+math1_descent!(
+    INT_FROM_TRUNC_DESCENT,
+    "pyre_interpreter::objspace::descroperation::_int_from_trunc",
+    "int_from_trunc_commit",
+    "INT-FROM-TRUNC-SUBWALK"
+);
 
 /// floatobject.py `descr_abs` / `ll_math_fabs`.
 const FLOAT_ABS_DESCENT: HelperDescent = HelperDescent {
@@ -15245,51 +15299,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-// The five entry points below are one row each: they name the callable they
-// answer for and hand the driver the two facts that differ between rows —
-// which branches of the body the trace has to pin, and what the compiled loop
-// computes.  Everything else — operand classification, the authentic
-// pre-execution, the callable pin, the coercions, the cross-check and the
-// boxing — is written once, here.  Upstream reaches the same surface the same
-// way: `intobject.py`'s `_make_descr_binop` emits one body per row from a
-// table instead of repeating it, and the codewriter looks its builtin
-// lowerings up by name in `support.py`'s `_ll_<arity>_<oopspec>` table.
-
-/// What a row's compiled body computes from the coerced operand(s).
-#[derive(Clone, Copy)]
-enum MathFloatEmit {
-    /// A pure `CALL_F` into the row's raw helper — the shape a translated
-    /// `ll_math_*` call carries once its exceptional branches are pinned.
-    Call1(extern "C" fn(f64) -> f64),
-    /// The two-operand form of [`MathFloatEmit::Call1`].
-    Call2(extern "C" fn(f64, f64) -> f64),
-    /// A bare IR op, for a row whose whole body is one machine instruction.
-    /// The `f64` function beside it is that same computation, for the
-    /// cross-check below.
-    Unary(OpCode, fn(f64) -> f64),
-}
-
-impl MathFloatEmit {
-    /// Positional argument count this emission answers for.
-    fn arity(self) -> usize {
-        match self {
-            Self::Call1(_) | Self::Unary(..) => 1,
-            Self::Call2(_) => 2,
-        }
-    }
-
-    /// The value the compiled body produces for these operands.
-    fn evaluate(self, values: &[f64]) -> f64 {
-        match self {
-            Self::Call1(raw) => raw(values[0]),
-            Self::Call2(raw) => raw(values[0], values[1]),
-            Self::Unary(_, compute) => compute(values[0]),
-        }
-    }
-}
-
-/// The branches of a row's body the trace has to pin before its
-/// [`MathFloatEmit`] stands for the whole builtin.
+/// The branches of a math1 leaf the trace has to pin before descent.
 #[derive(Clone, Copy, PartialEq)]
 enum MathFloatDomain {
     /// `ll_math_sqrt`: not negative, and finite.
@@ -15309,13 +15319,6 @@ enum MathFloatDomain {
     /// The body raises for no input and cannot leave the float domain, so the
     /// operand needs no pinning at all.
     Total,
-    /// The helper reports every raising direction as a non-finite result, so
-    /// the operand is unconstrained and the *result* is guarded instead: the
-    /// guard deoptimizes into the builtin, which re-executes and raises or
-    /// returns the non-finite value itself.  A row spelled this way carries no
-    /// per-function domain knowledge, so every `MATH_FLOAT1_FOLDS` entry
-    /// shares this one arm.
-    ResultFinite,
 }
 
 impl MathFloatDomain {
@@ -15331,7 +15334,7 @@ impl MathFloatDomain {
             Self::AbsLeOne => x.is_finite() && (-1.0..=1.0).contains(&x),
             Self::GreaterEqualOne => x.is_finite() && x >= 1.0,
             Self::AbsLtOne => x.is_finite() && x > -1.0 && x < 1.0,
-            Self::Total | Self::ResultFinite => true,
+            Self::Total => true,
         }
     }
 
@@ -15342,7 +15345,7 @@ impl MathFloatDomain {
         pc: usize,
         x: OpRef,
     ) -> Result<(), DispatchError> {
-        if matches!(self, Self::Total | Self::ResultFinite) {
+        if matches!(self, Self::Total) {
             return Ok(());
         }
         let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
@@ -15378,7 +15381,7 @@ impl MathFloatDomain {
                 walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[minus_one, x], true)?;
                 walker_float_cmp_guard(ctx, pc, OpCode::FloatLt, &[x, one], true)?;
             }
-            Self::Total | Self::ResultFinite => unreachable!("returned above"),
+            Self::Total => unreachable!("returned above"),
         }
         // `isfinite(x)`: `x - x == 0` holds exactly for the finite values,
         // signed zero included, so NaN and ±inf take the residual.
@@ -15387,161 +15390,6 @@ impl MathFloatDomain {
             .set_opref_concrete(diff, majit_ir::Value::Float(0.0));
         walker_float_cmp_guard(ctx, pc, OpCode::FloatEq, &[diff, zero], true)
     }
-}
-
-/// One pure elidable `CALL_F` into a raw float helper, stamped with the value
-/// it produced concretely.  `EF_ELIDABLE_CANNOT_RAISE` is what lets the
-/// optimizer hoist it out of a loop and keep the result box virtual.
-fn walker_call_pure_float<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    raw_fn: *const (),
-    args: &[OpRef],
-    values: &[f64],
-    result_value: f64,
-) -> OpRef {
-    let types = [majit_ir::Type::Float; 2];
-    let concrete = [
-        majit_ir::Value::Int(raw_fn as i64),
-        majit_ir::Value::Float(values[0]),
-        majit_ir::Value::Float(values[values.len() - 1]),
-    ];
-    let raw = ctx.trace_ctx.call_typed_with_effect_pure(
-        OpCode::CallF,
-        raw_fn,
-        args,
-        &types[..args.len()],
-        majit_ir::Type::Float,
-        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-        &concrete[..args.len() + 1],
-        majit_ir::Value::Float(result_value),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
-    raw
-}
-
-/// The body every `math` float fold shares.  `row` recognizes the callable
-/// this entry point answers for and returns the row's two variable facts.
-///
-/// The residual this replaces costs an argument tuple, a builtin dispatch, a
-/// `try_get_double` per operand and a `W_FloatObject` allocation, once per
-/// loop iteration; what goes in its place is the unboxed operand, the row's
-/// emission and an inline `wrapfloat` the optimizer can keep virtual.
-fn walker_specialize_math_float<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    op: &DecodedOp,
-    r_args: &[OpRef],
-    dst: usize,
-    arity: usize,
-    row: impl FnOnce(pyre_object::PyObjectRef) -> Option<(MathFloatDomain, MathFloatEmit)>,
-) -> Result<Option<()>, DispatchError> {
-    let Some((concrete_callable, mut operands)) =
-        plain_builtin_call_concretes(ctx, code, op, r_args, arity)
-    else {
-        return Ok(None);
-    };
-    let Some((domain, emit)) = row(concrete_callable) else {
-        return Ok(None);
-    };
-    debug_assert_eq!(
-        arity,
-        emit.arity(),
-        "a row's emission disagrees with the call shape its entry point reads"
-    );
-    // Exact `int`/`bool`/`float` operands only: a numeric subclass keeps the
-    // builtin `ob_type` but carries its own `w_class`, and may override
-    // `__float__`.
-    let mut coerced = [(false, 0.0f64); 2];
-    for (slot, &obj) in coerced.iter_mut().zip(&operands[..arity]) {
-        let Some(operand) = fold_float_operand(obj) else {
-            return Ok(None);
-        };
-        *slot = operand;
-    }
-    let values = [coerced[0].1, coerced[1].1];
-    if !domain.admits(&values[..arity]) {
-        return Ok(None);
-    }
-    // Authentic boxed result, produced on the plain eval loop exactly as the
-    // skipped residual would.  A raise, a non-float result and a non-finite
-    // one all keep the residual.
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_impl_result(concrete_callable, &operands[..arity])
-    };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    // The call above allocates, so the operand pointers read before it may have
-    // been forwarded.  Re-fetch them from the walker's op cells, which the
-    // collector does update, before anything reads through them again
-    // (`try_walker_specialize_builtin_divmod_long_int` takes the same route).
-    // The callable needs no re-fetch: a module's builtin function outlives
-    // every nursery it could have been born in, while these operands are the
-    // loop's own boxes.
-    for (slot, &arg) in operands[..arity].iter_mut().zip(&r_args[2..2 + arity]) {
-        let Some(refetched) = walker_concrete_ref_object(ctx, arg) else {
-            return Ok(None);
-        };
-        *slot = refetched;
-    }
-    let Some(result_value) = fold_finite_float_result(boxed_result) else {
-        return Ok(None);
-    };
-    // The compiled loop runs the row's emission, not the builtin it stands
-    // for.  Compare the two on these operands and keep the residual when they
-    // differ, so a row that disagrees is never compiled into the loop.  By
-    // bits, which `==` cannot do: it cannot tell `-0.0` from `0.0`, and which
-    // one is answered with is observable through `copysign`.
-    if emit.evaluate(&values[..arity]).to_bits() != result_value.to_bits() {
-        return Ok(None);
-    }
-
-    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
-    let x = walker_coerce_operand_to_float(
-        ctx,
-        op.pc,
-        r_args[2],
-        operands[0],
-        coerced[0].0,
-        values[0],
-        false,
-    )?;
-    domain.emit_operand_guards(ctx, op.pc, x)?;
-    let raw = match emit {
-        MathFloatEmit::Unary(opcode, _) => {
-            let raw = ctx.trace_ctx.record_op(opcode, &[x]);
-            ctx.trace_ctx
-                .set_opref_concrete(raw, majit_ir::Value::Float(result_value));
-            raw
-        }
-        MathFloatEmit::Call1(raw_fn) => {
-            walker_call_pure_float(ctx, raw_fn as *const (), &[x], &values[..1], result_value)
-        }
-        MathFloatEmit::Call2(raw_fn) => {
-            let y = walker_coerce_operand_to_float(
-                ctx,
-                op.pc,
-                r_args[3],
-                operands[1],
-                coerced[1].0,
-                values[1],
-                false,
-            )?;
-            walker_call_pure_float(ctx, raw_fn as *const (), &[x, y], &values, result_value)
-        }
-    };
-    if domain == MathFloatDomain::ResultFinite {
-        walker_guard_float_result_finite(ctx, op.pc, raw)?;
-    }
-    let boxed = crate::state::wrapfloat(ctx.trace_ctx, raw);
-    ctx.trace_ctx.set_opref_concrete(
-        boxed,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
-    );
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
-    Ok(Some(()))
 }
 
 /// `math.sqrt(x)` on an exact int/float argument: the domain-guarded pure
@@ -15568,12 +15416,7 @@ pub(crate) fn try_walker_specialize_math_sqrt<Sym: WalkSym>(
             }
         }
     }
-    walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        pyre_module::module::math::interp_math::is_math_sqrt_function(callable).then_some((
-            MathFloatDomain::NonNegativeFinite,
-            MathFloatEmit::Call1(crate::trace_opcode::sqrt_nonneg_jit),
-        ))
-    })
+    Ok(None)
 }
 
 /// `math.log/cos/sin(x)` on an exact int/float argument — the direct
@@ -15595,6 +15438,18 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
             } else if interp_math::is_math_cos_function(callable) {
                 walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
                 try_walker_orthodox_float_cos(ctx, op.pc, r_args[2], operands[0], dst, 'r')?
+            } else if interp_math::is_math_log_function(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                try_walker_orthodox_float_math1(
+                    ctx,
+                    op.pc,
+                    r_args[2],
+                    operands[0],
+                    dst,
+                    'r',
+                    MathFloatDomain::PositiveFinite,
+                    &FLOAT_LOG_DESCENT,
+                )?
             } else {
                 None
             };
@@ -15603,27 +15458,7 @@ pub(crate) fn try_walker_specialize_math_log_trig<Sym: WalkSym>(
             }
         }
     }
-    walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        use pyre_module::module::math::interp_math;
-        if interp_math::is_math_log_function(callable) {
-            Some((
-                MathFloatDomain::PositiveFinite,
-                MathFloatEmit::Call1(crate::trace_opcode::math_log_positive_jit),
-            ))
-        } else if interp_math::is_math_cos_function(callable) {
-            Some((
-                MathFloatDomain::Finite,
-                MathFloatEmit::Call1(crate::trace_opcode::math_cos_finite_jit),
-            ))
-        } else if interp_math::is_math_sin_function(callable) {
-            Some((
-                MathFloatDomain::Finite,
-                MathFloatEmit::Call1(crate::trace_opcode::math_sin_finite_jit),
-            ))
-        } else {
-            None
-        }
-    })
+    Ok(None)
 }
 
 /// `math.frexp(x)` on an exact int/float argument.  RPython lowers
@@ -16332,6 +16167,107 @@ fn try_walker_orthodox_float_math1<Sym: WalkSym>(
     try_walker_orthodox_descent(ctx, op_pc, &[], &[], &[(xa, x)], dst, dst_bank, descent)
 }
 
+#[derive(Clone, Copy)]
+enum MathFloat2Domain {
+    Total,
+    YNonZero,
+    Pow,
+}
+
+impl MathFloat2Domain {
+    fn admits(self, x: f64, y: f64) -> bool {
+        match self {
+            Self::Total => true,
+            Self::YNonZero => x.is_finite() && y.is_finite() && y != 0.0,
+            Self::Pow => {
+                x.is_finite() && y.is_finite() && !(x == 0.0 && y < 0.0) && x.powf(y).is_finite()
+            }
+        }
+    }
+
+    fn emit_guards<Sym: WalkSym>(
+        self,
+        ctx: &mut WalkContext<'_, '_, Sym>,
+        pc: usize,
+        x: OpRef,
+        y: OpRef,
+    ) -> Result<(), DispatchError> {
+        match self {
+            Self::Total => Ok(()),
+            Self::YNonZero => {
+                MathFloatDomain::Finite.emit_operand_guards(ctx, pc, x)?;
+                MathFloatDomain::Finite.emit_operand_guards(ctx, pc, y)?;
+                let zero = ctx.trace_ctx.const_float(0.0f64.to_bits() as i64);
+                walker_float_cmp_guard(ctx, pc, OpCode::FloatEq, &[y, zero], false)
+            }
+            Self::Pow => {
+                MathFloatDomain::Finite.emit_operand_guards(ctx, pc, x)?;
+                MathFloatDomain::Finite.emit_operand_guards(ctx, pc, y)
+            }
+        }
+    }
+}
+
+fn math2_descent_for(
+    callable: pyre_object::PyObjectRef,
+) -> Option<(&'static HelperDescent, MathFloat2Domain)> {
+    use pyre_module::module::math::interp_math as m;
+    if m::is_math_pow_function(callable) {
+        Some((&FLOAT_POW_DESCENT, MathFloat2Domain::Pow))
+    } else if m::is_math_fmod_function(callable) {
+        Some((&FLOAT_FMOD_DESCENT, MathFloat2Domain::YNonZero))
+    } else if m::is_math_copysign_function(callable) {
+        Some((&FLOAT_COPYSIGN_DESCENT, MathFloat2Domain::Total))
+    } else if m::is_math_remainder_function(callable) {
+        Some((&FLOAT_REMAINDER_DESCENT, MathFloat2Domain::YNonZero))
+    } else if m::is_math_atan2_function(callable) {
+        Some((&FLOAT_ATAN2_DESCENT, MathFloat2Domain::Total))
+    } else {
+        None
+    }
+}
+
+fn try_walker_orthodox_float_math2<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    x_op: OpRef,
+    x_obj: pyre_object::PyObjectRef,
+    y_op: OpRef,
+    y_obj: pyre_object::PyObjectRef,
+    dst: usize,
+    dst_bank: char,
+    domain: MathFloat2Domain,
+    descent: &HelperDescent,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some((x_is_int, x)) = fold_float_operand(x_obj) else {
+        return Ok(None);
+    };
+    let Some((y_is_int, y)) = fold_float_operand(y_obj) else {
+        return Ok(None);
+    };
+    if !domain.admits(x, y) {
+        return Ok(None);
+    }
+    let xa =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, x_op, x_obj, x_is_int, x, false)?;
+    let ya =
+        walker_coerce_dispatching_operand_to_float(ctx, op_pc, y_op, y_obj, y_is_int, y, false)?;
+    domain.emit_guards(ctx, op_pc, xa, ya)?;
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[],
+        &[],
+        &[(xa, x), (ya, y)],
+        dst,
+        dst_bank,
+        descent,
+    )
+}
+
 /// `math.fabs(x)` on an exact int/float argument.  RPython lowers
 /// `ll_math_fabs` to a sign mask, so the whole builtin is one `FloatAbs` once
 /// the operand is unboxed, and `fabs` raises for no input, which is why the
@@ -16361,12 +16297,7 @@ pub(crate) fn try_walker_specialize_math_fabs<Sym: WalkSym>(
             }
         }
     }
-    walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        pyre_module::module::math::interp_math::is_math_fabs_function(callable).then_some((
-            MathFloatDomain::Total,
-            MathFloatEmit::Unary(OpCode::FloatAbs, f64::abs),
-        ))
-    })
+    Ok(None)
 }
 
 /// Which reduction `try_walker_specialize_math_round_to_int` is folding.
@@ -16441,28 +16372,12 @@ pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
     if !(value >= SIGNED_MIN_AS_FLOAT && value < SIGNED_LIMIT_AS_FLOAT) {
         return Ok(None);
     }
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_impl_result(concrete_callable, &[arg_obj])
+    let descent = match mode {
+        MathRoundMode::Floor => &INT_FROM_FLOOR_DESCENT,
+        MathRoundMode::Ceil => &INT_FROM_CEIL_DESCENT,
+        MathRoundMode::Trunc => &INT_FROM_TRUNC_DESCENT,
     };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    if !unsafe { pyre_object::is_int(boxed_result) } {
-        return Ok(None);
-    }
-    let result_value = unsafe { pyre_object::w_int_get_value(boxed_result) };
-
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let arg_op = r_args[2];
     let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
     let raw_float = walker_unbox_float(ctx, op.pc, arg_op, float_type_addr)?;
@@ -16482,48 +16397,19 @@ pub(crate) fn try_walker_specialize_math_round_to_int<Sym: WalkSym>(
         .const_float(SIGNED_LIMIT_AS_FLOAT.to_bits() as i64);
     walker_float_cmp_guard(ctx, op.pc, OpCode::FloatGe, &[raw_float, low], true)?;
     walker_float_cmp_guard(ctx, op.pc, OpCode::FloatLt, &[raw_float, high], true)?;
-
-    // `CastFloatToInt` already truncates toward zero, so only floor and ceil
-    // need a rounding step.  Both are elidable and cannot raise.
-    let rounded = match mode {
-        MathRoundMode::Trunc => raw_float,
-        MathRoundMode::Floor | MathRoundMode::Ceil => {
-            let (helper, rounded_value) = match mode {
-                MathRoundMode::Floor => (
-                    pyre_module::module::math::interp_math::jit_math_floor_raw as *const (),
-                    value.floor(),
-                ),
-                _ => (
-                    pyre_module::module::math::interp_math::jit_math_ceil_raw as *const (),
-                    value.ceil(),
-                ),
-            };
-            let rounded = ctx.trace_ctx.call_typed_with_effect_pure(
-                OpCode::CallF,
-                helper,
-                &[raw_float],
-                &[majit_ir::Type::Float],
-                majit_ir::Type::Float,
-                majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-                &[
-                    majit_ir::Value::Int(helper as i64),
-                    majit_ir::Value::Float(value),
-                ],
-                majit_ir::Value::Float(rounded_value),
-            );
-            ctx.trace_ctx
-                .set_opref_concrete(rounded, majit_ir::Value::Float(rounded_value));
-            rounded
-        }
-    };
-    let raw_int = ctx.trace_ctx.record_op(OpCode::CastFloatToInt, &[rounded]);
-    ctx.trace_ctx
-        .set_opref_concrete(raw_int, majit_ir::Value::Int(result_value));
-    let boxed = walker_box_int(ctx, op.pc, raw_int, result_value)?;
-    ctx.trace_ctx
-        .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result as i64));
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
-    Ok(Some(()))
+    match try_walker_orthodox_descent(
+        ctx,
+        op.pc,
+        &[],
+        &[],
+        &[(raw_float, value)],
+        dst,
+        'r',
+        descent,
+    )? {
+        Some(_) => Ok(Some(())),
+        None => Ok(None),
+    }
 }
 
 /// Read a plain `bh_call_fn(callable, PY_NULL, args…)` shape's concrete
@@ -16618,10 +16504,7 @@ fn walker_guard_float_result_finite<Sym: WalkSym>(
     walker_float_cmp_guard(ctx, pc, OpCode::FloatEq, &[diff, zero], true)
 }
 
-/// The one-argument rows of the `math` float fold: `interp_math`'s `pm1!`
-/// family, each standing for one raw helper in `MATH_FLOAT1_FOLDS`.  Every row
-/// is [`MathFloatDomain::ResultFinite`], so the table is the whole of what
-/// this entry point knows.
+/// The one-argument `math` float builtins: descend the matching unboxed leaf.
 pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -16650,10 +16533,7 @@ pub(crate) fn try_walker_specialize_math_float1<Sym: WalkSym>(
             }
         }
     }
-    walker_specialize_math_float(ctx, code, op, r_args, dst, 1, |callable| {
-        pyre_module::module::math::interp_math::math_float1_fold_helper(callable)
-            .map(|raw| (MathFloatDomain::ResultFinite, MathFloatEmit::Call1(raw)))
-    })
+    Ok(None)
 }
 
 /// The two-argument rows — `pow`, `fmod`, `copysign`, `remainder` and
@@ -16667,10 +16547,30 @@ pub(crate) fn try_walker_specialize_math_float2<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    walker_specialize_math_float(ctx, code, op, r_args, dst, 2, |callable| {
-        pyre_module::module::math::interp_math::math_float2_fold_helper(callable)
-            .map(|raw| (MathFloatDomain::ResultFinite, MathFloatEmit::Call2(raw)))
-    })
+    if let Some((callable, operands)) = plain_builtin_call_concretes(ctx, code, op, r_args, 2) {
+        if r_args.len() >= 4 {
+            if let Some((descent, domain)) = math2_descent_for(callable) {
+                walker_guard_fold_callable(ctx, op.pc, r_args[0], callable)?;
+                if try_walker_orthodox_float_math2(
+                    ctx,
+                    op.pc,
+                    r_args[2],
+                    operands[0],
+                    r_args[3],
+                    operands[1],
+                    dst,
+                    'r',
+                    domain,
+                    descent,
+                )?
+                .is_some()
+                {
+                    return Ok(Some(()));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `math.isclose(a, b)` with both tolerances defaulted.

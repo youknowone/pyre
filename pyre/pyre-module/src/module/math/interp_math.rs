@@ -349,6 +349,11 @@ struct MathBuiltinWrappers {
     ceil: usize,
     trunc: usize,
     isclose: usize,
+    pow: usize,
+    fmod: usize,
+    copysign: usize,
+    remainder: usize,
+    atan2: usize,
 }
 
 static MATH_WRAPPERS: std::sync::OnceLock<MathBuiltinWrappers> = std::sync::OnceLock::new();
@@ -404,6 +409,11 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         ceil: math_wrapper_addr(ns, "ceil"),
         trunc: math_wrapper_addr(ns, "trunc"),
         isclose: math_wrapper_addr(ns, "isclose"),
+        pow: math_wrapper_addr(ns, "pow"),
+        fmod: math_wrapper_addr(ns, "fmod"),
+        copysign: math_wrapper_addr(ns, "copysign"),
+        remainder: math_wrapper_addr(ns, "remainder"),
+        atan2: math_wrapper_addr(ns, "atan2"),
     });
     // The generic float folds are identified the same way; they differ only in
     // that one table entry stands for one raw helper rather than one probe fn.
@@ -558,6 +568,22 @@ pub fn is_math_ceil_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_trunc_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.trunc)
+}
+
+pub fn is_math_pow_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.pow)
+}
+pub fn is_math_fmod_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.fmod)
+}
+pub fn is_math_copysign_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.copysign)
+}
+pub fn is_math_remainder_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.remainder)
+}
+pub fn is_math_atan2_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.atan2)
 }
 
 /// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
@@ -803,6 +829,7 @@ pub fn is_math_isclose_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.isclose)
 }
 
+#[allow(unused_macros)]
 macro_rules! math_fold_table {
     ($table:ident: $entry:ty, $($name:literal => $helper:ident),* $(,)?) => {
         // The length is spelled out from the entry list rather than left to a
@@ -822,14 +849,8 @@ macro_rules! math_fold_table {
 /// All one-arg float builtins now have dedicated leaves.
 static MATH_FLOAT1_FOLDS: [MathFloat1Fold; 0] = [];
 
-math_fold_table!(
-    MATH_FLOAT2_FOLDS: MathFloat2Fold,
-    "pow" => jit_math_pow,
-    "fmod" => jit_math_fmod,
-    "copysign" => jit_math_copysign,
-    "remainder" => jit_math_remainder,
-    "atan2" => jit_math_atan2,
-);
+/// All two-arg float builtins now have dedicated leaves.
+static MATH_FLOAT2_FOLDS: [MathFloat2Fold; 0] = [];
 
 /// The wrapper pointer `py_module!` installed for `math.<name>`, or `None`
 /// for a callable that is not a builtin function.
@@ -958,36 +979,45 @@ pub fn ulp(args: &[PyObjectRef]) -> PyResult {
 
 // ── 2-arg float→float via pymath ─────────────────────────────────────
 
-macro_rules! pm2 {
-    ($name:ident) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 2 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly 2 arguments"
-                )));
-            }
-            let x = try_get_double(args[0])?;
-            let y = try_get_double(args[1])?;
-            map_err(pymath::math::$name(x, y))
-        }
-    };
-}
-
-pm2!(pow);
-pm2!(fmod);
-pm2!(copysign);
-pm2!(remainder);
-
-pub fn atan2(args: &[PyObjectRef]) -> PyResult {
+/// Domain pin via pymath; box the pymath success value.  The walker
+/// still descends the unboxed two-arg leaf.
+fn math2_pymath(
+    name: &str,
+    args: &[PyObjectRef],
+    compute: fn(f64, f64) -> Result<f64, pymath::Error>,
+) -> PyResult {
     if args.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "atan2() takes exactly 2 arguments",
-        ));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "{name}() takes exactly 2 arguments"
+        )));
     }
     let x = try_get_double(args[0])?;
     let y = try_get_double(args[1])?;
-    map_err(pymath::math::atan2(x, y))
+    match compute(x, y) {
+        Ok(v) => pyre_interpreter::objspace::descroperation::_float_pos(v),
+        Err(pymath::Error::EDOM) => {
+            Err(pyre_interpreter::PyError::value_error("math domain error"))
+        }
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
+}
+
+pub fn pow(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("pow", args, pymath::math::pow)
+}
+pub fn fmod(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("fmod", args, pymath::math::fmod)
+}
+pub fn copysign(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("copysign", args, pymath::math::copysign)
+}
+pub fn remainder(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("remainder", args, pymath::math::remainder)
+}
+pub fn atan2(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("atan2", args, pymath::math::atan2)
 }
 
 pub fn hypot(args: &[PyObjectRef]) -> PyResult {
