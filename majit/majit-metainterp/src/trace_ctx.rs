@@ -1238,16 +1238,28 @@ impl TraceCtx {
     /// the per-CacheEntry `last_const_box` (heapcache.py) so two
     /// distinct ConstPtr OpRefs for the same gcref share the same
     /// cache slot.
+    /// `heapcache.py` keys the array cache on `ConstInt.getint()`.  A
+    /// just-unboxed `i % n` is a recorded IntMod, not a ConstInt, but
+    /// `execute_and_record` already stamped the concrete index.  Use
+    /// that stamp so `setarrayitem` updates the same slot `getitem`
+    /// filled (`array_deopt_resume` re-reads `buf[i%4]` after the store).
+    fn heapcache_array_index_value(&self, index: OpRef) -> Option<i64> {
+        match index.inline_const_to_value() {
+            Some(Value::Int(n)) => Some(n),
+            _ => match self.lookup_opref_concrete(index) {
+                Some(Value::Int(n)) => Some(n),
+                _ => None,
+            },
+        }
+    }
+
     pub fn heapcache_getarrayitem(
         &mut self,
         array: OpRef,
         index: OpRef,
         descr: u32,
     ) -> Option<OpRef> {
-        let index_value = match index.inline_const_to_value()? {
-            Value::Int(n) => n,
-            _ => return None,
-        };
+        let index_value = self.heapcache_array_index_value(index)?;
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getarrayitem_cache(array, index_value, descr, oracle)
@@ -1258,10 +1270,7 @@ impl TraceCtx {
     /// otherwise the write goes through the indexcache with `array`
     /// canonicalised by `_unique_const_heuristic`.
     pub fn heapcache_setarrayitem(&mut self, array: OpRef, index: OpRef, descr: u32, value: OpRef) {
-        let index_value = match index.inline_const_to_value() {
-            Some(Value::Int(n)) => Some(n),
-            _ => None,
-        };
+        let index_value = self.heapcache_array_index_value(index);
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .setarrayitem_cache(array, index_value, descr, value, oracle)
@@ -1275,10 +1284,7 @@ impl TraceCtx {
         descr: u32,
         value: OpRef,
     ) {
-        let index_value = match index.inline_const_to_value() {
-            Some(Value::Int(n)) => Some(n),
-            _ => None,
-        };
+        let index_value = self.heapcache_array_index_value(index);
         let oracle: &dyn crate::heapcache::SameConstantOracle = &crate::history::ConstOprefOracle;
         self.heap_cache
             .getarrayitem_now_known(array, index_value, descr, value, oracle)
