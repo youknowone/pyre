@@ -6964,9 +6964,17 @@ macro_rules! int_from_float_leaf {
     };
 }
 
-int_from_float_leaf!(_int_from_floor, |x| x.floor() as i64);
-int_from_float_leaf!(_int_from_ceil, |x| x.ceil() as i64);
-int_from_float_leaf!(_int_from_trunc, |x| x as i64);
+// The walker pins the signed range before descent, so the unchecked
+// conversion is defined.  `as i64` residualizes as a saturating rustc
+// helper (symbolic fnaddr); `to_int_unchecked` is the fptosi the
+// translator rewrites to `cast_float_to_int`.
+int_from_float_leaf!(_int_from_floor, |x| unsafe {
+    x.floor().to_int_unchecked::<i64>()
+});
+int_from_float_leaf!(_int_from_ceil, |x| unsafe {
+    x.ceil().to_int_unchecked::<i64>()
+});
+int_from_float_leaf!(_int_from_trunc, |x| unsafe { x.to_int_unchecked::<i64>() });
 
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
 #[inline(never)]

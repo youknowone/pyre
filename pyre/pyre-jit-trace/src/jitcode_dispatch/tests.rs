@@ -4470,15 +4470,15 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
         ),
         (
             "pyre_interpreter::objspace::descroperation::_int_from_floor",
-            "",
+            "cast_float_to_int",
         ),
         (
             "pyre_interpreter::objspace::descroperation::_int_from_ceil",
-            "",
+            "cast_float_to_int",
         ),
         (
             "pyre_interpreter::objspace::descroperation::_int_from_trunc",
-            "",
+            "cast_float_to_int",
         ),
         (
             "pyre_interpreter::objspace::descroperation::_int_abs",

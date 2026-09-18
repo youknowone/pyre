@@ -5077,6 +5077,29 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // `FloatRepr.rtype_int` (`rfloat.py`) emits `cast_float_to_int`.
+        // Charon spells `f64 as i64` / `to_int_unchecked` as a residual
+        // call (saturating `fptosi`, not a `UnaryOp` Cast), so the
+        // walker sees `residual_call_irf_i` with a symbolic fnaddr and
+        // declines the `_int_from_{floor,ceil,trunc}` descent.  Project
+        // the call onto the same signed cast `jtransform.py` emits for
+        // a float→Signed `force_cast` that fits in an int.
+        if is_float_to_signed_int_cast_target(target)
+            && args.len() == 1
+            && matches!(result_ty, ValueType::Int)
+        {
+            let src = resolve_alias(&args[0], &self.aliases);
+            if self.get_value_kind_var(&src) == 'f' || self.get_value_kind_var(&args[0]) == 'f' {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::UnaryOp {
+                        op: "cast_float_to_int".into(),
+                        operand: src,
+                        result_ty: ValueType::Int,
+                    },
+                }]);
+            }
+        }
         // `__getslice_rangefrom(l, start)` — the front's deferred `l[start:]`
         // on a GC array.  The rtyper's `rtype_getslice` (`rlist.py`) turns
         // the lifted graph's `getslice` into a direct call of
@@ -9920,6 +9943,37 @@ fn remap_op(
 
 /// `rpython.rtyper.lltypesystem.lltype.cast_*` — the host-callable path
 /// `front::mir::cast_call_segments` emits for a bank-crossing cast.
+/// Charon residual for a signed `f64 → i64` conversion: `__builtin__.int`,
+/// `to_int_unchecked`, or the rustc/`fptosi` helper behind `as i64`.
+fn is_float_to_signed_int_cast_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments } => {
+            if segments.as_slice() == ["__builtin__", "int"] {
+                return true;
+            }
+            segments
+                .last()
+                .is_some_and(|leaf| is_float_to_signed_int_leaf(leaf))
+        }
+        CallTarget::Method { name, .. } => is_float_to_signed_int_leaf(name),
+        _ => false,
+    }
+}
+
+fn is_float_to_signed_int_leaf(leaf: &str) -> bool {
+    matches!(
+        leaf,
+        "to_int_unchecked"
+            | "float_to_int_unchecked"
+            | "fptosi_sat"
+            | "f64_to_i64"
+            | "f64_to_isize"
+            | "fixdfti"
+            | "fixdfdi"
+    ) || leaf.contains("fptosi")
+        || leaf.ends_with("to_int_unchecked")
+}
+
 fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     segments.len() == 5
         && segments[0] == "rpython"
@@ -13891,6 +13945,80 @@ mod tests {
             other => panic!("expected CallResidual with runtime funcptr, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn int_of_float_projects_to_cast_float_to_int() {
+        // FloatRepr.rtype_int emits `cast_float_to_int` (`rfloat.py`).
+        // The rich-graph path must do the same for `simple_call(__builtin__.int, v_float)`
+        // or `_int_from_trunc`'s `as i64` residualizes as `residual_call_irf_i`.
+        let mut graph = FunctionGraph::new("cast_float_to_int_test");
+        let arg = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "arg".into(),
+                    ty: ValueType::Float,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&arg, ConcreteType::Float);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__builtin__", "int"]),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["__builtin__", "int"]),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &CallTarget::function_path(["__builtin__", "int"]),
+            std::slice::from_ref(&arg),
+            &ValueType::Int,
+            "cast_float_to_int_test",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, operand, result_ty }
+                            if op == "cast_float_to_int"
+                                && *operand == arg
+                                && *result_ty == ValueType::Int
+                    )),
+                    "float int() must become cast_float_to_int; ops={ops:?}"
+                );
+                assert!(
+                    !ops.iter()
+                        .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+                    "float int() must not residualize; ops={ops:?}"
+                );
+            }
+            RewriteResult::Keep => panic!("float int() must rewrite, got Keep"),
+            RewriteResult::Identity(_) => {
+                panic!("float int() must rewrite, got Identity")
+            }
+        }
     }
 
     #[test]
