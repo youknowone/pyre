@@ -1002,12 +1002,10 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
         opcode_load_const(self, constant)
     }
 
-    fn load_small_int(&mut self, value: i64) -> Result<(), PyError>
-    where
-        Self: ConstantOpcodeHandler,
-    {
-        opcode_load_small_int(self, value)
-    }
+    /// No default: the trait-default `small_int_constant` → `int_constant`
+    /// → `w_int_new` walk writes a translator-local `&INT_TYPE`. `PyFrame`
+    /// returns the interned `w_small_int_const` box.
+    fn load_small_int(&mut self, value: i64) -> Result<(), PyError>;
 
     fn load_fast_checked(&mut self, idx: usize) -> Result<(), PyError>
     where
