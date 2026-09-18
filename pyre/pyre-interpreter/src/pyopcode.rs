@@ -720,7 +720,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         }
         ConstantData::Slice { elements } => {
             // Slice constant → build start/stop/step via handler.slice_constant()
-            let items = load_const_pinned_items(handler, elements)?;
+            let items = load_const_pinned_items(handler, elements.as_slice())?;
             if items.len() == 3 {
                 let items = items.as_slice();
                 handler.slice_constant(items[0], items[1], items[2])
