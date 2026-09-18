@@ -99,6 +99,7 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
+    pyre_interpreter::importing::register_builtin_module("unicodedata", module::unicodedata::init);
     pyre_interpreter::importing::register_builtin_module("zlib", module::zlib::init);
 }
 
@@ -330,6 +331,8 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
 
     let mut aliases = vec![
         subclass_range_alias(129, typed::<module::_tokenize::W_TokenizerIter>()),
+        // `unicodedata.UCD` sits at AUTO-ID 157, before `__pypy__.Bufferable`.
+        subclass_range_alias(157, typed::<module::unicodedata::W_UCD>()),
         subclass_range_alias(162, typed::<module::_json::W_Scanner>()),
         subclass_range_alias(163, typed::<module::_json::W_Encoder>()),
         subclass_range_alias(172, typed::<module::_bz2::W_BZ2Compressor>()),
@@ -407,6 +410,16 @@ mod tests {
     /// process-global fnaddr table. The prepass reads the same table
     /// from a host copy of this crate; a missing row here is the same
     /// defect as a build script that forgot to link `pyre-module`.
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_unicodedata_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_module::module::unicodedata::__majit_wrap_category"),
+            "moved unicodedata #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
     #[test]
     fn jit_trace_fnaddrs_covers_moved_bz2_wrapper() {
         let bindings: HashMap<&'static str, i64> =

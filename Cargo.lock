@@ -2866,6 +2866,7 @@ dependencies = [
  "rustpython-compiler",
  "rustpython-compiler-core",
  "rustpython-host_env",
+ "rustpython-unicode",
  "rustpython-wtf8",
  "widestring",
  "windows-sys 0.61.2",

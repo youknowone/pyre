@@ -801,7 +801,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_typing);
     pyre_install_module!(_hashlib);
     pyre_install_module!(gc);
-    pyre_install_module!(unicodedata);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub

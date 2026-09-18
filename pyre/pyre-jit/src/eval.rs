@@ -3970,7 +3970,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_pyre_class(
         &mut gc,
         &mut pytype_to_tid,
-        <pyre_interpreter::module::unicodedata::W_UCD
+        <pyre_module::module::unicodedata::W_UCD
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
     register_pyre_class(

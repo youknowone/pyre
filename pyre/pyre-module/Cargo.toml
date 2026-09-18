@@ -37,6 +37,7 @@ rustpython-common = { workspace = true }
 rustpython-compiler = { workspace = true }
 rustpython-compiler-core = { workspace = true }
 rustpython-host_env = { workspace = true, optional = true }
+rustpython-unicode = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -47,3 +48,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_Debug"] 
 # `_overlapped.CreateEvent` builds the `WideCString` name
 # `rustpython_host_env::winapi::create_event_w` takes.
 widestring = "1.2"
+
+[dev-dependencies]
+pyre-interpreter = { workspace = true, features = ["test-hooks"] }
