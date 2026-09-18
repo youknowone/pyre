@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=load_attr
+# pyre-check: spec-folds=load_attr,builtin_getattr
 # pyre-check: max-wasm-ratio=6.3
 # Function.call_args now enters every application-level callee through the
 # recursive portal, matching PyPy's PyCode.funcrun -> PyFrame.run chain.  The
@@ -13,9 +13,9 @@
 # outgrown -- it is the darwin reading no CI run measures that this holds
 # for.
 # The attribute fold, 690 firings across the corpus and undeclared. Pure-Python
-# pickle drives it 122 times here, more than any other fixture.  Two-arg
-# `getattr` that used to credit `builtin_getattr` now folds at `getattr_str`
-# as `load_attr`; `instance_surrogate_attrs` keeps the CALL-site row.
+# pickle drives it 122 times here, more than any other fixture.  It also reaches
+# `builtin_getattr`, which a corpus census found no other fixture firing: once
+# here, out of 77 consultations.
 # Pure-Python pickle terminates its unpickler loop by raising the private
 # `_Stop` exception from `load_stop`.  The JIT's after-residual guard snapshot
 # must resume from the emitted post-call `-live-` anchor even though the
