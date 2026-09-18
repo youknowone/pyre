@@ -84,4 +84,5 @@ pub mod resource;
 pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod termios;
+pub mod unicodedata;
 pub mod zlib;

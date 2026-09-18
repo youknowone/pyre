@@ -83,7 +83,6 @@ pub mod sys;
 #[allow(non_snake_case)]
 pub mod thread;
 pub mod time;
-pub mod unicodedata;
 #[cfg(windows)]
 pub mod winreg;
 #[allow(non_snake_case)]

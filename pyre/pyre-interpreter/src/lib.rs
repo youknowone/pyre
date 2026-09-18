@@ -1192,9 +1192,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // `functools.KeyWrapper` follows them at the append-only AUTO-ID
         // registration tail.
         subclass_range_alias(156, typed::<crate::module::_functools::W_KeyWrapper>()),
-        // `unicodedata.UCD` and `__pypy__.Bufferable` close that tail in the
-        // order `build_gc` registers them.
-        subclass_range_alias(157, typed::<crate::module::unicodedata::W_UCD>()),
+        // `unicodedata.UCD` alias 157 lives on the optional-module hook.
+        // `__pypy__.Bufferable` closes that tail in the order `build_gc`
+        // registers them.
         subclass_range_alias(
             158,
             typed::<crate::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable>(),
