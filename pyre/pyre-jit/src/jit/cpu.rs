@@ -539,7 +539,7 @@ impl Cpu {
             truth_fn: crate::call_jit::bh_truth_fn,
             load_const_fn: crate::call_jit::bh_load_const_fn,
             store_subscr_fn: pyre_interpreter::opcode_ops::bh_store_subscr_fn,
-            getattr_fn: pyre_interpreter::opcode_ops::jit_baseobjspace_getattr,
+            getattr_fn: crate::call_jit::bh_getattr_fn,
             load_name_fn: crate::call_jit::bh_load_name_fn,
             store_name_fn: crate::call_jit::bh_store_name_fn,
             store_global_fn: crate::call_jit::bh_store_global_fn,

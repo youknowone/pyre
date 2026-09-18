@@ -1583,9 +1583,6 @@ pub(crate) unsafe fn subclass_special_override(
 /// the by-layout result). Only objects matching no fast path reach the
 /// generic tail, which consults `__bool__` then `__len__`, where the call
 /// exceptions — and the non-bool-`__bool__` TypeError — propagate.
-/// `inline(never)` so the codewriter mints the graph named by
-/// `flatten.rs` `IS_TRUE` (`space.is_true`).
-#[inline(never)]
 pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
     // descroperation.py:265 — `__bool__` (anywhere in the MRO) is consulted
     // before `__len__`.  An exact builtin's `__bool__` / `__len__` are the
@@ -4507,10 +4504,6 @@ pub fn finditem(obj: PyObjectRef, index: PyObjectRef) -> Result<Option<PyObjectR
 // return value.  STORE_SUBSCR and the `jit_setitem` residual drop this
 // result, so the void-ness lives at the opcode boundary, not in this
 // method's `PyResult` type.
-//
-// `inline(never)` so the codewriter mints the graph the jitted
-// STORE_SUBSCR path calls (`eval.rs store_subscr` → `setitem`).
-#[inline(never)]
 pub fn setitem(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef) -> PyResult {
     unsafe {
         // `pypy/objspace/std/dictproxyobject.py` exposes neither
@@ -6355,11 +6348,6 @@ pub fn clear_all_weakrefs(obj: PyObjectRef) {
 /// (PyPy: Module.getdict → w_dict lookup).
 /// For other objects, looks up the attribute in the per-object side table.
 
-/// `inline(never)` so the codewriter mints the graph the jitted
-/// `LOAD_ATTR` path actually calls (`eval.rs load_attr` → `getattr_str`).
-/// Without it rustc inlines this into the eval loop and the walker never
-/// sees a `space.getattr` boundary to fold `f_lasti` / mapdict.
-#[inline(never)]
 pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     // `space.getattr` — the full path, including the `__getattr__` fallback.
     getattr_str_impl(obj, name, true, false).map_err(|mut err| {
@@ -7316,10 +7304,6 @@ pub(crate) unsafe fn super_getattribute_code_name(
 // valid UTF-8 name takes the `&str` fast path unchanged.
 
 /// `space.getattr(w_obj, w_name)`.
-///
-/// `inline(never)` so the codewriter mints the graph named by
-/// `flatten.rs` `GETATTR` (`pyopcode.py LOAD_ATTR` → `space.getattr`).
-#[inline(never)]
 pub fn getattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     // `getattr` accepts a wrapped attribute name.  Validate it before the
     // Unicode storage access below: callers such as `_abc._abc_init` can
@@ -7386,10 +7370,6 @@ pub fn lookup_attr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 }
 
 /// `space.setattr(w_obj, w_name, w_val)`.
-///
-/// `inline(never)` so the codewriter mints the graph named by
-/// `flatten.rs` `SETATTR`.
-#[inline(never)]
 pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyResult {
     if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
         return Err(PyError::type_error(format!(
@@ -7410,10 +7390,6 @@ pub fn setattr(obj: PyObjectRef, w_name: PyObjectRef, value: PyObjectRef) -> PyR
 }
 
 /// `space.delattr(w_obj, w_name)`.
-///
-/// `inline(never)` so the codewriter mints the graph named by
-/// `flatten.rs` `DELATTR`.
-#[inline(never)]
 pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
     if w_name.is_null() || unsafe { !pyre_object::is_str(w_name) } {
         return Err(PyError::type_error(format!(
@@ -13412,9 +13388,6 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
     Ok(w_none())
 }
 
-/// `inline(never)` so the codewriter mints the graph the jitted
-/// `STORE_ATTR` path calls (`eval.rs store_attr` → `setattr_str`).
-#[inline(never)]
 pub fn setattr_str(obj: PyObjectRef, name: &str, value: PyObjectRef) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // `super` proxies only `__getattribute__` (descriptor.py W_Super); it has
@@ -14636,9 +14609,6 @@ fn missing_attribute_subject(obj: PyObjectRef) -> String {
 /// Delete an attribute: `del obj.name`.
 ///
 /// PyPy: descroperation.py descr__delattr__
-/// `inline(never)` so the codewriter mints the graph the jitted
-/// `DELETE_ATTR` path calls.
-#[inline(never)]
 pub fn delattr_str(obj: PyObjectRef, name: &str) -> PyResult {
     let obj = crate::module::_weakref::interp__weakref::force(obj)?;
     // descroperation.py:254 — space.lookup for __delattr__ through MRO
@@ -17015,10 +16985,6 @@ unsafe fn builtin_iter_override(
 
 /// `iter(obj)` — PyPy: space.iter(w_obj)
 /// Calls __iter__ on the object if available.
-///
-/// `inline(never)` so the codewriter mints the graph the jitted
-/// GET_ITER path calls (`opcode_get_iter` → `iter`).
-#[inline(never)]
 pub fn iter(obj: PyObjectRef) -> PyResult {
     if obj.is_null() {
         return Err(PyError::type_error("'NoneType' object is not iterable"));

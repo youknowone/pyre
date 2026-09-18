@@ -3339,13 +3339,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let is_standard_frame = ctx.trace_ctx.standard_virtualizable_box() == Some(obj)
         && ctx.trace_ctx.standard_virtualizable_ptr() == Some(concrete_obj as usize);
 
-    // Fold the walk's own frame (portal red or inlined callee, including
-    // `sys._getframe(0)` of that callee).  A traceback node's `tb_frame`
-    // is the same concrete portal under a GETFIELD box — residualize so
-    // the proxy reads the heap after `except` binds `e`.
-    let is_owned_inline_concrete = inline_frame != 0 && concrete_obj as usize == inline_frame;
     if name == "f_locals"
-        && (is_inline_frame || is_standard_frame || is_owned_inline_concrete)
+        && (is_inline_frame || is_standard_frame)
         && unsafe { (*concrete_obj).ob_type } == &pyre_interpreter::pyframe::FRAME_TYPE
         && unsafe {
             (*(concrete_obj as *const pyre_interpreter::PyFrame))
@@ -4494,31 +4489,15 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || dst_bank != 'r' {
         return Ok(None);
     }
-    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
-        return Ok(None);
-    };
-    fold_load_type_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
-}
-
-/// Same fold as [`try_walker_specialize_load_type_attr`] once the name is a
-/// `&str` — generated `getattr` / `getattr_str` already resolved it.
-pub(crate) fn fold_load_type_attr_named<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    obj: OpRef,
-    name: &str,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
-        return Ok(None);
-    }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
-    let Some((w_type, _version_tag, w_value, binding)) =
-        (unsafe { pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name)) })
-    else {
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
+        pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
+    }) else {
         return Ok(None);
     };
 
@@ -4594,30 +4573,8 @@ pub(crate) fn try_walker_specialize_load_bound_method_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    fold_load_bound_method_attr_named(ctx, op_pc, obj, &name, dst, dst_bank)
-}
-
-/// Same fold as [`try_walker_specialize_load_bound_method_attr`] once the
-/// name is a `&str`.
-pub(crate) fn fold_load_bound_method_attr_named<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    obj: OpRef,
-    name: &str,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' {
-        return Ok(None);
-    }
-    if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
-        return Ok(None);
-    }
-    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
-        return Ok(None);
-    };
     let Some((w_type, version_tag, w_descr, owes_shadow_guard)) = (unsafe {
-        pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, name)
+        pyre_interpreter::baseobjspace::bound_method_attr_fast_path(concrete_obj, &name)
     }) else {
         return Ok(None);
     };
@@ -6192,6 +6149,12 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
+    let (Some(concrete_obj), Some(concrete_value)) = (
+        walker_concrete_ref_object(ctx, obj),
+        walker_concrete_ref_object(ctx, value),
+    ) else {
+        return Ok(None);
+    };
     let name = unsafe {
         let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
         if code_ptr.is_null() {
@@ -6202,33 +6165,6 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             Some(n) => n.to_string(),
             None => return Ok(None),
         }
-    };
-    fold_store_attr_named(ctx, op_pc, obj, value, &name, original_effect)
-}
-
-/// Same fold as [`try_walker_specialize_store_attr`] once the name is a
-/// `&str` — flattened `setattr` / `setattr_str` already resolved it.
-pub(crate) fn fold_store_attr_named<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    obj: OpRef,
-    value: OpRef,
-    name: &str,
-    original_effect: &majit_ir::EffectInfo,
-) -> Result<Option<WalkerStoreAttrSpecialization>, DispatchError> {
-    if !ctx.is_authoritative_executor {
-        return Ok(None);
-    }
-    // A rewind-admitted BINARY_OP dunder must not commit before its result
-    // is known.  The StoreAttr residual already refuses here; the flattened
-    // `setattr` residual and the `setattr_str` inline_call fold both land
-    // in this helper, so the same refusal has to sit on the write itself.
-    fbw_binop_rewind_refuse_commit(ctx, op_pc, Some(obj))?;
-    let (Some(concrete_obj), Some(concrete_value)) = (
-        walker_concrete_ref_object(ctx, obj),
-        walker_concrete_ref_object(ctx, value),
-    ) else {
-        return Ok(None);
     };
     if let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = unsafe {
         pyre_interpreter::objspace::std::mapdict::store_attr_unboxed_fast_path(concrete_obj, &name)
@@ -9922,238 +9858,11 @@ pub(crate) fn binary_value_from_tag_jitcode()
     crate::jitcode_runtime::pathed_runtime_jitcode_cached(BINARY_OP_DESCENT.path)
 }
 
-/// True when the inlined callee is the graph keyed `path`.
-///
-/// `call.py get_jitcode` keys `CallControl.jitcodes` by graph.  A JitCode's
-/// `name` is only the key's last segment and many graphs share one (nine
-/// are named `setitem`, eight of them dict-strategy methods), so identity
-/// is the graph key, never the name.
-pub(crate) fn jitcode_is_pathed(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-    path: &str,
-) -> bool {
-    if crate::jitcode_runtime::compute_pathed_jitcode_index(path) == Some(sub_index) {
-        return true;
-    }
-    crate::jitcode_runtime::pathed_jitcode_cached(path)
-        .is_some_and(|jc| std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr()))
-}
-
-fn jitcode_is_any_pathed(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-    paths: &[&str],
-) -> bool {
-    paths
-        .iter()
-        .any(|path| jitcode_is_pathed(sub_index, sub_body, path))
-}
-
-/// `space.getattr` / `getattr_str` — the two spellings of the same
-/// `DescrOperation.getattr` body.  The jitted `LOAD_ATTR` path calls
-/// `getattr_str` (`eval.rs load_attr`); flatten's 2-arg HLOp calls
-/// `getattr`.
-pub(super) const SPACE_GETATTR_PATHS: &[&str] = &[
-    "pyre_interpreter::baseobjspace::getattr",
-    "pyre_interpreter::baseobjspace::getattr_str",
-];
-
-/// `getattr_str`'s shared body, `(obj, name, call_getattr, suppress)`.
-pub(super) const GETATTR_STR_IMPL_PATH: &str = "pyre_interpreter::baseobjspace::getattr_str_impl";
-
-/// `pyopcode.py LOAD_ATTR` trait methods — `(frame, obj, name)`.
-pub(super) const FRAME_LOAD_ATTR_PATHS: &[&str] = &[
-    "OpcodeStepExecutor::load_attr",
-    "SharedOpcodeHandler::load_attr",
-];
-
-/// `space.setattr` / `setattr_str` — `(obj, name, value)`.
-pub(super) const SPACE_SETATTR_PATHS: &[&str] = &[
-    "pyre_interpreter::baseobjspace::setattr",
-    "pyre_interpreter::baseobjspace::setattr_str",
-];
-
-/// `space.delattr` / `delattr_str` — `(obj, name)`.
-pub(super) const SPACE_DELATTR_PATHS: &[&str] = &[
-    "pyre_interpreter::baseobjspace::delattr",
-    "pyre_interpreter::baseobjspace::delattr_str",
-];
-
-/// `space.setitem` and its slot tail — `(obj, index, value)`.
-pub(super) const SPACE_SETITEM_PATHS: &[&str] = &[
-    "pyre_interpreter::baseobjspace::setitem",
-    "pyre_interpreter::baseobjspace::setitem_slot",
-];
-
-pub(super) const SPACE_ITER_PATH: &str = "pyre_interpreter::baseobjspace::iter";
-
-/// `space.is_true` and the two layout/lookup helpers it dispatches to.
-pub(super) const SPACE_IS_TRUE_PATHS: &[&str] = &[
-    "pyre_interpreter::baseobjspace::is_true",
-    "pyre_interpreter::baseobjspace::is_true_slot",
-    "pyre_interpreter::baseobjspace::is_true_lookup",
-];
-
-pub(crate) fn jitcode_is_space_getattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_any_pathed(sub_index, sub_body, SPACE_GETATTR_PATHS)
-}
-
-pub(crate) fn jitcode_is_getattr_str_impl(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_pathed(sub_index, sub_body, GETATTR_STR_IMPL_PATH)
-}
-
-pub(crate) fn jitcode_is_frame_load_attr(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_any_pathed(sub_index, sub_body, FRAME_LOAD_ATTR_PATHS)
-}
-
-pub(crate) fn jitcode_is_space_setattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_any_pathed(sub_index, sub_body, SPACE_SETATTR_PATHS)
-}
-
-pub(crate) fn jitcode_is_space_delattr(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_any_pathed(sub_index, sub_body, SPACE_DELATTR_PATHS)
-}
-
-pub(crate) fn jitcode_is_space_setitem(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_any_pathed(sub_index, sub_body, SPACE_SETITEM_PATHS)
-}
-
-pub(crate) fn jitcode_is_space_is_true(sub_index: usize, sub_body: &super::SubJitCodeBody) -> bool {
-    jitcode_is_any_pathed(sub_index, sub_body, SPACE_IS_TRUE_PATHS)
-}
-
-/// The exact-int `*_from_tag_inner` bodies an inlined caller still walks.
-pub(crate) fn jitcode_is_from_tag_inner(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_any_pathed(
-        sub_index,
-        sub_body,
-        &[
-            "pyre_interpreter::opcode_ops::compare_value_from_tag_inner",
-            "pyre_interpreter::opcode_ops::binary_value_from_tag_inner",
-        ],
-    )
-}
-
-/// Protocol bodies whose declined fold residualizes instead of descending.
-pub(crate) fn jitcode_is_unbounded_helper_body(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_space_getattr(sub_index, sub_body)
-        || jitcode_is_getattr_str_impl(sub_index, sub_body)
-        || jitcode_is_frame_load_attr(sub_index, sub_body)
-        || jitcode_is_space_setattr(sub_index, sub_body)
-        || jitcode_is_space_delattr(sub_index, sub_body)
-        || jitcode_is_space_setitem(sub_index, sub_body)
-        || jitcode_is_pathed(sub_index, sub_body, SPACE_ITER_PATH)
-        || jitcode_is_from_tag_inner(sub_index, sub_body)
-}
-
-/// `compare_value_from_tag(a, b, tag)` only.  `compare_value` takes a
-/// `ComparisonOperator`, whose discriminant order is not the tag order
-/// (`Equal` is 2, tag 2 is `>`); its body calls `compare_value_from_tag`,
-/// so walking it reaches this helper with the real tag.
-pub(crate) fn jitcode_is_compare_value_from_tag(
-    sub_index: usize,
-    sub_body: &super::SubJitCodeBody,
-) -> bool {
-    jitcode_is_pathed(sub_index, sub_body, COMPARE_OP_DESCENT.path)
-}
-
-/// Guard a non-constant attribute name and run the LOAD_ATTR specializations
-/// that used to sit on the `load_attr_fn` residual.
-pub(crate) fn try_fold_inline_getattr<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    obj: OpRef,
-    name_opref: OpRef,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    let Some(concrete_name) = walker_concrete_ref_object(ctx, name_opref) else {
-        return Ok(None);
-    };
-    if !unsafe { pyre_object::is_exact_type(concrete_name, &pyre_object::pyobject::STR_TYPE) } {
-        return Ok(None);
-    }
-    let name = unsafe { pyre_object::w_str_get_wtf8(concrete_name) };
-    let Ok(name) = name.as_str() else {
-        return Ok(None);
-    };
-    if !name_opref.is_constant() {
-        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            majit_ir::OpCode::GuardValue,
-            &[name_opref, name_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(name_opref, name_const);
-    }
-    try_fold_inline_getattr_named(ctx, op_pc, obj, name, dst, dst_bank)
-}
-
-pub(crate) fn resolved_attr_name_from_str_slice(int_concretes: &[ConcreteValue]) -> Option<String> {
-    let (ptr, len) = match int_concretes {
-        [ConcreteValue::Int(ptr), ConcreteValue::Int(len), ..] if *len >= 0 && *len < 4096 => {
-            (*ptr as *const u8, *len as usize)
-        }
-        _ => return None,
-    };
-    if ptr.is_null() {
-        return None;
-    }
-    std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) })
-        .ok()
-        .map(str::to_string)
-}
-
-pub(crate) fn try_fold_inline_getattr_named<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    obj: OpRef,
-    name: &str,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if spec_gate(SpecFold::LoadAttr, || {
-        try_walker_specialize_load_attr(ctx, op_pc, obj, name, dst, dst_bank)
-    })?
-    .is_some()
-    {
-        return Ok(Some(()));
-    }
-    if spec_gate(SpecFold::LoadTypeAttr, || {
-        fold_load_type_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
-    })?
-    .is_some()
-    {
-        return Ok(Some(()));
-    }
-    if spec_gate(SpecFold::LoadAttrOnSuper, || {
-        try_walker_specialize_load_attr_on_super(ctx, op_pc, obj, name, dst, dst_bank)
-    })?
-    .is_some()
-    {
-        return Ok(Some(()));
-    }
-    spec_gate(SpecFold::LoadBoundMethodAttr, || {
-        fold_load_bound_method_attr_named(ctx, op_pc, obj, name, dst, dst_bank)
-    })
-}
-
+/// True when `sub_body` is the `binary_value_from_tag` helper the
+/// codewriter inlines for BINARY.  The per-index name table can miss a
+/// helper that `pathed_jitcode_cached` still owns, and a name-only
+/// check then skipped descent so a declined sub-walk residualized
+/// `CallMayForce` (`binary_value_from_tag`) on fib bridges.
 pub(crate) fn jitcode_is_binary_value_from_tag(
     sub_index: usize,
     sub_body: &super::SubJitCodeBody,
@@ -12318,16 +12027,17 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let ConcreteValue::Ref(concrete_callable) = arg_concretes[0] else {
-        return Ok(None);
-    };
-    let null_or_self = match arg_concretes[1] {
-        ConcreteValue::Ref(value) => value,
-        ConcreteValue::Null => pyre_object::PY_NULL,
-        _ => return Ok(None),
-    };
-    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
-        (arg_concretes[2], arg_concretes[3])
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
     else {
         return Ok(None);
     };
@@ -12430,16 +12140,17 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
         return Ok(None);
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let ConcreteValue::Ref(concrete_callable) = arg_concretes[0] else {
-        return Ok(None);
-    };
-    let null_or_self = match arg_concretes[1] {
-        ConcreteValue::Ref(value) => value,
-        ConcreteValue::Null => pyre_object::PY_NULL,
-        _ => return Ok(None),
-    };
-    let (ConcreteValue::Ref(concrete_obj), ConcreteValue::Ref(concrete_name)) =
-        (arg_concretes[2], arg_concretes[3])
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_name),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
     else {
         return Ok(None);
     };
@@ -12540,9 +12251,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     // two guards above are the premise of a fold that is no longer there, and
     // the residual the caller falls through to recomputes the lookup from the
     // unguarded operands.
-    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none()
-        && (fold_load_type_attr_named(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none()
-    {
+    if (try_walker_specialize_load_attr(ctx, op.pc, r_args[2], name, dst, 'r')?).is_none() {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
@@ -20611,30 +20320,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     w_code_ptr: usize,
     name_idx: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    try_walker_trace_immutable_type_attr_raise_with_name(
-        ctx,
-        op,
-        obj_op,
-        store_value,
-        w_code_ptr,
-        name_idx,
-        None,
-    )
-}
-
-pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    obj_op: OpRef,
-    store_value: Option<OpRef>,
-    w_code_ptr: usize,
-    name_idx: usize,
-    name_override: Option<&str>,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor {
-        return Ok(None);
-    }
-    if name_override.is_none() && w_code_ptr == 0 {
+    if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
@@ -20653,19 +20339,15 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>
         }
         None => None,
     };
-    let name = if let Some(name) = name_override {
-        name.to_string()
-    } else {
-        unsafe {
-            let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-            if code_ptr.is_null() {
-                return Ok(None);
-            }
-            let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-            match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-                Some(n) => n.to_string(),
-                None => return Ok(None),
-            }
+    let name = unsafe {
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return Ok(None);
+        }
+        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
+            Some(n) => n.to_string(),
+            None => return Ok(None),
         }
     };
     if !pyre_interpreter::baseobjspace::type_immutable_attr_raise_is_stable(
@@ -20820,13 +20502,6 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise_with_name<Sym: WalkSym>
     // the catch-side `record_inline_exception_context` compensation finds the
     // context unchained and passes this exception to the resolver call, which
     // forces the very allocation this fold exists to keep virtual.
-    //
-    // `error.py OperationError.record_context` reads `ec.sys_exc_info()`.
-    // A ConstPtr of the recording-time active exception aliases the
-    // previous raise's NewWithVtable in this loop and keeps both
-    // allocations live; the GETFIELD is the same word PUSH_EXC_INFO /
-    // POP_EXCEPT write (`ec_sys_exc_value_descr`), so a completed except
-    // answers NULL and both TypeErrors DCE.
     let active = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[ec],
@@ -20889,24 +20564,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     w_code_ptr: usize,
     name_idx: usize,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    try_walker_trace_readonly_descr_attr_raise_with_name(
-        ctx, op, obj_op, value_op, w_code_ptr, name_idx, None,
-    )
-}
-
-pub(crate) fn try_walker_trace_readonly_descr_attr_raise_with_name<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op: &DecodedOp,
-    obj_op: OpRef,
-    value_op: OpRef,
-    w_code_ptr: usize,
-    name_idx: usize,
-    name_override: Option<&str>,
-) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor {
-        return Ok(None);
-    }
-    if name_override.is_none() && w_code_ptr == 0 {
+    if !ctx.is_authoritative_executor || w_code_ptr == 0 {
         return Ok(None);
     }
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj_op) else {
@@ -20914,19 +20572,15 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise_with_name<Sym: WalkSym>
     };
     let concrete_value =
         walker_concrete_ref_object(ctx, value_op).unwrap_or_else(pyre_object::w_none);
-    let name = if let Some(name) = name_override {
-        name.to_string()
-    } else {
-        unsafe {
-            let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
-            if code_ptr.is_null() {
-                return Ok(None);
-            }
-            let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
-            match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
-                Some(n) => n.to_string(),
-                None => return Ok(None),
-            }
+    let name = unsafe {
+        let code_ptr = pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef);
+        if code_ptr.is_null() {
+            return Ok(None);
+        }
+        let code = &*(code_ptr as *const pyre_interpreter::CodeObject);
+        match pyre_interpreter::pyframe::load_name_from_code(code, name_idx) {
+            Some(n) => n.to_string(),
+            None => return Ok(None),
         }
     };
     let Some(descr) =
@@ -21094,22 +20748,16 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise_with_name<Sym: WalkSym>
     ctx.trace_ctx
         .set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
 
-    // `error.py OperationError.record_context` reads `ec.sys_exc_info()`.
-    // A ConstPtr of the recording-time active exception aliases the
-    // previous raise's NewWithVtable and keeps both allocations live;
-    // GETFIELD is the same word PUSH_EXC_INFO / POP_EXCEPT write.
-    if let Some(ec) = walker_ensure_execution_context(ctx) {
-        let active = ctx.trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[ec],
-            crate::descr::ec_sys_exc_value_descr(),
-        );
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[new_op, active],
-            crate::descr::w_exception_context_descr(kind),
-        );
-    }
+    let active = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[ec],
+        crate::descr::ec_sys_exc_value_descr(),
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[new_op, active],
+        crate::descr::w_exception_context_descr(kind),
+    );
     fbw_context_chained_insert(new_op);
     let active_concrete = pyre_interpreter::eval::get_current_exception();
     if !active_concrete.is_null() {
@@ -21852,7 +21500,11 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     _dst: usize,
     dst_bank: char,
 ) -> Result<Option<OpRef>, DispatchError> {
-    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+    if !ctx.is_authoritative_executor
+        || dst_bank != 'r'
+        || r_args.len() != 1
+        || ctx.fbw_mode.inline_subwalk
+    {
         return Ok(None);
     }
 
@@ -21886,14 +21538,6 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         if !pyre_object::functional::is_w_range(range_obj)
             || !pyre_object::functional::is_exact_w_range(range_obj)
         {
-            if fbw_debug_abort_enabled() {
-                eprintln!(
-                    "[decline-why] GET-ITER-NOT-RANGE pc={op_pc} is_range={} exact={} ty={}",
-                    pyre_object::functional::is_w_range(range_obj),
-                    pyre_object::functional::is_exact_w_range(range_obj),
-                    unsafe { pyre_object::type_name_of(range_obj) },
-                );
-            }
             return Ok(None);
         }
         let (start_obj, _stop_obj, step_obj) = pyre_object::functional::w_range_fields(range_obj);

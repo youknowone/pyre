@@ -2273,12 +2273,6 @@ fn create_segmented_trace<Sym: WalkSym>(
     //
     // Before the guard: a refusal must leave no always-fails guard and no
     // FINISH behind, and the latch records nothing into the trace.
-    //
-    // Sit the mirror at this Python pc first.  `MIFrame.debug_merge_point`
-    // sees the stack after the previous opcode; a synthesized DMP can
-    // fire while the mirror still names that opcode, and the latch would
-    // then publish a leftover wrapint as TOS for FOR_ITER to peek.
-    sit_vstack_mirror_at_python_pc(ctx, mp_green_pc);
     if !latch_abort_blackhole(ctx, mp_opcode_pc, "segment-cut") {
         census_record("SegmentTrace::LatchRefused");
         return Ok(None);
@@ -4715,26 +4709,6 @@ fn write_ref_reg<Sym: WalkSym>(
     Ok(())
 }
 
-/// Write a Ref dest that is not a Python operand-stack producer.
-///
-/// [`write_ref_reg`] stamps `vstack_last_ref` for `ResultToTos` reconcile
-/// (`#73`). Void-like dests — setattr/setitem `w_none()`, vable scalar
-/// fields — must keep the previous candidate.  A STORE_ATTR that stamped
-/// None let a later boxed int overwrite TOS; segmented resume then fed
-/// that int to FOR_ITER (`'int' object is not an iterator`).
-fn write_ref_reg_keep_tos<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    pc: usize,
-    dst: usize,
-    value: OpRef,
-    concrete: ConcreteValue,
-) -> Result<(), DispatchError> {
-    let saved = ctx.frame_state.borrow().vstack_last_ref;
-    write_ref_reg(ctx, pc, dst, value, concrete)?;
-    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
-    Ok(())
-}
-
 /// Write a pyre scalar virtualizable Ref field without stamping operand TOS.
 ///
 /// Pyre's scalar virtualizable fields are `last_instr(0)`, `pycode(1)`,
@@ -4753,7 +4727,10 @@ fn write_vable_field_ref_reg<Sym: WalkSym>(
     value: OpRef,
     concrete: ConcreteValue,
 ) -> Result<(), DispatchError> {
-    write_ref_reg_keep_tos(ctx, pc, dst, value, concrete)
+    let saved = ctx.frame_state.borrow().vstack_last_ref;
+    write_ref_reg(ctx, pc, dst, value, concrete)?;
+    ctx.frame_state.borrow_mut().vstack_last_ref = saved;
+    Ok(())
 }
 
 /// One raw integer element read of `itemsize` bytes at `addr`, widened to

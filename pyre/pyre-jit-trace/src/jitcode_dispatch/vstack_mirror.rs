@@ -291,40 +291,6 @@ pub(crate) fn classify_vstack_opcode(
     }
 }
 
-/// True when `top` is the iterator a just-walked GET_ITER actually produced.
-///
-/// A loop-header walk that only *visits* the GET_ITER segment has no such
-/// production: `vstack_last_ref` is still NONE, or it names a later wrapint
-/// / setattr dest.  Replacing the seeded iterator with that box is how
-/// `for_iter_direct_store_double` published an int into the iterator slot.
-fn last_ref_is_fresh_iterator<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, top: OpRef) -> bool {
-    if top == OpRef::NONE {
-        return false;
-    }
-    let Some(obj) = (match ctx.trace_ctx.concrete_of_opref(top) {
-        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
-            let obj = r.as_usize() as pyre_object::PyObjectRef;
-            if obj.is_null() { None } else { Some(obj) }
-        }
-        _ => None,
-    }) else {
-        return false;
-    };
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-        return false;
-    }
-    // `space.iter` admits a result iff the type answers `__next__`
-    // (`baseobjspace.rs iter_check_is_iterator`).  A later wrapint /
-    // setattr dest does not, so a surviving generator, dict-iter,
-    // enumerate, or user iterator stays in TOS when GET_ITER is only
-    // visited, not re-executed.
-    unsafe {
-        let w_type = (*obj).w_class;
-        !w_type.is_null()
-            && pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__next__").is_some()
-    }
-}
-
 /// The boxed constant a value `LOAD_CONST` / `LOAD_SMALL_INT` pushes, as a
 /// trace-constant OpRef, or `OpRef::NONE` when `instr` is neither (or its
 /// constant is unresolvable). Realizes the constant the same way
@@ -673,20 +639,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                     // NONE hole from `getconstant_w` / `w_small_int_const`.
                     top = loadconst_operand_ref(ctx, code, &instr, op_arg);
                 }
-                // The loop-carried FOR_ITER iterator lives in TOS at
-                // depth 1.  PyPy's MIFrame keeps that register
-                // (`pyopcode.py opcode_for_iter` peeks; it never
-                // reconstructs the slot from `vstack_last_ref`).  A
-                // later iterator in last-ref (a nested `iter()` in the
-                // body) also answers `__next__`; keep the surviving
-                // TOS unless last-ref is the same box GET_ITER just
-                // wrote.
-                let existing = ctx.frame_state.borrow().vstack_boxes[new_depth - 1];
-                let keep_iterator =
-                    new_depth == 1 && last_ref_is_fresh_iterator(ctx, existing) && top != existing;
-                if !keep_iterator {
-                    ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
-                }
+                ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
             }
         }
         VstackOpClass::LoadGlobalMethod => {
@@ -1113,44 +1066,6 @@ fn exact_segmentation_disabled() -> bool {
 /// `vstack_valid` is still set.  Reached only when the outer full-body sym
 /// owns the shadow (`fbw_mode.snapshot_sym` non-null).  Writes
 /// only the `vstack_*` side-fields; never the registers / snapshot.
-/// Sit the operand-stack mirror at `py_pc`'s entry depth.
-///
-/// `pyjitpl.py MIFrame.debug_merge_point` observes the stack after the
-/// previous opcode and before this one.  A synthesized DMP can fire while
-/// `vstack_cur_pypc` still names the preceding opcode (the floor/exact
-/// segment has not retired it), so a segment-cut latch would publish the
-/// pre-pop stack — FOR_ITER then peeks a leftover wrapint as the iterator.
-pub(crate) fn sit_vstack_mirror_at_python_pc<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    py_pc: usize,
-) {
-    if !ctx.vstack_valid || ctx.vstack_cur_pypc as usize == py_pc {
-        return;
-    }
-    let full_body_sym = ctx.fbw_mode.snapshot_sym;
-    if full_body_sym.is_null() {
-        return;
-    }
-    let (code_ptr, depth) = unsafe {
-        let sym = &*full_body_sym;
-        if sym.jitcode().is_null() {
-            return;
-        }
-        let jc = &*sym.jitcode();
-        if jc.payload.code_ptr.is_null() {
-            return;
-        }
-        let depth = crate::liveness::liveness_for(jc.payload.code_ptr)
-            .depth_at_py_pc()
-            .get(py_pc)
-            .copied()
-            .unwrap_or(0) as usize;
-        (jc.payload.code_ptr, depth)
-    };
-    let code = unsafe { &*code_ptr };
-    reconcile_vstack_at_boundary(ctx, code, py_pc as u32, depth);
-}
-
 pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, jit_pc: usize) {
     if !ctx.vstack_valid {
         return;

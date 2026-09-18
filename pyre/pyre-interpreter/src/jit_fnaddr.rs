@@ -1609,43 +1609,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cp1(
         &mut entries,
-        "pyre_interpreter::type_methods::format_simple_w",
-        crate::opcode_ops::jit_format_simple_w,
-    );
-    cp2(
-        &mut entries,
-        "pyre_interpreter::type_methods::format_w",
-        crate::opcode_ops::jit_format_w,
-    );
-    cp2(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::getattr",
-        crate::opcode_ops::jit_baseobjspace_getattr,
-    );
-    cp1(
-        &mut entries,
         "pyre_interpreter::baseobjspace::len",
         crate::opcode_ops::jit_baseobjspace_len,
-    );
-    cp1(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::is_true",
-        crate::opcode_ops::jit_baseobjspace_is_true,
     );
     cp2(
         &mut entries,
         "pyre_interpreter::baseobjspace::delitem",
         crate::opcode_ops::jit_baseobjspace_delitem,
-    );
-    cp3(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::setattr",
-        crate::opcode_ops::jit_baseobjspace_setattr,
-    );
-    cp2(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::delattr",
-        crate::opcode_ops::jit_baseobjspace_delattr,
     );
     cpa2(
         &mut entries,

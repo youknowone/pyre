@@ -741,15 +741,24 @@ pub fn slot_for_call_flavor(flavor: CallFlavor) -> majit_metainterp::EffectInfoS
 /// `W_TypeObject`, so the
 /// `getfield_gc_r` shape is not required.
 ///
-/// `getattr` / `setattr` / `delattr` are NOT in this set: the frontend
-/// records the flowspace shapes that
-/// [`lower_getattr_hlop_to_insn`] / [`lower_setattr_hlop_to_insn`] /
-/// [`lower_delete_attr_hlop_to_insn`] lower to an `inline_call` of
-/// `space.{getattr,setattr,delattr}` (or the matching residual when
-/// that graph is unbound).  Eliding them under `lowering_ctx` would
-/// drop STORE_ATTR / DELETE_ATTR from the compiled loop.
+/// `getattr` is NOT in this set: the LoadAttr arm records the 4-arg
+/// rtyper-surrogate shape that [`lower_getattr_hlop_to_insn`] lowers
+/// to the `load_attr_fn` residual call (upstream `rclass.py:838
+/// rtype_getattr` would rewrite the HLOp post-rtyping; pyre's lowering
+/// arm is the surrogate for that pass).
+///
+/// `setattr` — emitted by `codewriter.rs::emit_frontend_setattr`
+/// mirroring `flowcontext.py:1031-1036 op.setattr(w_obj,
+/// w_attributename, w_newvalue)`.  Same shape as `getattr`: the
+/// `StoreAttr` arm (codewriter.rs) pairs it with an inline
+/// `emit_abort_permanent!`, so the compiled trace bails to the
+/// interpreter at the `abort_permanent` Insn canonical already emits.
+/// A literal `setattr` Insn would be unreachable at runtime and
+/// undispatchable by the assembler.  Upstream `rclass.py:859
+/// rtype_setattr` rewrites to `setfield_gc(v, descr, w_value)` after
+/// rtyping; pyre's lack of rtyping keeps the HLOp unmodified.
 fn is_pyre_canonical_elidable_hlop(opname: &str) -> bool {
-    matches!(opname, "type")
+    matches!(opname, "type" | "setattr")
 }
 
 pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
@@ -2702,8 +2711,6 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "load_import_globals"
             | "simple_call"
             | "getattr"
-            | "setattr"
-            | "delattr"
             | "load_special"
             | "load_fast_check"
             | "store_attr"
@@ -2727,7 +2734,6 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "match_keys"
             | "match_class"
             | "not_"
-            | "iter"
             | "import_from"
             | "load_from_dict_or_globals"
             | "load_super_attr"
@@ -3406,18 +3412,13 @@ pub struct LoweringContext {
     /// so the residual_call Insn has no result Register and no
     /// `ListI` (no scalar Int args).
     pub store_subscr_fn_idx: u16,
-    /// `getattr_fn` descrs-pool index — `jit_baseobjspace_getattr(obj,
-    /// w_name) → Ref`, the unbound fallback for the 2-arg
-    /// `flowcontext.py op.getattr` shape.
+    /// `getattr_fn` descrs-pool index — `bh_getattr_fn(obj: Ref,
+    /// w_name: Ref) → Ref`, the interned-name residual for the bare
+    /// 2-arg `flowcontext.py:862-867 op.getattr` shape.  Dormant: the
+    /// LoadAttr arm records the 4-arg rtyper-surrogate shape lowered
+    /// via [`lower_getattr_hlop_to_insn`] to `load_attr_fn` instead,
+    /// and bare 2-arg `getattr` HLOps pass through.
     pub getattr_fn_idx: u16,
-    /// `setattr_fn` descrs-pool index — `jit_baseobjspace_setattr(obj,
-    /// w_name, value) → Ref`, the unbound fallback for the 3-arg
-    /// `flowcontext.py op.setattr` shape.
-    pub setattr_fn_idx: u16,
-    /// `delattr_fn` descrs-pool index — `jit_baseobjspace_delattr(obj,
-    /// w_name) → Ref`, the unbound fallback for the 2-arg
-    /// `flowcontext.py op.delattr` shape.
-    pub delattr_fn_idx: u16,
     /// `load_name_fn` descrs-pool index.  LOAD_NAME family (single
     /// HLOp opname `load_name`, the `pyopcode.py:945` frame-receiver
     /// shape) lowers to `residual_call_ir_r` (`ListI([namei])` +
@@ -3767,11 +3768,6 @@ pub struct LoweringContext {
     /// `inline_call_r_r` of `baseobjspace::not_` when that body is fully
     /// bound, otherwise this residual (`bh_unary_not_fn`, MayForce).
     pub unary_not_fn_idx: u16,
-    /// `get_iter_fn` descrs-pool index.  GET_ITER records the object-space
-    /// `iter(iterable)` op; [`lower_iter_hlop_to_insn`] emits
-    /// `inline_call_r_r` of `baseobjspace::iter` when that body is fully
-    /// bound, otherwise this residual (`bh_get_iter_fn`, MayForce).
-    pub get_iter_fn_idx: u16,
     /// `load_fast_check_fn` descrs-pool index.  LOAD_FAST_CHECK records the
     /// `load_fast_check(value, code, name_idx)` HLOp lowered to
     /// `residual_call_ir_r(ConstInt(fn_idx), ListR([value, code]),
@@ -4121,19 +4117,15 @@ where
     };
     let lhs_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let rhs_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
-    // pyopcode.py `COMPARE_OP` / `IS_OP` / `CONTAINS_OP` all become one
-    // `compare_value_from_tag` call with the opcode tag as a constant.
-    // `jtransform.py handle_regular_call` emits `inline_call_ir_r` when
-    // that body is bound; the tag folds the unused arms away.  Residual
-    // only if this build did not bind the graph.
-    if let Some(insn) = build_orthodox_inline_call_ir_r(
-        inline_call_targets::COMPARE_VALUE_FROM_TAG,
-        vec![Operand::ConstInt(op_val)],
-        vec![lhs_operand.clone(), rhs_operand.clone()],
-        result_reg,
-    ) {
-        return Some(insn);
-    }
+    // `is` / `is_not` stay residual.  Walking `compare_value_from_tag` →
+    // `is_w` records `GuardSubclass` against an unbound type constant
+    // (classptr 0) on the value-comparing arms (`int`/`float`/`str`/…),
+    // and the assembler panics looking up that range.  The residual fold
+    // (`try_walker_fold_is_op`) already emits `ptr_eq` for pointer-identity
+    // classes and declines the value-comparing ones — which is the shape
+    // `is_op_identity` pins.  Other COMPARE tags stay residual so
+    // `CompareOpDescent` and `finishframe_exception` own the portal-frame
+    // raise.
     Some(build_residual_call_ir_r_insn_from_operands(
         ctx.compare_op_fn_idx,
         op_val,
@@ -5406,20 +5398,6 @@ where
     if op.args.len() != 1 {
         return None;
     }
-    let value = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => {
-            let reg = get_register(*var);
-            Register::new(Kind::Int, reg.index)
-        }
-        _ => return None,
-    };
-    // pyopcode.py truth tests → `space.is_true`.
-    if let Some(insn) =
-        build_orthodox_inline_call_r_i(inline_call_targets::IS_TRUE, value.clone(), dst_reg)
-    {
-        return Some(insn);
-    }
     // `truth_fn` returns Int (the boolean 0/1 result), so the
     // dispatcher must emit `dst_reg` with `Kind::Int` regardless of
     // the HLOp result Variable's recorded kind.  `emit_frontend_bool`
@@ -5541,28 +5519,12 @@ where
     if op.args.len() != 3 {
         return None;
     }
+    if op.result.is_some() {
+        return None;
+    }
     let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let key_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
     let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
-    // pyopcode.py STORE_SUBSCR → `space.setitem`.  The opcode discards
-    // the return; flatten still needs the dest so `inline_call_r_r` of
-    // `setitem` can write it.
-    if let Some(dst_reg) = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => Some(get_register(*var)),
-        _ => None,
-    } {
-        if let Some(insn) = build_orthodox_inline_call_r_r_n(
-            inline_call_targets::SETITEM,
-            vec![
-                obj_operand.clone(),
-                key_operand.clone(),
-                value_operand.clone(),
-            ],
-            dst_reg,
-        ) {
-            return Some(insn);
-        }
-    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.store_subscr_fn_idx,
         vec![obj_operand, key_operand, value_operand],
@@ -5835,9 +5797,6 @@ where
     if let Some(insn) = lower_unary_not_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
-    if let Some(insn) = lower_iter_hlop_to_insn(op, ctx, get_register, lower_constant) {
-        return Some(insn);
-    }
     if let Some(insn) = lower_load_fast_check_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
@@ -5913,38 +5872,16 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    if op.opname != "getattr" {
-        return None;
-    }
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
-    // pyopcode.py `LOAD_ATTR` (jitted): `space.getattr(w_obj, w_attributename)`.
-    if op.args.len() == 2 {
-        let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-        let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
-        if let Some(insn) = build_orthodox_inline_call_r_r_n(
-            inline_call_targets::GETATTR,
-            vec![obj.clone(), name.clone()],
-            dst_reg,
-        ) {
-            return Some(insn);
-        }
-        return Some(build_residual_call_r_r_insn_from_operands(
-            ctx.getattr_fn_idx,
-            vec![obj, name],
-            CallFlavor::MayForce,
-            majit_ir::RuntimeHelperKind::LoadAttr,
-            dst_reg,
-        ));
-    }
-    if op.args.len() != 4 {
+    if op.opname != "getattr" || op.args.len() != 4 {
         return None;
     }
     let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
     let code = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
     let name_idx = const_int_for_value_arg(&op.args[3])?;
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
     let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
     // Tag the LOAD_ATTR helper calldescr so the full-body walker recognizes the
     // call and folds a monomorphic instance-attribute read to a guarded inline
@@ -6153,30 +6090,6 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    // pyopcode.py STORE_ATTR (jitted): `space.setattr(w_obj, w_name, w_val)`.
-    if op.opname == "setattr" && op.args.len() == 3 {
-        let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-        let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
-        let value = operand_for_value_arg(&op.args[2], get_register, lower_constant)?;
-        let dst_reg = match &op.result {
-            Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-            _ => return None,
-        };
-        if let Some(insn) = build_orthodox_inline_call_r_r_n(
-            inline_call_targets::SETATTR,
-            vec![obj.clone(), name.clone(), value.clone()],
-            dst_reg,
-        ) {
-            return Some(insn);
-        }
-        return Some(build_residual_call_r_r_insn_from_operands(
-            ctx.setattr_fn_idx,
-            vec![obj, name, value],
-            CallFlavor::MayForce,
-            majit_ir::RuntimeHelperKind::None,
-            dst_reg,
-        ));
-    }
     if op.opname != "store_attr" || op.args.len() != 4 {
         return None;
     }
@@ -6325,13 +6238,6 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    // pyopcode.py `FORMAT_VALUE` without a spec is `space.format(w_value,
-    // space.newtext(''))`.  `format_simple_w` is that call.
-    if let Some(insn) =
-        build_orthodox_inline_call_r_r(inline_call_targets::FORMAT_SIMPLE, value.clone(), dst_reg)
-    {
-        return Some(insn);
-    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.format_simple_fn_idx,
         vec![value],
@@ -6599,28 +6505,10 @@ where
 mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
-    /// COMPARE_OP / IS_OP / CONTAINS_OP — `lower_compare_op_hlop_to_insn`.
-    pub const COMPARE_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::compare_value_from_tag";
-    /// FORMAT_SIMPLE — `lower_format_simple_hlop_to_insn`.
-    pub const FORMAT_SIMPLE: &str = "pyre_interpreter::type_methods::format_simple_w";
-    /// FORMAT_WITH_SPEC — `lower_format_with_spec_hlop_to_insn`.
-    pub const FORMAT_W: &str = "pyre_interpreter::type_methods::format_w";
-    /// LOAD_ATTR — `lower_getattr_hlop_to_insn`.
-    pub const GETATTR: &str = "pyre_interpreter::baseobjspace::getattr";
-    /// STORE_ATTR — `lower_setattr_hlop_to_insn`.
-    pub const SETATTR: &str = "pyre_interpreter::baseobjspace::setattr";
-    /// DELETE_ATTR — `lower_delete_attr_hlop_to_insn`.
-    pub const DELATTR: &str = "pyre_interpreter::baseobjspace::delattr";
     /// GET_LEN — `lower_get_len_hlop_to_insn`.
     pub const LEN: &str = "pyre_interpreter::baseobjspace::len";
-    /// BOOL / TO_BOOL — `lower_bool_hlop_to_insn`.
-    pub const IS_TRUE: &str = "pyre_interpreter::baseobjspace::is_true";
     /// DELETE_SUBSCR — `lower_delsubscr_hlop_to_insn`.
     pub const DELITEM: &str = "pyre_interpreter::baseobjspace::delitem";
-    /// STORE_SUBSCR — `space.setitem`.
-    pub const SETITEM: &str = "pyre_interpreter::baseobjspace::setitem";
-    /// GET_ITER — `space.iter`.
-    pub const ITER: &str = "pyre_interpreter::baseobjspace::iter";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -6726,24 +6614,6 @@ fn build_orthodox_inline_call_r_v(
             Operand::descr(DescrOperand::JitCode(jitcode)),
             Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
         ],
-    ))
-}
-
-/// `jtransform.py handle_regular_call` for a `(Ref) → Int` body:
-/// `inline_call_r_i(JitCode, ListR([value])) → reg`.
-fn build_orthodox_inline_call_r_i(
-    canonical_path: &'static str,
-    value: Operand,
-    dst_reg: Register,
-) -> Option<Insn> {
-    let jitcode = fully_bound_callee_body(canonical_path)?;
-    Some(Insn::op_with_result(
-        "inline_call_r_i",
-        vec![
-            Operand::descr(DescrOperand::JitCode(jitcode)),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
-        ],
-        dst_reg,
     ))
 }
 
@@ -7150,37 +7020,6 @@ where
     ))
 }
 
-/// Lower the GET_ITER object-space op `iter(iterable)` → `result: Ref`
-/// (pyopcode.py GET_ITER → `space.iter`) to `inline_call_r_r` of
-/// `baseobjspace::iter` when that body is fully bound, otherwise the
-/// MayForce `get_iter_fn` residual.
-pub fn lower_iter_hlop_to_insn<F, LC>(
-    op: &super::flow::SpaceOperation,
-    ctx: &LoweringContext,
-    get_register: &mut F,
-    lower_constant: &mut LC,
-) -> Option<Insn>
-where
-    F: FnMut(super::flow::Variable) -> Register,
-    LC: FnMut(&Constant) -> Operand,
-{
-    if op.opname != "iter" || op.args.len() != 1 {
-        return None;
-    }
-    let value = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-    let dst_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-        _ => return None,
-    };
-    Some(build_unary_inline_call_or_residual(
-        inline_call_targets::ITER,
-        ctx.get_iter_fn_idx,
-        majit_ir::RuntimeHelperKind::GetIter,
-        value,
-        dst_reg,
-    ))
-}
-
 /// Lower the FORMAT_WITH_SPEC pyre HLOp `format_with_spec(value, spec)` →
 /// `result: Ref` to `residual_call_r_r(ConstInt(format_with_spec_fn_idx),
 /// ListR([value, spec]), Descr) → reg`.  `bh_format_with_spec_fn(value,
@@ -7209,14 +7048,6 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    // pyopcode.py `FORMAT_VALUE` with a spec is `space.format(w_value, w_spec)`.
-    if let Some(insn) = build_orthodox_inline_call_r_r_n(
-        inline_call_targets::FORMAT_W,
-        vec![value.clone(), spec.clone()],
-        dst_reg,
-    ) {
-        return Some(insn);
-    }
     Some(build_residual_call_r_r_insn_from_operands(
         ctx.format_with_spec_fn_idx,
         vec![value, spec],
@@ -7710,29 +7541,6 @@ where
     F: FnMut(super::flow::Variable) -> Register,
     LC: FnMut(&Constant) -> Operand,
 {
-    // pyopcode.py DELETE_ATTR (jitted): `space.delattr(w_obj, w_name)`.
-    if op.opname == "delattr" && op.args.len() == 2 {
-        let obj = operand_for_value_arg(&op.args[0], get_register, lower_constant)?;
-        let name = operand_for_value_arg(&op.args[1], get_register, lower_constant)?;
-        let dst_reg = match &op.result {
-            Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
-            _ => return None,
-        };
-        if let Some(insn) = build_orthodox_inline_call_r_r_n(
-            inline_call_targets::DELATTR,
-            vec![obj.clone(), name.clone()],
-            dst_reg,
-        ) {
-            return Some(insn);
-        }
-        return Some(build_residual_call_r_r_insn_from_operands(
-            ctx.delattr_fn_idx,
-            vec![obj, name],
-            CallFlavor::MayForce,
-            majit_ir::RuntimeHelperKind::None,
-            dst_reg,
-        ));
-    }
     if op.opname != "delete_attr" || op.args.len() != 3 {
         return None;
     }
@@ -9094,21 +8902,21 @@ mod tests {
         }
     }
 
-    /// `setattr` is no longer an `is_pyre_canonical_elidable_hlop`:
-    /// under `lowering_ctx` it lowers to `inline_call_r_r` /
-    /// `residual_call_r_r` of `space.setattr`.  Without `lowering_ctx`
-    /// it still passes through as a raw `setattr` Insn.
+    /// `setattr` is an `is_pyre_canonical_elidable_hlop`: under
+    /// `lowering_ctx` (the canonical production path) `serialize_op` elides
+    /// it (the `StoreAttr` walker arm pairs it with `abort_permanent`, so a
+    /// literal `setattr` Insn would be unreachable and undispatchable);
+    /// without `lowering_ctx` it passes through as a raw `setattr` Insn.
     #[test]
-    fn serialize_op_lowers_setattr_under_lowering_ctx() {
+    fn serialize_op_elides_setattr_under_lowering_ctx() {
         let obj = Variable::new(VariableId(0), Kind::Ref);
         let attr = Variable::new(VariableId(1), Kind::Ref);
         let val = Variable::new(VariableId(2), Kind::Ref);
-        let result = Variable::new(VariableId(3), Kind::Ref);
         let make_op = || {
             SpaceOperation::new(
                 "setattr",
                 vec![obj.into(), attr.into(), val.into()],
-                Some(result.into()),
+                None,
                 7,
             )
         };
@@ -9117,7 +8925,6 @@ mod tests {
             ref_coloring.insert(obj.id, 0u16);
             ref_coloring.insert(attr.id, 1u16);
             ref_coloring.insert(val.id, 2u16);
-            ref_coloring.insert(result.id, 3u16);
             [
                 super::super::regalloc::GraphAllocationResult {
                     coloring: crate::jit::regalloc::Coloring::default(),
@@ -9125,7 +8932,7 @@ mod tests {
                 },
                 super::super::regalloc::GraphAllocationResult {
                     coloring: ref_coloring,
-                    num_colors: 4,
+                    num_colors: 3,
                 },
                 super::super::regalloc::GraphAllocationResult {
                     coloring: crate::jit::regalloc::Coloring::default(),
@@ -9148,13 +8955,12 @@ mod tests {
             off.insns,
         );
 
-        // With lowering_ctx: lower through space.setattr, never drop it.
+        // With lowering_ctx: `setattr` is elided (no Insn emitted).
         let ctx = LoweringContext {
             binary_op_fn_idx: 11,
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,
             store_subscr_fn_idx: 19,
-            setattr_fn_idx: 23,
             ..Default::default()
         };
         let mut on = SSARepr::new("setattr_on");
@@ -9163,19 +8969,8 @@ mod tests {
             GraphFlattener::new(&graph, &mut on_regallocs, &mut on).with_lowering_ctx(ctx);
         on_flat.serialize_op(&make_op());
         assert!(
-            on.insns.iter().any(|insn| matches!(
-                insn,
-                Insn::Op { opname, .. }
-                    if *opname == "inline_call_r_r" || *opname == "residual_call_r_r"
-            )),
-            "lowering ON must emit space.setattr: {:?}",
-            on.insns,
-        );
-        assert!(
-            !on.insns
-                .iter()
-                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "setattr")),
-            "lowering ON must not emit a raw setattr Insn: {:?}",
+            on.insns.is_empty(),
+            "lowering ON must elide setattr (no Insn): {:?}",
             on.insns,
         );
     }
@@ -9352,19 +9147,9 @@ mod tests {
             ssarepr.insns
         );
 
-        // BOOL `bool` → inline_call_r_i of `is_true` when bound, else
-        // residual_call_r_i with fn_idx=17.
+        // BOOL `bool` → residual_call_r_i with fn_idx=17.
         let bool_call = ssarepr.insns.iter().find(|insn| {
             matches!(
-                insn,
-                Insn::Op { opname, args, .. }
-                    if opname == "inline_call_r_i"
-                        && matches!(
-                            args.first(),
-                            Some(Operand::Descr(descr))
-                                if matches!(&**descr, DescrOperand::JitCode(jc) if jc.name() == "is_true")
-                        )
-            ) || matches!(
                 insn,
                 Insn::Op { opname, args, .. }
                     if opname == "residual_call_r_i"
@@ -9373,7 +9158,7 @@ mod tests {
         });
         assert!(
             bool_call.is_some(),
-            "expected BOOL inline_call or residual_call: {:?}",
+            "expected BOOL residual_call: {:?}",
             ssarepr.insns
         );
 
@@ -10214,62 +9999,13 @@ mod tests {
     }
 
     #[test]
-    fn lower_compare_op_hlop_emits_inline_call_when_body_is_bound() {
-        // `compare_value_from_tag` is fully bound, so COMPARE_OP tags
-        // 0..=5 lower to `jtransform.py handle_regular_call`'s
-        // `inline_call_ir_r`.
-        let lhs = Variable::new(VariableId(0), Kind::Ref);
-        let rhs = Variable::new(VariableId(1), Kind::Ref);
-        let result = Variable::new(VariableId(2), Kind::Ref);
-        let ctx = LoweringContext {
-            compare_op_fn_idx: 13,
-            ..Default::default()
-        };
-
-        let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
-        let mut get_register = identity_register_mapper();
-        let mut lower_constant = test_constant_lowering();
-        let lowered =
-            lower_compare_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
-                .expect("COMPARE_OP HLOp must lower");
-
-        match lowered {
-            Insn::Op {
-                opname,
-                args,
-                result: Some(reg),
-            } => {
-                assert_eq!(opname, "inline_call_ir_r");
-                assert_eq!(reg, Register::new(Kind::Ref, 2));
-                assert_eq!(args.len(), 3);
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Int);
-                        assert!(matches!(list.content.as_slice(), [Operand::ConstInt(4)]));
-                    }
-                    other => panic!("expected ListI([4]), got {other:?}"),
-                }
-                match &args[2] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert_eq!(list.content.len(), 2);
-                    }
-                    other => panic!("expected ListR([lhs, rhs]), got {other:?}"),
-                }
-            }
-            other => panic!("expected inline_call_ir_r, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn lower_compare_op_hlop_to_insn_emits_residual_call_ir_r() {
         // Lowering an `lt(lhs, rhs) → result`
-        // HLOp produces `inline_call_ir_r` when `compare_value_from_tag`
-        // is bound, else the residual shape
-        // `build_compare_op_residual_call_ir_r_insn` emits at the
-        // CompareOp callsite: `residual_call_ir_r` with args
-        // `[ConstInt(fn_idx), ListI([ConstInt(op_val)]), ListR([lhs, rhs]),
-        // Descr]`.
+        // HLOp must produce the same Insn shape that
+        // `build_compare_op_residual_call_ir_r_insn` produces inline at the
+        // CompareOp callsite (codewriter.rs's `Instruction::CompareOp` arm):
+        // `residual_call_ir_r` with args `[ConstInt(fn_idx),
+        // ListI([ConstInt(op_val)]), ListR([lhs, rhs]), Descr]`.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
         let result = Variable::new(VariableId(2), Kind::Ref);
@@ -10350,7 +10086,7 @@ mod tests {
         let mut lower_constant = test_constant_lowering();
 
         let insn = lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-            .expect("IS_OP HLOp must lower through compare_value_from_tag");
+            .expect("IS_OP HLOp must lower through the compare residual");
 
         match insn {
             Insn::Op { opname, args, .. } => {
@@ -10455,20 +10191,6 @@ mod tests {
                 opname,
                 args,
                 result: Some(reg),
-            } if opname == "inline_call_r_i" => {
-                assert_eq!(reg, Register::new(Kind::Int, 1));
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert_eq!(list.content.len(), 1);
-                    }
-                    other => panic!("expected ListR([cond]), got {other:?}"),
-                }
-            }
-            Insn::Op {
-                opname,
-                args,
-                result: Some(reg),
             } => {
                 assert_eq!(opname, "residual_call_r_i");
                 assert_eq!(reg, Register::new(Kind::Int, 1));
@@ -10538,18 +10260,8 @@ mod tests {
         let mut lower_constant = test_constant_lowering();
         let lowered = lower_bool_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
             .expect("BOOL HLOp must lower");
-        match &lowered {
-            Insn::Op { opname, .. }
-                if *opname == "inline_call_r_i" || *opname == "residual_call_r_i" => {}
-            other => panic!("BOOL must lower through space.is_true, got {other:?}"),
-        }
-        if matches!(
-            &lowered,
-            Insn::Op { opname, .. } if *opname == "residual_call_r_i"
-        ) {
-            let prod = build_truth_fn_residual_call_r_i_insn(31, 0, 1);
-            assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
-        }
+        let prod = build_truth_fn_residual_call_r_i_insn(31, 0, 1);
+        assert_eq!(format!("{lowered:?}"), format!("{prod:?}"));
     }
 
     #[test]
@@ -10694,9 +10406,8 @@ mod tests {
         assert!(
             lower_setitem_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant).is_none()
         );
-        // A result-bearing `setitem` still lowers: inline `setitem` when
-        // the minted helper is present, otherwise the same void residual
-        // STORE_SUBSCR uses.  The dest is what `inline_call_r_r` writes.
+        // Right opname but with a result — must still return None
+        // since `emit_frontend_setitem` always emits void.
         let r = Variable::new(VariableId(3), Kind::Ref);
         let op_with_result = SpaceOperation::new(
             "setitem",
@@ -10704,33 +10415,15 @@ mod tests {
             Some(r.into()),
             0,
         );
-        let insn = lower_setitem_hlop_to_insn(
-            &op_with_result,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("result-bearing setitem must lower");
-        match insn {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } if opname.starts_with("inline_call") => {
-                assert_eq!(result, Some(Register::new(Kind::Ref, 3)));
-                assert!(!args.is_empty());
-            }
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } => {
-                assert_eq!(opname, "residual_call_r_v");
-                assert!(result.is_none());
-                assert_eq!(args.len(), 3);
-            }
-            other => panic!("expected setitem inline or residual, got {other:?}"),
-        }
+        assert!(
+            lower_setitem_hlop_to_insn(
+                &op_with_result,
+                &ctx,
+                &mut get_register,
+                &mut lower_constant
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -12484,9 +12177,6 @@ mod tests {
     /// `co_names` index) the 4-arg HLOp shape threads through.
     fn load_attr_lowering_fixture() -> (LoweringContext, Constant, Constant) {
         let ctx = LoweringContext {
-            getattr_fn_idx: 89,
-            setattr_fn_idx: 90,
-            delattr_fn_idx: 88,
             load_attr_fn_idx: 91,
             load_method_self_fn_idx: 92,
             load_name_fn_idx: 93,
@@ -12630,8 +12320,10 @@ mod tests {
     }
 
     #[test]
-    fn lower_getattr_hlop_two_arg_is_space_getattr() {
-        // pyopcode.py `LOAD_ATTR` (jitted): `space.getattr(w_obj, w_name)`.
+    fn lower_getattr_hlop_declines_two_arg_legacy_shape() {
+        // Upstream's bare 2-arg `op.getattr(w_obj, w_attributename)`
+        // (legacy/test graphs without the rtyper-surrogate operands) must
+        // pass through, not lower with garbage operands.
         let obj_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();
@@ -12646,85 +12338,10 @@ mod tests {
             index: 101,
         };
         let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn =
+        assert!(
             super::lower_getattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .expect("2-arg getattr must lower through space.getattr");
-        match insn {
-            Insn::Op { opname, .. } => {
-                assert!(
-                    opname == "inline_call_r_r" || opname == "residual_call_r_r",
-                    "unexpected getattr lowering {opname}"
-                );
-            }
-            other => panic!("expected Insn::Op, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lower_setattr_hlop_three_arg_is_space_setattr() {
-        let obj_var = Variable::new(VariableId(8), Kind::Ref);
-        let name_var = Variable::new(VariableId(9), Kind::Ref);
-        let value_var = Variable::new(VariableId(10), Kind::Ref);
-        let result_var = Variable::new(VariableId(11), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
-        let op = super::super::flow::SpaceOperation::new(
-            "setattr",
-            vec![obj_var.into(), name_var.into(), value_var.into()],
-            Some(result_var.into()),
-            0,
+                .is_none()
         );
-        let mut get_register = |_var: Variable| Register {
-            kind: Kind::Ref,
-            index: 101,
-        };
-        let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn =
-            super::lower_setattr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
-                .expect("3-arg setattr must lower through space.setattr");
-        match insn {
-            Insn::Op { opname, .. } => {
-                assert!(
-                    opname == "inline_call_r_r" || opname == "residual_call_r_r",
-                    "unexpected setattr lowering {opname}"
-                );
-            }
-            other => panic!("expected Insn::Op, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lower_delattr_hlop_two_arg_is_space_delattr() {
-        let obj_var = Variable::new(VariableId(8), Kind::Ref);
-        let name_var = Variable::new(VariableId(9), Kind::Ref);
-        let result_var = Variable::new(VariableId(10), Kind::Ref);
-        let (ctx, _, _) = load_attr_lowering_fixture();
-        let op = super::super::flow::SpaceOperation::new(
-            "delattr",
-            vec![obj_var.into(), name_var.into()],
-            Some(result_var.into()),
-            0,
-        );
-        let mut get_register = |_var: Variable| Register {
-            kind: Kind::Ref,
-            index: 101,
-        };
-        let mut lower_constant = super::flatten_constant_operand_for_test;
-        let insn = super::lower_delete_attr_hlop_to_insn(
-            &op,
-            &ctx,
-            &mut get_register,
-            &mut lower_constant,
-        )
-        .expect("2-arg delattr must lower through space.delattr");
-        match insn {
-            Insn::Op { opname, .. } => {
-                assert!(
-                    opname == "inline_call_r_r" || opname == "residual_call_r_r",
-                    "unexpected delattr lowering {opname}"
-                );
-            }
-            other => panic!("expected Insn::Op, got {other:?}"),
-        }
     }
 
     #[test]
@@ -13512,20 +13129,6 @@ mod tests {
         )
         .expect("1-arg format_simple lowering must succeed");
         match insn {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } if opname == "inline_call_r_r" => {
-                assert!(result.is_some());
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert_eq!(list.content.len(), 1);
-                    }
-                    other => panic!("expected ListR([value]), got {other:?}"),
-                }
-            }
             Insn::Op {
                 opname,
                 args,
@@ -15138,20 +14741,6 @@ mod tests {
         )
         .expect("2-arg format_with_spec lowering must succeed");
         match insn {
-            Insn::Op {
-                opname,
-                args,
-                result,
-            } if opname == "inline_call_r_r" => {
-                assert!(result.is_some());
-                match &args[1] {
-                    Operand::ListOfKind(list) => {
-                        assert_eq!(list.kind, Kind::Ref);
-                        assert_eq!(list.content.len(), 2);
-                    }
-                    other => panic!("expected ListR([value, spec]), got {other:?}"),
-                }
-            }
             Insn::Op {
                 opname,
                 args,
