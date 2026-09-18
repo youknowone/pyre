@@ -1318,9 +1318,13 @@ pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodeP
         }
         let value = utf8_payload_wtf8((*(obj as *const W_UnicodeObject)).value);
         if w_str_is_ascii(obj) {
-            return value
-                .get(index..index + 1)
-                .and_then(|one| one.code_points().next());
+            // `unicodeobject.py` `_index_to_byte` on ASCII: the code-point
+            // index is the byte offset. Read that byte; do not `slice::get`
+            // a one-byte window and walk `code_points()`.
+            let bytes = value.as_bytes();
+            return Some(CodePoint::from_u32_unchecked(
+                *bytes.as_ptr().add(index) as u32
+            ));
         }
         let storage = w_str_get_index_storage(obj);
         Some(CodePoint::from_u32_unchecked(

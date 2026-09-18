@@ -572,10 +572,15 @@ pub unsafe fn w_bytes_block(obj: PyObjectRef) -> *const BytesBlock {
 pub unsafe fn w_bytes_find(obj: PyObjectRef, value: u8, start: usize) -> i64 {
     unsafe {
         let data = w_bytes_data(obj);
-        for (i, item) in data.iter().enumerate().skip(start) {
-            if *item == value {
+        // `rstr.py` `ll_find` is `for i in range(start, end)`, not
+        // `Enumerate` / `FilterMap`.
+        let end = data.len();
+        let mut i = start;
+        while i < end {
+            if *data.as_ptr().add(i) == value {
                 return i as i64;
             }
+            i += 1;
         }
         -1
     }

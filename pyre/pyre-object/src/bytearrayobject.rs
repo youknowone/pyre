@@ -385,10 +385,15 @@ pub unsafe fn w_bytearray_find(obj: PyObjectRef, value: u8, start: usize) -> i64
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
         let data = &*ba.data;
-        for (i, item) in data.iter().enumerate().skip(start) {
-            if *item == value {
+        // `rstr.py` `ll_find` is `for i in range(start, end)`, not
+        // `Enumerate` / `FilterMap`.
+        let end = data.len();
+        let mut i = start;
+        while i < end {
+            if *data.as_ptr().add(i) == value {
                 return i as i64;
             }
+            i += 1;
         }
         -1
     }

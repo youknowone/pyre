@@ -263,13 +263,17 @@ pub mod frame_locals_proxy {
                         )?,
                 )
             };
-            for (index, name) in code.varnames.iter().enumerate() {
+            // `range` + `ll_getitem_fast`, not `Enumerate`.
+            let mut index = 0usize;
+            for name in code.varnames.iter() {
                 if hidden_local(code, index) {
+                    index += 1;
                     continue;
                 }
                 if matches(name.as_ref())? {
                     return Ok(Some(index));
                 }
+                index += 1;
             }
             let mut index = code.varnames.len();
             for name in code.cellvars.iter() {

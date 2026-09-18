@@ -371,11 +371,17 @@ pub unsafe fn alloc_list_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock 
     unsafe {
         let block = alloc_items_block(cap);
         let base = items_block_items_base(block);
-        for (i, v) in values.iter().enumerate() {
-            *base.add(i) = *v;
+        // `rlist.py` `_ll_list_resize` copies with `ll_setitem_fast` /
+        // `ll_getitem_fast`, not `Enumerate`.
+        let src = values.as_ptr();
+        let mut i = 0usize;
+        while i < len {
+            *base.add(i) = *src.add(i);
+            i += 1;
         }
-        for i in len..cap {
+        while i < cap {
             *base.add(i) = PY_NULL;
+            i += 1;
         }
         block
     }
@@ -400,8 +406,11 @@ pub unsafe fn alloc_tuple_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock
     unsafe {
         let block = alloc_items_block(cap);
         let base = items_block_items_base(block);
-        for (i, v) in values.iter().enumerate() {
-            *base.add(i) = *v;
+        let src = values.as_ptr();
+        let mut i = 0usize;
+        while i < cap {
+            *base.add(i) = *src.add(i);
+            i += 1;
         }
         block
     }
@@ -1399,8 +1408,11 @@ pub unsafe fn alloc_mro_block_gc(values: &[PyObjectRef]) -> *mut FixedObjectArra
             crate::gc_hook::try_gc_write_barrier(block as *mut u8);
         }
         let items = (*block).items_mut_ptr();
-        for (i, &v) in values.iter().enumerate() {
-            items.add(i).write(v);
+        let src = values.as_ptr();
+        let mut i = 0usize;
+        while i < len {
+            items.add(i).write(*src.add(i));
+            i += 1;
         }
     }
     block
