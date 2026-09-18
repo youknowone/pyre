@@ -947,16 +947,26 @@ pub fn w_range_new(
     promote_step: bool,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
-    let start = crate::gc_roots::pin_root(start);
+    let _ = crate::gc_roots::pin_root(start);
     let start_slot = crate::gc_roots::shadow_stack_len() - 1;
-    let stop = crate::gc_roots::pin_root(stop);
+    let _ = crate::gc_roots::pin_root(stop);
     let stop_slot = crate::gc_roots::shadow_stack_len() - 1;
-    let step = crate::gc_roots::pin_root(step);
+    let _ = crate::gc_roots::pin_root(step);
     let step_slot = crate::gc_roots::shadow_stack_len() - 1;
+    // `RBigInt::fromint` / `RBigInt::new` allocate a nursery `Digits`
+    // payload (`rbigint.py fromint`), so each conversion can collect.
+    // Reload every bound from its shadow-stack slot before the next
+    // `range_obj_to_bigint` — the Rust locals above are not rewritten.
     let length = unsafe {
-        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(start));
-        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(stop));
-        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(step));
+        let start_b = RBigIntGcRoot::new(range_obj_to_bigint(
+            crate::gc_roots::shadow_stack_get(start_slot),
+        ));
+        let stop_b = RBigIntGcRoot::new(range_obj_to_bigint(
+            crate::gc_roots::shadow_stack_get(stop_slot),
+        ));
+        let step_b = RBigIntGcRoot::new(range_obj_to_bigint(
+            crate::gc_roots::shadow_stack_get(step_slot),
+        ));
         let len_big = range_length_big(&start_b, &stop_b, &step_b);
         range_bigint_to_obj(len_big)
     };
