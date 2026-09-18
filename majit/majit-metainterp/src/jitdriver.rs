@@ -1,4 +1,4 @@
-use majit_backend::ExitValueSourceLayout;
+use majit_backend::{Backend, ExitValueSourceLayout};
 
 thread_local! {
     /// Set while a full-body-walk trace executes a residual may-force call
@@ -9138,9 +9138,18 @@ impl<S: JitState> JitDriver<S> {
         let Some(fd) = source_descr.as_fail_descr() else {
             return false;
         };
-        let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
-        self.meta
-            .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
+        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
+        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
+        // `bridge_attached` returns `Some(false)` while the guard still
+        // owns its recovery stub; `None` falls back to the token map.
+        match self.meta.backend.bridge_attached(fd) {
+            Some(attached) => attached,
+            None => {
+                let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
+                self.meta
+                    .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
+            }
+        }
     }
 
     /// Start bridge tracing from a guard failure point.
@@ -9194,10 +9203,17 @@ impl<S: JitState> JitDriver<S> {
         // path once a bridge is attached. A later `must_compile` FIRED
         // here is a pyre re-entry; walking again can abort setup and
         // terminally decline the working source.
-        if self
-            .meta
-            .bridge_was_compiled(green_key, trace_id, fail_index)
-        {
+        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
+        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
+        // `bridge_attached` returns `Some(false)` while the guard still
+        // owns its recovery stub; `None` falls back to the token map.
+        let already_compiled = match self.meta.backend.bridge_attached(descr_fd) {
+            Some(attached) => attached,
+            None => self
+                .meta
+                .bridge_was_compiled(green_key, trace_id, fail_index),
+        };
+        if already_compiled {
             return false;
         }
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {

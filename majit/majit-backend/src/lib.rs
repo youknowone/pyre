@@ -958,6 +958,16 @@ pub struct CompiledLoopToken {
     /// `get_asmmemmgr_blocks`). pyre eagerly initializes to an empty Vec;
     /// the `None` sentinel is a Python idiom not needed on Rust.
     pub asmmemmgr_blocks: parking_lot::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    /// Append-only `(source_trace_id, source_fail_index) → entry address`
+    /// for compiled bridges stored in `asmmemmgr_blocks`. The most recently
+    /// compiled bridge for a key wins (insert overwrites). `0` / absent
+    /// means none. Written at the single site a `CompiledCode` bridge is
+    /// pushed; read by the dynasm `lookup_bridge_addr` path so a guard
+    /// failure does not walk every block. `assembler.py
+    /// patch_jump_for_descr` is what actually redirects the guard; this
+    /// map answers the query-style "is there a bridge" question RPython
+    /// never asks.
+    pub compiled_bridge_addrs: parking_lot::Mutex<std::collections::HashMap<(u64, u32), usize>>,
     /// `model.py` `asmmemmgr_gcreftracers = None`; parity shape
     /// reserved for the GC ref-tracer lifecycle (llsupport/assembler.py:190).
     /// Eagerly empty (same rationale as `asmmemmgr_blocks`).
@@ -1033,6 +1043,7 @@ impl CompiledLoopToken {
             bridges_count: parking_lot::Mutex::new(0),
             looptokens_redirected_to: parking_lot::Mutex::new(Vec::new()),
             asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
+            compiled_bridge_addrs: parking_lot::Mutex::new(std::collections::HashMap::new()),
             asmmemmgr_gcreftracers: parking_lot::Mutex::new(Vec::new()),
             frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
             _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
