@@ -4082,6 +4082,22 @@ pub fn fuse_boxing_alloc(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> usize {
+    fuse_boxing_alloc_with_pytypes(graph, struct_field_attrs, &[])
+}
+
+/// [`fuse_boxing_alloc`] plus `HostStaticAddrs.pytypes_by_struct`.
+///
+/// `#[pyre_class]` `allocate` / `allocate_stable` is `malloc_typed_stable`
+/// of `Self { ob: header, ..payload }`. The wrapper is residualized
+/// (`skip-pyre-class-allocate-ctor`) so the header lives inside the
+/// stub, not at the call site. The caller's payload is still a
+/// construct-on-stack ctor; the owner's `PyType` address from
+/// `pytypes_by_struct` is the vtable `w_int_new` reads off `&INT_TYPE`.
+pub fn fuse_boxing_alloc_with_pytypes(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    pytypes_by_struct: &[(&str, i64)],
+) -> usize {
     use crate::flowspace::model::Variable;
     // Gate names come from `crate::decline::gate` rather than being
     // spelled here: a name defined at its call site can be referenced
@@ -4143,16 +4159,51 @@ pub fn fuse_boxing_alloc(
         let CallTarget::FunctionPath { segments, .. } = target else {
             return None;
         };
-        if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
-            return None;
-        }
-        match segments[segments.len() - 1].as_str() {
-            flavor @ ("malloc"
+        match segments.last().map(String::as_str) {
+            // `#[pyre_class]` constructors (`allocate` / `allocate_stable`)
+            // both call `malloc_typed_stable`. The leaf alone is not
+            // enough; the site loop still requires a synthetic-ctor
+            // aggregate and a registered boxing layout.
+            Some("allocate") | Some("allocate_stable") => Some("malloc_typed_stable"),
+            Some(flavor @ ("malloc"
             | "malloc_typed"
             | "malloc_typed_managed"
-            | "malloc_typed_stable") => Some(flavor),
+            | "malloc_typed_stable"))
+                if segments.len() >= 2 && segments[segments.len() - 2] == "lltype" =>
+            {
+                Some(flavor)
+            }
             _ => None,
         }
+    }
+
+    fn is_pyre_class_ctor(target: &CallTarget) -> bool {
+        matches!(
+            target,
+            CallTarget::FunctionPath { segments }
+                if matches!(
+                    segments.last().map(String::as_str),
+                    Some("allocate") | Some("allocate_stable")
+                )
+        )
+    }
+
+    fn vtable_for_owner(owner: &str, pytypes_by_struct: &[(&str, i64)]) -> Option<i64> {
+        let mut found: Option<i64> = None;
+        for (key, addr) in pytypes_by_struct {
+            if *addr == 0 {
+                continue;
+            }
+            let leaf = key.rsplit("::").next().unwrap_or(key);
+            if leaf != owner && *key != owner && !key.ends_with(&format!("::{owner}")) {
+                continue;
+            }
+            if found.is_some_and(|prev| prev != *addr) {
+                return None;
+            }
+            found = Some(*addr);
+        }
+        found
     }
     // Whether the cluster's allocator hands back an object the collector may
     // move.  `malloc_typed_stable` is `try_gc_alloc_stable_raw`, whose contract
@@ -5023,6 +5074,37 @@ pub fn fuse_boxing_alloc(
                         value,
                         ty: payload_ty.clone(),
                     }),
+                    None if is_pyre_class_ctor(target) => {
+                        // `..Default::default()` leaves the unlisted
+                        // fields at the type's zero. Spell that zero
+                        // rather than declining the cluster.
+                        let value = match payload_ty {
+                            ValueType::Int | ValueType::Unsigned | ValueType::Bool => {
+                                LinkArg::Const(crate::flowspace::model::Constant::new(
+                                    crate::flowspace::model::ConstValue::Int(0),
+                                ))
+                            }
+                            ValueType::Float => {
+                                LinkArg::Const(crate::flowspace::model::Constant::new(
+                                    crate::flowspace::model::ConstValue::Float(0.0f64.to_bits()),
+                                ))
+                            }
+                            ValueType::Ref(_) | ValueType::Str => {
+                                LinkArg::Const(crate::flowspace::model::Constant::new(
+                                    crate::flowspace::model::ConstValue::None,
+                                ))
+                            }
+                            _ => {
+                                complete = false;
+                                break;
+                            }
+                        };
+                        payloads.push(Payload {
+                            field: FieldDescriptor::new(field_name, Some(owner.clone())),
+                            value,
+                            ty: payload_ty.clone(),
+                        });
+                    }
                     None => {
                         complete = false;
                         break;
@@ -5056,13 +5138,35 @@ pub fn fuse_boxing_alloc(
             // `model::resolve_header_plan` rows are where that is recorded,
             // and this row is the count of clusters the fuse gave up on for
             // any header reason at all.
-            let Some(header) = resolve_header_plan(graph, agg, (rewrite_bi, rewrite_oi)) else {
-                crate::decline::record(
-                    FUSE_GATE,
-                    "vtable-unresolved",
-                    format_args!("{owner} in {}", graph.name),
-                );
-                continue;
+            let header = match resolve_header_plan(graph, agg, (rewrite_bi, rewrite_oi)) {
+                Some(header) => header,
+                None if is_pyre_class_ctor(target) => {
+                    // The header is built inside the residual
+                    // `allocate[_stable]` stub. The owner's PyType
+                    // address is the same `&TYPE` that stub would store.
+                    match vtable_for_owner(&owner, pytypes_by_struct) {
+                        Some(vtable) => HeaderPlan {
+                            vtable: Some(vtable),
+                            w_class: None,
+                        },
+                        None => {
+                            crate::decline::record(
+                                FUSE_GATE,
+                                "class-ctor-vtable-unresolved",
+                                format_args!("{owner} in {}", graph.name),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    crate::decline::record(
+                        FUSE_GATE,
+                        "vtable-unresolved",
+                        format_args!("{owner} in {}", graph.name),
+                    );
+                    continue;
+                }
             };
             // `rewrite_op_malloc` refuses a malloc its allocation op cannot
             // express rather than lowering it approximately: a `nonmovable`
@@ -12035,6 +12139,105 @@ mod tests {
                     if segments.last().map(String::as_str) == Some("malloc_typed")
             )),
             "no malloc_typed call may survive the fusion"
+        );
+    }
+
+    /// `W_CData::allocate_stable(payload)` is `malloc_typed_stable` of
+    /// a construct-on-stack ctor whose header lives in the residual
+    /// stub. The owner's PyType address is the vtable.
+    #[test]
+    fn fuse_boxing_alloc_lowers_allocate_stable_from_owner_pytype() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let ctype = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let ptr = graph.push_op_var(entry, OpKind::ConstInt(0), true).unwrap();
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_CData"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_CData".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field = |base: &crate::flowspace::model::Variable, name: &str, value, ty| {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_CData".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value,
+                ty,
+            }
+        };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ctype", LinkArg::Value(ctype), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "ptr", LinkArg::Value(ptr), ValueType::Int),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "module",
+                        "_cffi_backend",
+                        "cdataobj",
+                        "W_CData",
+                        "allocate_stable",
+                    ]),
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_CData".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([(
+            "W_CData".to_string(),
+            vec![
+                ("ob".to_string(), ValueType::Ref(None)),
+                ("ctype".to_string(), ValueType::Ref(None)),
+                ("ptr".to_string(), ValueType::Int),
+            ],
+        )]);
+        const CDATA_VTABLE: i64 = 0x1020_4050;
+        let fused = fuse_boxing_alloc_with_pytypes(
+            &mut graph,
+            &attrs,
+            &[("module::_cffi_backend::cdataobj::W_CData", CDATA_VTABLE)],
+        );
+        assert_eq!(fused, 1, "allocate_stable must fuse from the owner PyType");
+        let ops = &graph.block(entry).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_CData" && *vtable == CDATA_VTABLE
+            )),
+            "NewWithVtable must carry the owner PyType address"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("allocate_stable")
+            )),
+            "allocate_stable must not survive the fusion"
         );
     }
 
