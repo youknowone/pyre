@@ -4120,10 +4120,9 @@ fn locale_asks_for_surrogateescape() -> bool {
 /// whatever the locale asks for. stderr replaces the handler with
 /// `backslashreplace` separately.
 ///
-/// `_WIN32 and not encoding` fixes the encoding at utf-8 rather than the ANSI
-/// code page; pyre takes that on every platform rather than resolving
-/// `initstdio`'s `"locale"`, which agrees with it wherever the locale encoding
-/// is utf-8.
+/// An unnamed encoding resolves through [`default_stdio_encoding`] rather than
+/// `initstdio`'s `"locale"` string, so the answer is fixed here instead of
+/// inside `TextIOWrapper`.
 ///
 /// Resolved once: `initstdio` runs once, and a later `locale.setlocale` must
 /// not change the answer a stream is already open with.
@@ -4144,14 +4143,14 @@ fn stdio_encoding_and_errors() -> (String, String) {
                         None
                     };
                     let encoding = if encoding.is_empty() {
-                        "utf-8"
+                        default_stdio_encoding()
                     } else {
-                        encoding
+                        encoding.to_string()
                     };
                     (encoding, errors, user_set_encoding)
                 }
-                Some(value) if !value.is_empty() => (value, None, true),
-                _ => ("utf-8", None, false),
+                Some(value) if !value.is_empty() => (value.to_string(), None, true),
+                _ => (default_stdio_encoding(), None, false),
             };
             let errors = match errors {
                 Some(errors) => errors.to_string(),
@@ -4160,9 +4159,59 @@ fn stdio_encoding_and_errors() -> (String, String) {
                 }
                 None => "strict".to_string(),
             };
-            (encoding.to_string(), errors)
+            (encoding, errors)
         })
         .clone()
+}
+
+/// `config_get_locale_encoding` — the encoding a standard stream opens with
+/// once PYTHONIOENCODING has named none.
+///
+/// utf-8 mode fixes every stream at utf-8; otherwise the locale's own codeset
+/// is the answer, which on Windows is the ANSI code page rather than utf-8.  A
+/// console stream overrides it back to utf-8 in [`make_std_stream`], the way
+/// `create_stdio` does after `_io.open` has told it which raw layer it got.
+///
+/// Only the Windows arm resolves the locale so far: `_Py_GetLocaleEncoding`'s
+/// POSIX answer is the `nl_langinfo` codeset, and reading it here would make a
+/// C-locale host open its streams as `ascii` — the encoding CPython avoids
+/// through the PEP 538 locale coercion pyre does not implement yet.
+fn default_stdio_encoding() -> String {
+    if crate::importing::utf8_mode_flag() != 0 {
+        return "utf-8".to_string();
+    }
+    #[cfg(windows)]
+    {
+        crate::module::_locale::interp_locale::locale_encoding()
+    }
+    #[cfg(not(windows))]
+    {
+        "utf-8".to_string()
+    }
+}
+
+/// `create_stdio`'s `PyObject_TypeCheck(raw, winconsoleio_type)`: a console
+/// stream is always utf-8 encoded, whatever encoding the configuration named.
+///
+/// The test is against the layout type rather than the class object, for two
+/// reasons: `init_sys_streams` runs before `_io` has finished registering its
+/// types, so `get_instantiate` still answers a null class here, and a subclass
+/// of a builtin keeps the builtin's `ob_type` — which is what makes an
+/// `ob_type` comparison the subclass-accepting check rather than an exact one.
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+fn raw_is_windows_console(raw: PyObjectRef) -> bool {
+    if raw.is_null() {
+        return false;
+    }
+    let pytype: *const pyre_object::PyType =
+        <crate::module::_io::W_WindowsConsoleIO as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
+    std::ptr::eq(unsafe { (*raw).ob_type }, pytype)
+}
+
+/// No `_WindowsConsoleIO` exists to compare against, so no stream is one.
+#[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+fn raw_is_windows_console(_raw: PyObjectRef) -> bool {
+    false
 }
 
 fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (String, String) {
@@ -4286,13 +4335,28 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     let buffer_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     // `app_main.py create_stdio` names the raw descriptor object rather
     // than the wrapper, so `repr(sys.stdin.buffer)` reads `name='<stdin>'`
-    // instead of the bare descriptor number.
-    if let Ok(raw) =
-        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(buffer_slot), "raw")
+    // instead of the bare descriptor number.  An unbuffered writable stream
+    // has no buffered layer to unwrap and the descriptor object is the buffer
+    // itself, which is the `raw = Py_NewRef(buf)` arm of `create_stdio`.
+    let raw = {
+        let buffer = pyre_object::gc_roots::shadow_stack_get(buffer_slot);
+        crate::baseobjspace::getattr_str(buffer, "raw").unwrap_or(buffer)
+    };
+    let _ = pyre_object::gc_roots::pin_root(raw);
+    let raw_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     {
-        let _ = crate::baseobjspace::setattr_str(raw, "name", w_str_new(name));
+        let w_name = w_str_new(name);
+        let raw = pyre_object::gc_roots::shadow_stack_get(raw_slot);
+        let _ = crate::baseobjspace::setattr_str(raw, "name", w_name);
     }
     let (encoding, configured_errors) = stdio_encoding_and_errors();
+    // `create_stdio` reads the raw layer back after `_io.open` has chosen it:
+    // a console stream is utf-8 encoded whatever the configuration named.
+    let encoding = if raw_is_windows_console(pyre_object::gc_roots::shadow_stack_get(raw_slot)) {
+        "utf-8".to_string()
+    } else {
+        encoding
+    };
     let errors = if to_stderr {
         "backslashreplace"
     } else {
