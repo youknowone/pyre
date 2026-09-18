@@ -4360,9 +4360,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::module_ns_store(
             ns,
             "_supports_virtual_terminal",
-            crate::make_builtin_function(
+            crate::make_builtin_function_with_arity(
                 "_supports_virtual_terminal",
                 win_nt::_supports_virtual_terminal,
+                0,
             ),
         );
     }
@@ -12200,6 +12201,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 |_| Ok(pyre_object::w_int_new(host_nt::getppid() as i64)),
                 0,
             ),
+        );
+
+        // os._exit(code) — immediate process exit, no cleanup.  `install_noop_stubs`
+        // binds the name for every host so os.py finds it, and only the POSIX
+        // branch replaced it until now: on Windows `os._exit` returned `None` and
+        // the process ran on, which is the one thing the call is documented not to
+        // do.  `os__exit_impl` spells it `_exit(status)`, the C runtime's
+        // no-cleanup exit rather than `exit`, so a child sharing an inherited
+        // stdio buffer with its parent does not flush it a second time.
+        crate::module_ns_store(
+            ns,
+            "_exit",
+            crate::make_builtin_function_with_arity(
+                "_exit",
+                |args| {
+                    let code = match args.first() {
+                        // interp_posix.py `@unwrap_spec(status=c_int)`.
+                        Some(&o) => crate::baseobjspace::c_int_w(o)?,
+                        None => {
+                            return Err(crate::PyError::type_error("_exit() requires 1 argument"));
+                        }
+                    };
+                    unsafe { libc::_exit(code) }
+                },
+                1,
+            ),
+        );
+
+        // os.abort() — `os_abort_impl` calls `abort()`, whose contract is that it
+        // never returns.  Windows kept the noop placeholder here for the same
+        // reason `_exit` did.
+        crate::module_ns_store(
+            ns,
+            "abort",
+            crate::make_builtin_function_with_arity("abort", |_| unsafe { libc::abort() }, 0),
         );
 
         // os.getlogin() -> str
