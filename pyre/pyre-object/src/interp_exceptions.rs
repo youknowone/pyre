@@ -802,6 +802,32 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// `lltype::malloc*` spellings `fuse_boxing_alloc` recognises. Residualise the
 /// whole constructor — the JIT models it by signature as a plain
 /// `PyObjectRef` GCREF and emits a residual call.
+/// `framework.py malloc` for a non-immortal exception. Nursery, same as
+/// `ll_newlist` / `rlist_new`. A born-old instance plus a nursery `args_w`
+/// rlist is a permanent old→young edge: if the setter misses the
+/// remembered set, the next minor recycles the items block and a type-9
+/// walk reads a pointer as capacity.
+fn alloc_exception_nursery<T: crate::lltype::GcType>(value: T) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let tid = T::type_id();
+    let raw = if tid != 0 {
+        crate::gc_hook::try_gc_alloc(tid, T::SIZE).unwrap_or(std::ptr::null_mut())
+    } else {
+        std::ptr::null_mut()
+    };
+    if !raw.is_null() {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+        let raw = crate::gc_roots::shadow_stack_get(slot) as *mut u8;
+        unsafe {
+            std::ptr::write(raw as *mut T, value);
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
+    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
 #[majit_macros::dont_look_inside]
 fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
     if exc_kind_uses_extended_layout(kind) {
@@ -809,18 +835,7 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
     }
     let value = w_exception_base_defaults(kind);
     if !immortal {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-            W_BASE_EXCEPTION_GC_TYPE_ID,
-            W_BASE_EXCEPTION_SIZE,
-        );
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(raw as *mut W_BaseException, value);
-            }
-            crate::gc_hook::try_gc_write_barrier(raw);
-            return raw as PyObjectRef;
-        }
-        return crate::lltype::malloc_typed(value) as PyObjectRef;
+        return alloc_exception_nursery(value);
     }
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
@@ -885,18 +900,7 @@ fn w_exception_new_empty_extended_impl(kind: ExcKind, immortal: bool) -> PyObjec
         w_group_exceptions_repr: PY_NULL,
     };
     if !immortal {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-            exception_extended_gc_type_id(),
-            W_EXCEPTION_EXTENDED_SIZE,
-        );
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(raw as *mut W_ExceptionExtended, value);
-            }
-            crate::gc_hook::try_gc_write_barrier(raw);
-            return raw as PyObjectRef;
-        }
-        return crate::lltype::malloc_typed(value) as PyObjectRef;
+        return alloc_exception_nursery(value);
     }
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
@@ -1035,20 +1039,32 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
             .map(crate::gc_roots::shadow_stack_get)
             .unwrap_or(std::ptr::null_mut()) as *mut crate::object_array::ItemsBlock
     };
+    // rlist.py `ll_newlist` mallocs the LIST header in the nursery, same
+    // as the items GcArray. A born-old header (`try_gc_alloc_stable_raw`)
+    // plus a nursery items block is a permanent old→young edge: if the
+    // header misses the remembered set, a minor collection moves or
+    // recycles the block and the next scan of the header walks stale
+    // nursery bytes as a type-9 array (GC BUG invalid type_id / huge
+    // holder_offset on StopIteration-heavy tests).
     let tid = rlist_gc_type_id();
-    if tid != 0 {
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(tid, RLIST_SIZE);
-        if !raw.is_null() {
-            let value = RList {
-                length: n as i64,
-                items: reload_block(),
-            };
-            unsafe {
-                std::ptr::write(raw as *mut RList, value);
-            }
-            crate::gc_hook::try_gc_write_barrier(raw);
-            return raw as PyObjectRef;
+    let raw = if tid != 0 {
+        crate::gc_hook::try_gc_alloc(tid, RLIST_SIZE).unwrap_or(std::ptr::null_mut())
+    } else {
+        std::ptr::null_mut()
+    };
+    if !raw.is_null() {
+        let header_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+        let value = RList {
+            length: n as i64,
+            items: reload_block(),
+        };
+        let raw = crate::gc_roots::shadow_stack_get(header_slot) as *mut u8;
+        unsafe {
+            std::ptr::write(raw as *mut RList, value);
         }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
     }
     let value = RList {
         length: n as i64,

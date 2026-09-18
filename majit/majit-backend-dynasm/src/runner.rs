@@ -1281,22 +1281,67 @@ fn dynasm_alloc_varsize_typed_and_set_len(
     length_ofs: usize,
     length: usize,
 ) -> u64 {
+    dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
+        type_id, base_size, item_size, length_ofs, length, false,
+    )
+}
+
+fn dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+    clear: bool,
+) -> u64 {
     let result = with_dynasm_active_gc_mut(|gc| {
         let obj = gc.alloc_varsize_typed(type_id, base_size, item_size, length);
         if obj.is_null() {
             0
         } else {
+            let payload = obj.0 as *mut u8;
+            if clear {
+                let nbytes = base_size.saturating_add(item_size.saturating_mul(length));
+                unsafe {
+                    core::ptr::write_bytes(payload, 0, nbytes);
+                }
+            }
             unsafe {
-                *((obj.0 as *mut u8).add(length_ofs) as *mut usize) = length;
+                *payload.add(length_ofs).cast::<usize>() = length;
             }
             obj.0 as u64
         }
     });
     result.unwrap_or_else(|| {
-        dynasm_raw_varsize_alloc_typed_and_set_len(
+        let raw = dynasm_raw_varsize_alloc_typed_and_set_len(
             type_id, base_size, item_size, length_ofs, length,
-        )
+        );
+        // The raw fallback already calloc's, so the length stamp is enough.
+        let _ = clear;
+        raw
     })
+}
+
+/// Backend leftover path for `NEW_ARRAY` / `NEW_ARRAY_CLEAR` when GC rewrite
+/// did not lower the op. Must allocate a typed GC array and stamp length at
+/// the descr's `lendescr` offset — libc malloc + store-at-+8 is the RPython
+/// string header, not `ItemsBlock` / `GcArray` (length at offset 0).
+pub extern "C" fn dynasm_malloc_new_array(
+    base_size: u64,
+    item_size: u64,
+    length_ofs: u64,
+    type_id: u64,
+    num_elem: u64,
+    clear: u64,
+) -> u64 {
+    oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len_maybe_clear(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        length_ofs as usize,
+        num_elem as usize,
+        clear != 0,
+    ))
 }
 
 pub extern "C" fn dynasm_malloc_array(item_size: u64, type_id: u64, num_elem: u64) -> u64 {

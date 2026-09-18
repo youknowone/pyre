@@ -1336,6 +1336,54 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
+static W_COMPLEX_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<W_ComplexObject>(),
+        W_COMPLEX_GC_TYPE_ID,
+        &COMPLEX_TYPE as *const _ as usize,
+        &[
+            (
+                "real",
+                COMPLEX_REAL_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
+                "imag",
+                COMPLEX_IMAG_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
+                "w_dict",
+                COMPLEX_W_DICT_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_slots",
+                COMPLEX_W_SLOTS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_ComplexObject",
+        "complexobject::W_ComplexObject",
+    )
+});
+
 static W_LONG_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<pyre_object::longobject::W_LongObject>(),
@@ -3441,6 +3489,10 @@ pub fn make_array_descr_with_full_id(
 
 // Range iterator field descriptors.
 
+use pyre_object::complexobject::{
+    COMPLEX_IMAG_OFFSET, COMPLEX_REAL_OFFSET, COMPLEX_W_DICT_OFFSET, COMPLEX_W_SLOTS_OFFSET,
+    W_COMPLEX_GC_TYPE_ID, W_ComplexObject,
+};
 use pyre_object::floatobject::{
     FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
 };
@@ -3472,7 +3524,7 @@ use pyre_object::{
     INT_ARRAY_LEN_OFFSET, INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
 };
 // Re-import the rest without duplication
-use pyre_object::{FLOAT_TYPE, INT_TYPE};
+use pyre_object::{COMPLEX_TYPE, FLOAT_TYPE, INT_TYPE};
 
 /// Field descriptor for `PyObject.w_class` (Ref, `w_class?`).
 ///
@@ -4838,6 +4890,14 @@ pub fn float_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_DESCR_GROUP, 0)
 }
 
+pub fn complex_real_descr() -> DescrRef {
+    field_descr_from_group(&W_COMPLEX_DESCR_GROUP, 0)
+}
+
+pub fn complex_imag_descr() -> DescrRef {
+    field_descr_from_group(&W_COMPLEX_DESCR_GROUP, 1)
+}
+
 /// FieldDescr for `W_LongObject.value` (the `*mut BigInt` gc-pointer), for the
 /// inline-NEW boxing of a `jit_w_long_*_raw` result.
 pub fn long_value_descr() -> DescrRef {
@@ -5120,6 +5180,12 @@ pub fn w_range_size_descr() -> DescrRef {
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_ComplexObject` allocation via NewWithVtable.
+/// vtable = &COMPLEX_TYPE (ob_type for virtual materialization).
+pub fn w_complex_size_descr() -> DescrRef {
+    W_COMPLEX_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for W_LongObject allocation via NewWithVtable (the inline
@@ -6604,6 +6670,7 @@ mod tests {
             ("W_RangeIterObject", w_range_iter_size_descr()),
             ("W_RangeObject", w_range_size_descr()),
             ("W_FloatObject", w_float_size_descr()),
+            ("W_ComplexObject", w_complex_size_descr()),
             ("W_LongObject", w_long_size_descr()),
             ("W_TupleObject", w_tuple_size_descr()),
             ("W_TupleIter", tuple_iter_size_descr()),
@@ -7822,6 +7889,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("floatobject::W_FloatObject", || {
         LazyLock::force(&W_FLOAT_DESCR_GROUP);
     }),
+    ("complexobject::W_ComplexObject", || {
+        LazyLock::force(&W_COMPLEX_DESCR_GROUP);
+    }),
     ("longobject::W_LongObject", || {
         LazyLock::force(&W_LONG_DESCR_GROUP);
     }),
@@ -8671,6 +8741,12 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 }
                 ("W_FloatObject" | "pyre_object::floatobject::W_FloatObject", "floatval") => {
                     return float_floatval_descr();
+                }
+                ("W_ComplexObject" | "pyre_object::complexobject::W_ComplexObject", "real") => {
+                    return complex_real_descr();
+                }
+                ("W_ComplexObject" | "pyre_object::complexobject::W_ComplexObject", "imag") => {
+                    return complex_imag_descr();
                 }
                 _ => {}
             }
