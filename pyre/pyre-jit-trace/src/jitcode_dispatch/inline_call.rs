@@ -114,8 +114,9 @@ enum DefaultsRepr {
 struct PositionalDefaultsInline {
     tuple: pyre_object::PyObjectRef,
     repr: DefaultsRepr,
-    /// `len(defs_w)` at trace time.  Every `tuple index` below was derived
-    /// from it, so a live re-read has to agree with it.
+    /// `len(defs_w)` at resolve time.  A live re-read recomputes each
+    /// element's index as `len - (nparams - param_index)` rather than
+    /// requiring this value to hold (`function.py _flat_pycall_defaults`).
     len: usize,
     /// `(parameter index, tuple index, concrete value)`.
     values: Vec<(usize, usize, pyre_object::PyObjectRef)>,
@@ -6898,31 +6899,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(defaults.tuple as usize)),
         );
 
-        // `defs_w?[*]`: the elements are read live below, so all trace time
-        // decided is the SHAPE it read them with — which `ob_type` selected the
-        // element reads, and WHICH element fills which missing parameter, a
-        // mapping `positional_defaults_for_inline` derives from `len(defs_w)`
-        // alone.  Those two are what has to be re-checked.
+        // `defs_w?[*]`: the elements are read live below.  Trace time
+        // picks the SHAPE (`ob_type` → which field/array read) and the
+        // missing-parameter set; `_flat_pycall_defaults` then recomputes
+        // each index from the live `len(self.defs_w)`.
         //
-        // For a callee whose identity changes every iteration, re-check them
-        // directly.  Upstream never pins the list: `funccall_valuestack` tests
-        // `natural_arity > nargs >= natural_arity - len(self.defs_w)` live, and
-        // `_flat_pycall_defaults` then reads `ndefs = len(self.defs_w)` and
-        // `self.defs_w[j]` live too (`function.py`).  Pinning the tuple here
-        // instead was a guard a `MAKE_FUNCTION` in the caller's own loop body
-        // can never satisfy twice, because a
-        // non-constant default expression (`def add(value=i)`, which emits
-        // `BUILD_TUPLE`) rebuilds the tuple every iteration.
-        // `synth/foriter_make_function_body` is exactly that shape and paid
-        // 980 guard failures in 3000 iterations for it, with no bridge — the
-        // per-value counter never fires on a value that is never seen twice —
-        // against 1 for the same fixture with a constant default.
+        // For a callee whose identity is not a baked `ConstPtr`, re-check
+        // the shape directly.  Upstream never pins the list:
+        // `funccall_valuestack` tests
+        // `natural_arity > nargs >= natural_arity - len(self.defs_w)` live,
+        // and `_flat_pycall_defaults` reads `ndefs = len(self.defs_w)` and
+        // `self.defs_w[j]` live too (`function.py`).  Pinning the exact
+        // length was a guard a mid-loop `f.__defaults__ = (…)` — or a
+        // `MAKE_FUNCTION` whose default expression rebuilds the tuple
+        // every iteration (`def add(value=i)`) — can never satisfy twice.
+        // `synth/foriter_make_function_body` paid 980 guard failures in
+        // 3000 iterations for that pin, with no bridge.
         //
-        // `GuardClass` dereferences its operand and a callee with no defaults
-        // at all carries `PY_NULL` here, so the nullity check comes first.
-        // The length is checked in the `ItemsBlock` arm below; the two
-        // specialised reprs are arity-2 classes, so the class guard already
-        // fixes their length.
+        // `GuardClass` dereferences its operand and a callee with no
+        // defaults at all carries `PY_NULL` here, so the nullity check
+        // comes first.  The `ItemsBlock` arm below guards only
+        // "enough defaults"; the two specialised reprs are arity-2
+        // classes, so the class guard already fixes their length.
         //
         // A constant callable keeps the identity `GuardValue`.  There the
         // function is pinned by its own guard, `defs_w` carries no
@@ -6957,26 +6955,52 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     crate::descr::tuple_wrappeditems_descr(),
                 );
                 if guards_the_callee_function {
-                    // `arraylen_gc(wrappeditems)` IS `len(self.defs_w)`
-                    // (`tupleobject.py` `W_TupleObject` carries no length
-                    // field), and the tuple indexes below were derived from it.
+                    // `funccall_valuestack` / `_flat_pycall_defaults`:
+                    // `natural_arity > nargs >= natural_arity - len(defs_w)`,
+                    // then `start = ndefs - defs_to_load` and
+                    // `defs_w[start:ndefs]`.  `arraylen_gc(wrappeditems)` is
+                    // `len(self.defs_w)` (`W_TupleObject` carries no length
+                    // field).  Pinning the exact length would deopt every
+                    // later iteration of a mid-loop `__defaults__` swap
+                    // whose new tuple is still long enough.
                     let len_op = crate::state::opimpl_arraylen_gc(
                         ctx.trace_ctx,
                         items,
                         crate::state::pyobject_gcarray_descr(),
                     );
-                    let expected_len = ctx.trace_ctx.const_int(defaults.len as i64);
-                    ctx.trace_ctx
-                        .record_guard(OpCode::GuardValue, &[len_op, expected_len], 0);
-                    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-                }
-                for (param_index, tuple_index, _) in defaults.values {
-                    let index = ctx.trace_ctx.const_int(tuple_index as i64);
-                    callee_args[param_index] = crate::state::trace_items_block_getitem_value_pure(
-                        ctx.trace_ctx,
-                        items,
-                        index,
+                    let defs_to_load = defaults.values.len() as i64;
+                    let min_len = ctx.trace_ctx.const_int(defs_to_load);
+                    let enough = ctx.trace_ctx.record_op(OpCode::IntGe, &[len_op, min_len]);
+                    ctx.trace_ctx.set_opref_concrete(
+                        enough,
+                        majit_ir::Value::Int(i64::from((defaults.len as i64) >= defs_to_load)),
                     );
+                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[enough])?;
+                    for (param_index, tuple_index, _) in defaults.values {
+                        let from_end = (defaults.len - tuple_index) as i64;
+                        let from_end_op = ctx.trace_ctx.const_int(from_end);
+                        let index = ctx
+                            .trace_ctx
+                            .record_op(OpCode::IntSub, &[len_op, from_end_op]);
+                        ctx.trace_ctx
+                            .set_opref_concrete(index, majit_ir::Value::Int(tuple_index as i64));
+                        callee_args[param_index] =
+                            crate::state::trace_items_block_getitem_value_pure(
+                                ctx.trace_ctx,
+                                items,
+                                index,
+                            );
+                    }
+                } else {
+                    for (param_index, tuple_index, _) in defaults.values {
+                        let index = ctx.trace_ctx.const_int(tuple_index as i64);
+                        callee_args[param_index] =
+                            crate::state::trace_items_block_getitem_value_pure(
+                                ctx.trace_ctx,
+                                items,
+                                index,
+                            );
+                    }
                 }
             }
             DefaultsRepr::PairObject => {
