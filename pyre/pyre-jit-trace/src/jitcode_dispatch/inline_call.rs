@@ -11584,15 +11584,13 @@ fn gen_resume_decline(reason: &str) {
 /// MIFrame, and the walk's yield is `dispatch`'s `except Yield` `popvalue()`.
 /// A `newframe` without that `popvalue` compiled `FOR_ITER` to hand the
 /// iterator back as the item (`int + generator` on
-/// `generator_iteration__main`).  The walk below now requires
-/// `DispatchOutcome::SubReturn { result: Some(item) }` — the yield
-/// `popvalue` — before writing `dst`, so the iterator-as-item path is
-/// closed.  Single-yield bodies (`should_not_inline` is false) look
-/// inside like `send_ex` when `we_are_jitted()`; two-or-more yields
-/// still decline here and take `generatorentry_driver`.
+/// `generator_iteration__main`).  Enabling the walk without that
+/// `popvalue` also lets the generator `while` start traces that die on
+/// the yield `abort_permanent` (`calls_closures` `loops_aborted` 1→11).
+/// Stay residual until the walk's TOS is that `popvalue`.
 #[inline(never)]
 fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sym>) -> bool {
-    true
+    false
 }
 
 /// Resume a suspended generator into the trace at a `FOR_ITER`, in place of
