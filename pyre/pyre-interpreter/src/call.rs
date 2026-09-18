@@ -3763,16 +3763,10 @@ fn call_with_kwargs_in_ctx_impl(
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
         // The `function`, `memoryview`, `_cffi_backend.buffer`, deque iterator,
-        // and stream constructors whose `tp_new` Signature binds keywords
-        // (`format=`/`preset=`/`filters=` on `_lzma`, `ident=`/`filter=` on
+        // and constructors whose `__new__`/`__init__` Signature binds
+        // keywords (`format=` on `_lzma`, `ident=`/`filter=` on
         // `select.kevent`) are non-acceptable-as-base too. Route those
-        // through `__new__`.
-        // `select` is not built under the sandbox feature, so the kevent arm
-        // is answered before the chain rather than inside it.
-        #[cfg(not(feature = "sandbox"))]
-        let is_kevent = std::ptr::eq(current_type(), crate::module::select::kevent_type());
-        #[cfg(feature = "sandbox")]
-        let is_kevent = false;
+        // through `__new__` / `__init__`.
         #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
         let is_cffi_buffer = std::ptr::eq(
             current_type(),
@@ -3800,7 +3794,6 @@ fn call_with_kwargs_in_ctx_impl(
                 crate::module::_contextvars::context_var_type(),
             )
             || type_new_accepts_keywords(current_type())
-            || is_kevent
             || crate::_structseq::is_structseq_type(current_type());
         if !kwargs.is_empty()
             && !accepts_keywords_despite_nonbase
@@ -4315,17 +4308,17 @@ fn type_call_vectorcall(
     None
 }
 
-/// `gateway.py Signature` on the type's `__new__` — keyword-capable when
-/// it has `**kwargs`, kw-only names, or positional-or-keyword slots.
-/// Types whose `tp_new` is positional-only keep a null Signature.
-fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
-    let Some(new_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }) else {
+/// `gateway.py Signature` on a type slot — keyword-capable when it has
+/// `**kwargs`, kw-only names, or positional-or-keyword slots.  A
+/// positional-only builtin keeps a null Signature.
+fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
+    let Some(func) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }) else {
         return false;
     };
-    if !crate::function::is_builtin_code(new_fn) {
+    if !crate::function::is_builtin_code(func) {
         return false;
     }
-    let code = unsafe { crate::getcode(new_fn) };
+    let code = unsafe { crate::getcode(func) };
     if code.is_null() || !unsafe { crate::gateway::is_builtin_code(code) } {
         return false;
     }
@@ -4337,6 +4330,24 @@ fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
     sig.has_kwarg()
         || sig.num_kwonlyargnames() > 0
         || sig.num_argnames() > sig.num_posonlyargnames()
+}
+
+/// `descr_call` forwards `__args__` to `__new__` and then `__init__`.
+/// `select.kevent` only declares `__init__`; its `__new__` is
+/// `object.__new__`, so keywords belong to the initializer.
+fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
+    if type_slot_accepts_keywords(w_type, "__new__") {
+        return true;
+    }
+    let object = crate::typedef::w_object();
+    let type_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
+    let object_new = unsafe { crate::baseobjspace::lookup_in_type(object, "__new__") };
+    let inherits_object_new = match (type_new, object_new) {
+        (Some(a), Some(b)) => std::ptr::eq(a, b),
+        (None, _) => true,
+        _ => false,
+    };
+    inherits_object_new && type_slot_accepts_keywords(w_type, "__init__")
 }
 
 /// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
