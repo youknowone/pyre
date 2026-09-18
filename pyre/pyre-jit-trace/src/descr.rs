@@ -5366,6 +5366,11 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
         );
     }
     let extended_tid = exception_extended_gc_type_id();
+    #[cfg(not(test))]
+    assert_ne!(
+        extended_tid, 0,
+        "W_ExceptionExtended GC type id is not initialised"
+    );
     let extended_tid = if extended_tid == 0 {
         pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID
     } else {

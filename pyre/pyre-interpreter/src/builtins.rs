@@ -10618,7 +10618,7 @@ fn exception_group_same_metadata(
 
 fn exception_group_collect_leaves(
     w_exc: PyObjectRef,
-    leaves: &mut Vec<PyObjectRef>,
+    leaves: &mut Vec<usize>,
 ) -> Result<(), crate::PyError> {
     if unsafe { pyre_object::is_none(w_exc) } {
         return Ok(());
@@ -10634,8 +10634,13 @@ fn exception_group_collect_leaves(
             )?;
         }
     } else if unsafe { pyre_object::is_exception(w_exc) } {
-        if !leaves.iter().any(|&leaf| std::ptr::eq(leaf, w_exc)) {
-            leaves.push(w_exc);
+        if !leaves
+            .iter()
+            .any(|&slot| std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(slot), w_exc))
+        {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(w_exc);
+            leaves.push(slot);
         }
     } else {
         let name = crate::baseobjspace::object_functionstr_type_name(w_exc);
@@ -10655,8 +10660,13 @@ fn exception_group_projection(
     for w_exc in keep.iter().copied() {
         exception_group_collect_leaves(w_exc, &mut leaves)?;
     }
+    let items: Vec<PyObjectRef> = leaves
+        .iter()
+        .copied()
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .collect();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(leaves));
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(items));
     let (matching, _) = exception_group_split_inner(
         w_group,
         &ExceptionGroupCondition::Identity(pyre_object::gc_roots::shadow_stack_get(list_slot)),
