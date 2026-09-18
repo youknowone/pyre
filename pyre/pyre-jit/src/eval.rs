@@ -13554,28 +13554,12 @@ fn materialize_virtual_from_rd(
             let int_type_addr = &pyre_object::INT_TYPE as *const _ as i64;
             let float_type_addr = &pyre_object::FLOAT_TYPE as *const _ as i64;
             if ob_type == int_type_addr {
-                let tp = unsafe { &*(ob_type as *const pyre_object::pyobject::PyType) };
-                let obj = Box::new(pyre_object::intobject::W_IntObject {
-                    ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: tp,
-                        w_class: pyre_object::pyobject::get_instantiate(tp),
-                    },
-                    intval: 0,
-                });
-                let raw = Box::into_raw(obj) as usize;
-                raw
+                // Header-bearing box: a bare `Box::into_raw` has no
+                // `GcHeader`, so `do_write_barrier` SIGBUS'd when the
+                // payload sat at Darwin `MALLOC_SMALL` start.
+                pyre_object::intobject::w_int_new_unique(0) as usize
             } else if ob_type == float_type_addr {
-                let tp = unsafe { &*(ob_type as *const pyre_object::pyobject::PyType) };
-                let obj = Box::new(pyre_object::floatobject::W_FloatObject {
-                    ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: tp,
-                        w_class: pyre_object::pyobject::get_instantiate(tp),
-                    },
-                    floatval: 0.0,
-                    w_dict: std::ptr::null_mut(),
-                    w_slots: std::ptr::null_mut(),
-                });
-                Box::into_raw(obj) as usize
+                pyre_object::floatobject::w_float_new(0.0) as usize
             } else if ob_type != 0 {
                 // resume.py: allocate_with_vtable(descr=self.descr).
                 if let Some(d) = descr {
@@ -15042,33 +15026,14 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         let descr_index = sd.type_id();
         let descr_size = sd.size();
         match descr_index {
-            W_INT_GC_TYPE_ID => {
-                let obj = Box::new(pyre_object::intobject::W_IntObject {
-                    ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: &pyre_object::pyobject::INT_TYPE as *const _,
-                        w_class: pyre_object::pyobject::get_instantiate(
-                            &pyre_object::pyobject::INT_TYPE,
-                        ),
-                    },
-                    intval: 0,
-                });
-                let raw = Box::into_raw(obj) as i64;
-                raw
-            }
-            W_FLOAT_GC_TYPE_ID => {
-                let obj = Box::new(pyre_object::floatobject::W_FloatObject {
-                    ob_header: pyre_object::pyobject::PyObject {
-                        ob_type: &pyre_object::pyobject::FLOAT_TYPE as *const _,
-                        w_class: pyre_object::pyobject::get_instantiate(
-                            &pyre_object::pyobject::FLOAT_TYPE,
-                        ),
-                    },
-                    floatval: 0.0,
-                    w_dict: std::ptr::null_mut(),
-                    w_slots: std::ptr::null_mut(),
-                });
-                Box::into_raw(obj) as i64
-            }
+            // `w_int_new_unique` / `w_float_new` prepend a `GcHeader`
+            // (collector heap, or `malloc_typed`). A bare `Box::into_raw`
+            // does not, so `do_write_barrier` → `registered_external_header`
+            // computes `header_of` eight bytes before the box. On Darwin
+            // that is SIGBUS when the box sits at `MALLOC_SMALL` start
+            // `0xb43000000` (nbody, 2026-09-18, `0xb42fffff8`).
+            W_INT_GC_TYPE_ID => pyre_object::intobject::w_int_new_unique(0) as i64,
+            W_FLOAT_GC_TYPE_ID => pyre_object::floatobject::w_float_new(0.0) as i64,
             _ => {
                 let bh_descr = majit_translate::jitcode::BhDescr::Size {
                     size: descr_size,

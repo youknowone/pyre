@@ -1582,6 +1582,60 @@ impl MiniMarkGC {
         addr != 0 && !self.is_tagged_immediate(addr)
     }
 
+    /// Whether `addr` is a word the external-header probe may load.
+    ///
+    /// RPython's write barrier only ever sees a typed GC pointer. The
+    /// external-header probe is a pyre fallback for bootstrap objects
+    /// allocated off the managed heaps; a blackhole resume can hand it a
+    /// garbage `struct_ptr` (ARM instruction bits decoded as a Ref, or a
+    /// `Box::into_raw` payload sitting on a mapping start). Loading that
+    /// word is SIGBUS / SIGSEGV. Refuse addresses that cannot be a user
+    /// object pointer.
+    fn addr_is_safe_user_word(&self, addr: usize) -> bool {
+        // The first page is never a bootstrap object (crash reports
+        // include `0x8`).
+        if addr < 4096 || !addr.is_multiple_of(GcHeader::ALIGN) {
+            return false;
+        }
+        if !self.is_valid_gc_object(addr) {
+            return false;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Pyre GcRefs do not use TBI; a non-zero top 16 bits is not a
+            // user pointer (seen as `0xf9400501f9404840` in crash reports).
+            if addr >> 48 != 0 {
+                return false;
+            }
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            // Reserved commpage. `do_write_barrier` SIGBUS'd here on
+            // `0xb42fffff8` (KERN_PROTECTION_FAILURE, end of the hole).
+            const COMMPAGE_LO: usize = 0x8440_00000;
+            const COMMPAGE_HI: usize = 0xB430_00000;
+            if (COMMPAGE_LO..COMMPAGE_HI).contains(&addr) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether `registered_external_header` may load a vtable word at
+    /// `addr` and a `GcHeader` at `header_of(addr)`.
+    ///
+    /// Both loads are required. A headerless `Box::into_raw` float whose
+    /// payload sits at Darwin `MALLOC_SMALL` start `0xb43000000` has a
+    /// readable vtable word (the `ob_type`) but `header_of` is
+    /// `0xb42fffff8` in the reserved commpage — the 2026-09-18 nbody
+    /// SIGBUS. Reject that payload, not only the header address itself.
+    fn addr_is_safe_header_probe(&self, addr: usize) -> bool {
+        let Some(header_addr) = addr.checked_sub(GcHeader::SIZE) else {
+            return false;
+        };
+        self.addr_is_safe_user_word(addr) && self.addr_is_safe_user_word(header_addr)
+    }
+
     /// incminimark.py range-check parity: nursery membership is a pure
     /// range check; JIT inline nursery bump-alloc must produce GcRefs
     /// indistinguishable from the slow path's, so a side table would
@@ -1604,7 +1658,7 @@ impl MiniMarkGC {
     /// box-probe experiment — so the tid witness stands.
     #[inline]
     fn registered_external_header(&self, addr: usize) -> Option<*mut GcHeader> {
-        if addr < GcHeader::SIZE || !addr.is_multiple_of(GcHeader::ALIGN) {
+        if !self.addr_is_safe_header_probe(addr) {
             return None;
         }
         let vtable = unsafe { *(addr as *const usize) };
@@ -11959,6 +12013,32 @@ mod tests {
         assert_eq!(unsafe { *flag_byte }, flag_byte_before);
 
         unsafe { std::alloc::dealloc(base, layout) };
+    }
+
+    #[test]
+    fn write_barrier_does_not_probe_reserved_or_non_user_addresses() {
+        // Blackhole resume has handed `bh_setfield_gc_r` these exact
+        // bit-patterns (`pyre-dynasm` crash reports 2026-09-18). The
+        // external-header probe must return without loading them.
+        let mut gc = test_gc(1024);
+        gc.do_write_barrier(GcRef(0xb_42ff_fff8));
+        gc.do_write_barrier(GcRef(0xf940_0501_f940_4840));
+        gc.do_write_barrier(GcRef(8));
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
+        assert!(!gc.addr_is_safe_header_probe(0xb_42ff_fff8));
+        assert!(!gc.addr_is_safe_header_probe(0xf940_0501_f940_4840));
+        assert!(!gc.addr_is_safe_header_probe(8));
+        // The live object pointer from the SIGBUS, not the fault address:
+        // a `Box::into_raw` float at Darwin `MALLOC_SMALL` start. The
+        // vtable word is mapped; `header_of` is the commpage hole.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            gc.do_write_barrier(GcRef(0xb43_000_000));
+            assert!(
+                !gc.addr_is_safe_header_probe(0xb43_000_000),
+                "payload at MALLOC_SMALL start has its header in the commpage"
+            );
+        }
     }
 
     #[test]
