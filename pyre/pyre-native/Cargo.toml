@@ -18,8 +18,7 @@ bitflags = { workspace = true }
 rustpython-common = { workspace = true, features = ["hashlib"] }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
-# `ssl` is MemoryBIO/OID/ALPN. `rustls` is the engine and is native-only;
-# wasm-host must not compile rustls (no JS UnixTime::now).
+# `ssl` is MemoryBIO/OID/ALPN. `rustls` is native-only.
 rustpython-host_env = { workspace = true, features = ["ssl"] }
 libc = { workspace = true }
 lz4_flex = { version = "0.13", default-features = false, features = [

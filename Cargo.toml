@@ -99,8 +99,7 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # _ssl/_socket, Windows types, thread _NAME_MAXLEN, WASI rustls,
 # parse-override ranking, and hang-at-finalize daemon handles.
 # Then through #8727 on RustPython/RustPython main (c382a607): host_env
-# `ssl` is rustls-free; `rustls` is the engine. wasm-host no longer needs
-# a web-time patch because host_env no longer forces rustls-pki-types `web`.
+# `ssl` is rustls-free; `rustls` is the engine.
 #
 rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "c382a607bbcb8882582edc33bbb89ed17d1188df", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
 rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "c382a607bbcb8882582edc33bbb89ed17d1188df" }
