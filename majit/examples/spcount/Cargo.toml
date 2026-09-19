@@ -13,3 +13,6 @@ linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-macros = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ctor = { workspace = true }

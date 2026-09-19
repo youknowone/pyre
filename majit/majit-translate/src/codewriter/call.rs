@@ -5351,16 +5351,17 @@ impl CallControl {
         self.unique_suffix_registered_path(segments)
     }
 
+    /// Unique registered free-function path that carries `segments` as a suffix.
+    /// Impl-method graphs stay out of this lookup: a FunctionPath must not
+    /// bind across that namespace.
     fn unique_suffix_registered_path(&self, segments: &[String]) -> Option<CallPath> {
         let leaf = segments.last()?;
         let mut matches = Vec::new();
-        for index in [&self.free_fn_leaf_index, &self.impl_method_leaf_index] {
-            if let Some(bucket) = index.get(leaf) {
-                matches.extend(bucket.iter().filter(|key| {
-                    let cs = &key.segments;
-                    cs.len() >= segments.len() && cs[cs.len() - segments.len()..] == *segments
-                }));
-            }
+        if let Some(bucket) = self.free_fn_leaf_index.get(leaf) {
+            matches.extend(bucket.iter().filter(|key| {
+                let cs = &key.segments;
+                cs.len() >= segments.len() && cs[cs.len() - segments.len()..] == *segments
+            }));
         }
         self.unique_shared_graph_path(&matches)
     }
@@ -13675,6 +13676,24 @@ mod tests {
             cc.graphs_from(op),
             Some(vec![registered.clone()]),
             "emit must use the same registered path BFS followed"
+        );
+    }
+
+    /// A FunctionPath whose leaf equals an impl method's leaf must not
+    /// resolve to that method graph.
+    #[test]
+    fn function_path_alias_does_not_bind_impl_method_with_same_leaf() {
+        let mut cc = CallControl::new();
+        let method_path = CallPath::for_impl_method("Owner", "shared_leaf");
+        cc.register_function_graph(
+            method_path.clone(),
+            FunctionGraph::new("shared_leaf").with_owner_root("Owner"),
+        );
+        let target = CallTarget::function_path(["shared_leaf"]);
+        assert_ne!(
+            cc.target_to_path(&target),
+            Some(method_path),
+            "a free-fn path must not resolve to an impl-method graph with the same leaf"
         );
     }
 

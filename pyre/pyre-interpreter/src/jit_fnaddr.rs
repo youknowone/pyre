@@ -4630,25 +4630,51 @@ fn intern_fnaddr_path(s: String) -> &'static str {
 ///
 /// A hand-listed path wins. Duplicate registry rows for the same path must
 /// agree on arity. Each row is published as the full `module_path!()::name`
-/// and, when the function is nested, the `cpa1` root `{crate}::{leaf}`.
-/// `register_macro_helper_trace_fnaddr` then adds the crate-stripped and
-/// `crate::` spellings from those keys.
+/// and, when the function is nested and `{crate}::{leaf}` is unique among
+/// full paths, that short alias. `register_macro_helper_trace_fnaddr` then
+/// adds the crate-stripped and `crate::` spellings from those keys.
 fn merge_macro_helper_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
     use std::collections::{HashMap, HashSet};
 
     let mut occupied: HashSet<&str> = entries.iter().map(|(path, _)| *path).collect();
     let mut arities: HashMap<&str, u8> = HashMap::new();
 
+    let mut rows: Vec<(&str, i64, u8)> = Vec::new();
     majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
         let addr = desc.get() as i64;
         if addr == 0 {
             return;
         }
-        let mut paths: Vec<&str> = vec![desc.path];
-        if let Some((crate_seg, rest)) = desc.path.split_once("::") {
+        rows.push((desc.path, addr, desc.arity));
+    });
+
+    let mut short_alias_owners: HashMap<String, HashSet<&str>> = HashMap::new();
+    for (path, _, _) in &rows {
+        if let Some((crate_seg, rest)) = path.split_once("::") {
             let leaf = rest.rsplit("::").next().unwrap_or(rest);
             if rest != leaf {
-                paths.push(intern_fnaddr_path(format!("{crate_seg}::{leaf}")));
+                short_alias_owners
+                    .entry(format!("{crate_seg}::{leaf}"))
+                    .or_default()
+                    .insert(*path);
+            }
+        }
+    }
+    let unique_short_aliases: HashSet<String> = short_alias_owners
+        .into_iter()
+        .filter(|(_, owners)| owners.len() == 1)
+        .map(|(alias, _)| alias)
+        .collect();
+
+    for (full_path, addr, arity) in rows {
+        let mut paths: Vec<&str> = vec![full_path];
+        if let Some((crate_seg, rest)) = full_path.split_once("::") {
+            let leaf = rest.rsplit("::").next().unwrap_or(rest);
+            if rest != leaf {
+                let short = format!("{crate_seg}::{leaf}");
+                if unique_short_aliases.contains(&short) {
+                    paths.push(intern_fnaddr_path(short));
+                }
             }
         }
         for path in paths {
@@ -4656,12 +4682,12 @@ fn merge_macro_helper_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
                 std::collections::hash_map::Entry::Occupied(existing) => {
                     debug_assert_eq!(
                         *existing.get(),
-                        desc.arity,
+                        arity,
                         "duplicate helper fnaddr arity mismatch for {path}"
                     );
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(desc.arity);
+                    slot.insert(arity);
                 }
             }
             if occupied.contains(path) {
@@ -4670,7 +4696,7 @@ fn merge_macro_helper_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
             entries.push((path, addr));
             occupied.insert(path);
         }
-    });
+    }
 }
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
@@ -5496,6 +5522,23 @@ mod tests {
         assert_ne!(
             obj_hint, raw_hint as *const () as usize as i64,
             "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
+    }
+
+    #[test]
+    fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_interpreter::call::register_frame_locals_slot"),
+            "call::register_frame_locals_slot must be registered"
+        );
+        assert!(
+            bindings.contains_key("pyre_interpreter::pyframe::register_frame_locals_slot"),
+            "pyframe::register_frame_locals_slot must be registered"
+        );
+        assert!(
+            !bindings.contains_key("pyre_interpreter::register_frame_locals_slot"),
+            "short alias shared by two full paths must not be emitted"
         );
     }
 
