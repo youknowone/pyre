@@ -169,11 +169,11 @@ fn call_varargs(
     let fvarargs = complete_argtypes(&fargs, args_w)?;
     let cif = build_cif_descr(&fvarargs, ct.ctitem, ct.abi, Some(fargs.len()))?;
     // `new_ctypefunc_completing_argtypes` builds a fresh function type and
-    // calls `_call` on it. The completed tuple is young and is not a field
+    // calls `_call` on it. The completed list is young and is not a field
     // of `ct`, so this opaque arm pins it for the conversions below.
     let roots = pyre_object::gc_roots::push_roots();
     let fargs_slot = roots.base();
-    let _ = roots.pin_root(pyre_object::tupleobject::w_tuple_new(fvarargs));
+    let _ = roots.pin_root(pyre_object::w_list_new_object(fvarargs));
     let result = do_call_fargs(roots.get(fargs_slot), ct.ctitem, cif, funcaddr, args_w);
     unsafe { free_cif_descr(cif) };
     result
@@ -267,7 +267,7 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     }
 }
 
-/// Variadic `_call`: the completed `fargs` tuple is not a field of `ct`.
+/// Variadic `_call`: the completed `fargs` list is not a field of `ct`.
 #[majit_macros::dont_look_inside]
 fn do_call_fargs(
     w_fargs: PyObjectRef,
