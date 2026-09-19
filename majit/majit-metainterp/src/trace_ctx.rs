@@ -2968,7 +2968,7 @@ impl TraceCtx {
     /// retires `execute_opcode_step`, this hook becomes a no-op (every
     /// mutation already lands in shadow) and can be deleted.
     pub fn refresh_virtualizable_shadow_from_heap(&mut self) {
-        let Some(heap_ptr) = self.virtualizable_sync_target() else {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
         let Some(info) = self.virtualizable_info.as_ref() else {
@@ -3219,27 +3219,13 @@ impl TraceCtx {
         self.set_virtualizable_boxes_with_info(boxes, values, &info, &lengths);
     }
 
-    /// Object `read_boxes` / `write_boxes` / `check_boxes` should name.
-    ///
-    /// The identity box is the upstream source (`pyjitpl.py
-    /// synchronize_virtualizable`, `load_fields_from_virtualizable`); the cell
-    /// is a pyre-only fallback for callers that seed a pointer before the
-    /// boxes exist.  Reader and writer must resolve through this one function:
-    /// the shadow-equals-heap invariant is over a single object, and a reader
-    /// that resolves differently from the writer refills the shadow from one
-    /// frame and flushes it into another.
-    pub(crate) fn virtualizable_sync_target(&self) -> Option<*const u8> {
-        self.standard_virtualizable_ptr()
-            .map(|addr| addr as *const u8)
-            .or_else(|| self.virtualizable_heap_ptr)
-    }
 
     /// `virtualizable.py write_boxes` over the whole shadow.
     ///
     /// `skip_when_outer_owned` names the merge-point form whose write-back
     /// is not this function's to make; see the carve-out below.
     fn write_virtualizable_back(&self, skip_when_outer_owned: bool) {
-        let Some(heap_ptr) = self.virtualizable_sync_target() else {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
         let Some(info) = self.virtualizable_info.as_ref() else {
@@ -3323,7 +3309,7 @@ impl TraceCtx {
             return;
         }
         let (Some(heap_ptr), Some(info), Some(values), Some(lengths)) = (
-            self.virtualizable_sync_target(),
+            self.virtualizable_heap_ptr,
             self.virtualizable_info.as_ref(),
             self.virtualizable_values.as_ref(),
             self.virtualizable_array_lengths.as_ref(),

@@ -2966,7 +2966,7 @@ where
                 if frame.jitcode.code[frame.last_opcode_position] != jitcode::insns::BC_RERAISE {
                     super::record_application_traceback(
                         self.last_exception_value,
-                        ctx.virtualizable_sync_target().unwrap_or(std::ptr::null()),
+                        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
                         frame,
                     );
                 }
@@ -2976,7 +2976,7 @@ where
                 let frame = self.frames.current_mut();
                 super::record_application_traceback(
                     self.last_exception_value,
-                    ctx.virtualizable_sync_target().unwrap_or(std::ptr::null()),
+                    ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
                     frame,
                 );
             }
@@ -10685,7 +10685,7 @@ where
                     // explicit value records at the raising instruction.
                     super::record_application_traceback(
                         concrete,
-                        ctx.virtualizable_sync_target().unwrap_or(std::ptr::null()),
+                        ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()),
                         frame,
                     );
                 }
