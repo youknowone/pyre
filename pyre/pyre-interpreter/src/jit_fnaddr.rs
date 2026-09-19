@@ -2914,6 +2914,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa1(
         &mut entries,
+        "pyre_object::intobject::w_small_int_const",
+        "pyre_object::w_small_int_const",
+        pyre_object::intobject::jit_w_small_int_const,
+    );
+    cpa1(
+        &mut entries,
         "pyre_object::floatobject::jit_w_float_new",
         "pyre_object::jit_w_float_new",
         pyre_object::jit_w_float_new,

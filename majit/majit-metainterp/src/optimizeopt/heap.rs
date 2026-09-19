@@ -1080,11 +1080,11 @@ impl OptHeap {
         if field_descr.is_typeptr() || field_descr.is_w_class() {
             return Self::header_field_slot(field_descr);
         }
-        let index = field_descr.index_in_parent();
+        let index = crate::optimizeopt::virtualize::parent_list_slot(field_descr);
         let holds_this_field = match field_descr.get_parent_descr() {
             Some(parent) => parent
                 .as_size_descr()
-                .and_then(|size| size.all_fielddescrs().get(index).cloned())
+                .and_then(|size| size.all_fielddescrs().get(index as usize).cloned())
                 .is_some_and(|row| {
                     crate::optimizeopt::virtualize::slot_holds_field(row.as_ref(), field_descr)
                 }),

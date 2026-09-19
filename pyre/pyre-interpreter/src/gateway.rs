@@ -2116,7 +2116,7 @@ pub fn fs_arg_bytes(data: Vec<u8>) -> Result<Vec<u8>, crate::PyError> {
     #[cfg(all(windows, feature = "host_env"))]
     if crate::typedef::legacy_windows_fs_encoding() {
         return crate::unicodehelper_win32::decode_code_page(
-            windows_sys::Win32::Globalization::CP_ACP,
+            rustpython_host_env::windows::CP_ACP,
             &data,
             "replace",
             true,
@@ -2150,7 +2150,7 @@ pub fn fsencode_wtf8_total(text: &rustpython_wtf8::Wtf8) -> Vec<u8> {
     #[cfg(all(windows, feature = "host_env"))]
     if crate::typedef::legacy_windows_fs_encoding()
         && let Ok(bytes) = crate::unicodehelper_win32::encode_code_page_replace(
-            windows_sys::Win32::Globalization::CP_ACP,
+            rustpython_host_env::windows::CP_ACP,
             text,
         )
     {

@@ -134,22 +134,10 @@ fn locale_error(message: &str) -> crate::PyError {
 
 #[cfg(all(windows, feature = "host_env"))]
 fn windows_default_locale_component(lctype: u32) -> Option<String> {
-    use windows_sys::Win32::Globalization::{GetLocaleInfoW, GetUserDefaultLCID};
-
-    let mut buffer = [0u16; 16];
-    let len = unsafe {
-        GetLocaleInfoW(
-            GetUserDefaultLCID(),
-            lctype,
-            buffer.as_mut_ptr(),
-            buffer.len() as i32,
-        )
-    };
-    if len <= 1 {
-        None
-    } else {
-        Some(String::from_utf16_lossy(&buffer[..len as usize - 1]))
-    }
+    rustpython_host_env::locale::locale_info(
+        rustpython_host_env::locale::user_default_lcid(),
+        lctype,
+    )
 }
 
 /// Numeric/monetary locale parameters decoded into owned buffers, the
@@ -409,7 +397,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "_getdefaultlocale",
             |_| {
-                use windows_sys::Win32::Globalization::{
+                use rustpython_host_env::locale::{
                     LOCALE_SISO639LANGNAME, LOCALE_SISO3166CTRYNAME,
                 };
                 let language = windows_default_locale_component(LOCALE_SISO639LANGNAME);

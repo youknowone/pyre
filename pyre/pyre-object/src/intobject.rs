@@ -317,6 +317,11 @@ pub extern "C" fn jit_w_int_new(value: i64) -> i64 {
     w_int_new(value) as i64
 }
 
+#[majit_macros::dont_look_inside]
+pub extern "C" fn jit_w_small_int_const(value: i64) -> i64 {
+    w_small_int_const(value) as i64
+}
+
 /// True iff `value` falls inside the prebuilt-int cache range AND
 /// the cache is enabled. Mirrors PyPy's `wrapint` in-range branch
 /// (`intobject.py:891-895`).
@@ -345,7 +350,13 @@ static SMALL_INT_CONSTS: [std::sync::OnceLock<usize>; 256] =
 /// the oparg *is* the value — so this table is that slot. `wrapint` /
 /// [`w_int_new`] still allocate a fresh box; this is not
 /// [`WITHPREBUILTINT`].
-#[inline]
+///
+/// `dont_look_inside`: looking inside the `OnceLock` init writes a
+/// translator-local `&INT_TYPE` into a fresh box. The residual hits
+/// the process table so `type(w1) is type(w2)` sees the same typeptr
+/// as interpreter-allocated ints.
+#[inline(never)]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub fn w_small_int_const(value: i64) -> PyObjectRef {
     if (SMALL_INT_CONST_FROM..SMALL_INT_CONST_TO).contains(&value) {
         let idx = (value - SMALL_INT_CONST_FROM) as usize;
@@ -361,6 +372,11 @@ pub fn w_small_int_const(value: i64) -> PyObjectRef {
     }
     w_int_new(value)
 }
+
+/// CALL_PURE fold: the intern table is deterministic after startup.
+#[doc(hidden)]
+#[allow(non_upper_case_globals)]
+pub const _elidable_function_w_small_int_const: bool = true;
 
 /// `intobject.py _bit_count` parity — population count of an i64.
 ///

@@ -2252,7 +2252,12 @@ impl GcCache {
                     expected_immutable,
                     expected_quasi_immutable,
                     virtualizable,
-                    expected_index_in_parent,
+                    // The completed parent list can shift the positional
+                    // slot after the first mint (`args_w` 1 → 2).  Offset
+                    // still names the same field; `get_field_descr` returns
+                    // the cached descr.  Virtualize looks the slot up on
+                    // the parent list, not this mint number.
+                    descr.index_in_parent,
                 ),
                 "get_field_descr cache hit for {field_name} disagrees with the caller: \
                      cached {:?} (offset {}, size {}, type {:?}, immutable {}, quasi {}, vable {}, \

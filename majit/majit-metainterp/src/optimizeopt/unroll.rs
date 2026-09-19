@@ -5215,7 +5215,7 @@ fn build_imported_virtuals_from_state(
             .filter_map(|field_descr| {
                 let field_idx = field_descr
                     .as_field_descr()
-                    .map(|fd| fd.index_in_parent() as u32)?;
+                    .map(crate::optimizeopt::virtualize::parent_list_slot)?;
                 fields
                     .iter()
                     .find(|(idx, _)| *idx == field_idx)

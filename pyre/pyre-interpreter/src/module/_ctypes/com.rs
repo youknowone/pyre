@@ -11,7 +11,6 @@
 use super::cdata;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
-use windows_sys::Win32::System::Com::{CoTaskMemFree, GetErrorInfo, ProgIDFromCLSID};
 
 /// Vtable slots.  Every interface starts with the three `IUnknown` ones, so
 /// the numbering below continues from there for each of the two interfaces an
@@ -121,7 +120,7 @@ impl Drop for ErrorInfo {
     fn drop(&mut self) {
         for bstr in [self.description, self.source, self.help_file] {
             if bstr != 0 {
-                unsafe { windows_sys::Win32::Foundation::SysFreeString(bstr as *const u16) };
+                host_ctypes::sys_free_string(bstr as *const u16);
             }
         }
     }
@@ -154,12 +153,11 @@ fn collect_error_info(this: usize, iid: usize) -> ErrorInfo {
         if supports < 0 {
             return info;
         }
-        let mut pei = std::ptr::null_mut();
         // `S_FALSE` means the thread has no error object, and only `S_OK` says
         // one came back.
-        if GetErrorInfo(0, &mut pei) != 0 {
+        let Some(pei) = host_ctypes::get_error_info() else {
             return info;
-        }
+        };
         let pei = pei as usize;
         call2(
             pei,
@@ -198,10 +196,9 @@ fn bstr_str(bstr: usize) -> PyObjectRef {
 /// The ProgID `guid` is registered under, or `None` when it is registered
 /// under none — which is also what a guid nobody filled in answers.
 fn prog_id(guid: &[u8; 16]) -> PyObjectRef {
-    let mut progid = std::ptr::null_mut();
-    if unsafe { ProgIDFromCLSID(guid.as_ptr() as *const _, &mut progid) } != 0 || progid.is_null() {
+    let Some(progid) = host_ctypes::prog_id_from_clsid(guid) else {
         return pyre_object::w_none();
-    }
+    };
     let mut len = 0;
     while unsafe { *progid.add(len) } != 0 {
         len += 1;
@@ -209,7 +206,7 @@ fn prog_id(guid: &[u8; 16]) -> PyObjectRef {
     let value = pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
         std::slice::from_raw_parts(progid, len)
     }));
-    unsafe { CoTaskMemFree(progid as *const _) };
+    host_ctypes::co_task_mem_free(progid.cast());
     value
 }
 

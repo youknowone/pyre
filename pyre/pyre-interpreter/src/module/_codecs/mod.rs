@@ -2068,7 +2068,7 @@ crate::py_module! {
         // rather than a codec that answers with the wrong bytes.
         #[cfg(all(windows, feature = "host_env"))]
         {
-            use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
+            use rustpython_host_env::windows::{CP_ACP, CP_OEMCP};
 
             fn mbcs_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 fixed_code_page_encode("mbcs_encode", CP_ACP, args)
