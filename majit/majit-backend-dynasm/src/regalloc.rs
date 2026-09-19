@@ -292,6 +292,13 @@ impl LifetimeManager {
         }
     }
 
+    pub fn with_capacity(n: usize) -> Self {
+        LifetimeManager {
+            lifetimes: indexmap::IndexMap::with_capacity_and_hasher(n, Default::default()),
+            fixed_register_use: IndexMap::new(),
+        }
+    }
+
     pub fn contains(&self, v: OpRef) -> bool {
         self.lifetimes.contains_key(&v)
     }
@@ -434,7 +441,8 @@ pub fn compute_vars_longevity<T: AsRef<Op>, A: AsRef<InputArg>>(
     inputargs: &[A],
     operations: &[T],
 ) -> LifetimeManager {
-    let mut longevity = LifetimeManager::new();
+    // Pre-size for one result per op plus one entry per input argument.
+    let mut longevity = LifetimeManager::with_capacity(operations.len() + inputargs.len());
 
     // regalloc.py:1179 iterate operations in REVERSE
     for i in (0..operations.len()).rev() {
