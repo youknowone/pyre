@@ -986,10 +986,7 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
-        // `cdataobj.py call` already has `args_w` without `self`. Index
-        // from 1 rather than `&args[1..]`: that slice is
-        // `ll_listslice_startonly` (`rlist.py`) and is not a jitcode subject.
-        return super::ctypefunc::call_from(ct, cdata.ptr, args, 1);
+        return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
     }
     Err(PyError::type_error(format!(
         "cdata '{}' is not callable",
