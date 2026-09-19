@@ -431,9 +431,9 @@ pub(crate) fn find_dispatch_match(block: &syn::Block) -> Option<&syn::ExprMatch>
 }
 
 /// A match is the opcode dispatch only when an opcode-fetch binding
-/// (`let op = program[pc]` / `program.get_op(pc)`) dominates it, or the
-/// scrutinee is itself `program[pc]`. A data index (`program[state.pos]`)
-/// is not the portal PC and stays on the matchless path.
+/// (`let op = program[pc]` / `program.get_op(pc)` / `insn_op(program, pc)`)
+/// dominates it, or the scrutinee is itself `program[pc]`. A data index
+/// (`program[state.pos]`) is not the portal PC and stays on the matchless path.
 fn match_is_opcode_dispatch(loop_body: &syn::Block, candidate: &syn::ExprMatch) -> bool {
     let mut names = Vec::new();
     let mut seen_merge_point = false;
@@ -468,11 +468,13 @@ fn opcode_fetch_binding_name(stmt: &syn::Stmt) -> Option<String> {
     };
     let fetches_program = match init_expr {
         syn::Expr::Index(idx) => index_is_program_at_pc(idx),
-        // Only `get_op(pc)` is the opcode fetch. `program.len()` /
-        // `get_operand` / `program[state.pos]` are ordinary values;
-        // treating them as the dispatch would send a local match through
+        // `get_op(pc)` and `insn_op(program, pc)` are the opcode fetch.
+        // `program.len()` / `get_operand` / `program[state.pos]` /
+        // `insn_a(program, pc)` are ordinary values; treating them as
+        // the dispatch would send a local match through
         // `lower_dispatch_chain` and drop the body.
         syn::Expr::MethodCall(mc) => method_is_get_op_at_pc(mc),
+        syn::Expr::Call(call) => call_is_insn_op_at_pc(call),
         _ => false,
     };
     if !fetches_program {
@@ -521,6 +523,18 @@ fn method_is_get_op_at_pc(mc: &syn::ExprMethodCall) -> bool {
             .args
             .first()
             .is_some_and(|a| expr_is_ident(unwrap_cast(a), "pc"))
+}
+
+/// CEL portal fetch: `insn_op(program, pc)`. Not `insn_a` / `insn_b`.
+fn call_is_insn_op_at_pc(call: &syn::ExprCall) -> bool {
+    let is_insn_op = match call.func.as_ref() {
+        syn::Expr::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "insn_op"),
+        _ => false,
+    };
+    is_insn_op
+        && call.args.len() == 2
+        && expr_is_ident(unwrap_cast(&call.args[0]), "program")
+        && expr_is_ident(unwrap_cast(&call.args[1]), "pc")
 }
 
 fn expr_is_ident(expr: &syn::Expr, name: &str) -> bool {
@@ -975,6 +989,39 @@ mod find_dispatch_match_tests {
         );
         let found = find_dispatch_match(&block).expect("dispatch match");
         assert_eq!(found.arms.len(), 3);
+    }
+
+    #[test]
+    fn insn_op_call_match_is_the_dispatch() {
+        let block = fn_block(
+            "loop {
+                jit_merge_point!(driver, program, pc; state);
+                let opcode = insn_op(program, pc);
+                let next = match opcode {
+                    0 => 1,
+                    1 => 2,
+                    _ => break,
+                };
+            }",
+        );
+        let found = find_dispatch_match(&block).expect("dispatch match");
+        assert_eq!(found.arms.len(), 3);
+    }
+
+    #[test]
+    fn insn_a_call_is_not_the_opcode_fetch() {
+        let block = fn_block(
+            "loop {
+                jit_merge_point!(driver, program, pc; state);
+                let a = insn_a(program, pc);
+                match a {
+                    0 => {},
+                    1 => {},
+                    _ => break,
+                }
+            }",
+        );
+        assert!(find_dispatch_match(&block).is_none());
     }
 
     #[test]

@@ -1332,6 +1332,20 @@ fn pick_local_and_const_idents(lowerer: &Lowerer, cond: &Expr) -> Option<(u16, s
 ///
 /// Returns `true` if the stmt was consumed (lowered or silently skipped),
 /// `false` if the caller should continue with other lowering paths.
+fn call_is_insn_op_at_pc(call: &syn::ExprCall) -> bool {
+    let is_insn_op = match call.func.as_ref() {
+        Expr::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == "insn_op"),
+        _ => false,
+    };
+    fn is_ident(expr: &Expr, name: &str) -> bool {
+        matches!(expr, Expr::Path(p) if p.path.is_ident(name))
+    }
+    is_insn_op
+        && call.args.len() == 2
+        && is_ident(&call.args[0], "program")
+        && is_ident(&call.args[1], "pc")
+}
+
 fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
     // Pattern 1: `let <name> = program[<index>];`
     // AST: Stmt::Local { pat: Pat::Ident { ident: <name> },
@@ -1384,6 +1398,26 @@ fn try_lower_opcode_fetch_stmt(lowerer: &mut Lowerer, stmt: &Stmt) -> bool {
         // `get_op` is registered as an elidable call policy. Emit
         // `call_pure_int` and bind the result so `lower_dispatch_chain`
         // finds the opcode register.
+        if opcode_fetch.is_none()
+            && let Expr::Call(call) = init_expr
+            && call_is_insn_op_at_pc(call)
+        {
+            if let Some(binding) = lowerer.lower_value_expr(&syn::Expr::Call(call.clone())) {
+                if let Some(name) = pat_bound_ident_name(&local.pat) {
+                    lowerer.bindings.insert(
+                        name.clone(),
+                        Binding {
+                            reg: binding.reg,
+                            kind: binding.kind,
+                            depends_on_stack: false,
+                            struct_type: None,
+                        },
+                    );
+                    lowerer.opcode_var_name = Some(name);
+                }
+                return true;
+            }
+        }
         if opcode_fetch.is_none()
             && let Expr::MethodCall(mc) = init_expr
         {
