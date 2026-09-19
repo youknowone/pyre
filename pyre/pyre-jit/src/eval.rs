@@ -2898,9 +2898,8 @@ fn build_gc() -> Box<MiniMarkGC> {
     // `contains_key` guard, so the net register-call count through
     // `W_MODULE_DICT_GC_TYPE_ID = 48` is unchanged (one explicit
     // registration here, one fewer from the loop) — no downstream
-    // hardcoded tid shifts.  Allocation routes through
-    // `try_gc_alloc_stable` (`w_pytraceback_new`), so the trace fires
-    // for real oldgen tracebacks.
+    // hardcoded tid shifts.  Allocation is `malloc_fixedsize`
+    // (`w_pytraceback_new`); the custom trace fires for every GC-owned node.
     let w_pytraceback_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         std::mem::size_of::<pyre_interpreter::pytraceback::PyTraceback>(),
         object_tid,
