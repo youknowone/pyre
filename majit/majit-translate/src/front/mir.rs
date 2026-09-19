@@ -45913,9 +45913,9 @@ mod tests {
         use crate::model::OpKind;
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
-        // Any &mut-self __majit_wrap setter; set__CHUNK_SIZE takes `&mut self`.
+        // Any &mut-self __majit_wrap setter; set_CHUNK_SIZE takes `&mut self`.
         let graph =
-            super::lower_function(&llbc, "__majit_wrap_set__CHUNK_SIZE").expect("lower setter");
+            super::lower_function(&llbc, "__majit_wrap_set_CHUNK_SIZE").expect("lower setter");
         let pos0_reads = graph
             .blocks
             .iter()

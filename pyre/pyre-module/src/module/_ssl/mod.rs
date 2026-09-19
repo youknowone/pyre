@@ -861,7 +861,7 @@ mod context_methods {
             self.host_flags as i64
         }
 
-        #[setter("_host_flags")]
+        #[setter]
         fn set_host_flags(&mut self, value: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
             let value = pyre_interpreter::baseobjspace::int_w(value)?;
             self.host_flags = i32::try_from(value).map_err(|_| {
@@ -967,7 +967,7 @@ mod context_methods {
             self.msg_callback
         }
 
-        #[setter("_msg_callback")]
+        #[setter]
         fn set_msg_callback(
             &mut self,
             value: PyObjectRef,

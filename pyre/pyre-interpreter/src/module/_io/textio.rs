@@ -1988,7 +1988,7 @@ impl W_TextIOWrapper {
 
     #[setter]
     #[allow(non_snake_case)]
-    fn set__CHUNK_SIZE(&mut self, size: PyObjectRef) -> Result<(), crate::PyError> {
+    fn set_CHUNK_SIZE(&mut self, size: PyObjectRef) -> Result<(), crate::PyError> {
         self.check_attached()?;
         let size = crate::baseobjspace::int_w(size)?;
         if size <= 0 {

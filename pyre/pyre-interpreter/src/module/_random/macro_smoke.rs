@@ -66,6 +66,13 @@ impl Demo {
     fn del_raw_state(&mut self) {
         self.state = 0;
     }
+    // `set_traceback` pairs with getter `__traceback__` as one getset.
+    #[getter]
+    fn __traceback__(&self) -> PyObjectRef {
+        w_none()
+    }
+    #[setter]
+    fn set_traceback(&mut self, _value: PyObjectRef) {}
 }
 
 /// `PyPath` typed-receiver alias.
