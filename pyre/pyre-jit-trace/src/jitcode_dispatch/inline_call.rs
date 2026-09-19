@@ -6076,9 +6076,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // would execute twice.  A seeded callee frame answers that hazard exactly:
     // the guard carries the callee's own resume coordinate, matching the
     // per-call MIFrame shape of `MetaInterp.perform_call`.  The Dirty admission
-    // therefore asks for that resume shape directly.  A constant callable, one
-    // paused caller, and the callee's own exception table remain required
-    // because the resume shape alone does not imply any of them.  The keyed
+    // therefore asks for that resume shape directly.  Of the three terms that
+    // once stood beside it, two are gone -- the callee's own exception table
+    // and the depth cap, both vestigial -- and the third, a constant callable,
+    // is a profitability screen rather than part of this answer
+    // (`seeded_callee_resume` below states what it measures).  The keyed
     // instance-`__next__` route is excluded because it already resumes keyed
     // guards through the seeded multi-frame snapshot.
     //
@@ -6294,14 +6296,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 foriter_deferred_admit
             }
             CalleeReplaySafety::Dirty => {
-                // The generated resume chain is sound for a constant callable
-                // with one paused caller when `try_multiframe` gives the callee
-                // a seeded frame.  That frame makes each in-callee guard carry
-                // the callee's own resume coordinate, so deopt does not replay
-                // the whole body from the caller's CALL boundary.  A stored
-                // bound method reaches the path on `bound_method` alone; one
-                // that also meets these terms takes the same screen exemption
-                // below.
+                // The generated resume chain is sound once `try_multiframe` or
+                // `strict_seed` gives the callee a seeded frame.  That frame
+                // makes each in-callee guard carry the callee's own resume
+                // coordinate, so deopt does not replay the whole body from the
+                // caller's CALL boundary.  A stored bound method reaches the
+                // path on `bound_method` alone; one that also meets these terms
+                // takes the same screen exemption below.
+                //
+                // `callable_guard_op.is_constant()` is not part of that
+                // argument.  The operand is pinned by a `GuardValue` either
+                // way, so a varying callable is inlined soundly; what the term
+                // screens is whether that guard holds.  Dropping it admits
+                // `self.cb(...)` and a `__getitem__` reached through a closure
+                // cell (1088 ns to 191 on an attr-callee loop) and buys a guard
+                // failure per iteration wherever the operand really varies:
+                // 9 `bench/synth` fixtures per backend moved together,
+                // `guard_failures` 210 -> 1007, `bridges_compiled` 1 -> 5,
+                // `loops_aborted` 1 -> 2.  Narrowing it to `!contains_raise`
+                // reproduces those numbers unchanged -- the regressing callees
+                // do not raise -- so the term is not standing in for the
+                // raising-chain resume shape either.  Widening it wants a
+                // predicate for "this non-constant operand is monomorphic
+                // across the loop", which nothing here computes.
                 //
                 // The callee's own exception table is NOT a term here.  It was
                 // one because the route was written for handler-bearing bodies,
