@@ -1158,7 +1158,10 @@ fn builtin_wrapper_args_slice_names_the_object_gcarray_descr() {
             op.key == "getarrayitem_gc_r/rid>r" && wrapper.code.get(op.pc + 1).copied() == Some(0)
         })
         .expect("wrapper getarrayitem(r0)");
-    assert_eq!(item_pool_descr_index(&wrapper.code, getitem.pc + 3), expected);
+    assert_eq!(
+        item_pool_descr_index(&wrapper.code, getitem.pc + 3),
+        expected
+    );
 }
 
 #[test]

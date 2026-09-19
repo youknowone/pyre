@@ -25577,7 +25577,9 @@ fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) 
     // block header, so an object-pointer slice is the length-prefixed
     // `GcArray(Ptr(PyObject))` every other access to that block names.
     if matches!(
-        identity.trim_start_matches(['&', ' ']).trim_start_matches("mut "),
+        identity
+            .trim_start_matches(['&', ' '])
+            .trim_start_matches("mut "),
         "[*mut PyObject]" | "[*const PyObject]"
     ) {
         return (Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()), false);
