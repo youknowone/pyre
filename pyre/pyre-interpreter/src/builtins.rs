@@ -7252,8 +7252,24 @@ fn exc_base_exception_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // tuple and the storage is never handed out, so its identity is not
     // observable.
     if !exception_args_already(w_self, positional) {
-        let args_list = pyre_object::interp_exceptions::w_exception_args_new(positional.to_vec());
-        unsafe { pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list) };
+        let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_self);
+        let args_base = pyre_object::gc_roots::shadow_stack_len();
+        for &arg in positional {
+            let _ = pyre_object::gc_roots::pin_root(arg);
+        }
+        let mut rooted_args = Vec::with_capacity(positional.len());
+        for i in 0..positional.len() {
+            rooted_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + i));
+        }
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted_args);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_args(
+                pyre_object::gc_roots::shadow_stack_get(self_slot),
+                args_list,
+            )
+        };
     }
     Ok(pyre_object::w_none())
 }
@@ -9841,14 +9857,22 @@ pub(crate) fn make_exc_type_with_init(
                             let _roots = pyre_object::gc_roots::push_roots();
                             let note_slot = pyre_object::gc_roots::shadow_stack_len();
                             let _ = pyre_object::gc_roots::pin_root(w_note);
+                            // The exception itself is nursery-allocated, so
+                            // it relocates across the same window and is
+                            // read back for the store.
+                            let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                            let _ = pyre_object::gc_roots::pin_root(w_self);
                             // `interp_exceptions.py:240-254` — lazy
                             // list allocation on first call; if the
                             // attribute is already set but NOT a list,
                             // PyPy raises TypeError("Cannot add note:
                             // __notes__ is not a list") per `:254`.
-                            let existing = crate::baseobjspace::getattr_str(w_self, "__notes__")
-                                .ok()
-                                .filter(|w| !w.is_null());
+                            let existing = crate::baseobjspace::getattr_str(
+                                pyre_object::gc_roots::shadow_stack_get(self_slot),
+                                "__notes__",
+                            )
+                            .ok()
+                            .filter(|w| !w.is_null());
                             // A `list` header moves, and storing the fresh
                             // one allocates: the attribute name, the
                             // instance dict that receives it, and whatever
@@ -9871,7 +9895,7 @@ pub(crate) fn make_exc_type_with_init(
                                         pyre_object::w_list_new(Vec::new()),
                                     );
                                     crate::baseobjspace::setattr_str(
-                                        w_self,
+                                        pyre_object::gc_roots::shadow_stack_get(self_slot),
                                         "__notes__",
                                         pyre_object::gc_roots::shadow_stack_get(notes_slot),
                                     )?;

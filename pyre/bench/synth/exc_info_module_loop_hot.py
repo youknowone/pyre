@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=25
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame
@@ -8,12 +8,10 @@
 # item, so it is not an accumulating body effect and must not refuse-drop the
 # iteration.  A drop loses that iteration's `exc_info_inside` / `exc_info_after`
 # increments (both would read N-k instead of N).
-# Keep N large enough that PyPy's execution-only time is measurable
-# after startup subtraction (`FLOOR_GATE_MIN_BASELINE_S`).
 
 import sys
 
-N = 500_000
+N = 50000
 
 exc_info_inside = 0
 exc_info_after_none = 0

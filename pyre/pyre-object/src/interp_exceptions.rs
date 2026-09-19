@@ -1235,10 +1235,20 @@ pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
 pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let exc = obj as *mut W_BaseException;
-        if (*exc).w_dict.is_null() {
-            (*exc).w_dict = crate::dictmultiobject::w_dict_new_instance();
-            exception_write_barrier(obj);
+        if !(*exc).w_dict.is_null() {
+            return (*exc).w_dict;
         }
+        // The exception is nursery-allocated.  The instance dict is a
+        // collecting allocation, so the receiver is pinned and the store
+        // goes through the forwarded address.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let w_dict = crate::dictmultiobject::w_dict_new_instance();
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let exc = obj as *mut W_BaseException;
+        (*exc).w_dict = w_dict;
+        exception_write_barrier(obj);
         (*exc).w_dict
     }
 }
