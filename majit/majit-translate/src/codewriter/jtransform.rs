@@ -5079,62 +5079,6 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        // `FloatRepr.rtype_int` (`rfloat.py`) emits `cast_float_to_int`.
-        // Charon spells `f64 as i64` / `to_int_unchecked` as a residual
-        // call (saturating `fptosi`, not a `UnaryOp` Cast), so the
-        // walker sees `residual_call_irf_i` with a symbolic fnaddr and
-        // declines the `_int_from_{floor,ceil,trunc}` descent.  Project
-        // the call onto the same signed cast `jtransform.py` emits for
-        // a float→Signed `force_cast` that fits in an int.
-        if is_float_to_signed_int_cast_target(target)
-            && args.len() == 1
-            && matches!(result_ty, ValueType::Int)
-        {
-            let src = resolve_alias(&args[0], &self.aliases);
-            if self.get_value_kind_var(&src) == 'f' || self.get_value_kind_var(&args[0]) == 'f' {
-                return RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::UnaryOp {
-                        op: "cast_float_to_int".into(),
-                        operand: src,
-                        result_ty: ValueType::Int,
-                    },
-                }]);
-            }
-        }
-        // `f64::to_bits` / `from_bits` are `float2longlong` /
-        // `longlong2float`.  Charon residualizes some rustc spellings
-        // as a typed call; project those onto the same llops rfloat.rs
-        // emits for the pair.
-        if is_f64_to_bits_target(target) && args.len() == 1 && matches!(result_ty, ValueType::Int) {
-            let src = resolve_alias(&args[0], &self.aliases);
-            if self.get_value_kind_var(&src) == 'f' || self.get_value_kind_var(&args[0]) == 'f' {
-                return RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::UnaryOp {
-                        op: "convert_float_bytes_to_longlong".into(),
-                        operand: src,
-                        result_ty: ValueType::Int,
-                    },
-                }]);
-            }
-        }
-        if is_f64_from_bits_target(target)
-            && args.len() == 1
-            && matches!(result_ty, ValueType::Float)
-        {
-            let src = resolve_alias(&args[0], &self.aliases);
-            if self.get_value_kind_var(&src) == 'i' || self.get_value_kind_var(&args[0]) == 'i' {
-                return RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::UnaryOp {
-                        op: "convert_longlong_bytes_to_float".into(),
-                        operand: src,
-                        result_ty: ValueType::Float,
-                    },
-                }]);
-            }
-        }
         // `__getslice_rangefrom(l, start)` — the front's deferred `l[start:]`
         // on a GC array.  The rtyper's `rtype_getslice` (`rlist.py`) turns
         // the lifted graph's `getslice` into a direct call of
@@ -9990,60 +9934,6 @@ fn remap_op(
 
 /// `rpython.rtyper.lltypesystem.lltype.cast_*` — the host-callable path
 /// `front::mir::cast_call_segments` emits for a bank-crossing cast.
-/// Charon residual for a signed `f64 → i64` conversion: `__builtin__.int`,
-/// `to_int_unchecked`, or the rustc/`fptosi` helper behind `as i64`.
-fn is_float_to_signed_int_cast_target(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::FunctionPath { segments } => {
-            if segments.as_slice() == ["__builtin__", "int"] {
-                return true;
-            }
-            segments
-                .last()
-                .is_some_and(|leaf| is_float_to_signed_int_leaf(leaf))
-        }
-        CallTarget::Method { name, .. } => is_float_to_signed_int_leaf(name),
-        _ => false,
-    }
-}
-
-fn is_float_to_signed_int_leaf(leaf: &str) -> bool {
-    matches!(
-        leaf,
-        "to_int_unchecked"
-            | "float_to_int_unchecked"
-            | "fptosi_sat"
-            | "f64_to_i64"
-            | "f64_to_isize"
-            | "fixdfti"
-            | "fixdfdi"
-    ) || leaf.contains("fptosi")
-        || leaf.ends_with("to_int_unchecked")
-}
-
-fn is_f64_bitcast_leaf(leaf: &str) -> bool {
-    leaf == "to_bits"
-        || leaf == "from_bits"
-        || leaf.contains("to_bits")
-        || leaf.contains("from_bits")
-        || leaf == "transmute"
-        || leaf.ends_with("transmute")
-}
-
-fn is_f64_to_bits_target(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::FunctionPath { segments } => segments
-            .last()
-            .is_some_and(|leaf| is_f64_bitcast_leaf(leaf)),
-        CallTarget::Method { name, .. } => is_f64_bitcast_leaf(name),
-        _ => false,
-    }
-}
-
-fn is_f64_from_bits_target(target: &CallTarget) -> bool {
-    is_f64_to_bits_target(target)
-}
-
 fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     segments.len() == 5
         && segments[0] == "rpython"
@@ -14023,78 +13913,107 @@ mod tests {
         assert!(matches!(ops[3].kind, OpKind::Live));
     }
 
-    #[test]
-    fn int_of_float_projects_to_cast_float_to_int() {
-        // FloatRepr.rtype_int emits `cast_float_to_int` (`rfloat.py`).
-        // The rich-graph path must do the same for `simple_call(__builtin__.int, v_float)`
-        // or `_int_from_trunc`'s `as i64` residualizes as `residual_call_irf_i`.
-        let mut graph = FunctionGraph::new("cast_float_to_int_test");
+    fn rewrite_direct_call(
+        target: CallTarget,
+        arg_ty: ValueType,
+        arg_ct: ConcreteType,
+        result_ty: ValueType,
+    ) -> (RewriteResult, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("cast_spelling_test");
         let arg = graph
             .push_op_var(
                 graph.startblock,
                 OpKind::Input {
                     name: "arg".into(),
-                    ty: ValueType::Float,
+                    ty: arg_ty.clone(),
                     class_root: None,
                 },
                 true,
             )
             .unwrap();
-        FunctionGraph::set_concretetype_of_inline(&arg, ConcreteType::Float);
+        FunctionGraph::set_concretetype_of_inline(&arg, arg_ct);
         let result = graph
             .push_op_var(
                 graph.startblock,
                 OpKind::Call {
-                    target: CallTarget::function_path(["__builtin__", "int"]),
+                    target: target.clone(),
                     args: crate::model::call_args(vec![arg.clone()]),
-                    result_ty: ValueType::Int,
+                    result_ty: result_ty.clone(),
                 },
                 true,
             )
             .unwrap();
         graph.set_return(graph.startblock, Some(result.clone()));
-
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
         let op = SpaceOperation {
             result: Some(result),
             kind: OpKind::Call {
-                target: CallTarget::function_path(["__builtin__", "int"]),
+                target: target.clone(),
                 args: crate::model::call_args(vec![arg.clone()]),
-                result_ty: ValueType::Int,
+                result_ty: result_ty.clone(),
             },
         };
         let rewritten = transformer.rewrite_op_direct_call(
             &op,
-            &CallTarget::function_path(["__builtin__", "int"]),
+            &target,
             std::slice::from_ref(&arg),
-            &ValueType::Int,
-            "cast_float_to_int_test",
+            &result_ty,
+            "cast_spelling_test",
             &mut graph,
         );
+        (rewritten, arg)
+    }
+
+    fn assert_not_projected_to(rewritten: &RewriteResult, forbidden: &str) {
         match rewritten {
             RewriteResult::Replace(ops) => {
                 assert!(
-                    ops.iter().any(|op| matches!(
+                    !ops.iter().any(|op| matches!(
                         &op.kind,
-                        OpKind::UnaryOp { op, operand, result_ty }
-                            if op == "cast_float_to_int"
-                                && *operand == arg
-                                && *result_ty == ValueType::Int
+                        OpKind::UnaryOp { op, .. } if op == forbidden
                     )),
-                    "float int() must become cast_float_to_int; ops={ops:?}"
-                );
-                assert!(
-                    !ops.iter()
-                        .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
-                    "float int() must not residualize; ops={ops:?}"
+                    "{forbidden} must not be projected from a guessed spelling; ops={ops:?}"
                 );
             }
-            RewriteResult::Keep => panic!("float int() must rewrite, got Keep"),
-            RewriteResult::Identity(_) => {
-                panic!("float int() must rewrite, got Identity")
-            }
+            RewriteResult::Keep | RewriteResult::Identity(_) => {}
         }
+    }
+
+    #[test]
+    fn f32_to_bits_is_not_projected() {
+        let (rewritten, _) = rewrite_direct_call(
+            CallTarget::function_path(["core", "f32", "<Impl>", "to_bits"]),
+            ValueType::SingleFloat,
+            ConcreteType::Float,
+            ValueType::Int,
+        );
+        assert_not_projected_to(&rewritten, "convert_float_bytes_to_longlong");
+        assert_not_projected_to(&rewritten, "cast_float_to_int");
+    }
+
+    #[test]
+    fn unrelated_transmute_is_not_projected() {
+        let (rewritten, _) = rewrite_direct_call(
+            CallTarget::function_path(["core", "intrinsics", "transmute"]),
+            ValueType::Float,
+            ConcreteType::Float,
+            ValueType::Int,
+        );
+        assert_not_projected_to(&rewritten, "convert_float_bytes_to_longlong");
+        assert_not_projected_to(&rewritten, "convert_longlong_bytes_to_float");
+        assert_not_projected_to(&rewritten, "cast_float_to_int");
+    }
+
+    #[test]
+    fn i128_conversion_is_not_projected() {
+        let (rewritten, _) = rewrite_direct_call(
+            CallTarget::function_path(["core", "f64", "<Impl>", "to_int_unchecked"]),
+            ValueType::Float,
+            ConcreteType::Float,
+            ValueType::Int128,
+        );
+        assert_not_projected_to(&rewritten, "cast_float_to_int");
     }
 
     #[test]
