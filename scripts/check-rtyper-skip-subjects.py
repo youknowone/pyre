@@ -29,9 +29,9 @@ on disk, for a second look at a reading just taken.
 The set is read against the corpus it was measured on.  The prepass reads
 `build/llbc/*.ullbc`, and a re-extraction brings interpreter code the
 baseline never saw: its graphs land in this set exactly like a regression
-would.  A rise measured over a corpus the baseline does not name is
-therefore reported and not failed, the same way the GC bracket gate
-treats a moved base.
+would.  A rise measured over a corpus the baseline does not name is a
+ratchet failure; refresh with `--update` only after attributing the
+additions to that move.
 """
 
 from __future__ import annotations
@@ -91,10 +91,10 @@ def corpus_key() -> tuple[str, list[str]]:
     where it would read as a corpus that simply differs.
 
     A corpus this cannot fully name is still not grounds to soften the
-    ratchet.  The moved-corpus allowance below turns on the key having
-    *changed*; absence of evidence that it moved is not evidence that it
-    did, and treating it as such would let deleting a stamp file excuse
-    any addition.
+    ratchet.  A moved-corpus failure turns on the key having *changed*;
+    absence of evidence that it moved is not evidence that it did, and
+    treating it as such would let deleting a stamp file excuse any
+    addition.
     """
     parts = []
     unstamped = []
@@ -373,7 +373,7 @@ def main() -> int:
             print(f"  ... and {len(gone) - 20} more")
 
     if added:
-        label = ("WARN — additions this run cannot attribute"
+        label = ("FAIL — additions this run cannot attribute"
                  if moved else "FAIL")
         print(f"\n{label} — {len(added)} graph(s) newly Skipped to the legacy "
               f"walker:")
@@ -383,8 +383,9 @@ def main() -> int:
             print(f"  ... and {len(added) - 40} more")
         if moved:
             print("  Re-extract onto the recorded corpus and rerun to "
-                  "attribute these, or rebaseline from a run that sits on it.")
-            return 0
+                  "attribute these, or refresh the baseline: "
+                  "python3 scripts/check-rtyper-skip-subjects.py --update")
+            return 1
         print("  Each name is a graph the real rtyper stopped handling. Fix "
               "the class it landed in, or record it with --update if the "
               "Skip is intended.")
