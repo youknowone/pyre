@@ -4499,8 +4499,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
+    funcptr: OpRef,
     ref_operand_offset: usize,
     r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
     runtime_helper: majit_ir::RuntimeHelperKind,
     dst_bank: char,
     dst: usize,
@@ -4646,23 +4648,41 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // different arm.  Suppressing the row restores the conservative scan and
     // is the A/B proof that the generated descent, rather than a hand emitter,
     // supplies the trace.
-    let builtin_len_shortcut = if receiver.is_none()
+    let builtin_len_call = receiver.is_none()
         && r_args.len() == 3
-        && pyre_interpreter::builtins::is_builtin_len_function(callable)
-    {
-        let concrete_receiver = match arg_concretes.get(2) {
-            Some(ConcreteValue::Ref(obj)) => *obj,
-            _ => pyre_object::PY_NULL,
-        };
-        spec_gate(SpecFold::BuiltinLenDescent, || {
-            Ok::<Option<()>, DispatchError>(
-                unsafe { exact_builtin_len_shortcut_receiver(concrete_receiver) }.then_some(()),
+        && pyre_interpreter::builtins::is_builtin_len_function(callable);
+    let len_receiver = match arg_concretes.get(2) {
+        Some(ConcreteValue::Ref(obj)) if builtin_len_call => *obj,
+        _ => pyre_object::PY_NULL,
+    };
+    // The receivers the shortcut below does not reach are the ones whose
+    // length is a Python call rather than a layout read.  They fail the same
+    // body-wide scan for the same reason, and the descent cannot serve them
+    // either, so they take their own route into the resolved `__len__`.
+    if builtin_len_call
+        && let Some(inlined) = spec_gate(SpecFold::LenUserDunder, || {
+            try_walker_inline_len_dunder(
+                ctx,
+                op,
+                code,
+                funcptr,
+                r_args,
+                call_descr,
+                dst,
+                r_args[2],
+                len_receiver,
             )
         })?
-        .is_some()
-    } else {
-        false
-    };
+    {
+        return Ok(Some(inlined));
+    }
+    let builtin_len_shortcut = builtin_len_call
+        && spec_gate(SpecFold::BuiltinLenDescent, || {
+            Ok::<Option<()>, DispatchError>(
+                unsafe { exact_builtin_len_shortcut_receiver(len_receiver) }.then_some(()),
+            )
+        })?
+        .is_some();
     let wrapper_item_count = usize::from(receiver.is_some()) + (r_args.len() - 2);
     if !builtin_len_shortcut
         && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
@@ -5507,6 +5527,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -5560,6 +5581,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     require_exact_int_result: bool,
     instance_next_foriter_green_key: Option<u64>,
     attribute_error_context: Option<AttributeErrorInlineContext>,
+    // The operator this call sits under, when its result is not the callee's
+    // return value.  It decides two things together: the checks emitted over
+    // the returned box, and the resume level pushed under the callee so a
+    // guard inside the BODY runs those same checks on the way out
+    // (`crate::operator_continuation`).
+    operator_tail: Option<crate::operator_continuation::OperatorTail>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -7860,6 +7887,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             };
             parents.push(tail);
         }
+        // An operator that post-processes the dunder's result pauses a level
+        // for the same span and the same reason: its tail runs between the
+        // callee's return and the caller's result slot, so without it
+        // `_setup_return_value_r` hands the caller the RAW return and the
+        // operator's own conversion and checks are simply skipped.
+        if let Some(operator_tail) = operator_tail
+            && callee_frame_materialized_has_resume
+        {
+            let Some(tail) = super::operator_continuation_parent_frame(operator_tail) else {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            };
+            parents.push(tail);
+        }
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, true, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
@@ -8438,6 +8478,77 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     // and it keeps a legal program from killing the enclosing
                     // loop's trace, which `callee_inline_unsupported` would.
                     return resolved_inline_decline(op.pc, line!());
+                }
+                if operator_tail == Some(crate::operator_continuation::OperatorTail::Len) {
+                    // `len` runs `space.index` on what `__len__` returned,
+                    // then `_check_len_result` on that, and boxes the machine
+                    // length it checked out to (`builtins.rs builtin_len`).
+                    // An exact machine int makes the index the identity,
+                    // reduces the check to its nonnegative test, and makes the
+                    // box an int of the same value, so admit that one shape
+                    // and guard it at runtime below.  Every other box — a
+                    // long, a bool, an int subclass, something carrying
+                    // `__index__`, and a negative — hands the call back to the
+                    // interpreter, which runs the whole operator and produces
+                    // the faithful conversion, TypeError, ValueError or
+                    // OverflowError.
+                    let len_value = match concrete_for_shadow {
+                        ConcreteValue::Ref(obj) if walker_is_exact_machine_int_concrete(obj) => {
+                            walker_machine_int_value(obj)
+                        }
+                        _ => None,
+                    };
+                    // Two refusals, one exit.  A length this route cannot
+                    // answer — a long, a bool, an int subclass, something
+                    // carrying `__index__`, a negative — owes the interpreter
+                    // its faithful conversion or error.  A body whose sub-walk
+                    // moved the executed-effect odometer owes it the operator
+                    // too: the guard below resumes at the CALL boundary with
+                    // the result slot pending, so the blackhole re-runs the
+                    // whole operator, `__len__` included, and the odometer is
+                    // what says that re-run is not free.  The traced prefix is
+                    // the only prefix a deopt can have, so it answers the
+                    // question exactly, and the guard is emitted only over a
+                    // body that committed nothing.
+                    //
+                    // Both leave by declining, not aborting.  Declining cuts
+                    // the emission and lets the caller's residual run the
+                    // whole operator; aborting would ban the enclosing loop
+                    // for a `__len__` that answers this way every iteration,
+                    // which is worse than the residual this route was opened
+                    // to replace.  It also concedes nothing on the committed
+                    // body: that abort's own rewind has no CALL-forward
+                    // carrier here, so it replays the outer frame from entry
+                    // and re-runs the very effects the residual re-runs.
+                    if !len_value.is_some_and(|value| value >= 0)
+                        || fbw_executed_effect_count() != executed_effects_before
+                    {
+                        return resolved_inline_decline(op.pc, line!());
+                    }
+                    // Both checks as guards, before the destination write, so a
+                    // later iteration whose `__len__` answers differently
+                    // resumes with the CALL's result slot still pending rather
+                    // than carrying a length the operator would have refused.
+                    let concrete = match concrete_for_shadow {
+                        ConcreteValue::Ref(obj) => obj,
+                        _ => pyre_object::PY_NULL,
+                    };
+                    let (int_type, intval_descr) =
+                        crate::state::int_or_bool_unbox_type_descr(concrete);
+                    let expected_class = walker_numeric_builtin_class(concrete);
+                    let raw = walker_unbox_int_exact(
+                        ctx,
+                        op.pc,
+                        value,
+                        int_type,
+                        intval_descr,
+                        expected_class,
+                    )?;
+                    let zero = ctx.trace_ctx.const_int(0);
+                    let nonnegative = ctx.trace_ctx.record_op(OpCode::IntGe, &[raw, zero]);
+                    ctx.trace_ctx
+                        .set_opref_concrete(nonnegative, majit_ir::Value::Int(1));
+                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[nonnegative])?;
                 }
                 // `descr_call` discards `__init__`'s result after checking it is
                 // None and returns the instance instead (`check_init_returned_none`).
@@ -10253,6 +10364,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             name: name_const,
             name_concrete: name_obj,
         }),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -10408,6 +10520,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
             name: name_const,
             name_concrete: name_obj,
         }),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -10717,6 +10830,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         true,
         None,
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -10847,6 +10961,120 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
     )
 }
 
+/// Inline `len(obj)` into the receiver type's Python `__len__`.
+///
+/// `descroperation.py _len` resolves `__len__` on the receiver's type and
+/// calls it; `len` then runs `space.index` over the answer and checks it with
+/// `_check_len_result`.  pyre reaches that whole chain through the generated
+/// `space.len` wrapper, and the wrapper's generic lookup and error arms carry
+/// un-lowered helper calls, so the body-wide descent scan refuses the descent
+/// and every `len(obj)` over a user instance runs as a fresh interpreter frame
+/// behind a `CALL_MAY_FORCE`.  [`exact_builtin_len_shortcut_receiver`] walks
+/// the receivers whose length is a layout read past that same scan; this route
+/// is the other half, for the receivers whose length really is a call.
+///
+/// The gate is `len_fast_path`, which admits exactly the receivers `_len`
+/// dispatches a method for — a user instance, or a builtin subclass overriding
+/// `__len__`.  Pinning the receiver's class and version tag is what makes that
+/// MRO answer constant for the trace, and the inline plumbing owes those
+/// guards the way the subscript route does.
+///
+/// Neither check around the call is dropped, on EITHER exit.  On the traced
+/// path `OperatorTail::Len` admits only the box that makes `space.index` the
+/// identity and emits `_check_len_result`'s nonnegative test as a guard; on
+/// the deopt path the same `OperatorTail::Len` is the resume level that runs
+/// `baseobjspace::len_result_tail` for real.  Without the second half the
+/// first is decoration: a guard inside the inlined body returns the callee's
+/// raw box straight into `len`'s result register
+/// (`crate::operator_continuation`).
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_len_dunder<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    receiver_op: OpRef,
+    concrete_receiver: pyre_object::PyObjectRef,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some((w_type, version_tag, w_len)) =
+        (unsafe { pyre_interpreter::baseobjspace::len_fast_path(concrete_receiver) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_len) }) else {
+        return Ok(None);
+    };
+    // `__len__(self)` — any other arity is a shape `get_and_call_function`
+    // would reject before the body runs.
+    if nparams != 1 {
+        return Ok(None);
+    }
+    // Decided once per callee on its jitcode payload; `None` means no body or
+    // descr pool, which this route declines on either way.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if body_facts.owns_loop_header {
+        return Ok(None);
+    }
+
+    // `[__len__, <self-placeholder>, obj]`: the method-form call header the
+    // inline plumbing expects, then the one positional argument.
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_len),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_receiver),
+    ];
+    let len_const = ctx.trace_ctx.const_ref(w_len as i64);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let inlined = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_len,
+        len_const,
+        w_len,
+        arg_concretes,
+        vec![receiver_op],
+        vec![ConcreteValue::Ref(concrete_receiver)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((receiver_op, concrete_receiver, w_type, version_tag)),
+        None,
+        // The entry is a Python CALL of its own, which is what the abort
+        // rewind names.
+        true,
+        false,
+        None,
+        None,
+        false,
+        None,
+        None,
+        Some(crate::operator_continuation::OperatorTail::Len),
+    )?;
+    // A refused result — `__len__` answering a non-int or a negative — declines
+    // from inside the call above after the body has been walked.  Cut that
+    // emission back so the caller's residual runs the operator itself.
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    }
+    Ok(inlined)
+}
+
 /// Inline a user instance's Python `__iter__` directly under GET_ITER.
 ///
 /// `iter`'s instance arm dispatches the method and then runs
@@ -10964,6 +11192,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         None,
         false,
+        None,
         None,
         None,
     );
@@ -11135,6 +11364,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         false,
         Some(foriter_green_key),
+        None,
         None,
     );
     let inline_resume_pc = match inline {
