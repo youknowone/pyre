@@ -390,10 +390,9 @@ fn classify_inline_install_error(error: &BackendError) {
 }
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Default OFF: compile_loop/compile_bridge keep today's intern_ref_constants
-/// path. Armed by the host through [`gc_rewrite_enable`]
-/// (`PYRE_WASM_GC_REWRITE`).
-static GC_REWRITE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Default ON: compile_loop/compile_bridge run `rewrite.py` then intern.
+/// Host opt-out through [`gc_rewrite_disable`] (`PYRE_WASM_GC_REWRITE=0`).
+static GC_REWRITE_ENABLED: AtomicBool = AtomicBool::new(true);
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// On: non-header regions are placed outside the header `loop`, so they
 /// do not tax the fall-through path. See `inline_nonheader_enable`.
@@ -518,17 +517,19 @@ pub fn reemit_enable() {
     REEMIT_ENABLED.store(true, Ordering::Relaxed);
 }
 
-/// Arm the GC rewrite pass (`rewrite.py`) from the host before guest
-/// execution starts. Off by default so unarmed modules stay byte-identical.
-pub fn gc_rewrite_enable() {
-    GC_REWRITE_ENABLED.store(true, Ordering::Relaxed);
+/// Disable the GC rewrite pass from the host before guest execution
+/// starts. On by default: every compile_loop/compile_bridge runs
+/// `rewrite.py`. `PYRE_WASM_GC_REWRITE=0|false|off` restores the
+/// intern-only pre-rewrite path.
+pub fn gc_rewrite_disable() {
+    GC_REWRITE_ENABLED.store(false, Ordering::Relaxed);
 }
 
 fn gc_rewrite_enabled() -> bool {
     GC_REWRITE_ENABLED.load(Ordering::Relaxed)
 }
 
-/// Test-only setter so host unit tests can arm/disarm the rewrite pass
+/// Test-only setter so host unit tests can pin the rewrite pass
 /// without a guest export.
 #[cfg(test)]
 pub fn gc_rewrite_enable_for_test(on: bool) {
@@ -7837,12 +7838,17 @@ mod tests {
     struct GcRewriteFlagGuard;
     impl Drop for GcRewriteFlagGuard {
         fn drop(&mut self) {
-            gc_rewrite_enable_for_test(false);
+            gc_rewrite_enable_for_test(true);
         }
     }
 
     fn arm_gc_rewrite() -> GcRewriteFlagGuard {
         gc_rewrite_enable_for_test(true);
+        GcRewriteFlagGuard
+    }
+
+    fn pin_gc_rewrite_off() -> GcRewriteFlagGuard {
+        gc_rewrite_enable_for_test(false);
         GcRewriteFlagGuard
     }
 
@@ -8013,7 +8019,8 @@ mod tests {
     #[test]
     fn gc_rewrite_off_matches_intern_ref_constants() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        gc_rewrite_enable_for_test(false);
+        // Pin OFF: this asserts the intern-only pre-rewrite path.
+        let _flag = pin_gc_rewrite_off();
         let (inputargs, ops) = u1_new_setfield_ops(1);
         let mut backend = WasmBackend::new();
         let (prepared_a, _) = backend.prepare_ops_for_compile(&inputargs, &ops, true);

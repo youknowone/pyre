@@ -1520,11 +1520,11 @@ mod host_abi {
         majit_backend_wasm::reemit_enable();
     }
 
-    /// Arm the GC rewrite pass before tracing begins. The host owns
+    /// Disable the default GC rewrite pass. The host owns
     /// `PYRE_WASM_GC_REWRITE`; the wasm guest cannot read its environment.
     #[unsafe(no_mangle)]
-    pub extern "C" fn pyre_jit_gc_rewrite_enable() {
-        majit_backend_wasm::gc_rewrite_enable();
+    pub extern "C" fn pyre_jit_gc_rewrite_disable() {
+        majit_backend_wasm::gc_rewrite_disable();
     }
 
     /// Disable the default loop-closing bridge inlining. The host owns the
