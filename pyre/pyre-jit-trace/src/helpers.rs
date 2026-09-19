@@ -814,14 +814,14 @@ pub fn portal_callfn_callable_index(raw_r: &[i64]) -> Option<usize> {
     }
     let a0 = raw_r[0] as pyre_object::PyObjectRef;
     let a1 = raw_r[1] as pyre_object::PyObjectRef;
-    let is_class = |p: pyre_object::PyObjectRef| {
-        !p.is_null()
-            && unsafe { pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(p) }
-            && pyre_object::interp_exceptions::is_canonical_exc_class(p)
-    };
-    if is_class(a1) {
+    // Residual CallFn words are not all objects: a portal `[frame,
+    // callable, args...]` can hold interned string buffers. Identity
+    // against `EXC_CLASS_BY_KIND` does not dereference; walking a
+    // non-type as `W_TypeObject` (`exception_is_valid_obj_as_class_w`
+    // → `w_type_issubtype`) does.
+    if pyre_object::interp_exceptions::is_canonical_exc_class(a1) {
         Some(1)
-    } else if is_class(a0) && a1.is_null() {
+    } else if pyre_object::interp_exceptions::is_canonical_exc_class(a0) && a1.is_null() {
         Some(0)
     } else {
         None
