@@ -620,6 +620,13 @@ pub struct Transformer<'a> {
     /// result are dropped — `rclass.py` embeds `OBJECT` in the instance
     /// and `rewrite_op_setfield` already ignores `typeptr`.
     header_stack_results: std::collections::HashSet<crate::flowspace::model::Variable>,
+    /// Bases of in-graph GC `FieldWrite` / `ArrayWrite` stores. A
+    /// `try_gc_write_barrier` call is dropped only when its argument
+    /// (after `resolve_alias` and identity casts) is one of these —
+    /// `rewrite.py handle_write_barrier_setfield` emits `COND_CALL_GC_WB`
+    /// on `SETFIELD_GC` of a pointer, not on a residual or raw store.
+    /// `None` until computed once per graph.
+    gc_stored_bases: Option<std::collections::HashSet<crate::flowspace::model::Variable>>,
     notes: Vec<GraphTransformNote>,
     vable_rewrites: usize,
     calls_classified: usize,
@@ -914,7 +921,9 @@ pub(crate) fn ctype_flags_const(segments: &[String]) -> Option<OpKind> {
 /// interpreter stand-in for a raw store. `rewrite.py
 /// handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
 /// `SETFIELD_GC` of a pointer; the hook itself is
-/// `@dont_look_inside` and must not survive as a residual helper.
+/// `@dont_look_inside` and must not survive as a residual helper
+/// **when that store is in this graph**. A barrier whose argument
+/// has no GC `FieldWrite` / `ArrayWrite` in the graph stays residual.
 /// `try_gc_write_barrier_before_move` is a different op
 /// (`gct_gc_writebarrier_before_move`) and is not this.
 fn is_gc_write_barrier_path(segments: &[String]) -> bool {
@@ -922,6 +931,106 @@ fn is_gc_write_barrier_path(segments: &[String]) -> bool {
         segments.last().map(String::as_str),
         Some("try_gc_write_barrier") | Some("try_gc_write_barrier_managed")
     )
+}
+
+/// Identity-cast markers `rewrite_op_direct_call` folds to `same_as`
+/// (`__cast_pointer`, `__cast_instance_intrinsic`,
+/// `__cast_address_intrinsic`).
+fn is_identity_cast_path(segments: &[String]) -> bool {
+    let [leaf] = segments else {
+        return false;
+    };
+    leaf == "__cast_pointer"
+        || leaf == crate::runtime_names::shims::CAST_INSTANCE
+        || leaf == crate::runtime_names::shims::CAST_ADDRESS
+}
+
+/// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`.
+/// Raw-pointer `Ref` owners are not this (`rewrite.py
+/// handle_write_barrier_setfield` keys on `v.type == 'r'`).
+fn value_type_is_gc_ref(ty: &ValueType) -> bool {
+    match ty {
+        ValueType::Ref(None) => true,
+        ValueType::Ref(Some(owner)) => {
+            owner != RAW_PTR_DEFAULT_OWNER
+                && !owner.contains("mut_ptr")
+                && !owner.contains("const_ptr")
+                && !owner.starts_with('*')
+        }
+        _ => false,
+    }
+}
+
+/// Operand of an identity-cast Call that produced `var`, if any.
+fn identity_cast_operand(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<crate::flowspace::model::Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            if let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+                && is_identity_cast_path(segments)
+            {
+                return args.iter().find_map(LinkArg::as_variable).cloned();
+            }
+        }
+    }
+    None
+}
+
+/// Follow `resolve_alias` then identity-cast Calls to the source pointer.
+fn canonical_gc_base(
+    graph: &FunctionGraph,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    var: &crate::flowspace::model::Variable,
+) -> crate::flowspace::model::Variable {
+    let mut cur = resolve_alias(var, aliases);
+    for _ in 0..32 {
+        let Some(src) = identity_cast_operand(graph, &cur) else {
+            break;
+        };
+        let next = resolve_alias(&src, aliases);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// Bases of in-graph GC `FieldWrite` / `ArrayWrite` stores, after
+/// identity-cast chasing. Computed once per graph.
+fn collect_gc_stored_bases(
+    graph: &FunctionGraph,
+) -> std::collections::HashSet<crate::flowspace::model::Variable> {
+    let aliases = std::collections::HashMap::new();
+    let mut set = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::FieldWrite { base, ty, .. } if value_type_is_gc_ref(ty) => {
+                    set.insert(canonical_gc_base(graph, &aliases, base));
+                    set.insert(base.clone());
+                }
+                OpKind::ArrayWrite { base, item_ty, .. } if value_type_is_gc_ref(item_ty) => {
+                    set.insert(canonical_gc_base(graph, &aliases, base));
+                    set.insert(base.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    set
 }
 
 /// `rtype_const_result` / `rtype_ptr_null` for a Default whose Self
@@ -1773,6 +1882,7 @@ impl<'a> Transformer<'a> {
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
             header_stack_results: std::collections::HashSet::new(),
+            gc_stored_bases: None,
             notes: Vec::new(),
             vable_rewrites: 0,
             calls_classified: 0,
@@ -1867,6 +1977,7 @@ impl<'a> Transformer<'a> {
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
+        self.gc_stored_bases = Some(collect_gc_stored_bases(&rewritten));
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
@@ -5445,6 +5556,14 @@ impl<'a> Transformer<'a> {
                     return RewriteResult::Identity(src);
                 }
                 if self.get_value_kind_var(&arg) == 'i' {
+                    // Stamp the operand Signed so flatten emits
+                    // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
+                    // `/r>r` from an unstamped Unknown.
+                    self.stamp_value_kind(
+                        graph,
+                        Some(arg.clone()),
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    );
                     self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
                     return rewrite_as_unary_llop(
                         op,
@@ -6161,22 +6280,40 @@ impl<'a> Transformer<'a> {
         }
         // `framework.py gct_gc_writebarrier` turns `llop.gc_writebarrier`
         // into a call the rewriter does not keep: `SETFIELD_GC` of a
-        // pointer already grows `COND_CALL_GC_WB`. The explicit hook is
-        // only for the interpreter's raw store; a residual helper here
-        // is the descent wall after a fused allocation.
+        // pointer already grows `COND_CALL_GC_WB`. Drop the explicit hook
+        // only when that store is in this graph as a GC `FieldWrite` /
+        // `ArrayWrite` of the same base; otherwise the barrier stays
+        // residual (`RewriteResult` fallthrough) — a raw or residual
+        // store has no `handle_write_barrier_setfield` to emit
+        // `COND_CALL_GC_WB`.
         if let CallTarget::FunctionPath { segments, .. } = target
             && args.len() == 1
             && is_gc_write_barrier_path(segments)
         {
-            return if op.result.is_some() {
-                self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Bool);
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::ConstBool(true),
-                }])
-            } else {
-                RewriteResult::Replace(vec![])
-            };
+            if self.gc_stored_bases.is_none() {
+                self.gc_stored_bases = Some(collect_gc_stored_bases(graph));
+            }
+            let arg = resolve_alias(&args[0], &self.aliases);
+            let canon = canonical_gc_base(graph, &self.aliases, &arg);
+            let has_gc_store = self
+                .gc_stored_bases
+                .as_ref()
+                .is_some_and(|bases| bases.contains(&arg) || bases.contains(&canon));
+            if has_gc_store {
+                return if op.result.is_some() {
+                    self.stamp_value_kind_from_value_type(
+                        graph,
+                        op.result.clone(),
+                        &ValueType::Bool,
+                    );
+                    RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::ConstBool(true),
+                    }])
+                } else {
+                    RewriteResult::Replace(vec![])
+                };
+            }
         }
         // `CTypeFlags::SIGNED_WCHAR` (and the other flag consts) is a
         // compile-time mask. Charon leaves the bitflags impl Opaque, so
@@ -6352,7 +6489,6 @@ impl<'a> Transformer<'a> {
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
                     // typed the unit `()` shell (see `effective_call_result_ty`).
-                    let libc_raw = libc_raw_alloc_oopspec(target);
                     let effective_result_ty =
                         self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
                     let result_ir_type = self
@@ -6367,18 +6503,15 @@ impl<'a> Transformer<'a> {
                     // `declares_cannot_raise` and a
                     // `#[dont_look_inside_cannot_raise]` residual emits
                     // GUARD_NO_EXCEPTION.
-                    let extraeffect = libc_raw.as_ref().map(|(_, extra)| *extra).or_else(|| {
-                        classified
-                            .as_ref()
-                            .filter(|(_, _, is_override)| *is_override)
-                            .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect)
-                    });
-                    let oopspecindex = libc_raw.map(|(idx, _)| idx).unwrap_or(OopSpecIndex::None);
+                    let extraeffect = classified
+                        .as_ref()
+                        .filter(|(_, _, is_override)| *is_override)
+                        .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect);
                     let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
                         result_ir_type,
-                        oopspecindex,
+                        OopSpecIndex::None,
                         extraeffect,
                         &mut self.analysis_cache,
                         None,
@@ -6602,35 +6735,26 @@ impl<'a> Transformer<'a> {
             // The jitcode_lower proc-macro intercepts the macros directly and
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
-        let (oopspecindex, extraeffect_override) = if let Some((idx, extra)) =
-            libc_raw_alloc_oopspec(target)
-        {
-            // `jtransform.py _rewrite_raw_malloc`: a char varsize raw
-            // malloc is `OS_RAW_MALLOC_VARSIZE_CHAR`. The frontend may
-            // already have inlined `raw_malloc_varsize_char` to
-            // `libc::malloc`, dropping the user oopspec; recover it
-            // before `describe_call` classifies the C leaf as a
-            // generic residual with `oopspecindex = None`.
-            (idx, Some(extra))
-        } else if let Some((descriptor, _, _)) = classify_call(target, &self.config.call_effects) {
-            (
-                descriptor.extra_info.oopspecindex,
-                Some(descriptor.extra_info.extraeffect),
-            )
-        } else if let Some(descriptor) = crate::call::describe_call(target) {
-            (
-                descriptor.extra_info.oopspecindex,
-                Some(descriptor.extra_info.extraeffect),
-            )
-        } else if let Some(spec) = user_oopspec.as_deref() {
-            // rlib/jit.py — map user oopspec string to OopSpecIndex.
-            // jtransform.py:1731-1755 — jit.* oopspecs.
-            let idx = map_user_oopspec_to_index(spec);
-            (idx, None)
-        } else {
-            // Unknown builtin — keep as unclassified Call.
-            return RewriteResult::Keep;
-        };
+        let (oopspecindex, extraeffect_override) =
+            if let Some((descriptor, _, _)) = classify_call(target, &self.config.call_effects) {
+                (
+                    descriptor.extra_info.oopspecindex,
+                    Some(descriptor.extra_info.extraeffect),
+                )
+            } else if let Some(descriptor) = crate::call::describe_call(target) {
+                (
+                    descriptor.extra_info.oopspecindex,
+                    Some(descriptor.extra_info.extraeffect),
+                )
+            } else if let Some(spec) = user_oopspec.as_deref() {
+                // rlib/jit.py — map user oopspec string to OopSpecIndex.
+                // jtransform.py:1731-1755 — jit.* oopspecs.
+                let idx = map_user_oopspec_to_index(spec);
+                (idx, None)
+            } else {
+                // Unknown builtin — keep as unclassified Call.
+                return RewriteResult::Keep;
+            };
 
         // RPython jtransform.py:1990-2002:
         //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
@@ -11053,33 +11177,6 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
-    }
-}
-
-/// Recover `OS_RAW_MALLOC_VARSIZE_CHAR` / `OS_RAW_FREE` when the frontend
-/// has already inlined `raw_malloc_varsize_char` / `raw_free` to the C
-/// leaf (`support.py _ll_1_raw_malloc_varsize` is never `libc.malloc` in
-/// the jitcode; the oopspec sits on that helper).
-fn libc_raw_alloc_oopspec(
-    target: &CallTarget,
-) -> Option<(majit_ir::descr::OopSpecIndex, majit_ir::descr::ExtraEffect)> {
-    let CallTarget::FunctionPath { segments, .. } = target else {
-        return None;
-    };
-    if !segments.iter().any(|s| s == "libc") {
-        return None;
-    }
-    match segments.last().map(String::as_str) {
-        // jtransform.py:677-681 `_rewrite_raw_malloc` uses `EF_CAN_RAISE`.
-        Some("malloc") => Some((
-            majit_ir::descr::OopSpecIndex::RawMallocVarsizeChar,
-            majit_ir::descr::ExtraEffect::CanRaise,
-        )),
-        Some("free") => Some((
-            majit_ir::descr::OopSpecIndex::RawFree,
-            majit_ir::descr::ExtraEffect::CannotRaise,
-        )),
-        _ => None,
     }
 }
 
@@ -18862,13 +18959,26 @@ mod tests {
     }
 
     /// `handle_write_barrier_setfield` owns the barrier on SETFIELD_GC.
-    /// The explicit hook must not survive as a residual helper.
+    /// The explicit hook must not survive as a residual helper when the
+    /// paired GC `FieldWrite` is in the graph.
     #[test]
     fn gc_write_barrier_call_is_dropped() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("wb_drop");
         let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let stored = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let entry = graph.startblock;
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: obj.clone(),
+                field: FieldDescriptor::new("w_value", Some("W_Foo".to_string())),
+                value: crate::model::LinkArg::Value(stored),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
         let target =
             CallTarget::function_path(["pyre_object", "gc_hook", "try_gc_write_barrier_managed"]);
         let op = SpaceOperation {
@@ -18889,6 +18999,37 @@ mod tests {
         ) {
             RewriteResult::Replace(ops) => assert!(ops.is_empty()),
             _ => panic!("expected empty Replace"),
+        }
+    }
+
+    /// A barrier whose argument has no GC store in the graph stays a
+    /// residual call — dropping it would be a GC hole.
+    #[test]
+    fn gc_write_barrier_without_gc_store_stays_residual() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("wb_keep");
+        let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target =
+            CallTarget::function_path(["pyre_object", "gc_hook", "try_gc_write_barrier_managed"]);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![obj.clone()]),
+                result_ty: ValueType::Bool,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&obj),
+            &ValueType::Bool,
+            "wb_keep",
+            &mut graph,
+        ) {
+            RewriteResult::Keep => {}
+            _ => panic!("expected residual Keep"),
         }
     }
 
@@ -19843,51 +19984,6 @@ mod tests {
             super::map_user_oopspec_to_index("dict.setitem"),
             OopSpecIndex::None
         );
-    }
-
-    /// An inlined `raw_malloc_varsize_char` is a call to `libc::malloc`.
-    /// `_rewrite_raw_malloc` still owes that call `OS_RAW_MALLOC_VARSIZE_CHAR`.
-    #[test]
-    fn libc_malloc_call_lowers_to_raw_malloc_varsize_char() {
-        use crate::call::CallControl;
-        use majit_ir::descr::{ExtraEffect, OopSpecIndex};
-
-        let mut cc = CallControl::new();
-        let mut graph = FunctionGraph::new("raw_malloc_site");
-        let size = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let target = CallTarget::function_path(["libc", "unix", "malloc"]);
-        let entry = graph.startblock;
-        graph.push_op_var(
-            entry,
-            OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![size.clone()]),
-                result_ty: ValueType::Int,
-            },
-            false,
-        );
-        graph.block_mut(entry).operations.last_mut().unwrap().result = Some(result);
-
-        let config = GraphTransformConfig::default();
-        let transformed = Transformer::new(&config)
-            .with_callcontrol(&mut cc)
-            .transform(&graph);
-        let descriptor = transformed
-            .graph
-            .block(entry)
-            .operations
-            .iter()
-            .find_map(|op| match &op.kind {
-                OpKind::CallResidual { descriptor, .. } => Some(descriptor),
-                _ => None,
-            })
-            .expect("expected CallResidual");
-        assert_eq!(
-            descriptor.extra_info.oopspecindex,
-            OopSpecIndex::RawMallocVarsizeChar
-        );
-        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     /// `jtransform.py rewrite_op_cast_ptr_to_int` keeps a GC cast as the
