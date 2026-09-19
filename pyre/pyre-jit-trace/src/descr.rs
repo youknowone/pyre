@@ -3047,30 +3047,6 @@ static W_SLICE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `rvirtualizable.py` appends `('vable_token', llmemory.GCREF)` to the
-/// virtualizable's own fields, so upstream's `gc_fielddescrs` names it and
-/// `clear_gc_fields` zeroes the slot on every `new`.  pyre declares
-/// `PyFrame.vable_token` as a plain `usize` and the positional census below
-/// does not list it, so without this edge a JIT-inlined
-/// `NewWithVtable(pyframe_size_descr())` leaves the slot holding recycled
-/// nursery bytes — which `emit_force_virtualizable`'s `GETFIELD_GC_R` then
-/// reads as a live GC reference (`pyjitpl.py:1148-1158`).
-static PYFRAME_VABLE_TOKEN_FIELD_DESCR: LazyLock<Arc<dyn FieldDescr>> = LazyLock::new(|| {
-    Arc::new(PyreFieldDescr {
-        offset: crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
-        field_size: std::mem::size_of::<usize>(),
-        field_type: Type::Ref,
-        signed: false,
-        immutable: false,
-        quasi_immutable: false,
-        name: "vable_token",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
-});
-
 static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_extra_gc_edges(
         std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>(),
@@ -3200,10 +3176,25 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // `rvirtualizable.py _setup_repr_llfields` appends
+            // `('vable_token', llmemory.GCREF)` to the virtualizable's own
+            // fields. A positional Ref row gives the slot a parent SizeDescr
+            // so `SetfieldGc` can NULL it at the constructor (`rewrite.py
+            // clear_gc_fields`); an extra-edge descr with `parent_descr:
+            // None` cannot, and OptVirtualize refuses that store.
+            (
+                "vable_token",
+                crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "PyFrame",
         "pyframe::PyFrame",
-        std::slice::from_ref(&PYFRAME_VABLE_TOKEN_FIELD_DESCR),
+        &[],
         &[],
         "",
         false,
@@ -6106,6 +6097,17 @@ pub fn pyframe_failed_attr_cleanup_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
 }
 
+/// `rvirtualizable.py` `vable_token` — located by offset so a later
+/// positional append cannot repoint it.
+pub fn pyframe_vable_token_descr() -> DescrRef {
+    let index = PYFRAME_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET)
+        .expect("PyFrame descr group has no vable_token field");
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6635,6 +6637,12 @@ mod tests {
                 .any(|fd| fd.offset() == crate::frame_layout::PYFRAME_VABLE_TOKEN_OFFSET),
             "emit_force_virtualizable reads vable_token with GETFIELD_GC_R, so \
              clear_gc_fields must zero it on a JIT-inlined frame allocation"
+        );
+        let token = pyframe_vable_token_descr();
+        let fd = token.as_field_descr().expect("vable_token FieldDescr");
+        assert!(
+            fd.get_parent_descr().is_some(),
+            "SetfieldGc of vable_token needs a parent SizeDescr"
         );
     }
 

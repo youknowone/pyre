@@ -2547,10 +2547,17 @@ impl BlackholeInterpreter {
     // jitcode parameter; pyre passes them directly so the pyre tracer
     // can reuse the helpers without a JitCode object.
     //
-    // RPython has no `called_residual`. pyre's `guard_may_bridge` uses
-    // that flag to refuse a next-merge-point fallback bridge after the
-    // walk left the interpreter. `bhimpl_inline_call_*` is `cpu.bh_call_*`
-    // of `jitcode.fnaddr`, so it must mark the same way residual does.
+    // RPython has no `called_residual`. pyre's `guard_may_bridge`
+    // (`jitdriver.rs`) refuses a next-merge-point fallback bridge after
+    // the walk left the interpreter. `bhimpl_inline_call_*` is
+    // `cpu.bh_call_*` of `jitcode.fnaddr`, so it must mark the same way
+    // residual does.
+    //
+    // Convergence: `compile.py` `compile_bridge` records from the guard
+    // `resumedescr` (`pyjitpl.py` `handle_guard_failure`). The orthodox
+    // path is `bridge_from_guard_resume_position`. When that path always
+    // succeeds or declines without a next-merge fallback, delete
+    // `called_residual` and `guard_may_bridge`.
 
     /// blackhole.py `bhimpl_inline_call_r_i`
     pub fn bhimpl_inline_call_r_i(
@@ -13560,6 +13567,19 @@ fn interpret_unresolved_inline_call(
             bh.got_exception = true;
             break 'callee Err(DispatchError::LeaveFrame);
         }
+        let dest = match dest {
+            None => {
+                assert!(
+                    callee.return_type == BhReturnType::Void,
+                    "inline_call interpret: callee jitcode {:?} returns {:?} \
+                     but the caller declared no destination",
+                    callee.jitcode.name,
+                    callee.return_type,
+                );
+                None
+            }
+            Some((_, dst)) => Some((return_kind_from_bh(callee.return_type), dst)),
+        };
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(post_p)
     };
@@ -14420,6 +14440,12 @@ fn handler_inline_call_nested_ext(
             break 'callee Err(DispatchError::LeaveFrame);
         }
 
+        assert!(
+            dest.is_none() == (callee.return_type == BhReturnType::Void),
+            "inline_call: void callee <=> no dest (callee {:?} return_type={:?} dest={dest:?})",
+            callee.jitcode.name,
+            callee.return_type,
+        );
         let dest = dest.map(|dst| (return_kind_from_bh(callee.return_type), dst));
         copy_inline_callee_tmpreg(bh, &mut callee, dest);
         Ok(p)

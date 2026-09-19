@@ -5122,7 +5122,7 @@ impl FailDescr for ResumeGuardCopiedDescr {
     /// copied descr, so it is written only on the donor.  Read through to the
     /// donor when no backend has written one, the same way `fail_arg_types`,
     /// `rd_numb` and `rd_consts` chase `get_resumestorage(): return prev`
-    /// (`compile.py:847-850`).  Without it the hole mask is empty on every
+    /// (`compile.py`).  Without it the hole mask is empty on every
     /// backend that keeps failargs in their logical slots, and both consumers
     /// silently take their unmasked branch.
     fn rd_locs(&self) -> &[u16] {
@@ -5602,8 +5602,8 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
 /// `compile.py AbstractResumeGuardDescr.get_resumestorage`: the descr that
 /// actually holds this guard's resume data.
 ///
-/// `ResumeGuardDescr.get_resumestorage` returns self (compile.py:883-884);
-/// `ResumeGuardCopiedDescr`'s returns `prev` (compile.py:848-851), the donor
+/// `ResumeGuardDescr.get_resumestorage` returns self (compile.py);
+/// `ResumeGuardCopiedDescr`'s returns `prev` (compile.py), the donor
 /// guard whose resume data it shares. The distinction is load-bearing wherever
 /// upstream tests the *storage* rather than the guard: `handle_guard_failure`
 /// takes `key = resumedescr.get_resumestorage()` and arms
@@ -6115,10 +6115,12 @@ impl TraceCtx {
     /// `mp.green_key == key` test here — the `same_greenkey` semantics
     /// survive the collapse.
     ///
-    /// `pyjitpl.py` `assert len(original_boxes) == len(live_arg_boxes)`
-    /// holds because the list only grows at a header visit. A
-    /// constructor seed used to mix the recorder inputargs into that
-    /// list; `TraceCtx::new` no longer seeds.
+    /// `pyjitpl.py` `assert len(original_boxes) == len(live_arg_boxes)`.
+    /// Primary traces seed the start boxes via
+    /// [`Self::seed_compile_and_run_once_merge_point`]
+    /// (`pyjitpl.py` `_compile_and_run_once` `current_merge_points = [(original_boxes, start)]`);
+    /// later header visits append the same jitdriver red+vable shape.
+    /// `TraceCtx::new` does not seed; bridges stay empty.
     pub fn has_merge_point_with_shape_assert(&self, key: u64, live_args_len: usize) -> bool {
         self.has_merge_point_same_greenkey(key, None, live_args_len)
     }
@@ -6141,21 +6143,14 @@ impl TraceCtx {
         //       if same_greenkey(...):
         //           ...
         for mp in self.current_merge_points.iter().rev() {
-            // pyjitpl.py `reached_loop_header`:
-            // `assert len(original_boxes) == len(live_arg_boxes)`.
-            // The list is only appended at a header visit, so every
-            // entry shares this jitdriver's red-bank shape. A leftover
-            // constructor seed used to sit here with the recorder
-            // inputargs and forced a length filter instead.
-            if mp.green_boxes.len() != live_args_len {
-                debug_assert_eq!(
-                    mp.green_boxes.len(),
-                    live_args_len,
-                    "same_greenkey: merge points in one trace share the jitdriver shape"
-                );
-                crate::mc_diag_bump(54);
-                continue;
-            }
+            // pyjitpl.py `assert len(original_boxes) == len(live_arg_boxes)`.
+            // Seed and every later header visit push the same red+vable
+            // length as the header's live args.
+            assert_eq!(
+                mp.green_boxes.len(),
+                live_args_len,
+                "same_greenkey: merge points in one trace share the jitdriver shape"
+            );
             let greens_match = match (mp.green_key_typed.as_ref(), live_typed) {
                 (Some(stored), Some(live)) => stored == live,
                 _ => mp.green_key == key,
