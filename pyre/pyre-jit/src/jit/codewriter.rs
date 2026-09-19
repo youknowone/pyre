@@ -16059,6 +16059,18 @@ fn backward_jump_is_handler_only_target(
 /// in the interpreter.
 pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
     let writer = CodeWriter::instance();
+    let code_ptr = code as *const pyre_interpreter::CodeObject;
+    // `call.py get_jitcode` / `self.jitcodes[graph]` after the one
+    // `codewriter.py make_jitcodes` drain. RPython runs that drain once at
+    // warmspot; a later `compile_and_run_once` of the same portal only looks
+    // the populated entry up.
+    if writer
+        .callcontrol()
+        .find_compiled_jitcode_arc(code_ptr)
+        .is_some()
+    {
+        return true;
+    }
     // codewriter.py `setup_jitdriver(jd)` — register the
     // portal so `grab_initial_jitcodes` finds it.
     writer.setup_jitdriver(super::call::JitDriverStaticData {
