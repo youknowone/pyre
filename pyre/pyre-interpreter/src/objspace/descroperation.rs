@@ -4254,13 +4254,11 @@ unsafe fn same_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// `user_overridden_class` is a class attribute on `W_Root` (False).
 /// After `type(w1) is type(w2)` the JIT has `guard_class`; the
 /// attribute is then a constant.  A pyre user subclass keeps the
-/// builtin `ob_type` and only retags `w_class` — that instance check
-/// is a separate residual (`user_overridden_class`) whose getfield
-/// encoding has been answering `true` for exact ints, so it cannot
-/// sit on this jitcode.  Own body is only the two live typeptrs.
+/// builtin `ob_type` and only retags `w_class`, so the class-attribute
+/// read is that instance check.
 #[inline(never)]
 unsafe fn same_unoverridden_rpy_type(a: PyObjectRef, b: PyObjectRef) -> bool {
-    same_rpy_type(a, b)
+    same_rpy_type(a, b) && !user_overridden_class(a)
 }
 
 /// Residual: `shortcut_binop` slot on the live typeptr.  STR/list types
