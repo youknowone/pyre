@@ -103,13 +103,29 @@ const fn block_items_offset(align: usize) -> usize {
     word.div_ceil(align) * align
 }
 
+mod sealed {
+    /// Sealed: only this module may name a `[..; virt]` backing.
+    pub trait PointerShaped {}
+}
+
 /// A container a `[..; virt]` state field may be declared with.
 ///
 /// The interpreter author picks the backing by choosing the field's Rust type;
 /// this trait is how the generated `VirtualizableInfo` builder and the
 /// fresh-entry state constructor stay written once. Every read and write of
 /// the elements goes through the slice the container derefs to.
-pub trait VirtArrayBacking: std::ops::DerefMut<Target = [Self::Item]> {
+///
+/// Sealed, because `LENGTH_OFFSET` and `ITEMS_OFFSET` are offsets from the
+/// FIELD'S OWN WORD: the state field is registered as a direct pointer, and
+/// the compiled entry and the blackhole both dereference that word to reach
+/// the block. A backing that kept anything else there -- a length inline
+/// ahead of its data, say -- would satisfy this trait's methods and still
+/// hand those paths a number to dereference. Upstream has the one shape too
+/// (`Ptr(GcArray)`), so a second backing belongs here, beside the paths that
+/// read it, rather than downstream.
+pub trait VirtArrayBacking:
+    sealed::PointerShaped + std::ops::DerefMut<Target = [Self::Item]>
+{
     /// Element type. Restricted to `Copy` so a block is released by freeing it,
     /// with no element drop glue to run.
     type Item: Copy;
@@ -348,6 +364,8 @@ impl<T: Copy> FromIterator<T> for VirtArray<T> {
         Self::from_slice(&items)
     }
 }
+
+impl<T: Copy> sealed::PointerShaped for VirtArray<T> {}
 
 impl<T: Copy> VirtArrayBacking for VirtArray<T> {
     type Item = T;
