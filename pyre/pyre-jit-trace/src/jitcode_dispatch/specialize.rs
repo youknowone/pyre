@@ -17018,7 +17018,11 @@ pub(crate) fn try_walker_specialize_str_prefix_match<Sym: WalkSym>(
             return Ok(None);
         }
         let str_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::STR_TYPE);
-        if pyre_interpreter::lookup_in_type(str_type, name) != Some(inner_func) {
+        if pyre_interpreter::lookup_in_type(
+            str_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        ) != Some(inner_func)
+        {
             return Ok(None);
         }
         (inner_func, inner_self)
@@ -17623,7 +17627,11 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
             return Ok(None);
         }
         let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
-        if pyre_interpreter::lookup_in_type(list_type, "append") != Some(inner_func) {
+        if pyre_interpreter::lookup_in_type(
+            list_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("append")),
+        ) != Some(inner_func)
+        {
             return Ok(None);
         }
         let Some(len_before) = orthodox_list_append_recognize(inner_self, value) else {
@@ -17792,7 +17800,11 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
             return Ok(None);
         }
         let set_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE);
-        if pyre_interpreter::lookup_in_type(set_type, "add") != Some(inner_func) {
+        if pyre_interpreter::lookup_in_type(
+            set_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("add")),
+        ) != Some(inner_func)
+        {
             return Ok(None);
         }
         inner_func
@@ -18520,7 +18532,11 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
             return Ok(None);
         }
         let list_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
-        if pyre_interpreter::lookup_in_type(list_type, "pop") != Some(inner_func) {
+        if pyre_interpreter::lookup_in_type(
+            list_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("pop")),
+        ) != Some(inner_func)
+        {
             return Ok(None);
         }
         let Some((len_before, popped)) = orthodox_list_pop_recognize(inner_self) else {
@@ -18992,12 +19008,18 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             return Ok(None);
         }
         let Some(class_new) = (unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(concrete_callable, "__new__")
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                concrete_callable,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
         }) else {
             return Ok(None);
         };
         let Some(class_init) = (unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(concrete_callable, "__init__")
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                concrete_callable,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
         }) else {
             return Ok(None);
         };
@@ -19012,10 +19034,14 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
                 return false;
             }
             unsafe {
-                pyre_interpreter::baseobjspace::lookup_in_type(candidate, "__new__")
-                    == Some(class_new)
-                    && pyre_interpreter::baseobjspace::lookup_in_type(candidate, "__init__")
-                        == Some(class_init)
+                pyre_interpreter::baseobjspace::lookup_in_type(
+                    candidate,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+                ) == Some(class_new)
+                    && pyre_interpreter::baseobjspace::lookup_in_type(
+                        candidate,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                    ) == Some(class_init)
             }
         });
         if !matches_canonical {
@@ -19053,10 +19079,14 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         };
         if canonical_class.is_null()
             || unsafe {
-                pyre_interpreter::baseobjspace::lookup_in_type(canonical_class, "__new__")
-                    != Some(class_new)
-                    || pyre_interpreter::baseobjspace::lookup_in_type(canonical_class, "__init__")
-                        != Some(class_init)
+                pyre_interpreter::baseobjspace::lookup_in_type(
+                    canonical_class,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+                ) != Some(class_new)
+                    || pyre_interpreter::baseobjspace::lookup_in_type(
+                        canonical_class,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                    ) != Some(class_init)
             }
         {
             return Ok(None);
@@ -19980,7 +20010,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     }
 
     // The raise decision also reads the metaclass-MRO descriptor state — the
-    // branch-F `lookup_in_type_where(type, name)` walk and the forwarding
+    // branch-F `lookup_in_type_where(type, pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)))` walk and the forwarding
     // `type.__setattr__` / `type.__delattr__` — which the receiver
     // `GuardValue` below does not cover.  A `version_tag` guard on the
     // metaclass pins that state (the guard the sibling method/attr folds

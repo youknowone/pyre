@@ -3440,9 +3440,10 @@ unsafe fn try_compare_override(
     };
     let rdunder = reverse_dunder(dunder).unwrap_or(dunder);
     let comparison_method = |obj: PyObjectRef, name: &str| {
+        let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
         if is_instance(obj) {
             let w_type = crate::typedef::r#type(obj)?;
-            let method = lookup_in_type_where(w_type.as_ptr(), name)?;
+            let method = lookup_in_type_where(w_type.as_ptr(), w_name)?;
             Some((method, w_type.as_ptr()))
         } else {
             crate::baseobjspace::subclass_special_override(obj, name)
@@ -3576,9 +3577,12 @@ unsafe fn try_lookup_unaryop(a: PyObjectRef, dunder: &str) -> Result<Option<PyOb
 /// `str`/`list`/`tuple` install `__add__`/`__radd__` on their own type;
 /// an inherited (non-overridden) lookup resolves back to `tp`.
 unsafe fn dunder_overridden(obj: PyObjectRef, dunder: &str, tp: PyObjectRef) -> bool {
-    match crate::typedef::r#type(obj)
-        .and_then(|t| lookup_where_with_method_cache(t.as_ptr(), dunder))
-    {
+    match crate::typedef::r#type(obj).and_then(|t| {
+        lookup_where_with_method_cache(
+            t.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(dunder)),
+        )
+    }) {
         Some((src, _)) => !std::ptr::eq(src, tp),
         None => false,
     }
@@ -3737,6 +3741,14 @@ impl UnaryDunder {
             Self::Pos => "__pos__",
             Self::Neg => "__neg__",
             Self::Invert => "__invert__",
+        }
+    }
+
+    fn interned_w_name(self) -> PyObjectRef {
+        match self {
+            Self::Pos => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pos__")),
+            Self::Neg => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__neg__")),
+            Self::Invert => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__invert__")),
         }
     }
 }
@@ -4127,7 +4139,7 @@ unsafe fn try_numeric_unaryop_override(
     let Some(t) = crate::typedef::r#type(a) else {
         return Ok(None);
     };
-    let Some(method) = lookup_in_type_where(t.as_ptr(), op.name()) else {
+    let Some(method) = lookup_in_type_where(t.as_ptr(), op.interned_w_name()) else {
         return Ok(None);
     };
     Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
@@ -4148,7 +4160,10 @@ unsafe fn try_reflected_binary_special(
     let roots = pyre_object::gc_roots::push_roots();
     let operands = roots.publish(&[*lhs, *rhs]);
     let operand = |index| roots.get(operands + index);
-    let result = if let Some(method) = lookup_type_special(operand(1), rdunder) {
+    let result = if let Some(method) = lookup_type_special(
+        operand(1),
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(rdunder)),
+    ) {
         let method_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(method);
         try_call_special(roots.get(method_slot), &[operand(1), operand(0)])?
@@ -4762,11 +4777,17 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
         let dispatched = match (a_seq, b_seq) {
             (true, true) => None,
-            (true, false) => match lookup_type_special(b, "__rmul__") {
+            (true, false) => match lookup_type_special(
+                b,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmul__")),
+            ) {
                 Some(method) => try_call_special(method, &[b, a])?,
                 None => None,
             },
-            (false, true) => match lookup_type_special(a, "__mul__") {
+            (false, true) => match lookup_type_special(
+                a,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__")),
+            ) {
                 Some(method) => try_call_special(method, &[a, b])?,
                 None => None,
             },
@@ -5293,8 +5314,11 @@ pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // reflected operand.
 
 /// `space.lookup(w_obj, dunder)` — descroperation.py.
-pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Option<PyObjectRef> {
-    crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), dunder))
+pub(crate) unsafe fn lookup_type_special(
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+) -> Option<PyObjectRef> {
+    crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), w_name))
 }
 
 /// Residual 3-word call: `get_and_call_function` takes a slice, which
@@ -5484,13 +5508,18 @@ fn try_dispatch_ternary_pow_special(
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[*base, *exp, *modulus]);
         let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
-        let (w_base_src, w_base_impl) =
-            match lookup_where_with_method_cache(w_base_type.as_ptr(), "__pow__") {
-                Some((src, imp)) => (Some(src), Some(imp)),
-                None => (None, None),
-            };
+        let (w_base_src, w_base_impl) = match lookup_where_with_method_cache(
+            w_base_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__")),
+        ) {
+            Some((src, imp)) => (Some(src), Some(imp)),
+            None => (None, None),
+        };
         let (w_exp_src, w_exp_impl) = if w_base_type != w_exp_type {
-            match lookup_where_with_method_cache(w_exp_type.as_ptr(), "__rpow__") {
+            match lookup_where_with_method_cache(
+                w_exp_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rpow__")),
+            ) {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             }
@@ -5571,7 +5600,12 @@ pub(crate) fn try_inplace_special(
         return Ok(None);
     }
     // descroperation.py:826 — only when the lhs in-place method exists.
-    if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
+    if let Some(method) = unsafe {
+        lookup_type_special(
+            lhs,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(idunder)),
+        )
+    } {
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
         // lhs is a builtin sequence and the rhs is not, try the rhs
         // reflected method before the lhs in-place method.
@@ -5582,7 +5616,12 @@ pub(crate) fn try_inplace_special(
             && crate::baseobjspace::flag_sequence_bug_compat(lhs_type.as_ptr())
             && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type.as_ptr())
         {
-            unsafe { lookup_type_special(rhs, rd) }
+            unsafe {
+                lookup_type_special(
+                    rhs,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new(rd)),
+                )
+            }
         } else {
             None
         };
@@ -6776,14 +6815,8 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
                 _ => unreachable!(),
             }));
         }
-        let dunder = match op {
-            CompareOp::Lt => "__lt__",
-            CompareOp::Le => "__le__",
-            CompareOp::Gt => "__gt__",
-            CompareOp::Ge => "__ge__",
-            CompareOp::Eq => "__eq__",
-            CompareOp::Ne => "__ne__",
-        };
+        let w_dunder = op.interned_w_name();
+        let w_rdunder = op.interned_rw_name();
         // `SetLikeDictView` operands expose comparison dunders through the
         // typedef. Instance-shaped operands were already handled by
         // `try_compare_override`, so only non-instance operands dispatch here.
@@ -6793,7 +6826,7 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         // path is the one that succeeds for `set == d.keys()`.
         if !is_instance(a)
             && let Some(a_type) = crate::typedef::r#type(a)
-            && let Some(method) = lookup_in_type_where(a_type.as_ptr(), dunder)
+            && let Some(method) = lookup_in_type_where(a_type.as_ptr(), w_dunder)
         {
             // A raised exception (not NotImplemented) propagates; only
             // NotImplemented falls through to the reflected comparison.
@@ -6803,9 +6836,9 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
             }
         }
         if !is_instance(b)
-            && let Some(rdunder) = reverse_dunder(dunder)
+            && !matches!(op, CompareOp::Eq | CompareOp::Ne)
             && let Some(b_type) = crate::typedef::r#type(b)
-            && let Some(method) = lookup_in_type_where(b_type.as_ptr(), rdunder)
+            && let Some(method) = lookup_in_type_where(b_type.as_ptr(), w_rdunder)
         {
             let result = crate::call::call_function_impl_result(method, &[b, a])?;
             if !is_not_implemented(result) {
@@ -6908,6 +6941,28 @@ impl CompareOp {
             CompareOp::Ge => ">=",
             CompareOp::Eq => "==",
             CompareOp::Ne => "!=",
+        }
+    }
+
+    fn interned_w_name(self) -> PyObjectRef {
+        match self {
+            CompareOp::Lt => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__lt__")),
+            CompareOp::Le => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__le__")),
+            CompareOp::Gt => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__gt__")),
+            CompareOp::Ge => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__ge__")),
+            CompareOp::Eq => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__eq__")),
+            CompareOp::Ne => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__ne__")),
+        }
+    }
+
+    fn interned_rw_name(self) -> PyObjectRef {
+        match self {
+            CompareOp::Lt => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__gt__")),
+            CompareOp::Le => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__ge__")),
+            CompareOp::Gt => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__lt__")),
+            CompareOp::Ge => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__le__")),
+            CompareOp::Eq => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__eq__")),
+            CompareOp::Ne => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__ne__")),
         }
     }
 }

@@ -1772,7 +1772,12 @@ pub unsafe fn load_attr_fast_path(
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
     // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
@@ -1861,12 +1866,23 @@ pub unsafe fn class_attr_fast_path(
     } {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    }?;
     if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
         return None;
     }
     let value_type = crate::typedef::r#type(w_descr)?.as_ptr();
-    if unsafe { crate::baseobjspace::lookup_in_type(value_type, "__get__") }.is_some()
+    if unsafe {
+        crate::baseobjspace::lookup_in_type(
+            value_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
+        )
+    }
+    .is_some()
         || unsafe { pyre_object::w_type_is_heaptype(value_type) }
     {
         return None;
@@ -1954,7 +1970,12 @@ pub unsafe fn getattr_hook_fast_path(
     name: &str,
 ) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef, PyObjectRef)> {
     let (w_type, version_tag, map) = unsafe { getattr_resolves_nowhere(w_obj, name) }?;
-    let w_getattr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }?;
+    let w_getattr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
+        )
+    }?;
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
     // cell is what `write_cell` updates; the caller getfields its payload.
     let cell = unsafe {
@@ -2002,7 +2023,14 @@ pub unsafe fn getattribute_hook_fast_path(
         return None;
     }
     let w_getattribute = unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }?;
-    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some() {
+    if unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
+        )
+    }
+    .is_some()
+    {
         return None;
     }
     // An in-place `ObjectMutableCell` write does not move `version_tag`.  The
@@ -2035,7 +2063,14 @@ pub unsafe fn getattr_absent_fast_path(
     // A hook would run application code whose answer neither pin describes,
     // and which can return a value or raise something other than
     // AttributeError.
-    if unsafe { crate::baseobjspace::lookup_in_type_where(pins.0, "__getattr__") }.is_some() {
+    if unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            pins.0,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
+        )
+    }
+    .is_some()
+    {
         return None;
     }
     Some(pins)
@@ -2076,7 +2111,14 @@ unsafe fn getattr_resolves_nowhere(
     // `classify_attr` reads a `__slots__` member under the `"slot"` name rather
     // than its own, so a descriptor found here says nothing about what
     // `find_map_attr(name)` below would answer.
-    if unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }.is_some() {
+    if unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    }
+    .is_some()
+    {
         return None;
     }
     // A devolved instance keeps its attributes in a real dictionary, and
@@ -2158,7 +2200,12 @@ pub unsafe fn instance_dict_attr_fast_path(
         return None;
     }
     // mapdict.py:1504-1526 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
     if attrkind != DICT || is_slot {
         return None;
@@ -2330,7 +2377,13 @@ pub unsafe fn data_descriptor_get_fast_path(
     let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null()
         || unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some()
-        || unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some()
+        || unsafe {
+            crate::baseobjspace::lookup_in_type_where(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getattr__")),
+            )
+        }
+        .is_some()
     {
         return None;
     }
@@ -2343,7 +2396,12 @@ pub unsafe fn data_descriptor_get_fast_path(
     } {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    }?;
     if !unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
         return None;
     }
@@ -2361,7 +2419,12 @@ pub unsafe fn data_descriptor_get_fast_path(
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
         return None;
     }
-    let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
+    let w_get = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            descr_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__get__")),
+        )
+    }?;
     Some((
         w_type,
         version_tag,
@@ -2436,7 +2499,12 @@ pub unsafe fn load_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1504-1524 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, false) };
     // mapdict.py `if attrkind != INVALID:`.
     if attrkind == INVALID {
@@ -2518,7 +2586,12 @@ pub unsafe fn store_attr_unboxed_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
     if attrkind == INVALID {
         return None;
@@ -2588,7 +2661,12 @@ pub unsafe fn store_attr_boxed_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
     if attrkind == INVALID {
         return None;
@@ -2704,7 +2782,12 @@ pub unsafe fn store_attr_add_fast_path(
         return None;
     }
     // mapdict.py:1618-1627 `_pure_lookup_where_with_method_cache` + classify.
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) };
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    };
     let (attrkind, is_slot) = unsafe { classify_attr(w_type, w_descr, true) };
     if attrkind == INVALID {
         return None;

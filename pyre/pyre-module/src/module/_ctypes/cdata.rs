@@ -15,6 +15,7 @@ use super::stginfo::ParamFunc;
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
+use rustpython_wtf8::Wtf8;
 use std::sync::OnceLock;
 
 /// Reserved instance-dict key holding the backing `bytearray` (root storage,
@@ -748,8 +749,13 @@ pub(super) fn new_simplecdata_obj(
         let v_slot = pyre_object::gc_roots::shadow_stack_len();
         let v = pyre_object::gc_roots::pin_root(v);
         let mut bytes = encode_value_into(tc, v, obj, "0")?;
-        if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }
-            .is_some()
+        if unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                cls,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+            )
+        }
+        .is_some()
         {
             bytes.reverse();
         }
@@ -820,8 +826,13 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     if tc == "O" {
         return Ok(decode_slot(&tc, bytes));
     }
-    let swapped =
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
+    let swapped = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+        )
+    }
+    .is_some();
     let owned;
     if swapped {
         owned = bytes.iter().rev().copied().collect::<Vec<_>>();
@@ -849,7 +860,14 @@ fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_int
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let value = pyre_object::gc_roots::pin_root(value);
     let mut bytes = encode_value_into(&tc, value, obj, "0")?;
-    if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some() {
+    if unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+        )
+    }
+    .is_some()
+    {
         bytes.reverse();
     }
     // `BSTR_set` frees what the slot held only once the new string exists, so
@@ -1067,8 +1085,13 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
                 return "B".to_string();
             };
             let big = forced_big.unwrap_or_else(|| {
-                unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }
-                    .is_some()
+                unsafe {
+                    pyre_interpreter::baseobjspace::lookup_in_type(
+                        cls,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("_swappedbytes_")),
+                    )
+                }
+                .is_some()
                     ^ cfg!(target_endian = "big")
             });
             format!(
@@ -1082,8 +1105,12 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
 
 fn struct_pep3118_format(cls: PyObjectRef) -> String {
     let big = super::stginfo::stginfo_of(cls).is_some_and(super::stginfo::stginfo_big_endian);
-    let Some(fields) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_fields_") })
-    else {
+    let Some(fields) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_fields_")),
+        )
+    }) else {
         return "B".to_string();
     };
     let items = if unsafe { pyre_object::is_tuple(fields) } {
@@ -1112,8 +1139,12 @@ fn struct_pep3118_format(cls: PyObjectRef) -> String {
         let Ok(name) = pyre_interpreter::baseobjspace::str_utf8_w(name_obj) else {
             continue;
         };
-        let Some(descr) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) })
-        else {
+        let Some(descr) = (unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type(
+                cls,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+            )
+        }) else {
             continue;
         };
         let dd = pyre_interpreter::baseobjspace::getdict_native(descr);
@@ -1713,7 +1744,12 @@ pub(super) fn declared_type_str(cls: PyObjectRef) -> Option<&'static str> {
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return None;
     }
-    let v = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_type_") }?;
+    let v = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            cls,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("_type_")),
+        )
+    }?;
     if !unsafe { pyre_object::is_str(v) } {
         return None;
     }
