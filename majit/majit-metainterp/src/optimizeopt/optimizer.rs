@@ -433,6 +433,11 @@ pub struct Optimizer {
     pub terminal_op: Option<Op>,
     /// Preserved final context after optimization, for jump_to_existing_trace.
     pub final_ctx: Option<OptContext>,
+    /// Recycled `OptContext` maps from the previous compile. Taken at the
+    /// start of the next `optimize_with_constants_and_inputs_at` so
+    /// `resop_refs` / `new_operations` / `emitted_operations` keep their
+    /// capacity (`optimizer.py Optimizer.__init__` builds those maps once).
+    recycled_ctx: Option<Box<OptContext>>,
     /// RPython Box identity: generation epoch for Phase 2 ops.
     /// Phase 1 JUMP arg OpRef indices to pre-tag as gen=0.
     /// bridgeopt.py:124-185: pending bridge resume data for deserialization
@@ -1538,6 +1543,7 @@ impl Optimizer {
             skip_flush: false,
             terminal_op: None,
             final_ctx: None,
+            recycled_ctx: None,
             pending_bridge_rd: None,
             building_bridge: false,
             bridge_vm_red: None,
@@ -1593,7 +1599,9 @@ impl Optimizer {
         self.patchguardop = None;
         self.skip_flush = false;
         self.terminal_op = None;
-        self.final_ctx = None;
+        if let Some(ctx) = self.final_ctx.take() {
+            self.stash_recycled_ctx(ctx);
+        }
         self.pending_bridge_rd = None;
         self.building_bridge = false;
         self.simple_compile = false;
@@ -1613,6 +1621,30 @@ impl Optimizer {
         for pass in &mut self.passes {
             pass.reset_between_compiles();
         }
+    }
+
+    fn stash_recycled_ctx(&mut self, mut ctx: OptContext) {
+        ctx.reset_keep_capacity(0, 0, 0, 0);
+        self.recycled_ctx = Some(Box::new(ctx));
+    }
+
+    fn take_opt_context(
+        &mut self,
+        estimated_ops: usize,
+        num_inputs: usize,
+        inputarg_base: u32,
+        start_next_pos: u32,
+    ) -> OptContext {
+        if let Some(mut ctx) = self.recycled_ctx.take() {
+            ctx.reset_keep_capacity(estimated_ops, num_inputs, inputarg_base, start_next_pos);
+            return *ctx;
+        }
+        OptContext::with_num_inputs_and_start_pos(
+            estimated_ops,
+            num_inputs,
+            inputarg_base,
+            start_next_pos,
+        )
     }
 
     /// Record a CALL_PURE result for cross-iteration constant folding.
@@ -2570,12 +2602,7 @@ impl Optimizer {
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
         self.last_guard_op_idx = None;
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(
-            ops.len(),
-            num_inputs,
-            inputarg_base,
-            start_next_pos,
-        );
+        let mut ctx = self.take_opt_context(ops.len(), num_inputs, inputarg_base, start_next_pos);
         ctx.skip_flush_mode = self.skip_flush;
         ctx.building_bridge = self.building_bridge;
         ctx.bridge_vm_red = self.bridge_vm_red;
@@ -4505,12 +4532,14 @@ impl Optimizer {
                     OptContext::with_inputarg_types(32, &types)
                 });
                 ctx.bridge_vm_red = self.bridge_vm_red;
-                return self.jump_to_preamble(
+                let result = self.jump_to_preamble(
                     &terminal_jump,
                     front_target_tokens,
                     optimized_ops,
                     &mut ctx,
                 );
+                self.final_ctx = Some(ctx);
+                return result;
             }
             return Ok((optimized_ops, false));
         }
@@ -4603,15 +4632,18 @@ impl Optimizer {
             // RPython: self.jump_to_preamble → send_extra_operation
             Err(_) => {
                 if !front_target_tokens.is_empty() {
-                    return self.jump_to_preamble(
+                    let result = self.jump_to_preamble(
                         &terminal_jump,
                         front_target_tokens,
                         optimized_ops,
                         &mut ctx,
                     );
+                    self.final_ctx = Some(ctx);
+                    return result;
                 }
                 let mut result = optimized_ops;
                 result.append(&mut ctx.new_operations);
+                self.final_ctx = Some(ctx);
                 return Ok((result, false));
             }
         };
@@ -4620,6 +4652,7 @@ impl Optimizer {
         if vs.is_none() {
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
+            self.final_ctx = Some(ctx);
             return Ok((result, false));
         }
 
@@ -4685,6 +4718,7 @@ impl Optimizer {
             result.append(&mut ctx.new_operations);
             // unroll.py `_clean_optimization_info(self._newoperations)`
             Self::clean_optimization_info(&result);
+            self.final_ctx = Some(ctx);
             return Ok((result, true));
         }
 
@@ -4714,6 +4748,7 @@ impl Optimizer {
         if vs2.is_none() {
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
+            self.final_ctx = Some(ctx);
             return Ok((result, false));
         }
 
@@ -4726,13 +4761,15 @@ impl Optimizer {
                 retraced_count, retrace_limit,
             );
         }
-        if !front_target_tokens.is_empty() {
+        let result = if !front_target_tokens.is_empty() {
             self.jump_to_preamble(&terminal_jump, front_target_tokens, optimized_ops, &mut ctx)
         } else {
             let mut result = optimized_ops;
             result.append(&mut ctx.new_operations);
             Ok((result, false))
-        }
+        };
+        self.final_ctx = Some(ctx);
+        result
     }
 
     /// unroll.py `UnrollOptimizer.jump_to_preamble`:

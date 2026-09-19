@@ -3688,7 +3688,7 @@ impl Optimization for OptHeap {
         self.cached_arrayitems.clear();
         self.seen_guard_not_invalidated = false;
         self.postponed_op = None;
-        self.seen_allocation = BitSet::new();
+        self.seen_allocation.make_empty();
         self.unescaped.clear();
         self.heapc_deps.clear();
         self.last_emitted_removed = false;

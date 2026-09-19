@@ -120,6 +120,13 @@ impl RecentPureOps {
         }
     }
 
+    fn clear(&mut self) {
+        for slot in &mut self.lst {
+            *slot = None;
+        }
+        self.next_index = 0;
+    }
+
     /// pure.py lookup(self, optimizer, op, commutative=False).
     ///
     /// Dispatches to `lookup1` / `lookup2` by arg count; any other
@@ -389,6 +396,17 @@ impl RecentPureOpTable {
 
     fn history_length(&self) -> usize {
         self.history_length
+    }
+
+    /// Drop ring entries, keep the bucket `Vec` and each ring's allocation.
+    /// `pure.py OptPure.__init__` builds `_pure_operations` once; `setup`
+    /// does not reallocate it.
+    fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            if let Some(ops) = bucket {
+                ops.clear();
+            }
+        }
     }
 }
 
@@ -1316,8 +1334,7 @@ impl Optimization for OptPure {
     }
 
     fn setup(&mut self) {
-        let limit = self.cache.history_length();
-        self.cache = RecentPureOpTable::new(limit);
+        self.cache.clear();
         self.postponed_op = None;
         self.postponed_box = None;
         self.call_pure_positions.clear();
