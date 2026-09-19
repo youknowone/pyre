@@ -4368,11 +4368,16 @@ fn type_call_vectorcall(
 /// `gateway.py Signature` on a type slot — keyword-capable when it has
 /// `**kwargs`, kw-only names, or positional-or-keyword slots.  A
 /// positional-only builtin keeps a null Signature.
+///
+/// `__init__` is retagged as `wrapper_descriptor` (`is_slot_wrapper`),
+/// which reuses the Function/BuiltinCode payload but is not
+/// `is_builtin_code`'s `is_function` set.  Read the carrier, not the
+/// public class.
 fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
     let Some(func) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }) else {
         return false;
     };
-    if !crate::function::is_builtin_code(func) {
+    if !unsafe { crate::function::is_function_carrier(func) } {
         return false;
     }
     let code = unsafe { crate::getcode(func) };
@@ -4390,21 +4395,11 @@ fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
 }
 
 /// `descr_call` forwards `__args__` to `__new__` and then `__init__`.
-/// `select.kevent` only declares `__init__`; its `__new__` is
-/// `object.__new__`, so keywords belong to the initializer.
+/// `#[pyre_methods]` synthesizes a raw-args `__new__` (null Signature)
+/// when the impl only wrote `__init__`, and that `__init__` is a slot
+/// wrapper, so keywords belong to the initializer.
 fn type_new_accepts_keywords(w_type: PyObjectRef) -> bool {
-    if type_slot_accepts_keywords(w_type, "__new__") {
-        return true;
-    }
-    let object = crate::typedef::w_object();
-    let type_new = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") };
-    let object_new = unsafe { crate::baseobjspace::lookup_in_type(object, "__new__") };
-    let inherits_object_new = match (type_new, object_new) {
-        (Some(a), Some(b)) => std::ptr::eq(a, b),
-        (None, _) => true,
-        _ => false,
-    };
-    inherits_object_new && type_slot_accepts_keywords(w_type, "__init__")
+    type_slot_accepts_keywords(w_type, "__new__") || type_slot_accepts_keywords(w_type, "__init__")
 }
 
 /// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
