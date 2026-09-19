@@ -403,7 +403,7 @@ fn alloc_set_object(set_type: &'static PyType) -> PyObjectRef {
             w_class: crate::gc_roots::shadow_stack_get(class_slot),
         },
         items,
-        len: AtomicUsize::new(0),
+        len: crate::object_array::length_cell(0),
         hash: -1,
     };
     if !raw.is_null() {

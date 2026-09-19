@@ -239,6 +239,7 @@ impl crate::lltype::GcType for W_UnicodeObject {
 }
 
 impl crate::lltype::GcType for W_UnicodeObjectUser {
+    #[inline(always)]
     fn type_id() -> u32 {
         W_UNICODE_USER_GC_TYPE_ID
     }
@@ -1317,9 +1318,13 @@ pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodeP
         }
         let value = utf8_payload_wtf8((*(obj as *const W_UnicodeObject)).value);
         if w_str_is_ascii(obj) {
-            return value
-                .get(index..index + 1)
-                .and_then(|one| one.code_points().next());
+            // `unicodeobject.py` `_index_to_byte` on ASCII: the code-point
+            // index is the byte offset. Read that byte; do not `slice::get`
+            // a one-byte window and walk `code_points()`.
+            let bytes = value.as_bytes();
+            return Some(CodePoint::from_u32_unchecked(
+                *bytes.as_ptr().add(index) as u32
+            ));
         }
         let storage = w_str_get_index_storage(obj);
         Some(CodePoint::from_u32_unchecked(
@@ -1376,13 +1381,9 @@ pub extern "C" fn jit_str_compare(a: i64, b: i64) -> i64 {
     unsafe {
         // WTF-8 byte order matches code point order, so the byte
         // comparison yields the same result as comparing code points.
-        let sa = w_str_get_wtf8(a);
-        let sb = w_str_get_wtf8(b);
-        match sa.as_bytes().cmp(sb.as_bytes()) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }
+        let sa = w_str_get_wtf8(a).as_bytes();
+        let sb = w_str_get_wtf8(b).as_bytes();
+        crate::object_array::ll_chars_strcmp(sa, sb) as i64
     }
 }
 
@@ -2083,7 +2084,9 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_value(cat), "abcd");
             assert_eq!(w_str_get_value(rep), "ababab");
-            assert_eq!(jit_str_compare(a as i64, b as i64), -1);
+            assert!(jit_str_compare(a as i64, b as i64) < 0);
+            assert_eq!(jit_str_compare(a as i64, a as i64), 0);
+            assert!(jit_str_compare(b as i64, a as i64) > 0);
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
         }

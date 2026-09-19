@@ -11584,10 +11584,10 @@ fn gen_resume_decline(reason: &str) {
 /// MIFrame, and the walk's yield is `dispatch`'s `except Yield` `popvalue()`.
 /// A `newframe` without that `popvalue` compiled `FOR_ITER` to hand the
 /// iterator back as the item (`int + generator` on
-/// `generator_iteration__main`).  Until the TOS is that `popvalue`, this
-/// is false: residual `do_residual_call`, and do not install a
-/// portal-shaped body whose yield `abort_permanent` aborts a later
-/// independent trace.
+/// `generator_iteration__main`).  Enabling the walk without that
+/// `popvalue` also lets the generator `while` start traces that die on
+/// the yield `abort_permanent` (`calls_closures` `loops_aborted` 1→11).
+/// Stay residual until the walk's TOS is that `popvalue`.
 #[inline(never)]
 fn generator_resume_can_perform_call<Sym: WalkSym>(_ctx: &WalkContext<'_, '_, Sym>) -> bool {
     false

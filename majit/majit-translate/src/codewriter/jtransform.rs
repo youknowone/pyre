@@ -174,7 +174,7 @@ pub struct GraphTransformConfig {
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
-/// two drivers.
+/// drivers.
 pub(crate) fn default_jitdriver_receiver_roots() -> Vec<String> {
     RECOGNIZED_JITDRIVER_RECEIVER_ROOTS
         .iter()
@@ -760,7 +760,11 @@ pub(crate) enum JitMarkerKey {
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its
 /// own portal via `portal_jd_index`. Another embedding pipeline names its
 /// driver through that field rather than being added here.
-const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &["PyPyJitDriver", "UnpackIterableJitDriver"];
+const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &[
+    "PyPyJitDriver",
+    "UnpackIterableJitDriver",
+    "GeneratorEntryJitDriver",
+];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
 /// (`flowspace/model.rs`), spelled as `HostObject::qualname`.
@@ -15171,6 +15175,12 @@ mod tests {
             CallTarget::method("jit_merge_point", Some("UnpackIterableJitDriver".into()));
         assert_eq!(
             jit_marker_key_from_target(&unpack_merge, &default_jitdriver_receiver_roots()),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let genentry_merge =
+            CallTarget::method("jit_merge_point", Some("GeneratorEntryJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&genentry_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
 

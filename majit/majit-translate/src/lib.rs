@@ -234,6 +234,10 @@ fn build_semantic_program_via_active_frontend(
             // Parse one artefact at a time. Holding every crate's Llbc
             // (interpreter ~825MB JSON plus its typed tree) together with
             // the merged SemanticProgram is what blew a 12GB container.
+            // The second loop reloads each file after
+            // `register_transparent_scalar_kinds` so cross-crate
+            // `repr(transparent)` scalar returns resolve; that extra
+            // parse is the cost of not keeping every tree live.
             let mut discovered = Vec::new();
             let mut crate_names = Vec::new();
             let mut hints: std::collections::HashMap<String, Vec<String>> =

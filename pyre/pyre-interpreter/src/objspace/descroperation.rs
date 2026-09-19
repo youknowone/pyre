@@ -2574,8 +2574,33 @@ unsafe fn long_int_compare(long: PyObjectRef, iother: i64, op: CompareOp) -> boo
 
 /// `rstr.py` `AbstractStringRepr.ll_strcmp`. Bytewise prefix, then
 /// length. Indexing is `ll_getitem_nonneg` (`as_ptr().add`), not
-/// `slice::cmp` / `Vec::index`.
+/// `slice::cmp` / `Vec::index`. No `stroruni.cmp` oopspec: the first
+/// argument is a byte slice, not `Ptr(STR)` / `Ptr(UNICODE)`.
+///
+/// Elidable only for immutable `bytes`/`bytes`. A `bytearray` operand
+/// reaches [`ll_bytes_strcmp_mutable`] instead: an in-place store
+/// (`b[i] = ...`) changes the compared bytes without changing the slice
+/// pointer or length, and `CALL_PURE` would reuse the first result.
+#[majit_macros::elidable]
 fn ll_bytes_strcmp(left: &[u8], right: &[u8]) -> isize {
+    let cmplen = left.len().min(right.len());
+    let left_p = left.as_ptr();
+    let right_p = right.as_ptr();
+    let mut i = 0usize;
+    while i < cmplen {
+        let diff = unsafe { *left_p.add(i) as isize - *right_p.add(i) as isize };
+        if diff != 0 {
+            return diff;
+        }
+        i += 1;
+    }
+    left.len() as isize - right.len() as isize
+}
+
+/// Same bytewise prefix-then-length compare as [`ll_bytes_strcmp`], not
+/// elidable. `_handle_stroruni_call` raises `NotSupported` for `BYTEARRAY`;
+/// a residual call re-reads the buffer after an in-place store.
+fn ll_bytes_strcmp_mutable(left: &[u8], right: &[u8]) -> isize {
     let cmplen = left.len().min(right.len());
     let left_p = left.as_ptr();
     let right_p = right.as_ptr();
@@ -6291,12 +6316,19 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         // bytearray counterparts — lexicographic comparison on the raw
         // bytes.  bytes and bytearray compare by content
         // (b"a" == bytearray(b"a")), so both operands route through
-        // bytes_like_data.
+        // bytes_like_data. Immutable `bytes`/`bytes` keeps the elidable
+        // `ll_bytes_strcmp`; any `bytearray` operand uses the non-elidable
+        // twin, matching `_handle_stroruni_call`'s `BYTEARRAY` reject.
         if pyre_object::bytesobject::is_bytes_like(a) && pyre_object::bytesobject::is_bytes_like(b)
         {
             let da = pyre_object::bytesobject::bytes_like_data(a);
             let db = pyre_object::bytesobject::bytes_like_data(b);
-            let diff = ll_bytes_strcmp(da, db);
+            let diff =
+                if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
+                    ll_bytes_strcmp(da, db)
+                } else {
+                    ll_bytes_strcmp_mutable(da, db)
+                };
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,
                 CompareOp::Le => diff <= 0,

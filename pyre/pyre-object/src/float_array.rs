@@ -72,7 +72,7 @@ impl FloatArray {
     pub fn empty() -> Self {
         Self {
             block: std::ptr::null_mut(),
-            len: AtomicUsize::new(0),
+            len: crate::object_array::length_cell(0),
         }
     }
 
@@ -80,7 +80,7 @@ impl FloatArray {
         let len = values.len();
         let arr = Self {
             block: unsafe { alloc_typed_items_block(len, gc_float_array_gc_type_id()) },
-            len: AtomicUsize::new(len),
+            len: crate::object_array::length_cell(len),
         };
         unsafe {
             std::ptr::copy_nonoverlapping(values.as_ptr(), arr.base(), len);
@@ -95,7 +95,7 @@ impl FloatArray {
         }
         Self {
             block: unsafe { alloc_typed_items_block(capacity, gc_float_array_gc_type_id()) },
-            len: AtomicUsize::new(0),
+            len: crate::object_array::length_cell(0),
         }
     }
 

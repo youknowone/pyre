@@ -1240,7 +1240,12 @@ fn real_main() {
     let field_mint_trace = majit_ir::descr::field_mint_trace_enabled();
     let struct_layout_census =
         std::env::var_os("MAJIT_STRUCT_LAYOUT_CENSUS").is_some_and(|value| value == "1");
+    // The decline census is likewise written by the analysis; a restore
+    // leaves `check-rtyper-skip-subjects.py` a stderr with no census line.
+    let decline_census = std::env::var_os("MAJIT_DECLINE_LOG")
+        .is_some_and(|value| value != "0" && !value.is_empty());
     if !verbose_prepass
+        && !decline_census
         && !callee_census
         && !field_mint_trace
         && !struct_layout_census

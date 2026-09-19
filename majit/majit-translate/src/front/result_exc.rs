@@ -1662,7 +1662,13 @@ fn rewire_one_call_site(
         // A wrapper whose every return is such a forward (`is_true`) is the
         // shape that shows both at once, which is why the two mismatch
         // classes are one defect and not two.
-        narrow_call_result_ty(graph, a, r, payload_ty.clone());
+        //
+        // Bind the payload to a fresh Variable: `r` is the Result
+        // shell, and reusing it as `T` unions `Result::Ok` with the
+        // payload at every phi (`exceptiontransform` / `jtransform`
+        // keep the normal-edge value off the shell).
+        let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+        replace_exit_value(graph, a, r, &payload);
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
@@ -1692,7 +1698,7 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
-        match try_fuse_drain_match(graph, a, r) {
+        match try_fuse_drain_match(graph, a, r, payload_ty) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
                 // The fusion's reason string, which reaches the census rather
@@ -1824,9 +1830,8 @@ fn rewire_one_call_site(
             LinkArg::Const(c) => normal_args.push(LinkArg::Const(c.clone())),
             LinkArg::Value(v) => {
                 if *v == cf_c {
-                    // The ControlFlow value at the continue edge is the
-                    // unwrapped payload once the callee raises: the
-                    // call result itself flows in its place.
+                    // Placeholder: the remint below replaces `r` with a
+                    // fresh payload Variable after the multi-slot check.
                     normal_args.push(LinkArg::Value(r.clone()));
                     payload_positions.push(i);
                 } else if *v == disc_var {
@@ -1870,12 +1875,24 @@ fn rewire_one_call_site(
     }
 
     // The continue target reads the payload via `cf.__pos_0`; with the
-    // call result flowing directly, that read collapses to the carried
-    // value itself.
+    // reminted call result flowing directly, that read collapses to
+    // the carried value itself.  Collapse is the first mutation and
+    // errs before writing, so a decline here still leaves the graph
+    // byte-identical.
     let continue_target = continue_link.target;
     for pos in payload_positions {
-        if collapse_pos0_read(graph, continue_target, pos, &name)?.is_some() {
-            narrow_call_result_ty(graph, a, r, payload_ty.clone());
+        let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
+    }
+    // Bind the unwrapped payload to a fresh Variable.  `r` is the
+    // Result shell; threading it as `T` unions `Result::Ok` with the
+    // payload at every phi (`exceptiontransform` / `jtransform` keep
+    // the normal-edge value off the shell).
+    let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+    for arg in &mut normal_args {
+        if let LinkArg::Value(v) = arg
+            && *v == *r
+        {
+            *v = payload.clone();
         }
     }
 
@@ -2096,28 +2113,29 @@ fn catch_and_rewrap(
     let mut exc_link = Link::new_mixed(a_to_e_args, e_id, Some(crate::model::exception_exitcase()));
     exc_link.last_exception = Some(LinkArg::Value(va));
     exc_link.last_exc_value = Some(LinkArg::Value(vb));
+    // The normal arm wraps the reminted payload in a fresh `Ok` shell.
+    // `r` is the Result shell; reusing it as `T` unions `Result::Ok`
+    // with the payload.  Without the remint the call keeps the shell's
+    // `Ref`, so a callee that `int_return`s is invoked through
+    // `inline_call_*_r` and the returned value has no destination in the int
+    // bank — and the `Ok` shell built here would be handed the register the
+    // caller never wrote.
+    let mut value_args = value_args;
+    if has_r {
+        let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+        for arg in &mut value_args {
+            if let LinkArg::Value(v) = arg
+                && *v == *r
+            {
+                *v = payload.clone();
+            }
+        }
+    }
     graph.set_control_flow_metadata(
         BlockId(a),
         Some(ExitSwitch::LastException),
         vec![Link::new_mixed(value_args, n_id, None), exc_link],
     );
-    // The normal arm above wrapped `r` in a fresh `Ok` shell, which is a
-    // statement about what `r` now IS: the raw payload the transformed
-    // callee returns, not the `Result` it returned before.  Retype the call
-    // to match, the same narrowing the diamond and tail-forward arms perform
-    // (`narrow_call_result_ty`).  Without it the call keeps the shell's
-    // `Ref`, so a callee that `int_return`s is invoked through
-    // `inline_call_*_r` and the returned value has no destination in the int
-    // bank — and the `Ok` shell built here would be handed the register the
-    // caller never wrote.
-    //
-    // Gated on `has_r` for the same reason the shells are: when the result
-    // does not flow along the original exit there is no payload to speak of
-    // and nothing consumes the call's type.  Placed last, after this rule's
-    // final mutation, so a decline still leaves the graph untouched.
-    if has_r {
-        narrow_call_result_ty(graph, a, r, payload_ty.clone());
-    }
     Ok(())
 }
 
@@ -2241,7 +2259,12 @@ fn verify_drain_reraise_returns_err_payload(
 /// leaves the graph byte-identical.  Detach-only: the bypassed
 /// discriminant / Err-arm / bool-switch / reraise blocks are left
 /// byte-intact for the post-rewrite `clear_unreachable_blocks` sweep.
-fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Result<(), String> {
+fn try_fuse_drain_match(
+    graph: &mut FunctionGraph,
+    a: usize,
+    r: &Variable,
+    payload_ty: &ValueType,
+) -> Result<(), String> {
     use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{BlockId, ExitCase};
     let name = graph.name.clone();
@@ -2891,6 +2914,17 @@ fn try_fuse_drain_match(graph: &mut FunctionGraph, a: usize, r: &Variable) -> Re
         graph.block(ok_link.target).inputargs.len(),
         "drain fuse: normal edge arity mismatch"
     );
+    // Bind the unwrapped next() payload to a fresh Variable.  `r` is
+    // the Result shell; threading it as the item unions `Result::Ok`
+    // with `PyObject`.
+    let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+    for arg in &mut normal_args {
+        if let LinkArg::Value(v) = arg
+            && *v == *r
+        {
+            *v = payload.clone();
+        }
+    }
     let normal_link = Link::new_mixed(normal_args, ok_link.target, None);
     graph.set_control_flow_metadata(
         BlockId(a),
@@ -3484,6 +3518,46 @@ fn narrow_call_result_ty(
     };
     if let OpKind::Call { result_ty, .. } = &mut op.kind {
         *result_ty = payload_ty;
+    }
+}
+
+/// Retarget the call that produced the Result shell `r` onto a fresh
+/// Variable typed as the unwrapped payload.
+///
+/// `r` stays the Result identity.  Reusing it as `T` after
+/// exception-link lowering unions `Result::Ok` with the payload at
+/// every phi.  RPython's `exceptiontransform` / `jtransform` keep the
+/// normal-edge value off the shell: the continue edge carries a new
+/// name whose only annotation is `T`.
+fn remint_call_as_payload(
+    graph: &mut FunctionGraph,
+    block: usize,
+    r: &Variable,
+    payload_ty: ValueType,
+) -> Variable {
+    let payload = graph.alloc_value_var();
+    let Some(op) = graph.blocks[block]
+        .operations
+        .iter_mut()
+        .find(|op| op.result.as_ref() == Some(r))
+    else {
+        return payload;
+    };
+    op.result = Some(payload.clone());
+    narrow_call_result_ty(graph, block, &payload, payload_ty);
+    payload
+}
+
+/// Replace `from` with `to` on every Value arg of `block`'s exits.
+fn replace_exit_value(graph: &mut FunctionGraph, block: usize, from: &Variable, to: &Variable) {
+    for link in &mut graph.blocks[block].exits {
+        for arg in &mut link.args {
+            if let LinkArg::Value(v) = arg
+                && *v == *from
+            {
+                *v = to.clone();
+            }
+        }
     }
 }
 
