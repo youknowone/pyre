@@ -572,7 +572,7 @@ pub fn spdiag_enabled() -> bool {
 /// "bridges are off" while they keep recording.
 pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
+    *FLAG.get_or_init(|| crate::jit_env::env_var_os("MAJIT_NO_BRIDGE").is_some())
 }
 /// `MAJIT_SKIP_BRIDGES=a,b,...` (diagnostic): decline exactly the listed
 /// `MAJIT_MAX_BRIDGES` sequence numbers and take every other one.  Where the

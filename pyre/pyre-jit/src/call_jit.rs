@@ -3667,8 +3667,7 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
 fn bridge_bail_stage() -> u32 {
     static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *STAGE.get_or_init(|| {
-        std::env::var("MAJIT_BRIDGE_BAIL")
-            .ok()
+        majit_metainterp::jit_env::env_var("MAJIT_BRIDGE_BAIL")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
     })
