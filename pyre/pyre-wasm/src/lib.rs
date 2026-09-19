@@ -1212,8 +1212,9 @@ pub fn run_python(source: &str) -> String {
 ///
 /// `pyre_set_script_path(ptr, len)` may precede step 2 to name the file the
 /// source came from, `pyre_set_launch_env(ptr, len)` to supply the environment
-/// the launcher options resolve against, and `pyre_set_gc_env(ptr, len)` the
-/// one the collector sizes itself from — the guest has none of its own.
+/// the launcher options resolve against, `pyre_set_gc_env(ptr, len)` the one
+/// the collector sizes itself from, and `pyre_set_jit_env(ptr, len)` the
+/// `PYRE_NO_JIT` / `MAJIT_NO_BRIDGE` knobs — the guest has none of its own.
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
@@ -1377,6 +1378,39 @@ mod host_abi {
     #[unsafe(no_mangle)]
     pub extern "C" fn pyre_gc_env_names() -> u64 {
         pack_into_guest(pyre_jit::GC_ENV_NAMES.join("\0").into_bytes())
+    }
+
+    /// Supply the `PYRE_NO_JIT` / `PYRE_JIT` / `MAJIT_NO_BRIDGE` variables the JIT knobs
+    /// resolve against, in the same NUL-separated `NAME=VALUE` form as
+    /// [`pyre_set_gc_env`]. The guest has no environment, so without this both
+    /// knobs read as unset however the host was configured — and they change
+    /// what the guest executes, not merely what it prints. `pyre_jit_env_names`
+    /// lists the names that are read.
+    ///
+    /// Each site caches the answer in a `OnceLock` on first read, which the
+    /// first compiled path does — so this must precede `pyre_run_python`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_set_jit_env(ptr: *const u8, len: usize) {
+        let Some(blob) = guest_str(ptr, len) else {
+            return;
+        };
+        let entries = blob
+            .split('\0')
+            .filter_map(|record| {
+                let (name, value) = record.split_once('=')?;
+                (!name.is_empty()).then(|| (name.to_string(), value.to_string()))
+            })
+            .collect();
+        pyre_jit::set_jit_supplied_env(entries);
+    }
+
+    /// The names [`pyre_set_jit_env`] is worth being given, as NUL-separated
+    /// records in a buffer the host must free with `pyre_dealloc`. Returned for
+    /// the same reason as [`pyre_gc_env_names`]: so a host does not keep its
+    /// own copy of the list in step with the knobs.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn pyre_jit_env_names() -> u64 {
+        pack_into_guest(pyre_jit::JIT_ENV_NAMES.join("\0").into_bytes())
     }
 
     /// Set `-P` / PYTHONSAFEPATH for the next `pyre_run_python`, suppressing the

@@ -95,7 +95,7 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// A form belonging to the other language costs nothing: `env::var(` cannot
 /// occur in Python, nor `environ.get(` in Rust.
 ///
-/// `read_uint_from_env` is the one name-taking helper in the tree that a gate
+/// `read_uint_from_env` is one name-taking helper in the tree that a gate
 /// literal reaches: the collector's GC knobs pass the name to it and it forwards
 /// to `env::var` with a *variable*, so the literal never sits beside a form
 /// above and three live `MAJIT_GC_BH_PROBE_*` sub-knobs were invisible to both
@@ -103,13 +103,23 @@ fn collect_sources(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
 /// undocumented. Its sibling `read_float_from_env` is not here because no gate
 /// name reaches it; add it the day one does.
 ///
+/// `env_var` is the other, and it covers its `_os` suffix the way `env::var`
+/// does. `jit_env::{env_var, env_var_os}` is the seam the JIT knobs read
+/// through so a wasm guest -- whose `std::env` is permanently empty -- resolves
+/// them against an environment its host supplies. The literal sits beside the
+/// helper, not beside `env::var`, and the six `PYRE_JD1*` / `PYRE_JIT` /
+/// `PYRE_NO_JIT` gates went unread by this brake the moment they moved.
+/// Written bare, because the call sites spell it both ways: imported
+/// (`env_var("PYRE_JIT")`) and qualified (`crate::jit_env::env_var_os(..)`).
+///
 /// Every form is matched on an identifier boundary: the character before it
 /// must not continue a name, so `my_read_uint_from_env` is not the helper and
 /// `pyre_env::var` is not `std::env::var`. The qualifiers the real read sites
 /// carry — `::` before `env::var`, `getenv` and `host_os::var`, `.` before
 /// `getenv` and `environ.get` — all clear that boundary.
-const READ_FORMS: [&str; 5] = [
+const READ_FORMS: [&str; 6] = [
     "env::var",
+    "env_var",
     "host_os::var",
     "getenv",
     "environ.get",
@@ -222,8 +232,11 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         os.getenv("PYRE_G")
         println!("cargo::rerun-if-env-changed=PYRE_H");
         read_uint_from_env("PYRE_I").unwrap_or(0);
+        env_var("PYRE_J");
+        crate::jit_env::env_var_os("PYRE_K");
         // a longer name ending in a read form is not that read form
         my_read_uint_from_env("PYRE_NOT_THE_HELPER");
+        supplied_env_var("PYRE_NOT_THE_SEAM");
         pyre_env::var("PYRE_NOT_STD_ENV");
         # a gate written into a child's environment is not a read of ours
         env["PYRE_NOT_A_READ_EITHER"] = "1"
@@ -239,7 +252,7 @@ fn gates_read_by_matches_the_read_forms_and_nothing_else() {
         got,
         vec![
             "PYRE_A", "PYRE_B", "PYRE_C", "PYRE_D", "PYRE_E", "PYRE_F", "PYRE_G", "PYRE_H",
-            "PYRE_I"
+            "PYRE_I", "PYRE_J", "PYRE_K"
         ]
     );
 }
