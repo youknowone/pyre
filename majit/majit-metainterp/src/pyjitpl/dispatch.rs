@@ -680,6 +680,14 @@ pub trait JitCodeSym {
     fn abort_portal_op(&mut self) {}
     fn total_slots(&self) -> usize;
     fn loop_header_pc(&self) -> usize;
+    /// pyjitpl.py `opimpl_jit_merge_point(..., redboxes, orgpc)` →
+    /// `reached_loop_header(greenboxes, redboxes)`: the boxes held by the
+    /// merge point's red registers, in `(I, R, F)` operand order.
+    /// `live_arg_boxes = greenboxes + redboxes` is built from these, so a
+    /// sym whose merge point carries real red operands takes its reds from
+    /// here. In a bridge the registers were rebuilt from the guard's resume
+    /// data and do not sit at the loop's inputarg positions.
+    fn set_redboxes(&mut self, _redboxes: &[(OpRef, majit_ir::Type)]) {}
     /// pyjitpl.py:2981-2989 `live_arg_boxes` — this merge point's
     /// loop-carried boxes, in the exact order the closing JUMP emits them.
     ///
@@ -6447,6 +6455,8 @@ where
                 // cut can peel the outer prefix as preamble. Built during the
                 // tracing walk only — off the compiled hot path.
                 let mut live_arg_boxes: Vec<crate::trace_ctx::GreenBox> = Vec::new();
+                // pyjitpl.py opimpl_jit_merge_point `redboxes`.
+                let mut redboxes: Vec<(OpRef, majit_ir::Type)> = Vec::new();
                 // Single-pass: accumulate the walk-final concrete RED values from
                 // the live value-bank shadow (slots 3-5 = reds I/R/F in operand
                 // order) so the merge-point hook can `restore_values` them into
@@ -6507,6 +6517,9 @@ where
                             };
                             if let Some(opref) = opref_opt {
                                 live_arg_boxes.push(crate::trace_ctx::GreenBox::new(opref, ty));
+                                if !is_green_slot {
+                                    redboxes.push((opref, ty));
+                                }
                             }
                         }
                         if slot == 0
@@ -6918,6 +6931,7 @@ where
                     // box handling in between, neither of which reads the
                     // heapcache, so reset-then-guard is the faithful order.
                     ctx.heap_cache_mut().reset();
+                    sym.set_redboxes(&redboxes);
                     // pyjitpl.py reached_loop_header, its second statement:
                     //
                     //     self.remove_consts_and_duplicates(
