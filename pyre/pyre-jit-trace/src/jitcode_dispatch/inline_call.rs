@@ -12680,8 +12680,10 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
         has_closure,
         Some((value, concrete_value, w_class, version_tag)),
         None,
-        // FORMAT_WITH_SPEC is a descriptor opcode, not a Python CALL
-        // boundary.  A bad effect-free result declines to this residual.
+        // FORMAT_WITH_SPEC pops both of its operands, so the abort rewind
+        // cannot re-execute it from the stack it had: only a `Clean` body is
+        // admitted from here, and a bad effect-free result declines to the
+        // residual, which raises `descroperation.py format`'s TypeError.
         false,
         // `__format__` returning a non-string is a TypeError the interpreter
         // raises; the plumbing guards the inlined result is a string so that

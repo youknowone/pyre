@@ -523,21 +523,37 @@ pub unsafe fn pyerror_to_exc_object(err: *mut PyError) -> *mut pyre_object::PyOb
 /// `PyError::type_error` call to this one and drops the successor's
 /// `pyerror_to_exc_object`.
 ///
-/// `w_msg` is the message *object*, not a `&str`: the JIT models a Rust
-/// string constant as a single `W_UnicodeObject` word, while `&str` is a
-/// two-word aggregate with no one-word residual-call ABI — the reason
-/// `stack_underflow_error` stays unpublished (`jit_fnaddr.rs`). The front
-/// rule only fires where the message resolves to a string literal, which is
-/// what makes that word a `box_str_constant` object.
+/// Message word of a fused `PyError::<kind>(msg)` raise
+/// (`front/result_exc.rs` `fuse_kind_ctor_raise`).
+///
+/// The front rule fires only where the message resolves to a string literal,
+/// and a literal's one-word `r` constant is `Ptr(STR)`
+/// (`rstr.py StringRepr.convert_const`) -- the payload `oefmt` takes before
+/// `space.newtext(msg)`, never a `W_UnicodeObject`.
+fn fused_raise_message(msg: *mut pyre_object::PyObject) -> Wtf8Buf {
+    unsafe {
+        debug_assert!(
+            !msg.is_null() && !pyre_object::is_str(msg),
+            "fused raise message must be a STR payload, not a W_UnicodeObject"
+        );
+        pyre_object::unicodeobject::utf8_payload_wtf8(
+            msg as *mut pyre_object::unicodeobject::UnicodeValueStorage,
+        )
+        .to_owned()
+    }
+}
+
+/// `w_msg` is the message word, not a `&str`: `&str` is a two-word aggregate
+/// with no one-word residual-call ABI -- the reason `stack_underflow_error`
+/// stays unpublished (`jit_fnaddr.rs`).
 ///
 /// # Safety
-/// `w_msg` must be a live `W_UnicodeObject`.
+/// `w_msg` is a live rstr `STR` payload.
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_type_error_to_exc_object(
     w_msg: *mut pyre_object::PyObject,
 ) -> *mut pyre_object::PyObject {
-    let msg = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_msg) }.to_owned();
-    PyError::type_error(msg).to_exc_object()
+    PyError::type_error(fused_raise_message(w_msg)).to_exc_object()
 }
 
 /// The zero-division twin of [`pyerror_type_error_to_exc_object`].
@@ -549,13 +565,12 @@ pub unsafe fn pyerror_type_error_to_exc_object(
 /// `W_BaseException` value that PyPy's `OperationError` path exposes.
 ///
 /// # Safety
-/// `w_msg` must be a live `W_UnicodeObject`.
+/// `w_msg` is a live rstr `STR` payload.
 #[majit_macros::dont_look_inside]
 pub unsafe fn pyerror_zero_division_to_exc_object(
     w_msg: *mut pyre_object::PyObject,
 ) -> *mut pyre_object::PyObject {
-    let msg = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_msg) }.to_owned();
-    PyError::zero_division(msg).to_exc_object()
+    PyError::zero_division(fused_raise_message(w_msg)).to_exc_object()
 }
 
 impl PyError {

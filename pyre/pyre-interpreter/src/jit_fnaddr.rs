@@ -1848,6 +1848,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     pa1(
         &mut entries,
+        "pyre_object::celldict::object_mutable_cell_write_barrier",
+        "pyre_object::object_mutable_cell_write_barrier",
+        pyre_object::celldict::object_mutable_cell_write_barrier,
+    );
+    pa1(
+        &mut entries,
         "pyre_object::unicodeobject::w_str_from_codepoint",
         "pyre_object::w_str_from_codepoint",
         pyre_object::unicodeobject::w_str_from_codepoint,
@@ -3337,6 +3343,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // The non-virtual shrink reallocs a raw low-level string down to its final
     // length; the virtual path is folded by `opt_call_shrink_array` and never
     // calls this.
+    cpa2(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_strconcat",
+        "pyre_object::jit_ll_strconcat",
+        pyre_object::lowlevel_string::jit_ll_strconcat,
+    );
+    pa3(
+        &mut entries,
+        "pyre_object::lowlevel_string::_ll_stringslice",
+        "pyre_object::_ll_stringslice",
+        pyre_object::lowlevel_string::_ll_stringslice,
+    );
+    pa2(
+        &mut entries,
+        "pyre_object::unicodeobject::next_codepoint_pos_dont_look_inside",
+        "pyre_object::next_codepoint_pos_dont_look_inside",
+        pyre_object::unicodeobject::next_codepoint_pos_dont_look_inside,
+    );
     cpa2(
         &mut entries,
         "pyre_object::lowlevel_string::jit_ll_shrink_array",

@@ -3604,8 +3604,9 @@ const FUSED_KIND_CTORS: &[(&str, &str)] = &[
 /// ```
 ///
 /// `v_msg` must resolve to a string literal: the helper reads it as a
-/// `W_UnicodeObject`, which is what a literal's one-word `r` constant
-/// materialises to, and a runtime-built message need not be one.
+/// `Ptr(STR)`, which is what a literal's one-word `r` constant materialises
+/// to (`rstr.py StringRepr.convert_const`), and a runtime-built message need
+/// not be one.
 pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
     // (pred, ctor op index, helper leaf, succ, payload position)
     let mut fusions: Vec<(usize, usize, &'static str, usize, usize)> = Vec::new();
@@ -3760,7 +3761,7 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
 /// straight-line control flow. A raise site's message routinely arrives at a
 /// merge block instead, where the paths carry different literals; the fusion
 /// does not need to know which one, only that every one of them is a literal,
-/// because that is what makes the word a `box_str_constant` object.
+/// because that is what makes the word a prebuilt `STR` constant.
 ///
 /// A value that is neither produced nor an input in the block it is read from
 /// is looked for in the predecessors unrenamed, mirroring the walk above; the

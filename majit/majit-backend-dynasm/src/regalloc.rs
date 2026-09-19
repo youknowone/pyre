@@ -6196,15 +6196,14 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, [] as [Loc; 0], Some(result_loc), output);
     }
 
-    /// load_effective_address: all args in regs
+    /// x86/regalloc.py `consider_load_effective_address` /
+    /// aarch64/regalloc.py `prepare_op_load_effective_address`.
+    /// Keep `p0` and `i0` in registers and forbid the result from
+    /// reusing either, so LEA cannot overwrite the index while
+    /// materializing a framed base.
     fn consider_load_effective_address(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let mut locs = Vec::new();
-        for arg in op.getarglist().iter() {
-            locs.push(self.loc(arg.to_opref(), Type::Int));
-        }
-        let result_loc =
-            Loc::Reg(self.force_allocate_reg(op.pos().get(), Type::Int, &[], None, false));
-        self.perform(i, locs, Some(result_loc), output);
+        let args: Vec<OpRef> = op.getarglist().iter().map(|a| a.to_opref()).collect();
+        self.consider_load_effective_address_j2(op.pos().get(), &args, i, output);
     }
 
     fn consider_load_effective_address_j2(
@@ -6214,11 +6213,19 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let mut locs = Vec::new();
-        for &arg in args {
-            locs.push(self.loc(arg, Type::Int));
-        }
-        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        let [p0, i0, baseofs, shift] = match args {
+            [a, b, c, d, ..] => [*a, *b, *c, *d],
+            other => panic!("LoadEffectiveAddress expects 4 args, got {other:?}"),
+        };
+        let ploc = self.make_sure_var_in_reg(p0, Type::Int, &[i0], None, false);
+        let iloc = self.make_sure_var_in_reg(i0, Type::Int, &[p0], None, false);
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[p0, i0], None, false));
+        let locs = vec![
+            ploc,
+            iloc,
+            self.loc(baseofs, Type::Int),
+            self.loc(shift, Type::Int),
+        ];
         self.perform(i, locs, Some(result_loc), output);
     }
 

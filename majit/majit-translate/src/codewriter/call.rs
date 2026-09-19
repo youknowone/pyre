@@ -9692,9 +9692,13 @@ const INT_SHIFT_TARGETS: &[CallTargetPattern] = &[
 const INT_POW_TARGETS: &[CallTargetPattern] = &[CallTargetPattern::FunctionPath(&["int_pow"])];
 
 // effectinfo.py: OS_STR_CONCAT etc. — string operations with oopspec
+// One callee per oopspec, as `_handle_oopspec_call` registers it: the
+// operands of `OS_STR_CONCAT` are `rstr.STR` payloads, which vstring reads
+// with `strlen` / `copystrcontent`.  The wrapper-level `jit_str_concat`
+// takes `W_UnicodeObject`s and must not share the index.
 const STR_CONCAT_TARGETS: &[CallTargetPattern] = &[
     CallTargetPattern::FunctionPath(&["str_concat"]),
-    CallTargetPattern::FunctionPath(&["jit_str_concat"]),
+    CallTargetPattern::FunctionPath(&["jit_ll_strconcat"]),
 ];
 
 const STR_CMP_TARGETS: &[CallTargetPattern] =

@@ -183,9 +183,11 @@ pub(crate) fn default_jitdriver_receiver_roots() -> Vec<String> {
 }
 
 /// The [`GraphTransformConfig::str_concat_helper`] default: pyre's own, in
-/// `pyre_object::unicodeobject`, whose address `jit_fnaddr.rs` binds.
+/// `pyre_object::lowlevel_string`, whose address `jit_fnaddr.rs` binds.  It
+/// is the `ll_strconcat` port over `rstr.STR` payloads, the operand type
+/// `OS_STR_CONCAT` promises the optimizer.
 fn default_str_concat_helper() -> String {
-    "jit_str_concat".to_string()
+    "jit_ll_strconcat".to_string()
 }
 
 /// The [`GraphTransformConfig::int_str_helper`] default, on the same terms.
@@ -3182,8 +3184,8 @@ impl<'a> Transformer<'a> {
             // lowers `s1 + s2` to a residual call to the concat helper.
             // Pyre's front-end emits a unified `BinOp { op: "add" }`
             // (Rust `+` is one AST node); over two Ref (string) operands
-            // this lowers to the registered `jit_str_concat` host extern
-            // (`pyre_object::unicodeobject`, address in `jit_fnaddr.rs`,
+            // this lowers to the registered `jit_ll_strconcat` host extern
+            // (`pyre_object::lowlevel_string`, address in `jit_fnaddr.rs`,
             // descriptor `OopSpecIndex::StrConcat` in
             // `STR_CONCAT_TARGETS`), assembling to the wired
             // `residual_call_r_r/iRd>r`.  Without this the op falls
@@ -7131,7 +7133,15 @@ impl<'a> Transformer<'a> {
                             result: op.result.clone(),
                             kind: OpKind::ArrayLen {
                                 base: block,
-                                array_type_id: None,
+                                // `cpu.arraydescrof(GcArray(OBJECTPTR))` —
+                                // the ItemsBlock identity
+                                // (`OBJECT_REF_GCARRAY_TYPE_ID`).  Without
+                                // it ArraylenGc mints cache_key=0 and
+                                // short-preamble `make_guards` cannot
+                                // resolve a GC tid, so unroll aborts.
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
                                 nolength: false,
                             },
                         },
@@ -7251,7 +7261,9 @@ impl<'a> Transformer<'a> {
                                 base: block,
                                 index,
                                 item_ty: ValueType::Ref(None),
-                                array_type_id: None,
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
                                 nolength: false,
                                 pure: false,
                             },
@@ -7283,7 +7295,9 @@ impl<'a> Transformer<'a> {
                                 index,
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Ref(None),
-                                array_type_id: None,
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
                                 nolength: false,
                             },
                         },
@@ -10213,7 +10227,13 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
         return StrOrUniKind::Other;
     };
     match s._name.as_str() {
-        "rpy_string" => StrOrUniKind::Str,
+        // `Utf8Str` is `W_UnicodeObject._utf8` and carries the `rstr.py STR`
+        // layout (hash, length, chars) field for field.  The other Rust
+        // spellings the bookkeeper annotates as `SomeString` do not --
+        // `BytesBlock` has no hash word and `String` / `Wtf8Buf` are
+        // Vec-shaped -- so a `stroruni.*` oopspec on them would be lowered
+        // with STR offsets they do not have.
+        "rpy_string" | "Utf8Str" => StrOrUniKind::Str,
         "rpy_unicode" => StrOrUniKind::Unicode,
         "rpy_bytearray" => StrOrUniKind::ByteArray,
         _ => StrOrUniKind::Other,
@@ -19933,6 +19953,49 @@ mod tests {
             OpKind::ArrayLen { base, nolength, .. } => {
                 assert_eq!(base, &block);
                 assert!(!*nolength, "the block carries its length header");
+            }
+            other => panic!("expected ArrayLen, got {other:?}"),
+        }
+        assert_eq!(ops[1].result, Some(result));
+    }
+
+    /// `list.obj_capacity(l)` names the ItemsBlock ARRAY identity so
+    /// `arraylen_gc` carries a resolvable GC tid (`rlist.py len(l.items)`).
+    #[test]
+    fn handle_list_call_obj_capacity_names_the_items_block_array() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("list_obj_capacity");
+        let l = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "list.obj_capacity",
+                &op,
+                std::slice::from_ref(&l),
+                &mut graph,
+                "list_obj_capacity",
+            )
+            .expect("list.obj_capacity must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 2);
+        match &ops[1].kind {
+            OpKind::ArrayLen {
+                array_type_id,
+                nolength,
+                ..
+            } => {
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+                );
+                assert!(!*nolength, "the ItemsBlock carries its length header");
             }
             other => panic!("expected ArrayLen, got {other:?}"),
         }

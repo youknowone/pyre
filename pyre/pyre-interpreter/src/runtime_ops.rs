@@ -685,38 +685,52 @@ pub fn build_set_from_refs(items: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     crate::builtins::builtin_set_from_items(items)
 }
 
-/// BUILD_STRING evaluation, shared by the interpreter (`build_string`) and
-/// the JIT residual (`bh_build_string_from_array`): concatenates `parts`
+/// BUILD_STRING residual (`bh_build_string_from_array`): concatenates `parts`
 /// (already-stringified f-string fragments, in bottom-to-top order) into a
-/// single `str`.  Each fragment is a `str` by construction (FORMAT_SIMPLE /
-/// FORMAT_WITH_SPEC / CONVERT_VALUE ran first); the `bool` / `int` / `None`
-/// / `<object>` arms are defensive rendering, so this never runs user code
-/// and is infallible.
+/// single `str` via `Utf8StringBuilder`.  The interpreter opcode uses the
+/// builder directly (`pyopcode.py BUILD_STRING`).  Each fragment is a `str`
+/// by construction (FORMAT_SIMPLE / FORMAT_WITH_SPEC / CONVERT_VALUE ran
+/// first); the `bool` / `int` / `None` / `<object>` arms are defensive
+/// rendering, so this never runs user code and is infallible.
 pub fn build_string_from_refs(parts: &[PyObjectRef]) -> PyObjectRef {
-    let mut result = rustpython_wtf8::Wtf8Buf::new();
+    let mut builder = pyre_object::rutf8::Utf8StringBuilder::new(0);
     for part in parts {
         unsafe {
             if pyre_object::is_str(*part) {
-                result.push_wtf8(pyre_object::w_str_get_wtf8(*part));
-            } else if pyre_object::is_bool(*part) {
-                // `is_int` is true for a bool, so test `is_bool` first; a
-                // bool renders "True"/"False", not its int value.
-                result.push_str(if pyre_object::w_bool_get_value(*part) {
-                    "True"
-                } else {
-                    "False"
-                });
-            } else if pyre_object::is_int(*part) {
-                result.push_str(&pyre_object::w_int_get_value(*part).to_string());
-            } else if pyre_object::is_none(*part) {
-                result.push_str("None");
+                builder.append_utf8(
+                    pyre_object::unicodeobject::w_str_storage(*part),
+                    pyre_object::unicodeobject::w_str_len(*part) as i64,
+                );
             } else {
-                result.push_str("<object>");
+                // Defensive rendering for a residual that saw a non-str
+                // fragment; `BUILD_STRING` itself only appends `utf8_len_w`.
+                let rendered = if pyre_object::is_bool(*part) {
+                    if pyre_object::w_bool_get_value(*part) {
+                        "True".to_string()
+                    } else {
+                        "False".to_string()
+                    }
+                } else if pyre_object::is_int(*part) {
+                    pyre_object::w_int_get_value(*part).to_string()
+                } else if pyre_object::is_none(*part) {
+                    "None".to_string()
+                } else {
+                    "<object>".to_string()
+                };
+                let tmp = pyre_object::w_str_from_wtf8_managed(
+                    rustpython_wtf8::Wtf8Buf::from_string(rendered),
+                );
+                builder.append_utf8(
+                    pyre_object::unicodeobject::w_str_storage(tmp),
+                    pyre_object::unicodeobject::w_str_len(tmp) as i64,
+                );
             }
         }
     }
-    // BUILD_STRING / f-string result is a fresh dynamic string; make it collectable.
-    pyre_object::w_str_from_wtf8_managed(result)
+    pyre_object::unicodeobject::w_str_from_storage_and_length(
+        builder.build(),
+        builder.getlength() as usize,
+    )
 }
 
 /// CONVERT_VALUE conversion code, shared by the interpreter and the JIT

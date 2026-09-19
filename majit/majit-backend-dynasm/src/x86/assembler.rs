@@ -4839,6 +4839,13 @@ impl<'a> Assembler386<'a> {
             // after observing following SETARRAYITEM_GC stores; it must reach
             // codegen even though it has no result.
             OpCode::ZeroArray => self.genop_discard_zero_array(op, arglocs),
+            // assembler.py `load_effective_addr` / aarch64
+            // `emit_op_load_effective_address`.  rewrite.py turns
+            // COPYSTRCONTENT into LEA + memcpy; a silent no-op here
+            // leaves the memcpy address in an unwritten register.
+            OpCode::LoadEffectiveAddress => {
+                self.genop_load_effective_address(&arglocs, result_loc);
+            }
             // ── Misc ──
             OpCode::ForceToken => {
                 if let Some(Loc::Reg(r)) = result_loc {
@@ -8562,6 +8569,118 @@ impl<'a> Assembler386<'a> {
     }
 
     // genop_* — string/array operations
+
+    /// assembler.py `load_effective_addr`:
+    /// `result = base + (index << shift) + baseofs`.
+    /// `resoperation.py` args `[v_gcptr, v_index, c_baseofs, c_shift]`.
+    fn genop_load_effective_address(&mut self, arglocs: &[Loc], result_loc: Option<&Loc>) {
+        let Some(Loc::Reg(dst)) = result_loc else {
+            panic!("LoadEffectiveAddress result_loc must be Loc::Reg, got {result_loc:?}");
+        };
+        let [base, index, baseofs, shift] = match arglocs {
+            [a, b, c, d, ..] => [a, b, c, d],
+            other => panic!("LoadEffectiveAddress expects 4 arglocs, got {other:?}"),
+        };
+        let shift_amt = match shift {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => i.value,
+            other => panic!(
+                "LoadEffectiveAddress shift must be Immed (rewrite.py ConstInt), got {other:?}"
+            ),
+        };
+        let ofs = match baseofs {
+            Loc::Immed(i) | Loc::ImmedFloat(i) => i.value,
+            other => panic!(
+                "LoadEffectiveAddress baseofs must be Immed (rewrite.py ConstInt), got {other:?}"
+            ),
+        };
+        if let Loc::Immed(i) | Loc::ImmedFloat(i) = index {
+            let total = ofs.wrapping_add(i.value.wrapping_shl(shift_amt as u32));
+            self.emit_lea_base_plus_disp(dst.value, base, total);
+            return;
+        }
+        let index_reg = match index {
+            Loc::Reg(r) if !r.is_xmm => r.value,
+            other => panic!(
+                "LoadEffectiveAddress index must be Loc::Reg after \
+                 consider_load_effective_address, got {other:?}"
+            ),
+        };
+        // `make_sure_var_in_reg` hands a constant back as an immediate, and
+        // `addr_add` takes an `ImmedLoc` base; the scratch register is never
+        // allocated, so it cannot alias `dst` or the index.
+        let base_reg = match base {
+            Loc::Reg(r) if !r.is_xmm => r.value,
+            Loc::Immed(i) => {
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                let imm = i.value;
+                dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD imm);
+                scratch
+            }
+            other => panic!(
+                "LoadEffectiveAddress base must be Loc::Reg or Loc::Immed after \
+                 consider_load_effective_address, got {other:?}"
+            ),
+        };
+        let scale = match shift_amt {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            other => panic!(
+                "LoadEffectiveAddress shift must be 0..=3 (rewrite.py itemscale), got {other}"
+            ),
+        };
+        let disp = i32::try_from(ofs).expect(
+            "LoadEffectiveAddress baseofs must fit signed disp32 (rewrite.py str/unicode basesize)",
+        );
+        self.emit_lea_sib(dst.value, base_reg, index_reg, scale, disp);
+    }
+
+    fn emit_lea_base_plus_disp(&mut self, dst: u8, base: &Loc, disp: i64) {
+        match base {
+            Loc::Reg(r) if !r.is_xmm => {
+                if let Ok(d) = i32::try_from(disp) {
+                    dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(r.value) + d]);
+                } else {
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD disp
+                        ; lea Rq(dst), [Rq(r.value) + Rq(scratch)]
+                    );
+                }
+            }
+            _ => {
+                self.regalloc_mov(
+                    base,
+                    &Loc::Reg(crate::regloc::RegLoc {
+                        value: dst,
+                        is_xmm: false,
+                    }),
+                );
+                if disp != 0 {
+                    if let Ok(d) = i32::try_from(disp) {
+                        dynasm!(self.mc ; .arch x64 ; add Rq(dst), d);
+                    } else {
+                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov Rq(scratch), QWORD disp
+                            ; add Rq(dst), Rq(scratch)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit_lea_sib(&mut self, dst: u8, base: u8, index: u8, scale: i64, disp: i32) {
+        match scale {
+            1 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) + disp]),
+            2 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) * 2 + disp]),
+            4 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) * 4 + disp]),
+            8 => dynasm!(self.mc ; .arch x64 ; lea Rq(dst), [Rq(base) + Rq(index) * 8 + disp]),
+            other => panic!("emit_lea_sib scale must be 1/2/4/8, got {other}"),
+        }
+    }
 
     /// NEWSTR: allocate a byte string of given length.
     /// `base_size` / `item_size` come from the injected ArrayDescr

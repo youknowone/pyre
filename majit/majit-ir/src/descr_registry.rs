@@ -80,6 +80,10 @@ pub fn register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
     gc_cache().lock().register_keyed_array(key, descr);
 }
 
+pub fn force_register_keyed_array(key: crate::descr::LLType, descr: DescrRef) {
+    gc_cache().lock().force_register_keyed_array(key, descr);
+}
+
 /// `descr.py:374-385 get_arraylen_descr` cache-miss publication.
 /// TODO: prefer
 /// `gc_cache.get_field_arraylen_descr(LLType::Array(...), ...)`.

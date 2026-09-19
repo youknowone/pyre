@@ -2806,6 +2806,15 @@ impl GcCache {
         self._cache_array.entry(key).or_insert(descr);
     }
 
+    /// Last-writer publication for a runtime singleton that must own
+    /// `key`.  `register_keyed_array` is first-wins (`or_insert`) so an
+    /// earlier analyzer mint with a different tid would otherwise keep
+    /// the slot; `pyobject_gcarray_descr` needs `PY_OBJECT_ARRAY_GC_TYPE_ID`
+    /// under `OBJECT_REF_GCARRAY_TYPE_ID`.
+    pub fn force_register_keyed_array(&mut self, key: LLType, descr: DescrRef) {
+        self._cache_array.insert(key, descr);
+    }
+
     /// External registration for arraylen descrs.  PyPy `descr.py:37-39`.
     pub fn register_external_arraylen(&mut self, descr: DescrRef) {
         if !self

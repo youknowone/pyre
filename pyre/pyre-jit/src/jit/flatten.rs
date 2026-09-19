@@ -5051,7 +5051,7 @@ where
                 ctx.build_string_from_array_fn_idx,
                 vec![array_operand],
                 CallFlavor::Plain,
-                majit_ir::RuntimeHelperKind::None,
+                majit_ir::RuntimeHelperKind::BuildStringFromArray,
                 dst_reg,
             ))
         }
@@ -6155,7 +6155,7 @@ where
         ctx.binary_slice_fn_idx,
         vec![obj, start, stop],
         CallFlavor::MayForce,
-        majit_ir::RuntimeHelperKind::None,
+        majit_ir::RuntimeHelperKind::BinarySlice,
         dst_reg,
     ))
 }
@@ -7086,7 +7086,9 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Recognition tag for the walker's exact-int / exact-str `!s` fold.
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::ConvertValue;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],

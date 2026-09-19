@@ -1521,7 +1521,7 @@ fn tuple_field_value_type(type_name: &str) -> ValueType {
         // (`valuetype_to_someshell(Str)`) rather than the classdef-less
         // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
-        "String" | "str" | "Wtf8" | "Wtf8Buf" => ValueType::Str,
+        "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str" => ValueType::Str,
         _ => ValueType::Ref(None),
     }
 }
@@ -3505,7 +3505,12 @@ impl std::error::Error for LowerError {}
 /// name it explicitly instead. Without a name `arraydescrof_concrete`
 /// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
 /// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
-pub(crate) const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
+///
+/// Runtime `pyobject_gcarray_descr` publishes under this same string
+/// (`cpu.arraydescrof(ARRAY)` / `descr.py get_array_descr` cache[ARRAY])
+/// so short-preamble `ArrayPtrInfo.make_guards` can resolve
+/// `PY_OBJECT_ARRAY_GC_TYPE_ID` from `path_hash` of this identity.
+pub const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
 /// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
 /// elements, while `rmodel.externalvsinternal(..., gcref=True)` stores those
 /// GC pointers in `GcArray(GCREF)`.  The logical list identity must therefore
@@ -24141,7 +24146,7 @@ fn node_is_string_value(node: &serde_json::Value, llbc: &Llbc) -> bool {
             np == "alloc::string::String"
                 || matches!(
                     np.rsplit("::").next(),
-                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock")
+                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock" | "Utf8Str")
                 )
         })
 }

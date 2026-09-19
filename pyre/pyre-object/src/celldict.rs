@@ -133,11 +133,11 @@ impl crate::lltype::GcType for IntMutableCell {
 }
 
 /// `typeobject.py:27-28 ObjectMutableCell.__init__`.
+///
+/// The cell is an ordinary GC object: old-gen so a trace can bake its
+/// address, traced through `W_OBJECT_MUTABLE_CELL_GC_PTR_OFFSETS`.
 pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
-    // A trace stores into `w_value` with the cell as the barriered object; the
-    // owning dict is not named by that store, so the cell itself has to be
-    // able to enter the remembered set.
-    crate::lltype::malloc_typed_track_young(ObjectMutableCell {
+    crate::lltype::malloc_typed_stable(ObjectMutableCell {
         ob_header: PyObject {
             ob_type: &OBJECT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&OBJECT_MUTABLE_CELL_TYPE),
@@ -148,7 +148,7 @@ pub fn w_object_mutable_cell_new(w_value: PyObjectRef) -> PyObjectRef {
 
 /// `typeobject.py:38-39 IntMutableCell.__init__`.
 pub fn w_int_mutable_cell_new(intvalue: i64) -> PyObjectRef {
-    crate::lltype::malloc_typed(IntMutableCell {
+    crate::lltype::malloc_typed_stable(IntMutableCell {
         ob_header: PyObject {
             ob_type: &INT_MUTABLE_CELL_TYPE as *const PyType,
             w_class: get_instantiate(&INT_MUTABLE_CELL_TYPE),
@@ -221,18 +221,14 @@ pub unsafe fn unwrap_cell(w_value: PyObjectRef) -> PyObjectRef {
     w_value
 }
 
-/// Forward the single movable `PyObjectRef` reachable through a module
-/// dict value slot during a GC root walk.
+/// Visit a module dict value slot during a GC root walk.
 ///
 /// A module dict entry (and a `GlobalCache.cell`) is either a raw
 /// `w_value` or a `MutableCell` wrapping it (`typeobject.py
-/// unwrap_cell`).  `MutableCell`s are `malloc_typed`
-/// (`w_object_mutable_cell_new` / `w_int_mutable_cell_new`), so the
-/// collector never relocates the cell itself and never recurses into
-/// it; for an `ObjectMutableCell` the inner `w_value` is the movable
-/// reference that must be forwarded in place, while an `IntMutableCell`
-/// holds an unboxed `i64` with no reference to forward.  A non-cell slot
-/// holds the movable value directly and is forwarded as-is.
+/// unwrap_cell`).  A cell the collector owns is visited as the slot
+/// itself; its `w_value` is traced through the registered offsets.  A
+/// cell allocated before the allocation hook was installed is outside
+/// the heap, so its inner `w_value` is visited in place instead.
 ///
 /// # Safety
 /// `slot` must point to a valid `PyObjectRef` (null tolerated).
@@ -252,14 +248,28 @@ pub unsafe fn walk_module_value_slot(
         visitor(slot);
         return;
     }
-    let tp = (*w_value).ob_type;
-    if std::ptr::eq(tp, &OBJECT_MUTABLE_CELL_TYPE as *const PyType) {
+    if !is_mutable_cell(w_value) || crate::gc_hook::try_gc_owns_object(w_value as *mut u8) {
+        visitor(slot);
+        return;
+    }
+    // IntMutableCell carries an unboxed i64; no GC reference.
+    if is_object_mutable_cell(w_value) {
         let cell = &mut *(w_value as *mut ObjectMutableCell);
         visitor(&mut cell.w_value);
-    } else if std::ptr::eq(tp, &INT_MUTABLE_CELL_TYPE as *const PyType) {
-        // IntMutableCell carries an unboxed i64; no GC reference.
+    }
+}
+
+/// Write barrier for an in-place `ObjectMutableCell.w_value` store.
+///
+/// A collector-owned cell takes the ordinary barrier.  A cell outside the
+/// heap is reached only by the prebuilt-family root walk, whose barrier is
+/// the `PREBUILT_ROOTS_DIRTY` bit.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn object_mutable_cell_write_barrier(cell: *mut u8) {
+    if crate::gc_hook::try_gc_owns_object(cell) {
+        crate::gc_hook::try_gc_write_barrier(cell);
     } else {
-        visitor(slot);
+        crate::gc_roots::mark_prebuilt_roots_dirty();
     }
 }
 
@@ -295,12 +305,9 @@ pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> O
     debug_assert!(!w_value.is_null(), "write_cell: null value");
     match classify_cell_write(w_cell, w_value) {
         CellWrite::InPlaceObject(cell) => {
-            // The cell is Box-immortal and reached only by the prebuilt-family
-            // root walk.  A pointer store is the write barrier for that walk
-            // (`gc_roots.rs` prebuilt-root write tracking).  An in-place int
-            // store writes no `PyObjectRef` and does not need the bit —
-            // `typeobject.py write_cell` has no barrier on `intvalue` either.
-            crate::gc_roots::mark_prebuilt_roots_dirty();
+            // Barrier before the store, the `remember_young_pointer` order.
+            // An in-place int store writes no `PyObjectRef` and needs none.
+            object_mutable_cell_write_barrier(cell as *mut u8);
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }

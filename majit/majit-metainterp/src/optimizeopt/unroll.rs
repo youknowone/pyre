@@ -432,6 +432,14 @@ pub struct UnrollOptimizer {
     /// `cpu.cls_of_box(runtime_box)` reads (virtualstate.py:601/:608/:620)
     /// and any future `bh_*` calls resolve to the same backend services.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
+    /// `optimizer.py Optimizer.__init__` host slots the inner phase
+    /// Optimizers need. `default_pipeline()` leaves them empty; pyjitpl
+    /// copies them off `MetaInterp` before `optimize_trace_*`.
+    pub string_length_resolver: Option<crate::optimizeopt::info::StringLengthResolver>,
+    pub string_content_resolver: Option<crate::optimizeopt::info::StringContentResolver>,
+    pub string_constant_alloc: Option<crate::optimizeopt::info::StringConstantAllocator>,
+    pub vrefinfo: Option<crate::virtualref::VirtualRefInfo>,
+    pub pureop_historylength: usize,
     /// Explicit `input_ops` seed for the phase optimizers, threaded from the
     /// compile caller. `Some(ops)` on the non-cut finish path =
     /// `preamble_data.base.operations()` — the recorder's `Rc<Op>` carrying
@@ -524,6 +532,20 @@ impl Drop for ActiveShortPreambleProducerPublication {
 }
 
 impl UnrollOptimizer {
+    /// `optimizer.py Optimizer.__init__` fan-out onto a phase Optimizer
+    /// spawned from `default_pipeline()`.
+    fn pin_inner_optimizer(&self, opt: &mut crate::optimizeopt::optimizer::Optimizer) {
+        opt.cpu = self.cpu.clone();
+        opt.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        opt.set_pureop_historylength(self.pureop_historylength);
+        if let Some(vrefinfo) = self.vrefinfo.clone() {
+            opt.set_vrefinfo(vrefinfo);
+        }
+        opt.string_length_resolver = self.string_length_resolver.clone();
+        opt.string_content_resolver = self.string_content_resolver.clone();
+        opt.string_constant_alloc = self.string_constant_alloc.clone();
+    }
+
     /// Supply the target tokens an earlier compile of this green key left
     /// behind.
     ///
@@ -592,6 +614,14 @@ impl UnrollOptimizer {
             callinfocollection: None,
             call_pure_results: crate::optimizeopt::util::args_dict(),
             cpu: crate::cpu::default_cpu(),
+            string_length_resolver: None,
+            string_content_resolver: None,
+            string_constant_alloc: None,
+            vrefinfo: None,
+            // Same default as `Optimizer::new` / `PARAMETERS.pureop_historylength`.
+            // Tests construct this without a WarmState pin; 0 makes
+            // `RecentPureOps` an empty ring and panics on the first CSE insert.
+            pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             phase2_input_ops_seed: None,
             compile_snapshot_root_slots: None,
             compile_resume_memos_slot: None,
@@ -897,8 +927,7 @@ impl UnrollOptimizer {
             self.register_resume_memo(&opt_p1);
             opt_p1.all_descrs = std::mem::take(&mut self.all_descrs);
             opt_p1.callinfocollection = self.callinfocollection.clone();
-            opt_p1.cpu = self.cpu.clone();
-            opt_p1.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+            self.pin_inner_optimizer(&mut opt_p1);
             opt_p1.trace_inputargs = self.trace_inputargs.clone();
             opt_p1.snapshot_boxes = self.snapshot_boxes.clone();
             opt_p1.snapshot_frame_sizes = self.snapshot_frame_sizes.clone();
@@ -1215,8 +1244,7 @@ impl UnrollOptimizer {
         let _published_short_preamble_producer = self.publish_short_preamble_producer(&mut opt_p2);
         opt_p2.all_descrs = std::mem::take(&mut self.all_descrs);
         opt_p2.callinfocollection = self.callinfocollection.clone();
-        opt_p2.cpu = self.cpu.clone();
-        opt_p2.supports_efficient_uint_mul_high = self.supports_efficient_uint_mul_high;
+        self.pin_inner_optimizer(&mut opt_p2);
         // Phase 2 (peeled-loop pass) runtime value seed.
         // The remap is deferred until after the Phase 2 `TraceIterator`
         // builds its `_cache`, because both inputargs AND body op results

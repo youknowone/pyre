@@ -46,6 +46,114 @@ static BINARY_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::Hash
 static COMPARE_VALUE_FROM_TAG_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
     std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("compare_value_from_tag")));
 
+/// `space.newutf8` / `w_str_from_storage_and_length`, identified by path.
+static NEWUTF8_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| fnaddr_set(|name| name.ends_with("w_str_from_storage_and_length")));
+
+/// Void `list_write_barrier` only. [`is_list_write_barrier`] also matches
+/// `prepare_list_ref_store` / `current_gc_ref`, which return the list or
+/// value and must not be recorded as void `CondCallGcWb`.
+static VOID_LIST_WRITE_BARRIER_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("::listobject::list_write_barrier")
+                || name == "pyre_object::list_write_barrier"
+        })
+    });
+
+/// Object-strategy in-place store: write-barrier plus the relocated value.
+static PREPARE_LIST_REF_STORE_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("::listobject::prepare_list_ref_store")
+                || name == "pyre_object::prepare_list_ref_store"
+        })
+    });
+
+/// Post-safepoint reload residual. Identity after `CondCallGcWb`.
+static CURRENT_GC_REF_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.ends_with("::listobject::current_gc_ref") || name == "pyre_object::current_gc_ref"
+        })
+    });
+
+fn residual_funcptr_addr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+) -> Option<usize> {
+    ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+        majit_ir::Value::Int(n) => Some(n as usize),
+        _ => None,
+    })
+}
+
+/// Record the list write-barrier residual as `rewrite.py gen_write_barrier`
+/// would: `CondCallGcWb` on the list, not a `CallN`/`CallR` every append.
+///
+/// `prepare_list_ref_store` still returns the value — only the barrier half
+/// becomes `CondCallGcWb`. `current_gc_ref` after that barrier is identity
+/// (`CondCallGcWb` is a header-flag check, not a moving collection). After a
+/// real collecting residual the reload stays a `Call*`.
+///
+/// Returns `(recorded, rewrote)`. `rewrote` skips `_record_helper_varargs`
+/// heapcache invalidation (`COND_CALL_GC_WB` is not a call).
+fn record_list_write_barrier_residual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+    allboxes: &[OpRef],
+    call_opcode: OpCode,
+    descr: DescrRef,
+) -> (OpRef, bool) {
+    let Some(addr) = residual_funcptr_addr(ctx, funcptr) else {
+        return (
+            ctx.trace_ctx
+                .record_op_with_descr(call_opcode, allboxes, descr),
+            false,
+        );
+    };
+    let addr_i = addr as i64;
+    if VOID_LIST_WRITE_BARRIER_FNADDRS.contains(&addr_i) {
+        let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        return (
+            ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]),
+            true,
+        );
+    }
+    if PREPARE_LIST_REF_STORE_FNADDRS.contains(&addr_i) {
+        let list_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        let _wb = ctx.trace_ctx.record_op(OpCode::CondCallGcWb, &[list_op]);
+        // Executor stamps the (possibly relocated) value onto this box.
+        let value_op = *allboxes.get(2).unwrap_or(&allboxes[0]);
+        return (value_op, true);
+    }
+    if CURRENT_GC_REF_FNADDRS.contains(&addr_i) && last_non_guard_is_cond_call_gc_wb(ctx) {
+        let obj_op = *allboxes.get(1).unwrap_or(&allboxes[0]);
+        return (obj_op, true);
+    }
+    (
+        ctx.trace_ctx
+            .record_op_with_descr(call_opcode, allboxes, descr),
+        false,
+    )
+}
+
+/// `CondCallGcWb` cannot raise, but the residual it replaced may have been
+/// classified `can_raise` and already grown a `GuardNoException`. Skip those
+/// when deciding whether the preceding barrier was a moving safepoint.
+fn last_non_guard_is_cond_call_gc_wb<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> bool {
+    for op in ctx.trace_ctx.ops().iter().rev() {
+        match op.opcode {
+            OpCode::GuardNoException | OpCode::GuardNotForced | OpCode::GuardException => {
+                continue;
+            }
+            OpCode::CondCallGcWb => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Which of [`flush_active_frame_escape`]'s two flushes committed the resume
 /// pc.  They differ in exactly the way the walk-end commit contract cares
 /// about, so the epilogue cannot classify the leg without being told.
@@ -4004,6 +4112,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         helper,
         majit_ir::RuntimeHelperKind::NewtupleFromArray
             | majit_ir::RuntimeHelperKind::NewlistFromArray
+            | majit_ir::RuntimeHelperKind::BuildStringFromArray
     );
     let provably_side_effect_free = reentrant_residual
         || is_rerunnable_bookkeeping
@@ -7069,6 +7178,19 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // BINARY_SLICE of an exact `str` plus exact-int / None bounds:
+    // `_unicode_sliced` instead of the opaque MayForce residual.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinarySlice
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::BinarySliceStr, || {
+            try_walker_specialize_binary_slice_str(ctx, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // FORMAT_SIMPLE on an exact `int` / `str`: the empty-spec fast path
     // `format_w` already takes, instead of the opaque MayForce residual.
     // Keyed off the helper tag; anything else (bool, subclass, user
@@ -7079,6 +7201,33 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && spec_gate(SpecFold::FormatSimple, || {
             try_walker_specialize_format_simple(ctx, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // BUILD_STRING of already-str fragments: left-fold `descr_add`
+    // (`jit_str_concat`) off the backing-array heap-cache, the same
+    // channel as `BINARY_OP ADD` of two exact `str`s.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BuildStringFromArray
+        && spec_gate(SpecFold::BuildString, || {
+            try_walker_specialize_build_string(ctx, op.pc, &r_args, dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // FORMAT_WITH_SPEC: an exact `int` plus a constant decimal spec
+    // (`:d` / `:05d`) is `ll_int2dec` + pad, the same split
+    // `format_int_or_long` records.  Tried before the Python `__format__`
+    // inline so a builtin `int.__format__` never takes that route.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatWithSpec
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::FormatWithSpecInt, || {
+            try_walker_specialize_format_with_spec_int(ctx, op, &r_args, dst)
         })?
         .is_some()
     {
@@ -7961,6 +8110,60 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrFind, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::Find,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrRfind, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::RFind,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::StrCount, || {
+            try_walker_specialize_str_search(
+                ctx,
+                code,
+                op,
+                &r_args,
+                dst,
+                dst_bank,
+                StrSearchKind::Count,
+            )
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
 
     // `divmod(a, b)` on two exact ints: inline the guarded
     // `OS_INT_PY_DIV` / `OS_INT_PY_MOD` pair into a virtual `Cls_ii`
@@ -8244,21 +8447,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 .profiler()
                 .count_ops(call_opcode, majit_metainterp::counters::OPS);
         }
-        // Always record `list_write_barrier` on the Object strategy's in-place
-        // append arm.  Dropping it in favour of the backend's
-        // `COND_CALL_GC_WB_ARRAY` on the block's `setarrayitem` is unsound: a
-        // guard-failure bridge that re-materializes the items block appends into
-        // it without that array barrier ever firing, so an `old -> young` slot
-        // store leaves the block off the remembered set.  A later minor frees
-        // the still-referenced young element and the collector then reads a
-        // freed (poison) header.  The list barrier remembers the enclosing
-        // `W_ListObject`, whose trace reaches every slot, and keeps them alive.
+        // `list_write_barrier` is pyre's stand-in for the write barrier
+        // RPython's GC transform inserts.  `pyjitpl.py` never records
+        // `ll_writebarrier` as a call (`executor.py` skips `COND_CALL_GC_WB`);
+        // `rewrite.py gen_write_barrier` emits `COND_CALL_GC_WB` after
+        // optimize.  A residual `CallN` every Object-strategy append is the
+        // slow path of that barrier.  Record `CondCallGcWb` on the list
+        // instead: the fast path is a header-flag check, and remembering the
+        // `W_ListObject` still lets its custom tracer reach every slot
+        // (`list_append_write_barrier_gc`, including `MAJIT_GC_ITEMSBLOCK=0`).
+        // The helper still executes concretely below.
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
         let patch_pos = ctx.trace_ctx.get_trace_position();
-        let recorded = ctx
-            .trace_ctx
-            .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        let (recorded, is_list_wb) =
+            record_list_write_barrier_residual(ctx, funcptr, &allboxes, call_opcode, descr.clone());
 
         // `MIFrame.execute_varargs(pure=True)` parity: for
         // `CallPure*` whose every argbox carries a known `box_value`,
@@ -8354,8 +8557,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // (`CallLoopinvariant*`/`CallPure*`/`Call*`) match the
         // `_record_helper_varargs` invocation that runs inside
         // upstream's `executor.execute_varargs(opnum, ...)`.
-        ctx.trace_ctx
-            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        // `COND_CALL_GC_WB` is not a call (`resoperation.py`); the
+        // rewrite-inserted form never goes through `_record_helper_varargs`.
+        if !is_list_wb {
+            ctx.trace_ctx
+                .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        }
         // pyjitpl.py execute_varargs: `make_result_of_lastop(op)`
         // runs BEFORE `handle_possible_exception()` precisely "because we need
         // the box to show up in get_list_of_active_boxes()".  Write the dst
@@ -8393,7 +8600,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // (keyed on the guard opcode) so the
         // optimizer's `store_final_boxes_in_guard` finds a
         // `rd_resume_position` advanced *past* the call.
-        if can_raise {
+        // `COND_CALL_GC_WB` cannot raise (`resoperation.py`).
+        if can_raise && !is_list_wb {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // `handle_possible_exception` routes
@@ -8522,6 +8730,32 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         original_call_descr.arg_types(),
         None,
     );
+
+    if ctx.is_authoritative_executor && dst_bank == 'r' && i_args.len() == 1 && r_args.len() == 1 {
+        let func_addr = match ctx.trace_ctx.box_value(funcptr) {
+            Some(majit_ir::Value::Int(n)) => n,
+            _ => 0,
+        };
+        if func_addr != 0 && NEWUTF8_FNADDRS.contains(&func_addr) {
+            if let (Some(majit_ir::Value::Int(len)), Some(storage_obj)) = (
+                ctx.trace_ctx.box_value(i_args[0]),
+                walker_concrete_ref_object(ctx, r_args[0]),
+            ) {
+                if len >= 0 {
+                    let boxed = pyre_object::unicodeobject::w_str_from_storage_and_length(
+                        storage_obj as *mut pyre_object::unicodeobject::UnicodeValueStorage,
+                        len as usize,
+                    );
+                    if let Some(result) =
+                        try_walker_orthodox_newutf8(ctx, op.pc, r_args[0], i_args[0], boxed)?
+                    {
+                        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+                        return Ok((DispatchOutcome::Continue, op.next_pc));
+                    }
+                }
+            }
+        }
+    }
 
     // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before
     // any fold or residual applies the opcode. In particular,
@@ -8779,6 +9013,21 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         if let Some(inlined) = try_walker_inline_object_new(ctx, op, &r_args, dst_bank, dst)? {
             return Ok(inlined);
         }
+    }
+
+    // CONVERT_VALUE on an exact `int` (`!s`/`!r`/`!a`) or exact `str`
+    // `!s`: `descr_str` / `descr_repr` (intobject.py) share a body, and
+    // `descr_str` of an exact `str` is identity.  Keyed off the helper
+    // tag; a bool / subclass / Python `__str__` falls through.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::ConvertValue
+        && ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && spec_gate(SpecFold::ConvertValue, || {
+            try_walker_specialize_convert_value(ctx, op, &r_args, &i_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // LoadConst fold: the LOAD_CONST helper (oopspec `LoadConst`, set
@@ -9871,9 +10120,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // `pyjitpl.py:1943` takes `patch_pos` before recording the call so
         // `record_result_of_call_pure` can cut it back out.
         let patch_pos = ctx.trace_ctx.get_trace_position();
-        let recorded = ctx
-            .trace_ctx
-            .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+        let (recorded, is_list_wb) =
+            record_list_write_barrier_residual(ctx, funcptr, &allboxes, call_opcode, descr.clone());
 
         // `MIFrame.execute_varargs(pure=True)` parity — see
         // `dispatch_residual_call_iRd_kind` for the upstream walk.
@@ -9944,8 +10192,11 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // `dispatch_residual_call_iRd_kind` for the upstream-citation
         // walkthrough.  Same invalidation semantics; only the
         // arglist construction differs (boxes2 = i_args ++ r_args).
-        ctx.trace_ctx
-            .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        // `COND_CALL_GC_WB` is not a call (`resoperation.py`).
+        if !is_list_wb {
+            ctx.trace_ctx
+                .heapcache_invalidate_caches_varargs(call_opcode, Some(ei), &allboxes);
+        }
         // pyjitpl.py _opimpl_residual_call*: result writeback runs
         // BEFORE handle_possible_exception().  See
         // `dispatch_residual_call_iRd_kind` for the full citation.
@@ -9954,7 +10205,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         }
-        if can_raise {
+        if can_raise && !is_list_wb {
             if resid_raised {
                 walker_record_guard_exception(ctx, op.pc);
                 // pyjitpl.py `handle_possible_exception`
