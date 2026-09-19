@@ -13,12 +13,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use wasmi::{
-    AsContext, AsContextMut, Caller, Config, Engine, Extern, F32, F64, Func, Linker, Memory,
-    Module, Ref, Store, Table, Val, ValType,
+    AsContext, AsContextMut, Caller, Config, Engine, Extern, Func, Linker, Memory, Module, Ref,
+    Store, Table, Val, ValType, F32, F64,
 };
 
-use crate::CALL_RESULT_OFS;
 use crate::host_path::{guest_path_to_host, host_path_to_guest};
+use crate::CALL_RESULT_OFS;
 
 /// Per-store host state, mirroring the wasmtime path's `Host`. wasmi needs the
 /// engine handle stored too, because trace modules are compiled from inside an
@@ -39,7 +39,8 @@ fn estr(e: impl std::fmt::Display) -> String {
 
 /// Reported when wasmi's translator declines a main-module function. Not a pyre
 /// bug; the program is runnable under wasmtime.
-const WASMI_TRANSLATOR_DECLINE: &str = "wasmi could not translate this module (cmp+branch fusion assertion in wasmi 1.x); \
+const WASMI_TRANSLATOR_DECLINE: &str =
+    "wasmi could not translate this module (cmp+branch fusion assertion in wasmi 1.x); \
      run this program with `--engine wasmtime`";
 
 /// True for panics raised by wasmi's own bytecode translator (e.g. the
@@ -106,7 +107,9 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
     let memory = instance
         .get_memory(&store, "memory")
         .ok_or("main module is missing its `memory` export")?;
-    let table = instance.get_table(&store, "__indirect_function_table").ok_or(
+    let table = instance
+        .get_table(&store, "__indirect_function_table")
+        .ok_or(
         "main module is missing its `__indirect_function_table` export (build with --export-table)",
     )?;
     store.data_mut().memory = Some(memory);
@@ -137,6 +140,43 @@ pub fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32, Strin
                 .map_err(estr)?;
             set_path.call(&mut store, (p, nlen)).map_err(estr)?;
             dealloc.call(&mut store, (p, nlen)).map_err(estr)?;
+        }
+    }
+
+    // Same `pyre_set_gc_env` channel as the wasmtime path: the guest has no
+    // process environment, so `PYPY_GC_*` and `MAJIT_GC_STRESS` have to arrive
+    // before the first allocation builds the collector.
+    let gc_env_names = instance
+        .get_typed_func::<(), u64>(&store, "pyre_gc_env_names")
+        .ok();
+    let set_gc_env = instance
+        .get_typed_func::<(u32, u32), ()>(&store, "pyre_set_gc_env")
+        .ok();
+    if let (Some(names), Some(set_gc_env)) = (gc_env_names, set_gc_env) {
+        let packed = names.call(&mut store, ()).map_err(estr)?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf).map_err(estr)?;
+        dealloc.call(&mut store, (nptr, nlen)).map_err(estr)?;
+
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen).map_err(estr)?;
+            memory
+                .write(&mut store, p as usize, blob.as_bytes())
+                .map_err(estr)?;
+            set_gc_env.call(&mut store, (p, blen)).map_err(estr)?;
+            dealloc.call(&mut store, (p, blen)).map_err(estr)?;
         }
     }
 

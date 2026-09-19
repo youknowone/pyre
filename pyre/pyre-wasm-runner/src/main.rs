@@ -185,6 +185,9 @@ impl majit_backend_wasm_host::HostState for Host {
 /// here; the prefix match needs no upkeep for new guest-side knobs.
 fn warn_inert_guest_env() {
     const HOST_HANDLED: &[&str] = &["PYRE_STDLIB", "MAJIT_STATS", "PYRE_LOOP_CENSUS"];
+    // Forwarded into the guest through `pyre_set_gc_env` / `GC_ENV_NAMES`,
+    // not interpreted here. Presence of the name is the native contract.
+    const GUEST_FORWARDED_GC: &[&str] = &["MAJIT_GC_STRESS"];
     // `to_string_lossy`, not `into_string().ok()`: a name the platform allows
     // but UTF-8 does not is still a setting the guest silently ignores, and
     // dropping it here would hide exactly the case worth reporting.
@@ -195,6 +198,7 @@ fn warn_inert_guest_env() {
             !name.starts_with("PYRE_WASM_")
                 && !name.starts_with("PYRE_CHECK_")
                 && !HOST_HANDLED.contains(&name.as_str())
+                && !GUEST_FORWARDED_GC.contains(&name.as_str())
         })
         .collect();
     if inert.is_empty() {
@@ -572,9 +576,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         memory.read(&store, nptr as usize, &mut buf)?;
         dealloc.call(&mut store, (nptr, nlen))?;
 
-        // `env::var`, not `var_os`: the guest parses these as numbers, so a
+        // `env::var`, not `var_os`: the size/rate pins are numbers, so a
         // value that does not decode could not have been one and is left unset
-        // exactly as it would be natively.
+        // exactly as it would be natively. `MAJIT_GC_STRESS` is presence-only
+        // and any UTF-8 value, including empty, opts in.
         let blob = String::from_utf8_lossy(&buf)
             .split('\0')
             .filter(|name| !name.is_empty())

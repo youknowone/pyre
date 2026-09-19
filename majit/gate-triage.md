@@ -264,8 +264,8 @@ cover the condition they diagnose.
 ### `MAJIT_GC_STRESS`
 
 - Read sites: 1 — `majit/majit-gc/src/collector.rs`
-- Accessor: read inline in `with_config()`, behind `#[cfg(feature = "gc_stress")]`
-- What it does: **UNRECORDED** — no doc comment at the read site.
+- Accessor: `env_is_set("MAJIT_GC_STRESS")` in `with_config()`, behind `#[cfg(feature = "gc_stress")]`. Presence, not a parse: empty is on. Falls back to the embedder table (`GC_ENV_NAMES` / `set_supplied_env`) so a wasm32 guest with no process environment still opts in through `pyre_set_gc_env`.
+- What it does: with the `gc_stress` feature compiled in, force a full collection at the start of every `alloc_with_type` so a live object that is not reachable from a registered root or custom-trace path is moved or swept on the next allocation. Off by default even when the feature is compiled (`stress_collect` starts false unless the name is set). Test/diagnostic only.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_GC_YOUNG_RAWMALLOC`

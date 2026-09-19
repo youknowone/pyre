@@ -333,7 +333,7 @@ mod host_fs_provider {
         /// writing if it exceeds `cap`), or -1 if `path` is not a readable
         /// directory.
         fn host_list_dir(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32)
-        -> i64;
+            -> i64;
         /// Write the host's working directory into `[buf, buf+cap)`; return
         /// its byte length (without writing if it exceeds `cap`), or -1 if
         /// the host has none.
@@ -1217,7 +1217,7 @@ pub fn run_python(source: &str) -> String {
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
-    use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+    use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 
     // Buffers crossing the boundary are allocated and freed through the
     // global allocator with a `Layout::array::<u8>(len)` derived purely
@@ -1344,13 +1344,15 @@ mod host_abi {
         )
     }
 
-    /// Supply the `PYPY_GC_*` variables the collector sizes itself from, in the
-    /// same NUL-separated `NAME=VALUE` form as [`pyre_set_launch_env`]. The
-    /// guest has no environment, so without this the nursery, the major-collection
-    /// threshold and the growth rates all take their built-in defaults however
-    /// the host was configured — and the threshold decides when the collector
-    /// arms the eval-breaker word, which every compiled loop's back edge polls
-    /// through a real guard. `pyre_gc_env_names` lists the names that are read.
+    /// Supply the `PYPY_GC_*` / `MAJIT_GC_STRESS` variables the collector
+    /// sizes itself from (and, for stress, whether it collects on every
+    /// allocation), in the same NUL-separated `NAME=VALUE` form as
+    /// [`pyre_set_launch_env`]. The guest has no environment, so without this
+    /// the nursery, the major-collection threshold and the growth rates all
+    /// take their built-in defaults however the host was configured — and the
+    /// threshold decides when the collector arms the eval-breaker word, which
+    /// every compiled loop's back edge polls through a real guard.
+    /// `pyre_gc_env_names` lists the names that are read.
     ///
     /// The collector reads them once, when it is built, which the first
     /// allocation does — so this must precede `pyre_run_python`, not merely the
