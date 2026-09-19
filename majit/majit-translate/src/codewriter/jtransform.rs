@@ -16364,6 +16364,103 @@ mod tests {
         }
     }
 
+    /// The MIR front rewrites `f64::from_bits` to
+    /// `longlong2float.longlong2float`. `LongLong2FloatEntry.specialize_call`
+    /// emits `convert_longlong_bytes_to_float`; a leftover Call here
+    /// must do the same rather than residualize the path.
+    #[test]
+    fn longlong2float_call_rewrites_to_convert_llop() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("longlong2float_call");
+        let bits = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let target = CallTarget::function_path(["longlong2float", "longlong2float"]);
+        let result_ty = ValueType::Float;
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![bits.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&bits),
+            &result_ty,
+            "longlong2float_call",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert_eq!(ops.len(), 1);
+                match &ops[0].kind {
+                    OpKind::UnaryOp {
+                        op,
+                        operand,
+                        result_ty,
+                    } => {
+                        assert_eq!(op, "convert_longlong_bytes_to_float");
+                        assert_eq!(operand, &bits);
+                        assert_eq!(*result_ty, ValueType::Float);
+                    }
+                    other => panic!("expected convert_longlong_bytes_to_float, got {other:?}"),
+                }
+                assert_eq!(ops[0].result.as_ref(), Some(&result_var));
+            }
+            _ => panic!("expected Replace(convert_longlong_bytes_to_float)"),
+        }
+    }
+
+    /// `float2longlong` is the inverse: `convert_float_bytes_to_longlong`.
+    #[test]
+    fn float2longlong_call_rewrites_to_convert_llop() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("float2longlong_call");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["longlong2float", "float2longlong"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![value.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&value),
+            &result_ty,
+            "float2longlong_call",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert_eq!(ops.len(), 1);
+                match &ops[0].kind {
+                    OpKind::UnaryOp {
+                        op,
+                        operand,
+                        result_ty,
+                    } => {
+                        assert_eq!(op, "convert_float_bytes_to_longlong");
+                        assert_eq!(operand, &value);
+                        assert_eq!(*result_ty, ValueType::Int);
+                    }
+                    other => panic!("expected convert_float_bytes_to_longlong, got {other:?}"),
+                }
+                assert_eq!(ops[0].result.as_ref(), Some(&result_var));
+            }
+            _ => panic!("expected Replace(convert_float_bytes_to_longlong)"),
+        }
+    }
+
     /// `Transformer.rewrite_op_direct_call` dispatches real calls through
     /// CallControl; a function's leaf name does not make it a low-level cast.
     #[test]
