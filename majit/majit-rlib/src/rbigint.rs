@@ -661,6 +661,33 @@ impl RBigInt {
         }
     }
 
+    /// `[NULLDIGIT] * size` with the GC-transform livevars that
+    /// `gct_fv_gc_malloc` publishes across that malloc.  Reloads `a` and `b`
+    /// from the root span after a moving collection.
+    fn with_size_reloading_operands<'a>(
+        size: i64,
+        sign: i64,
+        a: &mut &'a RBigInt,
+        b: &mut &'a RBigInt,
+        digit_roots: Option<&mut [majit_ir::GcRef]>,
+    ) -> Self {
+        debug_assert!(size >= 0);
+        if let Some(roots) = digit_roots {
+            debug_assert!(roots.len() >= 2);
+            roots[0] = majit_ir::GcRef((*a as *const RBigInt) as usize);
+            roots[1] = majit_ir::GcRef((*b as *const RBigInt) as usize);
+            let block = unsafe { Digits::alloc_and_set_zero_rooted(size as usize, roots) };
+            *a = unsafe { &*(roots[0].0 as *const RBigInt) };
+            *b = unsafe { &*(roots[1].0 as *const RBigInt) };
+            Self {
+                _digits: block,
+                _size: size * sign,
+            }
+        } else {
+            Self::with_size(size, sign)
+        }
+    }
+
     /// The explicit Rust form of RPython's implicit `gc_malloc_array`
     /// `MemoryError` edge. Used by operations whose public Rust signature
     /// already carries `RBigIntError`.
@@ -1328,6 +1355,14 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn add(&self, other: &Self) -> Self {
+        self.add_with_gc_roots(other, None)
+    }
+
+    /// The body of `rbigint.add`, with the optional live-root vector inserted
+    /// by RPython's GC transform around the digit-list malloc.  Ordinary Rust
+    /// callers take the source-shaped `None` arm; GC-payload residuals supply
+    /// the transformed graph's roots through `rbigint::gc`.
+    fn add_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
         let selfsign = self.get_sign();
         let othersign = other.get_sign();
         if selfsign == 0 {
@@ -1337,9 +1372,9 @@ impl RBigInt {
             return self.translated_alias();
         }
         let mut result = if selfsign == othersign {
-            _x_add(self, other)
+            _x_add(self, other, digit_roots)
         } else {
-            _x_sub(other, self)
+            _x_sub(other, self, digit_roots)
         };
         result._set_sign(result.get_sign() * othersign);
         result
@@ -1416,6 +1451,11 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn sub(&self, other: &Self) -> Self {
+        self.sub_with_gc_roots(other, None)
+    }
+
+    /// GC-transformed twin of `sub`, for the residual payload boundary.
+    fn sub_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
         let selfsign = self.get_sign();
         let othersign = other.get_sign();
         if othersign == 0 {
@@ -1429,9 +1469,9 @@ impl RBigInt {
             );
         }
         let mut result = if selfsign == othersign {
-            _x_sub(self, other)
+            _x_sub(self, other, digit_roots)
         } else {
-            _x_add(self, other)
+            _x_add(self, other, digit_roots)
         };
         result._set_sign(result.get_sign() * selfsign);
         result
@@ -1468,6 +1508,11 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn mul(&self, other: &Self) -> Self {
+        self.mul_with_gc_roots(other, None)
+    }
+
+    /// GC-transformed twin of `mul`, for the residual payload boundary.
+    fn mul_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
         let mut this = self;
         let mut that = other;
         let mut selfsize = this.numdigits();
@@ -1510,7 +1555,7 @@ impl RBigInt {
                     1,
                 );
             }
-            result = _x_mul(this, that, this.digit(0));
+            result = _x_mul(this, that, this.digit(0), digit_roots);
         } else if USE_KARATSUBA {
             let cutoff = if std::ptr::eq(this, that) {
                 KARATSUBA_SQUARE_CUTOFF
@@ -1518,12 +1563,12 @@ impl RBigInt {
                 KARATSUBA_CUTOFF
             };
             if selfsize <= cutoff {
-                result = _x_mul(this, that, 0);
+                result = _x_mul(this, that, 0, digit_roots);
             } else {
-                result = _k_mul(this, that);
+                result = _k_mul(this, that, digit_roots);
             }
         } else {
-            result = _x_mul(this, that, 0);
+            result = _x_mul(this, that, 0, digit_roots);
         }
         result._set_sign(selfsign * othersign);
         result
@@ -2296,7 +2341,11 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn and_(&self, other: &Self) -> Self {
-        _bitwise_and(self, other)
+        self.and_with_gc_roots(other, None)
+    }
+
+    fn and_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
+        _bitwise_and(self, other, digit_roots)
     }
 
     #[majit_macros::jit_elidable]
@@ -2306,7 +2355,11 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn xor(&self, other: &Self) -> Self {
-        _bitwise_xor(self, other)
+        self.xor_with_gc_roots(other, None)
+    }
+
+    fn xor_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
+        _bitwise_xor(self, other, digit_roots)
     }
 
     #[majit_macros::jit_elidable]
@@ -2316,7 +2369,11 @@ impl RBigInt {
 
     #[majit_macros::jit_elidable]
     pub fn or_(&self, other: &Self) -> Self {
-        _bitwise_or(self, other)
+        self.or_with_gc_roots(other, None)
+    }
+
+    fn or_with_gc_roots(&self, other: &Self, digit_roots: Option<&mut [majit_ir::GcRef]>) -> Self {
+        _bitwise_or(self, other, digit_roots)
     }
 
     #[majit_macros::jit_elidable]
@@ -3117,14 +3174,18 @@ fn args_from_long(value: i128) -> (Vec<Digit>, i64) {
 }
 
 /// rbigint.py `_x_add`.
-fn _x_add<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
+fn _x_add<'a>(
+    mut a: &'a RBigInt,
+    mut b: &'a RBigInt,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
     if size_a < size_b {
         std::mem::swap(&mut a, &mut b);
         std::mem::swap(&mut size_a, &mut size_b);
     }
-    let mut z = RBigInt::with_size(size_a + 1, 1);
+    let mut z = RBigInt::with_size_reloading_operands(size_a + 1, 1, &mut a, &mut b, digit_roots);
     let mut i = 0;
     let mut carry = 0_u64;
     while i < size_b {
@@ -3164,7 +3225,11 @@ fn _x_int_add(a: &RBigInt, b: i64) -> RBigInt {
 }
 
 /// rbigint.py `_x_sub`.
-fn _x_sub<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
+fn _x_sub<'a>(
+    mut a: &'a RBigInt,
+    mut b: &'a RBigInt,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
     let mut size_a = a.numdigits();
     let mut size_b = b.numdigits();
     let mut sign = 1;
@@ -3188,7 +3253,7 @@ fn _x_sub<'a>(mut a: &'a RBigInt, mut b: &'a RBigInt) -> RBigInt {
         size_b = i;
     }
 
-    let mut z = RBigInt::with_size(size_a, sign);
+    let mut z = RBigInt::with_size_reloading_operands(size_a, sign, &mut a, &mut b, digit_roots);
     let mut borrow = 0_u64;
     let mut i = 0;
     while i < size_b {
@@ -3260,12 +3325,18 @@ const fn make_ptwotable() -> [i64; SHIFT as usize] {
 const PTWOTABLE: [i64; SHIFT as usize] = make_ptwotable();
 
 /// rbigint.py `_x_mul`.
-fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
+fn _x_mul<'a>(
+    mut a: &'a RBigInt,
+    mut b: &'a RBigInt,
+    digit: Digit,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
     let size_a = a.numdigits();
     let size_b = b.numdigits();
 
     if std::ptr::eq(a, b) {
-        let mut z = RBigInt::with_size(size_a + size_b, 1);
+        let mut z =
+            RBigInt::with_size_reloading_operands(size_a + size_b, 1, &mut a, &mut b, digit_roots);
         let mut i = 0;
         while i < size_a {
             let mut f = a.uwidedigit(i);
@@ -3305,7 +3376,8 @@ fn _x_mul(a: &RBigInt, b: &RBigInt, digit: Digit) -> RBigInt {
         return _muladd1(b, digit, 0);
     }
 
-    let mut z = RBigInt::with_size(size_a + size_b, 1);
+    let mut z =
+        RBigInt::with_size_reloading_operands(size_a + size_b, 1, &mut a, &mut b, digit_roots);
     let mut i = 0;
     let size_a1 = size_a - 1;
     let size_b1 = size_b - 1;
@@ -3379,10 +3451,18 @@ fn _kmul_split(n: &RBigInt, size: i64) -> (RBigInt, RBigInt) {
 }
 
 /// rbigint.py `_k_mul`.
-fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
+fn _k_mul<'a>(
+    mut a: &'a RBigInt,
+    mut b: &'a RBigInt,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
     let asize = a.numdigits();
     let bsize = b.numdigits();
-    let mut ret = RBigInt::with_size(asize + bsize, 1);
+    // Collecting malloc of the result buffer.  Recursive `mul` below stays
+    // on the source `None` arm: those intermediates are fresh nursery
+    // objects whose `_digits` are not in this residual's livevar span.
+    let mut ret =
+        RBigInt::with_size_reloading_operands(asize + bsize, 1, &mut a, &mut b, digit_roots);
     let shift = bsize >> 1;
     let (bh, bl) = _kmul_split(b, shift);
 
@@ -3431,11 +3511,11 @@ fn _k_mul(a: &RBigInt, b: &RBigInt) -> RBigInt {
     _v_isub(&mut ret, shift, i, &t2, t2.numdigits());
     _v_isub(&mut ret, shift, i, &t1, t1.numdigits());
 
-    let t1 = _x_add(ah, al);
+    let t1 = _x_add(ah, al, None);
     let t3 = if std::ptr::eq(a, b) {
         t1.mul(&t1)
     } else {
-        let t2 = _x_add(&bh, &bl);
+        let t2 = _x_add(&bh, &bl, None);
         t1.mul(&t2)
     };
     debug_assert!(t3.get_sign() >= 0);
@@ -4812,22 +4892,58 @@ fn _format(
     Ok(output)
 }
 
+/// Holds an inverted operand so its `_digits` stay live across a collecting
+/// `with_size`.  The residual root span names the heap payloads, not these
+/// stack handles; `RBigIntGcRoot` is the `_digits` shadow-stack slot.
+struct BitwiseInvertHold {
+    root: Option<RBigIntGcRoot>,
+    hold: Option<RBigInt>,
+}
+
+fn bitwise_prep_operand<'a>(
+    value: &'a RBigInt,
+    collect: bool,
+    storage: &'a mut BitwiseInvertHold,
+) -> (&'a RBigInt, Digit, bool) {
+    if value.get_sign() < 0 {
+        let inverted = value.invert();
+        if collect {
+            storage.root = Some(RBigIntGcRoot::new(inverted));
+            (
+                storage.root.as_ref().expect("just stored"),
+                MASK as Digit,
+                true,
+            )
+        } else {
+            storage.hold = Some(inverted);
+            (
+                storage.hold.as_ref().expect("just stored"),
+                MASK as Digit,
+                true,
+            )
+        }
+    } else {
+        (value, 0, false)
+    }
+}
+
 /// rbigint.py `@specialize.arg(1) _bitwise(a, '&', b)`.
-fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
-    let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
-        (&a_inverted, MASK as Digit)
-    } else {
-        (a, 0)
+fn _bitwise_and<'a>(
+    orig_a: &'a RBigInt,
+    orig_b: &'a RBigInt,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
+    let collect = digit_roots.is_some();
+    let mut a_storage = BitwiseInvertHold {
+        root: None,
+        hold: None,
     };
-    let b_inverted;
-    let (b, mut maskb) = if b.get_sign() < 0 {
-        b_inverted = b.invert();
-        (&b_inverted, MASK as Digit)
-    } else {
-        (b, 0)
+    let mut b_storage = BitwiseInvertHold {
+        root: None,
+        hold: None,
     };
+    let (a, mut maska, inverted_a) = bitwise_prep_operand(orig_a, collect, &mut a_storage);
+    let (b, mut maskb, inverted_b) = bitwise_prep_operand(orig_b, collect, &mut b_storage);
 
     let mut negz = false;
     let mut op_is_and = true;
@@ -4851,7 +4967,12 @@ fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
     } else {
         size_a.max(size_b)
     };
-    let mut z = RBigInt::with_size(size_z, 1);
+    let mut live_a = orig_a;
+    let mut live_b = orig_b;
+    let mut z =
+        RBigInt::with_size_reloading_operands(size_z, 1, &mut live_a, &mut live_b, digit_roots);
+    let a = if inverted_a { a } else { live_a };
+    let b = if inverted_b { b } else { live_b };
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -4873,21 +4994,22 @@ fn _bitwise_and(a: &RBigInt, b: &RBigInt) -> RBigInt {
 }
 
 /// The `'|'` graph emitted by upstream's `@specialize.arg(1) _bitwise`.
-fn _bitwise_or(a: &RBigInt, b: &RBigInt) -> RBigInt {
-    let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
-        (&a_inverted, MASK as Digit)
-    } else {
-        (a, 0)
+fn _bitwise_or<'a>(
+    orig_a: &'a RBigInt,
+    orig_b: &'a RBigInt,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
+    let collect = digit_roots.is_some();
+    let mut a_storage = BitwiseInvertHold {
+        root: None,
+        hold: None,
     };
-    let b_inverted;
-    let (b, mut maskb) = if b.get_sign() < 0 {
-        b_inverted = b.invert();
-        (&b_inverted, MASK as Digit)
-    } else {
-        (b, 0)
+    let mut b_storage = BitwiseInvertHold {
+        root: None,
+        hold: None,
     };
+    let (a, mut maska, inverted_a) = bitwise_prep_operand(orig_a, collect, &mut a_storage);
+    let (b, mut maskb, inverted_b) = bitwise_prep_operand(orig_b, collect, &mut b_storage);
 
     let mut negz = false;
     let mut op_is_and = false;
@@ -4911,7 +5033,12 @@ fn _bitwise_or(a: &RBigInt, b: &RBigInt) -> RBigInt {
     } else {
         size_a.max(size_b)
     };
-    let mut z = RBigInt::with_size(size_z, 1);
+    let mut live_a = orig_a;
+    let mut live_b = orig_b;
+    let mut z =
+        RBigInt::with_size_reloading_operands(size_z, 1, &mut live_a, &mut live_b, digit_roots);
+    let a = if inverted_a { a } else { live_a };
+    let b = if inverted_b { b } else { live_b };
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -4933,21 +5060,22 @@ fn _bitwise_or(a: &RBigInt, b: &RBigInt) -> RBigInt {
 }
 
 /// The `'^'` graph emitted by upstream's `@specialize.arg(1) _bitwise`.
-fn _bitwise_xor(a: &RBigInt, b: &RBigInt) -> RBigInt {
-    let a_inverted;
-    let (a, mut maska) = if a.get_sign() < 0 {
-        a_inverted = a.invert();
-        (&a_inverted, MASK as Digit)
-    } else {
-        (a, 0)
+fn _bitwise_xor<'a>(
+    orig_a: &'a RBigInt,
+    orig_b: &'a RBigInt,
+    digit_roots: Option<&mut [majit_ir::GcRef]>,
+) -> RBigInt {
+    let collect = digit_roots.is_some();
+    let mut a_storage = BitwiseInvertHold {
+        root: None,
+        hold: None,
     };
-    let b_inverted;
-    let (b, maskb) = if b.get_sign() < 0 {
-        b_inverted = b.invert();
-        (&b_inverted, MASK as Digit)
-    } else {
-        (b, 0)
+    let mut b_storage = BitwiseInvertHold {
+        root: None,
+        hold: None,
     };
+    let (a, mut maska, inverted_a) = bitwise_prep_operand(orig_a, collect, &mut a_storage);
+    let (b, maskb, inverted_b) = bitwise_prep_operand(orig_b, collect, &mut b_storage);
 
     let mut negz = false;
     if maska != maskb {
@@ -4958,7 +5086,12 @@ fn _bitwise_xor(a: &RBigInt, b: &RBigInt) -> RBigInt {
     let size_a = a.numdigits();
     let size_b = b.numdigits();
     let size_z = size_a.max(size_b);
-    let mut z = RBigInt::with_size(size_z, 1);
+    let mut live_a = orig_a;
+    let mut live_b = orig_b;
+    let mut z =
+        RBigInt::with_size_reloading_operands(size_z, 1, &mut live_a, &mut live_b, digit_roots);
+    let a = if inverted_a { a } else { live_a };
+    let b = if inverted_b { b } else { live_b };
     let mut i = 0;
     while i < size_z {
         let diga = if i < size_a {
@@ -4982,7 +5115,7 @@ fn _bitwise_xor(a: &RBigInt, b: &RBigInt) -> RBigInt {
 /// `@specialize.arg(1) _int_bitwise(a, '&', b)`.
 fn _int_bitwise_and(a: &RBigInt, mut b: i64) -> RBigInt {
     if !int_in_valid_range(b) {
-        return _bitwise_and(a, &RBigInt::fromint(b));
+        return _bitwise_and(a, &RBigInt::fromint(b), None);
     }
     let a_inverted;
     let (a, mut maska) = if a.get_sign() < 0 {
@@ -5039,7 +5172,7 @@ fn _int_bitwise_and(a: &RBigInt, mut b: i64) -> RBigInt {
 /// The `'|'` graph emitted by upstream's `@specialize.arg(1) _int_bitwise`.
 fn _int_bitwise_or(a: &RBigInt, mut b: i64) -> RBigInt {
     if !int_in_valid_range(b) {
-        return _bitwise_or(a, &RBigInt::fromint(b));
+        return _bitwise_or(a, &RBigInt::fromint(b), None);
     }
     let a_inverted;
     let (a, mut maska) = if a.get_sign() < 0 {
@@ -5096,7 +5229,7 @@ fn _int_bitwise_or(a: &RBigInt, mut b: i64) -> RBigInt {
 /// The `'^'` graph emitted by upstream's `@specialize.arg(1) _int_bitwise`.
 fn _int_bitwise_xor(a: &RBigInt, mut b: i64) -> RBigInt {
     if !int_in_valid_range(b) {
-        return _bitwise_xor(a, &RBigInt::fromint(b));
+        return _bitwise_xor(a, &RBigInt::fromint(b), None);
     }
     let a_inverted;
     let (a, mut maska) = if a.get_sign() < 0 {
@@ -7356,5 +7489,52 @@ mod tests {
         assert!(high < cache.lowest_part);
         assert!(low < cache.lowest_part);
         assert_eq!(value.str(0).unwrap(), source);
+    }
+
+    #[test]
+    fn add_sub_mul_and_bitwise_payloads_collecting_match_the_source_bodies() {
+        // Residual `jit_bigint_*` paths enter the GC-transformed bodies so
+        // the digit-list malloc can take `malloc_fast`'s `collect_and_reserve`.
+        // Without a collector the rooted allocator falls back to the ordinary
+        // list malloc; the two bodies must still agree.
+        let pairs = [
+            (0_i64, 0_i64),
+            (0, 1),
+            (1, 0),
+            (i64::MAX, 1),
+            (i64::MAX, i64::MAX),
+            (i64::MIN, i64::MIN),
+            (-1, 1),
+            (i64::MIN, 1),
+            (-7, -3),
+        ];
+        for (left, right) in pairs {
+            let a = RBigInt::fromint(left);
+            let b = RBigInt::fromint(right);
+            let added = unsafe { add_payloads_collecting(&a, &b) };
+            assert!(added.eq(&a.add(&b)), "{left} + {right}");
+            let subtracted = unsafe { sub_payloads_collecting(&a, &b) };
+            assert!(subtracted.eq(&a.sub(&b)), "{left} - {right}");
+            let product = unsafe { mul_payloads_collecting(&a, &b) };
+            assert!(product.eq(&a.mul(&b)), "{left} * {right}");
+            let anded = unsafe { and_payloads_collecting(&a, &b) };
+            assert!(anded.eq(&a.and_(&b)), "{left} & {right}");
+            let ored = unsafe { or_payloads_collecting(&a, &b) };
+            assert!(ored.eq(&a.or_(&b)), "{left} | {right}");
+            let xored = unsafe { xor_payloads_collecting(&a, &b) };
+            assert!(xored.eq(&a.xor(&b)), "{left} ^ {right}");
+        }
+        // Two-limb operands so `_x_add` / `_x_mul` walk more than one digit.
+        let a = RBigInt::fromint(i64::MAX)
+            .lshift(SHIFT)
+            .unwrap()
+            .int_add(i64::MAX);
+        let b = a.translated_alias();
+        assert!(unsafe { add_payloads_collecting(&a, &b) }.eq(&a.add(&b)));
+        assert!(unsafe { sub_payloads_collecting(&a, &b) }.eq(&a.sub(&b)));
+        assert!(unsafe { mul_payloads_collecting(&a, &b) }.eq(&a.mul(&b)));
+        assert!(unsafe { and_payloads_collecting(&a, &b) }.eq(&a.and_(&b)));
+        assert!(unsafe { or_payloads_collecting(&a, &b) }.eq(&a.or_(&b)));
+        assert!(unsafe { xor_payloads_collecting(&a, &b) }.eq(&a.xor(&b)));
     }
 }
