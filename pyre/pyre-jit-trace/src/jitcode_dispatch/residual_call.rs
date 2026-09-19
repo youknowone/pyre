@@ -4339,17 +4339,21 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // to be safer than.
     let writes_gc_liveness_root_only =
         helper == majit_ir::RuntimeHelperKind::ClearInFlightException;
-    // A transparent helper is not a Python body residual.  `write_cell`
+    // `cell_store_helper_subwalk` is write_cell-specific.  `write_cell`
     // implements STORE_NAME / STORE_GLOBAL; its inner ops are `helper=None`
     // Void writes, so the StoreName loop-var exemption above cannot see
     // them.  The caller journals the cell (`FBW_CELL_STORE_JOURNAL`).
     // Counting the descent as R1 body effect makes an abort after
     // `for y in xs` refuse delivery and drop the item
     // (`complex_abs_sub_hot`, `fbw_foriter_item_dropped`).
+    // A generator resume or an inlined builtin call also sets
+    // `transparent_helper_subwalk`, but those walks run real Python body
+    // code or unmodelled mutations with no journal, so they must not take
+    // this exemption.
     let body_effect_candidate = !provably_side_effect_free
         && !is_idempotent_gc_barrier
         && !is_loop_var_binding_store
-        && !ctx.fbw_mode.transparent_helper_subwalk
+        && !ctx.fbw_mode.cell_store_helper_subwalk
         && !writes_gc_liveness_root_only
         && writes_live_heap
         && fbw_foriter_inflight_active();

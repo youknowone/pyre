@@ -1729,6 +1729,10 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// Absolute build-time `MetaInterpStaticData.jitcodes` index of that
     /// helper. `None` outside a translated helper sub-walk.
     pub transparent_helper_jitcode_index: Option<usize>,
+    /// Set only while walking the generated `write_cell` helper.  Inner
+    /// ops are `helper=None` Void writes the StoreName loop-var exemption
+    /// cannot see; the caller journals them (`FBW_CELL_STORE_JOURNAL`).
+    pub cell_store_helper_subwalk: bool,
     /// A bridge-carrier resume folds nested self-recursive calls directly to
     /// `CALL_ASSEMBLER` (`opimpl_recursive_call_assembler`) rather than
     /// re-unrolling the call tree to the multi-frame depth cap.
@@ -1840,6 +1844,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
             immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,
             transparent_helper_jitcode_index: None,
+            cell_store_helper_subwalk: false,
             carrier_resume: false,
             current_exception_seed_from_walk_store: false,
             class_of_last_exc_is_const: false,

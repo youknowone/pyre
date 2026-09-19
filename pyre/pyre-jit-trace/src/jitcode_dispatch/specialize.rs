@@ -9629,15 +9629,17 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
         return Ok(false);
     }
     let cell_opref = ctx.trace_ctx.const_ref(stored as i64);
-    if descend_named_cell_helper(
+    let saved_fbw_mode = ctx.fbw_mode;
+    ctx.fbw_mode.cell_store_helper_subwalk = true;
+    let descended = descend_named_cell_helper(
         ctx,
         op_pc,
         jc.index(),
         &[(cell_opref, stored), (value_opref, new_value)],
         &WRITE_CELL_DESCENT,
-    )?
-    .is_none()
-    {
+    );
+    ctx.fbw_mode = saved_fbw_mode;
+    if descended?.is_none() {
         return Ok(false);
     }
     if unsafe { pyre_object::celldict::is_int_mutable_cell(stored) } {
