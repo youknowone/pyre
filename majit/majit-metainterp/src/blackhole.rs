@@ -867,18 +867,21 @@ impl BlackholeInterpreter {
 
     /// `setposition` without taking the `Arc`.
     ///
-    /// `blackhole.py BlackholeInterpreter.setposition` grows a bank only
-    /// when it is too small, then `copy_constants` of `len(constants)`
-    /// entries at `num_regs_*`. A same-helper reseat after
-    /// [`Self::reset_for_inline_reuse`] does not recopy: that reset no
-    /// longer wipes the constant area, so the previous copy is still
-    /// there (regex `shift` has `constants_* = 0` in any case).
+    /// Bank setup runs on every call. `blackhole.py
+    /// BlackholeInterpreter.setposition` grows a bank only when it is too
+    /// small (`len(registers_*) < num_regs_and_consts_*`), then
+    /// `copy_constants` of `len(constants)` entries at `num_regs_*`.
+    /// [`Self::init_register_file`] is that length gate, so an
+    /// unconditional [`Self::init_register_files_from_runtime_jitcode`]
+    /// re-copies constants and grows only when the bank is too small.
+    /// The `Arc::ptr_eq` test skips only the `Arc` clone when the jitcode
+    /// is unchanged.
     #[inline]
     pub fn setposition_ref(&mut self, jitcode: &std::sync::Arc<JitCode>, position: usize) {
         if !std::sync::Arc::ptr_eq(&self.jitcode, jitcode) {
             self.jitcode = std::sync::Arc::clone(jitcode);
-            self.init_register_files_from_runtime_jitcode(jitcode);
         }
+        self.init_register_files_from_runtime_jitcode(jitcode);
         self.reset_position_state(position);
         if crate::bh_debug_enabled() {
             eprintln!(
@@ -4770,6 +4773,38 @@ mod tests {
             assert_eq!(bh.registers_i[first_slot], 0x1111);
             bh.setposition_ref(&second, 0);
             assert_eq!(bh.registers_i[second_slot], 0x2222);
+        }
+
+        /// A drained interpreter whose `jitcode` is unchanged must still
+        /// reseat its banks. `blackhole.py BlackholeInterpreter.setposition`
+        /// grows a bank when `len(registers_*) < num_regs_and_consts_*` and
+        /// copies constants on every call. Two production sites empty the
+        /// banks with `std::mem::take` while leaving `jitcode` set
+        /// (`BlackholeTerminalImage::take_from`,
+        /// `SingleFrameBlackholeResult`).
+        #[test]
+        fn setposition_reseats_a_drained_register_file_for_the_same_jitcode() {
+            let mut b = JitCodeBuilder::default();
+            b.ensure_i_regs(1);
+            b.int_return(0);
+            let jitcode = std::sync::Arc::new(b.finish());
+            let mut builder = build_test_bh_builder();
+            let mut bh = builder.acquire_interp();
+            bh.setposition_ref(&jitcode, 0);
+            bh.setarg_i(0, 1);
+            assert_eq!(bh.registers_i[0], 1);
+
+            let _ = std::mem::take(&mut bh.registers_i);
+            let _ = std::mem::take(&mut bh.registers_r);
+            let _ = std::mem::take(&mut bh.registers_f);
+
+            bh.setposition_ref(&jitcode, 0);
+            assert!(
+                bh.registers_i.len() >= jitcode.num_regs_and_consts_i(),
+                "same-jitcode reseat after drain must grow the int bank"
+            );
+            bh.setarg_i(0, 7);
+            assert_eq!(bh.registers_i[0], 7);
         }
 
         /// `_setup_return_value_i` reads `code[position-1]`, the single
