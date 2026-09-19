@@ -117,8 +117,8 @@ fn dominating_literal(
     }
 }
 
-/// Replace `box_str_constant` calls over proven string literals with the
-/// literal constant while preserving each call's result variable.
+/// Replace `box_str_constant` calls over proven string literals with an
+/// interned-unicode Ref constant while preserving each call's result variable.
 pub fn fold_box_str_constants(graph: &mut FunctionGraph) {
     let mut rewrites = Vec::new();
     for block in &graph.blocks {
@@ -133,7 +133,7 @@ pub fn fold_box_str_constants(graph: &mut FunctionGraph) {
     }
 
     for (block_id, op_index, bytes) in rewrites {
-        graph.block_mut(block_id).operations[op_index].kind = OpKind::ConstStr(bytes);
+        graph.block_mut(block_id).operations[op_index].kind = OpKind::ConstInternedStr(bytes);
     }
 }
 
@@ -186,7 +186,10 @@ mod tests {
         );
         let folded = &graph.block(call_block).operations[0];
         assert_eq!(folded.result.as_ref(), Some(&boxed));
-        assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+        assert_eq!(
+            folded.kind,
+            OpKind::ConstInternedStr(b"__instancecheck__".to_vec())
+        );
     }
 
     /// The other arm of [`str_literal_bytes`]. A front pass sees the literal
@@ -213,7 +216,10 @@ mod tests {
         );
         let folded = &graph.block(entry).operations[1];
         assert_eq!(folded.result.as_ref(), Some(&boxed));
-        assert_eq!(folded.kind, OpKind::ConstStr(b"__instancecheck__".to_vec()));
+        assert_eq!(
+            folded.kind,
+            OpKind::ConstInternedStr(b"__instancecheck__".to_vec())
+        );
     }
 
     #[test]

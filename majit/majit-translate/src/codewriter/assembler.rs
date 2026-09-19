@@ -1386,6 +1386,21 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::ConstInternedStr(bytes) => {
+                let hash = crate::translator::rtyper::lltypesystem::rstr::ll_strhash_value(bytes);
+                let idx = self.emit_str_const_r(bytes.clone(), hash, true, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::ConstRefNull => {
                 let const_value = crate::flowspace::model::ConstValue::LLAddress(
                     crate::translator::rtyper::lltypesystem::lltype::_address::Null,
@@ -2956,6 +2971,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstStr(_) => "ConstStr",
+                OpKind::ConstInternedStr(_) => "ConstInternedStr",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
                 OpKind::ConstNone => "ConstNone",
@@ -3265,7 +3281,7 @@ impl AssemblerEncode for Assembler {
             && let Some((bytes, hash)) =
                 crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
         {
-            return self.emit_str_const_r(bytes, hash, state);
+            return self.emit_str_const_r(bytes, hash, false, state);
         }
         // A unit-variant prebuilt singleton is likewise process-local
         // (`rpbc.py SingleFrozenPBCRepr`'s prebuilt instance): the
@@ -3315,9 +3331,14 @@ impl AssemblerEncode for Assembler {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
+        as_unicode_object: bool,
         state: &mut AssemblyState,
     ) -> u8 {
-        if let Some(ordinal) = state.str_consts.iter().position(|d| d.bytes == bytes) {
+        if let Some(ordinal) = state
+            .str_consts
+            .iter()
+            .position(|d| d.bytes == bytes && d.as_unicode_object == as_unicode_object)
+        {
             return self.emit_const_r_bits(str_const_sentinel(ordinal), state);
         }
         let ordinal = state.str_consts.len();
@@ -3332,6 +3353,7 @@ impl AssemblerEncode for Assembler {
             constants_r_index,
             bytes,
             precomputed_hash,
+            as_unicode_object,
         });
         reg
     }
@@ -5097,6 +5119,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
         OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstRefAddr(_) => "ref_copy".into(),

@@ -9719,6 +9719,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstFloat(_)
         | OpKind::ConstSingleFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone

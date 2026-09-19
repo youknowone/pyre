@@ -7669,7 +7669,10 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             let w_descr = if metatype.is_null() {
                 None
             } else {
-                lookup_in_type_where_wtf8(metatype, name)
+                lookup_in_type_where_wtf8(
+                    metatype,
+                    pyre_object::unicodeobject::box_str_constant(name),
+                )
             };
             // typeobject.py:814-819: metatype data descriptor, bound as
             // `__get__(self, type(self))`.
@@ -7684,7 +7687,9 @@ pub(crate) unsafe fn object_getattribute_surrogate(
             // Internally a null receiver distinguishes this class access from
             // attribute access on the actual `None` singleton; `get` converts
             // it back to `w_None` only for a Python-visible `__get__` call.
-            if let Some(w_value) = lookup_in_type_where_wtf8(obj, name) {
+            if let Some(w_value) =
+                lookup_in_type_where_wtf8(obj, pyre_object::unicodeobject::box_str_constant(name))
+            {
                 if let Some(result) = get(w_value, PY_NULL, obj)? {
                     return Ok(result);
                 }
@@ -10836,6 +10841,7 @@ pub(crate) unsafe fn lookup_where_pair_no_unwrapping(
     // the way `lookup_in_type_uncached_split` does for the value half: the
     // `&str` projections above cannot be published as residual targets, and
     // an unpublished callee blocks every descent whose body reaches this arm.
+    // A proven literal here folds to one interned-unicode Ref constant.
     let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
     let name_wtf8 = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
     for _ in 0..8 {
@@ -10925,9 +10931,8 @@ pub(crate) unsafe fn lookup_in_type_wtf8_uncached(
 }
 
 /// Residual-call twin of [`lookup_in_type_wtf8_uncached`] for traced code:
-/// the name arrives as an interned, immortal str object (`box_str_constant`)
-/// because the residual call ABI cannot pass a `&Wtf8`, and the result is a
-/// raw pointer with null for `None`.  The same shape as
+/// `w_name` is an interned immortal str object, and the result is a raw
+/// pointer with null for `None`.  The same shape as
 /// [`_pure_lookup_where_with_method_cache`] next to the cached arm, without
 /// the elidable marker: this arm serves types without a version tag.
 ///
@@ -10957,18 +10962,17 @@ pub(crate) unsafe fn _lookup_where_class_uncached(
     lookup_where_pair_wtf8_uncached(w_type, name).map_or(std::ptr::null_mut(), |(src, _value)| src)
 }
 
-/// The uncached arms of [`lookup_in_type_where_wtf8`].  The ordinary
-/// interpreter passes its borrowed name straight through; traced code boxes
-/// the name so the residual call carries thin pointers only, which keeps the
-/// un-lowerable `&Wtf8` callee out of every gateway body that reaches a type
-/// lookup (`descent_decline` scans a body for such callees regardless of
-/// which arm executes).
+/// The uncached arms of [`lookup_in_type_where_wtf8`].  `w_name` is already
+/// the interned immortal str; the residual call carries thin pointers only.
 #[inline]
-unsafe fn lookup_in_type_uncached_split(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+unsafe fn lookup_in_type_uncached_split(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+) -> Option<PyObjectRef> {
     if !majit_metainterp::jit::we_are_jitted() {
+        let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
         return lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v));
     }
-    let w_name = pyre_object::unicodeobject::box_str_constant(name);
     let v = _lookup_in_type_uncached(w_type, w_name);
     unwrap_looked_up_value(v)
 }
@@ -11405,6 +11409,7 @@ pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectR
 /// `(version_tag, name)`-keyed `MethodCache` for the `(w_class,
 /// w_value)` pair.  The cache stores the cell.  A `MutableCell` is
 /// unwrapped here; any other value is returned in the cached tuple.
+#[inline(always)]
 pub(crate) unsafe fn lookup_where_with_method_cache(
     w_type: PyObjectRef,
     name: &str,
@@ -11432,18 +11437,10 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // same cache entry (see `_pure_lookup_class_with_method_cache`), so the
     // `MethodCache` read stays off the trace surface and the lookup folds to
     // a `CALL_PURE_R` instead of aborting the trace.  The interned, immortal
-    // `w_name` (`box_str_constant`) is the green token the trace folds on;
-    // both residuals share it.  Upstream reads the pair atomically because it
-    // returns one tuple, whereas each residual here takes the cache mutex
-    // separately, so a concurrent `mutated()` can land between them.  That is
-    // no weaker than the `version_tag` promotion above, which is likewise
-    // only stable while no other thread invalidates the type: both halves are
-    // then read under a tag that is no longer current, exactly as a lookup
-    // that had completed one instruction earlier would have been.
-    let w_name = pyre_object::unicodeobject::box_str_constant_jit_abi(
-        name.as_ptr() as i64,
-        name.len() as i64,
-    ) as PyObjectRef;
+    // `w_name` is the green token the trace folds on; both residuals share
+    // it.  A proven literal folds to one Ref constant, so no `str::as_ptr` /
+    // `str::len` operand remains in the jitcode.
+    let w_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(name));
     lookup_where_with_method_cache_w(w_type, w_name, version_tag)
 }
 
@@ -11578,10 +11575,10 @@ pub(crate) unsafe fn w_type_getdictvalue(
 /// at the call site below.
 pub(crate) unsafe fn lookup_in_type_where_wtf8(
     w_type: PyObjectRef,
-    name: &Wtf8,
+    w_name: PyObjectRef,
 ) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
-        return lookup_in_type_uncached_split(w_type, name);
+        return lookup_in_type_uncached_split(w_type, w_name);
     }
     // typeobject.py:505 — `promote(self)`.
     let _ = majit_metainterp::jit::promote(w_type);
@@ -11589,21 +11586,16 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     let version_tag = w_type_version_tag(w_type);
     if version_tag == 0 {
         // typeobject.py:507-509 — no version tag: uncacheable.
-        return lookup_in_type_uncached_split(w_type, name);
+        return lookup_in_type_uncached_split(w_type, w_name);
     }
     if !majit_metainterp::jit::we_are_jitted() {
+        let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
         let v = _cached_lookup_where_name(w_type, name, version_tag).1;
         return unwrap_looked_up_value(v);
     }
-    // The JIT elidable projection takes an interned, immortal str object
-    // (`box_str_constant`: content-keyed, never freed) because its residual
-    // call ABI cannot pass a `&Wtf8`. The ordinary interpreter returned through
-    // `_cached_lookup_where_name` above without materialising this wrapper.
-    // This does not fold away after tracing: each lookup calls
-    // `box_str_constant` (the process-global `STRING_INTERN_TABLE` mutex) once
-    // per lookup per iteration.
-    let w_name = pyre_object::unicodeobject::box_str_constant(name);
     // typeobject.py — `_pure_lookup_where_with_method_cache(name, version_tag)`.
+    // `w_name` is the interned immortal str; a proven literal in the caller
+    // is one Ref constant, so this graph has no boxing call.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
     unwrap_looked_up_value(v)
 }
@@ -11742,9 +11734,12 @@ unsafe fn unwrap_looked_up_value(w_value: PyObjectRef) -> Option<PyObjectRef> {
     }
 }
 
-#[inline]
+#[inline(always)]
 pub unsafe fn lookup_in_type_where(w_type: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    lookup_in_type_where_wtf8(w_type, Wtf8::new(name))
+    lookup_in_type_where_wtf8(
+        w_type,
+        pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+    )
 }
 
 /// `objspace.py:817 getfulltypename` — the type name used by the default
@@ -12197,7 +12192,8 @@ pub unsafe fn type_attr_value_fast_path(
     }
     // typeobject.py:814-823: a metatype data descriptor preempts the class's
     // own MRO, while a non-data metatype entry loses to the class value.
-    if lookup_in_type_where_wtf8(metatype, name).is_some_and(|descr| is_data_descr(descr)) {
+    let w_name = pyre_object::unicodeobject::box_str_constant(name);
+    if lookup_in_type_where_wtf8(metatype, w_name).is_some_and(|descr| is_data_descr(descr)) {
         return None;
     }
     // `try_walker_specialize_load_type_attr` and
@@ -12207,7 +12203,7 @@ pub unsafe fn type_attr_value_fast_path(
     if type_attr_stored_is_cell(w_type, name) {
         return None;
     }
-    let w_value = lookup_in_type_where_wtf8(w_type, name)?;
+    let w_value = lookup_in_type_where_wtf8(w_type, w_name)?;
     // typeobject.py:822 calls `space.get(w_value, w_None, self)`; `get`'s arms
     // for a null instance decide what that answers.
     // `gateway.py descr_function_get` with no instance returns the function
@@ -12405,7 +12401,9 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
     if type_attr_stored_is_cell(w_type, name) {
         return None;
     }
-    let w_descr = unsafe { lookup_in_type_where_wtf8(w_type, name)? };
+    let w_descr = unsafe {
+        lookup_in_type_where_wtf8(w_type, pyre_object::unicodeobject::box_str_constant(name))?
+    };
     // The exact shape `get()` binds through `w_method_new`: a `function` or a
     // `method_descriptor`.  Both take the SAME arm there (the
     // `FUNCTION_TYPE || METHOD_DESCRIPTOR_TYPE` test above `w_method_new`),

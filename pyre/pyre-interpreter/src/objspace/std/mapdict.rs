@@ -2237,7 +2237,12 @@ unsafe fn property_descr_fast_path_wtf8(
     if unsafe { crate::baseobjspace::type_attr_stored_is_cell(w_type, name) } {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(w_type, name) }?;
+    let w_descr = unsafe {
+        crate::baseobjspace::lookup_in_type_where_wtf8(
+            w_type,
+            pyre_object::unicodeobject::box_str_constant(name),
+        )
+    }?;
     // Exact type: the fold calls `fget`/`fset` directly, which stands in for
     // `type(w_descr).__get__` only where that cannot have been overridden
     // (`descroperation.py get_and_call_function`).  A `property` subclass keeps the base

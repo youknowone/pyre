@@ -422,16 +422,21 @@ pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
 /// pattern.
 const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
-/// Materialize one immortal rstr `STR` for a prebuilt-string constant.
-/// `StringRepr.convert_const` (`rstr.py`) yields `Ptr(STR)`, and
-/// `bh_strlen` / `bh_strgetitem` (`llmodel.py`) read that payload.
-/// `box_str_constant` still interns the wrapper; the slot holds
-/// `_utf8`, not the wrapper header.
-fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
+/// Materialize one immortal string constant.
+///
+/// `as_unicode_object` is the `box_str_constant` result — a `W_UnicodeObject`
+/// the residual `w_name` ABI passes as one Ref. Otherwise the slot is rstr
+/// `Ptr(STR)` (`StringRepr.convert_const`): `bh_strlen` / `bh_strgetitem`
+/// read that payload.
+fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_object: bool) -> i64 {
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("prebuilt STR constant bytes are not valid WTF-8");
     let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
-    unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+    if as_unicode_object {
+        wrapper as i64
+    } else {
+        unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+    }
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -451,7 +456,7 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
 /// identity holds across calls even though entries are materialized one
 /// jitcode at a time.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
-    let mut interned: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut interned: HashMap<(Vec<u8>, bool), i64> = HashMap::new();
     for arc in jitcodes.iter_mut() {
         // Body-less placeholder shells, and bodies with no deferred strings
         // (the common case — only cutover string literals record any), need
@@ -467,14 +472,15 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
         for i in 0..body.str_consts.len() {
             let idx = body.str_consts[i].constants_r_index;
             let hash = body.str_consts[i].precomputed_hash;
+            let as_unicode_object = body.str_consts[i].as_unicode_object;
             let addr = {
                 let bytes = &body.str_consts[i].bytes;
-                if let Some(&a) = interned.get(bytes) {
+                let key = (bytes.clone(), as_unicode_object);
+                if let Some(&a) = interned.get(&key) {
                     a
                 } else {
-                    let owned = bytes.clone();
-                    let a = materialize_prebuilt_str(&owned, hash);
-                    interned.insert(owned, a);
+                    let a = materialize_prebuilt_str(&key.0, hash, as_unicode_object);
+                    interned.insert(key, a);
                     a
                 }
             };
@@ -632,6 +638,7 @@ mod tests {
             constants_r_index: 0,
             bytes: b"hello".to_vec(),
             precomputed_hash: 0x1234_5678,
+            as_unicode_object: false,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -658,6 +665,7 @@ mod tests {
             constants_r_index: 0,
             bytes: b"x".to_vec(),
             precomputed_hash: 7,
+            as_unicode_object: false,
         };
         let mut jcs = vec![
             jitcode_with_str_consts(vec![desc()]),
@@ -684,6 +692,7 @@ mod tests {
                 constants_r_index: 0,
                 bytes: b"y".to_vec(),
                 precomputed_hash: 9,
+                as_unicode_object: false,
             };
             let mut first = vec![jitcode_with_str_consts(vec![desc()])];
             let mut second = vec![jitcode_with_str_consts(vec![desc()])];
@@ -841,6 +850,7 @@ mod tests {
             constants_r_index: 0,
             bytes: Vec::new(),
             precomputed_hash: -1,
+            as_unicode_object: false,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -858,5 +868,23 @@ mod tests {
             runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
         );
+    }
+
+    #[test]
+    fn materialize_str_consts_unicode_object_slot_is_the_wrapper() {
+        let descs = vec![StrConstDescriptor {
+            constants_r_index: 0,
+            bytes: b"__add__".to_vec(),
+            precomputed_hash: 0,
+            as_unicode_object: true,
+        }];
+        let mut jcs = vec![jitcode_with_str_consts(descs)];
+        materialize_str_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        let wrapper =
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new("__add__"));
+        assert_eq!(addr, wrapper as i64);
+        let storage = unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) } as i64;
+        assert_ne!(addr, storage, "w_name is the wrapper, not the rstr payload");
     }
 }
