@@ -942,6 +942,12 @@ pub struct CompiledLoopToken {
     /// the owning Arc is built first, then `set_loop_token_wref` patches
     /// the weak ref through `&CompiledLoopToken`.
     pub loop_token_wref: parking_lot::Mutex<std::sync::Weak<JitCellToken>>,
+    /// Lock-free stamp of the owning `JitCellToken`'s green key, written
+    /// in [`Self::set_loop_token_wref`] once the owning Arc is the stable
+    /// identity. `0` is a legal green key, so `owning_green_key_set` is
+    /// the "is set" flag rather than a sentinel.
+    owning_green_key: AtomicU64,
+    owning_green_key_set: AtomicBool,
     /// `model.py` `self.bridges_count = 0`.
     pub bridges_count: parking_lot::Mutex<usize>,
     /// `model.py` `self.looptokens_redirected_to = []` — weak
@@ -1040,6 +1046,8 @@ impl CompiledLoopToken {
         CompiledLoopToken {
             number,
             loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
+            owning_green_key: AtomicU64::new(0),
+            owning_green_key_set: AtomicBool::new(false),
             bridges_count: parking_lot::Mutex::new(0),
             looptokens_redirected_to: parking_lot::Mutex::new(Vec::new()),
             asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
@@ -1056,8 +1064,15 @@ impl CompiledLoopToken {
     /// stable identity (i.e., once `make_jitcell_token` has stamped its
     /// generation and the token is the soon-to-be `compiled_loops[gk]`
     /// entry's `.token` field). The weak ref ages out automatically when
-    /// memmgr drops the owning Arc.
+    /// memmgr drops the owning Arc. Also stamps `owning_green_key` from
+    /// the upgraded token so [`descr_owning_green_key`] can read it
+    /// without locking.
     pub fn set_loop_token_wref(&self, wref: std::sync::Weak<JitCellToken>) {
+        if let Some(jct) = wref.upgrade() {
+            self.owning_green_key
+                .store(jct.green_key(), Ordering::Relaxed);
+            self.owning_green_key_set.store(true, Ordering::Release);
+        }
         *self.loop_token_wref.lock() = wref;
     }
 
@@ -1174,6 +1189,27 @@ pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>
 /// consume the metainterp `AbstractFailDescr` Arc directly.
 pub fn descr_owning_jct(descr: &dyn FailDescr) -> Option<Arc<JitCellToken>> {
     descr_owning_clt(descr)?.upgrade_loop_token()
+}
+
+/// Lock-free reader of the owning loop's green key.
+///
+/// Reaches the owning [`CompiledLoopToken`] the same way [`descr_owning_jct`]
+/// does (via [`descr_owning_clt`]) and returns the green key stamped at
+/// [`CompiledLoopToken::set_loop_token_wref`]. Returns `None` when `descr`
+/// carries no owning clt or the stamp was never written. Does not lock the
+/// weak-reference mutex and does not upgrade the weak reference.
+///
+/// Unlike [`descr_owning_jct`], this keeps answering after the owning
+/// `JitCellToken` has been dropped by the memory manager. That matches
+/// `compile.py AbstractResumeGuardDescr.must_compile` reading
+/// `self.rd_loop_token` and `pyjitpl.py` reading `resumedescr.rd_loop_token`:
+/// `rd_loop_token` is a strong attribute and never becomes unreadable.
+pub fn descr_owning_green_key(descr: &dyn FailDescr) -> Option<u64> {
+    let clt = descr_owning_clt(descr)?;
+    if !clt.owning_green_key_set.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(clt.owning_green_key.load(Ordering::Relaxed))
 }
 
 /// Token identifying a compiled loop. Bridges are attached to this.

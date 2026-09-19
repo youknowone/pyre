@@ -3650,7 +3650,7 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = ExitTypes::from_slice(descr.fail_arg_types());
-        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
+        let rd_loop_token = majit_backend::descr_owning_green_key(descr);
 
         let default_layout = || CompiledExitLayout {
             rd_loop_token: green_key,
@@ -12361,17 +12361,12 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
-        // compile.py `descr.rd_loop_token` — owning loop's clt,
-        // stamped at compile time.  Walk the chain
-        // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
-        // recover the owning `Arc<JitCellToken>` (pyjitpl.py:2897
-        // `resumedescr.rd_loop_token.loop_token_wref()`) for guard
-        // exits that belong to a loop other than the one currently
-        // executing (bridge-into-B while running A).  Derive
-        // `green_key` from `jct.green_key` so identity is preserved
-        // through the lookup. O(1) replacement for the legacy O(N)
-        // scan over `compiled_loops`.
-        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
+        // compile.py `descr.rd_loop_token` — owning loop's green key,
+        // stamped onto the clt at `set_loop_token_wref`. Guard exits
+        // that belong to a loop other than the one currently executing
+        // (bridge-into-B while running A) read that stamp lock-free.
+        // `pyjitpl.py` reads `resumedescr.rd_loop_token` the same way.
+        let rd_loop_token = majit_backend::descr_owning_green_key(descr);
         Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
@@ -12833,12 +12828,12 @@ impl<M: Clone> MetaInterp<M> {
         };
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
         // Only the layout fallback and the `must_compile` identity read it, and
-        // a JUMP exit reaches neither, so the weakref upgrade the resolution
-        // costs is not paid on the back edge.
+        // a JUMP exit reaches neither, so the owning-key resolution is not
+        // paid on the back edge.
         let rd_loop_token = if is_jump_exit {
             None
         } else {
-            majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key())
+            majit_backend::descr_owning_green_key(descr)
         };
         Self::finish_compiled_run_io();
 
@@ -13928,12 +13923,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Green key of the loop a failing guard belongs to.
     ///
-    /// `compile.py _trace_and_compile_from_bridge` walks
-    /// `resumedescr.rd_loop_token.loop_token_wref()` for the owning JCT.  When
-    /// the weakref is dead (memmgr eviction — `compile.py compile.giveup()`
-    /// parity), no other identity is recoverable, so the caller's own outer
-    /// entry key stands in.  RPython has no such fallback because its identity
-    /// is descr-pointer-based, never indirected through a numeric `green_key`.
+    /// `compile.py AbstractResumeGuardDescr.must_compile` reads
+    /// `self.rd_loop_token`; `pyjitpl.py` reads `resumedescr.rd_loop_token`.
+    /// That attribute is strong, so this path uses the green key stamped
+    /// onto the owning clt rather than upgrading the weakref.  When the
+    /// descr carries no owning clt (or the stamp was never written), the
+    /// caller's own outer entry key stands in.  RPython has no such
+    /// fallback because its identity is descr-pointer-based, never
+    /// indirected through a numeric `green_key`.
     ///
     /// A JitCellToken invalidated by `QuasiImmut.invalidate()` (quasiimmut.py)
     /// still resolves here, and the `must_compile` tick that follows still
@@ -13949,8 +13946,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> u64 {
         descr_arc
             .as_fail_descr()
-            .and_then(majit_backend::descr_owning_jct)
-            .map(|jct| jct.green_key())
+            .and_then(majit_backend::descr_owning_green_key)
             .unwrap_or(fallback_green_key)
     }
 
@@ -13968,7 +13964,7 @@ impl<M: Clone> MetaInterp<M> {
     /// loop_token_wref()`, `trace_id` mirrors `assembler.py:227
     /// self.faildescr.trace_id`, and `fail_index_per_trace` mirrors
     /// `self.faildescr.index = i`.  The `fallback_green_key` only fires
-    /// when the owning-JCT walk returns `None`; see
+    /// when the stamped owning green key is unset; see
     /// [`Self::owning_key_for_descr`].
     ///
     /// Returns (should_compile, owning_green_key).
@@ -16317,9 +16313,8 @@ impl<M: Clone> MetaInterp<M> {
             let descr = descr_arc
                 .as_fail_descr()
                 .expect("forced virtualizable must have a fail descriptor");
-            let green_key = majit_backend::descr_owning_jct(descr)
-                .expect("forced virtualizable must belong to a compiled loop")
-                .green_key();
+            let green_key = majit_backend::descr_owning_green_key(descr)
+                .expect("forced virtualizable must belong to a compiled loop");
             let trace_id = descr.trace_id();
             let fail_index = descr.fail_index();
             // compile.py `force_from_resumedata(..., deadframe)`: TAGBOX
