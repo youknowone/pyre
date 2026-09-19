@@ -1219,22 +1219,23 @@ pub fn default_unicode_hash(a: i64) -> u64 {
 /// fallback masks frontend-init bugs (e.g., calling
 /// `equal_whatever(GreenType::Str, ..)` before
 /// `install_jit_call_bridge` runs).
+///
+/// `#[inline]` is `@specialize.arg(0)` (warmstate.py): `tp` is a
+/// translation-time constant at every generated merge point, so the
+/// Int/Ref/Void arm is a compare once this inlines. Resolver-missing
+/// panics stay behind `#[cold] #[inline(never)]` so they do not inflate
+/// that arm.
+#[inline]
 pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
     match tp {
-        GreenType::Str => STR_EQ.get().expect(
-            "equal_whatever(GreenType::Str, ..): no Str resolver \
-                 registered — frontend must call \
-                 `set_str_resolver(eq, hash)` at startup before any \
-                 STR green key is compared (warmstate.py:108-111 \
-                 ll_streq parity)",
-        )(x, y),
-        GreenType::Unicode => UNICODE_EQ.get().expect(
-            "equal_whatever(GreenType::Unicode, ..): no Unicode \
-                 resolver registered — frontend must call \
-                 `set_unicode_resolver(eq, hash)` at startup before \
-                 any UNICODE green key is compared (warmstate.py:\
-                 108-111 ll_streq parity)",
-        )(x, y),
+        GreenType::Str => match STR_EQ.get() {
+            Some(eq) => eq(x, y),
+            None => equal_whatever_missing_str(),
+        },
+        GreenType::Unicode => match UNICODE_EQ.get() {
+            Some(eq) => eq(x, y),
+            None => equal_whatever_missing_unicode(),
+        },
         GreenType::Float => {
             let a = f64::from_bits(x as u64);
             let b = f64::from_bits(y as u64);
@@ -1243,6 +1244,30 @@ pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
         // Int, Ref, Void: x == y (integer / pointer equality)
         GreenType::Int | GreenType::Ref | GreenType::Void => x == y,
     }
+}
+
+#[cold]
+#[inline(never)]
+fn equal_whatever_missing_str() -> ! {
+    panic!(
+        "equal_whatever(GreenType::Str, ..): no Str resolver \
+                 registered — frontend must call \
+                 `set_str_resolver(eq, hash)` at startup before any \
+                 STR green key is compared (warmstate.py:108-111 \
+                 ll_streq parity)"
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn equal_whatever_missing_unicode() -> ! {
+    panic!(
+        "equal_whatever(GreenType::Unicode, ..): no Unicode \
+                 resolver registered — frontend must call \
+                 `set_unicode_resolver(eq, hash)` at startup before \
+                 any UNICODE green key is compared (warmstate.py:\
+                 108-111 ll_streq parity)"
+    );
 }
 
 /// warmstate.py hash_whatever(TYPE, x)
@@ -1262,22 +1287,23 @@ pub fn equal_whatever(tp: GreenType, x: i64, y: i64) -> bool {
 /// masks frontend-init bugs (e.g., calling
 /// `hash_whatever(GreenType::Str, ..)` before
 /// `install_jit_call_bridge` runs).
+///
+/// `#[inline]` is `@specialize.arg(0)` (warmstate.py): `tp` is a
+/// translation-time constant at every generated merge point, so the
+/// Int arm is a cast once this inlines into [`green_uhash_step`].
+/// Resolver-missing panics stay behind `#[cold] #[inline(never)]` so
+/// they do not inflate that arm.
+#[inline]
 pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
     match tp {
-        GreenType::Str => STR_HASH.get().expect(
-            "hash_whatever(GreenType::Str, ..): no Str resolver \
-                 registered — frontend must call \
-                 `set_str_resolver(eq, hash)` at startup before any \
-                 STR green key is hashed (warmstate.py:115-121 \
-                 ll_strhash parity)",
-        )(value),
-        GreenType::Unicode => UNICODE_HASH.get().expect(
-            "hash_whatever(GreenType::Unicode, ..): no Unicode \
-                 resolver registered — frontend must call \
-                 `set_unicode_resolver(eq, hash)` at startup before \
-                 any UNICODE green key is hashed (warmstate.py:\
-                 115-121 ll_strhash parity)",
-        )(value),
+        GreenType::Str => match STR_HASH.get() {
+            Some(hash) => hash(value),
+            None => hash_whatever_missing_str(),
+        },
+        GreenType::Unicode => match UNICODE_HASH.get() {
+            Some(hash) => hash(value),
+            None => hash_whatever_missing_unicode(),
+        },
         GreenType::Ref => {
             // warmstate.py `hash_whatever`: identityhash(x) or 0.  The
             // identity hash is a GC operation, not the pointer bits: minimark
@@ -1296,6 +1322,30 @@ pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
         // Int, Void: rffi.cast(Signed, x) — the value itself
         GreenType::Int | GreenType::Void => value as u64,
     }
+}
+
+#[cold]
+#[inline(never)]
+fn hash_whatever_missing_str() -> ! {
+    panic!(
+        "hash_whatever(GreenType::Str, ..): no Str resolver \
+                 registered — frontend must call \
+                 `set_str_resolver(eq, hash)` at startup before any \
+                 STR green key is hashed (warmstate.py:115-121 \
+                 ll_strhash parity)"
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn hash_whatever_missing_unicode() -> ! {
+    panic!(
+        "hash_whatever(GreenType::Unicode, ..): no Unicode \
+                 resolver registered — frontend must call \
+                 `set_unicode_resolver(eq, hash)` at startup before \
+                 any UNICODE green key is hashed (warmstate.py:\
+                 115-121 ll_strhash parity)"
+    );
 }
 
 /// Seed of `JitCell.get_uhash` — `x = r_uint(-1888132534)`
@@ -1428,6 +1478,7 @@ impl GreenKey {
     ///         y = r_uint(hash_whatever(TYPE, item))
     ///         x = (x ^ y) * r_uint(1405695061)
     ///     return x
+    #[inline]
     pub fn get_uhash(&self) -> u64 {
         let mut x: u64 = GREEN_UHASH_SEED;
         for i in 0..self.values.len() {

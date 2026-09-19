@@ -8740,6 +8740,14 @@ impl<S: JitState> JitDriver<S> {
     /// Returns `Some(resume_pc)` only when compiled code ran and left a
     /// resume point. FINISH is published on the same latch as
     /// [`Self::back_edge`].
+    ///
+    /// Not `#[cold]`: this is the interpreter's per-call door, and the
+    /// empty-chain arm (`warmstate.py:465-469` with
+    /// `increment_function_threshold`) is the common path. Compiled-entry
+    /// / tracing-start / chained-resolve bodies stay in
+    /// `function_entry_internal`, which is `#[inline(never)]` so they do
+    /// not land in the portal.
+    #[inline]
     pub fn function_entry_structured(
         &mut self,
         green_key_hash: u64,
@@ -8754,8 +8762,112 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return None;
         }
+        if let Some(handled) = self.try_function_entry_cold_tick(
+            green_key_hash,
+            &make_green_key,
+            target_pc,
+            state,
+            env,
+        ) {
+            return handled;
+        }
+        self.function_entry_internal(green_key_hash, make_green_key, target_pc, state, env, false)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` `:465-480` with
+    /// `increment_function_threshold`: hash already in hand, `lookup_chain`
+    /// once, and if there is no enterable procedure token, `jitcounter.tick`
+    /// and return. A compiled token, a chained bucket, a dead token, or a
+    /// `JC_DONT_TRACE_HERE` cell continues into `function_entry_internal`.
+    ///
+    /// `Some(resume)` means this IS that cold case — including `Some(None)`
+    /// when the tick did not overflow. A True tick is already consumed here
+    /// and is handed to `function_entry_internal` as `already_ticked` so
+    /// [`crate::warmstate::WarmEnterState::function_entry_step`] does not
+    /// increment a second time.
+    #[inline(always)]
+    fn try_function_entry_cold_tick(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: &impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<Option<usize>> {
+        if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
+            if cell.next.is_some() {
+                return None;
+            }
+            if cell.cell_bucket == green_key_hash {
+                if cell.is_compiled() {
+                    return None;
+                }
+                if cell.is_tracing() {
+                    // Slot 23/65/66 live on `function_entry_step`; keep them
+                    // on that walk so a JC_TRACING leak still tallies.
+                    return None;
+                }
+                if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+                    return None;
+                }
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return Some(None);
+                }
+                if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
+                    // Immediate-Proceed (never traced) vs tick-normally
+                    // (TRACING_OCCURRED) stay on the occupied door.
+                    return None;
+                }
+                if cell.flags.contains(JcFlags::JC_TEMPORARY) {
+                    return None;
+                }
+            }
+            // Occupant of this slot is a different green key. Same as empty
+            // for our hash: tick our hash, do not inspect the stranger
+            // (`warmstate.py:465-469` not-found arm).
+        }
+        if self
+            .meta
+            .warm_state_mut()
+            .tick_function_entry_empty_chain(green_key_hash)
+        {
+            return Some(self.function_entry_internal(
+                green_key_hash,
+                make_green_key,
+                target_pc,
+                state,
+                env,
+                true,
+            ));
+        }
+        Some(None)
+    }
+
+    /// Occupied / overflow half of [`Self::function_entry_structured`].
+    ///
+    /// `already_ticked` is the empty-chain overflow: the counter already
+    /// returned True, so this skips [`Self::function_entry_step`] (which
+    /// would tick again) and takes the Proceed arm. RunCompiled, chained
+    /// `resolve_cell_key`, decay + `stack_almost_full` +
+    /// `force_start_tracing` all stay here.
+    #[inline(never)]
+    fn function_entry_internal(
+        &mut self,
+        green_key_hash: u64,
+        make_green_key: impl Fn() -> GreenKey,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+        already_ticked: bool,
+    ) -> Option<usize> {
         let cell_key = self.resolve_cell_key(green_key_hash, make_green_key);
-        match self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc)) {
+        let step = if already_ticked {
+            FunctionEntryStep::Proceed
+        } else {
+            self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc))
+        };
+        match step {
             FunctionEntryStep::RunCompiled(token) => {
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
             }

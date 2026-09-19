@@ -1030,6 +1030,16 @@ impl WarmEnterState {
         self.counter.tick(hash, self.increment_threshold)
     }
 
+    /// `warmstate.py maybe_compile_and_run` `:256-257` / `:465-469` with
+    /// `increment_function_threshold`: the function-entry door's empty-chain
+    /// (or unchained not-compiled cell) tick. Slot 25 is the same bump
+    /// [`Self::function_entry_step`] makes before that tick.
+    #[inline]
+    pub fn tick_function_entry_empty_chain(&mut self, hash: u64) -> bool {
+        crate::mc_diag_bump(25);
+        self.counter.tick(hash, self.increment_function_threshold)
+    }
+
     /// The counter [`Self::cell_generation`] documents.
     pub fn cell_generation(&self) -> u64 {
         self.cell_generation
