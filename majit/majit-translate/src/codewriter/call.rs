@@ -5480,12 +5480,14 @@ impl CallControl {
                 let impl_type = self.resolve_method_impl_type(name, receiver_root.as_deref())?;
                 Some(CallPath::for_impl_method(impl_type, name.as_str()))
             }
-            // RPython: an `indirect_call` is a *family* of graphs — there is
-            // no single CallPath to resolve to.  Post-rtyper, indirect calls
-            // live as `OpKind::IndirectCall` and `graphs_from(op)` returns
-            // the candidate `Vec<CallPath>` directly; `target_to_path` only
-            // names direct_call-equivalent sites.  `call.py:94-114` indirect
-            // branch.
+            // A named-struct aggregate is not a callee: `front::mir` rewrites
+            // it to `OpKind::New` plus `FieldWrite`s (`rewrite_op_malloc`'s
+            // `new(descr)`).  A leftover constructor therefore has no
+            // `CallPath` — the same answer as an `indirect_call`, which is a
+            // family of graphs rather than one (`call.py:94-114`).
+            CallTarget::SyntheticTransparentCtor {
+                is_struct: true, ..
+            } => None,
             CallTarget::SyntheticTransparentCtor { .. } | CallTarget::Indirect { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
@@ -13244,6 +13246,30 @@ mod tests {
         assert!(
             cc.interiorfielddescrof(1, &array, "value").is_some(),
             "the stored element field still resolves"
+        );
+    }
+
+    #[test]
+    fn struct_aggregate_ctor_is_not_a_callee_path() {
+        let cc = CallControl::new();
+        let struct_ctor = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["error".to_string()],
+            "DictKeyError",
+        );
+        assert_eq!(
+            cc.target_to_path(&struct_ctor),
+            None,
+            "a struct aggregate is malloc + setfield, not a CallPath"
+        );
+        let variant = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["Result".to_string()],
+            "Ok",
+            0,
+        );
+        assert_eq!(
+            cc.target_to_path(&variant),
+            None,
+            "an enum-variant constructor is still not a direct_call graph"
         );
     }
 
