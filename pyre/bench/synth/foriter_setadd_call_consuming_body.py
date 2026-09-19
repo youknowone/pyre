@@ -7,10 +7,9 @@
 # silently, so `len(heap) == 0` is what carries the detection — a replayed body
 # leaves the heap short, a dropped one leaves it long.
 #
-# `for_iter_body_is_jit_safe_at` admits SET_ADD with no condition on what else
-# the body does, so a call-bearing set comprehension is traced. The LIST_APPEND
-# spelling of the same loop is declined by that gate's CALL scan, which is why
-# only the set spelling is pinned here.
+# The fixture is a call-bearing set comprehension: SET_ADD plus a consuming
+# call in the same body, so a tracer abort that replayed or dropped the body
+# would change the heap, not just the result.
 import heapq
 
 N = 300

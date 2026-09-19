@@ -8436,9 +8436,7 @@ fn cached_unsupported_jit_shape(code: &pyre_interpreter::CodeObject) -> Unsuppor
 /// on coverage alone took every function holding a comprehension plus any other
 /// loop out of the JIT entirely.
 ///
-/// A single `FOR_ITER` keeps JITting because the count stays at one, and
-/// genuinely nested `FOR_ITER` frames are already declined by
-/// [`pyre_interpreter::function_entry_trace_is_jit_safe`].
+/// A single `FOR_ITER` keeps JITting because the count stays at one.
 fn for_iter_frame_is_finally_duplicated(code: &pyre_interpreter::CodeObject) -> bool {
     let entries: Vec<_> =
         pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable).collect();
@@ -10350,24 +10348,6 @@ fn maybe_compile_and_run(
         pyre_jit_trace::trace::fbw_diag::record_gate_declined_shape();
         return None;
     }
-    if !pyre_interpreter::cached_loop_region_for_iter_bodies_all_jit_safe(
-        code as *const _,
-        loop_header_pc,
-    ) {
-        pyre_jit_trace::trace::fbw_diag::record_gate_declined_for_iter_region();
-        const DENIAL: &str = "BackedgeGate::ForIter/UnsafeLoopRegion";
-        let first_decline = pyre_jit_trace::jitcode_dispatch::census_record_for_iter_gate_decline(
-            code as *const _ as usize,
-            DENIAL,
-        );
-        if first_decline && pyre_interpreter::for_iter_gate_diag_enabled() {
-            eprintln!(
-                "[for-iter-gate-decline] code={} source={} loop_header_pc={loop_header_pc} predicate={DENIAL}",
-                code.qualname, code.source_path
-            );
-        }
-        return None;
-    }
     if let Some(expected_vsd) =
         pyre_jit_trace::state::depth_based_vsd_for_wcode(frame.pycode as usize, loop_header_pc)
     {
@@ -12060,15 +12040,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
 
     if driver.is_tracing() {
-        return None;
-    }
-
-    // A function-entry walk can reach every loop in the frame. Decline only
-    // this newly armed trace when one of those bodies is unsafe; the frame
-    // continues in `eval_loop_jit`, where its back-edges tick independently
-    // and consult their own natural loop regions.
-    if !pyre_interpreter::cached_function_entry_trace_is_jit_safe(code as *const _) {
-        pyre_jit_trace::trace::fbw_diag::record_gate_declined_function_entry();
         return None;
     }
 
@@ -14974,7 +14945,6 @@ mod tests {
         let module = compile_exec("def f(n):\n    return [i for i in range(n)]\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15004,7 +14974,6 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -15023,7 +14992,6 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -15043,7 +15011,6 @@ mod tests {
         ] {
             let module = compile_exec(source).expect("test code should compile");
             let code = function_code_from_module(&module, "f");
-            assert!(function_entry_trace_is_jit_safe(&code));
             assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
         }
     }
@@ -15056,43 +15023,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-    }
-
-    #[test]
-    fn for_iter_body_deleting_a_namespace_name_is_refused() {
-        // The counterpart to the `STORE_NAME` and `STORE_GLOBAL` admission: a
-        // store settles after its first version bump, a delete bumps on every
-        // iteration and forces the trace every time, so the loop it would
-        // admit never compiles. Only a module or class frame spells
-        // `DELETE_NAME` -- a function's `del x` is `DELETE_FAST`, which stays
-        // admitted, so the store-only loop below has to keep passing.
-        use pyre_interpreter::compile_exec;
-        let stores =
-            compile_exec("total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n")
-                .expect("test code should compile");
-        assert!(function_entry_trace_is_jit_safe(&stores));
-
-        let deletes = compile_exec(
-            "total = 0\nfor i in range(10):\n    x = i * 2\n    total += x\n    del x\n",
-        )
-        .expect("test code should compile");
-        assert!(!function_entry_trace_is_jit_safe(&deletes));
-
-        let del_global = compile_exec(
-            "g = 0\ndef f(n):\n    global g\n    c = 0\n    for i in range(n):\n        g = i\n        c += g\n        del g\n    return c\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&del_global, "f");
-        assert!(!function_entry_trace_is_jit_safe(&code));
-
-        let del_fast = compile_exec(
-            "def f(n):\n    c = 0\n    for i in range(n):\n        x = i * 2\n        c += x\n        del x\n    return c\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&del_fast, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
@@ -15103,7 +15034,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15113,21 +15043,7 @@ mod tests {
         let module = compile_exec("def f(n):\n    for _ in range(n):\n        import os\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-    }
-
-    #[test]
-    fn for_iter_single_level_binaryop_mutation_body_is_jit_safe() {
-        // single-level `s += t` (in-place list extend via BINARY_OP) recovers on
-        // abort (verified by /tmp/inplace_probe.py) -> body is all allow-listed.
-        use pyre_interpreter::compile_exec;
-        let module = compile_exec(
-            "def h(src, t):\n    s = []\n    for x in src:\n        s += t\n    return len(s)\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "h");
-        assert!(function_entry_trace_is_jit_safe(&code));
     }
 
     #[test]
@@ -15140,7 +15056,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "g");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15154,235 +15069,7 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "k");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-    }
-
-    #[test]
-    fn unsafe_later_loop_does_not_blacklist_an_earlier_loop() {
-        // The trailing loop holds a `with`, whose LOAD_SPECIAL is deliberately
-        // withheld from the body allow-list, so it is the whole-code scan's
-        // sole refusal.
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(n, cm):\n    escaped = []\n    i = 0\n    while i < n:\n        for value in range(3):\n            pass\n        escaped.append(range(i, i + 3))\n        i += 1\n    out = []\n    for item in escaped:\n        with cm:\n            out.append(len(item))\n    return out\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-        assert!(!function_entry_trace_is_jit_safe(&code));
-        assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
-
-        let mut outer_header = usize::MAX;
-        let mut final_for_iter = None;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            match instr {
-                I::ForIter { .. } => final_for_iter = Some(pc),
-                I::JumpBackward { delta } => {
-                    let target =
-                        skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize());
-                    outer_header = outer_header.min(target);
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    let target = (pc + 1).saturating_sub(delta.get(op_arg).as_usize());
-                    outer_header = outer_header.min(target);
-                }
-                _ => {}
-            }
-        }
-        assert_ne!(outer_header, usize::MAX);
-        assert!(loop_region_for_iter_bodies_all_jit_safe(
-            &code,
-            outer_header
-        ));
-        assert!(!for_iter_body_is_jit_safe_at(
-            &code,
-            final_for_iter.expect("fixture must contain the final comprehension")
-        ));
-    }
-
-    #[test]
-    fn loop_region_includes_out_of_line_handler_rejoining_mid_body() {
-        // The handler holds a loop of its own whose body opens a `with`, and
-        // LOAD_SPECIAL is deliberately withheld from the body allow-list. The
-        // region scan reaches that inner FOR_ITER only if it follows the
-        // out-of-line handler past the back edge.
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(items, k, cm):\n    out = []\n    seen = []\n    for x in items:\n        try:\n            items[x + 100]\n        except IndexError:\n            for y in range(k):\n                with cm:\n                    out.append(y)\n        seen.append(len(range(x)))\n        out.append(x)\n    return out, seen\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let backward_target = |pc: usize, instr: I, op_arg: pyre_interpreter::OpArg| match instr {
-            I::JumpBackward { delta } => {
-                Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            I::JumpBackwardNoInterrupt { delta } => {
-                Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-            }
-            _ => None,
-        };
-
-        let mut outer_header = usize::MAX;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            if let Some(target) = backward_target(pc, instr, op_arg) {
-                outer_header = outer_header.min(target);
-            }
-        }
-
-        let mut direct_end = None;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            if let Some(target) = backward_target(pc, instr, op_arg) {
-                if target == outer_header {
-                    direct_end = Some(direct_end.map_or(pc, |end: usize| end.max(pc)));
-                }
-            }
-        }
-
-        let direct_end = direct_end.expect("fixture must contain the outer backedge");
-        let ranges = loop_region_ranges(&code, outer_header);
-        assert!(ranges.iter().any(|range| *range.start() > direct_end));
-        assert!(!loop_region_for_iter_bodies_all_jit_safe(
-            &code,
-            outer_header
-        ));
-    }
-
-    /// A `return` leg is reachable from the header and never returns to it, so
-    /// it is not in the region and its `FOR_ITER`s cannot run in this
-    /// backedge's trace.
-    ///
-    /// The span from the header to the last backedge contains that leg, so
-    /// reading the region off the layout declines the loop for an unsafe
-    /// `FOR_ITER` the loop can only reach on its way out.
-    #[test]
-    fn an_inner_loops_region_excludes_the_loop_that_encloses_it() {
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        // Two backedges: the outer `for`, and the inlined comprehension nested
-        // in its body. Control does leave the inner loop, finish the outer body
-        // and come back round to the inner header — so the inner header's
-        // strongly connected component is the whole outer loop. Its natural
-        // loop is not.
-        let module = compile_exec(
-            "def run(rows, k):\n    total = 0\n    for row in rows:\n        total += sum([y * k for y in row])\n    return total\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let mut headers: Vec<usize> = Vec::new();
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target {
-                headers.push(target);
-            }
-        }
-        headers.sort_unstable();
-        headers.dedup();
-        assert_eq!(
-            headers.len(),
-            2,
-            "fixture must nest one loop inside another"
-        );
-        let (outer_header, inner_header) = (headers[0], headers[1]);
-
-        let inner = loop_region_ranges(&code, inner_header);
-        let outer = loop_region_ranges(&code, outer_header);
-        assert!(
-            !inner.is_empty() && !outer.is_empty(),
-            "both have backedges"
-        );
-
-        assert!(
-            !inner.iter().any(|range| range.contains(&outer_header)),
-            "the enclosing loop's header is not in the inner loop's region",
-        );
-        assert!(
-            outer.iter().any(|range| range.contains(&inner_header)),
-            "the inner header is in the enclosing loop's region",
-        );
-        let count = |ranges: &[std::ops::RangeInclusive<usize>]| -> usize {
-            ranges
-                .iter()
-                .map(|range| range.end() + 1 - range.start())
-                .sum()
-        };
-        assert!(
-            count(&inner) < count(&outer),
-            "the inner region is the smaller of the two, not the same set",
-        );
-    }
-
-    #[test]
-    fn loop_region_excludes_a_return_leg_inside_the_body_span() {
-        use pyre_interpreter::{Instruction as I, compile_exec};
-        let module = compile_exec(
-            "def run(items, k):\n    out = []\n    for x in items:\n        if x < 0:\n            return [str(y) for y in range(k)]\n        out.append(x)\n    return out\n",
-        )
-        .expect("test code should compile");
-        let code = function_code_from_module(&module, "run");
-
-        let mut header = usize::MAX;
-        let mut last_backedge = 0usize;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, op_arg) = arg_state.get(unit);
-            let target = match instr {
-                I::JumpBackward { delta } => {
-                    Some(skip_caches(&code, pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                I::JumpBackwardNoInterrupt { delta } => {
-                    Some((pc + 1).saturating_sub(delta.get(op_arg).as_usize()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target {
-                header = header.min(target);
-                last_backedge = last_backedge.max(pc);
-            }
-        }
-        assert!(header != usize::MAX, "fixture must contain a backedge");
-
-        // The comprehension's FOR_ITER is the one on the return leg: it sits
-        // inside the header..=last_backedge span but is not the loop's own.
-        let mut return_leg_for_iter = None;
-        let mut arg_state = pyre_interpreter::OpArgState::default();
-        for (pc, unit) in code.instructions.iter().copied().enumerate() {
-            let (instr, _) = arg_state.get(unit);
-            if matches!(instr, I::ForIter { .. }) && pc > header && pc < last_backedge {
-                return_leg_for_iter = Some(pc);
-            }
-        }
-        let return_leg_for_iter =
-            return_leg_for_iter.expect("fixture must inline the comprehension in the body span");
-
-        let ranges = loop_region_ranges(&code, header);
-        assert!(!ranges.is_empty(), "the header has a backedge");
-        assert!(
-            ranges.iter().any(|range| range.contains(&header)),
-            "the header is in its own region",
-        );
-        assert!(
-            !ranges
-                .iter()
-                .any(|range| range.contains(&return_leg_for_iter)),
-            "a return leg does not reach the header, so it is outside the region",
-        );
     }
 
     #[test]
@@ -15397,7 +15084,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "s");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15426,7 +15112,6 @@ mod tests {
         .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
 
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15468,7 +15153,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15481,7 +15165,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15495,7 +15178,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15514,7 +15196,6 @@ mod tests {
                 .copied()
                 .any(|unit| { matches!(arg_state.get(unit).0, Instruction::StoreDeref { .. }) })
         );
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15528,7 +15209,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15542,7 +15222,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15554,7 +15233,6 @@ mod tests {
             compile_exec("def w(src, o):\n    for i in src:\n        o.x = i\n    return o.x\n")
                 .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15566,7 +15244,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "w");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
 
@@ -15582,7 +15259,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert!(!for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(unsupported_jit_shape_of(&code), UnsupportedJitShape::None);
     }
@@ -15599,9 +15275,6 @@ mod tests {
         )
         .expect("test code should compile");
         let code = function_code_from_module(&module, "r");
-        // The body opcodes themselves stay admissible; only the frame-level
-        // handler shape declines.
-        assert!(function_entry_trace_is_jit_safe(&code));
         assert!(for_iter_frame_has_raising_named_handler(&code));
         assert_eq!(
             unsupported_jit_shape(&code),
@@ -15668,8 +15341,7 @@ mod tests {
         // lowered as a residual with the exception disposition preserved across
         // the guard-failure bridge. The frame is admitted for tracing.
         // The body is kept free of `FOR_ITER` so the only classification axis
-        // is the `WITH_EXCEPT_START` shape; a `for` loop whose body is not
-        // allow-listed declines independently via `function_entry_trace_is_jit_safe`.
+        // is the `WITH_EXCEPT_START` shape.
         use pyre_interpreter::compile_exec;
         let module = compile_exec(
             "def wf(cm):\n    total = 0\n    with cm:\n        total += 1\n    return total\n",

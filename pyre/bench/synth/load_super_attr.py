@@ -5,9 +5,7 @@
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.
 # `super(C, self).val()` with the loop INSIDE the super-bearing method, in the
-# `while` spelling — the one loop form that never reaches the FOR_ITER body
-# gate (`eval.rs for_iter_body_op_is_jit_safe`), so a regression in that gate
-# cannot hide here.  `zero_arg_super_attr.py` is the `for` twin.
+# `while` spelling.  `zero_arg_super_attr.py` is the `for` twin.
 #
 # `spec-folds` is the invariant here: those three folds fire or the fixture
 # fails, on every host and backend.  The two-argument oparg form lowers to the

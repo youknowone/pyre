@@ -1378,8 +1378,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             "fbw_blackhole_adopted_single_frame",
             "fbw_blackhole_adopted_multi_frame",
             "gate_declined_shape",
-            "gate_declined_for_iter_region",
-            "gate_declined_function_entry",
             "bridge_ec_from_portal_red",
             "bridge_ec_missing",
             "fbw_foriter_item_dropped",

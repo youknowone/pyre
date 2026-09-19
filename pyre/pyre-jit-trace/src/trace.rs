@@ -7608,18 +7608,7 @@ pub mod fbw_diag {
     ///
     /// `GATE_DECLINED_SHAPE` is `unsupported_jit_shape` — a frame the tracer
     /// cannot encode or whose resume shape it cannot express.
-    /// `GATE_DECLINED_FOR_ITER_REGION` is the back edge's FOR_ITER gate, which
-    /// judges the loop region being entered, so it counts only loops refused
-    /// for their own bodies.  `GATE_DECLINED_FUNCTION_ENTRY` is
-    /// `function_entry_trace_is_jit_safe`: a trace armed at function entry can
-    /// reach every FOR_ITER body in the code object, so it is refused for a
-    /// body no single back edge would have judged.  The frame keeps running
-    /// interpreted and its back edges still decide for themselves, which makes
-    /// that slot a count of refused traces where the other two count refused
-    /// entries.
     pub const GATE_DECLINED_SHAPE: usize = 14;
-    pub const GATE_DECLINED_FOR_ITER_REGION: usize = 15;
-    pub const GATE_DECLINED_FUNCTION_ENTRY: usize = 16;
     /// How `setup_bridge_sym` recovered the `ec` red, one slot per outcome, so
     /// the two sum to the number of bridge setups.  `PyPyJitDriver.reds` names
     /// `frame` and `ec`; `frame` comes back through the virtualizable rebuild,
@@ -7634,8 +7623,8 @@ pub mod fbw_diag {
     /// (`MIFrame::ensure_execution_context`).  That re-derivation is sound but
     /// costs a residual call the live red does not, and nothing else
     /// distinguishes the two.
-    pub const BRIDGE_EC_FROM_PORTAL_RED: usize = 17;
-    pub const BRIDGE_EC_MISSING: usize = 18;
+    pub const BRIDGE_EC_FROM_PORTAL_RED: usize = 15;
+    pub const BRIDGE_EC_MISSING: usize = 16;
 
     /// An in-flight FOR_ITER item the walk consumed concretely and no leg
     /// handed back — the iteration it belongs to is LOST.
@@ -7660,7 +7649,7 @@ pub mod fbw_diag {
     /// (`class_stmt_after_attr_store_keeps_the_iteration`, 9995 of 10000
     /// iterations before the class-body qmut abort latched its operand stack);
     /// nothing in the corpus reaches either refusal today.
-    pub const FORITER_ITEM_DROPPED: usize = 19;
+    pub const FORITER_ITEM_DROPPED: usize = 17;
 
     /// The `[jit-stats]` key for each tally slot, in index order, so a slot
     /// cannot be added without naming it and no reader can print a subset of
@@ -7701,8 +7690,6 @@ pub mod fbw_diag {
         "fbw_blackhole_adopted_single_frame",
         "fbw_blackhole_adopted_multi_frame",
         "gate_declined_shape",
-        "gate_declined_for_iter_region",
-        "gate_declined_function_entry",
         "bridge_ec_from_portal_red",
         "bridge_ec_missing",
         "fbw_foriter_item_dropped",
@@ -7754,14 +7741,6 @@ pub mod fbw_diag {
     /// than a slot index no caller outside this module should be spelling.
     pub fn record_gate_declined_shape() {
         bump(GATE_DECLINED_SHAPE);
-    }
-
-    pub fn record_gate_declined_for_iter_region() {
-        bump(GATE_DECLINED_FOR_ITER_REGION);
-    }
-
-    pub fn record_gate_declined_function_entry() {
-        bump(GATE_DECLINED_FUNCTION_ENTRY);
     }
 
     /// Record one consumed FOR_ITER item that no leg handed back.  The
