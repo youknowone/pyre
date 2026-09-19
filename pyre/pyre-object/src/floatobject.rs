@@ -115,6 +115,19 @@ pub fn w_float_gc_alloc(value: f64) -> *mut PyObject {
     raw as PyObjectRef
 }
 
+/// Residual word ABI for [`w_float_gc_alloc`].
+///
+/// The `dont_look_inside` trampoline bitcasts every argument to `i64`.
+/// A residual of this helper is `residual_call_fr_r` (float bank in,
+/// word-sized ref out), so the argument must stay `f64`. The result is
+/// widened to a word for the same reason `__majit_call_target_w_int_gc_alloc`
+/// widens `*mut PyObject`: that pointer is `i32` on wasm32 while the
+/// descr returns `i64`.
+#[doc(hidden)]
+pub extern "C" fn w_float_gc_alloc_word(value: f64) -> i64 {
+    w_float_gc_alloc(value) as usize as i64
+}
+
 /// Allocate a `W_FloatObject` for a `float` subclass instance, on the
 /// managed heap so it can be reclaimed.
 ///
@@ -219,6 +232,18 @@ mod tests {
         unsafe {
             assert!(is_float(obj));
             assert!(!is_int(obj));
+            assert_eq!(w_float_get_value(obj), 3.25);
+        }
+    }
+
+    #[test]
+    fn test_w_float_gc_alloc_word_boxes_a_float() {
+        let obj = w_float_gc_alloc_word(3.25) as PyObjectRef;
+        if obj.is_null() {
+            return;
+        }
+        unsafe {
+            assert!(is_float(obj));
             assert_eq!(w_float_get_value(obj), 3.25);
         }
     }
