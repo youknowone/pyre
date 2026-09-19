@@ -2762,7 +2762,7 @@ impl TraceCtx {
         Self::do_record_op_with_descr(&mut self.recorder, opcode, args, descr)
     }
 
-    /// pyjitpl.py:2714-2718 `execute_new_with_vtable`: record the allocation,
+    /// pyjitpl.py `MetaInterp.execute_new_with_vtable`: record the allocation,
     /// then `heapcache.new(resbox)` and `heapcache.class_now_known(resbox)`.
     pub fn execute_new_with_vtable(&mut self, descr: DescrRef) -> OpRef {
         let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);

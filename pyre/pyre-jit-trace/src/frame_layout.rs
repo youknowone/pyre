@@ -147,7 +147,8 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
         std::sync::OnceLock::new();
     INFO.get_or_init(|| {
         let mut info = crate::virtualizable_gen::build_virtualizable_info();
-        // virtualizable.py:58 `array_descrs = [cpu.arraydescrof(...)]`: the
+        // virtualizable.py `VirtualizableInfo.__init__`
+        // `array_descrs = [cpu.arraydescrof(...)]`: the
         // cached GcArray(PyObjectRef) descriptor frame construction and
         // materialization already use.  OptHeap keys array items by descriptor
         // identity, so a second descriptor for `locals_cells_stack_w` hides
