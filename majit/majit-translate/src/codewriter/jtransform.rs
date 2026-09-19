@@ -3372,10 +3372,10 @@ impl<'a> Transformer<'a> {
             // Pre-existing optimisation passes
             // (`optimize_call_int_py_mod` /
             // `optimize_call_int_py_div` in `optimizeopt/rewrite.rs`)
-            // stay parked for the future route-(b) path: pyre has no
-            // Python-bytecode emitter that produces `int.py_mod` /
-            // `int.py_div` oopspec calls today, so those passes are
-            // dormant.  Performance recovery for the BinOp{mod,Int}
+            // apply to the route-(b) path: a
+            // `#[oopspec("int.py_div(x, y)")]` function reached through
+            // `_handle_int_special` produces those oopspec calls.
+            // Performance recovery for the BinOp{mod,Int}
             // path lands when (and only when) a route-(a) optimization
             // pass is ported on top of the C-trunc helper.
             //
