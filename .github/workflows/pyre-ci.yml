@@ -21,6 +21,10 @@ on:
       - ".pre-commit-config.yaml"
   pull_request:
     branches: [ "main", "py3.[0-9]+" ]
+    # `ready_for_review` beside the defaults: a draft runs the Linux legs only
+    # (see prepare-charon-llbc-macos), so leaving draft has to start the run
+    # that carries the other two platforms.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -405,7 +409,15 @@ jobs:
     - name: Save Charon cargo target
       # The directory is only populated when extract ran Charon. An exact
       # hit on this key already has the deps; saving again is refused.
+      #
+      # Only on main, like rust-cache above. A cache saved from a PR ref is
+      # readable by that PR alone, so each PR that missed stored its own
+      # 1.3 GB copy under the same key: seven of them held 9 GB of the 10 GB
+      # budget on 2026-09-19 and evicted the entries main had saved, the
+      # macOS rust-cache among them. PRs restore main's entry through
+      # `restore-keys`.
       if: >-
+        github.ref == 'refs/heads/main' &&
         steps.charon-target-cache.outputs.cache-hit != 'true' &&
         (steps.llbc-extract.outputs.majit_rlib_rewrote == '1' ||
          steps.llbc-extract.outputs.pyre_object_rewrote == '1' ||
@@ -452,6 +464,11 @@ jobs:
     # only on macOS or Windows, and under that rule they would have landed
     # first.
     needs: pre-commit
+    # A draft PR runs Linux alone. The macOS and Windows legs were half of all
+    # runner time over the 120 runs of 2026-09-17..18, and a draft is pushed to
+    # many times before anyone asks whether it is portable. Every job of the
+    # two platforms hangs off its prepare job, so skipping here skips them all.
+    if: ${{ github.event.pull_request.draft != true }}
     env: *charon-llbc-env
     steps: *prepare-charon-llbc-steps
 
@@ -460,8 +477,10 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
-    # See prepare-charon-llbc-macos for why `pre-commit` is the only wait.
+    # See prepare-charon-llbc-macos for why `pre-commit` is the only wait,
+    # and for the draft condition.
     needs: pre-commit
+    if: ${{ github.event.pull_request.draft != true }}
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
       CHARON_VERSION: nightly-2026.05.29
@@ -633,20 +652,19 @@ jobs:
       # every other workspace crate; re-running those under cranelift only
       # reproduced the same results while linking the metainterp unit harness.
       # `--tests` is integration targets only, not `--lib`.
-      # `--no-fail-fast` because these are several separate test binaries:
-      # without it cargo stops at the first one that fails and the run names a
-      # single failure where there may be more, which costs a round trip per
-      # hidden sibling.
+      # Fail-fast, like the dynasm pass: cargo stops at the first test binary
+      # that fails, and the job's remaining runner time is not spent on a run
+      # that is already red.
       run: |
-        cargo test --no-fail-fast -p majit-backend-cranelift
-        cargo test --no-fail-fast --no-default-features --features cranelift \
+        cargo test -p majit-backend-cranelift
+        cargo test --no-default-features --features cranelift \
           -p majit-metainterp --tests
         # The two label-selector tests set PYRE_CL_NO_CLOSING_JUMP, a
         # process-global env var read while compiling, so they are `#[ignore]`d
         # out of the parallel run above and need a serial process of their own.
         # The name filter narrows the run to those two tests and reuses the
         # backend test harness built above.
-        cargo test --no-fail-fast -p majit-backend-cranelift \
+        cargo test -p majit-backend-cranelift \
           --lib -- --ignored --test-threads=1 \
           compiler::tests::test_host_loop_external_jump_to
 
