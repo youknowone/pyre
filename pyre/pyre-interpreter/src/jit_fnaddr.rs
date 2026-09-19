@@ -4665,11 +4665,23 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::call_type_one_arg",
         crate::call::call_type_one_arg,
     );
+    cpa2(
+        &mut entries,
+        "pyre_interpreter::call::call_zero_arg_in_frame",
+        "pyre_interpreter::call_zero_arg_in_frame",
+        crate::call::call_zero_arg_in_frame,
+    );
     cpa3(
         &mut entries,
         "pyre_interpreter::call::call_one_arg_in_frame",
         "pyre_interpreter::call_one_arg_in_frame",
         crate::call::call_one_arg_in_frame,
+    );
+    upa3(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::get_and_call_function0",
+        "pyre_interpreter::get_and_call_function0",
+        crate::baseobjspace::get_and_call_function0,
     );
     cpa1(
         &mut entries,

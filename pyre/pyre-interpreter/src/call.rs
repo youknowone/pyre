@@ -2329,6 +2329,31 @@ fn call_callable_with_mode(
     call_non_function_callable_with_mode(execution_context, callable, args, mode, profile_frame)
 }
 
+/// Zero-arg CALL as two word values (`frame`, callable). Portal jitcode
+/// must not carry a `&[]` slice operand — that serializes as a non-GC
+/// `Array<*mut PyObject;0>` Ref and `ARRAYLEN_GC` faults on it.
+/// `descroperation.py get_and_call_function(w_descr, w_obj)` has no extra
+/// `*args_w` list at arity 0; this is that specialized graph.
+/// Errors go through [`set_call_error`]; a null return is the failure.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub extern "C" fn call_zero_arg_in_frame(
+    frame: *mut PyFrame,
+    callable: PyObjectRef,
+) -> PyObjectRef {
+    if frame.is_null() {
+        set_call_error(PyError::type_error("call failed"));
+        return pyre_object::PY_NULL;
+    }
+    match call_callable(unsafe { &mut *frame }, callable, &[]) {
+        Ok(value) => value,
+        Err(err) => {
+            set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
 /// One-arg CALL as three word values (`frame`, callable, arg). Portal
 /// interpret cannot rebuild a `&[T]` from residual boxes — that SIGBUS'd
 /// in `pin_roots` — so `opcode_call` nargs=1 residual-calls this instead.
