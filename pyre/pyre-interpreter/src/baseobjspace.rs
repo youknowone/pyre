@@ -2356,7 +2356,7 @@ pub(crate) unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyRes
 }
 
 #[inline(never)]
-unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+pub(crate) unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     if is_slice(index) {
         // tupleobject.py descr_getslice → slice.indices.
@@ -11138,7 +11138,8 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 /// `function.rs::getcode`.
 #[inline]
 pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
-    // typeobject.py `version_tag`: `if not we_are_jitted() or self.is_heaptype()`.
+    // typeobject.py version_tag — `if not we_are_jitted() or self.is_heaptype()`.
+    // A prebuilt type's tag is stable, so the jitted path promotes it.
     if !majit_metainterp::jit::we_are_jitted() || pyre_object::w_type_is_heaptype(w_type) {
         return pyre_object::typeobject::w_type_get_version_tag(w_type);
     }

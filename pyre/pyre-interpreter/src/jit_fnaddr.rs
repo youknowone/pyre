@@ -176,6 +176,10 @@ extern "C" fn bh_load_attr_name_idx(oparg: i64) -> i64 {
     )
 }
 
+fn load_attr_is_method_word(attr: rustpython_compiler_core::bytecode::oparg::LoadAttr) -> i64 {
+    i64::from(attr.is_method())
+}
+
 // `descr.py CallDescr.create_call_stub` constructs FuncType(ARGS, RESULT),
 // calls that typed function and only then casts its result to Signed. These
 // source-registry entries need the same stub: the override probes return bool,
@@ -1192,6 +1196,20 @@ unsafe fn jit_getitem_list(
     }
 }
 
+/// `getitem_tuple` is the same `(r, r) -> r` erasure as `getitem_list`.
+unsafe fn jit_getitem_tuple(
+    obj: pyre_object::PyObjectRef,
+    index: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    match crate::baseobjspace::getitem_tuple(obj, index) {
+        Ok(value) => value,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
 /// `rbuilder.py` `StringBuilder` default `init_size=100`, STR item size 1.
 fn jit_stringbuilder_new() -> i64 {
     pyre_object::rbuilder::rbuilder_runtime::ll_new(100, 1)
@@ -1210,6 +1228,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "bytecode::oparg::LoadAttr::name_idx",
         rustpython_compiler_core::bytecode::oparg::LoadAttr::name_idx,
     );
+    // `is_method` is the other `LoadAttr` bit. A raw `-> bool` leaves the
+    // upper result bits unspecified; widen like `bh_w_type_issubtype`.
+    p1(
+        &mut entries,
+        "bytecode::oparg::LoadAttr::is_method",
+        load_attr_is_method_word,
+    );
     p1(
         &mut entries,
         "pyre_interpreter::runtime_ops::classify_callable",
@@ -1224,6 +1249,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_interpreter::baseobjspace::getitem_list",
         jit_getitem_list,
+    );
+    up2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::getitem_tuple",
+        jit_getitem_tuple,
     );
     p0(
         &mut entries,
