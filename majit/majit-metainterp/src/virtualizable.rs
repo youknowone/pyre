@@ -1435,7 +1435,7 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     /// The static half of `virtualizable.py write_boxes`; the port of the whole
-    /// is [`Self::write_boxes_to_heap`].  Upstream closes with
+    /// is [`Self::write_boxes`].  Upstream closes with
     /// `assert len(boxes) == i + 1`; this one stops at the end of the static
     /// fields instead, because its callers hand it exactly that prefix.
     pub unsafe fn write_static_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
@@ -1449,7 +1449,11 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Read static boxes and array boxes from the heap object.
+    /// Port of `virtualizable.py read_boxes`. Upstream returns one flat list
+    /// of statics then array items; this splits them into
+    /// `(Vec<i64>, Vec<Vec<i64>>)`. Convergence is to flatten the pair into
+    /// one list so that `write_all_boxes` becomes a caller of `write_boxes`
+    /// rather than a second writer of the same fields.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
@@ -1473,7 +1477,11 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Write static boxes and array boxes back to the heap object.
+    /// Port of `virtualizable.py write_boxes`. Upstream takes one flat list
+    /// of statics then array items; this takes the same values as
+    /// `(&[i64], &[Vec<i64>])`. Convergence is to flatten the pair into one
+    /// list so that `write_all_boxes` becomes a caller of `write_boxes`
+    /// rather than a second writer of the same fields.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
@@ -1504,7 +1512,7 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+    pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         unsafe {
             let mut i = 0;
             // Static fields
@@ -1524,7 +1532,7 @@ impl VirtualizableInfo {
             assert_eq!(
                 boxes.len(),
                 i + 1,
-                "write_boxes_to_heap: boxes count mismatch (expected {}, got {})",
+                "write_boxes: boxes count mismatch (expected {}, got {})",
                 i + 1,
                 boxes.len()
             );
@@ -1539,7 +1547,7 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         unsafe {
-            self.write_boxes_to_heap(obj_ptr, boxes);
+            self.write_boxes(obj_ptr, boxes);
             self.reset_vable_token(obj_ptr);
         }
     }
@@ -1595,49 +1603,6 @@ impl VableArrayInfo {
                     *(container.add(ptr_offset) as *const *const u8)
                 }
             }
-        }
-    }
-}
-
-/// Reads virtualizable fields from a heap object into a flat value array.
-///
-/// This is the "synchronize" direction: heap → JIT representation.
-///
-/// `obj_ptr` is a pointer to the virtualizable heap object.
-/// Returns a vector of values (static fields first, then array elements).
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` points to a valid object with the
-/// layout described by `info`.
-#[cfg(test)]
-unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
-    unsafe {
-        let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
-
-        // Read static fields
-        for index in 0..info.static_fields.len() {
-            boxes.push(info.read_field(obj_ptr, index));
-        }
-
-        boxes
-    }
-}
-
-/// Writes values back from JIT representation to a virtualizable heap object.
-///
-/// This is the "force" direction: JIT representation → heap.
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` points to a valid object with the
-/// layout described by `info`.
-#[cfg(test)]
-unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
-    unsafe {
-        for i in 0..info.static_fields.len() {
-            if i >= boxes.len() {
-                break;
-            }
-            info.write_field(obj_ptr, i, boxes[i]);
         }
     }
 }
@@ -1829,40 +1794,6 @@ unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u
     }
 }
 
-/// Read all virtualizable state (static fields + array fields) into a flat box array.
-///
-/// Returns (static_boxes, array_boxes_per_field).
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` is valid and arrays have the specified lengths.
-#[cfg(test)]
-unsafe fn read_all_virtualizable_boxes(
-    info: &VirtualizableInfo,
-    obj_ptr: *const u8,
-    array_lengths: &[usize],
-) -> (Vec<i64>, Vec<Vec<i64>>) {
-    // SAFETY: forwarded from this function's caller via the doc-comment
-    // contract — `obj_ptr` valid + array lengths match storage.
-    unsafe { info.read_all_boxes(obj_ptr, array_lengths) }
-}
-
-/// Write all virtualizable state back to the heap.
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` is valid and arrays have sufficient space.
-#[cfg(test)]
-unsafe fn write_all_virtualizable_boxes(
-    info: &VirtualizableInfo,
-    obj_ptr: *mut u8,
-    static_boxes: &[i64],
-    array_boxes: &[Vec<i64>],
-) {
-    // SAFETY: per the function-level Safety contract, callers guarantee
-    // `obj_ptr` is valid and the arrays have sufficient space; that
-    // forwards directly to `write_all_boxes`'s same precondition.
-    unsafe { info.write_all_boxes(obj_ptr, static_boxes, array_boxes) };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2020,11 +1951,11 @@ mod tests {
             *(obj_ptr.add(16) as *mut i64) = 99;
 
             // Read boxes
-            let boxes = read_virtualizable_boxes(&info, obj_ptr);
+            let boxes = info.read_static_boxes(obj_ptr);
             assert_eq!(boxes, vec![42, 99]);
 
             // Write new boxes
-            write_virtualizable_boxes(&info, obj_ptr, &[100, 200]);
+            info.write_static_boxes(obj_ptr, &[100, 200]);
             assert_eq!(*(obj_ptr.add(8) as *const i64), 100);
             assert_eq!(*(obj_ptr.add(16) as *const i64), 200);
         }
@@ -2318,12 +2249,12 @@ mod tests {
         info.add_field("y", Type::Int, 16);
         test_add_array_field(&mut info, "stack", Type::Int, 24, 0, 8);
 
-        // Use read_array_lengths + read_all_virtualizable_boxes (the auto path)
+        // Use read_array_lengths + read_all_boxes (the auto path)
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![2]);
 
         let (static_boxes, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(static_boxes, vec![42, 99]);
         assert_eq!(array_boxes, vec![vec![10, 20]]);
     }
@@ -2353,7 +2284,7 @@ mod tests {
         assert_eq!(lengths, vec![3]);
 
         let (_, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(array_boxes, vec![vec![100, 200, 300]]);
 
         // Verify write roundtrip with custom layout
@@ -2367,7 +2298,7 @@ mod tests {
         }
         // Re-read from the actual array_data (obj_mut still points to array_data)
         let (_, array_boxes2) =
-            unsafe { read_all_virtualizable_boxes(&info, obj_mut.as_ptr(), &lengths) };
+            unsafe { info.read_all_boxes(obj_mut.as_ptr(), &lengths) };
         assert_eq!(array_boxes2, vec![vec![111, 222, 333]]);
     }
 
@@ -2409,7 +2340,7 @@ mod tests {
         assert_eq!(lengths, vec![3]);
 
         let (static_boxes, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(static_boxes, vec![7]);
         assert_eq!(array_boxes, vec![vec![10, 20, 30]]);
 
@@ -2417,7 +2348,7 @@ mod tests {
         let new_static = vec![42i64];
         let new_arrays = vec![vec![100i64, 200, 300]];
         unsafe {
-            write_all_virtualizable_boxes(&info, obj.as_mut_ptr(), &new_static, &new_arrays);
+            info.write_all_boxes(obj.as_mut_ptr(), &new_static, &new_arrays);
         }
 
         // Verify heap was updated
@@ -2533,7 +2464,7 @@ mod tests {
         // sync_before_jit: read from heap
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         let (mut statics, mut arrays) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(statics, vec![11, 22]);
         assert_eq!(arrays, vec![vec![50, 60]]);
 
@@ -2545,7 +2476,7 @@ mod tests {
 
         // sync_after_jit: write back to heap
         unsafe {
-            write_all_virtualizable_boxes(&info, obj.as_mut_ptr(), &statics, &arrays);
+            info.write_all_boxes(obj.as_mut_ptr(), &statics, &arrays);
         }
 
         // Verify heap has new values

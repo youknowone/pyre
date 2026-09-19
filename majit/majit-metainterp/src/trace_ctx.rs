@@ -4283,12 +4283,9 @@ impl TraceCtx {
     ///      return True
     /// ```
     ///
-    /// In pyre this is the LIVE entry path used by the jitcode machine
-    /// (`vable_*_indexed`) at trace time. The pyjitpl::nonstandard_virtualizable
-    /// duplicate is reachable only from the legacy `opimpl_*_vable` test
-    /// surface. The two implementations carry the same line-by-line shape so
-    /// the structural divergence is duplication-only — fixing the type-tag
-    /// refactor will let us collapse them into a single entry point.
+    /// This is the only implementation of pyjitpl.py `_nonstandard_virtualizable`.
+    /// `TraceCtx::vable_*` call it; the `opimpl_*_vable` wrappers forward to
+    /// those handlers.
     fn is_nonstandard_virtualizable(
         &mut self,
         pc: usize,
