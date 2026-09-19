@@ -805,17 +805,30 @@ pub fn publish_runtime_insn(key: &str, byte: u8) {
     let mut table = RUNTIME_INSNS_BYTE_TO_OPNAME
         .write()
         .expect("runtime insn table poisoned");
-    let entry = table.entry(byte).or_insert_with(|| match build_time {
-        // The build-time table claims this byte for something else, so no
-        // single key can answer for it.
-        Some(_) => RuntimeInsn::Ambiguous,
-        None => RuntimeInsn::Unique(Box::leak(key.to_string().into_boxed_str())),
-    });
-    if !matches!(entry, RuntimeInsn::Unique(recorded) if *recorded == key) {
-        *entry = RuntimeInsn::Ambiguous;
-    }
+    let changed = match table.entry(byte) {
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            let insn = match build_time {
+                // The build-time table claims this byte for something else, so no
+                // single key can answer for it.
+                Some(_) => RuntimeInsn::Ambiguous,
+                None => RuntimeInsn::Unique(Box::leak(key.to_string().into_boxed_str())),
+            };
+            vacant.insert(insn);
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(mut occupied) => match *occupied.get() {
+            RuntimeInsn::Ambiguous => false,
+            RuntimeInsn::Unique(recorded) if recorded == key => false,
+            RuntimeInsn::Unique(_) => {
+                *occupied.get_mut() = RuntimeInsn::Ambiguous;
+                true
+            }
+        },
+    };
     drop(table);
-    rebuild_decode_snap();
+    if changed {
+        rebuild_decode_snap();
+    }
 }
 
 /// Pre-split `opname/argcodes` for one opcode byte. `blackhole.py`
