@@ -9157,10 +9157,10 @@ impl<'a> Lowering<'a> {
                         .clone();
                 }
                 // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
-                // move.  When both Rust types lower to the same JIT register
-                // bank and Charon's type/layout data proves their byte sizes
-                // equal, the move is the bank's ordinary copy (`same_as`).
-                // This includes `u8 -> #[repr(u8)]` fieldless enums: the enum
+                // move.  `f64 ↔ i64` is `float2longlong` /
+                // `longlong2float`.  Any other pair of equal-size
+                // same-bank types is the bank's ordinary copy (`same_as`),
+                // including `u8 -> #[repr(u8)]` fieldless enums: the enum
                 // is already modelled as its integer tag by
                 // `tyref_to_value_type`, and its `TypeDecl` layout supplies
                 // the matching one-byte size.  A bank crossing or an unknown
@@ -9172,26 +9172,51 @@ impl<'a> Lowering<'a> {
                         fd.item_meta.name_path().as_str(),
                         "core::intrinsics::transmute" | "core::mem::transmute"
                     )
-                    && first_arg_ty.as_ref().is_some_and(|src_ty| {
-                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
-                    })
                 {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "same_as".to_string(),
-                            operand: args[0].clone(),
-                            result_ty: result_ty.clone(),
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    if first_arg_ty.as_ref().is_some_and(|src| {
+                        self.tyref_literal_float_atom(src) == Some("F64")
+                            && self.tyref_literal_int_atom(&call.dest.ty) == Some("I64")
+                    }) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            false,
+                        );
+                    }
+                    if first_arg_ty.as_ref().is_some_and(|src| {
+                        self.tyref_literal_int_atom(src) == Some("I64")
+                            && self.tyref_literal_float_atom(&call.dest.ty) == Some("F64")
+                    }) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            true,
+                        );
+                    }
+                    if first_arg_ty.as_ref().is_some_and(|src_ty| {
+                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
+                    }) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "same_as".to_string(),
+                                operand: args[0].clone(),
+                                result_ty: result_ty.clone(),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(res);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
@@ -10771,43 +10796,39 @@ impl<'a> Lowering<'a> {
                 // `longlong2float.longlong2float(bits)`: reinterpret the integer
                 // bit pattern as an f64 instead of following the opaque core body.
                 if args.len() == 1 && self.is_f64_from_bits(&reg) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "longlong2float".to_string(),
-                                    "longlong2float".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
-                            result_ty: ValueType::Float,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    return self.emit_longlong2float_call(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        true,
+                    );
                 }
                 // `f64::to_bits(x)` is `longlong2float.float2longlong(x)`.
                 if args.len() == 1 && self.is_f64_to_bits(&reg) {
+                    return self.emit_longlong2float_call(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        false,
+                    );
+                }
+                // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.
+                // Truncation toward zero, undefined outside the signed
+                // range — the same contract as the llop.  A saturating
+                // `as i64` helper is not this spelling and stays residual.
+                if args.len() == 1
+                    && self.is_f64_to_int_unchecked_i64(&reg, &call.dest.ty, first_arg_ty.as_ref())
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "longlong2float".to_string(),
-                                    "float2longlong".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_float_to_int".to_string(),
+                            operand: args[0].clone(),
                             result_ty: ValueType::Int,
                         },
                     });
@@ -15124,30 +15145,128 @@ impl<'a> Lowering<'a> {
     /// Its rtyper specialization emits `convert_longlong_bytes_to_float`, the
     /// exact inverse of `float2longlong`.
     fn is_f64_from_bits(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::from_bits"
-                || path == "std::f64::<Impl>::from_bits"
-                || path.ends_with("::from_bits")
-                || path.contains("from_bits")
-        })
+        self.f64_inherent_method(reg, "from_bits")
     }
 
     /// `f64::to_bits(self)` — the reverse of [`is_f64_from_bits`].
     fn is_f64_to_bits(&self, reg: &RegularCall) -> bool {
+        self.f64_inherent_method(reg, "to_bits")
+    }
+
+    /// Inherent `f64` method at `core::f64::<Impl>::{method}` (or `std::`).
+    fn f64_inherent_method(&self, reg: &RegularCall, method: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::to_bits"
-                || path == "std::f64::<Impl>::to_bits"
-                || path.ends_with("::to_bits")
-                || path.contains("to_bits")
+            path.strip_prefix("core::f64::<Impl>::")
+                .or_else(|| path.strip_prefix("std::f64::<Impl>::"))
+                == Some(method)
         })
+    }
+
+    /// `f64::to_int_unchecked::<i64>` — truncation toward zero, undefined
+    /// outside the signed range, which is `cast_float_to_int`.  An i128
+    /// dest, an f32 receiver, or a saturating `as` helper is not this
+    /// spelling.
+    fn is_f64_to_int_unchecked_i64(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+        first_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if self.tyref_literal_int_atom(dest_ty) != Some("I64") {
+            return false;
+        }
+        let path = fd.item_meta.name_path();
+        match path.as_str() {
+            "core::f64::<Impl>::to_int_unchecked" | "std::f64::<Impl>::to_int_unchecked" => true,
+            "core::convert::num::<Impl>::to_int_unchecked"
+            | "core::convert::num::FloatToInt::to_int_unchecked" => {
+                first_arg_ty.is_some_and(|ty| self.tyref_literal_float_atom(ty) == Some("F64"))
+            }
+            _ => false,
+        }
+    }
+
+    /// `transmute::<f64, i64>` / `transmute::<i64, f64>` is the same
+    /// bitcast as `float2longlong` / `longlong2float`.  Emit the llop
+    /// itself so a leaf the walker descends does not residualize a
+    /// typed call.
+    fn emit_float_bytes_llop(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        to_float: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let (op, result_ty) = if to_float {
+            ("convert_longlong_bytes_to_float", ValueType::Float)
+        } else {
+            ("convert_float_bytes_to_longlong", ValueType::Int)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: op.to_string(),
+                operand,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// Rewrite a 64-bit float/int bitcast to the `longlong2float` pair.
+    /// `to_float` is `longlong2float.longlong2float`; otherwise
+    /// `longlong2float.float2longlong`.
+    fn emit_longlong2float_call(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        to_float: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let (leaf, result_ty) = if to_float {
+            ("longlong2float", ValueType::Float)
+        } else {
+            ("float2longlong", ValueType::Int)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["longlong2float".to_string(), leaf.to_string()],
+                },
+                args: crate::model::call_args(vec![operand]),
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the
@@ -18834,6 +18953,22 @@ impl<'a> Lowering<'a> {
     where
         'a: 't,
     {
+        self.tyref_literal_atom(ty, "Int")
+    }
+
+    /// The `Float` width atom (`"F32"` / `"F64"`) of a float literal type.
+    /// `None` for any non-float-literal type.
+    fn tyref_literal_float_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        self.tyref_literal_atom(ty, "Float")
+    }
+
+    fn tyref_literal_atom<'t>(&self, ty: &'t TyRef, kind: &str) -> Option<&'t str>
+    where
+        'a: 't,
+    {
         let value = match ty {
             TyRef::Inline { value: (_, v) } => v,
             TyRef::Other(v) => v,
@@ -18843,7 +18978,7 @@ impl<'a> Lowering<'a> {
             .as_object()?
             .get("Literal")?
             .as_object()?
-            .get("Int")?
+            .get(kind)?
             .as_str()
     }
 
@@ -30691,7 +30826,7 @@ mod tests {
         simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
         tyref_positional_aggregate_root, tyref_to_value_type,
     };
-    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
 
     #[test]
@@ -34946,6 +35081,271 @@ mod tests {
             })
             .expect("value input");
         assert_eq!(copies[0].0.id(), input.id());
+    }
+
+    fn scalar_method_call_fixture(
+        caller_name: &str,
+        callee_name: &[&str],
+        src_ty: serde_json::Value,
+        dst_ty: serde_json::Value,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [src_ty.clone()],
+                "output": dst_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span(), "ty": dst_ty.clone()},
+                            {"index": 1, "name": "value", "span": span(), "ty": src_ty.clone()}
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": {"Regular": 1}},
+                                                    "generics": {
+                                                        "regions": [],
+                                                        "types": [src_ty.clone(), dst_ty.clone()],
+                                                        "const_generics": [],
+                                                        "trait_refs": []
+                                                    }
+                                                }
+                                            },
+                                            "args": [{
+                                                "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                            }],
+                                            "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(callee_name, false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dst_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("scalar method fixture Llbc parses")
+    }
+
+    fn graph_ops(graph: &crate::model::FunctionGraph) -> Vec<&SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect()
+    }
+
+    #[test]
+    fn int_of_float_projects_to_cast_float_to_int() {
+        let llbc = scalar_method_call_fixture(
+            "to_int_unchecked_i64",
+            &["core", "f64", "<Impl>", "to_int_unchecked"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "to_int_unchecked_i64")
+            .expect("lower f64::to_int_unchecked::<i64>");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "cast_float_to_int" && *result_ty == ValueType::Int
+            )),
+            "f64::to_int_unchecked::<i64> must become cast_float_to_int; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "f64::to_int_unchecked::<i64> must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f64_to_bits_projects_to_float2longlong() {
+        let llbc = scalar_method_call_fixture(
+            "f64_to_bits",
+            &["core", "f64", "<Impl>", "to_bits"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"UInt": "U64"}}),
+        );
+        let graph = super::lower_function(&llbc, "f64_to_bits").expect("lower f64::to_bits");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if matches!(segments.as_slice(), [a, b] if a == "longlong2float" && b == "float2longlong")
+            )),
+            "f64::to_bits must become float2longlong; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f32_to_bits_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "f32_to_bits",
+            &["core", "f32", "<Impl>", "to_bits"],
+            serde_json::json!({"Literal": {"Float": "F32"}}),
+            serde_json::json!({"Literal": {"UInt": "U32"}}),
+        );
+        let graph = super::lower_function(&llbc, "f32_to_bits").expect("lower f32::to_bits");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => matches!(
+                    segments.as_slice(),
+                    [a, b] if a == "longlong2float"
+                        && (b == "float2longlong" || b == "longlong2float")
+                ),
+                _ => false,
+            }),
+            "f32::to_bits must not become the f64 bitcast; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "to_bits")
+            )),
+            "f32::to_bits must stay a residual call; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn i128_to_int_unchecked_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "to_int_unchecked_i128",
+            &["core", "f64", "<Impl>", "to_int_unchecked"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I128"}}),
+        );
+        let graph = super::lower_function(&llbc, "to_int_unchecked_i128")
+            .expect("lower f64::to_int_unchecked::<i128>");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_float_to_int"
+            )),
+            "to_int_unchecked::<i128> must not become the 64-bit cast; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "to_int_unchecked")
+            )),
+            "to_int_unchecked::<i128> must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f64_i64_transmute_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "transmute_f64_to_i64",
+            &["core", "intrinsics", "transmute"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "transmute_f64_to_i64")
+            .expect("lower transmute::<f64, i64>");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "convert_float_bytes_to_longlong" && *result_ty == ValueType::Int
+            )),
+            "transmute::<f64, i64> must become convert_float_bytes_to_longlong; ops={ops:?}"
+        );
     }
 
     #[test]
