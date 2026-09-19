@@ -392,11 +392,33 @@ fn codec_input_bytes(w_input: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::
     Ok(input)
 }
 
+/// `errors: str(accept={str, NoneType})` -- the conversion the two
+/// `MultibyteCodec` methods declare.  `None` is the "strict" spelling, and
+/// anything that is neither is refused before the body runs.  PyPy spells it
+/// `unwrap_spec(errors='text_or_none')`, a gateway conversion, so it costs no
+/// frame of its own and no app-level name can be rebound to change it.
+/// `entry_point` is the only thing the two messages differ in.
+fn codec_errors_arg(
+    w_errors: PyObjectRef,
+    entry_point: &str,
+) -> Result<String, pyre_interpreter::PyError> {
+    if unsafe { pyre_object::is_none(w_errors) } {
+        return Ok("strict".to_string());
+    }
+    if unsafe { !pyre_object::is_str(w_errors) } {
+        let got = unsafe { pyre_object::type_name_of(w_errors) };
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "{entry_point}() argument 'errors' must be str or None, not {got}"
+        )));
+    }
+    Ok(pyre_interpreter::baseobjspace::text_w(w_errors)?.to_owned())
+}
+
 fn raw_encode(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let base = publish_codec_args(&roots, args, "_encode")?;
     let name = pyre_interpreter::baseobjspace::text_w(roots.get(base))?.to_owned();
-    let errors = pyre_interpreter::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
+    let errors = codec_errors_arg(roots.get(base + 2), "encode")?;
     let final_input = pyre_interpreter::baseobjspace::is_true(roots.get(base + 3))?;
     let (output, consumed) = encode_impl(&name, roots.get(base + 1), &errors, final_input)?;
     let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -460,7 +482,7 @@ fn raw_decode(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
     let roots = pyre_object::gc_roots::push_roots();
     let base = publish_codec_args(&roots, args, "_decode")?;
     let name = pyre_interpreter::baseobjspace::text_w(roots.get(base))?.to_owned();
-    let errors = pyre_interpreter::baseobjspace::text_w(roots.get(base + 2))?.to_owned();
+    let errors = codec_errors_arg(roots.get(base + 2), "decode")?;
     let input = codec_input_bytes(roots.get(base + 1))?;
     let final_input = pyre_interpreter::baseobjspace::is_true(roots.get(base + 3))?;
     let (output, consumed) = decode_impl(&name, &input, &errors, final_input)?;

@@ -720,13 +720,25 @@ fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_encoding) } {
         return Err(bad_arg("lookup", None, "str", w_encoding));
     }
+    // The search below runs Python, which can collect `w_encoding`, so the
+    // name outlives it as owned Rust text rather than as a borrow of the
+    // object's payload.
     let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
+    lookup_codec_name(&encoding)
+}
+
+/// `lookup_codec` for a name the caller already holds as Rust text.  The
+/// registry is keyed by the normalized spelling and answers with an object,
+/// so a caller reaching here with a `&str` owes no `str` of its own; minting
+/// one only to have the lookup read it straight back is what
+/// [`lookup_text_codec`] did.
+pub(crate) fn lookup_codec_name(encoding: &str) -> Result<PyObjectRef, crate::PyError> {
     // PyPy's `space.text0_w` gateway rejects this before normalization.  A
     // NUL must not be folded away into a valid codec name.
     if encoding.contains('\0') {
         return Err(crate::PyError::value_error("embedded null character"));
     }
-    let normalized_encoding = normalize(&encoding);
+    let normalized_encoding = normalize(encoding);
 
     with_codec_state(|state| {
         if let Some(w_result) = unsafe {
@@ -779,8 +791,7 @@ pub(crate) fn lookup_text_codec(
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
-    let w_codec_info = lookup_codec(&[w_encoding])?;
+    let w_codec_info = lookup_codec_name(encoding)?;
     match crate::baseobjspace::getattr_str(w_codec_info, "_is_text_encoding") {
         Ok(w_flag) if !crate::baseobjspace::is_true(w_flag)? => {
             return Err(crate::PyError::new(
