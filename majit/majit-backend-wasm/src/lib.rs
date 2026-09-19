@@ -53,7 +53,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
@@ -1172,14 +1172,20 @@ pub(crate) mod gc_box {
         if !majit_gc::gc_box_installed() {
             return None;
         }
-        WASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
-            // SAFETY: `guard` holds the borrow for the whole `f` call and
-            // these are non-reentrant top-level trampolines, so the reborrow
-            // is exclusive and outlives `f`.
-            Some(f(unsafe { &mut *raw }))
-        })
+        // `try_with`: `WasmFrameData::drop` and hook trampolines can run
+        // while this thread's locals are already being destroyed. cranelift
+        // `gc_box::clear` / `CA_DISPATCH_TABLE` use the same seam.
+        WASM_ACTIVE_GC
+            .try_with(|cell| {
+                let mut guard = cell.borrow_mut();
+                let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
+                // SAFETY: `guard` holds the borrow for the whole `f` call and
+                // these are non-reentrant top-level trampolines, so the reborrow
+                // is exclusive and outlives `f`.
+                Some(f(unsafe { &mut *raw }))
+            })
+            .ok()
+            .flatten()
     }
 
     /// Read-only access that tolerates being reached from inside a collection:
@@ -1189,28 +1195,39 @@ pub(crate) mod gc_box {
         if !majit_gc::gc_box_installed() {
             return None;
         }
-        WASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
+        match WASM_ACTIVE_GC.try_with(|cell| match cell.try_borrow() {
             Ok(guard) => guard.0.as_deref().map(f),
             // SAFETY: the mirror is published and cleared under the same
             // borrow as the box itself, so a non-null value points at the
             // live allocator, and this query only reads it.
-            Err(_) => WASM_ACTIVE_GC_RAW.with(|raw| raw.get().map(|p| f(unsafe { &*p }))),
-        })
+            Err(_) => WASM_ACTIVE_GC_RAW
+                .try_with(|raw| raw.get().map(|p| f(unsafe { &*p })))
+                .ok()
+                .flatten(),
+        }) {
+            Ok(r) => r,
+            Err(_) => None,
+        }
     }
 
     /// Whether this thread holds a box at all.
     pub(super) fn present() -> bool {
-        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().0.is_some())
+        majit_gc::gc_box_installed()
+            && WASM_ACTIVE_GC
+                .try_with(|cell| cell.borrow().0.is_some())
+                .unwrap_or(false)
     }
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
-    /// Returns the installation id the matching [`ActiveGcBox`] must present
-    /// to uninstall. A previous box is forgotten, not dropped
-    /// (`replace_singleton_leaking_old`).
-    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> u64 {
+    /// Returns `(generation, installed)`: the installation id the matching
+    /// [`ActiveGcBox`] must present to uninstall, and whether the TLS slot
+    /// was empty (a new live box, not a replacement). A previous box is
+    /// forgotten, not dropped (`replace_singleton_leaking_old`).
+    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> (u64, bool) {
         let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
-        WASM_ACTIVE_GC.with(|cell| {
+        let installed = WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
+            let installed = guard.0.is_none();
             if let Some(old) = guard.0.take() {
                 std::mem::forget(old);
             }
@@ -1218,8 +1235,9 @@ pub(crate) mod gc_box {
             let raw = guard.0.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
             WASM_ACTIVE_GC_GEN.with(|slot| slot.set(generation));
+            installed
         });
-        generation
+        (generation, installed)
     }
 
     /// Uninstall this thread's box without freeing its nursery.
@@ -1229,21 +1247,27 @@ pub(crate) mod gc_box {
     /// itself is leaked: `gc_sync::replace_singleton_leaking_old`
     /// — a dropped nursery's pages return to the OS and ExtraHeap /
     /// InputArg slabs reuse them, smashing their mutex words.
-    pub(crate) fn clear() {
+    /// Returns `true` when a box was actually removed.
+    pub(crate) fn clear() -> bool {
         WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
         WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
         WASM_ACTIVE_GC.with(|cell| {
             if let Some(gc) = cell.borrow_mut().0.take() {
                 std::mem::forget(gc);
+                true
+            } else {
+                false
             }
-        });
+        })
     }
 
     /// [`clear`] only when `generation` is still the live installation.
-    pub(crate) fn clear_if_generation(generation: u64) {
+    pub(crate) fn clear_if_generation(generation: u64) -> bool {
         let live = WASM_ACTIVE_GC_GEN.with(|slot| slot.get());
         if live == generation && generation != 0 {
-            clear();
+            clear()
+        } else {
+            false
         }
     }
 }
@@ -1348,6 +1372,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     );
 }
 
+/// Live per-thread wasm GC boxes. Root hooks are process-global, so they
+/// stay installed until the last box is dropped — clearing one thread must
+/// not unhook another thread's still-active heap.
+static WASM_GC_BOXES: AtomicUsize = AtomicUsize::new(0);
+
 /// Owns the TLS GC box installed by [`install_gc_box`]. Dropping it
 /// uninstalls the box on this thread (`llmodel.py` `cpu.gc_ll_descr`
 /// dies with the cpu) only if this guard still owns the slot.
@@ -1357,7 +1386,9 @@ pub(crate) struct ActiveGcBox {
 
 impl Drop for ActiveGcBox {
     fn drop(&mut self) {
-        gc_box::clear_if_generation(self.generation);
+        if gc_box::clear_if_generation(self.generation) {
+            withdraw_root_hooks_if_last_box();
+        }
     }
 }
 
@@ -1375,9 +1406,41 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    let generation = gc_box::store(gc);
+    let (generation, installed) = gc_box::store(gc);
+    if installed {
+        WASM_GC_BOXES.fetch_add(1, Ordering::Release);
+    }
     register_active_hooks(supports_guard_gc_type);
     ActiveGcBox { generation }
+}
+
+/// Drop the active wasm GC box. Callers must go through this helper rather
+/// than reaching the thread-local directly, otherwise the raw mirror used by
+/// `wasm_gc_owns_object`'s reentrant fallback would be left pointing at
+/// freed memory. Matches dynasm/cranelift `clear_gc_allocator`.
+///
+/// Root hooks are withdrawn too: a later `WasmFrameData` drop with a
+/// leftover MiniMark would otherwise treat a test `GcRef` token as a heap
+/// pointer. `install_gc_box` reinstalls the hooks.
+pub fn clear_gc_allocator() {
+    if !gc_box::clear() {
+        return;
+    }
+    withdraw_root_hooks_if_last_box();
+}
+
+fn withdraw_root_hooks_if_last_box() {
+    // Withdraw the process-global hooks only when this was the last box.
+    // A leftover MiniMark on a later `WasmFrameData` drop must not see a
+    // test `GcRef` token as a heap pointer, but another thread's box still
+    // needs the hooks.
+    if WASM_GC_BOXES
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        .ok()
+        == Some(1)
+    {
+        majit_gc::set_active_root_hooks(None, None);
+    }
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
@@ -7297,6 +7360,7 @@ mod tests {
 
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
+        let _gc = ActiveGcGuard;
 
         let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
         assert_eq!(resolved, Some(int_tid));
@@ -7321,6 +7385,7 @@ mod tests {
         unsafe { *(root.0 as *mut u64) = 0xA11C_E701 };
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
+        let _gc = ActiveGcGuard;
 
         let constant = majit_ir::Op::new(
             majit_ir::OpCode::SameAsR,

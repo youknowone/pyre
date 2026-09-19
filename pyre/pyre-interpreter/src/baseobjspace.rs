@@ -1350,10 +1350,8 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
             // and may collect; `obj` and the classinfo tuple are raw locals, so
             // pin them on the shadow stack across the walk.
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let info_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(classinfo);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, classinfo]);
+            let info_slot = obj_slot + 1;
             let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(info_slot));
             for i in 0..n {
                 if let Some(c) =
@@ -1369,10 +1367,8 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         if pyre_object::is_union(classinfo) {
             let union_args = pyre_object::w_union_get_args(classinfo);
             let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(union_args);
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, union_args]);
+            let args_slot = obj_slot + 1;
             let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
             for i in 0..n {
                 if let Some(c) =
@@ -1436,10 +1432,8 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
             // and may collect; `derived` and the classinfo tuple are raw locals,
             // so pin them on the shadow stack across the walk.
             let _roots = pyre_object::gc_roots::push_roots();
-            let derived_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(derived);
-            let info_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(classinfo);
+            let derived_slot = pyre_object::gc_roots::pin_roots(&[derived, classinfo]);
+            let info_slot = derived_slot + 1;
             let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(info_slot));
             for i in 0..n {
                 if let Some(c) =
@@ -1454,10 +1448,8 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         if pyre_object::is_union(classinfo) {
             let union_args = pyre_object::w_union_get_args(classinfo);
             let _roots = pyre_object::gc_roots::push_roots();
-            let derived_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(derived);
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(union_args);
+            let derived_slot = pyre_object::gc_roots::pin_roots(&[derived, union_args]);
+            let args_slot = derived_slot + 1;
             let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
             for i in 0..n {
                 if let Some(c) =
@@ -1540,14 +1532,25 @@ pub(crate) unsafe fn subclass_special_override(
     obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
+    // Do not pin at the head: `pin_root` / `shadow_stack_get` are
+    // `dont_look_inside`, and a residual on the exact-builtin return is
+    // recorded by every walker that descends this body (`_len` /
+    // `builtin_len_descent`, getitem, binop). Exact builtins never
+    // collect here. MayForce C ABI copies are published in the `jit_*`
+    // shims. Publish only on the override-lookup path, which can
+    // allocate, then reload `obj` before reading `ob_type`.
     if pyre_object::is_exact_builtin_instance(obj) {
         return None;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let w_type = crate::typedef::r#type(obj)?;
     let method = lookup_in_type_where(w_type.as_ptr(), name)?;
     // The builtin layout type for `obj` — the canonical type object for its
     // `ob_type`.  When the MRO resolution matches that type's own slot the
     // method is inherited, not overridden.
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let base = pyre_object::get_instantiate(&*(*obj).ob_type);
     if !base.is_null()
         && let Some(inherited) = lookup_in_type_where(base, name)
@@ -4162,12 +4165,10 @@ unsafe fn pull_iterator_tuple(
     let _roots = pyre_object::gc_roots::push_roots();
     // Pin the iterator list itself: `next(it)` runs Python and can move it, and
     // later iterations dereference it again — a raw local would go stale.
-    let _ = pyre_object::gc_roots::pin_root(w_iterators);
-    let iters_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let zip_slot = w_zip.map(|zip| {
-        let _ = pyre_object::gc_roots::pin_root(zip);
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    });
+    // `zip` is already live too; publish both before the first normalize.
+    let iters_slot = pyre_object::gc_roots::publish_roots(&[w_iterators]);
+    let zip_slot = w_zip.map(|zip| pyre_object::gc_roots::publish_roots(&[zip]));
+    pyre_object::gc_roots::normalize_roots(iters_slot, 1 + usize::from(zip_slot.is_some()));
     if let Some(slot) = zip_slot {
         pyre_object::functional::w_zip_set_iteration_progress(
             pyre_object::gc_roots::shadow_stack_get(slot),
@@ -4316,10 +4317,8 @@ pub(crate) fn map_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let self_ = map_receiver(args, "__setstate__")?;
     let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(self_);
-    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(state);
-    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_, state]);
+    let state_slot = self_slot + 1;
     let strict = is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
         pyre_object::functional::w_map_set_strict(
@@ -4407,10 +4406,8 @@ pub(crate) fn zip_setstate_method(args: &[PyObjectRef]) -> PyResult {
     let self_ = zip_receiver(args, "__setstate__")?;
     let state = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
     let _roots = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(self_);
-    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let _ = pyre_object::gc_roots::pin_root(state);
-    let state_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_, state]);
+    let state_slot = self_slot + 1;
     let strict = is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(state_slot) })?;
     unsafe {
         pyre_object::functional::w_zip_set_strict(
@@ -4631,12 +4628,9 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     // both list constructors allocate — so publish the operands on the shadow
     // stack first and read each one back after any step that can collect.
     let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    let value_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(value);
-    let index_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(index);
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, value, index]);
+    let value_slot = obj_slot + 1;
+    let index_slot = obj_slot + 2;
     // CPython 3.14 `list_ass_subscript_lock_held`: unpack the slice first,
     // materialize the replacement next, and only then adjust the bounds
     // against the list's live length. Materializing an arbitrary iterable may
@@ -6335,9 +6329,7 @@ pub fn clear_all_weakrefs(obj: PyObjectRef) {
         return;
     };
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(obj);
-    let _ = roots.pin_root(lifeline);
+    let base = roots.pin_roots(&[obj, lifeline]);
     delweakref(pyre_object::gc_roots::shadow_stack_get(base));
     crate::module::_weakref::interp__weakref::clear_all_weakrefs(
         pyre_object::gc_roots::shadow_stack_get(base + 1),
@@ -12404,11 +12396,8 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
     validate_c3_mro(w_bases, true)?;
     let w_self = pyre_object::gc_roots::shadow_stack_get(self_slot);
     let default_mro = compute_default_mro(w_self);
-    let default_mro_start = pyre_object::gc_roots::shadow_stack_len();
     let default_mro_len = default_mro.len();
-    for w_class in default_mro {
-        let _ = pyre_object::gc_roots::pin_root(w_class);
-    }
+    let default_mro_start = pyre_object::gc_roots::pin_roots(&default_mro);
     let default_mro =
         |index: usize| pyre_object::gc_roots::shadow_stack_get(default_mro_start + index);
     if pyre_object::w_type_is_cpython_heaptype(w_self) {
@@ -12425,10 +12414,7 @@ pub(crate) unsafe fn compute_and_set_mro(w_self: PyObjectRef) -> PyResult {
             // so pin every yielded class while validation can execute
             // Python (`abstract_isclass_w`) and allocate.
             let _mro_roots = pyre_object::gc_roots::push_roots();
-            let mro_root_start = pyre_object::gc_roots::shadow_stack_len();
-            for &w_class in &mro_w {
-                let _ = pyre_object::gc_roots::pin_root(w_class);
-            }
+            let mro_root_start = pyre_object::gc_roots::pin_roots(&mro_w);
             for index in 0..mro_w.len() {
                 let w_class = pyre_object::gc_roots::shadow_stack_get(mro_root_start + index);
                 if !abstract_isclass_w(w_class)? {
@@ -14923,10 +14909,7 @@ pub fn call(
     // execute Python and collect.  RPython's GC transform roots these locals;
     // publish and reload the corresponding raw pointers explicitly.
     let roots = pyre_object::gc_roots::push_roots();
-    let root_base = roots.base();
-    let _ = roots.pin_root(callable);
-    let _ = roots.pin_root(w_args);
-    let _ = roots.pin_root(w_kwds.unwrap_or(PY_NULL));
+    let root_base = roots.pin_roots(&[callable, w_args, w_kwds.unwrap_or(PY_NULL)]);
     let callable = || roots.get(root_base);
     let w_args = || roots.get(root_base + 1);
     let w_kwds = || roots.get(root_base + 2);
@@ -15108,14 +15091,18 @@ pub fn call_args_and_c_profile_args(
     // updates.  Root them all, dispatch from the roots, and refresh the
     // `Arguments` vectors before the return hook reads them again.
     let _roots = pyre_object::gc_roots::push_roots();
-    let callable_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(callable);
-    let flat_base = pyre_object::gc_roots::pin_roots(flat_args);
-    let positional_base = pyre_object::gc_roots::pin_roots(&arguments.arguments_w);
+    let callable_slot = pyre_object::gc_roots::publish_roots(&[callable]);
+    let flat_base = pyre_object::gc_roots::publish_roots(flat_args);
+    let positional_base = pyre_object::gc_roots::publish_roots(&arguments.arguments_w);
     let keyword_base = arguments
         .keywords_w
         .as_ref()
-        .map(|values| pyre_object::gc_roots::pin_roots(values));
+        .map(|values| pyre_object::gc_roots::publish_roots(values));
+    let keyword_len = arguments.keywords_w.as_ref().map(|v| v.len()).unwrap_or(0);
+    pyre_object::gc_roots::normalize_roots(
+        callable_slot,
+        1 + flat_args.len() + arguments.arguments_w.len() + keyword_len,
+    );
     let callable = || pyre_object::gc_roots::shadow_stack_get(callable_slot);
     let refresh = |arguments: &mut crate::argument::Arguments| {
         for (index, slot) in arguments.arguments_w.iter_mut().enumerate() {
@@ -15731,9 +15718,7 @@ pub fn unpackiterable_portal(
     // names `root_base`, `items_slot`, and the `RootScope`; the hook seeds
     // those extracted banks.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_iterator);
-    let _ = pyre_object::gc_roots::pin_root(items);
+    let root_base = pyre_object::gc_roots::pin_roots(&[w_iterator, items]);
     let items_slot = root_base + 1;
     loop {
         unpackiterable_driver.jit_merge_point(
@@ -17592,10 +17577,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 // `obj`, so pin it and read the iterator state back through the
                 // re-read pointer rather than the now-stale `iter` reference.
                 let _roots = pyre_object::gc_roots::push_roots();
-                let _ = pyre_object::gc_roots::pin_root(obj);
-                let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let seq_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(seq);
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj, seq]);
+                let seq_slot = obj_slot + 1;
                 let idx_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_int_new(idx));
                 match getitem(
@@ -18698,10 +18681,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let call_args = crate::builtins::collect_iterable(
                 pyre_object::gc_roots::shadow_stack_get(obj_args_slot),
             )?;
-            let first_arg_slot = pyre_object::gc_roots::shadow_stack_len();
-            for &arg in &call_args {
-                let _ = pyre_object::gc_roots::pin_root(arg);
-            }
+            let first_arg_slot = pyre_object::gc_roots::pin_roots(&call_args);
             let mut rooted_args = Vec::with_capacity(call_args.len());
             for index in 0..call_args.len() {
                 rooted_args.push(pyre_object::gc_roots::shadow_stack_get(
@@ -18907,10 +18887,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 None,
             )? {
                 Some(items) => {
-                    let items_base = pyre_object::gc_roots::shadow_stack_len();
-                    for &item in &items {
-                        let _ = pyre_object::gc_roots::pin_root(item);
-                    }
+                    let items_base = pyre_object::gc_roots::pin_roots(&items);
                     let w_fun =
                         mo::w_map_get_fun(pyre_object::gc_roots::shadow_stack_get(obj_slot));
                     let _ = pyre_object::gc_roots::pin_root(w_fun);
@@ -18968,10 +18945,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     1,
                 )
                 .unwrap();
-                let _ = pyre_object::gc_roots::pin_root(iterator0);
-                let iterator0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                let _ = pyre_object::gc_roots::pin_root(iterator1);
-                let iterator1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let iterator0_slot = pyre_object::gc_roots::pin_roots(&[iterator0, iterator1]);
+                let iterator1_slot = iterator0_slot + 1;
                 zo::w_zip_set_iteration_progress(
                     pyre_object::gc_roots::shadow_stack_get(obj_slot),
                     0,
@@ -19026,20 +19001,25 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 Some(pyre_object::gc_roots::shadow_stack_get(obj_slot)),
             )? {
                 Some(items) => {
-                    for &item in &items {
-                        let _ = pyre_object::gc_roots::pin_root(item);
-                    }
-                    // PyPy's `space.newtuple(items)` may select the `_ii` or
+                    let items_base = pyre_object::gc_roots::pin_roots(&items);
+                    // `space.newtuple(items)` may select the `_ii` or
                     // `_ff` value-backed arity-2 representation because its
                     // object space gives plain numeric objects value identity.
-                    // Python 3.14 requires `zip` to retain the exact objects
+                    // 3.14 requires `zip` to retain the exact objects
                     // returned by its input iterators.  Pyre uses pointer
                     // identity, so keep the two references in the otherwise
                     // equivalent inline `_oo` representation.
                     if items.len() == 2 {
-                        Ok(pyre_object::w_specialised_tuple_oo_new(items[0], items[1]))
+                        Ok(pyre_object::w_specialised_tuple_oo_new(
+                            pyre_object::gc_roots::shadow_stack_get(items_base),
+                            pyre_object::gc_roots::shadow_stack_get(items_base + 1),
+                        ))
                     } else {
-                        Ok(pyre_object::w_tuple_new(items))
+                        Ok(pyre_object::w_tuple_new(
+                            (0..items.len())
+                                .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
+                                .collect(),
+                        ))
                     }
                 }
                 None => Err(PyError::stop_iteration()),
@@ -20705,8 +20685,9 @@ fn async_generator_init_hooks(async_gen: PyObjectRef) -> PyResult {
         let firstiter = (*ec).w_asyncgen_firstiter_fn;
         if !firstiter.is_null() {
             let _roots = pyre_object::gc_roots::push_roots();
-            let async_gen = pyre_object::gc_roots::pin_root(async_gen);
-            let firstiter = pyre_object::gc_roots::pin_root(firstiter);
+            let base = pyre_object::gc_roots::pin_roots(&[async_gen, firstiter]);
+            let async_gen = pyre_object::gc_roots::shadow_stack_get(base);
+            let firstiter = pyre_object::gc_roots::shadow_stack_get(base + 1);
             crate::call::call_function_impl_result(firstiter, &[async_gen])?;
         }
     }
@@ -20936,9 +20917,7 @@ fn async_gen_athrow_do_send(awaitable: PyObjectRef, arg: PyObjectRef) -> PyResul
     // the nested execution runs Python, so it reaches collection points of its
     // own.
     let _roots = pyre_object::gc_roots::push_roots();
-    let awaitable_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(awaitable);
-    let _ = pyre_object::gc_roots::pin_root(arg);
+    let awaitable_slot = pyre_object::gc_roots::pin_roots(&[awaitable, arg]);
     let awaitable = pyre_object::gc_roots::shadow_stack_get(awaitable_slot);
     let arg = pyre_object::gc_roots::shadow_stack_get(awaitable_slot + 1);
     let (async_gen, exc_type, exc_value, exc_tb, state) = {

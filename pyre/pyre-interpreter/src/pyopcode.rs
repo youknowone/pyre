@@ -581,7 +581,7 @@ pub trait ArithmeticOpcodeHandler: SharedOpcodeHandler {
     fn unary_invert_value(&mut self, value: Self::Value) -> Result<Self::Value, PyError>;
 }
 
-pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
+pub trait ConstantOpcodeHandler: SharedOpcodeHandler<Value = PyObjectRef> {
     fn int_constant(&mut self, value: i64) -> Result<Self::Value, PyError>;
     /// Interned box for `LOAD_SMALL_INT`. Default is a fresh
     /// [`Self::int_constant`]; `PyFrame` returns the process-lifetime
@@ -628,6 +628,20 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler {
     }
 }
 
+/// Realize each nested constant and keep it rooted while later siblings
+/// mint. Each element is freshly minted, then pinned; `take` reloads the
+/// live words and the bracket stays open across the container constructor.
+fn load_const_rooted_items<H: ConstantOpcodeHandler + ?Sized>(
+    handler: &mut H,
+    elements: &[ConstantData],
+) -> Result<pyre_object::gc_roots::RootedItems, PyError> {
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for element in elements {
+        items.push(load_const_value(handler, element)?);
+    }
+    Ok(items)
+}
+
 fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
     handler: &mut H,
     constant: &ConstantData,
@@ -652,11 +666,8 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Boolean { value } => handler.bool_constant(*value),
         ConstantData::Str { value } => handler.str_constant(value),
         ConstantData::Tuple { elements } => {
-            let mut items = Vec::with_capacity(elements.len());
-            for element in elements {
-                items.push(load_const_value(handler, element)?);
-            }
-            handler.build_tuple(&items)
+            let items = load_const_rooted_items(handler, elements)?;
+            handler.build_tuple(&items.take())
         }
         ConstantData::Code { code } => handler.code_constant(code),
         ConstantData::None => handler.none_constant(),
@@ -664,23 +675,17 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Bytes { value } => handler.bytes_constant(value),
         ConstantData::Complex { value } => handler.complex_constant(value.re, value.im),
         ConstantData::Frozenset { elements } => {
-            let mut items = Vec::with_capacity(elements.len());
-            for element in elements {
-                items.push(load_const_value(handler, element)?);
-            }
-            handler.frozenset_constant(&items)
+            let items = load_const_rooted_items(handler, elements)?;
+            handler.frozenset_constant(&items.take())
         }
         ConstantData::Slice { elements } => {
             // Slice constant → build start/stop/step via handler.slice_constant()
-            let mut items = Vec::with_capacity(3);
-            for element in elements.iter() {
-                items.push(load_const_value(handler, element)?);
-            }
-            if items.len() == 3 {
-                let items = items.as_slice();
-                handler.slice_constant(items[0], items[1], items[2])
+            let items = load_const_rooted_items(handler, elements.as_slice())?;
+            let taken = items.take();
+            if taken.len() == 3 {
+                handler.slice_constant(taken[0], taken[1], taken[2])
             } else {
-                handler.build_tuple(&items)
+                handler.build_tuple(&taken)
             }
         }
     }

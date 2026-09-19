@@ -423,48 +423,68 @@ impl ObjectConverter {
     /// and must not reject a tree the converter would go on to accept.
     fn scan_extent(&mut self, object: PyObjectRef, extent: &mut (usize, usize)) -> AstResult<()> {
         if unsafe { pyre_object::is_list(object) } {
-            for item in unsafe {
+            let items = unsafe {
                 pyre_object::w_list_items_copy_as_vec_mode(
                     object,
                     majit_metainterp::jit::we_are_jitted(),
                 )
-            } {
+            };
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&items);
+            for index in 0..items.len() {
+                let item = pyre_object::gc_roots::shadow_stack_get(base + index);
                 self.recurse(|this| this.scan_extent(item, extent))?;
             }
             return Ok(());
         }
         if unsafe { pyre_object::is_tuple(object) } {
-            for item in unsafe { pyre_object::w_tuple_items_copy_as_vec(object) } {
+            let items = unsafe { pyre_object::w_tuple_items_copy_as_vec(object) };
+            let _roots = pyre_object::gc_roots::push_roots();
+            let base = pyre_object::gc_roots::pin_roots(&items);
+            for index in 0..items.len() {
+                let item = pyre_object::gc_roots::shadow_stack_get(base + index);
                 self.recurse(|this| this.scan_extent(item, extent))?;
             }
             return Ok(());
         }
-        if !self.is_node(object, "AST")? {
+        let _node_roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(object);
+        if !self.is_node(pyre_object::gc_roots::shadow_stack_get(obj_slot), "AST")? {
             return Ok(());
         }
         for (line_field, column_field) in
             [("lineno", "col_offset"), ("end_lineno", "end_col_offset")]
         {
-            if let Some(value) = self.optional_field(object, line_field)?
-                && let Ok(line) = self.obj_to_int(value)
+            if let Some(value) = self.optional_field(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                line_field,
+            )? && let Ok(line) = self.obj_to_int(value)
                 && line > 0
             {
                 extent.0 = extent.0.max(line as usize);
             }
-            if let Some(value) = self.optional_field(object, column_field)?
-                && let Ok(column) = self.obj_to_int(value)
+            if let Some(value) = self.optional_field(
+                pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                column_field,
+            )? && let Ok(column) = self.obj_to_int(value)
                 && column > 0
             {
                 extent.1 = extent.1.max(column as usize);
             }
         }
-        let Some(fields) = self.optional_field(object, "_fields")? else {
+        let Some(fields) =
+            self.optional_field(pyre_object::gc_roots::shadow_stack_get(obj_slot), "_fields")?
+        else {
             return Ok(());
         };
         if !unsafe { pyre_object::is_tuple(fields) } {
             return Ok(());
         }
-        for name in unsafe { pyre_object::w_tuple_items_copy_as_vec(fields) } {
+        let names = unsafe { pyre_object::w_tuple_items_copy_as_vec(fields) };
+        let name_base = pyre_object::gc_roots::pin_roots(&names);
+        for index in 0..names.len() {
+            let name = pyre_object::gc_roots::shadow_stack_get(name_base + index);
             if !unsafe { pyre_object::is_str(name) } {
                 continue;
             }
@@ -473,7 +493,9 @@ impl ObjectConverter {
                 continue;
             };
             let name = name.to_string();
-            if let Some(value) = self.optional_field(object, &name)? {
+            if let Some(value) =
+                self.optional_field(pyre_object::gc_roots::shadow_stack_get(obj_slot), &name)?
+            {
                 self.recurse(|this| this.scan_extent(value, extent))?;
             }
         }
@@ -557,6 +579,24 @@ impl ObjectConverter {
                 majit_metainterp::jit::we_are_jitted(),
             )
         })
+    }
+
+    fn with_list<T>(
+        &mut self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+        mut each: impl FnMut(&mut Self, PyObjectRef) -> AstResult<T>,
+    ) -> AstResult<Vec<T>> {
+        let items = self.list(object, field, node)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&items);
+        let mut out = Vec::with_capacity(items.len());
+        for index in 0..items.len() {
+            let value = pyre_object::gc_roots::shadow_stack_get(base + index);
+            out.push(each(self, value)?);
+        }
+        Ok(out)
     }
 
     fn string(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<String> {
@@ -1129,7 +1169,10 @@ impl ObjectConverter {
                 default: None,
             })
             .collect();
-        for (index, default) in kw_defaults.into_iter().enumerate() {
+        let _kw_roots = pyre_object::gc_roots::push_roots();
+        let kw_base = pyre_object::gc_roots::pin_roots(&kw_defaults);
+        for index in 0..kw_defaults.len() {
+            let default = pyre_object::gc_roots::shadow_stack_get(kw_base + index);
             if unsafe { pyre_object::is_none(default) } {
                 continue;
             }
@@ -1152,10 +1195,9 @@ impl ObjectConverter {
         object: PyObjectRef,
         field: &str,
     ) -> AstResult<Vec<ast::Parameter>> {
-        self.list(object, field, "arguments")?
-            .into_iter()
-            .map(|value| self.recurse(|this| this.parameter(value)))
-            .collect()
+        self.with_list(object, field, "arguments", |this, value| {
+            this.recurse(|this| this.parameter(value))
+        })
     }
 
     fn opt_parameter(
@@ -1232,25 +1274,21 @@ impl ObjectConverter {
         object: PyObjectRef,
         node: &str,
     ) -> AstResult<Vec<ast::Comprehension>> {
-        self.list(object, "generators", node)?
-            .into_iter()
-            .map(|value| self.recurse(|this| this.comprehension(value)))
-            .collect()
+        self.with_list(object, "generators", node, |this, value| {
+            this.recurse(|this| this.comprehension(value))
+        })
     }
 
     fn aliases(&mut self, object: PyObjectRef, node: &str) -> AstResult<Vec<ast::Alias>> {
-        self.list(object, "names", node)?
-            .into_iter()
-            .map(|value| {
-                let range = self.location(value, "alias")?;
-                Ok(ast::Alias {
-                    range,
-                    node_index: Default::default(),
-                    name: self.identifier(value, "name", "alias")?,
-                    asname: self.opt_identifier(value, "asname")?,
-                })
+        self.with_list(object, "names", node, |this, value| {
+            let range = this.location(value, "alias")?;
+            Ok(ast::Alias {
+                range,
+                node_index: Default::default(),
+                name: this.identifier(value, "name", "alias")?,
+                asname: this.opt_identifier(value, "asname")?,
             })
-            .collect()
+        })
     }
 
     fn decorators(
@@ -1258,17 +1296,16 @@ impl ObjectConverter {
         object: PyObjectRef,
         node: &str,
     ) -> AstResult<ThinVec<ast::Decorator>> {
-        self.list(object, "decorator_list", node)?
-            .into_iter()
-            .map(|value| {
-                self.require_node(value, "expression")?;
+        Ok(self
+            .with_list(object, "decorator_list", node, |this, value| {
+                this.require_node(value, "expression")?;
                 Ok(ast::Decorator {
                     range: Default::default(),
                     node_index: Default::default(),
-                    expression: self.recurse(|this| this.expr(value))?,
+                    expression: this.recurse(|this| this.expr(value))?,
                 })
-            })
-            .collect()
+            })?
+            .into())
     }
 
     /// `type_params` postdates the original positional constructors, so a
@@ -1296,10 +1333,13 @@ impl ObjectConverter {
         if values.is_empty() {
             return Ok(None);
         }
-        let type_params = values
-            .into_iter()
-            .map(|value| self.recurse(|this| this.type_param(value)))
-            .collect::<Result<Vec<_>, _>>()?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&values);
+        let mut type_params = Vec::with_capacity(values.len());
+        for index in 0..values.len() {
+            let value = pyre_object::gc_roots::shadow_stack_get(base + index);
+            type_params.push(self.recurse(|this| this.type_param(value))?);
+        }
         Ok(Some(Box::new(ast::TypeParams {
             range: Default::default(),
             node_index: Default::default(),
@@ -1362,10 +1402,9 @@ impl ObjectConverter {
         field: &str,
         node: &str,
     ) -> AstResult<Vec<ast::Pattern>> {
-        self.list(object, field, node)?
-            .into_iter()
-            .map(|value| self.recurse(|this| this.pattern(value)))
-            .collect()
+        self.with_list(object, field, node, |this, value| {
+            this.recurse(|this| this.pattern(value))
+        })
     }
 
     fn pattern(&mut self, object: PyObjectRef) -> AstResult<ast::Pattern> {
@@ -1503,23 +1542,19 @@ impl ObjectConverter {
         field: &str,
         node: &str,
     ) -> AstResult<ThinVec<ast::Stmt>> {
-        self.list(object, field, node)?
-            .into_iter()
-            .map(|value| {
-                self.require_node(value, "statement")?;
-                self.recurse(|this| this.stmt(value))
-            })
-            .collect()
+        Ok(self
+            .with_list(object, field, node, |this, value| {
+                this.require_node(value, "statement")?;
+                this.recurse(|this| this.stmt(value))
+            })?
+            .into())
     }
 
     fn exprs(&mut self, object: PyObjectRef, field: &str, node: &str) -> AstResult<Vec<ast::Expr>> {
-        self.list(object, field, node)?
-            .into_iter()
-            .map(|value| {
-                self.require_node(value, "expression")?;
-                self.recurse(|this| this.expr(value))
-            })
-            .collect()
+        self.with_list(object, field, node, |this, value| {
+            this.require_node(value, "expression")?;
+            this.recurse(|this| this.expr(value))
+        })
     }
 
     fn req_expr(
@@ -1772,23 +1807,28 @@ impl ObjectConverter {
                     "Dict doesn't have the same number of keys as values",
                 ));
             }
+            let _roots = pyre_object::gc_roots::push_roots();
+            // Two slices: publish both before the first normalize, which is
+            // itself a GC safepoint (`pin_roots` multi-slice contract).
+            let key_base = pyre_object::gc_roots::publish_roots(&keys);
+            let value_base = pyre_object::gc_roots::publish_roots(&values);
+            pyre_object::gc_roots::normalize_roots(key_base, keys.len() + values.len());
             // A `None` key is the `**mapping` spread, which has no key node.
-            let items = keys
-                .into_iter()
-                .zip(values)
-                .map(|(key, value)| {
-                    let key = if unsafe { pyre_object::is_none(key) } {
-                        None
-                    } else {
-                        Some(self.recurse(|this| this.expr(key))?)
-                    };
-                    self.require_node(value, "expression")?;
-                    Ok(ast::DictItem {
-                        key,
-                        value: self.recurse(|this| this.expr(value))?,
-                    })
-                })
-                .collect::<Result<Vec<_>, crate::PyError>>()?;
+            let mut items = Vec::with_capacity(keys.len());
+            for index in 0..keys.len() {
+                let key = pyre_object::gc_roots::shadow_stack_get(key_base + index);
+                let value = pyre_object::gc_roots::shadow_stack_get(value_base + index);
+                let key = if unsafe { pyre_object::is_none(key) } {
+                    None
+                } else {
+                    Some(self.recurse(|this| this.expr(key))?)
+                };
+                self.require_node(value, "expression")?;
+                items.push(ast::DictItem {
+                    key,
+                    value: self.recurse(|this| this.expr(value))?,
+                });
+            }
             Ok(ast::Expr::Dict(ast::ExprDict {
                 node_index: Default::default(),
                 range,
@@ -2099,19 +2139,25 @@ impl ObjectConverter {
                 // here from a tree an optimizer folded, and it nests. The node
                 // depth guard does not apply: it counts AST nodes, and a
                 // constant nested past it still compiles where 3.14 compiles.
-                Ok(ast::ConstantValue::Tuple(
-                    pyre_object::w_tuple_items_copy_as_vec(object)
-                        .into_iter()
-                        .map(|item| self.constant_value(item))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ))
+                let items = pyre_object::w_tuple_items_copy_as_vec(object);
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&items);
+                let mut values = Vec::with_capacity(items.len());
+                for index in 0..items.len() {
+                    let item = pyre_object::gc_roots::shadow_stack_get(base + index);
+                    values.push(self.constant_value(item)?);
+                }
+                Ok(ast::ConstantValue::Tuple(values))
             } else if pyre_object::is_frozenset(object) {
-                Ok(ast::ConstantValue::Frozenset(
-                    pyre_object::w_set_items(object)
-                        .into_iter()
-                        .map(|item| self.constant_value(item))
-                        .collect::<Result<Vec<_>, _>>()?,
-                ))
+                let items = pyre_object::w_set_items(object);
+                let _roots = pyre_object::gc_roots::push_roots();
+                let base = pyre_object::gc_roots::pin_roots(&items);
+                let mut values = Vec::with_capacity(items.len());
+                for index in 0..items.len() {
+                    let item = pyre_object::gc_roots::shadow_stack_get(base + index);
+                    values.push(self.constant_value(item)?);
+                }
+                Ok(ast::ConstantValue::Frozenset(values))
             } else {
                 Err(crate::PyError::type_error(format!(
                     "got an invalid type in Constant: {}",

@@ -806,10 +806,8 @@ fn call_codec(
 ) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py _call_codec`.
     let roots = pyre_object::gc_roots::push_roots();
-    let coder_slot = roots.base();
-    let _ = roots.pin_root(w_coder);
+    let coder_slot = roots.pin_roots(&[w_coder, w_obj]);
     let obj_slot = coder_slot + 1;
-    let _ = roots.pin_root(w_obj);
     let call = if let Some(errors) = errors {
         let err_slot = coder_slot + 2;
         let _ = roots.pin_root(w_str_new_managed(errors));
@@ -1003,15 +1001,31 @@ fn encode_with_name(
     let errors = codec_errors_arg(fname, 2, errors)?;
     // PyPy `make_encoder_wrapper`: convert to unicode, call unicodehelper
     // encoder, return `(bytes, unicode_length)`.
-    let encode_method = crate::baseobjspace::getattr_str(w_obj, "encode")?;
     let _roots = pyre_object::gc_roots::push_roots();
-    let encode_method = pyre_object::gc_roots::pin_root(encode_method);
-    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
-    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
-    let encoded = crate::call::call_function_impl_result(encode_method, &[w_encoding, w_errors])?;
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let encode_method = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(obj_slot),
+        "encode",
+    )?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(encode_method);
+    let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let encoded = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
+            pyre_object::gc_roots::shadow_stack_get(err_slot),
+        ],
+    )?;
     Ok(rooted_tuple()
         .arg(encoded)
-        .arg(w_int_new(unsafe { pyre_object::w_str_len(w_obj) } as i64))
+        .arg(w_int_new(unsafe {
+            pyre_object::w_str_len(pyre_object::gc_roots::shadow_stack_get(obj_slot))
+        } as i64))
         .finish())
 }
 
@@ -1033,10 +1047,19 @@ fn decode_with_name(
     let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&data));
     let decode_method =
         crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "decode")?;
-    let decode_method = pyre_object::gc_roots::pin_root(decode_method);
-    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
-    let w_errors = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
-    let decoded = crate::call::call_function_impl_result(decode_method, &[w_encoding, w_errors])?;
+    let method_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(decode_method);
+    let enc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&errors));
+    let decoded = crate::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(method_slot),
+        &[
+            pyre_object::gc_roots::shadow_stack_get(enc_slot),
+            pyre_object::gc_roots::shadow_stack_get(err_slot),
+        ],
+    )?;
     Ok(rooted_tuple()
         .arg(decoded)
         .arg(w_int_new(consumed as i64))
@@ -1245,9 +1268,7 @@ fn charmap_encode_impl(
     // The code points are copied out above, so only the two objects have to
     // survive the collections a table read or a handler call can trigger.
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_unicode);
-    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let sp = pyre_object::gc_roots::pin_roots(&[w_unicode, w_mapping]);
     let mut i = 0usize;
     while i < char_len {
         if charmap_output(
@@ -1635,17 +1656,25 @@ fn charmap_build(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py charmap_build`: build a dict mapping
     // each Unicode codepoint in `chars` to its ordinal position.
     let chars = unsafe { w_str_get_wtf8(chars) }.to_wtf8_buf();
-    let w_charmap = w_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+    let val_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
     for (num, cp) in chars.code_points().enumerate() {
+        pyre_object::gc_roots::shadow_stack_set(key_slot, w_int_new(cp.to_u32() as i64));
+        pyre_object::gc_roots::shadow_stack_set(val_slot, w_int_new(num as i64));
         unsafe {
             pyre_object::dictmultiobject::w_dict_store(
-                w_charmap,
-                w_int_new(cp.to_u32() as i64),
-                w_int_new(num as i64),
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                pyre_object::gc_roots::shadow_stack_get(key_slot),
+                pyre_object::gc_roots::shadow_stack_get(val_slot),
             );
         }
     }
-    Ok(w_charmap)
+    Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
 }
 
 /// The `errors` argument the code page entry points share: `None` is

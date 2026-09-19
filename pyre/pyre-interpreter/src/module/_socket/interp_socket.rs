@@ -1670,29 +1670,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         libc::if_freenameindex(head);
                         interfaces
                     };
-                    let _roots = pyre_object::gc_roots::push_roots();
-                    let mut pair_slots = Vec::with_capacity(interfaces.len());
+                    let mut result_w = pyre_object::gc_roots::RootedItems::new();
                     for (index, name) in interfaces {
-                        let idx = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                            index as i64,
-                        ));
-                        // Interface names are OS bytes: preserve fsencode/fsdecode
-                        // round trips, including non-UTF-8 names.
-                        let decoded = pyre_object::gc_roots::pin_root(
-                            crate::gateway::fsdecode_filename_bytes(&name),
-                        );
-                        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                            idx, decoded,
-                        ]));
-                        pair_slots.push(pair_slot);
+                        let pair = {
+                            let mut fields = pyre_object::gc_roots::RootedItems::new();
+                            fields.push(pyre_object::w_int_new(index as i64));
+                            // Interface names are OS bytes: preserve fsencode/fsdecode
+                            // round trips, including non-UTF-8 names.
+                            fields.push(crate::gateway::fsdecode_filename_bytes(&name));
+                            pyre_object::w_tuple_new(fields.take())
+                        };
+                        result_w.push(pair);
                     }
-                    Ok(pyre_object::w_list_new(
-                        pair_slots
-                            .into_iter()
-                            .map(pyre_object::gc_roots::shadow_stack_get)
-                            .collect(),
-                    ))
+                    Ok(pyre_object::w_list_new(result_w.take()))
                 },
                 0,
             ),
@@ -2378,10 +2368,9 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
             }
 
             // Every field and entry is a nursery object and the next lap
-            // allocates again, so they all sit on one bracket. Reload each
-            // word at the constructor that consumes it.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let mut entry_slots = Vec::new();
+            // allocates again. Nested `RootedItems` closes before the outer
+            // `push`, so each completed entry stays live on `result_w`.
+            let mut result_w = pyre_object::gc_roots::RootedItems::new();
             let mut cur = res;
             unsafe {
                 while !cur.is_null() {
@@ -2403,37 +2392,21 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         &mut storage as *mut _ as *mut u8,
                         copy_len,
                     );
-                    let family = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                        ai.ai_family as i64,
-                    ));
-                    let socktype = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                        ai.ai_socktype as i64,
-                    ));
-                    let protocol = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                        ai.ai_protocol as i64,
-                    ));
-                    let canon = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(
-                        &canon,
-                    ));
-                    let addr = pyre_object::gc_roots::pin_root(unpack_inet_addr(
-                        &storage,
-                        copy_len as rffi::SockLen,
-                    ));
-                    let entry_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                        family, socktype, protocol, canon, addr,
-                    ]));
-                    entry_slots.push(entry_slot);
+                    let entry = {
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_int_new(ai.ai_family as i64));
+                        fields.push(pyre_object::w_int_new(ai.ai_socktype as i64));
+                        fields.push(pyre_object::w_int_new(ai.ai_protocol as i64));
+                        fields.push(pyre_object::w_str_new_managed(&canon));
+                        fields.push(unpack_inet_addr(&storage, copy_len as rffi::SockLen));
+                        pyre_object::w_tuple_new(fields.take())
+                    };
+                    result_w.push(entry);
                     cur = ai.ai_next;
                 }
                 rffi::freeaddrinfo(res);
             }
-            Ok(pyre_object::w_list_new(
-                entry_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ))
+            Ok(pyre_object::w_list_new(result_w.take()))
         }),
     );
 
@@ -5172,67 +5145,62 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // Walk ancillary data.  Re-run msghdr with the final
             // controllen so CMSG_* macros see the trimmed buffer.  Every
             // field, cmsg tuple, the anc list, and the result tuple is a
-            // nursery object, so they all sit on one bracket and each later
-            // mint reloads the words it consumes.
+            // nursery object. Build the anc list first so its bracket
+            // closes before the result fields are pinned.
             let _roots = pyre_object::gc_roots::push_roots();
-            let mut anc_slots = Vec::new();
-            if ancbufsize > 0 && controllen > 0 {
-                let mut dummy_iov = libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                };
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                msg.msg_iov = &mut dummy_iov;
-                msg.msg_iovlen = 1;
-                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = controllen;
-                unsafe {
-                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                    while !cmsg.is_null() {
-                        let header = &*cmsg;
-                        let hdr_size = libc::CMSG_LEN(0) as usize;
-                        let total = header.cmsg_len as usize;
-                        if total < hdr_size {
-                            break;
+            let anc = {
+                let mut result_w = pyre_object::gc_roots::RootedItems::new();
+                if ancbufsize > 0 && controllen > 0 {
+                    let mut dummy_iov = libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    };
+                    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                    msg.msg_iov = &mut dummy_iov;
+                    msg.msg_iovlen = 1;
+                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                    msg.msg_controllen = controllen;
+                    unsafe {
+                        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                        while !cmsg.is_null() {
+                            let header = &*cmsg;
+                            let hdr_size = libc::CMSG_LEN(0) as usize;
+                            let total = header.cmsg_len as usize;
+                            if total < hdr_size {
+                                break;
+                            }
+                            let payload_ptr = libc::CMSG_DATA(cmsg);
+                            let control_start = control.as_ptr() as usize;
+                            let data_start = payload_ptr as usize;
+                            let control_end = control_start.saturating_add(controllen as usize);
+                            if data_start < control_start || data_start > control_end {
+                                break;
+                            }
+                            // A truncated cmsg may retain its original cmsg_len.
+                            // `recvmsg.py` returns only bytes the kernel actually
+                            // left inside the final msg_controllen boundary.
+                            let available = control_end - data_start;
+                            let payload_len = (total - hdr_size).min(available);
+                            let payload =
+                                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                            let pair = {
+                                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                                fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
+                                fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
+                                fields.push(pyre_object::bytesobject::w_bytes_from_bytes(
+                                    &payload,
+                                ));
+                                pyre_object::w_tuple_new(fields.take())
+                            };
+                            result_w.push(pair);
+                            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                         }
-                        let payload_ptr = libc::CMSG_DATA(cmsg);
-                        let control_start = control.as_ptr() as usize;
-                        let data_start = payload_ptr as usize;
-                        let control_end = control_start.saturating_add(controllen as usize);
-                        if data_start < control_start || data_start > control_end {
-                            break;
-                        }
-                        // A truncated cmsg may retain its original cmsg_len.
-                        // `recvmsg.py` returns only bytes the kernel actually
-                        // left inside the final msg_controllen boundary.
-                        let available = control_end - data_start;
-                        let payload_len = (total - hdr_size).min(available);
-                        let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                        let level = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                            header.cmsg_level as i64,
-                        ));
-                        let cmsg_type = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                            header.cmsg_type as i64,
-                        ));
-                        let data = pyre_object::gc_roots::pin_root(
-                            pyre_object::bytesobject::w_bytes_from_bytes(&payload),
-                        );
-                        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                            level, cmsg_type, data,
-                        ]));
-                        anc_slots.push(pair_slot);
-                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
                 }
-            }
+                pyre_object::w_list_new(result_w.take())
+            };
             let anc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(
-                anc_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ));
+            let _ = pyre_object::gc_roots::pin_root(anc);
             let data_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(
                 pyre_object::bytesobject::w_bytes_from_bytes(&data),
@@ -5354,62 +5322,58 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
 
             // Every field, cmsg tuple, the anc list, and the result tuple
             // sit on the same bracket already opened for the writable
-            // buffers. Later mints reload the words they consume.
-            let mut anc_slots = Vec::new();
-            if ancbufsize > 0 && controllen > 0 {
-                let mut dummy_iov = libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                };
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                msg.msg_iov = &mut dummy_iov;
-                msg.msg_iovlen = 1;
-                msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = controllen;
-                unsafe {
-                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                    while !cmsg.is_null() {
-                        let header = &*cmsg;
-                        let hdr_size = libc::CMSG_LEN(0) as usize;
-                        let total = header.cmsg_len as usize;
-                        if total < hdr_size {
-                            break;
+            // buffers. Build the anc list first so its bracket closes
+            // before the result fields are pinned.
+            let anc = {
+                let mut result_w = pyre_object::gc_roots::RootedItems::new();
+                if ancbufsize > 0 && controllen > 0 {
+                    let mut dummy_iov = libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    };
+                    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                    msg.msg_iov = &mut dummy_iov;
+                    msg.msg_iovlen = 1;
+                    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                    msg.msg_controllen = controllen;
+                    unsafe {
+                        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                        while !cmsg.is_null() {
+                            let header = &*cmsg;
+                            let hdr_size = libc::CMSG_LEN(0) as usize;
+                            let total = header.cmsg_len as usize;
+                            if total < hdr_size {
+                                break;
+                            }
+                            let payload_ptr = libc::CMSG_DATA(cmsg);
+                            let control_start = control.as_ptr() as usize;
+                            let data_start = payload_ptr as usize;
+                            let control_end = control_start.saturating_add(controllen as usize);
+                            if data_start < control_start || data_start > control_end {
+                                break;
+                            }
+                            let available = control_end - data_start;
+                            let payload_len = (total - hdr_size).min(available);
+                            let payload =
+                                std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
+                            let pair = {
+                                let mut fields = pyre_object::gc_roots::RootedItems::new();
+                                fields.push(pyre_object::w_int_new(header.cmsg_level as i64));
+                                fields.push(pyre_object::w_int_new(header.cmsg_type as i64));
+                                fields.push(pyre_object::bytesobject::w_bytes_from_bytes(
+                                    &payload,
+                                ));
+                                pyre_object::w_tuple_new(fields.take())
+                            };
+                            result_w.push(pair);
+                            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                         }
-                        let payload_ptr = libc::CMSG_DATA(cmsg);
-                        let control_start = control.as_ptr() as usize;
-                        let data_start = payload_ptr as usize;
-                        let control_end = control_start.saturating_add(controllen as usize);
-                        if data_start < control_start || data_start > control_end {
-                            break;
-                        }
-                        let available = control_end - data_start;
-                        let payload_len = (total - hdr_size).min(available);
-                        let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
-                        let level = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                            header.cmsg_level as i64,
-                        ));
-                        let cmsg_type = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                            header.cmsg_type as i64,
-                        ));
-                        let data = pyre_object::gc_roots::pin_root(
-                            pyre_object::bytesobject::w_bytes_from_bytes(&payload),
-                        );
-                        let pair_slot = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(vec![
-                            level, cmsg_type, data,
-                        ]));
-                        anc_slots.push(pair_slot);
-                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
                 }
-            }
+                pyre_object::w_list_new(result_w.take())
+            };
             let anc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(
-                anc_slots
-                    .into_iter()
-                    .map(pyre_object::gc_roots::shadow_stack_get)
-                    .collect(),
-            ));
+            let _ = pyre_object::gc_roots::pin_root(anc);
             let got_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(got as i64));
             let flags_slot = pyre_object::gc_roots::shadow_stack_len();

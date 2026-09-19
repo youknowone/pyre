@@ -417,9 +417,7 @@ pub(crate) fn w_memoryview_new_simple_with_owner(
     use pyre_object::bufferview::BufferView;
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_backing);
-        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let sp = pyre_object::gc_roots::pin_roots(&[w_backing, w_obj]);
         let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
         let r_backing = pyre_object::gc_roots::shadow_stack_get(sp);
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp + 1);
@@ -622,9 +620,7 @@ unsafe fn w_memoryview_new_python_buffer(
     unsafe {
         use pyre_object::memoryview::*;
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_obj);
-        let _ = pyre_object::gc_roots::pin_root(w_descr);
+        let sp = pyre_object::gc_roots::pin_roots(&[w_obj, w_descr]);
         let _ = pyre_object::gc_roots::pin_root(w_int_new(flags as i64));
 
         let r_obj = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -786,9 +782,7 @@ fn w_memoryview_new_with_flags_impl(
             use pyre_object::buffer::Buffer;
             use pyre_object::bufferview::BufferView;
             let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_obj);
-            let _ = pyre_object::gc_roots::pin_root(backing_obj);
+            let sp = pyre_object::gc_roots::pin_roots(&[w_obj, backing_obj]);
             let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&fmt));
             let shape_i64 = shape.iter().map(|&dim| dim as i64).collect::<Vec<_>>();
             let mut strides = vec![0i64; shape.len()];
@@ -2158,10 +2152,7 @@ unsafe fn memoryview_call_python_release_unraisable(
 ) {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(exporter);
-        let _ = pyre_object::gc_roots::pin_root(view);
-        let _ = pyre_object::gc_roots::pin_root(descr);
+        let sp = pyre_object::gc_roots::pin_roots(&[exporter, view, descr]);
         let r_exporter = pyre_object::gc_roots::shadow_stack_get(sp);
         let w_type = crate::typedef::r#type(r_exporter).map_or(r_exporter, |p| p.as_ptr());
         if let Err(mut error) = crate::baseobjspace::get_and_call_function(
@@ -2215,10 +2206,7 @@ unsafe fn memoryview_release_native_python_slot(exporter: PyObjectRef, source: P
             return;
         };
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(exporter);
-        let _ = pyre_object::gc_roots::pin_root(source);
-        let _ = pyre_object::gc_roots::pin_root(descr);
+        let sp = pyre_object::gc_roots::pin_roots(&[exporter, source, descr]);
         let restricted =
             w_memoryview_new_restricted_snapshot(pyre_object::gc_roots::shadow_stack_get(sp + 1));
         let _ = pyre_object::gc_roots::pin_root(restricted);
@@ -2251,10 +2239,7 @@ unsafe fn memoryview_release_buffer_wrapper(wrapper: PyObjectRef) {
             return;
         }
         let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(wrapper);
-        let _ = pyre_object::gc_roots::pin_root(w_mv);
-        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        let sp = pyre_object::gc_roots::pin_roots(&[wrapper, w_mv, w_obj]);
 
         let r_mv = pyre_object::gc_roots::shadow_stack_get(sp + 1);
         w_memoryview_exports_decref(r_mv);
@@ -4294,10 +4279,8 @@ fn input_streams_are_std_tty(
     // ordinary Python calls, so both streams are read back from their slots
     // rather than kept in the words this was entered with.
     let roots = pyre_object::gc_roots::push_roots();
-    let stdin_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(stdin);
-    let stdout_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(stdout);
+    let stdin_slot = roots.pin_roots(&[stdin, stdout]);
+    let stdout_slot = stdin_slot + 1;
     let fileno = |stream| -> Option<PyObjectRef> {
         let method = crate::baseobjspace::getattr_str(stream, "fileno").ok()?;
         crate::call_and_check(method, &[]).ok()
@@ -4335,10 +4318,8 @@ fn input_write_prompt(stdout: PyObjectRef, prompt: PyObjectRef) -> Result<(), cr
     // The attribute lookups and `write` are ordinary Python calls; keep the
     // stream and the prompt in slots across them.
     let roots = pyre_object::gc_roots::push_roots();
-    let stdout_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(stdout);
-    let prompt_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(prompt);
+    let stdout_slot = roots.pin_roots(&[stdout, prompt]);
+    let prompt_slot = stdout_slot + 1;
     let write = crate::baseobjspace::getattr_str(roots.get(stdout_slot), "write")?;
     crate::call_and_check(write, &[roots.get(prompt_slot)])?;
     match crate::baseobjspace::getattr_str(roots.get(stdout_slot), "flush") {
@@ -4616,23 +4597,16 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `sep` / `end` are native locals, so all of them name pre-collection
     // addresses from the first of those calls onwards.
     let arg_roots = pyre_object::gc_roots::push_roots();
-    let args_base = arg_roots.base();
-    for &arg in positional {
-        let _ = arg_roots.pin_root(arg);
-    }
+    let args_base = arg_roots.publish(positional);
     let nargs = positional.len();
     // `base()` is the bracket's fixed save point, so the two slots that follow
     // the arguments are read off the live top instead.
-    let sep = sep.map(|s| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = arg_roots.pin_root(s);
-        slot
-    });
-    let end = end.map(|e| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = arg_roots.pin_root(e);
-        slot
-    });
+    let sep = sep.map(|s| arg_roots.publish(&[s]));
+    let end = end.map(|e| arg_roots.publish(&[e]));
+    arg_roots.normalize(
+        args_base,
+        nargs + usize::from(sep.is_some()) + usize::from(end.is_some()),
+    );
 
     // With no explicit `file` (absent or `file=None`), the sink is the live
     // `sys.stdout`, resolved per call so a Python-level rebinding redirects
@@ -4858,16 +4832,14 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // Rust local would still name the address it had before a collection moved
     // the object.
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(args.get(1).copied().unwrap_or_else(w_none));
-    let _ = pyre_object::gc_roots::pin_root(args.get(2).copied().unwrap_or_else(w_none));
-    // A stream that is not there is `None` in the slot and `false` beside it;
-    // the two answer different questions and the tests below ask both.
-    let has_stderr = stderr.is_some();
-    let _ = pyre_object::gc_roots::pin_root(match stderr {
+    let value_obj = args.get(1).copied().unwrap_or_else(w_none);
+    let traceback_obj = args.get(2).copied().unwrap_or_else(w_none);
+    let stderr_obj = match stderr {
         Some(stream) if !stream.is_null() => stream,
         _ => w_none(),
-    });
+    };
+    let has_stderr = stderr.is_some();
+    let sp = pyre_object::gc_roots::pin_roots(&[value_obj, traceback_obj, stderr_obj]);
     let value = || pyre_object::gc_roots::shadow_stack_get(sp);
     let traceback = || pyre_object::gc_roots::shadow_stack_get(sp + 1);
     let stderr_slot = || has_stderr.then(|| pyre_object::gc_roots::shadow_stack_get(sp + 2));
@@ -6183,15 +6155,12 @@ fn min_max_multiple_args(
     want_max: bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let item_base = pyre_object::gc_roots::shadow_stack_len();
-    for &item in positional {
-        let _ = pyre_object::gc_roots::pin_root(item);
-    }
-    let key_fn_slot = key_fn.map(|key| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(key);
-        slot
-    });
+    let item_base = pyre_object::gc_roots::publish_roots(positional);
+    let key_fn_slot = key_fn.map(|key| pyre_object::gc_roots::publish_roots(&[key]));
+    pyre_object::gc_roots::normalize_roots(
+        item_base,
+        positional.len() + usize::from(key_fn_slot.is_some()),
+    );
     let cmp_op = if want_max {
         crate::baseobjspace::CompareOp::Gt
     } else {
@@ -6661,11 +6630,12 @@ fn type_descr_new_with_metaclass(
         {
             let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
             let items = unsafe { pyre_object::w_dict_items(class_ns) };
-            let item_root = pyre_object::gc_roots::shadow_stack_len();
+            let mut flat = Vec::with_capacity(items.len() * 2);
             for &(key, value) in &items {
-                let _ = pyre_object::gc_roots::pin_root(key);
-                let _ = pyre_object::gc_roots::pin_root(value);
+                flat.push(key);
+                flat.push(value);
             }
+            let item_root = pyre_object::gc_roots::pin_roots(&flat);
             for index in 0..items.len() {
                 let key = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2);
                 let value = pyre_object::gc_roots::shadow_stack_get(item_root + index * 2 + 1);
@@ -10344,10 +10314,9 @@ fn exception_group_derive_and_copy(
     // argument list, and the group it answers has to survive the attribute
     // copy, which allocates in turn.
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_self);
+    let self_slot = pyre_object::gc_roots::publish_roots(&[w_self]);
     let items_base = pyre_object::gc_roots::publish_roots(&exceptions);
-    pyre_object::gc_roots::normalize_roots(items_base, exceptions.len());
+    pyre_object::gc_roots::normalize_roots(self_slot, 1 + exceptions.len());
     let derive = crate::baseobjspace::getattr_str(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         "derive",
@@ -12164,14 +12133,29 @@ pub(crate) fn builtin_tuple(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
             return Ok(obj);
         }
         if is_exact_list(obj) {
-            let n = w_list_len(obj);
-            let items: Vec<_> = (0..n)
-                .filter_map(|i| w_list_getitem(obj, i as i64))
-                .collect();
-            return Ok(w_tuple_new(items));
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let n = w_list_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            for i in 0..n {
+                if let Some(item) =
+                    w_list_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i as i64)
+                {
+                    items.push(item);
+                }
+            }
+            return Ok(w_tuple_new(items.take()));
         }
     }
-    Ok(w_tuple_new(collect_iterable(obj)?))
+    let items = collect_iterable(obj)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&items);
+    Ok(w_tuple_new(
+        (0..items.len())
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect(),
+    ))
 }
 
 pub fn builtin_list_ctor(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -16880,11 +16864,7 @@ pub(crate) fn exec_or_eval(
     // `_closure_root` opens: a slot claimed after that scope would be truncated
     // away by its drop.
     let ns_roots = pyre_object::gc_roots::push_roots();
-    let w_globals_slot = (!w_globals.is_null()).then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(w_globals);
-        slot
-    });
+    let w_globals_slot = (!w_globals.is_null()).then(|| ns_roots.publish(&[w_globals]));
     // `locals_arg` is what `setdictscope` binds far below, and the plant on the
     // next lines runs user Python: a dict-subclass `setdefault` /
     // `__contains__` / `__setitem__` can collect, and the nursery relocates the
@@ -16909,35 +16889,24 @@ pub(crate) fn exec_or_eval(
     let globals_is_absent = is_none_or_null(globals_arg);
     let locals_is_globals =
         !locals_is_absent && !globals_is_absent && std::ptr::eq(locals_arg, globals_arg);
-    let locals_object_slot = (!locals_is_absent && !locals_is_globals).then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(locals_arg);
-        slot
-    });
+    let locals_object_slot =
+        (!locals_is_absent && !locals_is_globals).then(|| ns_roots.publish(&[locals_arg]));
     // The validated closure is the caller's tuple, and it is consumed last of
     // all -- after `ensure_*_builtins`, the two namespace pins and the
     // snapshot allocation.  It goes on the same scope as they do rather than
     // on `_closure_root`, which opens after those calls have already run.
-    let closure_slot = inject_closure.then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(closure);
-        slot
-    });
+    let closure_slot = inject_closure.then(|| ns_roots.publish(&[closure]));
     // The two namespace arguments outlive that same window.  `w_globals` is
     // pinned above, but `globals_arg` is a different local even when the two
     // name one object, and the tests below forward the argument rather than the
     // resolved mapping.  `locals_arg` is the mapping the frame runs on; nothing
     // else names it while the override runs.
-    let globals_arg_slot = (!globals_arg.is_null()).then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(globals_arg);
-        slot
-    });
-    let locals_arg_slot = (!locals_arg.is_null()).then(|| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = ns_roots.pin_root(locals_arg);
-        slot
-    });
+    let globals_arg_slot = (!globals_arg.is_null()).then(|| ns_roots.publish(&[globals_arg]));
+    let locals_arg_slot = (!locals_arg.is_null()).then(|| ns_roots.publish(&[locals_arg]));
+    ns_roots.normalize(
+        ns_roots.base(),
+        pyre_object::gc_roots::shadow_stack_len() - ns_roots.base(),
+    );
     // pyopcode.py:773-774 `space.call_method(w_globals, 'setdefault', ...)`
     // (exec) and compiling.py:109-110 `space.setitem_str(w_globals, ...)`
     // (eval) dispatch on the ORIGINAL `w_globals` object so a dict-subclass
@@ -18423,8 +18392,13 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
         if pyre_object::is_w_range(obj) {
             // `descr_hash` — `hash((length, start|None, step|None))` so two
             // ranges denoting the same sequence hash equally.
-            let w_len = pyre_object::w_range_length(obj);
-            let (start, _stop, step) = pyre_object::w_range_fields(obj);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            let w_len =
+                pyre_object::w_range_length(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+            let (start, _stop, step) =
+                pyre_object::w_range_fields(pyre_object::gc_roots::shadow_stack_get(obj_slot));
             let len_b = pyre_object::range_obj_to_bigint(w_len);
             let none = w_none();
             let (a, b) = if len_b == BigInt::from(0) {
@@ -18434,7 +18408,12 @@ pub fn hash_value(mut obj: PyObjectRef) -> i64 {
             } else {
                 (start, step)
             };
-            let tup = pyre_object::w_tuple_new(vec![w_len, a, b]);
+            let field_base = pyre_object::gc_roots::pin_roots(&[w_len, a, b]);
+            let tup = pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(field_base),
+                pyre_object::gc_roots::shadow_stack_get(field_base + 1),
+                pyre_object::gc_roots::shadow_stack_get(field_base + 2),
+            ]);
             return hash_value(tup);
         }
         if pyre_object::is_generic_alias(obj) {
@@ -18606,15 +18585,13 @@ pub(crate) fn builtin_map(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // PyPy's `args_w` and `build_iterators_from_args` keep every argument live
     // while `space.iter` and the Python 3.14 `strict` truth conversion execute.
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
+    let args_base = pyre_object::gc_roots::publish_roots(args);
     let w_strict = kwarg_get(kwargs, "strict");
-    let strict_slot = w_strict.map(|value| {
-        let _ = pyre_object::gc_roots::pin_root(value);
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    });
+    let strict_slot = w_strict.map(|value| pyre_object::gc_roots::publish_roots(&[value]));
+    pyre_object::gc_roots::normalize_roots(
+        args_base,
+        args.len() + usize::from(strict_slot.is_some()),
+    );
     let strict = strict_slot
         .map(|slot| {
             crate::baseobjspace::is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
@@ -18660,14 +18637,13 @@ pub(crate) fn builtin_zip(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     clinic_arity("zip", 0, real_kwarg_count(kwargs), 0, 0, 1)?;
     kwarg_reject_unknown(kwargs, &["strict"], "zip")?;
     let _roots = pyre_object::gc_roots::push_roots();
-    let args_base = pyre_object::gc_roots::shadow_stack_len();
-    for &arg in args {
-        let _ = pyre_object::gc_roots::pin_root(arg);
-    }
-    let strict_slot = kwarg_get(kwargs, "strict").map(|value| {
-        let _ = pyre_object::gc_roots::pin_root(value);
-        pyre_object::gc_roots::shadow_stack_len() - 1
-    });
+    let args_base = pyre_object::gc_roots::publish_roots(args);
+    let strict_slot =
+        kwarg_get(kwargs, "strict").map(|value| pyre_object::gc_roots::publish_roots(&[value]));
+    pyre_object::gc_roots::normalize_roots(
+        args_base,
+        args.len() + usize::from(strict_slot.is_some()),
+    );
     let strict = strict_slot
         .map(|slot| {
             crate::baseobjspace::is_true(unsafe { pyre_object::gc_roots::shadow_stack_get(slot) })
@@ -19010,6 +18986,12 @@ pub fn sort_list_in_place(
         // while key and comparison calls can collect.  The receiver is empty
         // for the whole operation, so user code cannot alter this sorting
         // slice through the visible list.
+        //
+        // `descr_sort` snapshots via `getitems()` (`we_are_jitted` selects
+        // the copy that keeps identity-bearing boxes explicit) and holds
+        // that snapshot in `sorter.list`. The copy is a bare Vec, so
+        // publish every word then normalize once (`pin_roots`) before any
+        // later allocation can move a still-unpublished sibling.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
         let saved = pyre_object::listobject::w_list_items_copy_as_vec_mode(
@@ -19017,11 +18999,9 @@ pub fn sort_list_in_place(
             majit_metainterp::jit::we_are_jitted(),
         );
         let _roots = pyre_object::gc_roots::push_roots();
-        let item_base = pyre_object::gc_roots::shadow_stack_len();
-        for item in saved {
-            let _ = pyre_object::gc_roots::pin_root(item);
-        }
-        let saved_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
+        let item_base = pyre_object::gc_roots::pin_roots(&saved);
+        let saved_len = saved.len();
+        let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         pyre_object::listobject::w_list_clear(list);
         // CPython 3.14 list_sort_impl detaches ob_item and marks `allocated`
         // as -1. Any resizing mutation replaces the sentinel with a normal
@@ -19897,8 +19877,7 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         Some(mode) => mode,
         None => {
             let _mode_roots = pyre_object::gc_roots::push_roots();
-            let _ = pyre_object::gc_roots::pin_root(file);
-            let _ = pyre_object::gc_roots::pin_root(self_obj);
+            let _ = pyre_object::gc_roots::pin_roots(&[file, self_obj]);
             w_str_new("r")
         }
     };
@@ -19966,14 +19945,12 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     }
     let opener = bind_pos_or_kw(pos, kwargs, 4, "opener", "FileIO", 4)?.unwrap_or_else(w_none);
     let _open_roots = pyre_object::gc_roots::push_roots();
-    let file_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(file);
+    let file_slot = pyre_object::gc_roots::publish_roots(&[file, closefd_obj, opener]);
+    let closefd_slot = file_slot + 1;
+    let opener_slot = file_slot + 2;
+    pyre_object::gc_roots::normalize_roots(file_slot, 3);
     let mode_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&raw_mode));
-    let closefd_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(closefd_obj);
-    let opener_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(opener);
     let fd_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_int_new(-1));
     let opened = open_raw_file(&[
@@ -19987,8 +19964,9 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
         pyre_object::gc_roots::shadow_stack_get(opener_slot),
     ])?;
     let _roots = pyre_object::gc_roots::push_roots();
-    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
-    let opened = pyre_object::gc_roots::pin_root(opened);
+    let opened_base = pyre_object::gc_roots::pin_roots(&[self_obj, opened]);
+    let self_obj = pyre_object::gc_roots::shadow_stack_get(opened_base);
+    let opened = pyre_object::gc_roots::shadow_stack_get(opened_base + 1);
     for name in [
         "__file_data__",
         "__file_pos__",

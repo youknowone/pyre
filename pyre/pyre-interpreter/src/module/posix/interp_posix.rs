@@ -3931,12 +3931,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // is a second that fits. Dividing after the narrowing turned away
             // the whole range instead. `divmod` is also what answers for a
             // value that is not a number at all.
-            let split =
-                crate::builtins::builtin_divmod(&[v, pyre_object::w_int_new(1_000_000_000)])?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let v_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(v);
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(1_000_000_000));
+            let split = crate::builtins::builtin_divmod(&[
+                pyre_object::gc_roots::shadow_stack_get(v_slot),
+                pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            ])?;
+            let split_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(split);
             let (w_sec, w_nsec) = unsafe {
                 (
-                    pyre_object::w_tuple_getitem(split, 0),
-                    pyre_object::w_tuple_getitem(split, 1),
+                    pyre_object::w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(split_slot),
+                        0,
+                    ),
+                    pyre_object::w_tuple_getitem(
+                        pyre_object::gc_roots::shadow_stack_get(split_slot),
+                        1,
+                    ),
                 )
             };
             let (Some(w_sec), Some(w_nsec)) = (w_sec, w_nsec) else {
@@ -3944,13 +3959,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "utime: divmod() returned a non-pair",
                 ));
             };
+            // Both words are already live; publish them together so the
+            // first normalize cannot move `w_nsec` before it is a root.
+            let sec_slot = pyre_object::gc_roots::pin_roots(&[w_sec, w_nsec]);
+            let nsec_slot = sec_slot + 1;
             // Python's own `//` and `%`, so a negative count of nanoseconds
             // lands on the second below it with a positive remainder.
             //
             // Only an integer second can be out of a `time_t`'s range. A
             // quotient that is not one at all — `divmod` answers a float pair
             // for `ns=(1.5, 2.5)` — keeps the conversion's own refusal.
-            let sec = crate::builtins::space_index_w(w_sec).map_err(|err| {
+            let sec = crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
+                sec_slot,
+            ))
+            .map_err(|err| {
                 if err.kind == crate::PyErrorKind::OverflowError {
                     time_t_overflow()
                 } else {
@@ -3959,7 +3981,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             })?;
             Ok(UTime {
                 sec,
-                nsec: crate::builtins::space_index_w(w_nsec)?,
+                nsec: crate::builtins::space_index_w(pyre_object::gc_roots::shadow_stack_get(
+                    nsec_slot,
+                ))?,
             })
         };
 
@@ -10350,16 +10374,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // keyword dictionary the remaining options are looked up in.
                 // Publish them once and read each back at its use.
                 let _roots = pyre_object::gc_roots::push_roots();
-                let positional_base = pyre_object::gc_roots::pin_roots(&[
+                let positional_base = pyre_object::gc_roots::publish_roots(&[
                     bound[0].expect("path is required"),
                     bound[1].expect("argv is required"),
                     bound[2].expect("env is required"),
                 ]);
-                let kwargs_slot = kwargs.map(|kwargs| {
-                    let slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(kwargs);
-                    slot
-                });
+                let kwargs_slot = kwargs.map(|kwargs| pyre_object::gc_roots::publish_roots(&[kwargs]));
+                pyre_object::gc_roots::normalize_roots(
+                    positional_base,
+                    3 + usize::from(kwargs_slot.is_some()),
+                );
                 let positional =
                     |index: usize| pyre_object::gc_roots::shadow_stack_get(positional_base + index);
                 let kwargs = || kwargs_slot.map(pyre_object::gc_roots::shadow_stack_get);
