@@ -329,6 +329,7 @@ fn rematerializable_marker_receiver_producer(
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone

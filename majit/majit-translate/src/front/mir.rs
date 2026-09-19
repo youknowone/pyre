@@ -38640,6 +38640,8 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
             | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
             | OpKind::ConstRef(_)
             | OpKind::ConstRefNull
             | OpKind::ConstNone

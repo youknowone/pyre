@@ -3651,67 +3651,75 @@ impl BinopDunder {
     }
 }
 
-const INTERNED_SPECIAL_NAMES: &[&str] = &[
-    "__add__",
-    "__radd__",
-    "__sub__",
-    "__rsub__",
-    "__mul__",
-    "__rmul__",
-    "__floordiv__",
-    "__rfloordiv__",
-    "__mod__",
-    "__rmod__",
-    "__truediv__",
-    "__rtruediv__",
-    "__pow__",
-    "__rpow__",
-    "__divmod__",
-    "__rdivmod__",
-    "__lshift__",
-    "__rlshift__",
-    "__rshift__",
-    "__rrshift__",
-    "__and__",
-    "__rand__",
-    "__or__",
-    "__ror__",
-    "__xor__",
-    "__rxor__",
-    "__matmul__",
-    "__rmatmul__",
-];
-
-const INTERNED_SPECIAL_N: usize = INTERNED_SPECIAL_NAMES.len();
-
-static INTERNED_SPECIAL_W: [std::sync::atomic::AtomicPtr<pyre_object::PyObject>;
-    INTERNED_SPECIAL_N] =
-    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; INTERNED_SPECIAL_N];
-
-/// Fill [`INTERNED_SPECIAL_W`] once at startup (`init_typeobjects`).
-///
-/// PyPy's method names are interned unicode constants in the graph.
-/// Also stamp `W_Root.shortcut___mod__` and siblings onto the builtin
-/// layouts (`typedef.py use_special_method_shortcut`).
+/// Stamp `W_Root.shortcut___mod__` and siblings onto the builtin layouts
+/// (`typedef.py use_special_method_shortcut`).
 pub fn init_interned_binop_names() {
-    for (i, name) in INTERNED_SPECIAL_NAMES.iter().enumerate() {
-        INTERNED_SPECIAL_W[i].store(
-            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
     set_shortcut_binop(&INT_TYPE, &INT_BINOP_SHORTCUTS as *const _ as *mut ());
     set_shortcut_binop(&BOOL_TYPE, &BOOL_BINOP_SHORTCUTS as *const _ as *mut ());
     set_shortcut_binop(&FLOAT_TYPE, &FLOAT_BINOP_SHORTCUTS as *const _ as *mut ());
 }
 
-/// Interned immortal `w_name` for a binop special, keyed by a one-word id.
-pub fn interned_special_name(id: i64) -> PyObjectRef {
-    let idx = id as usize;
-    if idx >= INTERNED_SPECIAL_N {
-        return pyre_object::PY_NULL;
+/// Interned immortal `w_name` pair for a binop special. Each arm names a
+/// literal so the fold emits one Ref constant per name.
+fn interned_binop_w_names(op: BinopDunder) -> (PyObjectRef, PyObjectRef) {
+    match op {
+        BinopDunder::Add => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__radd__")),
+        ),
+        BinopDunder::Sub => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__sub__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rsub__")),
+        ),
+        BinopDunder::Mul => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmul__")),
+        ),
+        BinopDunder::FloorDiv => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__floordiv__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rfloordiv__")),
+        ),
+        BinopDunder::Mod => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mod__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmod__")),
+        ),
+        BinopDunder::TrueDiv => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__truediv__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rtruediv__")),
+        ),
+        BinopDunder::Pow => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rpow__")),
+        ),
+        BinopDunder::DivMod => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__divmod__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rdivmod__")),
+        ),
+        BinopDunder::LShift => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__lshift__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rlshift__")),
+        ),
+        BinopDunder::RShift => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rshift__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rrshift__")),
+        ),
+        BinopDunder::And => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__and__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rand__")),
+        ),
+        BinopDunder::Or => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__or__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__ror__")),
+        ),
+        BinopDunder::Xor => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__xor__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rxor__")),
+        ),
+        BinopDunder::MatMul => (
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__matmul__")),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rmatmul__")),
+        ),
     }
-    INTERNED_SPECIAL_W[idx].load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Unary special-method name, carried as a word for the same reason as
@@ -4366,7 +4374,7 @@ fn binop_shortcut_fn(vtable: &BinopShortcutVtable, op: BinopDunder) -> Option<Bi
 /// `descroperation.py shortcut_binop`: `space.lookup` + `get_and_call_function`.
 ///
 /// Each arm passes a literal to `box_str_constant` so the fold can see
-/// the name.  `interned_special_name` residualizes the intern table.
+/// the name.
 unsafe fn shortcut_binop(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -5364,10 +5372,7 @@ pub(crate) fn try_dispatch_binary_special(
 ) -> Result<Option<PyObjectRef>, PyError> {
     // descroperation.py `seq_bug_compat = (symbol == '+' or symbol == '*')`.
     let seq_bug_compat = matches!(op, BinopDunder::Add | BinopDunder::Mul);
-    let fwd_id = (op as i64) * 2;
-    let rev_id = fwd_id + 1;
-    let w_left_name = interned_special_name(fwd_id);
-    let w_right_name = interned_special_name(rev_id);
+    let (w_left_name, w_right_name) = interned_binop_w_names(op);
     unsafe {
         let Some(w_typ1) = crate::typedef::r#type(*lhs) else {
             return Ok(None);
@@ -8412,7 +8417,10 @@ mod tests {
             assert!(same_unoverridden_rpy_type(wrap, lit));
             let rem = binop_with_shortcut(wrap, lit, BinopDunder::Mod).unwrap();
             assert_eq!(w_int_get_value(rem), 1189 % 7);
-            assert_eq!(interned_special_name(8) as usize & 7, 0);
+            assert_eq!(
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mod__")) as usize & 7,
+                0
+            );
         }
     }
 

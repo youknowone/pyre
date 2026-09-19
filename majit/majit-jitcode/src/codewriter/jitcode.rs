@@ -75,6 +75,11 @@ pub struct StrConstDescriptor {
     /// already applied), written to the STR block's `hash` field at
     /// offset 0 so the runtime never recomputes it.
     pub precomputed_hash: i64,
+    /// When true, the load pass writes the interned `W_UnicodeObject`
+    /// wrapper into the slot (`box_str_constant` result). When false,
+    /// it writes the rstr `_utf8` payload (`StringRepr.convert_const`).
+    #[serde(default)]
+    pub as_unicode_object: bool,
 }
 
 /// A payload-less enum-variant singleton constant whose runtime cell is

@@ -279,6 +279,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // annotator sees this as a plain ref-typed value; concrete
         // class identity stays in the `HostObject` carrier itself.
         OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstRefAddr(_) => {

@@ -612,8 +612,8 @@ impl CodeWriter {
         // literals to, so jtransform sees a constant rather than a call.
         crate::translator::rtyper::str_const_fold::fold_str_consts(&mut graph_owned);
         // String view construction is an identity in the model graph. When a
-        // box call receives a proven literal, its interned result is that same
-        // prebuilt string constant.
+        // box call receives a proven literal, the interned `W_UnicodeObject`
+        // is one Ref constant — not an rstr `Ptr(STR)`.
         crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
         let graph = &graph_owned;
 
