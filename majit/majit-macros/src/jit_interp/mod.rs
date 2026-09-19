@@ -2827,6 +2827,100 @@ impl FinishReturn {
     }
 }
 
+/// Parsed arguments of a `jit_merge_point!` invocation.
+///
+/// The bare form (`jit_merge_point!()`) is the observer/replay close.
+/// `jit_merge_point!(driver, env, pc; state)` is the single-executor close:
+/// the walk keeps executing, so the live struct and the trace shadow must
+/// stay equal.
+#[derive(Default, Clone)]
+struct MergePointArgs {
+    driver: Option<Expr>,
+    env: Option<Expr>,
+    pc: Option<Expr>,
+    /// Single-pass tracing opt-in handle: the mutable native `JitState`
+    /// binding. Supplied as the first expr after `;`
+    /// (`jit_merge_point!(driver, env, pc; state)`). When present, the
+    /// expansion emits the gated post-walk transfer hook; when absent
+    /// (the default `jit_merge_point!()` form), the expansion is the
+    /// byte-identical observer/replay statement.
+    state: Option<Expr>,
+}
+
+impl Parse for MergePointArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(Self::default());
+        }
+        let driver: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let env: Expr = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let pc: Expr = input.parse()?;
+        let mut state = None;
+        if input.peek(Token![;]) {
+            input.parse::<Token![;]>()?;
+            let tail: Punctuated<Expr, Token![,]> =
+                input.parse_terminated(Expr::parse, Token![,])?;
+            // The first tail expr is the single-pass `state` handle; any
+            // further exprs remain accepted-and-ignored (legacy form).
+            state = tail.into_iter().next();
+        }
+        Ok(Self {
+            driver: Some(driver),
+            env: Some(env),
+            pc: Some(pc),
+            state,
+        })
+    }
+}
+
+/// Whether any `jit_merge_point!` in this body carries `; state`.
+struct SinglePassCloseScan {
+    found: bool,
+    first_state: Option<MergePointArgs>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let path_str = mac
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
+            let args = syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
+            if args.state.is_some() {
+                self.found = true;
+                if self.first_state.is_none() {
+                    self.first_state = Some(args);
+                }
+            }
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+fn scan_single_pass_close(block: &syn::Block) -> SinglePassCloseScan {
+    let mut scan = SinglePassCloseScan {
+        found: false,
+        first_state: None,
+    };
+    syn::visit::Visit::visit_block(&mut scan, block);
+    scan
+}
+
+/// Whether any `jit_merge_point!` in this function carries `; state`.
+///
+/// `rewrite_body` uses `scan_single_pass_close` for the entry door;
+/// `codegen_state::generate_jit_state` publishes the inverted answer on
+/// `VirtualizableInfo::outer_executor_owns_state`.
+fn has_single_pass_close(func: &ItemFn) -> bool {
+    scan_single_pass_close(&func.block).found
+}
+
 /// Rewrite function body: replace jit_merge_point!() and can_enter_jit!() calls.
 fn rewrite_body(
     block: &syn::Block,
@@ -2839,48 +2933,6 @@ fn rewrite_body(
     finish_return: Option<&FinishReturn>,
 ) -> TokenStream {
     use syn::visit_mut::VisitMut;
-
-    #[derive(Default, Clone)]
-    struct MergePointArgs {
-        driver: Option<Expr>,
-        env: Option<Expr>,
-        pc: Option<Expr>,
-        /// Single-pass tracing opt-in handle: the mutable native `JitState`
-        /// binding. Supplied as the first expr after `;`
-        /// (`jit_merge_point!(driver, env, pc; state)`). When present, the
-        /// expansion emits the gated post-walk transfer hook; when absent
-        /// (the default `jit_merge_point!()` form), the expansion is the
-        /// byte-identical observer/replay statement.
-        state: Option<Expr>,
-    }
-
-    impl Parse for MergePointArgs {
-        fn parse(input: ParseStream) -> syn::Result<Self> {
-            if input.is_empty() {
-                return Ok(Self::default());
-            }
-            let driver: Expr = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let env: Expr = input.parse()?;
-            input.parse::<Token![,]>()?;
-            let pc: Expr = input.parse()?;
-            let mut state = None;
-            if input.peek(Token![;]) {
-                input.parse::<Token![;]>()?;
-                let tail: Punctuated<Expr, Token![,]> =
-                    input.parse_terminated(Expr::parse, Token![,])?;
-                // The first tail expr is the single-pass `state` handle; any
-                // further exprs remain accepted-and-ignored (legacy form).
-                state = tail.into_iter().next();
-            }
-            Ok(Self {
-                driver: Some(driver),
-                env: Some(env),
-                pc: Some(pc),
-                state,
-            })
-        }
-    }
 
     struct CanEnterJitArgs {
         driver: Expr,
@@ -3637,36 +3689,7 @@ fn rewrite_body(
     // before the rewrite because the back edge and the merge point are separate
     // statements visited in source order, and a dispatch loop reaches its back
     // edge inside an opcode arm that can precede the merge point in the tree.
-    struct SinglePassCloseScan {
-        found: bool,
-        first_state: Option<MergePointArgs>,
-    }
-    impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
-        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            let path_str = mac
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect::<Vec<_>>()
-                .join("::");
-            if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
-                let args = syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
-                if args.state.is_some() {
-                    self.found = true;
-                    if self.first_state.is_none() {
-                        self.first_state = Some(args);
-                    }
-                }
-            }
-            syn::visit::visit_macro(self, mac);
-        }
-    }
-    let mut scan = SinglePassCloseScan {
-        found: false,
-        first_state: None,
-    };
-    syn::visit::Visit::visit_block(&mut scan, &cloned_block);
+    let scan = scan_single_pass_close(&cloned_block);
 
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
