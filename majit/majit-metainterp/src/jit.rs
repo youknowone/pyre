@@ -245,8 +245,9 @@ pub fn loop_unrolling_heuristic<T>(lst: &[T], size: usize, cutoff: usize) -> boo
 /// Considered as true during tracing and blackholing,
 /// so its consequences are reflected into jitted code.
 ///
-/// rlib/jit.py:355
-#[inline(always)]
+/// rlib/jit.py:355. `inline(never)` so the call survives to
+/// `fold_we_are_jitted_calls` (`jtransform.py` `_we_are_jitted`).
+#[inline(never)]
 pub fn we_are_jitted() -> bool {
     majit_backend::we_are_jitted()
 }

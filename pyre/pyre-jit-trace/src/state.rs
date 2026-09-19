@@ -4083,52 +4083,34 @@ pub(crate) fn note_root_trace_too_long(
 /// including an abort that retires the log before the close.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
-    pos: majit_metainterp::recorder::TracePosition,
+    _pos: majit_metainterp::recorder::TracePosition,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
-    // Every Python callee re-enters the Python driver's declared portal.
-    // eval.rs registers that driver in slot 0; portal_jitcode resolves its
-    // actual mainjitcode from CompiledJitDriver, including a split portal.
-    // Read that JitCode's owner as pyjitpl.py `MetaInterp.newframe` does,
-    // rather than choosing the first recursive driver in the process.
-    let jitcode = crate::jitcode_runtime::portal_jitcode()?;
+    let canonical = crate::jitcode_runtime::portal_jitcode()?;
     let meta = driver.meta_interp_mut();
-    if !meta.is_main_jitcode(&jitcode) {
+    if !meta.is_main_jitcode(&canonical) {
         return None;
     }
-    let jd_no = jitcode.jitdriver_sd()?;
-    // pyjitpl.py `newframe`: ENTER_PORTAL_FRAME sits on the same greenkey
-    // path as the log append. The walker never builds an MIFrame, so this
-    // is the counterpart of that record.
-    let unique_id = meta.unique_id_for_greenkey(jd_no, &green_key);
-    meta.enter_portal_frame(jd_no, unique_id);
-    meta.push_portal_trace_position(jd_no, Some(green_key), pos);
-    // Counted HERE, not where the entry is appended: an abort retires the log
-    // mid-sub-walk, so counting appends would read `push` far above `pop` for a
-    // reason that says nothing about the pairing.  Counting the decisions makes
-    // `ptp_push != ptp_pop` mean exactly one thing — a sub-walk exit that
-    // skipped its close.
+    let jd_no = canonical.jitdriver_sd()?;
+    // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
+    // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
+    let jitcode = crate::jitcode_runtime::portal_metainterp_jitcode()?;
+    meta.newframe(jitcode, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
 }
 
 /// pyjitpl.py:2470-2472 — close the entry [`note_inline_subwalk_start`] opened.
 pub(crate) fn note_inline_subwalk_end(
-    jd_no: usize,
-    pos: majit_metainterp::recorder::TracePosition,
+    _jd_no: usize,
+    _pos: majit_metainterp::recorder::TracePosition,
 ) {
-    // Like note_inline_subwalk_start, count the activation decision even
-    // when the abort has retired the log. These are not append counters.
     let Some((driver, _)) = crate::driver::try_driver_pair() else {
         return;
     };
     majit_metainterp::mc_diag_bump(59);
-    let meta = driver.meta_interp_mut();
-    // pyjitpl.py `popframe(leave_portal_frame=True)`: the walker close is
-    // a normal return, so LEAVE is recorded even when the abort has
-    // already retired the log.
-    meta.leave_portal_frame(jd_no);
-    meta.push_portal_trace_position(jd_no, None, pos);
+    // pyjitpl.py `popframe(leave_portal_frame=True)`.
+    driver.meta_interp_mut().popframe(true);
 }
 
 /// Stage `reason` as the abort the walker is returning, so the single
