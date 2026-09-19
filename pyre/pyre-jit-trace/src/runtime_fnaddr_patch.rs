@@ -553,6 +553,44 @@ pub fn materialize_unit_variant_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// Materialize every deferred type-static constant
+/// ([`materialize_str_consts`]' sibling for `PyType` singletons).
+/// Each descriptor names a `constants_r` slot holding a non-canonical
+/// sentinel; overwrite it with the live `&INT_TYPE` (etc.) from
+/// `jit_static_pytype_addrs`, keyed by the shared name.
+pub fn materialize_type_static_consts(jitcodes: &mut [Arc<JitCode>]) {
+    let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
+    runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::pyre_class_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::pyre_class_pytype_by_struct_addrs());
+
+    for arc in jitcodes.iter_mut() {
+        if arc
+            .try_body()
+            .is_none_or(|b| b.type_static_consts.is_empty())
+        {
+            continue;
+        }
+        let jc = Arc::get_mut(arc).expect(
+            "materialize_type_static_consts: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        let body = jc.body_mut();
+        for i in 0..body.type_static_consts.len() {
+            let idx = body.type_static_consts[i].constants_r_index;
+            let name = body.type_static_consts[i].name.as_str();
+            assert_eq!(
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
+                (majit_translate::assembler::TYPE_STATIC_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
+                "constants_r[{idx}] did not hold a type-static sentinel",
+            );
+            let addr = runtime_map.get(name).copied().unwrap_or(0);
+            body.constants_r[idx] = addr.into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +761,29 @@ mod tests {
         // The discriminant read the portal switch performs: one word at
         // offset 0 of the cell.
         assert_eq!(unsafe { *(addr as *const i64) }, 0);
+    }
+
+    #[test]
+    fn materialize_type_static_consts_overwrites_sentinel_with_live_int_type() {
+        use majit_translate::jitcode::TypeStaticConstDescriptor;
+
+        let jc = JitCode::new("test");
+        jc.set_body(JitCodeBody {
+            type_static_consts: vec![TypeStaticConstDescriptor {
+                constants_r_index: 0,
+                name: "pyobject::INT_TYPE".into(),
+            }],
+            constants_r: vec![(majit_translate::assembler::TYPE_STATIC_CONST_SENTINEL_BASE).into()],
+            ..Default::default()
+        });
+        let mut jcs = vec![Arc::new(jc)];
+        materialize_type_static_consts(&mut jcs);
+        let addr = jcs[0].body().constants_r[0].get();
+        assert_eq!(
+            addr,
+            &pyre_object::INT_TYPE as *const _ as i64,
+            "sentinel must become the live INT_TYPE address"
+        );
     }
 
     #[test]

@@ -6131,6 +6131,7 @@ impl JitCodeBuilder {
             // descriptor banks are empty.
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
+            type_static_consts: Vec::new(),
             // `jitcode.py JitCode.setup`: the three register counts are
             // stored as one `chr` apiece.  The gate above proves these casts
             // lossless; keeping the builder counters wide is useful only
