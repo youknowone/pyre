@@ -3376,6 +3376,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_int_str",
         pyre_object::jit_int_str,
     );
+    cpa1(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_int_hex",
+        "pyre_object::jit_int_hex",
+        pyre_object::jit_int_hex,
+    );
     cpa2(
         &mut entries,
         "pyre_object::unicodeobject::jit_str_getitem",
