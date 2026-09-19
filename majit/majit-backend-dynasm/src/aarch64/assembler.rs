@@ -6322,7 +6322,7 @@ impl<'a> AssemblerARM64<'a> {
             } else if let Some(entry_label) = self.self_entry_label {
                 dynasm!(self.mc ; .arch aarch64 ; bl =>entry_label);
             }
-            // aarch64/callbuilder.py:75-77 `pop_gcmap` runs
+            // aarch64/callbuilder.py `CallBuilderARM64.pop_gcmap` runs
             // `_reload_frame_if_necessary` first: a collection during the
             // call can move the caller jitframe that the callee footer
             // restored into x29, so x29 is re-read from the shadow stack.
