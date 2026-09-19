@@ -2185,14 +2185,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             })
             .collect();
-        // Per virt array: nested data-ptr/len extractor fns + a registration
-        // keyed on the field byte offset.
+        // Per virt array: a registration keyed on the field byte offset.
         let virt_array_field_parts: Vec<TokenStream> = virt_arrays
             .iter()
             .map(|(_, f)| {
                 let fname = &f.name;
-                let data_ptr_fn = quote::format_ident!("__vinfo_{}_data_ptr", f.name);
-                let len_fn = quote::format_ident!("__vinfo_{}_len", f.name);
                 let fname_str = f.name.to_string();
                 let (item_size, item_type) = match &f.kind {
                     StateFieldKind::VirtArray(tp) if tp == "float" => (
@@ -2205,27 +2202,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     ),
                 };
                 quote! {
-                    fn #data_ptr_fn(__p: *mut u8) -> *mut i64 {
-                        unsafe { (*(__p as *mut #state_type)).#fname.as_mut_ptr() as *mut i64 }
-                    }
-                    fn #len_fn(__p: *const u8) -> usize {
-                        unsafe { (*(__p as *const #state_type)).#fname.len() }
-                    }
                     majit_metainterp::virt_array::register_virt_array_field(
                         &mut __info,
                         #fname_str,
                         #item_type,
                         #item_size,
                         ::std::mem::offset_of!(#state_type, #fname),
-                        #data_ptr_fn,
-                        #len_fn,
                         |__s: &#state_type| &__s.#fname,
                     );
                 }
             })
             .collect();
         // Field idents in `virt_arrays` order — the same order
-        // `add_rust_vec_array_field` registers them, which is the order
+        // `register_virt_array_field` registers them, which is the order
         // `flatten_virtualizable_values` (jitdriver.rs) reads them back.
         let virt_array_export_parts: Vec<TokenStream> = virt_arrays
             .iter()

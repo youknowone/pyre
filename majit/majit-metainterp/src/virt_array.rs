@@ -103,49 +103,24 @@ const fn block_items_offset(align: usize) -> usize {
     word.div_ceil(align) * align
 }
 
-/// How a virtualizable array field is physically laid out in its owner.
-///
-/// The two arms are the two things a field can hold: the container itself, or a
-/// pointer to it. Only the second can be reloaded by the compiled entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VirtArrayBackingKind {
-    /// The field embeds a Rust `Vec<T>` by value.
-    RustVec,
-    /// The field holds a pointer to a `[length][payload…]` block, with both
-    /// offsets measured from that pointer.
-    GcArrayBlock {
-        length_offset: usize,
-        items_offset: usize,
-    },
-}
-
 /// A container a `[..; virt]` state field may be declared with.
 ///
 /// The interpreter author picks the backing by choosing the field's Rust type;
 /// this trait is how the generated `VirtualizableInfo` builder and the
-/// fresh-entry state constructor stay written once for both. Every read and
-/// write of the elements goes through the slice the container derefs to, so the
-/// two backings present the same surface to interpreter code.
+/// fresh-entry state constructor stay written once. Every read and write of
+/// the elements goes through the slice the container derefs to.
 pub trait VirtArrayBacking: std::ops::DerefMut<Target = [Self::Item]> {
     /// Element type. Restricted to `Copy` so a block is released by freeing it,
     /// with no element drop glue to run.
     type Item: Copy;
 
-    /// Physical shape of this container, and where its length and payload sit
-    /// when the shape has fixed offsets.
-    const BACKING: VirtArrayBackingKind;
+    /// Offset of the length word from the field's pointer value.
+    const LENGTH_OFFSET: usize;
+    /// Offset of item 0 from the field's pointer value.
+    const ITEMS_OFFSET: usize;
 
     /// `len` copies of `value` — the fresh-entry constructor.
     fn filled(value: Self::Item, len: usize) -> Self;
-}
-
-impl<T: Copy> VirtArrayBacking for Vec<T> {
-    type Item = T;
-    const BACKING: VirtArrayBackingKind = VirtArrayBackingKind::RustVec;
-
-    fn filled(value: T, len: usize) -> Self {
-        vec![value; len]
-    }
 }
 
 /// A `Vec`-like array whose storage is a single owned pointer to a
@@ -376,10 +351,8 @@ impl<T: Copy> FromIterator<T> for VirtArray<T> {
 
 impl<T: Copy> VirtArrayBacking for VirtArray<T> {
     type Item = T;
-    const BACKING: VirtArrayBackingKind = VirtArrayBackingKind::GcArrayBlock {
-        length_offset: Self::LENGTH_OFFSET,
-        items_offset: Self::ITEMS_OFFSET,
-    };
+    const LENGTH_OFFSET: usize = VirtArray::<T>::LENGTH_OFFSET;
+    const ITEMS_OFFSET: usize = VirtArray::<T>::ITEMS_OFFSET;
 
     fn filled(value: T, len: usize) -> Self {
         VirtArray::filled(value, len)
@@ -393,55 +366,29 @@ impl<T: Copy> VirtArrayBacking for VirtArray<T> {
 /// runs before any state instance exists, so the backing has to be resolved from
 /// the type rather than from a value.
 ///
-/// `data_ptr_fn` and `len_fn` reach a `Vec` backing's items through `Vec`'s own
-/// methods, because there are no offsets that can. A block backing has offsets,
-/// so it registers as an ordinary array-pointer field and the extractors go
-/// unused — which is the whole difference the compiled entry sees.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "One call per declared field carries the field's whole description; splitting it into a context object would separate the offsets from the container they describe"
-)]
+/// The container's length and payload offsets register as an ordinary
+/// array-pointer field, which is what the compiled entry reloads from.
 pub fn register_virt_array_field<S, B: VirtArrayBacking>(
     info: &mut VirtualizableInfo,
     name: &str,
     item_type: Type,
     item_size: usize,
     field_offset: usize,
-    data_ptr_fn: fn(*mut u8) -> *mut i64,
-    len_fn: fn(*const u8) -> usize,
     witness: impl Fn(&S) -> &B,
 ) {
     let _ = witness;
-    match B::BACKING {
-        VirtArrayBackingKind::RustVec => {
-            info.add_rust_vec_array_field(
-                name,
-                item_type,
-                field_offset,
-                data_ptr_fn,
-                len_fn,
-                majit_ir::descr::make_array_descr(0, item_size, item_type),
-            );
-        }
-        VirtArrayBackingKind::GcArrayBlock {
-            length_offset,
-            items_offset,
-        } => {
-            // `virtualizable.py:58 cpu.arraydescrof(ARRAY)` — the descr an
-            // element access is emitted with. Its base is the payload offset, so
-            // `GETARRAYITEM_GC_*` against the pointer the field holds addresses
-            // item `i` directly, with no step in between for the entry to
-            // express.
-            info.add_array_field(
-                name,
-                item_type,
-                field_offset,
-                length_offset,
-                items_offset,
-                majit_ir::descr::make_array_descr(items_offset, item_size, item_type),
-            );
-        }
-    }
+    // `virtualizable.py cpu.arraydescrof` — the descr an element access is
+    // emitted with. Its base is the payload offset, so `GETARRAYITEM_GC_*`
+    // against the pointer the field holds addresses item `i` directly, with
+    // no step in between for the entry to express.
+    info.add_array_field(
+        name,
+        item_type,
+        field_offset,
+        B::LENGTH_OFFSET,
+        B::ITEMS_OFFSET,
+        majit_ir::descr::make_array_descr(B::ITEMS_OFFSET, item_size, item_type),
+    );
 }
 
 #[cfg(test)]
@@ -531,17 +478,14 @@ mod tests {
     }
 
     #[test]
-    fn the_two_backings_declare_different_shapes() {
+    fn a_virt_array_declares_its_block_offsets() {
         assert_eq!(
-            <Vec<i64> as VirtArrayBacking>::BACKING,
-            VirtArrayBackingKind::RustVec
+            <VirtArray<i64> as VirtArrayBacking>::LENGTH_OFFSET,
+            VirtArray::<i64>::LENGTH_OFFSET,
         );
         assert_eq!(
-            <VirtArray<i64> as VirtArrayBacking>::BACKING,
-            VirtArrayBackingKind::GcArrayBlock {
-                length_offset: 0,
-                items_offset: VirtArray::<i64>::ITEMS_OFFSET,
-            }
+            <VirtArray<i64> as VirtArrayBacking>::ITEMS_OFFSET,
+            VirtArray::<i64>::ITEMS_OFFSET,
         );
     }
 
@@ -553,12 +497,6 @@ mod tests {
         struct State {
             regs: VirtArray<i64>,
         }
-        fn data_ptr(p: *mut u8) -> *mut i64 {
-            unsafe { (*(p as *mut State)).regs.as_mut_ptr() }
-        }
-        fn len(p: *const u8) -> usize {
-            unsafe { (*(p as *const State)).regs.len() }
-        }
 
         let mut info = VirtualizableInfo::without_vable_token();
         register_virt_array_field(
@@ -567,8 +505,6 @@ mod tests {
             Type::Int,
             8,
             std::mem::offset_of!(State, regs),
-            data_ptr,
-            len,
             |s: &State| &s.regs,
         );
 
@@ -589,39 +525,6 @@ mod tests {
         assert_eq!(descr.item_size(), 8);
     }
 
-    /// The same declaration on a `Vec` field keeps the storage that reads the
-    /// items through `Vec`'s own methods.
-    #[test]
-    fn a_vec_backed_field_registers_as_rust_vec_storage() {
-        #[repr(C)]
-        struct State {
-            regs: Vec<i64>,
-        }
-        fn data_ptr(p: *mut u8) -> *mut i64 {
-            unsafe { (*(p as *mut State)).regs.as_mut_ptr() }
-        }
-        fn len(p: *const u8) -> usize {
-            unsafe { (*(p as *const State)).regs.len() }
-        }
-
-        let mut info = VirtualizableInfo::without_vable_token();
-        register_virt_array_field(
-            &mut info,
-            "regs",
-            Type::Int,
-            8,
-            std::mem::offset_of!(State, regs),
-            data_ptr,
-            len,
-            |s: &State| &s.regs,
-        );
-
-        assert!(matches!(
-            info.array_fields[0].storage,
-            crate::virtualizable::VableArrayStorage::RustVec { .. }
-        ));
-    }
-
     /// The heap-side readers the blackhole and the resume writer use reach the
     /// items of a block-backed field through its registered offsets.
     #[test]
@@ -630,12 +533,6 @@ mod tests {
         struct State {
             regs: VirtArray<i64>,
         }
-        fn data_ptr(p: *mut u8) -> *mut i64 {
-            unsafe { (*(p as *mut State)).regs.as_mut_ptr() }
-        }
-        fn len(p: *const u8) -> usize {
-            unsafe { (*(p as *const State)).regs.len() }
-        }
 
         let mut info = VirtualizableInfo::without_vable_token();
         register_virt_array_field(
@@ -644,8 +541,6 @@ mod tests {
             Type::Int,
             8,
             std::mem::offset_of!(State, regs),
-            data_ptr,
-            len,
             |s: &State| &s.regs,
         );
 

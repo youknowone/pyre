@@ -125,18 +125,6 @@ pub enum VableArrayStorage {
     /// (e.g. `*mut PyObjectArray`). The data pointer is at `ptr_offset`
     /// within that container (2-level indirection).
     EmbeddedArray { ptr_offset: usize },
-    /// The frame field embeds a Rust `Vec<T>` by value. The `Vec`'s
-    /// `(ptr, cap, len)` triple has no guaranteed field order, so the data
-    /// pointer and length are read through type-aware extractor functions
-    /// monomorphized for the concrete frame type rather than via byte
-    /// offsets. `field_offset` is unused for reads (the extractors locate
-    /// the `Vec` themselves) but is retained for flat-index bookkeeping.
-    RustVec {
-        /// Returns the live data pointer of the embedded `Vec<i64>`.
-        data_ptr_fn: fn(*mut u8) -> *mut i64,
-        /// Returns the live length of the embedded `Vec<i64>`.
-        len_fn: fn(*const u8) -> usize,
-    },
 }
 
 /// Complete description of a virtualizable type.
@@ -766,42 +754,6 @@ impl VirtualizableInfo {
         self.array_descrs.push(array_descr);
     }
 
-    /// Add a Rust `Vec<T>`-backed array field embedded by value in the frame.
-    ///
-    /// `field_offset` is the byte offset of the `Vec` within the frame (used
-    /// only for flat-index bookkeeping). `data_ptr_fn`/`len_fn` read the live
-    /// data pointer and length through `Vec` methods, so no assumption is
-    /// made about the in-memory order of the `Vec`'s `(ptr, cap, len)` words.
-    pub fn add_rust_vec_array_field(
-        &mut self,
-        name: impl Into<String>,
-        item_type: Type,
-        field_offset: usize,
-        data_ptr_fn: fn(*mut u8) -> *mut i64,
-        len_fn: fn(*const u8) -> usize,
-        array_descr: DescrRef,
-    ) {
-        let name = name.into();
-        let item_size = array_descr_item_size(&array_descr, item_type);
-        let item_signed = array_descr_item_signed(&array_descr);
-        let array_type_id = array_field_type_id(&name, &array_descr);
-        self.array_fields.push(VableArrayInfo {
-            name,
-            item_type,
-            item_size,
-            item_signed,
-            field_offset,
-            array_type_id,
-            storage: VableArrayStorage::RustVec {
-                data_ptr_fn,
-                len_fn,
-            },
-            length_offset: 0,
-            items_offset: 0,
-        });
-        self.array_descrs.push(array_descr);
-    }
-
     /// Total number of static fields.
     pub fn num_fields(&self) -> usize {
         self.static_fields.len()
@@ -1369,7 +1321,6 @@ impl VirtualizableInfo {
                     let container = *(obj_ptr.add(ai.field_offset) as *const *const u8);
                     *(container.add(ai.length_offset) as *const usize)
                 }
-                VableArrayStorage::RustVec { len_fn, .. } => len_fn(obj_ptr),
             }
         }
     }
@@ -1615,23 +1566,16 @@ impl VableArrayInfo {
     /// array's data pointer followed by one `GETARRAYITEM_GC_*` per element —
     /// two loads expressible in trace IR with nothing but byte offsets. A
     /// storage whose data pointer sits at a fixed offset (from the field, or
-    /// from a container the field points at) answers that; a `Vec` embedded by
-    /// value does not, because its data pointer is one of three words in an
-    /// order the language does not specify, so no field load portably finds it.
-    /// `patch_new_loop_to_load_virtualizable_fields` panics rather than read a
-    /// capacity as a base address, which makes this the predicate a caller must
-    /// consult BEFORE putting a virtualizable on the preamble's path.
+    /// from a container the field points at) answers that.
     pub fn is_entry_reloadable(&self) -> bool {
         match self.storage {
             VableArrayStorage::DirectPointer | VableArrayStorage::EmbeddedArray { .. } => true,
-            VableArrayStorage::RustVec { .. } => false,
         }
     }
 
     pub fn can_read_length_from_heap(&self) -> bool {
         match self.storage {
             VableArrayStorage::EmbeddedArray { .. } => true,
-            VableArrayStorage::RustVec { .. } => true,
             VableArrayStorage::DirectPointer => {
                 !(self.length_offset == 0 && self.items_offset == 0)
             }
@@ -1649,9 +1593,6 @@ impl VableArrayInfo {
                     // then ptr_offset within that struct → data pointer.
                     let container = *(obj_ptr.add(self.field_offset) as *const *const u8);
                     *(container.add(ptr_offset) as *const *const u8)
-                }
-                VableArrayStorage::RustVec { data_ptr_fn, .. } => {
-                    data_ptr_fn(obj_ptr as *mut u8) as *const u8
                 }
             }
         }
@@ -3218,7 +3159,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                         );
                     }
                 }
-                VableArrayStorage::EmbeddedArray { .. } | VableArrayStorage::RustVec { .. } => {}
+                VableArrayStorage::EmbeddedArray { .. } => {}
             }
         }
         // virtualizable.py write_boxes: static ref fields live on the
@@ -3334,14 +3275,13 @@ pub(crate) unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableAr
                     *(arr_ptr.add(array.length_offset) as *const usize)
                 }
             }
-            VableArrayStorage::RustVec { len_fn, .. } => len_fn(vable_ptr),
         }
     }
 }
 
 /// Address of item 0 of a virtualizable array field.
 ///
-/// The three storage kinds reach the items through different indirections, and
+/// The two storage kinds reach the items through different indirections, and
 /// both the item read and the item write below resolved that separately. They
 /// now share this, so an item access and a whole-array access can never
 /// disagree about where the items start.
@@ -3372,9 +3312,6 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
                     return std::ptr::null();
                 }
                 arr_ptr.add(array.items_offset)
-            }
-            VableArrayStorage::RustVec { data_ptr_fn, .. } => {
-                data_ptr_fn(vable_ptr as *mut u8) as *const u8
             }
         }
     }
@@ -3482,7 +3419,6 @@ pub(crate) unsafe fn vable_array_write_base(
             VableArrayStorage::DirectPointer => {
                 *(vable_ptr.add(array.field_offset) as *const *mut u8)
             }
-            VableArrayStorage::RustVec { .. } => std::ptr::null_mut(),
         };
         (data_ptr, owner_ptr)
     }
@@ -3539,9 +3475,8 @@ pub(crate) unsafe fn vable_write_array_item(
 /// Write one item of a virtualizable array whose base is already resolved.
 ///
 /// Split out of [`vable_write_array_item`] so a caller walking a whole array
-/// can bind the base once, the way `virtualizable.py:134-137` binds `lst`
-/// outside its item loop.  Resolving it per item costs an indirect call for
-/// `RustVec` storage and two loads for the others.
+/// can bind the base once, the way `virtualizable.py write_from_resume_data_partial`
+/// binds `lst` outside its item loop.  Resolving it per item costs two loads.
 pub(crate) unsafe fn vable_write_array_item_at(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
@@ -3669,89 +3604,6 @@ pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *m
         unsafe { follow_forwarded_vable(obj_ptr) }
     } else {
         obj_ptr
-    }
-}
-
-#[cfg(test)]
-mod opt1_rustvec_abi_roundtrip {
-    use super::*;
-
-    // Mirrors examples/tl `TlState { stackpos: i64, stack: Vec<i64> }`: a
-    // Rust `Vec<i64>` embedded by value, the layout `RustVec` storage targets.
-    #[repr(C)]
-    struct FakeState {
-        stackpos: i64,
-        stack: Vec<i64>,
-    }
-
-    fn fake_stack_data_ptr(p: *mut u8) -> *mut i64 {
-        unsafe { (*(p as *mut FakeState)).stack.as_mut_ptr() }
-    }
-    fn fake_stack_len(p: *const u8) -> usize {
-        unsafe { (*(p as *const FakeState)).stack.len() }
-    }
-
-    fn build_info() -> VirtualizableInfo {
-        let mut info = VirtualizableInfo::new(0);
-        info.add_field(
-            "stackpos",
-            Type::Int,
-            std::mem::offset_of!(FakeState, stackpos),
-        );
-        let descr = majit_ir::descr::make_array_descr(0, std::mem::size_of::<i64>(), Type::Int);
-        info.add_rust_vec_array_field(
-            "stack",
-            Type::Int,
-            std::mem::offset_of!(FakeState, stack),
-            fake_stack_data_ptr,
-            fake_stack_len,
-            descr,
-        );
-        info
-    }
-
-    #[test]
-    fn arraylen_reads_live_vec_len() {
-        let mut s = FakeState {
-            stackpos: 0,
-            stack: vec![10, 20, 30],
-        };
-        let info = build_info();
-        let p = (&mut s as *mut FakeState) as *const u8;
-        let len = unsafe { bhimpl_arraylen_vable(p, &info.array_fields[0]) };
-        assert_eq!(len, 3);
-    }
-
-    #[test]
-    fn read_write_roundtrip_through_vec_data() {
-        let mut s = FakeState {
-            stackpos: 0,
-            stack: vec![0, 0, 0, 0],
-        };
-        let info = build_info();
-        let p = (&mut s as *mut FakeState) as *mut u8;
-        unsafe {
-            vable_write_array_item(p, &info.array_fields[0], 0, 111);
-            vable_write_array_item(p, &info.array_fields[0], 3, 444);
-        }
-        assert_eq!(s.stack, vec![111, 0, 0, 444]);
-        let v0 = unsafe { vable_read_array_item(p as *const u8, &info.array_fields[0], 0) };
-        let v3 = unsafe { vable_read_array_item(p as *const u8, &info.array_fields[0], 3) };
-        assert_eq!((v0, v3), (111, 444));
-    }
-
-    #[test]
-    fn flat_index_and_total_size_match_consume_assertion() {
-        let info = build_info();
-        // add_field sets num_static_extra_boxes = static_fields.len().
-        assert_eq!(info.num_static_extra_boxes, 1);
-        let lengths = [4usize];
-        // Flat layout [stackpos, stack[0..4]]; identity is appended separately
-        // by init_virtualizable_boxes.
-        assert_eq!(info.get_index_in_array(0, 0, &lengths), 1);
-        assert_eq!(info.get_index_in_array(0, 3, &lengths), 4);
-        // consume_vable_info asserts get_total_size(slice) == vable_size - 1.
-        assert_eq!(info.get_total_size(&lengths), 1 + 4);
     }
 }
 
