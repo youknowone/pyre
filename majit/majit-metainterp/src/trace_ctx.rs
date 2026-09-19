@@ -3219,7 +3219,6 @@ impl TraceCtx {
         self.set_virtualizable_boxes_with_info(boxes, values, &info, &lengths);
     }
 
-
     /// `virtualizable.py write_boxes` over the whole shadow.
     ///
     /// `skip_when_outer_owned` names the merge-point form whose write-back
