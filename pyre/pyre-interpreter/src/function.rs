@@ -4052,6 +4052,8 @@ pub fn funccall_valuestack(
 /// For user functions with exact arity match (no defaults needed).
 /// Copies args from caller's value stack into the new frame's locals
 /// without intermediate Vec allocation.
+/// `function.py _flat_pycall` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn _flat_pycall(
     func: PyObjectRef,
     code: PyObjectRef,
@@ -4136,6 +4138,8 @@ fn _flat_pycall(
 /// `self.defs_w[ndefs - defs_to_load ..]`.
 /// `defs` is the pre-unwrapped defaults tuple (already null-checked and
 /// verified as a tuple by the caller in `funccall_valuestack`).
+/// `function.py _flat_pycall_defaults` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 fn _flat_pycall_defaults(
     func: PyObjectRef,
     code: PyObjectRef,

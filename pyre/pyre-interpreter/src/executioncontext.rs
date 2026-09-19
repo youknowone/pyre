@@ -2373,6 +2373,8 @@ pub trait ActionFlagOps {
     /// `CheckSignalAction` delivering `KeyboardInterrupt`); the error
     /// propagates out via `?`, aborting the remaining actions, exactly
     /// like PyPy's `action.perform(...)` raising an `OperationError`.
+    /// `executioncontext.py action_dispatcher` is `@jit.unroll_safe`.
+    #[majit_macros::unroll_safe]
     fn action_dispatcher(
         &mut self,
         ec: *mut ExecutionContext,

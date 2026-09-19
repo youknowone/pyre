@@ -291,6 +291,29 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("build_map_from_refs", "pyopcode.py BUILD_MAP pair store"),
     ("match_keys_value", "pyopcode.py MATCH_KEYS"),
     ("match_class_value", "pyopcode.py _match_class"),
+    (
+        "validate_check_eg_match_class",
+        "pyopcode.py check_except_star_type_valid",
+    ),
+    ("exception_match", "baseobjspace.py exception_match"),
+    // `tupleobject.py` short-tuple arms. `_unroll_condition` is
+    // `loop_unrolling_heuristic(..., UNROLL_CUTOFF=10)`; contains/hash
+    // fork to these `@jit.unroll_safe` bodies, and `_compare_tuples`
+    // is `@jit.look_inside_iff(_unroll_condition_cmp)`.
+    (
+        "_descr_contains_unroll_safe",
+        "tupleobject.py _descr_contains_unroll_safe",
+    ),
+    ("_descr_hash_unroll", "tupleobject.py _descr_hash_unroll"),
+    (
+        "_orig_compare_tuples",
+        "rlib/jit.py look_inside_iff unroll_safe(_compare_tuples)",
+    ),
+    ("_flat_pycall", "function.py _flat_pycall"),
+    ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
+    ("action_dispatcher", "executioncontext.py action_dispatcher"),
+    ("match_signature", "argument.py _match_signature"),
+    ("save_float", "interp_pickle.py _Framer.write_binfloat"),
     // `rlib/jit.py look_inside_iff.inner` does `func = unroll_safe(func)`.
     // Harvested names are the inlined originals (`_orig_*`), not the
     // dispatch wrappers.

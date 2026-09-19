@@ -10692,9 +10692,10 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Opaque `f64::{hypot,atan2,copysign,floor,ceil,powf,ln,
-                // exp,sin,cos,sqrt,log10}` are the C llexternals in
-                // `ll_math.py` (`math_hypot`, …).  The raising wrappers
-                // (`ll_math_hypot`, …) stay around them.
+                // exp,sin,cos,tan,sqrt,log10,asin,acos,atan,sinh,cosh,
+                // tanh,asinh,acosh,atanh,exp_m1,ln_1p}` are the C
+                // llexternals in `ll_math.py` (`math_hypot`, …).  The
+                // raising wrappers (`ll_math_hypot`, …) stay around them.
                 if let Some((arity, leaf)) = self.f64_ll_math_leaf(&reg)
                     && args.len() == arity
                 {
@@ -15128,8 +15129,20 @@ impl<'a> Lowering<'a> {
             "exp" => (1, "math_exp"),
             "sin" => (1, "math_sin"),
             "cos" => (1, "math_cos"),
+            "tan" => (1, "math_tan"),
             "sqrt" => (1, "math_sqrt"),
             "log10" => (1, "math_log10"),
+            "asin" => (1, "math_asin"),
+            "acos" => (1, "math_acos"),
+            "atan" => (1, "math_atan"),
+            "sinh" => (1, "math_sinh"),
+            "cosh" => (1, "math_cosh"),
+            "tanh" => (1, "math_tanh"),
+            "asinh" => (1, "math_asinh"),
+            "acosh" => (1, "math_acosh"),
+            "atanh" => (1, "math_atanh"),
+            "exp_m1" => (1, "math_expm1"),
+            "ln_1p" => (1, "math_log1p"),
             _ => return None,
         })
     }

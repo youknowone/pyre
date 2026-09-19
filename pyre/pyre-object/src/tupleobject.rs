@@ -703,6 +703,16 @@ pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
     items_block_capacity(tuple.wrappeditems)
 }
 
+/// `tupleobject.py UNROLL_CUTOFF`.
+pub const UNROLL_CUTOFF: usize = 10;
+
+/// `W_TupleObject._unroll_condition` —
+/// `jit.loop_unrolling_heuristic(self.wrappeditems, self.length(), UNROLL_CUTOFF)`.
+pub fn unroll_condition(obj: PyObjectRef) -> bool {
+    let len = unsafe { w_tuple_len(obj) };
+    majit_rlib::jit::loop_unrolling_heuristic(&len, len, UNROLL_CUTOFF)
+}
+
 /// Snapshot the tuple's items as an owned `Vec<PyObjectRef>`.
 ///
 /// The returned vector is a plain `Vec` and roots nothing: a caller that
@@ -856,6 +866,16 @@ mod tests {
             assert_eq!(w_tuple_getitem(mixed, 0).unwrap(), finite);
             assert_eq!(w_tuple_getitem(mixed, 1).unwrap(), nan);
         }
+    }
+
+    #[test]
+    fn unroll_condition_empty_is_true() {
+        // `rlib/jit.py loop_unrolling_heuristic`: size == 0 is always true.
+        let empty = w_tuple_new(vec![]);
+        assert!(unroll_condition(empty));
+        let one = w_tuple_new(vec![crate::intobject::w_int_new(1)]);
+        // Residual `isconstant` is false, so a non-empty tuple does not unroll.
+        assert!(!unroll_condition(one));
     }
 
     #[test]

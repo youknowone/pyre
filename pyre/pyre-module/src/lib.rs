@@ -119,7 +119,8 @@ pub fn register() {
 }
 
 /// `ll_math.py` C llexternals. The front retargets Opaque
-/// `f64::{hypot,atan2,copysign,floor,ceil,ln,exp,sin,cos,powf,sqrt,log10}`
+/// `f64::{hypot,atan2,copysign,floor,ceil,ln,exp,sin,cos,tan,powf,sqrt,
+/// log10,asin,acos,atan,sinh,cosh,tanh,asinh,acosh,atanh,exp_m1,ln_1p}`
 /// to these paths; the raising `ll_math_*` wrappers stay around them.
 fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
     use module::math::interp_math as math;
@@ -193,6 +194,12 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
     );
     pair(
         entries,
+        "ll_math::math_tan",
+        "math_tan",
+        math::jit_math_tan_raw as *const (),
+    );
+    pair(
+        entries,
         "ll_math::math_pow",
         "math_pow",
         math::jit_math_pow_raw as *const (),
@@ -208,6 +215,72 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         "ll_math::math_log10",
         "math_log10",
         math::jit_math_log10_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_asin",
+        "math_asin",
+        math::jit_math_asin_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_acos",
+        "math_acos",
+        math::jit_math_acos_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_atan",
+        "math_atan",
+        math::jit_math_atan_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_sinh",
+        "math_sinh",
+        math::jit_math_sinh_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_cosh",
+        "math_cosh",
+        math::jit_math_cosh_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_tanh",
+        "math_tanh",
+        math::jit_math_tanh_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_asinh",
+        "math_asinh",
+        math::jit_math_asinh_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_acosh",
+        "math_acosh",
+        math::jit_math_acosh_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_atanh",
+        "math_atanh",
+        math::jit_math_atanh_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_expm1",
+        "math_expm1",
+        math::jit_math_expm1_raw as *const (),
+    );
+    pair(
+        entries,
+        "ll_math::math_log1p",
+        "math_log1p",
+        math::jit_math_log1p_raw as *const (),
     );
 }
 
@@ -291,5 +364,11 @@ mod tests {
             bindings.contains_key("math_hypot"),
             "the crate-root hypot alias must resolve too",
         );
+        for leaf in ["math_asin", "math_acosh", "math_expm1", "math_log1p"] {
+            assert!(
+                bindings.contains_key(leaf),
+                "ll_math {leaf} residual must publish after optional-module register",
+            );
+        }
     }
 }

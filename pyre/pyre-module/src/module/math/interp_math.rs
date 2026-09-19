@@ -608,7 +608,8 @@ pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
 }
 
 /// `ll_math.py` C llexternals for Opaque
-/// `f64::{ln,exp,sin,cos,powf,sqrt,log10}`.
+/// `f64::{ln,exp,sin,cos,tan,powf,sqrt,log10,asin,acos,atan,sinh,cosh,
+/// tanh,asinh,acosh,atanh,exp_m1,ln_1p}`.
 /// IEEE, no raise — the `ll_math_*` wrappers stay around them.
 pub extern "C" fn jit_math_log_raw(x: f64) -> f64 {
     x.ln()
@@ -624,6 +625,54 @@ pub extern "C" fn jit_math_sin_raw(x: f64) -> f64 {
 
 pub extern "C" fn jit_math_cos_raw(x: f64) -> f64 {
     x.cos()
+}
+
+pub extern "C" fn jit_math_tan_raw(x: f64) -> f64 {
+    x.tan()
+}
+
+pub extern "C" fn jit_math_asin_raw(x: f64) -> f64 {
+    x.asin()
+}
+
+pub extern "C" fn jit_math_acos_raw(x: f64) -> f64 {
+    x.acos()
+}
+
+pub extern "C" fn jit_math_atan_raw(x: f64) -> f64 {
+    x.atan()
+}
+
+pub extern "C" fn jit_math_sinh_raw(x: f64) -> f64 {
+    x.sinh()
+}
+
+pub extern "C" fn jit_math_cosh_raw(x: f64) -> f64 {
+    x.cosh()
+}
+
+pub extern "C" fn jit_math_tanh_raw(x: f64) -> f64 {
+    x.tanh()
+}
+
+pub extern "C" fn jit_math_asinh_raw(x: f64) -> f64 {
+    x.asinh()
+}
+
+pub extern "C" fn jit_math_acosh_raw(x: f64) -> f64 {
+    x.acosh()
+}
+
+pub extern "C" fn jit_math_atanh_raw(x: f64) -> f64 {
+    x.atanh()
+}
+
+pub extern "C" fn jit_math_expm1_raw(x: f64) -> f64 {
+    x.exp_m1()
+}
+
+pub extern "C" fn jit_math_log1p_raw(x: f64) -> f64 {
+    x.ln_1p()
 }
 
 pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {

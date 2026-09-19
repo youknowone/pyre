@@ -5393,6 +5393,8 @@ pub fn findattr_result(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRe
 }
 
 /// Check whether `exc_type` matches `check_class`, including tuple/list class inputs.
+/// `baseobjspace.py exception_match` is `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
 pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool {
     let (exc_type, check_class) = (exc_type, check_class);
     if unsafe { is_none(check_class) || is_none(exc_type) } {
@@ -21303,6 +21305,50 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
     Ok(w_none())
 }
 
+/// `eq_w` scan used by both `tupleobject.py` contains arms.
+///
+/// `eq_w` re-enters Python and may collect; the tuple and needle are
+/// raw locals, so pin them on the shadow stack across the scan.
+macro_rules! tuple_contains_scan {
+    ($haystack:expr, $needle:expr) => {{
+        let _roots = pyre_object::gc_roots::push_roots();
+        let pair = pyre_object::gc_roots::pin_roots(&[$haystack, $needle]);
+        let hay_slot = pair;
+        let needle_slot = pair + 1;
+        let len = unsafe { w_tuple_len(pyre_object::gc_roots::shadow_stack_get(hay_slot)) };
+        let mut found = false;
+        let mut i = 0usize;
+        while i < len {
+            if let Some(item) = unsafe {
+                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hay_slot), i as i64)
+            } {
+                let _item_roots = pyre_object::gc_roots::push_roots();
+                let item = pyre_object::gc_roots::pin_root(item);
+                if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
+                    found = true;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        Ok(found)
+    }};
+}
+
+/// `tupleobject.py _descr_contains_unroll_safe` — `@jit.unroll_safe`.
+#[majit_macros::unroll_safe]
+fn _descr_contains_unroll_safe(
+    haystack: PyObjectRef,
+    needle: PyObjectRef,
+) -> Result<bool, PyError> {
+    tuple_contains_scan!(haystack, needle)
+}
+
+/// `tupleobject.py _descr_contains_jmp`.
+fn _descr_contains_jmp(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
+    tuple_contains_scan!(haystack, needle)
+}
+
 /// `in` operator: check if `needle` is in `haystack`.
 /// PyPy: space.contains_w(haystack, needle)
 pub fn contains(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
@@ -21472,25 +21518,11 @@ pub(crate) fn contains_slot(haystack: PyObjectRef, needle: PyObjectRef) -> Resul
             ));
         }
         if is_tuple(haystack) {
-            // `eq_w` re-enters Python and may collect; the tuple and needle are
-            // raw locals, so pin them on the shadow stack across the scan.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let pair = pyre_object::gc_roots::pin_roots(&[haystack, needle]);
-            let hay_slot = pair;
-            let needle_slot = pair + 1;
-            let len = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(hay_slot));
-            for i in 0..len {
-                if let Some(item) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(hay_slot), i as i64)
-                {
-                    let _item_roots = pyre_object::gc_roots::push_roots();
-                    let item = pyre_object::gc_roots::pin_root(item);
-                    if eq_w(item, pyre_object::gc_roots::shadow_stack_get(needle_slot))? {
-                        return Ok(true);
-                    }
-                }
-            }
-            return Ok(false);
+            return if pyre_object::tupleobject::unroll_condition(haystack) {
+                _descr_contains_unroll_safe(haystack, needle)
+            } else {
+                _descr_contains_jmp(haystack, needle)
+            };
         }
         if is_str(haystack) {
             // `x in s` requires a str left operand; any other type is a
