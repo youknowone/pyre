@@ -3786,12 +3786,16 @@ class Check:
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(output, encoding="utf-8")
-            time_path.write_text(f"{elapsed:.2f}", encoding="utf-8")
+            # `newline=""` on every baseline: these files are committed,
+            # and a text-mode write on Windows would store each line feed as
+            # CRLF, so the recorder would rewrite every line of a baseline it
+            # did not change.
+            out_path.write_text(output, encoding="utf-8", newline="")
+            time_path.write_text(f"{elapsed:.2f}", encoding="utf-8", newline="")
             if jitstats is None:
                 jitstats_path.unlink(missing_ok=True)
             else:
-                jitstats_path.write_text(jitstats, encoding="utf-8")
+                jitstats_path.write_text(jitstats, encoding="utf-8", newline="")
 
         if self.args.snapshot_mode == "diff":
             if not out_path.exists():
