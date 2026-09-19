@@ -1620,18 +1620,19 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     if let Some(w_type) = crate::typedef::r#type(obj) {
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__bool__") } {
             let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
-            // The only instances of bool are `w_False` / `w_True`, so a
-            // non-bool result is a TypeError reporting the receiver's type
-            // (upstream's `%T` on `w_obj`).
+            // The only instances of bool are `w_False` / `w_True`, so any
+            // other box is the TypeError, and what it names is the type of
+            // what `__bool__` RETURNED.  The docstring above transcribes
+            // `%T` on `w_obj`, which is upstream's own slip -- it computes
+            // `w_restype` on the line before and then does not use it.
             if unsafe { is_bool(w_res) } {
                 return Ok(unsafe { w_bool_get_value(w_res) });
             }
-            // The TypeError formats the receiver's type name.  Keep that
-            // `format!` off the look-inside graph: `__majit_stringbuilder_new`
-            // is an un-lowered helper, and a red `__bool__` result would
-            // otherwise decline every descent that has already executed an
-            // effect (the `__import__` `sys.modules` read).
-            return Err(bool_must_return_bool(obj));
+            // Keep that `format!` off the look-inside graph:
+            // `__majit_stringbuilder_new` is an un-lowered helper, and a red
+            // `__bool__` result would otherwise decline every descent that has
+            // already executed an effect (the `__import__` `sys.modules` read).
+            return Err(bool_must_return_bool(w_res));
         }
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__len__") } {
             let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
@@ -1642,13 +1643,14 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     Ok(true)
 }
 
-/// `descroperation.py` TypeError for a `__bool__` that did not return a bool.
-/// The message allocates, so it stays off the look-inside graph.
+/// `descroperation.py` TypeError for a `__bool__` that did not return a bool,
+/// naming the type of the returned object.  The message allocates, so it stays
+/// off the look-inside graph.
 #[majit_macros::dont_look_inside]
-pub(crate) fn bool_must_return_bool(obj: PyObjectRef) -> PyError {
+pub(crate) fn bool_must_return_bool(w_res: PyObjectRef) -> PyError {
     PyError::type_error(format!(
         "__bool__ should return bool, returned {}",
-        object_functionstr_type_name(obj),
+        object_functionstr_type_name(w_res),
     ))
 }
 
@@ -5597,14 +5599,16 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         // `r#type` so a true user instance, a W_Root type (e.g. `deque`), and
         // a class whose metaclass defines `__len__` (e.g. `EnumMeta.__len__`)
         // all dispatch correctly.
+        //
+        // `lookup` is the whole resolution: a special method is read off the
+        // type, never off the object.  A `getattr_str` fallback here answered
+        // `len(SomeClass)` with the class's OWN unbound `__len__` bound to the
+        // class — `len` of a class is a TypeError unless its METAclass defines
+        // the slot, which the lookup above already covers.
         if let Some(w_type) = crate::typedef::r#type(obj)
             && let Some(method) = lookup_in_type_where(w_type.as_ptr(), "__len__")
         {
             return get_and_call_function(method, obj, w_type.as_ptr(), &[]);
-        }
-        // Per-instance __len__ via the unified getattr path (live dict).
-        if let Ok(method) = getattr_str(obj, "__len__") {
-            return crate::builtins::call_and_check(method, &[obj]);
         }
         Err(PyError::type_error(format!(
             "object of type '{}' has no len()",
