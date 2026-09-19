@@ -4516,13 +4516,6 @@ pub fn load_super_attr_value(
 }
 
 impl OpcodeStepExecutor for PyFrame {
-    /// The generic default walks `small_int_constant` → `int_constant`
-    /// → `w_int_new` and writes a translator-local `&INT_TYPE`.
-    fn load_small_int(&mut self, value: i64) -> Result<(), PyError> {
-        let w = w_small_int_const(value);
-        self.push_value(w)
-    }
-
     fn last_instr(&self) -> isize {
         self.last_instr
     }
