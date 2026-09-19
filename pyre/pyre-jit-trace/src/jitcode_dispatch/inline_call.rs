@@ -12260,15 +12260,20 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
             unsafe { pyre_object::typeobject::w_type_get_name(w_typ_r) }
         ));
     };
-    // `_invoke_binop` (`descroperation.py`) treats a missing impl as no
-    // result.  A builtin slot is invoked at record time: NotImplemented is
-    // no result, anything else (a value or a raise) is a result we cannot
-    // skip.  The compiled body will not re-run that slot, so the skip has
-    // to hold for every pair the emitted guards admit.  Those guards pin
-    // the rhs class/version tag (the reflected receiver) and the lhs
-    // `w_class`; builtin numeric slots decide NotImplemented from those
-    // types.  A Python forward dunder is never invoked here.
+    // `_invoke_binop` (`descroperation.py` `_call_binop_impl`) treats a
+    // missing impl as no result.  A builtin slot is invoked at record
+    // time: NotImplemented is no result, anything else (a value or a
+    // raise) is a result we cannot skip.  The compiled body will not
+    // re-run that slot, so the skip has to hold for every pair the
+    // emitted guards admit.  Those guards pin the rhs class/version tag
+    // (the reflected receiver) and the lhs `w_class`; builtin numeric
+    // slots decide NotImplemented from those types.  The odometer
+    // reading around the invocation — not an assumption — is what
+    // establishes that the skipped slot applied nothing.  A Python
+    // forward dunder is never invoked here.
     if let Some(fwd) = forward_method {
+        let effects_before = fbw_executed_effect_count();
+        let unjournaled_before = fbw_has_unjournaled_effect();
         match unsafe {
             pyre_interpreter::baseobjspace::get_and_call_function(
                 fwd,
@@ -12294,6 +12299,15 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
                     unsafe { pyre_object::typeobject::w_type_get_name(w_class_l) }
                 ));
             }
+        }
+        if fbw_executed_effect_count() != effects_before
+            || unjournaled_before
+            || fbw_has_unjournaled_effect()
+        {
+            decline!(format_args!(
+                "{}.{forward_dunder} applied an effect before answering NotImplemented",
+                unsafe { pyre_object::typeobject::w_type_get_name(w_class_l) }
+            ));
         }
     }
     try_walker_inline_user_binop_dunder(
