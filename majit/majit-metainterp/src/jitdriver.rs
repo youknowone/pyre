@@ -571,7 +571,7 @@ pub fn spdiag_enabled() -> bool {
 /// "bridges are off" while they keep recording.
 pub fn no_bridge_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("MAJIT_NO_BRIDGE").is_some())
+    *FLAG.get_or_init(|| crate::jit_env::env_var_os("MAJIT_NO_BRIDGE").is_some())
 }
 /// `MAJIT_SKIP_BRIDGES=a,b,...` (diagnostic): decline exactly the listed
 /// `MAJIT_MAX_BRIDGES` sequence numbers and take every other one.  Where the
@@ -5221,8 +5221,10 @@ impl<S: JitState> JitDriver<S> {
     /// This is upstream's split: `get_uhash(*greenargs)` hashes the greens in
     /// place on every back edge, and the greens are stored on the cell only
     /// when one is installed (warmstate.py:584-604).
-    #[cold]
-    #[inline(never)]
+    ///
+    /// Port of `warmstate.py maybe_compile_and_run`, which upstream leaves
+    /// unannotated. Neither `#[cold]` nor `#[inline(never)]` has an upstream
+    /// counterpart; `_always_inline_` is on the `maybe_enter_jit` wrapper.
     pub fn back_edge_structured(
         &mut self,
         green_key_hash: u64,
@@ -5264,8 +5266,10 @@ impl<S: JitState> JitDriver<S> {
     /// resolved key would also rebuild the caller's `GreenKey` on a chained
     /// bucket, which is the allocation the carry exists to avoid), and the
     /// token is entered as given.
-    #[cold]
-    #[inline(never)]
+    ///
+    /// Port of `warmstate.py maybe_compile_and_run`, which upstream leaves
+    /// unannotated. Neither `#[cold]` nor `#[inline(never)]` has an upstream
+    /// counterpart; `_always_inline_` is on the `maybe_enter_jit` wrapper.
     pub fn back_edge_resolved(
         &mut self,
         cell_key: u64,

@@ -11800,6 +11800,7 @@ fn record_portal_debugdata_guard<Sym: WalkSym>(
         // `GuardNotForced` where the guard below would otherwise be it, and
         // the decline then refuses to recompile.
         if !unsafe { (*debugdata).w_f_trace }.is_null() {
+            census_record("PortalFrameTracerArmed::Decline");
             return Err(DispatchError::PortalFrameTracerArmed { pc: op_pc });
         }
         // Only a trace recorded while a global trace function is live needs the

@@ -3369,8 +3369,16 @@ impl InstanceRepr {
             let Some((mangled_name, r)) = self._get_field(name) else {
                 continue;
             };
+            // `rclass.py _parse_field_list`: `isinstance(r, AbstractBaseListRepr)`.
+            // Both `ListRepr` and `FixedSizeListRepr` inherit that base
+            // (`rlist.py AbstractFixedSizeListRepr(AbstractBaseListRepr)`);
+            // `[*]` / `?[*]` therefore accepts a never-resized list
+            // (`Ptr(GcArray)`), not only the resized `ListRepr` header.
             if matches!(rank, IR_IMMUTABLE_ARRAY | IR_QUASIIMMUTABLE_ARRAY)
-                && r.repr_class_id() != ReprClassId::ListRepr
+                && !matches!(
+                    r.repr_class_id(),
+                    ReprClassId::ListRepr | ReprClassId::FixedSizeListRepr
+                )
             {
                 return Err(TyperError::message(format!(
                     "_immutable_fields_ = [{fullname:?}] in {:?}, but {name:?} is not a list \

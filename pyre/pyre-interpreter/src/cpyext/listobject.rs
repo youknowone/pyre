@@ -18,9 +18,15 @@ pub unsafe extern "C" fn PyList_New(size: isize) -> *mut CPyObject {
     pyobject::make_ref(pyre_object::listobject::w_list_new_object(items))
 }
 
+/// The list a `PyList_*` entry point operates on.
+///
+/// `PyList_Check` is the gate the reading entry points apply (`listobject.py`
+/// `PyList_Size`), so a `list` subclass is accepted.  A subclass instance is
+/// still a `W_ListObject`, unlike a `dict` subclass, so the object itself is
+/// the operand.
 fn list_argument(object: *mut CPyObject, function: &str) -> Option<PyObjectRef> {
     let value = argument(object)?;
-    if !unsafe { pyre_object::is_list(value) } {
+    if !unsafe { crate::baseobjspace::isinstance_list_w(value) } {
         super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
             "{function}(): list expected"
         )));
@@ -145,10 +151,12 @@ pub unsafe extern "C" fn PyList_GetItemRef(object: *mut CPyObject, index: isize)
 /// A list, or the `SystemError` `PyErr_BadInternalCall` records.
 ///
 /// The rejection `PyList_Sort` and `PyList_Reverse` make, which is not the
-/// `TypeError` the reading entry points make (`listobject.py`, `:139`).
+/// `TypeError` the reading entry points make (`listobject.py` `PyList_Sort`).
+/// The gate is still `isinstance` of `W_ListObject`, so a `list` subclass is
+/// accepted; only the error kind differs.
 fn internal_list(object: *mut CPyObject) -> Option<PyObjectRef> {
     let value = argument(object)?;
-    if !unsafe { pyre_object::is_list(value) } {
+    if !unsafe { crate::baseobjspace::isinstance_list_w(value) } {
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return None;
     }
@@ -280,7 +288,7 @@ pub unsafe extern "C" fn PyList_SetSlice(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyList_Check(object: *mut CPyObject) -> c_int {
     let object = unsafe { pyobject::from_ref(object) };
-    (!object.is_null() && unsafe { pyre_object::is_list(object) }) as c_int
+    (!object.is_null() && unsafe { crate::baseobjspace::isinstance_list_w(object) }) as c_int
 }
 
 #[unsafe(no_mangle)]

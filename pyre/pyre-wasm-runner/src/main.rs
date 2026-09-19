@@ -155,14 +155,14 @@ impl majit_backend_wasm_host::HostState for Host {
 /// The module is built for `wasm32-unknown-unknown`, whose `std::env` is
 /// permanently empty: every `std::env::var_os` reached from inside the guest
 /// returns `None` regardless of this process's environment. That covers every
-/// JIT knob and probe that lives in the guest crates — `PYRE_NO_JIT`,
-/// `PYRE_GC_INTERP`, `MAJIT_STRICT`, `MAJIT_LOG`, the `PYRE_FBW_*` /
-/// `PYRE_P2_DIAG` / `PYRE_JD1*` diagnostics — so setting one here changes
-/// nothing at all. Silently ignoring them is the trap: an A/B run through such
-/// a knob measures the same build twice and reads as a result. Name them
-/// instead, once, on stderr (`check.py` shows a run's stderr only when it
-/// fails, so this is invisible to a green suite and present in every failure
-/// dump and interactive run).
+/// JIT knob and probe that lives in the guest crates — `PYRE_GC_INTERP`,
+/// `MAJIT_STRICT`, `MAJIT_LOG`, the `PYRE_FBW_*` / `PYRE_P2_DIAG` /
+/// `PYRE_JD1_DEBUG` / `PYRE_JD1_DUMP` diagnostics — so setting one here
+/// changes nothing at all. Silently ignoring them is the trap: an A/B run
+/// through such a knob measures the same build twice and reads as a result.
+/// Name them instead, once, on stderr (`check.py` shows a run's stderr only
+/// when it fails, so this is invisible to a green suite and present in every
+/// failure dump and interactive run).
 ///
 /// Where a guest-side probe has a host-side replacement, use that instead:
 /// `PYRE_FBW_DEBUG_ABORT`'s decline census is `PYRE_WASM_FBW_CENSUS` here,
@@ -179,12 +179,26 @@ impl majit_backend_wasm_host::HostState for Host {
 /// second name would make the wasm leg answer a differently-spelled question.
 ///
 /// Exempt: the names this runner interprets host-side (`PYRE_WASM_*`,
-/// `PYRE_STDLIB`, `MAJIT_STATS`, `PYRE_LOOP_CENSUS`) and `check.py`'s own
-/// `PYRE_CHECK_*`
-/// interpreter paths. A knob that later becomes host-interpreted must be added
-/// here; the prefix match needs no upkeep for new guest-side knobs.
+/// `PYRE_STDLIB`, `MAJIT_STATS`, `PYRE_LOOP_CENSUS`), the knobs it forwards
+/// into the guest (`PYRE_NO_JIT`, `PYRE_JIT`, `MAJIT_NO_BRIDGE`, `PYRE_NO_JD1`,
+/// `PYRE_JD1`, `PYRE_JD1_NO_ENTER`, `PYRE_JD1_THRESHOLD`, `MAJIT_BRIDGE_BAIL`),
+/// and `check.py`'s own `PYRE_CHECK_*` interpreter paths. A knob that later
+/// becomes host-interpreted must be added here; the prefix match needs no
+/// upkeep for new guest-side knobs.
 fn warn_inert_guest_env() {
-    const HOST_HANDLED: &[&str] = &["PYRE_STDLIB", "MAJIT_STATS", "PYRE_LOOP_CENSUS"];
+    const HOST_HANDLED: &[&str] = &[
+        "PYRE_STDLIB",
+        "MAJIT_STATS",
+        "PYRE_LOOP_CENSUS",
+        "PYRE_NO_JIT",
+        "PYRE_JIT",
+        "MAJIT_NO_BRIDGE",
+        "PYRE_NO_JD1",
+        "PYRE_JD1",
+        "PYRE_JD1_NO_ENTER",
+        "PYRE_JD1_THRESHOLD",
+        "MAJIT_BRIDGE_BAIL",
+    ];
     // `to_string_lossy`, not `into_string().ok()`: a name the platform allows
     // but UTF-8 does not is still a setting the guest silently ignores, and
     // dropping it here would hide exactly the case worth reporting.
@@ -591,6 +605,49 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             let p = alloc.call(&mut store, blen)?;
             memory.write(&mut store, p as usize, blob.as_bytes())?;
             set_gc_env.call(&mut store, (p, blen))?;
+            dealloc.call(&mut store, (p, blen))?;
+        }
+    }
+
+    // The environment the JIT knobs resolve against, forwarded the same way
+    // and for the same reason. It is not a diagnostic knob: `PYRE_NO_JIT`
+    // disables every compiled path and `MAJIT_NO_BRIDGE` sends every guard
+    // failure through the blackhole — so a guest that cannot read them
+    // executes a different program than the native backends run beside it,
+    // from the same settings. Absent on a module predating the export, which
+    // then keeps both knobs unset.
+    let jit_env_names = instance
+        .get_typed_func::<(), u64>(&mut store, "pyre_jit_env_names")
+        .ok();
+    let set_jit_env = instance
+        .get_typed_func::<(u32, u32), ()>(&mut store, "pyre_set_jit_env")
+        .ok();
+    if let (Some(names), Some(set_jit_env)) = (jit_env_names, set_jit_env) {
+        let packed = names.call(&mut store, ())?;
+        let (nptr, nlen) = ((packed >> 32) as u32, packed as u32);
+        let mut buf = vec![0u8; nlen as usize];
+        memory.read(&store, nptr as usize, &mut buf)?;
+        dealloc.call(&mut store, (nptr, nlen))?;
+
+        // Presence flags, but the blob is still UTF-8 `NAME=VALUE`: a value
+        // that does not decode is left unset exactly as it would be natively
+        // for `env::var`. An empty value still counts as set.
+        let blob = String::from_utf8_lossy(&buf)
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| {
+                std::env::var(name)
+                    .ok()
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\0");
+
+        let blen = blob.len() as u32;
+        if blen != 0 {
+            let p = alloc.call(&mut store, blen)?;
+            memory.write(&mut store, p as usize, blob.as_bytes())?;
+            set_jit_env.call(&mut store, (p, blen))?;
             dealloc.call(&mut store, (p, blen))?;
         }
     }

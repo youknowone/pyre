@@ -30,6 +30,7 @@ use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
 use majit_ir::{Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
+use majit_metainterp::jit_env::{env_var, env_var_os};
 use majit_metainterp::warmstate::FunctionEntryStep;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
@@ -5693,7 +5694,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     // PyPy way (parameter; the defaults stay off). `PYRE_JIT=0` keeps its
     // existing disable meaning (handled on the can_enter_jit gate), so it
     // is skipped here.
-    if let Ok(text) = std::env::var("PYRE_JIT") {
+    if let Some(text) = env_var("PYRE_JIT") {
         let text = text.trim();
         if !text.is_empty() && text != "0" {
             let ws = d.meta_interp_mut().warm_state_mut();
@@ -7335,18 +7336,14 @@ fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
 fn jd1_experiment_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if std::env::var_os("PYRE_NO_JD1").is_some()
-            || std::env::var("PYRE_JD1").as_deref() == Ok("0")
-        {
+        if env_var_os("PYRE_NO_JD1").is_some() || env_var("PYRE_JD1").as_deref() == Some("0") {
             return false;
         }
         // No JIT at all → no jd1.
-        if std::env::var_os("PYRE_NO_JIT").is_some()
-            || std::env::var("PYRE_JIT").as_deref() == Ok("0")
-        {
+        if env_var_os("PYRE_NO_JIT").is_some() || env_var("PYRE_JIT").as_deref() == Some("0") {
             return false;
         }
-        std::env::var("PYRE_JD1").as_deref() == Ok("1")
+        env_var("PYRE_JD1").as_deref() == Some("1")
     })
 }
 
@@ -7633,7 +7630,7 @@ fn drive_portal_metatrace(
 /// to the interpreter caller.
 fn jd1_enter_enabled() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("PYRE_JD1_NO_ENTER").is_none())
+    *E.get_or_init(|| env_var_os("PYRE_JD1_NO_ENTER").is_none())
 }
 
 thread_local! {
@@ -7656,8 +7653,7 @@ const JD1_TRACE_THRESHOLD: u32 = 100;
 fn jd1_trace_threshold() -> u32 {
     static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("PYRE_JD1_THRESHOLD")
-            .ok()
+        env_var("PYRE_JD1_THRESHOLD")
             .and_then(|s| s.trim().parse().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(JD1_TRACE_THRESHOLD)
@@ -9447,7 +9443,7 @@ fn eval_with_jit_inner(
     init_gc_root_walkers();
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *PYRE_JIT_DISABLED.get_or_init(|| std::env::var("PYRE_JIT").as_deref() == Ok("0")) {
+    if *PYRE_JIT_DISABLED.get_or_init(|| env_var("PYRE_JIT").as_deref() == Some("0")) {
         return frame.execute_frame_plain(resume);
     }
     // A profiled frame runs interpreted, and `c_call` / `c_return` are the
@@ -10876,7 +10872,7 @@ fn maybe_compile_and_run(
     // No RPython counterpart — kept for development debugging only.
     // TODO: remove when JIT is stable enough to not need a kill switch.
     static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
+    if *NO_JIT.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
 
@@ -12316,7 +12312,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     }
     // warmstate.py parity: PYRE_NO_JIT disables ALL JIT paths.
     static NO_JIT_FN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *NO_JIT_FN.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
+    if *NO_JIT_FN.get_or_init(|| env_var_os("PYRE_NO_JIT").is_some()) {
         return None;
     }
     // A compiled trace polls the breaker word at its loop header
@@ -12352,24 +12348,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if dump_bytecode_enabled() {
-        if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
+        if frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
             if DUMPED.get().is_none() {
                 let _ = DUMPED.set(());
                 let mut state = pyre_interpreter::OpArgState::default();
-                eprintln!("-- fannkuch bytecode dump --");
+                eprintln!("-- {} bytecode dump --", code.obj_name.as_str());
                 for (pc, unit) in code.instructions.iter().copied().enumerate() {
                     let (instr, oparg) = state.get(unit);
                     eprintln!("{pc:03}: {instr:?} oparg={oparg:?}");
-                }
-                for pc in [
-                    72usize, 99, 129, 131, 141, 155, 168, 179, 234, 245, 447, 449,
-                ] {
-                    eprintln!(
-                        "decode[{pc}] = {:?}",
-                        pyre_interpreter::decode_instruction_at(code, pc)
-                    );
                 }
             }
         }
