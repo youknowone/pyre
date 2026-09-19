@@ -3984,8 +3984,12 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // self-binding optimization for a custom `tp_getattro` (pushes
             // NULL), so an override returning the raw descriptor must call as a
             // plain function, not a bound method.  This is the same gate
-            // `load_method_fast_path` applies before its fast path.
-            if !pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) {
+            // `load_method_fast_path` applies before its fast path, in the same
+            // computing form: the raw `uses_object_getattribute` flag is only a
+            // memo that `mutated` clears and a jitted lookup never sets, so
+            // reading it here would answer NULL for a descriptor the fast path
+            // just surfaced unbound.
+            if !crate::baseobjspace::has_object_getattribute(w_type) {
                 return PY_NULL;
             }
             let raw = crate::baseobjspace::lookup_in_type(w_type, name);
