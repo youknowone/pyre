@@ -2499,6 +2499,7 @@ const THIN_STAMP_MASK: u64 = 0x3f;
 const THIN_STAMPED_BIT: u64 = 1u64 << 61;
 const THIN_STAMPED_ID_SHIFT: u32 = 48;
 const THIN_STAMPED_ID_MASK: u64 = 0x1fff;
+const THIN_STAMPED_SLOT_COUNT: usize = THIN_STAMPED_ID_MASK as usize + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ThinStamped {
@@ -2513,17 +2514,20 @@ struct ThinStamped {
 }
 
 struct ThinStampedTable {
-    entries: Vec<ThinStamped>,
+    len: usize,
     index: rustc_hash::FxHashMap<ThinStamped, usize>,
 }
 
 static THIN_STAMPED: std::sync::LazyLock<std::sync::Mutex<ThinStampedTable>> =
     std::sync::LazyLock::new(|| {
         std::sync::Mutex::new(ThinStampedTable {
-            entries: Vec::new(),
+            len: 0,
             index: rustc_hash::FxHashMap::default(),
         })
     });
+
+static THIN_STAMPED_SLOTS: [std::sync::OnceLock<ThinStamped>; THIN_STAMPED_SLOT_COUNT] =
+    [const { std::sync::OnceLock::new() }; THIN_STAMPED_SLOT_COUNT];
 
 static DESCR_VTABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
@@ -2569,8 +2573,7 @@ fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
         return None;
     }
     let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
-    let v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
-    v.entries.get(id).copied()
+    THIN_STAMPED_SLOTS[id].get().copied()
 }
 
 fn thin_stamp(w: u64) -> u32 {
@@ -2623,11 +2626,12 @@ fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Opti
     if let Some(&i) = v.index.get(&key) {
         return Some(i as u64);
     }
-    if v.entries.len() as u64 >= THIN_STAMPED_ID_MASK + 1 {
+    if v.len >= THIN_STAMPED_SLOT_COUNT {
         return None;
     }
-    let i = v.entries.len();
-    v.entries.push(key);
+    let i = v.len;
+    let _ = THIN_STAMPED_SLOTS[i].set(key);
+    v.len += 1;
     v.index.insert(key, i);
     Some(i as u64)
 }
