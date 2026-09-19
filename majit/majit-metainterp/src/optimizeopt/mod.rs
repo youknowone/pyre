@@ -1264,9 +1264,6 @@ pub struct OptContext {
     /// consumer keying on `inputarg_base != 0` treats an unrolled loop body as
     /// a bridge. This flag is the discriminator; the base is the namespace.
     pub building_bridge: bool,
-    /// Reminted parent-loop Vm red (`InputArg(1)` after prepare).
-    /// Only set while `building_bridge`.
-    pub bridge_vm_red: Option<OpRef>,
     /// Index of the pass currently executing propagate_forward.
     /// Used by passes to call send_extra_operation_after(self_idx, ..)
     /// matching RPython's emit_extra(op, emit=False) which routes to
@@ -1608,13 +1605,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         {
             return opref;
         }
-        // The second merge-point Ref red (Grain's Vm) is a loop-carried
-        // inputarg. Import can forward its host onto a Scope; numbering
-        // that Scope dumps reused bits. Stay on the declared red so
-        // `densify_root_loop_inputargs` maps it to the assembled loc.
-        if self.ctx.is_vm_red_name(opref) && !self.ctx.is_vm_red_name(walked) {
-            return opref;
-        }
         walked
     }
 
@@ -1632,13 +1622,6 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
         // resoperation.py:64-65 not_const arm. The resume liveboxes boundary
         // is legitimately OpRef-keyed (rd_numb wire format), so resolve
         // through the OpRef glue directly.
-        if self.ctx.is_vm_red_name(opref) {
-            let walked = self.ctx.get_box_replacement_impl(opref, true);
-            if !self.ctx.is_vm_red_name(walked) {
-                return opref;
-            }
-            return walked;
-        }
         self.ctx.get_box_replacement_impl(opref, true)
     }
 
@@ -2292,7 +2275,6 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             building_bridge: false,
-            bridge_vm_red: None,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -2975,7 +2957,6 @@ impl OptContext {
             preamble_end_args: None,
             skip_flush_mode: false,
             building_bridge: false,
-            bridge_vm_red: None,
             current_pass_idx: 0,
             optearlyforce_idx: 0,
 
@@ -3077,7 +3058,6 @@ impl OptContext {
         self.preamble_end_args = None;
         self.skip_flush_mode = false;
         self.building_bridge = false;
-        self.bridge_vm_red = None;
         self.current_pass_idx = 0;
         self.optearlyforce_idx = 0;
         self.in_final_emission = false;
@@ -5341,12 +5321,6 @@ impl OptContext {
         if op.is_constant() {
             return;
         }
-        // The Vm red must stay a distinct SSA. Forwarding it onto a
-        // Scope makes the backend share one loc; the guard dump then
-        // reads Scope bits for the reserved red.
-        if self.is_vm_red_name(op.to_opref()) && !self.is_vm_red_name(newop.to_opref()) {
-            return;
-        }
         // A stack-resident red (Grain's `Vm` / frame / `Scope`) folded
         // to `ConstPtr` becomes TAGCONST in resume numbering
         // (`isinstance(box, Const)` after `get_box_replacement`). The
@@ -7259,102 +7233,6 @@ impl OptContext {
         resolved
     }
 
-    /// Recover a declared Ref inputarg that the IR fail_args still
-    /// name but snapshot numbering dropped as TAGCONST.
-    ///
-    /// Grain's `Vm` / frame live on the stack and change every
-    /// `Vm::new`. The tracer can snapshot them as `ConstPtr(this
-    /// eval)`, so `_number_boxes` never puts the InputArg in
-    /// liveboxes and `rebind_bridge_reds` bakes that address. If the
-    /// optimizer kept the InputArg (or folded it only to a
-    /// stack-resident ConstPtr), put it back as a failarg. Heap
-    /// InputArgs that numbered as TAGCONST stay Const.
-    /// Grain's live `Vm`, when the bridge remint named it.
-    ///
-    /// Not `inputargs[1]`: a two-Ref optimizer (this crate's virtualize
-    /// tests, brainfuck's tape pointer after vable expansion, pyre's
-    /// topframeref) is not Grain. Production Grain loops are already
-    /// expanded past two reds; the reminted failarg is `bridge_vm_red`.
-    fn declared_vm_red(&self) -> Option<OpRef> {
-        self.bridge_vm_red
-    }
-
-    /// Phase-1 name (`InputArg(1)`) or, when the remint kept that
-    /// assembled name, the Phase-2 host at `inputarg_base+1`.
-    ///
-    /// A reminted bridge failarg (e.g. 561 with `inputarg_base` 556) is
-    /// not the assembled Vm; `inputarg_base+1` is failarg 1 and is often
-    /// a Scope. Do not treat that slot as the Vm.
-    pub(crate) fn is_vm_red_name(&self, opref: OpRef) -> bool {
-        let Some(vm) = self.declared_vm_red() else {
-            return false;
-        };
-        if opref == vm {
-            return true;
-        }
-        vm == OpRef::input_arg_typed(1, Type::Ref)
-            && self.inputarg_base > 0
-            && opref == OpRef::input_arg_typed(self.inputarg_base + 1, Type::Ref)
-    }
-
-    /// A loop JUMP writes arg *i* into the target LABEL's `inputargs[i]`
-    /// home. Grain's second red is the live `Vm`; if that slot walks
-    /// onto a Scope the next mid-opcode dump of loc(1) is Scope bits.
-    /// Put the declared red back. Bridges keep their own failarg names.
-    pub(crate) fn pin_vm_red_jump_arg(&self, op: &Op) {
-        if op.opcode != OpCode::Jump {
-            return;
-        }
-        // Only the reminted parent-guard Vm. Treating `inputargs[1]` as
-        // the Vm on every interp duplicates a vable field (brainfuck's
-        // tape pointer, pyre's topframeref) into fail_args.
-        let Some(vm) = self.bridge_vm_red else {
-            return;
-        };
-        if op.num_args() <= 1 {
-            return;
-        }
-        if op.arg(1).to_opref() == vm {
-            return;
-        }
-        op.setarg(1, Operand::bound_from_opref(vm));
-    }
-
-    /// Number the assembled Vm inputarg, not a Phase-2 remap that import
-    /// forwarded onto a Scope. `densify_root_loop_inputargs` then maps
-    /// that InputArg onto the dense loc the backend allocated.
-    fn snapshot_needs_vm_red_pin(&self, boxes: &[crate::resume::SnapshotBox]) -> bool {
-        let Some(vm) = self.declared_vm_red() else {
-            return false;
-        };
-        if boxes.iter().any(|b| b.opref() == vm) {
-            return false;
-        }
-        boxes
-            .iter()
-            .any(|b| self.is_vm_red_name(b.opref()) && b.opref() != vm)
-    }
-
-    fn pin_vm_red_in_snapshot(&self, boxes: &mut [crate::resume::SnapshotBox]) {
-        if !self.snapshot_needs_vm_red_pin(boxes) {
-            return;
-        }
-        let vm = self
-            .declared_vm_red()
-            .expect("snapshot_needs_vm_red_pin requires a declared vm red");
-        // Remap at most one Phase-2 host onto the assembled name.
-        // Stealing another live Ref (or rewriting every host) puts the
-        // same InputArg in two snapshot slots; `store_final_boxes`
-        // then panics on a duplicate failarg, and pending-field
-        // tagging never sees the stolen box.
-        if let Some(slot) = boxes
-            .iter_mut()
-            .find(|b| self.is_vm_red_name(b.opref()) && b.opref() != vm)
-        {
-            *slot = crate::resume::SnapshotBox::typed(vm, Type::Ref);
-        }
-    }
-
     /// RPython optimizer.py store_final_boxes_in_guard inline.
     /// Called from emit() for every guard during optimization. Produces
     /// rd_numb via memo.number() using the CURRENT optimizer state
@@ -7504,24 +7382,10 @@ impl OptContext {
         // including guards with rd_virtuals. The snapshot uses original boxes
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
-        //
-        // resume.py numbers the live snapshot; it does not clone the
-        // stored list. pin_vm_red rewrites at most one Phase-2 host, so
-        // clone only when that rewrite would land.
-        let stored_snapshot = snapshot_get(&self.snapshot_boxes, resume_pos);
-        let needs_pin =
-            stored_snapshot.is_some_and(|list| self.snapshot_needs_vm_red_pin(list.as_slice()));
-        let mut pinned_snapshot = None;
-        if needs_pin {
-            let mut owned = stored_snapshot.cloned().unwrap_or_default();
-            self.pin_vm_red_in_snapshot(owned.as_mut_slice());
-            pinned_snapshot = Some(owned);
-        }
-        let snapshot_boxes: &[crate::resume::SnapshotBox] = pinned_snapshot
-            .as_ref()
-            .map(|list| list.as_slice())
-            .or_else(|| stored_snapshot.map(|list| list.as_slice()))
-            .unwrap_or(&[]);
+        let snapshot_boxes: &[crate::resume::SnapshotBox] =
+            snapshot_get(&self.snapshot_boxes, resume_pos)
+                .map(|list| list.as_slice())
+                .unwrap_or(&[]);
         let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, resume_pos)
             .map(|v| v.as_slice())
             .unwrap_or_default();
@@ -10390,185 +10254,6 @@ mod boxref_forwarding_tests {
         assert!(
             b1.get_box_replacement(false).is_constant(),
             "heap InputArg stays foldable (PyPy GC identity)"
-        );
-    }
-
-    #[test]
-    fn pin_vm_red_rewrites_the_phase2_host_to_the_assembled_inputarg() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 230, 232);
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(0, Type::Ref),
-            OpRef::input_arg_typed(1, Type::Ref),
-        ];
-        ctx.bridge_vm_red = Some(OpRef::input_arg_typed(1, Type::Ref));
-        let mut boxes = vec![
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(231, Type::Ref), Type::Ref),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(6, Type::Ref), Type::Ref),
-        ];
-        ctx.pin_vm_red_in_snapshot(&mut boxes);
-        assert_eq!(boxes[0].opref(), OpRef::input_arg_typed(0, Type::Ref));
-        assert_eq!(
-            boxes[1].opref(),
-            OpRef::input_arg_typed(1, Type::Ref),
-            "Phase-2 Vm host becomes the assembled InputArg densify locates"
-        );
-        assert_eq!(
-            boxes[2].opref(),
-            OpRef::input_arg_typed(6, Type::Ref),
-            "a later Scope failarg is not stolen when the Vm red is already present"
-        );
-    }
-
-    #[test]
-    fn pin_vm_red_does_not_rewrite_scope_when_reminted_is_not_assembled() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 8, 556, 564);
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(556, Type::Ref),
-            OpRef::input_arg_typed(557, Type::Ref),
-            OpRef::input_arg_typed(561, Type::Ref),
-        ];
-        ctx.bridge_vm_red = Some(OpRef::input_arg_typed(561, Type::Ref));
-        let mut boxes = vec![
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(556, Type::Ref), Type::Ref),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(557, Type::Ref), Type::Ref),
-        ];
-        ctx.pin_vm_red_in_snapshot(&mut boxes);
-        assert_eq!(boxes[0].opref(), OpRef::input_arg_typed(556, Type::Ref));
-        assert_eq!(
-            boxes[1].opref(),
-            OpRef::input_arg_typed(557, Type::Ref),
-            "bridge remint 561 must not steal Scope at inputarg_base+1"
-        );
-    }
-
-    #[test]
-    fn pin_vm_red_does_not_steal_an_unrelated_ref_slot() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(0, Type::Ref),
-            OpRef::input_arg_typed(1, Type::Ref),
-        ];
-        let mut boxes = vec![
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(2, Type::Int), Type::Int),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(6, Type::Ref), Type::Ref),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
-        ];
-        ctx.pin_vm_red_in_snapshot(&mut boxes);
-        assert_eq!(boxes[1].opref(), OpRef::input_arg_typed(6, Type::Ref));
-        assert_eq!(boxes[2].opref(), OpRef::input_arg_typed(0, Type::Ref));
-    }
-
-    #[test]
-    fn pin_vm_red_does_not_rewrite_a_scope_when_the_assembled_vm_is_absent() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(0, Type::Ref),
-            OpRef::input_arg_typed(1, Type::Ref),
-        ];
-        let mut boxes = vec![
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(0, Type::Ref), Type::Ref),
-            crate::resume::SnapshotBox::typed(OpRef::input_arg_typed(6, Type::Ref), Type::Ref),
-        ];
-        ctx.pin_vm_red_in_snapshot(&mut boxes);
-        assert_eq!(boxes[0].opref(), OpRef::input_arg_typed(0, Type::Ref));
-        assert_eq!(boxes[1].opref(), OpRef::input_arg_typed(6, Type::Ref));
-    }
-
-    #[test]
-    fn pin_vm_red_jump_arg_without_a_reminted_vm_leaves_the_args() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(0, Type::Ref),
-            OpRef::input_arg_typed(1, Type::Ref),
-        ];
-        let frame = Operand::bound_from_opref(OpRef::input_arg_typed(0, Type::Ref));
-        let scope = Operand::bound_from_opref(OpRef::input_arg_typed(6, Type::Ref));
-        let op = Op::new(OpCode::Jump, &[frame, scope.clone()]);
-        ctx.pin_vm_red_jump_arg(&op);
-        assert_eq!(op.arg(1).to_opref(), scope.to_opref());
-    }
-
-    #[test]
-    fn pin_vm_red_jump_arg_on_a_bridge_uses_the_reminted_failarg() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 8, 556, 564);
-        ctx.building_bridge = true;
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(556, Type::Ref),
-            OpRef::input_arg_typed(557, Type::Ref),
-            OpRef::input_arg_typed(558, Type::Int),
-            OpRef::input_arg_typed(561, Type::Ref),
-        ];
-        let reminted_vm = OpRef::input_arg_typed(561, Type::Ref);
-        ctx.bridge_vm_red = Some(reminted_vm);
-        let frame = Operand::bound_from_opref(OpRef::input_arg_typed(556, Type::Ref));
-        let scope = Operand::bound_from_opref(OpRef::input_arg_typed(557, Type::Ref));
-        let op = Op::new(OpCode::Jump, &[frame, scope]);
-        ctx.pin_vm_red_jump_arg(&op);
-        assert_eq!(
-            op.arg(1).to_opref(),
-            reminted_vm,
-            "bridge JUMP[1] takes the reminted Vm failarg, not failarg 1 / assembled 1"
-        );
-        assert_eq!(op.arg(0).to_opref(), OpRef::input_arg_typed(556, Type::Ref));
-    }
-
-    #[test]
-    fn pin_vm_red_jump_arg_survives_after_building_bridge_clears() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 8, 556, 564);
-        ctx.building_bridge = false;
-        let reminted_vm = OpRef::input_arg_typed(561, Type::Ref);
-        ctx.bridge_vm_red = Some(reminted_vm);
-        let frame = Operand::bound_from_opref(OpRef::input_arg_typed(556, Type::Ref));
-        let scope = Operand::bound_from_opref(OpRef::input_arg_typed(557, Type::Ref));
-        let op = Op::new(OpCode::Jump, &[frame, scope]);
-        ctx.pin_vm_red_jump_arg(&op);
-        assert_eq!(
-            op.arg(1).to_opref(),
-            reminted_vm,
-            "optimize_bridge clears building_bridge before jump_to_preamble"
-        );
-    }
-
-    #[test]
-    fn numbering_does_not_walk_the_vm_red_onto_a_scope() {
-        let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 2, 0, 2);
-        ctx.inputargs = vec![
-            OpRef::input_arg_typed(0, Type::Ref),
-            OpRef::input_arg_typed(1, Type::Ref),
-        ];
-        ctx.bridge_vm_red = Some(OpRef::input_arg_typed(1, Type::Ref));
-        ctx.ensure_inputarg_bindings();
-        let vm = OpRef::input_arg_typed(1, Type::Ref);
-        let scope = OpRef::input_arg_typed(6, Type::Ref);
-        let (scope_op, _) = bound_inputarg_operand(Type::Ref, 6);
-        ctx.seed_boxes_canonical(&[scope_op.clone()]);
-        if let Some(vm_op) = ctx.resolve_to_operand(vm) {
-            ctx.make_equal_to(&vm_op, &scope_op);
-        }
-        assert_eq!(
-            ctx.get_replacement_opref(vm),
-            vm,
-            "make_equal_to must not forward the Vm red onto a Scope"
-        );
-        let env = OptBoxEnv { ctx: &ctx };
-        assert_eq!(
-            majit_ir::BoxEnv::get_box_replacement(&env, vm),
-            vm,
-            "numbering must keep the declared Vm red"
-        );
-        assert_eq!(
-            majit_ir::BoxEnv::get_box_replacement_operand(&env, vm).to_opref(),
-            vm
-        );
-        assert_eq!(
-            majit_ir::BoxEnv::get_box_replacement_not_const(&env, vm),
-            vm
-        );
-        assert_eq!(
-            majit_ir::BoxEnv::get_box_replacement(&env, scope),
-            ctx.get_replacement_opref(scope),
-            "a non-Vm InputArg still walks"
         );
     }
 
