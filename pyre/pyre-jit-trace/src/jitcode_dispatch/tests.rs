@@ -1361,6 +1361,33 @@ fn user_binop_forward_dunder_covers_fraction_arithmetic_without_inplace_shortcut
 }
 
 #[test]
+fn user_binop_reflected_dunder_covers_fraction_arithmetic_without_inplace_shortcuts() {
+    use pyre_interpreter::bytecode::BinaryOperator;
+
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::Add),
+        Some("__radd__")
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::Subtract),
+        Some("__rsub__")
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::TrueDivide),
+        Some("__rtruediv__")
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::InplaceSubtract),
+        None
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::InplaceTrueDivide),
+        None
+    );
+    assert_eq!(user_binop_reflected_dunder(BinaryOperator::Subscr), None);
+}
+
+#[test]
 fn rewind_dunder_admits_only_terminal_nested_raise_shape() {
     use crate::pyjitcode::InlineBodyFacts;
 
