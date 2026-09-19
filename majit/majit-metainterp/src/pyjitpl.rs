@@ -19030,26 +19030,14 @@ impl<M: Clone> MetaInterp<M> {
     ///                              descr=vinfo.vable_token_descr)
     /// ```
     pub fn vable_and_vrefs_before_residual_call(&mut self) {
-        // pyjitpl.py:3318-3324 — vrefinfo loop over odd indices.
-        let vref_ptrs: Vec<usize> = self
-            .tracing
-            .as_ref()
-            .map(|ctx| {
-                ctx.virtualref_boxes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (_, ptr))| (i % 2 == 1).then_some(*ptr))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for vref_ptr in vref_ptrs {
-            // SAFETY: vref_ptr was registered by `opimpl_virtual_ref` with a
-            // valid JitVirtualRef pointer; we only flip its token field.
-            unsafe {
-                self.staticdata
-                    .virtualref_info
-                    .tracing_before_residual_call(vref_ptr as *mut u8);
-            }
+        // The `virtualref_boxes` odd-index loop that opens
+        // `pyjitpl.py vable_and_vrefs_before_residual_call`. It lives on
+        // `TraceCtx` so the walker's own residual-call bracket
+        // (`pyre-jit-trace` `try_execute_residual_call_via_executor`) stamps
+        // the same vrefs this does, against the same
+        // `MetaInterpStaticData::virtualref_info`.
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.vrefs_before_residual_call();
         }
         // pyjitpl.py vable_and_vrefs_before_residual_call: vinfo path.
         let vinfo = match self.virtualizable_info().cloned() {
