@@ -7128,6 +7128,22 @@ impl MiniMarkGC {
             let hdr = unsafe { *header_of(candidate) };
             if hdr.is_forwarded() {
                 let fwd = unsafe { GcHeader::forwarding_address(header_of(candidate)) };
+                // Follow the copy for size: the original's first payload
+                // word is the forwarding address (`set_forwarding_address`).
+                // Keep scanning unless that extent actually covers `obj_addr`.
+                if !self.is_managed_heap_object(fwd) {
+                    continue;
+                }
+                let fwd_hdr = unsafe { *header_of(fwd) };
+                if fwd_hdr.is_forwarded() {
+                    continue;
+                }
+                let Some(size) = self.try_size_for_typeid(fwd, fwd_hdr.type_id()) else {
+                    continue;
+                };
+                if candidate + size <= obj_addr {
+                    continue;
+                }
                 return format!("forwarded back={back}w candidate={candidate:#x} fwd={fwd:#x}");
             }
             let tid = hdr.type_id();
