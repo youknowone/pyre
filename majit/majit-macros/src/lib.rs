@@ -806,7 +806,11 @@ impl HelperFnAddrSkip {
 }
 
 fn is_fat_pointer_arg(ty: &Type) -> bool {
-    matches!(ty, Type::Reference(reference) if is_wide_pointee(&reference.elem))
+    match ty {
+        Type::Reference(reference) => is_wide_pointee(&reference.elem),
+        Type::Ptr(ptr) => is_wide_pointee(&ptr.elem),
+        _ => false,
+    }
 }
 
 fn is_result_type(ty: &Type) -> bool {
@@ -824,10 +828,13 @@ fn trampoline_skip_reason(func: &ItemFn) -> Option<HelperFnAddrSkip> {
             return Some(HelperFnAddrSkip::FatPointerArg);
         }
     }
-    if let ReturnType::Type(_, ty) = &func.sig.output
-        && is_result_type(ty)
-    {
-        return Some(HelperFnAddrSkip::ResultReturn);
+    if let ReturnType::Type(_, ty) = &func.sig.output {
+        if is_result_type(ty) {
+            return Some(HelperFnAddrSkip::ResultReturn);
+        }
+        if is_fat_pointer_arg(ty) {
+            return Some(HelperFnAddrSkip::Other);
+        }
     }
     if func.sig.receiver().is_some() {
         return Some(HelperFnAddrSkip::MethodReceiver);
@@ -3911,6 +3918,22 @@ mod tests {
         assert_eq!(
             trampoline_skip_reason(&parse_fn("fn f(xs: &[u8]) -> i64 { 0 }")),
             Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(p: *const [u8]) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(p: *mut [u8]) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(p: *const dyn Trait) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f() -> *const [u8] { loop {} }")),
+            Some(HelperFnAddrSkip::Other)
         );
         assert_eq!(
             trampoline_skip_reason(&parse_fn("fn f(x: i64) -> Result<i64, ()> { Ok(x) }")),
