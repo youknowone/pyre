@@ -1017,6 +1017,13 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             args,
             ..
         } if nonraising_core_bridge_opname(segments, args.len()).is_some() => false,
+        // `__strlen` lowers (in `translate_op`) to the same `len` op as
+        // `ArrayLen` on a string-byte-view; `len` raises nothing.
+        OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } if segments.as_slice() == ["__strlen"] && args.len() == 1 => false,
         // `core::slice::<Impl>::reverse` lowers (in `translate_op`) to a
         // `getattr` + `simple_call` method shape whose `rtype_method_reverse`
         // does `hop.exception_cannot_occur()` (`rlist.py`); classify the
@@ -1942,11 +1949,19 @@ pub fn translate_op(
                         }
                         return Ok(vec![FlowspaceOp::new("type", arg_hls, result)]);
                     }
-                    if segments.as_slice() == ["simple_call"] {
+                    if segments.as_slice() == ["simple_call"]
+                        || segments.as_slice() == ["__dyn_call"]
+                    {
+                        // `__dyn_call` is the front's spelling of a call
+                        // through a function pointer (`CallClass::Dynamic`
+                        // whose operand is not a recovered vtable slot).
+                        // The annotator sees a `simple_call` whose args[0]
+                        // is that pointer; `PtrRepr.rtype_simple_call`
+                        // then emits `indirect_call`.
                         if arg_hls.is_empty() {
                             return Err(TyperError::message(
-                                "translate_op: FunctionPath [\"simple_call\"] \
-                                 requires args[0] as the callable \
+                                "translate_op: FunctionPath [\"simple_call\"] / \
+                                 [\"__dyn_call\"] requires args[0] as the callable \
                                  (flowspace/operation.py SimpleCall.eval)"
                                     .to_string(),
                             ));
@@ -2414,24 +2429,27 @@ pub fn translate_op(
                             FlowspaceOp::new("simple_call", vec![bound_method], result),
                         ]);
                     }
-                    // The `len` operation in its three spellings: the
+                    // The `len` operation in its four spellings: the
                     // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
                     // (and the `<str>::is_empty` decomposition) to; the
-                    // slice-receiver `core::slice::<Impl>::len`; and the
-                    // `<str>::len` method.  Rust lowers `slice.len()` /
+                    // `__strlen` synthetic the same front plants when the
+                    // place is a string-byte-view (`as_bytes().len()`);
+                    // the slice-receiver `core::slice::<Impl>::len`; and
+                    // the `<str>::len` method.  Rust lowers `slice.len()` /
                     // `s.len()` to MIR calls to those intrinsics, which
-                    // have no source body to register.  Route all three to
+                    // have no source body to register.  Route all four to
                     // the rtyper's `len` operation (`rtyper.rs "len"
                     // arm` → `Repr.rtype_len`), the same dispatch upstream
                     // `op.len(v)` reaches via `unaryop.py`.  The
                     // rtyper dispatches on the receiver repr: a slice maps
-                    // to `SomeList` (`ll_length`), a `&str` to `SomeString`
-                    // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
-                    // is registered as an opname graph and lowered to the
-                    // `strlen`/`arraylen_gc` blackhole op
+                    // to `SomeList` (`ll_length`), a `&str` / byte-view to
+                    // `SomeString` (`StringRepr.rtype_len` → `ll_strlen`).
+                    // The helper is registered as an opname graph and
+                    // lowered to the `strlen`/`arraylen_gc` blackhole op
                     // (`codewriter::jtransform_opname::lower_graph`), so
                     // these are real `len` ops, not symbolic residuals.
-                    let is_len_op = (segments.len() == 1 && segments[0] == "__len")
+                    let is_len_op = (segments.len() == 1
+                        && (segments[0] == "__len" || segments[0] == "__strlen"))
                         || (segments.len() == 4
                             && segments[0] == "core"
                             && segments[1] == "slice"
@@ -5865,6 +5883,45 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_dyn_call_lowers_to_simple_call() {
+        // `front::mir` mints `Call(["__dyn_call"], [funcptr, *args])` for
+        // a Dynamic call whose operand is not a recovered vtable slot.
+        // That is a call through a function pointer: the pre-rtyper
+        // shape is `simple_call(funcptr, *args)`, the same op
+        // `PtrRepr.rtype_simple_call` later emits `indirect_call` for.
+        // args[0] is the callable Variable, not a wrapped HostObject.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__dyn_call".into()],
+                },
+                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__dyn_call marker must lower to simple_call");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        assert_eq!(translated[0].args.len(), 2);
+        assert!(
+            matches!(&translated[0].args[0], Hlvalue::Variable(_)),
+            "callable must be the funcptr Variable, not a wrapped path"
+        );
+        assert!(
+            matches!(&translated[0].args[1], Hlvalue::Variable(_)),
+            "call argument must stay a Variable"
+        );
+    }
+
+    #[test]
     fn translate_op_call_function_path_falls_back_to_host_env_builtin() {
         // Single-segment FunctionPath unregistered in CallRegistry
         // falls back to HOST_ENV.lookup_builtin(name), letting frontend
@@ -6753,6 +6810,36 @@ mod tests {
         };
         let translated =
             translate_op(&op, &value_map, &empty_call_registry()).expect("ArrayLen arm must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "len");
+        assert_eq!(translated[0].args.len(), 1);
+        assert!(!op_canraise(&op.kind));
+    }
+
+    #[test]
+    fn translate_op_strlen_marker_lowers_to_len() {
+        // `front::mir` rewrites `Rvalue::Len` / `<[u8]>::len` on a string
+        // byte-view to `Call(["__strlen"])`.  That is the same length
+        // read as `__len` / `ArrayLen`: the rtyper's `len` operation,
+        // which `StringRepr.rtype_len` lowers to `ll_strlen`.  It must
+        // not look up an unregistered CallRegistry path.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__strlen".into()],
+                },
+                args: crate::model::call_args(vec![vars[1].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__strlen marker must lower to len");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "len");
         assert_eq!(translated[0].args.len(), 1);
