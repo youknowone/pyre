@@ -9071,7 +9071,8 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_named_const_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
-                    .or_else(|| bitflags_trait_empty_const(&segments));
+                    .or_else(|| bitflags_trait_empty_const(&segments))
+                    .or_else(|| crate::codewriter::jtransform::ctype_flags_const(&segments));
                 // No lane produced a value for this static.  The synthetic
                 // nullary call below targets the static's own path, which is
                 // not a function, so the failure only becomes visible two

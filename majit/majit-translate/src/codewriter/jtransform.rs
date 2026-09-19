@@ -861,6 +861,48 @@ pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
         || joined.starts_with("std::default")
 }
 
+/// Supply the value of a `CTypeFlags` associated constant.
+///
+/// `bitflags!` generates each flag as `impl CTypeFlags { const NAME: Self }`
+/// whose initializer Charon records as an `Opaque` body (the impl module
+/// anonymizes to `_`), so `const_eval_global` finds no in-LLBC init.
+/// The bits are a fixed compile-time `i64` mask (`ctypeobj.rs
+/// CTypeFlags`). `W_CType.has(CTypeFlags::SIGNED_WCHAR)` is then the
+/// integer bit-and PyPy's immutable `is_signed_wchar` field reads as
+/// after promotion.
+pub(crate) fn ctype_flags_const(segments: &[String]) -> Option<OpKind> {
+    let [.., owner, impl_seg, leaf] = segments else {
+        return None;
+    };
+    if owner.as_str() != "_" || impl_seg.as_str() != "<Impl>" {
+        return None;
+    }
+    let path = segments.join("::");
+    if !path.contains("ctypeobj") {
+        return None;
+    }
+    let bits: i64 = match leaf.as_str() {
+        "PRIMITIVE_INTEGER" => 1 << 0,
+        "NONFUNC_POINTER_OR_ARRAY" => 1 << 1,
+        "ACCEPT_STR" => 1 << 2,
+        "VOID_PTR" => 1 << 3,
+        "VOIDCHAR_PTR" => 1 << 4,
+        "ONEBYTE_PTR" => 1 << 5,
+        "FILE_PTR" => 1 << 6,
+        "VALUE_FITS_LONG" => 1 << 7,
+        "VALUE_SMALLER_THAN_LONG" => 1 << 8,
+        "VALUE_FITS_ULONG" => 1 << 9,
+        "SIGNED_WCHAR" => 1 << 10,
+        "ELLIPSIS" => 1 << 11,
+        "ENUM" => 1 << 12,
+        "CUSTOM_FIELD_POS" => 1 << 13,
+        "WITH_VAR_ARRAY" => 1 << 14,
+        "WITH_PACKED_CHANGE" => 1 << 15,
+        _ => return None,
+    };
+    Some(OpKind::ConstInt(bits))
+}
+
 /// `try_gc_write_barrier` / `try_gc_write_barrier_managed` — the
 /// interpreter stand-in for a raw store. `rewrite.py
 /// handle_write_barrier_setfield` emits `COND_CALL_GC_WB` on
@@ -6080,6 +6122,19 @@ impl<'a> Transformer<'a> {
             } else {
                 RewriteResult::Replace(vec![])
             };
+        }
+        // `CTypeFlags::SIGNED_WCHAR` (and the other flag consts) is a
+        // compile-time mask. Charon leaves the bitflags impl Opaque, so
+        // a leftover 0-arg Call still has to become ConstInt here.
+        if let CallTarget::FunctionPath { segments } = target
+            && args.is_empty()
+            && let Some(kind) = ctype_flags_const(segments)
+        {
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind,
+            }]);
         }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
@@ -18708,6 +18763,65 @@ mod tests {
             RewriteResult::Keep => {}
             _ => panic!("expected residual Keep for before_move"),
         }
+    }
+
+    /// `CTypeFlags::SIGNED_WCHAR` is `1 << 10`. The bitflags impl is
+    /// Opaque in Charon, so the 0-arg associated-const Call must become
+    /// that integer, not a residual helper.
+    #[test]
+    fn ctype_flags_signed_wchar_rewrites_to_bit_mask() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("signed_wchar");
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "module",
+            "_cffi_backend",
+            "ctypeobj",
+            "_",
+            "<Impl>",
+            "SIGNED_WCHAR",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &ValueType::Int,
+            "signed_wchar",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::ConstInt(bits),
+                        ..
+                    }] if *bits == 1 << 10
+                ));
+            }
+            _ => panic!("expected ConstInt(1 << 10)"),
+        }
+    }
+
+    #[test]
+    fn ctype_flags_unknown_leaf_stays_residual() {
+        assert!(super::ctype_flags_const(&[
+            "module".into(),
+            "_cffi_backend".into(),
+            "ctypeobj".into(),
+            "_".into(),
+            "<Impl>".into(),
+            "NOT_A_FLAG".into(),
+        ])
+        .is_none());
     }
 
     /// `rtuple.py TupleRepr.newtuple`: a non-empty tuple lowers to
