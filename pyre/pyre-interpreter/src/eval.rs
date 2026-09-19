@@ -2961,6 +2961,15 @@ impl SharedOpcodeHandler for PyFrame {
         callable: Self::Value,
         args: &[Self::Value],
     ) -> Result<Self::Value, PyError> {
+        if args.is_empty() {
+            let value = crate::call::call_zero_arg_in_frame(self as *mut PyFrame, callable);
+            if value.is_null() {
+                return Err(
+                    crate::call::take_call_error().unwrap_or(PyError::type_error("call failed"))
+                );
+            }
+            return Ok(value);
+        }
         if args.len() == 1 {
             let value = crate::call::call_one_arg_in_frame(self as *mut PyFrame, callable, args[0]);
             if value.is_null() {
@@ -2971,6 +2980,16 @@ impl SharedOpcodeHandler for PyFrame {
             return Ok(value);
         }
         call_callable(self, callable, args)
+    }
+
+    fn call_callable_zero(&mut self, callable: Self::Value) -> Result<Self::Value, PyError> {
+        let value = crate::call::call_zero_arg_in_frame(self as *mut PyFrame, callable);
+        if value.is_null() {
+            return Err(
+                crate::call::take_call_error().unwrap_or(PyError::type_error("call failed"))
+            );
+        }
+        Ok(value)
     }
 
     fn call_callable_one(
@@ -6133,6 +6152,34 @@ impl OpcodeStepExecutor for PyFrame {
         }
 
         // Slow path: method call or non-Function callable.
+        // Zero explicit args and no bound self: residual-call a word ABI
+        // (`frame`, callable) so portal jitcode never records a `&[]`.
+        if nargs == 0 {
+            let null_or_self = self.pop();
+            let callable = self.pop();
+            let anchor = FrameAnchor::new(self);
+            let result = if null_or_self.is_null() {
+                let value = crate::call::call_zero_arg_in_frame(self as *mut PyFrame, callable);
+                if value.is_null() {
+                    return Err(crate::call::take_call_error()
+                        .unwrap_or(PyError::type_error("call failed")));
+                }
+                value
+            } else {
+                let value = crate::call::call_one_arg_in_frame(
+                    self as *mut PyFrame,
+                    callable,
+                    null_or_self,
+                );
+                if value.is_null() {
+                    return Err(crate::call::take_call_error()
+                        .unwrap_or(PyError::type_error("call failed")));
+                }
+                value
+            };
+            unsafe { &mut *anchor.live() }.push_on_self(result);
+            return Ok(());
+        }
         // One explicit arg and no bound self: residual-call a word ABI
         // (`frame`, callable, arg) instead of building a `&[T]` the
         // portal interpret would dereference as a symbolic pointer.

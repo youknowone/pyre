@@ -1603,7 +1603,11 @@ pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
 pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     if let Some(w_type) = crate::typedef::r#type(obj) {
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__bool__") } {
-            let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
+            let w_res = unsafe { get_and_call_function0(w_descr, obj, w_type.as_ptr()) };
+            if w_res.is_null() {
+                return Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| PyError::type_error("call failed")));
+            }
             // The only instances of bool are `w_False` / `w_True`, so any
             // other box is the TypeError, and what it names is the type of
             // what `__bool__` RETURNED.  The docstring above transcribes
@@ -1619,7 +1623,11 @@ pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
             return Err(bool_must_return_bool(w_res));
         }
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__len__") } {
-            let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
+            let w_res = unsafe { get_and_call_function0(w_descr, obj, w_type.as_ptr()) };
+            if w_res.is_null() {
+                return Err(crate::call::take_call_error()
+                    .unwrap_or_else(|| PyError::type_error("call failed")));
+            }
             let w_index = space_index(w_res)?;
             return Ok(_check_len_result(w_index)? != 0);
         }
@@ -1810,6 +1818,26 @@ pub(crate) unsafe fn normalize_slice(
 /// first, then called with `args_w` alone, so `@staticmethod` /
 /// `@classmethod` / custom-descriptor dunders receive the arguments PyPy
 /// gives them.
+/// `space.get_and_call_function(w_descr, w_obj)` — zero extra positionals.
+/// Portal jitcode must not pass a `&[]` slice; that constant has no GC header
+/// and `ARRAYLEN_GC` faults on it. The body still uses the slice-taking
+/// helper, which stays inside this residual.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub unsafe fn get_and_call_function0(
+    w_descr: PyObjectRef,
+    w_obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> PyObjectRef {
+    match get_and_call_function(w_descr, w_obj, w_type, &[]) {
+        Ok(value) => value,
+        Err(err) => {
+            crate::call::set_call_error(err);
+            pyre_object::PY_NULL
+        }
+    }
+}
+
 pub unsafe fn get_and_call_function(
     w_descr: PyObjectRef,
     w_obj: PyObjectRef,
