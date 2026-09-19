@@ -2259,13 +2259,11 @@ pub(crate) fn fbw_store_journal_rollback() {
                                 cell as usize, before as usize
                             );
                         }
-                        // `write_cell` dirtied the prebuilt-root bit for the
-                        // speculative store; a minor collection can consume
-                        // that bit before rollback.  Restoring a young
-                        // `before` without re-dirtying leaves this immortal
-                        // cell off the next prebuilt walk.
-                        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+                        // A minor collection can run between the speculative
+                        // store's barrier and rollback, so restoring a young
+                        // `before` needs its own barrier.
                         (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
+                        pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8);
                     }
                 }
             }
