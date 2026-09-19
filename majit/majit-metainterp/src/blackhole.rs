@@ -7301,7 +7301,7 @@ fn handler_abort_result_marker_i(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StateFieldLayout {
     pub num_scalars: usize,
-    pub array_lens: smallvec::SmallVec<[usize; 4]>,
+    pub array_lens: Vec<usize>,
     /// `1` when the state declares any `[.. ; virt]` array (or an explicit
     /// virtualizable), else `0`. `pyjitpl.py:2984-2989` carries the
     /// virtualizable exactly once — it is one red, `warmspot.py:538
@@ -7339,13 +7339,13 @@ pub struct StateFieldLayout {
 impl StateFieldLayout {
     pub fn new(
         num_scalars: usize,
-        array_lens: impl Into<smallvec::SmallVec<[usize; 4]>>,
+        array_lens: Vec<usize>,
         num_vable_identity_slots: usize,
         int_scalar_base: usize,
     ) -> Self {
         Self {
             num_scalars,
-            array_lens: array_lens.into(),
+            array_lens,
             num_vable_identity_slots,
             num_ref_scalars: 0,
             ref_scalar_base: 0,
@@ -7359,7 +7359,7 @@ impl StateFieldLayout {
     /// starting at `ref_scalar_base`.
     pub fn with_ref_scalars(
         num_scalars: usize,
-        array_lens: impl Into<smallvec::SmallVec<[usize; 4]>>,
+        array_lens: Vec<usize>,
         num_vable_identity_slots: usize,
         num_ref_scalars: usize,
         ref_scalar_base: usize,
@@ -7367,7 +7367,7 @@ impl StateFieldLayout {
     ) -> Self {
         Self {
             num_scalars,
-            array_lens: array_lens.into(),
+            array_lens,
             num_vable_identity_slots,
             num_ref_scalars,
             ref_scalar_base,
