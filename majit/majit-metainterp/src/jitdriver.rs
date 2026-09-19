@@ -3237,8 +3237,10 @@ impl<S: JitState> JitDriver<S> {
     /// Push the walk's loop-carried virtualizable-array element values into
     /// native `state`, the array analog of `writeback_scalar_state_fields`. The
     /// walk mutates the array on the trace-ctx shadow; native `state`'s array is
-    /// stale at the close because `synchronize_virtualizable` skips the RustVec
-    /// write-back during tracing. Without this, the compiled-loop seed
+    /// stale at the close because `synchronize_virtualizable` skips the
+    /// write-back when `VirtualizableInfo::outer_executor_owns_state` is set —
+    /// the observer/replay merge-point form, where an outer executor owns the
+    /// live struct. Without this, the compiled-loop seed
     /// (`extract_live_values` reads native `state`) reflects the trace-start
     /// array, so the loop re-executes the peeled iteration — double-firing any
     /// side-effecting residual. Consumes (`take`s) the stash. No-op when the
@@ -10511,39 +10513,20 @@ mod tests {
         assert_eq!(after.num_reds(), 1);
     }
 
-    /// Build a driver whose virtualizable holds one array in `storage`.
-    fn driver_with_one_vable_array(
-        storage: crate::virtualizable::VableArrayStorage,
-    ) -> JitDriver<TypedRestoreState> {
+    /// Build a driver whose virtualizable holds one array.
+    fn driver_with_one_vable_array() -> JitDriver<TypedRestoreState> {
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
         driver.declare_schema_typed(vec![("pc", GreenType::Int)], vec![("state", Type::Ref)]);
         let mut info = crate::virtualizable::VirtualizableInfo::without_vable_token();
         info.name = "state".to_string();
-        match storage {
-            crate::virtualizable::VableArrayStorage::RustVec {
-                data_ptr_fn,
-                len_fn,
-            } => {
-                info.add_rust_vec_array_field(
-                    "regs",
-                    Type::Int,
-                    0,
-                    data_ptr_fn,
-                    len_fn,
-                    majit_ir::descr::make_array_descr(0, 8, Type::Int),
-                );
-            }
-            _ => {
-                info.add_array_field(
-                    "regs",
-                    Type::Int,
-                    0,
-                    0,
-                    8,
-                    majit_ir::descr::make_array_descr(8, 8, Type::Int),
-                );
-            }
-        }
+        info.add_array_field(
+            "regs",
+            Type::Int,
+            0,
+            0,
+            8,
+            majit_ir::descr::make_array_descr(8, 8, Type::Int),
+        );
         driver
             .meta
             .set_virtualizable_info(info.finalize_arc(majit_ir::descr::make_size_descr(16)));
@@ -10555,8 +10538,7 @@ mod tests {
     /// `compile.py` run.
     #[test]
     fn arming_declares_the_contract_for_a_reloadable_virtualizable() {
-        let mut driver =
-            driver_with_one_vable_array(crate::virtualizable::VableArrayStorage::DirectPointer);
+        let mut driver = driver_with_one_vable_array();
         assert!(driver.arm_flat_entry_contract(FlatEntryContract {
             len: 2,
             index_of_virtualizable: 1,
@@ -10574,34 +10556,6 @@ mod tests {
             driver.descriptor.as_ref().unwrap().virtualizable.as_deref(),
             Some("state")
         );
-    }
-
-    /// A `Vec` embedded by value has no offset a field load can reach its data
-    /// pointer at, so `patch_new_loop_to_load_virtualizable_fields` refuses that
-    /// storage. Arming must decline BEFORE the driver reaches that refusal, and
-    /// leave the descriptor exactly as it found it — no contract and no name, so
-    /// the entry keeps the shape it already had.
-    #[test]
-    fn arming_declines_a_virtualizable_the_entry_preamble_cannot_reload() {
-        fn data_ptr(_: *mut u8) -> *mut i64 {
-            std::ptr::null_mut()
-        }
-        fn len(_: *const u8) -> usize {
-            0
-        }
-        let mut driver =
-            driver_with_one_vable_array(crate::virtualizable::VableArrayStorage::RustVec {
-                data_ptr_fn: data_ptr,
-                len_fn: len,
-            });
-        assert!(!driver.arm_flat_entry_contract(FlatEntryContract {
-            len: 2,
-            index_of_virtualizable: 1,
-        }));
-        assert_eq!(driver.flat_entry_contract(), None);
-        let descriptor = driver.descriptor.as_ref().expect("descriptor survives");
-        assert_eq!(descriptor.virtualizable, None);
-        assert_eq!(descriptor.virtualizable_arg_index(), None);
     }
 
     /// With no virtualizable there is nothing for the preamble to reload from,

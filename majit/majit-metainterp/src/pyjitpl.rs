@@ -2249,8 +2249,9 @@ pub struct MetaInterp<M: Clone> {
     /// (`collect_virtualizable_element_values`) at the CloseLoop point. The walk
     /// mutates the array on the trace-ctx shadow only; native `state`'s array is
     /// frozen at trace-start because `synchronize_virtualizable` skips the
-    /// write-back for `RustVec` storage during tracing (the native match body,
-    /// the usual writer, never runs under the single-pass walk). The macro hook
+    /// write-back when `VirtualizableInfo::outer_executor_owns_state` is set
+    /// (the observer/replay merge-point form; the native match body, the usual
+    /// writer, never runs under the single-pass walk). The macro hook
     /// `take`s these and applies them to native `state` via
     /// `writeback_virt_array_state_fields_from_values` before re-entering the
     /// compiled loop, so it resumes at the post-peeled iteration (S_{k+1})
