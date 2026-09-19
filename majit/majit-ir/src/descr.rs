@@ -5979,10 +5979,25 @@ impl Descr for SimpleFieldDescr {
         self.ei_index.store(ei_index, Ordering::Relaxed);
     }
     fn is_always_pure(&self) -> bool {
-        // RPython `jtransform.py:895-896`: a quasi-immutable field is *not*
-        // always-pure at the descriptor level — the pure-read is protected by
-        // `record_quasiimmut_field` + guard.  Only true immutable fields are
-        // unconditionally pure.
+        // `llsupport/descr.py get_field_descr` sets
+        // `is_pure = STRUCT._immutable_field(fieldname) != False`, and a `?`
+        // entry ranks `IR_QUASIIMMUTABLE`, an `ImmutableRanking` instance
+        // whose `__nonzero__` is false but which is not `False` — so upstream
+        // answers true here for a quasi-immutable field.
+        //
+        // pyre answers false on purpose, and the reason is the const-fold this
+        // word also licenses: upstream can afford it because the codewriter
+        // emits `record_quasiimmut_field` immediately before every
+        // quasi-immutable read (`jtransform.py`), so the marker and its
+        // `GUARD_NOT_INVALIDATED` are always already there.  pyre's emitters do
+        // not all pair them, and a read that folds without the marker leaves a
+        // loop no write can retire.  The nine `function.rs` `?` fields depend
+        // on this; see `pyre-jit-trace/src/descr.rs`.
+        //
+        // The other half of upstream's word — that a quasi-immutable entry
+        // survives a call's cache wipe — is not skipped, it is spelled at the
+        // invalidation sites in `optimizeopt/heap.rs` instead, which is why
+        // this stays a const-fold gate only.
         self.is_immutable && !self.is_quasi_immutable
     }
     fn is_quasi_immutable(&self) -> bool {
