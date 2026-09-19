@@ -350,9 +350,10 @@ mod tests {
         // `base` fixed at compile time. A moving collection forwards the slot
         // value in place (gcreftracer.py `trace`), so a later execution of the
         // baked load observes the relocated address — no stale immediate. This
-        // is the shared dynasm/cranelift `LoadFromGcTable` contract; wasm never
-        // runs the GC rewrite (loud-panic), so it has no moving-GC ref-const
-        // path to cover.
+        // is the shared dynasm/cranelift/wasm `LoadFromGcTable` contract.
+        // wasm `compile_loop` / `compile_bridge` run `rewrite_ops_for_gc`
+        // (`rewrite.py` `remove_constptr`) and bind the table via
+        // `bind_failarg_const_table`.
         let _serialize = GC_TABLE_WALK_LOCK.write();
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // `base` is the value baked into the trace at compile time.
