@@ -696,7 +696,9 @@ ENV_ALLOWLIST = (
     "DYLD_FALLBACK_LIBRARY_PATH",
     # The locale chain, because an unset chain resolves to the C locale and
     # changes how the child decodes its own stdio — not something to vary
-    # under a run whose stdout is diffed against an oracle.
+    # under a run whose stdout is diffed against an oracle. On Windows the
+    # chain answers nothing, which is why `child_env_base` names the codec
+    # outright rather than leaving it to these.
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
@@ -750,6 +752,26 @@ def child_env_base():
         upper = name.upper()
         if upper in ENV_ALLOWLIST or upper.startswith(ENV_ALLOWLIST_PREFIXES):
             env[name] = value
+    # Name the stdio codec the locale chain cannot name on every host.
+    # Dropping LANG/LC_ALL/LC_CTYPE settles the child's stdio encoding on a
+    # POSIX host, where the chain is what `config_get_locale_encoding` reads.
+    # It settles nothing on Windows: there the answer is `cp%u` of GetACP(),
+    # a machine setting no variable reaches, so a cp1252 runner and a cp949
+    # workstation open their streams on different codecs and import different
+    # `encodings.*` modules to do it. That import is startup work like any
+    # other and it reaches jit-stats the way the bytecode cache above does --
+    # measured, `import_none_sentinel` reads loops_compiled=1 against a
+    # recorded 0 here, and naming utf-8 restores the recorded value exactly.
+    #
+    # The value spells the handler as well as the codec, because the handler
+    # is the answer both hosts already give: Windows asks for surrogateescape
+    # and a scrubbed POSIX chain resolves to the C locale, which asks for the
+    # same. Naming a bare encoding would settle it at strict instead and so
+    # change the streams it is meant to hold still. stderr keeps
+    # backslashreplace either way -- `init_sys_streams` hardcodes it.
+    #
+    # An explicit PYTHONIOENCODING still wins, so the A/B stays reachable.
+    env.setdefault("PYTHONIOENCODING", "utf-8:surrogateescape")
     return env
 
 
@@ -3764,12 +3786,16 @@ class Check:
 
         if self.args.snapshot_mode == "record":
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(output, encoding="utf-8")
-            time_path.write_text(f"{elapsed:.2f}", encoding="utf-8")
+            # `newline=""` on every baseline: these files are committed,
+            # and a text-mode write on Windows would store each line feed as
+            # CRLF, so the recorder would rewrite every line of a baseline it
+            # did not change.
+            out_path.write_text(output, encoding="utf-8", newline="")
+            time_path.write_text(f"{elapsed:.2f}", encoding="utf-8", newline="")
             if jitstats is None:
                 jitstats_path.unlink(missing_ok=True)
             else:
-                jitstats_path.write_text(jitstats, encoding="utf-8")
+                jitstats_path.write_text(jitstats, encoding="utf-8", newline="")
 
         if self.args.snapshot_mode == "diff":
             if not out_path.exists():

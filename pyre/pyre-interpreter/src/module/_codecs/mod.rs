@@ -720,13 +720,25 @@ fn lookup_codec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { is_str(w_encoding) } {
         return Err(bad_arg("lookup", None, "str", w_encoding));
     }
+    // The search below runs Python, which can collect `w_encoding`, so the
+    // name outlives it as owned Rust text rather than as a borrow of the
+    // object's payload.
     let encoding = crate::baseobjspace::str_utf8_w(w_encoding)?.to_string();
+    lookup_codec_name(&encoding)
+}
+
+/// `lookup_codec` for a name the caller already holds as Rust text.  The
+/// registry is keyed by the normalized spelling and answers with an object,
+/// so a caller reaching here with a `&str` owes no `str` of its own; minting
+/// one only to have the lookup read it straight back is what
+/// [`lookup_text_codec`] did.
+pub(crate) fn lookup_codec_name(encoding: &str) -> Result<PyObjectRef, crate::PyError> {
     // PyPy's `space.text0_w` gateway rejects this before normalization.  A
     // NUL must not be folded away into a valid codec name.
     if encoding.contains('\0') {
         return Err(crate::PyError::value_error("embedded null character"));
     }
-    let normalized_encoding = normalize(&encoding);
+    let normalized_encoding = normalize(encoding);
 
     with_codec_state(|state| {
         if let Some(w_result) = unsafe {
@@ -779,8 +791,7 @@ pub(crate) fn lookup_text_codec(
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let w_encoding = pyre_object::gc_roots::pin_root(w_str_new_managed(encoding));
-    let w_codec_info = lookup_codec(&[w_encoding])?;
+    let w_codec_info = lookup_codec_name(encoding)?;
     match crate::baseobjspace::getattr_str(w_codec_info, "_is_text_encoding") {
         Ok(w_flag) if !crate::baseobjspace::is_true(w_flag)? => {
             return Err(crate::PyError::new(
@@ -1186,12 +1197,37 @@ fn utf8_decode_impl(
 /// `LookupError` / `KeyError` propagates, so a `__getitem__` of its own is not
 /// mistaken for "undefined".
 fn charmap_output(
-    w_mapping: PyObjectRef,
+    mapping_slot: usize,
     cp: u32,
     out: &mut Vec<u8>,
 ) -> Result<bool, crate::PyError> {
+    let w_mapping = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
     if unsafe { is_str(w_mapping) } && cp as usize >= unsafe { w_str_len(w_mapping) } {
         return Ok(false);
+    }
+    // An exact dict is read straight off its own strategy, the way
+    // `charmapencode_lookup` reads an exact table and leaves every other
+    // mapping to the item protocol.  The table `charmap_build` hands back is
+    // always this case, so the generic descent below is what a hand-written
+    // table costs, not what encoding a line of text costs.
+    //
+    // Exactness is the whole licence: a dict subclass can carry a
+    // `__getitem__` of its own, and that one still has to run.  With it
+    // established, nothing here can call back into Python, so the read needs
+    // no root frame — only the key, which is minted before the table is
+    // re-read because minting it can collect.
+    if unsafe { pyre_object::pyobject::is_exact_type(w_mapping, &pyre_object::pyobject::DICT_TYPE) }
+    {
+        let w_key = w_int_new(cp as i64);
+        let w_mapping = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
+        // A key the table has no entry for is undefined, the same answer an
+        // explicit `None` value gives — and asking this way costs no
+        // exception object to raise and catch per undefined character.
+        let Some(w_ch) = (unsafe { pyre_object::dictmultiobject::w_dict_lookup(w_mapping, w_key) })
+        else {
+            return Ok(false);
+        };
+        return charmap_emit(w_ch, out);
     }
     // Minting the key can collect, and a table read can run a `__getitem__` of
     // its own, so the table is pinned and re-read rather than carried across
@@ -1213,6 +1249,12 @@ fn charmap_output(
         }
         Err(e) => return Err(e),
     };
+    charmap_emit(w_ch, out)
+}
+
+/// The value half of `charmapencode_lookup` — append what one table entry
+/// stands for, and answer whether it defined the character at all.
+fn charmap_emit(w_ch: PyObjectRef, out: &mut Vec<u8>) -> Result<bool, crate::PyError> {
     // `Charmap_Encode.get` tests the table's value with `w_bytes`, so a
     // `bytearray` falls through to the type error below with everything else
     // the table is not allowed to give.
@@ -1271,11 +1313,7 @@ fn charmap_encode_impl(
     let sp = pyre_object::gc_roots::pin_roots(&[w_unicode, w_mapping]);
     let mut i = 0usize;
     while i < char_len {
-        if charmap_output(
-            pyre_object::gc_roots::shadow_stack_get(sp + 1),
-            cps[i],
-            &mut out,
-        )? {
+        if charmap_output(sp + 1, cps[i], &mut out)? {
             i += 1;
             continue;
         }
@@ -1285,11 +1323,7 @@ fn charmap_encode_impl(
         let mut probe = Vec::new();
         while end < char_len {
             probe.clear();
-            if charmap_output(
-                pyre_object::gc_roots::shadow_stack_get(sp + 1),
-                cps[end],
-                &mut probe,
-            )? {
+            if charmap_output(sp + 1, cps[end], &mut probe)? {
                 break;
             }
             end += 1;
@@ -1326,11 +1360,7 @@ fn charmap_encode_impl(
                     }
                     crate::type_methods::EncodeReplacement::Str(replacement_cps) => {
                         for replacement_cp in replacement_cps {
-                            if !charmap_output(
-                                pyre_object::gc_roots::shadow_stack_get(sp + 1),
-                                replacement_cp,
-                                &mut out,
-                            )? {
+                            if !charmap_output(sp + 1, replacement_cp, &mut out)? {
                                 return Err(crate::typedef::unicode_encode_error(
                                     "charmap",
                                     pyre_object::gc_roots::shadow_stack_get(sp),
@@ -1427,11 +1457,20 @@ fn charmap_decode_impl(
     while i < data.len() {
         let b = data[i];
         let mapped = if let Some(chars) = mapping_chars.as_ref() {
-            chars.get(b as usize).copied().map(|cp| {
-                let mut one = rustpython_wtf8::Wtf8Buf::new();
-                one.push(cp);
-                w_str_from_wtf8_managed(one)
-            })
+            // `charmap_decode_string` writes the code point straight to the
+            // output.  Minting a one-character object per byte only to read it
+            // back below costs an allocation per input byte, which is more
+            // than the table read it wraps.
+            if let Some(cp) = chars.get(b as usize).copied() {
+                if cp.to_u32() != 0xFFFE {
+                    out.push(cp);
+                    i += 1;
+                    continue;
+                }
+            }
+            // A byte past the table's end and the `￾` sentinel are both
+            // "undefined", and reach the error handler the same way.
+            None
         } else {
             charmap_decode_lookup(pyre_object::gc_roots::shadow_stack_get(sp), b)?
         };

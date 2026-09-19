@@ -8390,6 +8390,16 @@ fn reconstruct_inline_recipe(
             return_substitute: Some(instance),
         });
     }
+    // An operator's tail (`crate::operator_continuation`) reconstructs no
+    // frame either, and unlike `descr_call`'s it cannot be carried out by
+    // substituting a box: its JIT-visible body is a CALL that has to run, over
+    // a value the callee has not returned yet.  The conservative blackhole
+    // resume runs it correctly, so decline the whole chain here -- named,
+    // rather than as the `NoCodeForJitcodeIndex` every check below would give
+    // it anyway.
+    if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
+        decline!("OperatorTail");
+    }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
     let Some(w_code) = code_for_jitcode_index(frame.jitcode_index) else {
