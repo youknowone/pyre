@@ -253,6 +253,17 @@ pub struct VirtualizableInfo {
     /// `None` (PyFrame and tests) means the flat `num_green_args +
     /// index_of_virtualizable` formula already names the box.
     pub identity_live_index: Option<usize>,
+    /// Whether an outer executor (the macro-generated mainloop) owns the
+    /// live virtualizable and writes it on every opcode.
+    ///
+    /// `pyjitpl.py synchronize_virtualizable` writes the boxes back after
+    /// every vable store because upstream's metainterp IS the interpreter.
+    /// A pyre driver whose merge point is the bare observer/replay form
+    /// (`jit_merge_point!()`) leaves a second executor running the guest,
+    /// so the live struct — not the shadow — is authoritative and the
+    /// flush would clobber it. `false` is the upstream situation (the
+    /// `; state` single-executor close, or a token-bearing VTYPE).
+    pub outer_executor_owns_state: bool,
 }
 
 impl Clone for VirtualizableInfo {
@@ -277,6 +288,7 @@ impl Clone for VirtualizableInfo {
             clear_vable_descr: self.clear_vable_descr.clone(),
             identity_ref_bank_index: self.identity_ref_bank_index,
             identity_live_index: self.identity_live_index,
+            outer_executor_owns_state: self.outer_executor_owns_state,
         }
     }
 }
@@ -368,6 +380,7 @@ impl VirtualizableInfo {
             clear_vable_descr: None,
             identity_ref_bank_index: None,
             identity_live_index: None,
+            outer_executor_owns_state: false,
         }
     }
 

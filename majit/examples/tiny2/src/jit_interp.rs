@@ -13,6 +13,8 @@
 //! Greens: [bytecode (env), pc]
 //! Reds:   [stackpos, stack]  (tracked via state_fields)
 
+use majit_metainterp::virt_array::VirtArray;
+
 // ── Bytecode opcodes ──
 
 const OP_PUSH_INT: u8 = 0; // followed by 8 bytes (i64 LE)
@@ -73,13 +75,10 @@ fn compile(words: &[&str]) -> Vec<u8> {
 /// RPython tiny2_hotpath.py Stack. `_virtualizable_ = ['stackpos', 'stack[*]']`.
 struct Tiny2State {
     stackpos: i64,
-    // Observer/replay `jit_merge_point!()` — not the `; state` close.
-    // `VirtArray` registers DirectPointer and lets `compile.py` emit the
-    // GETFIELD_GC_R + GETARRAYITEM_GC_* entry reload; that compiled loop
-    // disagrees with the interpreter on fib. `Vec` keeps RustVec storage
-    // so the entry seeds boxes via `initialize_virtualizable` instead.
-    // This portal does not resume `getarrayitem_vable_*` in the blackhole.
-    stack: Vec<i64>,
+    // Upstream `Ptr(GcArray)` shape: one pointer to a `[length][payload…]`
+    // block, which `compile.py patch_new_loop_to_load_virtualizable_fields`
+    // reloads.
+    stack: VirtArray<i64>,
 }
 
 pub type Bytecode = [u8];
@@ -124,7 +123,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
     let stacksize: i32 = 0;
     let mut state = Tiny2State {
         stackpos: num_args as i64,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
 
     // RPython warmspot.py:281-289 canonical-liveness install hook.

@@ -2144,6 +2144,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // fixed payload offset can be reloaded by `compile.py:441-457`, and a `Vec`
     // embedded by value is not one.
     let build_vinfo_override: TokenStream = if num_virt_arrays > 0 {
+        let outer_executor_owns_state = !super::has_single_pass_close(func);
         let scalar_field_parts: Vec<_> = vable_scalars
             .iter()
             .map(|f| {
@@ -2300,6 +2301,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // no-op rather than land there.
                 let mut __info = VirtualizableInfo::without_vable_token();
                 __info.name = "state".to_string();
+                __info.outer_executor_owns_state = #outer_executor_owns_state;
                 // The dispatch lowering binds the green ref `program` to ref
                 // register 0 (it is the base for `program[pc]` reads) and the
                 // `&state` virtualizable identity to ref register 1

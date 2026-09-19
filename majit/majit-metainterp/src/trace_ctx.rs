@@ -3022,21 +3022,6 @@ impl TraceCtx {
         }
     }
 
-    /// Whether any virtualizable array is a Rust `Vec` embedded by value in
-    /// the interpreter's live state struct.
-    ///
-    /// Such an array is owned and rewritten by the outer executor on every
-    /// opcode, so the heap — not the trace's shadow — is authoritative for it
-    /// while the walk is in progress.
-    fn has_outer_owned_array(&self, info: &crate::virtualizable::VirtualizableInfo) -> bool {
-        info.array_fields.iter().any(|a| {
-            matches!(
-                a.storage,
-                crate::virtualizable::VableArrayStorage::RustVec { .. }
-            )
-        })
-    }
-
     /// pyjitpl.py `synchronize_virtualizable()`.
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
@@ -3231,9 +3216,9 @@ impl TraceCtx {
 
     /// `virtualizable.py write_boxes` over the whole shadow.
     ///
-    /// `skip_outer_owned_arrays` names the one storage shape whose write-back
+    /// `skip_when_outer_owned` names the merge-point form whose write-back
     /// is not this function's to make; see the carve-out below.
-    fn write_virtualizable_back(&self, skip_outer_owned_arrays: bool) {
+    fn write_virtualizable_back(&self, skip_when_outer_owned: bool) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -3267,15 +3252,19 @@ impl TraceCtx {
             array_bits.push(items);
             cursor += len;
         }
-        // When the virtualizable array is a Rust `Vec` embedded by value in
-        // the interpreter's live state struct (`RustVec` storage), an outer
-        // executor (the macro-generated mainloop) owns that struct and writes
-        // it on every opcode. The trace's shadow is seeded from that heap and
-        // tracked for IR purposes only; flushing the shadow back here would
-        // clobber the outer executor's writes. The heap is authoritative, so
+        // When the merge point is the bare observer/replay form
+        // (`jit_merge_point!()`), an outer executor (the macro-generated
+        // mainloop) owns the live struct and writes it on every opcode. The
+        // trace's shadow is seeded from that heap and tracked for IR
+        // purposes only; flushing the shadow back here would clobber the
+        // outer executor's writes. The live struct is authoritative, so
         // skip the write-back during tracing — the resume path performs its
-        // own field-aware flush on guard failure.
-        if skip_outer_owned_arrays && self.has_outer_owned_array(info) {
+        // own field-aware flush on guard failure. The `; state`
+        // single-executor close keeps the walk executing, so the flush is
+        // required there: it is the only thing that keeps the live struct
+        // and the shadow equal. `pyjitpl.py synchronize_virtualizable`
+        // always writes because upstream's metainterp IS the interpreter.
+        if skip_when_outer_owned && info.outer_executor_owns_state {
             return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
@@ -3321,11 +3310,11 @@ impl TraceCtx {
         ) else {
             return;
         };
-        // `RustVec`-stored arrays are owned and rewritten by the outer
-        // executor on every opcode, so the shadow is deliberately not kept
-        // equal to the heap for them — the same carve-out
-        // `synchronize_virtualizable` makes before writing back.
-        if self.has_outer_owned_array(info) {
+        // Observer/replay merge points leave an outer executor owning the
+        // live struct, so the shadow is deliberately not kept equal to it
+        // — the same carve-out `synchronize_virtualizable` makes before
+        // writing back.
+        if info.outer_executor_owns_state {
             return;
         }
         let static_count = info.num_static_extra_boxes;
