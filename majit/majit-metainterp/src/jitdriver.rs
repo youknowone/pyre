@@ -5221,8 +5221,10 @@ impl<S: JitState> JitDriver<S> {
     /// This is upstream's split: `get_uhash(*greenargs)` hashes the greens in
     /// place on every back edge, and the greens are stored on the cell only
     /// when one is installed (warmstate.py:584-604).
-    #[cold]
-    #[inline(never)]
+    ///
+    /// Port of `warmstate.py maybe_compile_and_run`, which upstream leaves
+    /// unannotated. Neither `#[cold]` nor `#[inline(never)]` has an upstream
+    /// counterpart; `_always_inline_` is on the `maybe_enter_jit` wrapper.
     pub fn back_edge_structured(
         &mut self,
         green_key_hash: u64,
@@ -5264,8 +5266,10 @@ impl<S: JitState> JitDriver<S> {
     /// resolved key would also rebuild the caller's `GreenKey` on a chained
     /// bucket, which is the allocation the carry exists to avoid), and the
     /// token is entered as given.
-    #[cold]
-    #[inline(never)]
+    ///
+    /// Port of `warmstate.py maybe_compile_and_run`, which upstream leaves
+    /// unannotated. Neither `#[cold]` nor `#[inline(never)]` has an upstream
+    /// counterpart; `_always_inline_` is on the `maybe_enter_jit` wrapper.
     pub fn back_edge_resolved(
         &mut self,
         cell_key: u64,
