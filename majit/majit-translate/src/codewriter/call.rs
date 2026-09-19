@@ -799,9 +799,7 @@ impl GraphStore {
                 // one `GraphSlot`, so "any alias said true" has to survive
                 // the fold or the flag depends on registration order.
                 existing.graph.access_directly |= graph.access_directly;
-                if !graph.hints.is_empty() {
-                    existing.graph.hints = graph.hints;
-                }
+                crate::front::llbc_hints::merge_hints_into_graph(&mut existing.graph, &graph.hints);
                 if existing.graph.return_type.is_none() {
                     existing.graph.return_type = graph.return_type;
                 }
@@ -3288,10 +3286,11 @@ impl CallControl {
     pub fn register_function_graph_with_hints(
         &mut self,
         path: CallPath,
-        graph: FunctionGraph,
+        mut graph: FunctionGraph,
         hints: Vec<String>,
     ) {
-        self.register_function_graph(path, graph.with_hints(hints));
+        crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &hints);
+        self.register_function_graph(path, graph);
     }
 
     /// Stamp hints onto an already-registered graph. Used by call sites
@@ -3303,7 +3302,7 @@ impl CallControl {
         if !hints.is_empty()
             && let Some(graph) = self.function_graphs.get_mut(&path)
         {
-            graph.hints = hints;
+            crate::front::llbc_hints::merge_hints_into_graph(graph, &hints);
         }
     }
 
@@ -9878,6 +9877,63 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+
+    /// An earlier alias's hint set is unioned with a later one, not replaced.
+    #[test]
+    fn graph_store_unions_hints_across_alias_inserts() {
+        let mut store = GraphStore::new();
+        let mut first = FunctionGraph::new("f");
+        first.hints = vec!["elidable".into()];
+        let mut second = FunctionGraph::new("f");
+        second.hints = vec!["unroll_safe".into()];
+        store.insert(CallPath::from_segments(["m", "f"]), first);
+        store.insert(CallPath::from_segments(["alias", "f"]), second);
+        let hints = &store
+            .get(&CallPath::from_segments(["m", "f"]))
+            .expect("registered")
+            .hints;
+        assert!(hints.iter().any(|h| h == "elidable"));
+        assert!(hints.iter().any(|h| h == "unroll_safe"));
+    }
+
+    /// Harvested hints registered after a hint-less first insert must land
+    /// on the stored graph — BFS reads `graph.hints`, not the caller's
+    /// `SemanticFunction.hints`.
+    #[test]
+    fn register_function_graph_with_hints_merges_onto_an_existing_graph() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["mod", "loopy"]);
+        let mut g = FunctionGraph::new("loopy");
+        let entry = g.startblock;
+        g.set_goto(entry, entry, Vec::new());
+        cc.register_function_graph(path.clone(), g);
+        cc.register_function_graph_with_hints(
+            path.clone(),
+            FunctionGraph::new("loopy"),
+            vec!["unroll_safe".into()],
+        );
+        let stored = cc.function_graphs().get(&path).expect("registered");
+        assert!(
+            stored.hints.iter().any(|h| h == "unroll_safe"),
+            "harvested unroll_safe was not merged into FunctionGraph.hints"
+        );
+        let hints = stored.hints.clone();
+        let graph = stored.clone();
+        let func = SemanticFunction {
+            name: "loopy".into(),
+            graph,
+            return_type: None,
+            self_ty_root: None,
+            trait_impl_id: None,
+            hints,
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        };
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        assert!(policy.look_inside_graph(&func));
+    }
 
     /// Two aliases of one source funcobj fold onto a single `GraphSlot`.
     /// Upstream never faces this — its aliases are the same Python graph

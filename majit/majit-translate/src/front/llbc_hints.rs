@@ -249,6 +249,20 @@ fn should_skip_generated_elidable_helper(fn_name: &str) -> bool {
     fn_name.starts_with("_orig_") && fn_name.ends_with("_unlikely_name")
 }
 
+/// Union harvested JIT-hint tokens onto `graph.hints`.
+///
+/// `harvest_hints_from_llbcs` keys the marker consts; the BFS reads
+/// `_jit_unroll_safe_` off `FunctionGraph.hints` the way RPython reads
+/// it off `graph.func`. A replace would drop tokens an earlier alias
+/// already carried, so this is monotonic.
+pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[String]) {
+    for hint in hints {
+        if !graph.hints.iter().any(|h| h == hint) {
+            graph.hints.push(hint.clone());
+        }
+    }
+}
+
 fn push_hint(out: &mut HashMap<String, Vec<String>>, key: String, hint: &str) {
     out.entry(key).or_default().push(hint.to_string());
 }
@@ -539,6 +553,17 @@ mod tests {
         assert_eq!(
             decode_str_const(&serde_json::json!({"kind": {"Literal": {"Bool": true}}})),
             None
+        );
+    }
+
+    #[test]
+    fn merge_hints_into_graph_unions_unroll_safe_onto_existing_tokens() {
+        let mut g = crate::model::FunctionGraph::new("f");
+        g.hints = vec!["elidable".into()];
+        super::merge_hints_into_graph(&mut g, &["unroll_safe".to_string(), "elidable".to_string()]);
+        assert_eq!(
+            g.hints,
+            vec!["elidable".to_string(), "unroll_safe".to_string()]
         );
     }
 }
