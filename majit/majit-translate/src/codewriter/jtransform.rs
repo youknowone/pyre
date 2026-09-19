@@ -761,16 +761,6 @@ fn is_typeptr_field(field: &FieldDescriptor) -> bool {
     field.name == "ob_type" && owner_leaf == Some("PyObject")
 }
 
-/// Nested `PyObject { ob_type, w_class }` struct literal. The leaf is
-/// the header type; a user function named `PyObject` stays a
-/// `FunctionPath` and is not this.
-fn is_object_header_ctor(target: &CallTarget) -> bool {
-    let CallTarget::SyntheticTransparentCtor { name, .. } = target else {
-        return false;
-    };
-    name.rsplit("::").next() == Some("PyObject")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedCallResult {
     kind: char,
@@ -873,48 +863,6 @@ pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
     }
     let joined = rest.join("::");
     joined == "Default" || joined.starts_with("core::default") || joined.starts_with("std::default")
-}
-
-/// Supply the value of a `CTypeFlags` associated constant.
-///
-/// `bitflags!` generates each flag as `impl CTypeFlags { const NAME: Self }`
-/// whose initializer Charon records as an `Opaque` body (the impl module
-/// anonymizes to `_`), so `const_eval_global` finds no in-LLBC init.
-/// The bits are a fixed compile-time `i64` mask (`ctypeobj.rs
-/// CTypeFlags`). `W_CType.has(CTypeFlags::SIGNED_WCHAR)` is then the
-/// integer bit-and PyPy's immutable `is_signed_wchar` field reads as
-/// after promotion.
-pub(crate) fn ctype_flags_const(segments: &[String]) -> Option<OpKind> {
-    let [.., owner, impl_seg, leaf] = segments else {
-        return None;
-    };
-    if owner.as_str() != "_" || impl_seg.as_str() != "<Impl>" {
-        return None;
-    }
-    let path = segments.join("::");
-    if !path.contains("ctypeobj") {
-        return None;
-    }
-    let bits: i64 = match leaf.as_str() {
-        "PRIMITIVE_INTEGER" => 1 << 0,
-        "NONFUNC_POINTER_OR_ARRAY" => 1 << 1,
-        "ACCEPT_STR" => 1 << 2,
-        "VOID_PTR" => 1 << 3,
-        "VOIDCHAR_PTR" => 1 << 4,
-        "ONEBYTE_PTR" => 1 << 5,
-        "FILE_PTR" => 1 << 6,
-        "VALUE_FITS_LONG" => 1 << 7,
-        "VALUE_SMALLER_THAN_LONG" => 1 << 8,
-        "VALUE_FITS_ULONG" => 1 << 9,
-        "SIGNED_WCHAR" => 1 << 10,
-        "ELLIPSIS" => 1 << 11,
-        "ENUM" => 1 << 12,
-        "CUSTOM_FIELD_POS" => 1 << 13,
-        "WITH_VAR_ARRAY" => 1 << 14,
-        "WITH_PACKED_CHANGE" => 1 << 15,
-        _ => return None,
-    };
-    Some(OpKind::ConstInt(bits))
 }
 
 /// `try_gc_write_barrier` / `try_gc_write_barrier_managed` — the
@@ -2803,6 +2751,16 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "cast_opaque_ptr" => RewriteResult::Identity(operand.clone()),
+            // `cast_int_to_ptr` is `i>r` (`insns.rs`, `blackhole.py
+            // bhimpl_cast_int_to_ptr`). A Ref operand is already a
+            // pointer; emitting `/r>r` is not a wired op.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_int_to_ptr" && self.get_value_kind_var(operand) != 'i' => {
+                RewriteResult::Identity(operand.clone())
+            }
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -5093,22 +5051,6 @@ impl<'a> Transformer<'a> {
             });
             return RewriteResult::Replace(Vec::new());
         }
-        // A construct-on-stack `PyObject` header is not a heap object
-        // (`rclass.py` embeds `OBJECT` in the instance). Stores into the
-        // rewritten null stand-in are the header words `new` / the
-        // vtable already stamp.
-        if let OpKind::FieldWrite { base, .. } = &op.kind
-            && self.header_stack_results.contains(base)
-        {
-            self.notes.push(GraphTransformNote {
-                function: graph_name.to_string(),
-                detail: format!(
-                    "rewrite: setfield({}) on stack header → dropped",
-                    field.name
-                ),
-            });
-            return RewriteResult::Replace(Vec::new());
-        }
         // `jtransform.py rewrite_op_setfield`: `if RESULT is lltype.Void: return`.
         // A unit payload has no register; emitting the store sends it to
         // the assembler with no coloring.
@@ -5883,26 +5825,6 @@ impl<'a> Transformer<'a> {
         if self.is_synthetic_result_option_ctor(target, args, result_ty) {
             return RewriteResult::Identity(args[0].clone());
         }
-        // `rclass.py` embeds `OBJECT` in the instance; there is no
-        // `malloc` of a bare header. `front::mir` still emits a
-        // niladic `PyObject` ctor plus `ob_type` / `w_class` stores
-        // (the construct-on-stack header `fuse_boxing_alloc` sweeps
-        // when the parent is `malloc_typed`). Left as a residual it
-        // has no function address, so the descent scan declines on
-        // the symbolic hash. It is not a heap `New` either: both
-        // fields are header words (`heaptracker.is_header_word`) and
-        // an empty field list has no registered tid
-        // (`UnregisteredNewGcType`). Produce a null stand-in; the
-        // header stores are dropped below.
-        if is_object_header_ctor(target) && args.is_empty() {
-            if let Some(res) = op.result.clone() {
-                self.header_stack_results.insert(res);
-            }
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::ConstRefNull,
-            }]);
-        }
         // The two signedness markers `front::mir` emits for a same-width
         // reinterpret.  Both coerce their input to the result's low-level type
         // and hand it back unchanged: `rtype_intmask` to `lltype.Signed`, and
@@ -6314,19 +6236,6 @@ impl<'a> Transformer<'a> {
                     RewriteResult::Replace(vec![])
                 };
             }
-        }
-        // `CTypeFlags::SIGNED_WCHAR` (and the other flag consts) is a
-        // compile-time mask. Charon leaves the bitflags impl Opaque, so
-        // a leftover 0-arg Call still has to become ConstInt here.
-        if let CallTarget::FunctionPath { segments, .. } = target
-            && args.is_empty()
-            && let Some(kind) = ctype_flags_const(segments)
-        {
-            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind,
-            }]);
         }
         // `rewrite_op_cast_pointer` → `rewrite_op_same_as`
         // (jtransform.py:254-257): the JIT does not distinguish a
@@ -19065,67 +18974,6 @@ mod tests {
         }
     }
 
-    /// `CTypeFlags::SIGNED_WCHAR` is `1 << 10`. The bitflags impl is
-    /// Opaque in Charon, so the 0-arg associated-const Call must become
-    /// that integer, not a residual helper.
-    #[test]
-    fn ctype_flags_signed_wchar_rewrites_to_bit_mask() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("signed_wchar");
-        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let target = CallTarget::function_path([
-            "module",
-            "_cffi_backend",
-            "ctypeobj",
-            "_",
-            "<Impl>",
-            "SIGNED_WCHAR",
-        ]);
-        let op = SpaceOperation {
-            result: Some(result),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Int,
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[],
-            &ValueType::Int,
-            "signed_wchar",
-            &mut graph,
-        ) {
-            RewriteResult::Replace(ops) => {
-                assert!(matches!(
-                    ops.as_slice(),
-                    [SpaceOperation {
-                        kind: OpKind::ConstInt(bits),
-                        ..
-                    }] if *bits == 1 << 10
-                ));
-            }
-            _ => panic!("expected ConstInt(1 << 10)"),
-        }
-    }
-
-    #[test]
-    fn ctype_flags_unknown_leaf_stays_residual() {
-        assert!(
-            super::ctype_flags_const(&[
-                "module".into(),
-                "_cffi_backend".into(),
-                "ctypeobj".into(),
-                "_".into(),
-                "<Impl>".into(),
-                "NOT_A_FLAG".into(),
-            ])
-            .is_none()
-        );
-    }
-
     /// `rtuple.py TupleRepr.newtuple`: a non-empty tuple lowers to
     /// `malloc(GcStruct)`; the following per-item `FieldWrite`s supply the
     /// `setfield`s.  It must never survive as a synthetic residual call.
@@ -19856,73 +19704,6 @@ mod tests {
             &target,
             &[arg],
             &ValueType::Ref(None),
-        ));
-    }
-
-    /// `rclass.py` embeds `OBJECT` in the instance. A niladic `PyObject`
-    /// struct literal must not become a residual helper.
-    #[test]
-    fn pyobject_header_ctor_becomes_null_standin() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("header_ctor");
-        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::synthetic_transparent_struct_ctor(
-            vec!["pyre_object".into(), "pyobject".into()],
-            "PyObject",
-        );
-        let result_ty = ValueType::Ref(Some("pyre_object::pyobject::PyObject".into()));
-        let op = SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![]),
-                result_ty: result_ty.clone(),
-            },
-        };
-        match transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            &[],
-            &result_ty,
-            "header_ctor",
-            &mut graph,
-        ) {
-            RewriteResult::Replace(ops) => {
-                assert!(matches!(
-                    ops.as_slice(),
-                    [SpaceOperation {
-                        kind: OpKind::ConstRefNull,
-                        ..
-                    }]
-                ));
-            }
-            _ => panic!("expected ConstRefNull stand-in"),
-        }
-        let w_class = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let store = SpaceOperation {
-            result: None,
-            kind: OpKind::FieldWrite {
-                base: result,
-                field: crate::model::FieldDescriptor::new("w_class", Some("PyObject".into())),
-                value: crate::model::LinkArg::Value(w_class),
-                ty: ValueType::Ref(None),
-            },
-        };
-        match transformer.rewrite_operation(&store, "header_ctor", &mut graph) {
-            RewriteResult::Replace(ops) if ops.is_empty() => {}
-            _ => panic!("expected header store into the stand-in to drop"),
-        }
-    }
-
-    /// A user function named `PyObject` is an ordinary call.
-    #[test]
-    fn pyobject_function_path_is_not_a_header_ctor() {
-        assert!(!super::is_object_header_ctor(&CallTarget::function_path([
-            "mymod", "PyObject",
-        ])));
-        assert!(super::is_object_header_ctor(
-            &CallTarget::synthetic_transparent_ctor("PyObject")
         ));
     }
 
