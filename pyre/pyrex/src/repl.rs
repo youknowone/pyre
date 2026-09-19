@@ -8,7 +8,7 @@ use rustpython_compiler::{
 
 use pyre_interpreter::call::register_build_class;
 use pyre_interpreter::importing;
-use pyre_interpreter::{PyDisplay, PyError, PyExecutionContext};
+use pyre_interpreter::{CompileOpts, PyDisplay, PyError, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
 
 use crate::repl_readline::{Readline, ReadlineResult};
@@ -384,9 +384,41 @@ fn run_startup_file(
             pyre_object::w_none(),
         );
     }
-    let outcome =
-        pyre_interpreter::compile_source_named_by_bytes(&source, Mode::Exec, filename_bytes)
-            .and_then(|w_code| exec_in_main(runtime, w_code));
+    // The script and `-c` paths compile through `compile_with_codegen_warnings`
+    // so an invalid escape is a SyntaxWarning; the filename bytes still name
+    // the unit the way `compile_source_named_by_bytes` does.
+    let (source_path, filename_bytes) =
+        pyre_interpreter::split_code_filename_bytes(filename_bytes, None);
+    let compiled = pyre_interpreter::syntax_warnings::compile_with_codegen_warnings(
+        &source,
+        Mode::Exec,
+        &source_path,
+        CompileOpts {
+            optimize: importing::optimize_flag(),
+            debug_ranges: importing::code_debug_ranges_flag(),
+            int_max_str_digits: pyre_interpreter::module::sys::state::int_max_str_digits().max(0)
+                as usize,
+            ..Default::default()
+        },
+    );
+    let outcome = match compiled {
+        Ok(code) => {
+            let w_code = pyre_interpreter::box_code_object(code);
+            unsafe {
+                pyre_interpreter::set_compilation_unit_filename_bytes(w_code, filename_bytes);
+            }
+            exec_in_main(runtime, w_code)
+        }
+        Err(pyre_interpreter::syntax_warnings::SourceCompileError::Compile(error)) => {
+            let mut err =
+                pyre_interpreter::compile_err_to_syntax_error(error, &source, Mode::Exec);
+            err.replace_syntax_error_filename(pyre_interpreter::gateway::fsdecode_filename_bytes(
+                filename_bytes.as_deref().unwrap_or(source_path.as_bytes()),
+            ));
+            Err(err)
+        }
+        Err(pyre_interpreter::syntax_warnings::SourceCompileError::Warning(error)) => Err(error),
+    };
     if bind_file_name {
         let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__file__");
         let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__cached__");
