@@ -3864,6 +3864,19 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     descr
 }
 
+/// The runtime's own descr for a list backing block named by its ARRAY
+/// identity.  The build-time descr pool consults this before minting, so
+/// the GC tid stamped here reaches the shared `_cache_array` slot first.
+pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
+    use majit_translate::codewriter::jtransform as jt;
+    match array_type_id {
+        jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
+        jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
+        jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),
+        _ => None,
+    }
+}
+
 /// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block
 /// (`erase([int])`). Length-prefixed `[capacity][i64...]`: `base_size` skips
 /// the capacity header so `GetarrayitemGcI(block, i)` lands on items[i], and
@@ -3871,13 +3884,14 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
 /// the raw `int_array_descr`.
 pub(crate) fn int_gcarray_descr() -> DescrRef {
     let token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
-    crate::descr::make_array_descr_with_type(
+    crate::descr::make_array_descr_with_full_id(
         token.base_size,
         token.item_size,
         pyre_object::gc_int_array_gc_type_id(),
         Some(token.len_offset),
         Type::Int,
         true,
+        Some(majit_translate::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string()),
     )
 }
 
@@ -3918,13 +3932,14 @@ pub(crate) fn mapdict_storage_gcarray_descr() -> DescrRef {
 /// (`erase([float])`). See [`int_gcarray_descr`].
 pub(crate) fn float_gcarray_descr() -> DescrRef {
     let token = &pyre_object::TYPED_ITEMS_BLOCK_FLOAT_TOKEN;
-    crate::descr::make_array_descr_with_type(
+    crate::descr::make_array_descr_with_full_id(
         token.base_size,
         token.item_size,
         pyre_object::gc_float_array_gc_type_id(),
         Some(token.len_offset),
         Type::Float,
         false,
+        Some(majit_translate::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string()),
     )
 }
 

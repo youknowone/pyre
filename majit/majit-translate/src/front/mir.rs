@@ -9629,6 +9629,13 @@ impl<'a> Lowering<'a> {
                 // routing host containers through the same `[str]` identity
                 // would also alias them into that array's `_cache_array` slot.
                 let element_spelling = element_scalar;
+                // A `&[PyObjectRef]` is `Ptr(GcArray(Ptr(PyObject)))` in the
+                // translated type model — the block a gateway wrapper's
+                // argument array is built as — so it names that ARRAY like
+                // every other access to it.  A `Vec` stays a host container.
+                let slice_object_element = self
+                    .is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                    && element_node.is_some_and(|elem| json_ty_is_objectptr(elem, self.llbc));
                 let element_is_addressable = element_spelling.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
@@ -9657,8 +9664,9 @@ impl<'a> Lowering<'a> {
                 // `*mut PyObject` element there IS the length-prefixed object
                 // block that `set_ref` and the `swap` decomposition name, and
                 // this read has to share their descr or a cached element
-                // survives their store.  The `Vec<T>` and slice legs reach
-                // object pointers that are not that block, and they keep the
+                // survives their store.  An object-pointer slice is that
+                // block too (`slice_object_element`).  The `Vec<T>` leg reaches
+                // object pointers that are not that block, and it keeps the
                 // identity-less descr, which `arraydescrof_concrete` mints
                 // locally without a cache publish.
                 //
@@ -9690,10 +9698,11 @@ impl<'a> Lowering<'a> {
                     // the length-prefixed object block that `set_ref` and the
                     // `swap` decomposition name, and this read has to share
                     // their descr or a cached element survives their store.
-                    // The `Vec<T>` and slice legs reach object pointers that
-                    // are not that block, and they keep the identity-less
-                    // descr, which `arraydescrof_concrete` mints locally
-                    // without a cache publish.
+                    // An object-pointer slice is that block too
+                    // (`slice_object_element`).  The `Vec<T>` leg reaches
+                    // object pointers that are not that block, and it keeps
+                    // the identity-less descr, which `arraydescrof_concrete`
+                    // mints locally without a cache publish.
                     //
                     // Unlike the `swap` arm, the item kind is sound evidence
                     // here.  The `Ref(None)` fallback that forced `swap` onto
@@ -9722,9 +9731,9 @@ impl<'a> Lowering<'a> {
                         // non-`Ref` element at 8 bytes, so a narrow int read
                         // through such a receiver would stride past its
                         // neighbours.
-                        element_spelling
-                            .as_deref()
-                            .map(|elem| format!("[{elem}]"))
+                        slice_object_element
+                            .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
+                            .or_else(|| element_spelling.as_deref().map(|elem| format!("[{elem}]")))
                             .or_else(|| {
                                 if !matches!(
                                     item_ty,
@@ -10991,7 +11000,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
-                            array_type_id: None,
+                            array_type_id: self.slice_object_array_type_id(&reg),
                             nolength: false,
                         }
                     };
@@ -11048,7 +11057,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
-                            array_type_id: None,
+                            array_type_id: self.slice_object_array_type_id(&reg),
                             nolength: false,
                         }
                     };
@@ -11094,7 +11103,7 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayLen {
                             base: args[0].clone(),
-                            array_type_id: None,
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
                         },
                     });
@@ -13773,6 +13782,11 @@ impl<'a> Lowering<'a> {
         // T, not a Rust slot reference.  Read the bank from the call's T
         // generic before looking at the reference-wrapped destination.
         let item_ty = tyref_to_value_type(&element_ty, self.llbc);
+        // An object-pointer slice names its ARRAY; see `slice_object_element`
+        // at the `Index::index` arm.
+        if json_ty_is_objectptr(element, self.llbc) {
+            return Some((item_ty, Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string())));
+        }
         if let Some(spelling) = json_ty_scalar_element_spelling(element, self.llbc) {
             return Some((item_ty, Some(format!("[{spelling}]"))));
         }
@@ -14727,6 +14741,14 @@ impl<'a> Lowering<'a> {
                 .any(|&local| place_references_local(place, local)),
             Operand::Const(_) => false,
         }
+    }
+
+    /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
+    /// an object pointer; see `slice_object_element` at the index arm.
+    fn slice_object_array_type_id(&self, reg: &RegularCall) -> Option<String> {
+        self.slice_swap_elem_tyref(reg)
+            .is_some_and(|ty| output_type_is_objectptr(&ty, self.llbc))
+            .then(|| OBJECT_REF_GCARRAY_TYPE_ID.to_string())
     }
 
     fn is_slice_len(&self, reg: &RegularCall) -> bool {
@@ -25376,8 +25398,11 @@ fn ref_return_is_single_word(ast: &str) -> bool {
 }
 
 pub(crate) fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
+    tyref_node(ty, llbc).is_some_and(|n| json_ty_is_objectptr(n, llbc))
+}
+
+fn json_ty_is_objectptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    strip_ty_wrappers(node, llbc)
         .and_then(|n| raw_ptr_pointee_class_root(n, llbc))
         .as_deref()
         == Some("PyObject")
@@ -25579,6 +25604,17 @@ fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) 
     let identity = tyref_to_ast_string(ty, llbc);
     if identity.starts_with("??") {
         return (None, false);
+    }
+    // A `&[T]` is one GC array pointer whose length `ArrayLen` reads from the
+    // block header, so an object-pointer slice is the length-prefixed
+    // `GcArray(Ptr(PyObject))` every other access to that block names.
+    if matches!(
+        identity
+            .trim_start_matches(['&', ' '])
+            .trim_start_matches("mut "),
+        "[*mut PyObject]" | "[*const PyObject]"
+    ) {
+        return (Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()), false);
     }
     let nolength = crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()));
     (Some(identity), nolength)
