@@ -6965,6 +6965,40 @@ mod tests {
         assert_eq!(size.all_fielddescrs()[1].field_name(), "Cell.value");
     }
 
+    /// A build-time `setarrayitem_gc` on a list's int block and the walker's
+    /// own `getarrayitem_gc_i` name one ArrayDescr, or the heap cache keeps
+    /// the pre-store read alive across the store.
+    #[test]
+    fn make_descr_from_bh_list_int_block_is_the_runtime_gcarray_descr() {
+        use majit_translate::jitcode::BhDescr;
+        let token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
+        let atid = majit_translate::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
+        let bridged = make_descr_from_bh(&BhDescr::Array {
+            base_size: token.base_size,
+            itemsize: token.item_size,
+            len_offset: Some(token.len_offset),
+            type_id: majit_ir::descr::path_hash(atid),
+            gc_type_id: 0,
+            item_type: Type::Int,
+            is_array_of_pointers: false,
+            is_array_of_structs: false,
+            is_item_signed: true,
+            is_gc_managed: true,
+            ei_index: u32::MAX,
+            array_type_id: Some(atid.to_string()),
+            interior_fields: Vec::new(),
+        });
+        let runtime = crate::state::int_gcarray_descr();
+        assert!(std::sync::Arc::ptr_eq(&bridged, &runtime));
+        // `BhDescr::from_array_descr` drops the spelling; `cache_key` alone
+        // still finds the published descr.
+        let round_trip = make_descr_from_bh(&BhDescr::from_array_descr(
+            runtime.as_array_descr().expect("ArrayDescr"),
+        ));
+        assert!(std::sync::Arc::ptr_eq(&round_trip, &runtime));
+        assert_ne!(runtime.as_array_descr().unwrap().type_id(), 0);
+    }
+
     #[test]
     fn make_descr_from_bh_items_block_capacity_with_parent_is_canonical() {
         use majit_ir::descr::ArrayFlag;
@@ -8649,6 +8683,36 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     *item_type,
                     interior_fields,
                 )
+            } else if let Some(runtime) = array_type_id
+                .as_deref()
+                .and_then(crate::state::runtime_gcarray_descr)
+                .or_else(|| {
+                    // `descr.py get_array_descr` cache hit: `type_id` is the
+                    // `cache_key` the producer read off a published descr
+                    // (`BhDescr::from_array_descr` carries no spelling).
+                    (*type_id != 0)
+                        .then(|| {
+                            majit_ir::descr::gc_cache()
+                                .lock()
+                                ._cache_array
+                                .get(&majit_ir::descr::LLType::Array(*type_id))
+                                .cloned()
+                        })
+                        .flatten()
+                })
+            {
+                // `cpu.arraydescrof(ARRAY)` is one descr per ARRAY: a list
+                // backing block the runtime already describes keeps that
+                // descr, with its GC tid, instead of a second one the heap
+                // cache would treat as a different array.
+                let ad = runtime
+                    .as_array_descr()
+                    .expect("runtime gcarray descr is an ArrayDescr");
+                assert!(
+                    ad.base_size() == *base_size && ad.item_size() == *itemsize,
+                    "build-time layout of {array_type_id:?} disagrees with the runtime block",
+                );
+                runtime
             } else {
                 // `descr.py:348-360 gccache._cache_array[ARRAY_OR_STRUCT]`
                 // is keyed on lltype object identity; thread the
