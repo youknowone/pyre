@@ -287,6 +287,31 @@ pub fn remove_ref_constants_for_inputs(
     (out, gcrefs)
 }
 
+/// Append non-null ConstPtr failargs onto an existing `gcrefs` list.
+///
+/// `rewrite_for_gc_with_constants` does not process failargs (rewrite.py
+/// `emit_op` / rewrite.rs `remove_constptrs_in`); the backend still has
+/// to root them so deopt can rematerialize from the same `GcTable` the
+/// operand `LoadFromGcTable`s use. Existing indices are unchanged:
+/// already-listed refs keep their slots and new ones are appended.
+pub fn append_failarg_gcrefs(ops: &[Op], gcrefs: &mut Vec<GcRef>) {
+    let mut gcrefs_map: IndexMap<usize, u32> = gcrefs
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (g.0, i as u32))
+        .collect();
+    for op in ops {
+        if op.opcode == OpCode::JitDebug {
+            continue;
+        }
+        if let Some(fail_args) = op.getfailargs() {
+            for arg in fail_args {
+                register_constptr(&arg, gcrefs, &mut gcrefs_map);
+            }
+        }
+    }
+}
+
 /// Alignment for nursery allocations (8 bytes).
 const NURSERY_ALIGN: usize = 8;
 

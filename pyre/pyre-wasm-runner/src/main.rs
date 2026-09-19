@@ -652,6 +652,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
+    if std::env::var_os("PYRE_WASM_GC_REWRITE")
+        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("1" | "true" | "on")))
+        && let Ok(arm) =
+            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_gc_rewrite_enable")
+    {
+        arm.call(&mut store, ())?;
+    }
     // Loop-closing bridge inlining is the default. The guest has no
     // environment, so an explicit host-side opt-out must travel through this
     // export before tracing begins.
