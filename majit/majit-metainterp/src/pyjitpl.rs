@@ -5805,6 +5805,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `has_compiled_targets_fn` presence, so the parallel
                 // entry installs both fns unconditionally.
                 let self_ptr = self as *const Self as *const ();
+                let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
                 if let Some(ref mut ctx) = self.tracing {
                     ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
                         let meta = unsafe { &*(self_ptr as *const Self) };
@@ -5824,10 +5825,8 @@ impl<M: Clone> MetaInterp<M> {
                         let meta = unsafe { &*(self_ptr as *const Self) };
                         meta.call_ids.last().copied().unwrap_or(0)
                     }));
-                    let self_mut = self_ptr as *mut ();
                     ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
-                        let meta = unsafe { &mut *(self_mut as *mut Self) };
-                        meta.push_portal_trace_position(jd, key, pos);
+                        Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
                     }));
                 }
                 let pending_token =
@@ -6137,6 +6136,7 @@ impl<M: Clone> MetaInterp<M> {
         // as a bridge marker — `TraceCtx::is_bridge_trace` carries
         // that distinction explicitly.
         let self_ptr = self as *const Self as *const ();
+        let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
         if let Some(ref mut ctx) = self.tracing {
             ctx.has_compiled_targets_fn = Some(Box::new(move |gk: u64| -> bool {
                 let meta = unsafe { &*(self_ptr as *const Self) };
@@ -6156,10 +6156,8 @@ impl<M: Clone> MetaInterp<M> {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.call_ids.last().copied().unwrap_or(0)
             }));
-            let self_mut = self_ptr as *mut ();
             ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
-                let meta = unsafe { &mut *(self_mut as *mut Self) };
-                meta.push_portal_trace_position(jd, key, pos);
+                Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
             }));
         }
         let pending_token = self.make_pending_trace_token(green_key, driver_descriptor.as_ref());
@@ -16126,6 +16124,7 @@ impl<M: Clone> MetaInterp<M> {
         self.tracing = Some(ctx);
         self.arm_portal_trace_positions();
         let self_ptr = self as *const Self as *const ();
+        let positions_ptr = std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut ();
         if let Some(ref mut ctx) = self.tracing {
             ctx.portal_call_depth_fn = Some(Box::new(move || -> i32 {
                 let meta = unsafe { &*(self_ptr as *const Self) };
@@ -16135,10 +16134,8 @@ impl<M: Clone> MetaInterp<M> {
                 let meta = unsafe { &*(self_ptr as *const Self) };
                 meta.call_ids.last().copied().unwrap_or(0)
             }));
-            let self_mut = self_ptr as *mut ();
             ctx.portal_trace_push_fn = Some(Box::new(move |jd, key, pos| {
-                let meta = unsafe { &mut *(self_mut as *mut Self) };
-                meta.push_portal_trace_position(jd, key, pos);
+                Self::push_portal_trace_position_into(positions_ptr, jd, key, pos);
             }));
         }
         // pyjitpl.py `MetaInterp.__init__` binds the driver passed by the
@@ -17782,7 +17779,32 @@ impl<M: Clone> MetaInterp<M> {
         green_key: Option<PortalGreenKey>,
         pos: crate::recorder::TracePosition,
     ) {
-        let Some(positions) = self.portal_trace_positions.as_mut() else {
+        Self::push_portal_trace_position_into(
+            std::ptr::addr_of_mut!(self.portal_trace_positions) as *mut (),
+            jd_no,
+            green_key,
+            pos,
+        );
+    }
+
+    /// Append `(jd_no, green_key, pos)` when the log is armed (`Some`).
+    fn push_portal_trace_position_into(
+        positions: *mut (),
+        jd_no: usize,
+        green_key: Option<PortalGreenKey>,
+        pos: crate::recorder::TracePosition,
+    ) {
+        let positions = unsafe {
+            &mut *(positions
+                as *mut Option<
+                    Vec<(
+                        usize,
+                        Option<PortalGreenKey>,
+                        crate::recorder::TracePosition,
+                    )>,
+                >)
+        };
+        let Some(positions) = positions.as_mut() else {
             return;
         };
         positions.push((jd_no, green_key, pos));
