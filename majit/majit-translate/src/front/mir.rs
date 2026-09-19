@@ -11013,6 +11013,52 @@ impl<'a> Lowering<'a> {
                         false,
                     );
                 }
+                // Host llops spelled as calls: `pyre_*::longlong2float::*`
+                // (`Float2LongLongEntry.specialize_call` /
+                // `LongLong2FloatEntry.specialize_call`) and
+                // `*::lltype::cast_{ptr_to_int,int_to_ptr}`
+                // (`rewrite_op_cast_ptr_to_int`). Exact trailing
+                // segments plus banks; a look-alike module or leaf
+                // stays residual.
+                if args.len() == 1
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                {
+                    let path = fd.item_meta.name_path();
+                    let src = first_arg_ty
+                        .as_ref()
+                        .map(|ty| tyref_to_value_type(ty, self.llbc));
+                    let dst = tyref_to_value_type(&call.dest.ty, self.llbc);
+                    if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            to_float,
+                        );
+                    }
+                    if let Some((op, result_ty)) = host_lltype_cast_llop(&path, src.as_ref(), &dst)
+                    {
+                        if op == "cast_int_to_ptr"
+                            && let Some(orig) = self.cast_ptr_to_int_src.get(&args[0]).cloned()
+                        {
+                            self.local_var[dest_local] = Some(orig);
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                        return self.emit_host_cast_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            op,
+                            result_ty,
+                        );
+                    }
+                }
                 // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.
                 // Truncation toward zero, undefined outside the signed
                 // range — the same contract as the llop.  A saturating
@@ -15449,6 +15495,51 @@ impl<'a> Lowering<'a> {
         let res = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: op.to_string(),
+                operand,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// `lltype.cast_ptr_to_int` / `cast_int_to_ptr` as the unary llop
+    /// `rewrite_op_cast_ptr_to_int` keeps, not a residual call.
+    fn emit_host_cast_llop(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        op: &str,
+        result_ty: ValueType,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let concretetype = if op == "cast_int_to_ptr" {
+            crate::model::ConcreteType::GcRef
+        } else {
+            crate::model::ConcreteType::Signed
+        };
+        let res = self.graph.alloc_value_var_with_type(concretetype);
+        FunctionGraph::set_concretetype_of_inline(
+            &operand,
+            if op == "cast_int_to_ptr" {
+                crate::model::ConcreteType::Signed
+            } else {
+                crate::model::ConcreteType::GcRef
+            },
+        );
+        if op == "cast_ptr_to_int" {
+            self.cast_ptr_to_int_src
+                .insert(res.clone(), operand.clone());
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::UnaryOp {
@@ -27624,6 +27715,59 @@ fn path_ends_with_segments(path: &str, key: &str) -> bool {
     path_eq_ignoring_raw(path, key) || path_has_suffix_ignoring_raw(path, key)
 }
 
+fn value_type_is_int_bank(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Unsigned)
+}
+
+/// `rlib/longlong2float.py` `float2longlong` / `longlong2float`.
+/// Trailing segments are exactly `longlong2float::{float2longlong,longlong2float}`
+/// and the banks are f64↔i64; a look-alike module is not this pair.
+fn host_longlong2float_llop(path: &str, src: Option<&ValueType>, dst: &ValueType) -> Option<bool> {
+    let to_float = if path_ends_with_segments(path, "longlong2float::longlong2float") {
+        true
+    } else if path_ends_with_segments(path, "longlong2float::float2longlong") {
+        false
+    } else {
+        return None;
+    };
+    let src_ok = match src {
+        Some(ValueType::Int | ValueType::Unsigned) if to_float => true,
+        Some(ValueType::Float) if !to_float => true,
+        None => true,
+        _ => false,
+    };
+    let dst_ok = if to_float {
+        matches!(dst, ValueType::Float)
+    } else {
+        value_type_is_int_bank(dst)
+    };
+    (src_ok && dst_ok).then_some(to_float)
+}
+
+/// `lltype.cast_ptr_to_int` / `cast_int_to_ptr`. Trailing segments are
+/// exactly `lltype::{cast_ptr_to_int,cast_int_to_ptr}` and the banks are
+/// Ref↔Int; a bare leaf or a look-alike module stays a call.
+fn host_lltype_cast_llop(
+    path: &str,
+    src: Option<&ValueType>,
+    dst: &ValueType,
+) -> Option<(&'static str, ValueType)> {
+    if path_ends_with_segments(path, "lltype::cast_ptr_to_int") {
+        let src_ok = matches!(src, Some(ValueType::Ref(_)) | None);
+        return (src_ok && value_type_is_int_bank(dst))
+            .then_some(("cast_ptr_to_int", ValueType::Int));
+    }
+    if path_ends_with_segments(path, "lltype::cast_int_to_ptr") {
+        let src_ok = match src {
+            Some(ty) => value_type_is_int_bank(ty),
+            None => true,
+        };
+        return (src_ok && matches!(dst, ValueType::Ref(_)))
+            .then_some(("cast_int_to_ptr", dst.clone()));
+    }
+    None
+}
+
 /// Whether an impl-owned global is exactly
 /// `PyreClassPyTypeOf::PYTYPE`.
 ///
@@ -37449,6 +37593,116 @@ mod tests {
                     if op == "convert_float_bytes_to_longlong" && *result_ty == ValueType::Int
             )),
             "transmute::<f64, i64> must become convert_float_bytes_to_longlong; ops={ops:?}"
+        );
+    }
+
+    fn assert_unary_llop(ops: &[&SpaceOperation], name: &str, result_ty: ValueType) {
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty: ty, .. } if op == name && *ty == result_ty
+            )),
+            "{name} llop missing; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "{name} must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn pyre_longlong2float_float2longlong_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "pyre_float2longlong",
+            &["pyre_object", "longlong2float", "float2longlong"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "pyre_float2longlong")
+            .expect("lower pyre_object::longlong2float::float2longlong");
+        assert_unary_llop(
+            &graph_ops(&graph),
+            "convert_float_bytes_to_longlong",
+            ValueType::Int,
+        );
+    }
+
+    #[test]
+    fn pyre_longlong2float_longlong2float_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "pyre_longlong2float",
+            &["pyre_interpreter", "longlong2float", "longlong2float"],
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+        );
+        let graph = super::lower_function(&llbc, "pyre_longlong2float")
+            .expect("lower pyre_interpreter::longlong2float::longlong2float");
+        assert_unary_llop(
+            &graph_ops(&graph),
+            "convert_longlong_bytes_to_float",
+            ValueType::Float,
+        );
+    }
+
+    #[test]
+    fn pyre_lltype_cast_ptr_to_int_projects_to_llop() {
+        let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
+        let llbc = scalar_method_call_fixture(
+            "pyre_cast_ptr_to_int",
+            &["pyre_object", "lltype", "cast_ptr_to_int"],
+            ptr_ty,
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "pyre_cast_ptr_to_int")
+            .expect("lower pyre_object::lltype::cast_ptr_to_int");
+        assert_unary_llop(&graph_ops(&graph), "cast_ptr_to_int", ValueType::Int);
+    }
+
+    #[test]
+    fn pyre_lltype_cast_int_to_ptr_projects_to_llop() {
+        let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
+        let llbc = scalar_method_call_fixture(
+            "pyre_cast_int_to_ptr",
+            &["pyre_object", "lltype", "cast_int_to_ptr"],
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "pyre_cast_int_to_ptr")
+            .expect("lower pyre_object::lltype::cast_int_to_ptr");
+        assert_unary_llop(&graph_ops(&graph), "cast_int_to_ptr", ValueType::Ref(None));
+    }
+
+    #[test]
+    fn lookalike_float2longlong_path_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "lookalike_float2longlong",
+            &["pyre_object", "my_longlong2float", "float2longlong"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "lookalike_float2longlong")
+            .expect("lower look-alike float2longlong path");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. }
+                    if op == "convert_float_bytes_to_longlong"
+                        || op == "convert_longlong_bytes_to_float"
+                        || op == "cast_ptr_to_int"
+                        || op == "cast_int_to_ptr"
+            )),
+            "substring look-alike must not become a host llop; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "float2longlong")
+            )),
+            "look-alike path must stay a residual call; ops={ops:?}"
         );
     }
 

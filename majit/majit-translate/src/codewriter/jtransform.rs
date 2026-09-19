@@ -5015,20 +5015,71 @@ impl<'a> Transformer<'a> {
             if is_lltype_cast_path(segments, "cast_opaque_ptr") && args.len() == 1 {
                 return RewriteResult::Identity(args[0].clone());
             }
-            if is_lltype_cast_path(segments, "cast_ptr_to_int") && args.len() == 1 {
+            if is_lltype_cast_path(segments, "cast_ptr_to_int")
+                && args.len() == 1
+                && matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+            {
+                let src = resolve_alias(&args[0], &self.aliases);
                 if let Some(res) = op.result.clone() {
-                    let src = resolve_alias(&args[0], &self.aliases);
-                    self.cast_ptr_to_int_src.insert(res, src);
+                    self.cast_ptr_to_int_src.insert(res, src.clone());
                 }
-                // `rewrite_op_cast_ptr_to_int` keeps a GC pointer cast;
-                // fall through so the existing Call residual path still
-                // emits it.
+                // `rewrite_op_cast_ptr_to_int` keeps a GC pointer cast as
+                // `cast_ptr_to_int/r>i`. A non-Ref operand is the implicit
+                // None rewrite (alias).
+                if self.get_value_kind_var(&src) == 'r' {
+                    self.stamp_value_kind_from_value_type(
+                        graph,
+                        op.result.clone(),
+                        &ValueType::Int,
+                    );
+                    return rewrite_as_unary_llop(op, &args[0], "cast_ptr_to_int", ValueType::Int);
+                }
+                return RewriteResult::Identity(src);
             }
-            if is_lltype_cast_path(segments, "cast_int_to_ptr") && args.len() == 1 {
+            if is_lltype_cast_path(segments, "cast_int_to_ptr")
+                && args.len() == 1
+                && matches!(result_ty, ValueType::Ref(_))
+            {
                 let arg = resolve_alias(&args[0], &self.aliases);
                 if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
                     return RewriteResult::Identity(src);
                 }
+                if self.get_value_kind_var(&arg) == 'i' {
+                    self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
+                    return rewrite_as_unary_llop(
+                        op,
+                        &args[0],
+                        "cast_int_to_ptr",
+                        result_ty.clone(),
+                    );
+                }
+                return RewriteResult::Identity(arg);
+            }
+            if args.len() == 1
+                && path_segments_end_with(segments, &["longlong2float", "float2longlong"])
+                && matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+                && self.get_value_kind_var(&args[0]) == 'f'
+            {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+                return rewrite_as_unary_llop(
+                    op,
+                    &args[0],
+                    "convert_float_bytes_to_longlong",
+                    ValueType::Int,
+                );
+            }
+            if args.len() == 1
+                && path_segments_end_with(segments, &["longlong2float", "longlong2float"])
+                && matches!(result_ty, ValueType::Float)
+                && self.get_value_kind_var(&args[0]) == 'i'
+            {
+                self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Float);
+                return rewrite_as_unary_llop(
+                    op,
+                    &args[0],
+                    "convert_longlong_bytes_to_float",
+                    ValueType::Float,
+                );
             }
         }
         // RPython `IntegerRepr.rtype_float` (`rint.py`) converts an
@@ -9936,15 +9987,41 @@ fn remap_op(
     }
 }
 
-/// `rpython.rtyper.lltypesystem.lltype.cast_*` — the host-callable path
-/// `front::mir::cast_call_segments` emits for a bank-crossing cast.
+/// Trailing `::` segments of a `FunctionPath`, compared as a path rather
+/// than a substring.
+fn path_segments_end_with(segments: &[String], tail: &[&str]) -> bool {
+    segments.len() >= tail.len()
+        && segments[segments.len() - tail.len()..]
+            .iter()
+            .zip(tail)
+            .all(|(s, t)| s.as_str() == *t)
+}
+
+/// `lltype.cast_*` — the host-callable path `front::mir::cast_call_segments`
+/// emits, and the `pyre_*::lltype::cast_*` spelling of the same helpers.
+/// A user function named `cast_int_to_ptr` is an ordinary call
+/// (`pointer_cast_function_names_do_not_alias`).
 fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
-    segments.len() == 5
-        && segments[0] == "rpython"
-        && segments[1] == "rtyper"
-        && segments[2] == "lltypesystem"
-        && segments[3] == "lltype"
-        && segments[4] == name
+    path_segments_end_with(segments, &["lltype", name])
+}
+
+/// Project a 1-arg host call to the unary llop the rtyper would have
+/// emitted (`Float2LongLongEntry.specialize_call`,
+/// `rewrite_op_cast_ptr_to_int`).
+fn rewrite_as_unary_llop(
+    op: &SpaceOperation,
+    operand: &crate::flowspace::model::Variable,
+    llop: &str,
+    result_ty: ValueType,
+) -> RewriteResult {
+    RewriteResult::Replace(vec![SpaceOperation {
+        result: op.result.clone(),
+        kind: OpKind::UnaryOp {
+            op: llop.into(),
+            operand: operand.clone(),
+            result_ty,
+        },
+    }])
 }
 
 /// Rewrite `we_are_jitted()` calls to the `_we_are_jitted` symbolic
@@ -13984,6 +14061,33 @@ mod tests {
         }
     }
 
+    fn assert_projected_unary(
+        rewritten: &RewriteResult,
+        arg: &crate::flowspace::model::Variable,
+        name: &str,
+        result_ty: ValueType,
+    ) {
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    ops.iter().any(|op| matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, operand, result_ty: ty }
+                            if op == name && operand == arg && *ty == result_ty
+                    )),
+                    "{name} llop missing; ops={ops:?}"
+                );
+                assert!(
+                    !ops.iter()
+                        .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+                    "{name} must not residualize; ops={ops:?}"
+                );
+            }
+            RewriteResult::Keep => panic!("{name} must rewrite, got Keep"),
+            RewriteResult::Identity(_) => panic!("{name} must rewrite, got Identity"),
+        }
+    }
+
     #[test]
     fn f32_to_bits_is_not_projected() {
         let (rewritten, _) = rewrite_direct_call(
@@ -14018,6 +14122,80 @@ mod tests {
             ValueType::Int128,
         );
         assert_not_projected_to(&rewritten, "cast_float_to_int");
+    }
+
+    #[test]
+    fn host_float2longlong_projects_to_convert_float_bytes() {
+        let (rewritten, arg) = rewrite_direct_call(
+            CallTarget::function_path(["longlong2float", "float2longlong"]),
+            ValueType::Float,
+            ConcreteType::Float,
+            ValueType::Int,
+        );
+        assert_projected_unary(
+            &rewritten,
+            &arg,
+            "convert_float_bytes_to_longlong",
+            ValueType::Int,
+        );
+    }
+
+    #[test]
+    fn pyre_longlong2float_projects_to_convert_longlong_bytes() {
+        let (rewritten, arg) = rewrite_direct_call(
+            CallTarget::function_path(["pyre_object", "longlong2float", "longlong2float"]),
+            ValueType::Int,
+            ConcreteType::Signed,
+            ValueType::Float,
+        );
+        assert_projected_unary(
+            &rewritten,
+            &arg,
+            "convert_longlong_bytes_to_float",
+            ValueType::Float,
+        );
+    }
+
+    #[test]
+    fn lltype_cast_ptr_to_int_call_projects_to_llop() {
+        let (rewritten, arg) = rewrite_direct_call(
+            CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_ptr_to_int",
+            ]),
+            ValueType::Ref(None),
+            ConcreteType::GcRef,
+            ValueType::Int,
+        );
+        assert_projected_unary(&rewritten, &arg, "cast_ptr_to_int", ValueType::Int);
+    }
+
+    #[test]
+    fn pyre_lltype_cast_int_to_ptr_call_projects_to_llop() {
+        let (rewritten, arg) = rewrite_direct_call(
+            CallTarget::function_path(["pyre_object", "lltype", "cast_int_to_ptr"]),
+            ValueType::Int,
+            ConcreteType::Signed,
+            ValueType::Ref(None),
+        );
+        assert_projected_unary(&rewritten, &arg, "cast_int_to_ptr", ValueType::Ref(None));
+    }
+
+    #[test]
+    fn lookalike_float2longlong_path_is_not_projected() {
+        let (rewritten, _) = rewrite_direct_call(
+            CallTarget::function_path(["pyre_object", "my_longlong2float", "float2longlong"]),
+            ValueType::Float,
+            ConcreteType::Float,
+            ValueType::Int,
+        );
+        assert_not_projected_to(&rewritten, "convert_float_bytes_to_longlong");
+        assert_not_projected_to(&rewritten, "convert_longlong_bytes_to_float");
+        assert_not_projected_to(&rewritten, "cast_ptr_to_int");
+        assert_not_projected_to(&rewritten, "cast_int_to_ptr");
     }
 
     #[test]

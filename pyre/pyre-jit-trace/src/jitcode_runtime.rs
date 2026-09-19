@@ -3739,6 +3739,10 @@ mod tests {
     /// resume through such an arm dispatches them instead of panicking
     /// `unwired opcode`.
     ///
+    /// `cast_int_to_ptr/i>r` left with them: `rewrite_op_cast_int_to_ptr`
+    /// keeps the unary llop, so assembled JitCodes carry the key and the
+    /// production overlay registers it next to `cast_ptr_to_int/r>i`.
+    ///
     /// The three `getinteriorfield_gc_*` loads left without the emitted set
     /// growing: they are registered pre-emptively, not in response to an
     /// observed panic naming one of them.  Their
@@ -3767,7 +3771,6 @@ mod tests {
         let expected = [
             "abort/>r",
             "assert_not_none/r",
-            "cast_int_to_ptr/i>r",
             "check_neg_index/rid>i",
             "gc_load_indexed_f/riiii>f",
             "gc_load_indexed_i/riiii>i",
