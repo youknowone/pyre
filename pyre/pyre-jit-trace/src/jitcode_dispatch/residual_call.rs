@@ -3842,15 +3842,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     //
     // In RPython the tracing metainterp and the executing (blackhole /
     // compiled) interpreter are SEPARATE objects, so `do_residual_call`
-    // never perturbs the tracer's `MetaInterp.vable_ptr` /
-    // `virtualizable_boxes`.  Pyre shares one `TraceCtx` across the walk
-    // and any re-entrant JIT activity the concrete call triggers: a
-    // self-recursive `CALL_ASSEMBLER` callee that re-enters compiled code
-    // and deopts runs `set_vable_ptr` for the nested frames, leaving
-    // `virtualizable_heap_ptr` pointing at a nested callee frame whose
-    // `vable_token` is still the live JIT FORCE_TOKEN.  The next
-    // `tracing_before_residual_call` in this same walk would then assert on
-    // the non-NONE token (virtualizable.rs).  Snapshot the standard
+    // never perturbs the tracer's virtualizable boxes. Pyre shares one
+    // `TraceCtx` across the walk and any re-entrant JIT activity the
+    // concrete call triggers. `set_vable_ptr` no longer retargets an
+    // active ctx (`virtualizable.py write_boxes` stays on the frame the
+    // boxes name), but a nested `initialize_virtualizable` or bridge
+    // start on this same ctx still would. Snapshot the standard
     // virtualizable pointer and restore it after the call so the walk's
     // subsequent vable token protocol / field reads see the frame being
     // traced, mirroring RPython's separate-state isolation.
