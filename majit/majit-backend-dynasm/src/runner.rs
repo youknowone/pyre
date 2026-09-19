@@ -1086,7 +1086,13 @@ fn dynasm_id_or_identityhash(addr: usize) -> usize {
     if let Some(r) = gc_box::with_mut_or_busy(addr, |gc| gc.id_or_identityhash(addr)) {
         return r;
     }
-    majit_gc::gc_sync::gc_op(|g| g.id_or_identityhash(addr))
+    // minimark.py `id_or_identityhash`: only a nursery object moves to a
+    // shadow. With no collector on this thread and no process singleton,
+    // there is no nursery the object could be in, so the identity is `addr`.
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|g| g.id_or_identityhash(addr));
+    }
+    addr
 }
 
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side
@@ -4202,6 +4208,21 @@ impl Backend for DynasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_or_identityhash_without_collector_returns_addr() {
+        std::thread::spawn(|| {
+            assert!(!gc_box::present());
+            let marker = 0usize;
+            let addr = &marker as *const usize as usize;
+            let got = dynasm_id_or_identityhash(addr);
+            if !majit_gc::gc_sync::is_initialized() {
+                assert_eq!(got, addr);
+            }
+        })
+        .join()
+        .expect("id_or_identityhash must not panic without a collector");
+    }
 
     #[test]
     fn reference_value_read_does_not_become_a_substructure_address() {
