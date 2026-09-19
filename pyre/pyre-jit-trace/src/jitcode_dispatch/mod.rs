@@ -635,6 +635,20 @@ impl LiveFrameRegs {
 /// Per-trace-attempt walk session, owned by the walk driver and threaded
 /// through [`WalkContext`] — `MetaInterp.framestack` (`pyjitpl.py`,
 /// `:2487`; depth scan `:1390`). Innermost level last.
+/// Carrier-boundary raise (`finishframe_exception` at the bridge carrier).
+///
+/// Set on the drain session and copied onto the root walk's new session
+/// before [`dispatch_via_miframe`] runs. Lives on [`WalkSession`] rather
+/// than TLS because a residual executed while tracing may start another
+/// walk on the same OS thread — the same reason
+/// [`WalkSession::open_inline_activations`] is per session.
+#[derive(Clone, Copy)]
+pub(crate) struct CarrierRaiseSeed {
+    pub exc: OpRef,
+    pub exc_concrete: crate::state::ConcreteValue,
+    pub catch_target: Option<usize>,
+}
+
 pub struct WalkSession {
     /// Live frame owners waiting to apply `MetaInterp.replace_box` to their
     /// borrowed register banks. Resume snapshots are updated synchronously.
@@ -697,6 +711,10 @@ pub struct WalkSession {
     /// an adapter caller seeded only the symbolic OpRef without a concrete
     /// (e.g. a synthetic test fixture).
     pub last_exc_value_concrete: ConcreteValue,
+    /// Handoff from the carrier drain into the root walk that
+    /// [`dispatch_via_miframe`] consumes once. `None` on every walk that
+    /// is not that root `finishframe_exception` continuation.
+    pub(crate) carrier_raise_seed: Option<CarrierRaiseSeed>,
     /// Blackhole `tmpreg_r`/`tmpreg_i`/`tmpreg_f` (`blackhole.py`):
     /// the single-slot scratch that `insert_renamings` (`flatten.py`)
     /// routes a cyclic parallel move through via `*_push`/`*_pop` pairs.
@@ -784,6 +802,7 @@ impl Default for WalkSession {
             abort_in_subwalk: false,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
+            carrier_raise_seed: None,
             tmpreg_r: OpRef::NONE,
             tmpreg_r_concrete: ConcreteValue::Null,
             tmpreg_i: OpRef::NONE,
@@ -3444,39 +3463,6 @@ pub fn census_report() -> String {
         .iter()
         .map(|(name, count)| format!("[fbw-census] {name}: {count}\n"))
         .collect()
-}
-
-/// Carrier-boundary raise seed (`finishframe_exception` at the bridge carrier):
-/// set by [`crate::trace::drive_bridge_carrier_walk`] when an inlined callee's
-/// sub-walk ended in `SubRaise` and no paused middle caught it.
-/// [`crate::jitcode_dispatch::dispatch_via_miframe`] reads it once when it sets
-/// up the root walk.  With `catch_target` set the root frame's `except` handler
-/// covers the CALL and the walk enters at that handler with the caught
-/// exception seeded — the same handler-entry reconstruction the walk-level
-/// SubRaise routing performs, but at the carrier boundary the sub-walk crossed
-/// on its own.  `None` means the root frame has no covering handler: the
-/// framestack this trace models is exhausted, so the walk ends immediately with
-/// `compile_exit_frame_with_exception` and the interpreter unwinds the
-/// remaining Python frames.  A middle that catches is entered at its handler
-/// by the carrier walk itself (`ChangeFrame`) and never writes this seed.
-#[derive(Clone, Copy)]
-pub(crate) struct CarrierRaiseSeed {
-    pub exc: OpRef,
-    pub exc_concrete: crate::state::ConcreteValue,
-    pub catch_target: Option<usize>,
-}
-
-thread_local! {
-    static FBW_CARRIER_RAISE_SEED: std::cell::Cell<Option<CarrierRaiseSeed>> =
-        const { std::cell::Cell::new(None) };
-}
-
-pub(crate) fn set_carrier_raise_seed(seed: CarrierRaiseSeed) {
-    FBW_CARRIER_RAISE_SEED.with(|c| c.set(Some(seed)));
-}
-
-pub(crate) fn take_carrier_raise_seed() -> Option<CarrierRaiseSeed> {
-    FBW_CARRIER_RAISE_SEED.with(|c| c.take())
 }
 
 thread_local! {
@@ -6807,6 +6793,13 @@ unsafe fn walk_session_roots(data: *const (), visitor: &mut dyn FnMut(&mut majit
     if let ConcreteValue::Ref(value) = &mut session.last_exc_value_concrete {
         walk_ptr(value, visitor);
         unsafe { pyre_interpreter::eval::walk_raw_exception_roots(*value, visitor) };
+    }
+    if let Some(seed) = session.carrier_raise_seed.as_mut() {
+        seed.exc.walk_const_ptr_refs_mut(visitor);
+        if let ConcreteValue::Ref(value) = &mut seed.exc_concrete {
+            walk_ptr(value, visitor);
+            unsafe { pyre_interpreter::eval::walk_raw_exception_roots(*value, visitor) };
+        }
     }
     session.tmpreg_r.walk_const_ptr_refs_mut(visitor);
     if let ConcreteValue::Ref(value) = &mut session.tmpreg_r_concrete {

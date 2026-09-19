@@ -2254,7 +2254,7 @@ impl GcCache {
                     virtualizable,
                     // The completed parent list can shift the positional
                     // slot after the first mint (`args_w` 1 → 2).  Offset
-                    // still names the same field; descr.py:220-221 returns
+                    // still names the same field; `get_field_descr` returns
                     // the cached descr.  Virtualize looks the slot up on
                     // the parent list, not this mint number.
                     descr.index_in_parent,

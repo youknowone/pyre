@@ -16,6 +16,36 @@
 pub mod codegen;
 pub mod failguard;
 
+/// The wasm host compiles and resumes on the thread that ran the
+/// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
+/// harness is N threads against one process-global cpu
+/// (`FAIL_DESCR_REGISTRY`, ExtraHeap, `cpu.gc_ll_descr`). PyPy never
+/// interleaves those. Cargo.toml has no per-package `test-threads`;
+/// `#[serial]` only serializes bodies (TLS teardown still races).
+/// This constructor runs before libtest's `main` reads
+/// `RUST_TEST_THREADS`, so this crate's test binary is one thread
+/// without the caller passing `--test-threads`. Other crates stay
+/// parallel (`cargo test --all` is one process per crate).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod serial_cpu_tests {
+    extern "C" fn set_one_test_thread() {
+        // SAFETY: constructor runs before `main`, single-threaded.
+        // libtest reads `RUST_TEST_THREADS` in `main`.
+        unsafe { std::env::set_var("RUST_TEST_THREADS", "1") };
+    }
+
+    #[used]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "ios"),
+        unsafe(link_section = "__DATA,__mod_init_func")
+    )]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+        unsafe(link_section = ".init_array")
+    )]
+    static SET_ONE_TEST_THREAD: extern "C" fn() = set_one_test_thread;
+}
+
 #[cfg(target_arch = "wasm32")]
 mod glue;
 
@@ -1096,8 +1126,24 @@ pub fn jit_threadlocalref_set(offset: i64, value: i64) {
 /// dependency, so the box is eliminated by the optimizer rather than by
 /// conditional compilation. Mirrors `majit-backend-dynasm/src/runner.rs`'s
 /// `gc_box`.
-mod gc_box {
-    use super::{GcAllocator, RefCell};
+pub(crate) mod gc_box {
+    use super::{GcAllocator, Ordering, RefCell};
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_GC_BOX_GEN: AtomicU64 = AtomicU64::new(1);
+
+    /// TLS payload whose destructor forgets the MiniMark.
+    /// Thread teardown must not free the nursery
+    /// (`replace_singleton_leaking_old`).
+    struct LeakingNursery(Option<Box<dyn GcAllocator>>);
+
+    impl Drop for LeakingNursery {
+        fn drop(&mut self) {
+            if let Some(gc) = self.0.take() {
+                std::mem::forget(gc);
+            }
+        }
+    }
 
     thread_local! {
         /// llmodel.py self.gc_ll_descr — owned by the active wasm backend on
@@ -1105,14 +1151,18 @@ mod gc_box {
         /// `majit_gc::ActiveGcGuardHooks` shims can reach the live allocator
         /// without taking a wasm dependency. RPython's `cpu.gc_ll_descr`
         /// parity, single-slot per thread.
-        static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
-            const { RefCell::new(None) };
+        static WASM_ACTIVE_GC: RefCell<LeakingNursery> =
+            const { RefCell::new(LeakingNursery(None)) };
         /// Read-only mirror of the box address: the interpreter-safepoint major
         /// holds the mutable borrow while extra-root walkers ask whether a slot
         /// is GC-managed, so that query routes through the raw pointer instead
         /// of taking a second borrow.
         static WASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn GcAllocator>> =
             const { std::cell::Cell::new(None) };
+        /// Installation id of the live box. An [`ActiveGcBox`] only
+        /// uninstalls when this still matches, so dropping an older
+        /// backend cannot clear a newer one on the same thread.
+        static WASM_ACTIVE_GC_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
     /// `&mut` access to this thread's GC box, for allocation, write barriers
@@ -1124,7 +1174,7 @@ mod gc_box {
         }
         WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
-            let raw: *mut dyn GcAllocator = guard.as_deref_mut()?;
+            let raw: *mut dyn GcAllocator = guard.0.as_deref_mut()?;
             // SAFETY: `guard` holds the borrow for the whole `f` call and
             // these are non-reentrant top-level trampolines, so the reborrow
             // is exclusive and outlives `f`.
@@ -1140,7 +1190,7 @@ mod gc_box {
             return None;
         }
         WASM_ACTIVE_GC.with(|cell| match cell.try_borrow() {
-            Ok(guard) => guard.as_deref().map(f),
+            Ok(guard) => guard.0.as_deref().map(f),
             // SAFETY: the mirror is published and cleared under the same
             // borrow as the box itself, so a non-null value points at the
             // live allocator, and this query only reads it.
@@ -1150,17 +1200,51 @@ mod gc_box {
 
     /// Whether this thread holds a box at all.
     pub(super) fn present() -> bool {
-        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().is_some())
+        majit_gc::gc_box_installed() && WASM_ACTIVE_GC.with(|cell| cell.borrow().0.is_some())
     }
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
-    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) {
+    /// Returns the installation id the matching [`ActiveGcBox`] must present
+    /// to uninstall. A previous box is forgotten, not dropped
+    /// (`replace_singleton_leaking_old`).
+    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> u64 {
+        let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
         WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
-            *guard = Some(gc);
-            let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
+            if let Some(old) = guard.0.take() {
+                std::mem::forget(old);
+            }
+            guard.0 = Some(gc);
+            let raw = guard.0.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
+            WASM_ACTIVE_GC_GEN.with(|slot| slot.set(generation));
         });
+        generation
+    }
+
+    /// Uninstall this thread's box without freeing its nursery.
+    ///
+    /// The raw mirror is cleared first so a reentrant query during
+    /// uninstall does not observe a dangling pointer. The MiniMark
+    /// itself is leaked: `gc_sync::replace_singleton_leaking_old`
+    /// — a dropped nursery's pages return to the OS and ExtraHeap /
+    /// InputArg slabs reuse them, smashing their mutex words.
+    pub(crate) fn clear() {
+        WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
+        WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+        WASM_ACTIVE_GC.with(|cell| {
+            if let Some(gc) = cell.borrow_mut().0.take() {
+                std::mem::forget(gc);
+            }
+        });
+    }
+
+    /// [`clear`] only when `generation` is still the live installation.
+    pub(crate) fn clear_if_generation(generation: u64) {
+        let live = WASM_ACTIVE_GC_GEN.with(|slot| slot.get());
+        if live == generation && generation != 0 {
+            clear();
+        }
     }
 }
 
@@ -1264,6 +1348,19 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     );
 }
 
+/// Owns the TLS GC box installed by [`install_gc_box`]. Dropping it
+/// uninstalls the box on this thread (`llmodel.py` `cpu.gc_ll_descr`
+/// dies with the cpu) only if this guard still owns the slot.
+pub(crate) struct ActiveGcBox {
+    generation: u64,
+}
+
+impl Drop for ActiveGcBox {
+    fn drop(&mut self) {
+        gc_box::clear_if_generation(self.generation);
+    }
+}
+
 /// Store a GC allocator in the wasm backend thread-local and register
 /// the `majit_gc::set_active_*` function-pointer hooks, without
 /// requiring a `WasmBackend` instance.
@@ -1272,14 +1369,15 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
 /// the backend thread. Production uses [`install_gc_standalone`], which
 /// registers the same hooks WITHOUT a box so the trampolines fall through
 /// to `gc_sync`.
-fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
+fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    gc_box::store(gc);
+    let generation = gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
+    ActiveGcBox { generation }
 }
 
 /// Production path: register all `set_active_*` hooks WITHOUT storing a
@@ -2243,6 +2341,10 @@ pub struct WasmBackend {
     constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
+    /// Test-path `gc_ll_descr`. Dropping the backend uninstalls the TLS
+    /// box so a cargo worker thread does not run MiniMark `Drop` at
+    /// pthread TLS teardown.
+    gc_box: Option<ActiveGcBox>,
 }
 
 /// GC type id of the `JitFrame`. The single registration authority is `eval.rs`
@@ -2502,6 +2604,16 @@ static NEXT_PENDING_INLINE_ID: AtomicI64 = AtomicI64::new(1);
 
 fn with_pending_inlines<R>(f: impl FnOnce(&IndexMap<i64, PendingInline>) -> R) -> R {
     PENDING_INLINES.with(|pending| f(&pending.borrow()))
+}
+
+/// Drop this thread's deferred-inline Op graphs before the cpu lock
+/// is released. The graph holds `OpRc` / ExtraHeap slots; a worker
+/// TLS dtor freeing them after the next test has started is what
+/// smashed ExtraHeap's process mutex.
+#[cfg(test)]
+pub(crate) fn clear_pending_inlines_for_tests() {
+    PENDING_INLINES.with(|pending| pending.borrow_mut().clear());
+    TRIPPED_INLINES.with(|tripped| tripped.borrow_mut().clear());
 }
 
 fn with_pending_inlines_mut<R>(f: impl FnOnce(&mut IndexMap<i64, PendingInline>) -> R) -> R {
@@ -2911,6 +3023,7 @@ impl WasmBackend {
             next_header_pc: 0,
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
+            gc_box: None,
         }
     }
 
@@ -2931,7 +3044,11 @@ impl WasmBackend {
     /// wasm dependency.
     pub fn set_gc_allocator(&mut self, mut gc: Box<dyn majit_gc::GcAllocator>) {
         gc.freeze_types();
-        install_gc_box(gc);
+        // Drop the previous `ActiveGcBox` first. Assignment would install
+        // the replacement and then run the old guard's `Drop`, which
+        // `gc_box::clear`s the just-installed allocator.
+        drop(self.gc_box.take());
+        self.gc_box = Some(install_gc_box(gc));
     }
 
     /// No-op: present for API parity with the dynasm backend so
@@ -3881,6 +3998,9 @@ impl WasmBackend {
     }
 }
 
+// `Backend: Send` (`model.py` AbstractCPU is stored on MetaInterp).
+// The TLS box is not in this struct; its destructor forgets the MiniMark
+// so a thread hop cannot free the nursery on TLS teardown.
 unsafe impl Send for WasmBackend {}
 
 /// Stamp a position onto every non-Void-result op left unpositioned by the
@@ -6636,6 +6756,7 @@ mod tests {
 
     #[test]
     fn home_gcmap_marks_used_homes_and_label_captures_only() {
+        let _compile_guard = failguard::lock_cpu();
         let sign = std::mem::size_of::<isize>();
         let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
         let map = codegen::build_home_gcmap(frame, 5, 2);
@@ -6658,6 +6779,7 @@ mod tests {
 
     #[test]
     fn union_gcmap_covers_incomparable_ordinary_and_label_maps() {
+        let _compile_guard = failguard::lock_cpu();
         let frame = codegen::FrameGeometry::compact(16, 128 + 2, 2);
         let owner = codegen::build_home_gcmap(frame, 8, 0);
         let bridge = codegen::build_home_gcmap(frame, 3, 2);
@@ -6684,6 +6806,7 @@ mod tests {
 
     #[test]
     fn union_gcmap_keeps_bits_past_sixty_four_words() {
+        let _compile_guard = failguard::lock_cpu();
         // value_slots=16, 4200 homes: last signed index is past 64 data words
         // on a 64-bit host (`build_home_gcmap` word count).
         let frame = codegen::FrameGeometry::compact(16, 4200, 2);
@@ -6705,6 +6828,7 @@ mod tests {
 
     #[test]
     fn parameter_bridge_dispatch_is_bounded_by_guard_population() {
+        let _compile_guard = failguard::lock_cpu();
         assert!(bridge_param_dispatch_profitable(
             true,
             MAX_BRIDGE_PARAM_GUARDS
@@ -6718,6 +6842,7 @@ mod tests {
 
     #[test]
     fn ca_pop_publishes_the_forwarded_shadow_stack_frame() {
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{FIRST_ITEM_OFFSET, JitFrame, jitframe_type_info};
         use majit_gc::GcAllocator;
 
@@ -6756,6 +6881,7 @@ mod tests {
 
     #[test]
     fn callee_gcmap_marks_homes_not_overwritable_input_slots() {
+        let _compile_guard = failguard::lock_cpu();
         // FRAME_SLOT_BASE is the value/fail-arg area. A static gcmap bit there
         // stays set after a guard spill overwrites the slot with an integer,
         // and `is_nursery_object_start` is only a nursery range check.
@@ -6775,16 +6901,16 @@ mod tests {
 
     #[test]
     fn headerless_helper_rejects_non_positive_size() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let gc = MiniMarkGC::new();
-        install_gc_box(Box::new(gc));
+        let _gc_box = install_gc_box(Box::new(gc));
         assert_eq!(wasm_jit_alloc_headerless(-1), 0);
         assert_eq!(wasm_jit_alloc_headerless(0), 0);
     }
 
     #[test]
     fn ca_alloc_frame_zeros_recycled_nursery_bytes() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{JitFrame, jitframe_type_info};
         use majit_gc::GcAllocator;
 
@@ -6798,7 +6924,7 @@ mod tests {
         gc.collect_nursery();
 
         set_wasm_jitframe_tid(tid);
-        install_gc_box(Box::new(gc));
+        let _gc_box = install_gc_box(Box::new(gc));
         let frame = wasm_jit_ca_alloc_frame(std::mem::size_of::<isize>() as i64, 0);
         assert_ne!(frame, 0);
         unsafe {
@@ -6815,6 +6941,7 @@ mod tests {
 
     #[test]
     fn typed_blackhole_allocation_never_falls_back_to_raw_memory() {
+        let _compile_guard = failguard::lock_cpu();
         // No active wasm GC is installed on this test thread.  A typed descr
         // therefore has no legal allocator and must report NULL to
         // blackhole.py `_get_method`; the previous raw fallback returned a
@@ -6825,6 +6952,7 @@ mod tests {
 
     #[test]
     fn blackhole_varsize_rejects_negative_lengths_without_panicking() {
+        let _compile_guard = failguard::lock_cpu();
         let backend = WasmBackend::new();
         assert_eq!(backend.bh_newstr(-1), 0);
         assert_eq!(backend.bh_newunicode(-1), 0);
@@ -6832,6 +6960,7 @@ mod tests {
 
     #[test]
     fn cross_loop_terminal_jump_uses_target_descr_identity() {
+        let _compile_guard = failguard::lock_cpu();
         let local_descr = majit_ir::make_loop_target_descr(1, false);
         let foreign_descr = majit_ir::make_loop_target_descr(2, false);
         let label = Op::new(majit_ir::OpCode::Label, &[]);
@@ -6847,7 +6976,7 @@ mod tests {
 
     #[test]
     fn straightline_trace_defers_host_module_until_execution() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(1);
         let finish = Op::new(majit_ir::OpCode::Finish, &[]);
@@ -6892,7 +7021,7 @@ mod tests {
 
     #[test]
     fn identical_call_assembler_publication_reuses_the_runtime_snapshot() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let token_number = 9_900_000;
         let compiled_ptr = 1_000_022;
         let _cleanup = DispatchCleanup {
@@ -6948,7 +7077,7 @@ mod tests {
 
     #[test]
     fn mark_gnf2_sets_the_cell_without_a_new_snapshot() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let token_number = 9_900_001;
         let compiled_ptr = 1_000_023;
         let _cleanup = DispatchCleanup {
@@ -6977,7 +7106,7 @@ mod tests {
 
     #[test]
     fn mark_gnf2_raises_redirected_alias_cells() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let old_number = 9_900_030;
         let new_number = 9_900_031;
         let old_ptr = 1_000_024;
@@ -7009,7 +7138,7 @@ mod tests {
 
     #[test]
     fn mark_gnf2_raises_cells_that_retain_a_historical_target() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let alias = 9_900_040;
         let source = 9_900_041;
         let source_ptr = 1_000_026;
@@ -7047,7 +7176,7 @@ mod tests {
 
     #[test]
     fn publish_after_mark_raises_a_new_alias_cell() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let source = 9_900_050;
         let alias = 9_900_051;
         let compiled_ptr = 1_000_028;
@@ -7077,7 +7206,7 @@ mod tests {
 
     #[test]
     fn redirect_call_assembler_grows_tmp_callback_frame_info() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
             let inputargs = vec![InputArg::new_int_rc(0)];
             let mut previous = majit_ir::OpRef::input_arg_int(0);
@@ -7160,7 +7289,7 @@ mod tests {
     /// vtable→type_id mapping.
     #[test]
     fn test_backend_typeid_from_classptr_via_gc_ll_descr() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let mut gc = MiniMarkGC::new();
         let int_tid = gc.register_type(TypeInfo::simple(16));
         let int_vtable: usize = 0x3333_4400;
@@ -7181,7 +7310,7 @@ mod tests {
     /// ConstPtr that is only in `LIVE_GC_TABLES` would stay unforwarded.
     #[test]
     fn compile_loop_remembers_gc_table_for_minor_collection() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -7239,7 +7368,7 @@ mod tests {
     /// side works so the feeders can be built.
     #[test]
     fn jitframe_oldgen_gcmap_minor_forwards_ref_item() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_FRAME_OFS, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
@@ -7310,7 +7439,7 @@ mod tests {
     /// homes and a recycled nursery address is left in a gcmap slot.
     #[test]
     fn oldgen_jitframe_must_be_remembered_before_host_pop() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let _compile_guard = failguard::lock_cpu();
         use majit_backend::jitframe::{
             FIRST_ITEM_OFFSET, JF_GCMAP_OFS, JitFrame, jitframe_type_info,
         };
@@ -7329,7 +7458,7 @@ mod tests {
             *((frame_ptr as *mut u8).add(JF_GCMAP_OFS as usize) as *mut *const u8) =
                 gcmap.as_ptr() as *const u8;
         }
-        install_gc_box(Box::new(gc));
+        let _gc_box = install_gc_box(Box::new(gc));
         let saved = majit_gc::shadow_stack::push_jf(frame);
         remember_and_drop_execution_frame(frame_ptr, saved);
         with_wasm_active_gc_mut(|gc| gc.collect_nursery());

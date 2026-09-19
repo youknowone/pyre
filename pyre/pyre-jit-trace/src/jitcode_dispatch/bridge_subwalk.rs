@@ -440,7 +440,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         // Carrier-boundary raise seed (`finishframe_exception`): a depth-2
         // inlined callee's sub-walk raised and the root frame's handler covers
         // the CALL (set by `drive_bridge_carrier_walk`).  Consumed once here.
-        let carrier_raise_seed = crate::jitcode_dispatch::take_carrier_raise_seed();
+        let carrier_raise_seed = session.borrow_mut().carrier_raise_seed.take();
         // Set by the carrier seed's no-handler arm: the root frame lets the
         // exception through, so the trace ends at bridge entry and the walk is
         // skipped entirely.

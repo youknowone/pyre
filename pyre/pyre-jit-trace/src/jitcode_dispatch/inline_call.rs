@@ -617,8 +617,8 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
 /// frame(s) through the cross-frame exception-unwind bridge (gh#343 / gh#467),
 /// so the depth is bounded rather than unbounded: the call site caps a raising
 /// callee at THREE distinct multiframe levels, not at the top level — see
-/// `fbw_effective_multiframe_depth`.  A third copy of the same `w_code` still
-/// storms `selfrec_tail_exception_unwind` (`guard_failures` 937 → 7408).
+/// `fbw_effective_multiframe_depth`.  A recursive / duplicate raising chain is
+/// bounded by `max_unroll_recursion` alone.
 /// Straight value-returning chains never raise, so they still inline to the
 /// full `fbw_max_multiframe_depth`.
 pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {

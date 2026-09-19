@@ -480,6 +480,24 @@ pub fn malloc_typed_immortal<T: GcType>(value: T) -> *mut T {
     majit_gc::header::alloc_with_gc_header_immortal(value, type_id)
 }
 
+/// [`malloc_typed`] for a box whose reference fields are rewritten by compiled
+/// code: the header carries `GCFLAG_TRACK_YOUNG_PTRS`, so the write barrier
+/// the JIT places ahead of a `SETFIELD_GC` on the box records it for the next
+/// minor collection.
+#[inline]
+pub fn malloc_typed_track_young<T: GcType>(value: T) -> *mut T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        T::SIZE,
+        "GcType::SIZE drift from std::mem::size_of"
+    );
+    let type_id = match T::type_id() {
+        TypeIdCell::UNASSIGNED => 0,
+        id => id,
+    };
+    majit_gc::header::alloc_with_gc_header_track_young(value, type_id)
+}
+
 /// Managed typed allocation.
 ///
 /// `gct_fv_gc_malloc` / `init_gc_object(result, typeid, flags=0)`
