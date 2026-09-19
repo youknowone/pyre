@@ -866,6 +866,14 @@ fn try_commit_midbody_abort_inner(
             ));
         }
     };
+    // The callee frame's nursery locals array and a minor collection inside
+    // the callee can both move the operands the CALL sat on, so they have to
+    // survive as roots rather than as a borrow of the unvisited clone.
+    // Re-reading them from the carrier afterwards would work too, but it can
+    // fail — and a failure here is `AfterRun`, from which no leg is sound
+    // (R8).  Rooting an owned copy cannot fail, which is the point.
+    let mut below_owned: Vec<pyre_object::PyObjectRef> = below.to_vec();
+    let _below_root = ObjectVecRoot::new(&mut below_owned);
     if !crate::state::can_flush_walk_end_state_after_outer_call(
         ctx,
         cf_addr,
@@ -954,7 +962,7 @@ fn try_commit_midbody_abort_inner(
         w_globals,
         ec,
         pyre_object::PY_NULL,
-        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+        pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
     ) {
         Ok(frame) => frame,
         Err(_) => return Err(MidBodyDecline::BeforeRun("callee frame allocation failed")),
@@ -990,11 +998,9 @@ fn try_commit_midbody_abort_inner(
         };
         locals_w_mut!(frame).as_mut_slice()[stack_base + rel] = *value;
     }
-    // The array is old-gen from birth (`FrameLocalsArrayAllocation::OldGenGc`)
-    // and `FrameLocalsRoot` only forwards the field slot, not the items: the
-    // young refs just stored need the remembered set to survive the boxing
-    // allocations below, and each minor consumes the entry, so re-arm after
-    // every batch that follows a possible collection.
+    // `PyFrame.__init__` creates this as a fresh nursery array.  The barrier
+    // helper is harmless for that case and still covers the old-gen spill arm
+    // if a full nursery made `malloc_fast` reserve the block there.
     crate::state::frame_array_write_barrier(
         frame.as_mut_ptr() as *mut u8,
         locals_w_mut!(frame) as *mut _,
@@ -1023,13 +1029,6 @@ fn try_commit_midbody_abort_inner(
     frame.valuestackdepth = stack_base + current.live_stack.len();
     frame.last_instr = words.callee_py_pc as isize - 1;
     let sys_exc_value_pre = unsafe { (*ec).sys_exc_value };
-    // A minor collection inside the callee can move the operands the CALL sat
-    // on, so they have to survive it as roots rather than as a stale borrow.
-    // Re-reading them from the carrier afterwards would work too, but it can
-    // fail — and a failure here is `AfterRun`, from which no leg is sound
-    // (R8).  Rooting an owned copy cannot fail, which is the point.
-    let mut below_owned: Vec<pyre_object::PyObjectRef> = below.to_vec();
-    let _below_root = ObjectVecRoot::new(&mut below_owned);
     // Everything between the preflight above and here — the callee frame
     // allocation, the local writes, the Int/Float boxing — can allocate and
     // therefore collect.  Re-verify immediately before the point of no return
