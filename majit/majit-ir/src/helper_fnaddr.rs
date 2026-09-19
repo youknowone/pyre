@@ -69,6 +69,17 @@ pub fn register(path: &'static str, addr: *const (), arity: u8) {
         .push(HelperFnAddr::new(path, addr, arity));
 }
 
+/// Error a residual trampoline can report out of band.
+///
+/// RPython residual calls return the value and store the exception in
+/// `exc_data`; the codewriter then records `GUARD_NO_EXCEPTION`. A trampoline
+/// for `Result<T, E>` therefore returns `T` (or the zero of that kind) and
+/// calls this on `Err`. The defining crate implements it for its exception
+/// carrier — `majit` does not name that type.
+pub trait ResidualError {
+    fn publish_residual(self);
+}
+
 /// Visit every registered trampoline, whichever population the target carries.
 pub fn for_each_helper_fnaddr(mut visit: impl FnMut(&HelperFnAddr)) {
     #[cfg(not(target_arch = "wasm32"))]

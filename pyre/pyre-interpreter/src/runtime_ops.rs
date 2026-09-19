@@ -262,6 +262,13 @@ pub(crate) fn jit_publish_residual_error(mut error: PyError) -> i64 {
     0
 }
 
+impl majit_ir::helper_fnaddr::ResidualError for PyError {
+    #[inline]
+    fn publish_residual(self) {
+        let _ = jit_publish_residual_error(self);
+    }
+}
+
 /// Widest `jit_call_known_builtin_N` published by [`known_builtin_call_helper`],
 /// plus the leading code slot.
 const MAX_KNOWN_BUILTIN_ARGS: usize = 9;

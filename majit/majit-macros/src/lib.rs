@@ -731,7 +731,14 @@ fn is_reference_type(ty: &Type) -> bool {
     matches!(ty, Type::Reference(reference) if !is_wide_pointee(&reference.elem))
 }
 
+fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
 fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
+    if is_unit_type(ty) {
+        return HelperCallKind::Void;
+    }
     if is_gc_ref_type(ty) || is_raw_pointer_type(ty) || is_reference_type(ty) {
         return HelperCallKind::Ref;
     }
@@ -813,11 +820,92 @@ fn is_fat_pointer_arg(ty: &Type) -> bool {
     }
 }
 
-fn is_result_type(ty: &Type) -> bool {
-    path_type_last_ident(ty).is_some_and(|id| id == "Result")
+fn result_ok_and_err(ty: &Type) -> Option<(&Type, &Type)> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    let last = type_path.path.segments.last()?;
+    if last.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    });
+    Some((types.next()?, types.next()?))
 }
 
-fn trampoline_skip_reason(func: &ItemFn) -> Option<HelperFnAddrSkip> {
+/// Last ident of the exception carrier `tyref_is_result_of_carrier` matches
+/// against `ErrorCarrierSpec.carrier_path` (ends in `PyError`).
+/// `dont_look_inside_return_token` uses that same gate before projecting
+/// `FUNC.RESULT` to the Ok payload. Other `Result` error types stay real
+/// ADTs, so a payload trampoline would disagree.
+fn is_project_error_type(ty: &Type) -> bool {
+    path_type_last_ident(ty).is_some_and(|id| id == "PyError")
+}
+
+fn result_exc_payload(output: &ReturnType) -> Option<&Type> {
+    let ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    let (ok, err) = result_ok_and_err(ty)?;
+    is_project_error_type(err).then_some(ok)
+}
+
+fn payload_is_projectable(ok_ty: &Type) -> bool {
+    match helper_call_kind_for_type(ok_ty) {
+        HelperCallKind::Unsupported => false,
+        HelperCallKind::Void => true,
+        HelperCallKind::Int | HelperCallKind::Ref | HelperCallKind::Float => {
+            helper_return_to_i64(quote! { __probe }, ok_ty).is_some()
+                || helper_call_kind_for_type(ok_ty) == HelperCallKind::Float
+        }
+    }
+}
+
+fn wrap_result_exc_call(
+    inner: proc_macro2::TokenStream,
+    return_kind: HelperCallKind,
+    payload_ty: &Type,
+) -> Option<proc_macro2::TokenStream> {
+    match return_kind {
+        HelperCallKind::Void => Some(quote! {
+            match #inner {
+                ::core::result::Result::Ok(_) => {}
+                ::core::result::Result::Err(__majit_err) => {
+                    ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                }
+            }
+        }),
+        HelperCallKind::Float => Some(quote! {
+            match #inner {
+                ::core::result::Result::Ok(__majit_ok) => __majit_ok,
+                ::core::result::Result::Err(__majit_err) => {
+                    ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                    0.0
+                }
+            }
+        }),
+        HelperCallKind::Int | HelperCallKind::Ref => {
+            let converted = helper_return_to_i64(quote! { __majit_ok }, payload_ty)?;
+            Some(quote! {
+                match #inner {
+                    ::core::result::Result::Ok(__majit_ok) => #converted,
+                    ::core::result::Result::Err(__majit_err) => {
+                        ::majit_ir::helper_fnaddr::ResidualError::publish_residual(__majit_err);
+                        0
+                    }
+                }
+            })
+        }
+        HelperCallKind::Unsupported => None,
+    }
+}
+
+fn trampoline_skip_reason(func: &ItemFn, attr_name: &str) -> Option<HelperFnAddrSkip> {
     if !func.sig.generics.params.is_empty() {
         return Some(HelperFnAddrSkip::Generic);
     }
@@ -828,13 +916,29 @@ fn trampoline_skip_reason(func: &ItemFn) -> Option<HelperFnAddrSkip> {
             return Some(HelperFnAddrSkip::FatPointerArg);
         }
     }
-    if let ReturnType::Type(_, ty) = &func.sig.output {
-        if is_result_type(ty) {
-            return Some(HelperFnAddrSkip::ResultReturn);
+    let result_payload = if let ReturnType::Type(_, ty) = &func.sig.output {
+        if let Some((ok_ty, err_ty)) = result_ok_and_err(ty) {
+            if attr_name == "dont_look_inside_cannot_raise" || !is_project_error_type(err_ty) {
+                return Some(HelperFnAddrSkip::ResultReturn);
+            }
+            if is_fat_pointer_arg(ok_ty) {
+                return Some(HelperFnAddrSkip::Other);
+            }
+            if !payload_is_projectable(ok_ty) {
+                return Some(HelperFnAddrSkip::ResultReturn);
+            }
+            Some(ok_ty)
+        } else {
+            None
         }
-        if is_fat_pointer_arg(ty) {
-            return Some(HelperFnAddrSkip::Other);
-        }
+    } else {
+        None
+    };
+    if let ReturnType::Type(_, ty) = &func.sig.output
+        && result_payload.is_none()
+        && is_fat_pointer_arg(ty)
+    {
+        return Some(HelperFnAddrSkip::Other);
     }
     if func.sig.receiver().is_some() {
         return Some(HelperFnAddrSkip::MethodReceiver);
@@ -846,6 +950,9 @@ fn trampoline_skip_reason(func: &ItemFn) -> Option<HelperFnAddrSkip> {
         if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none() {
             return Some(HelperFnAddrSkip::Other);
         }
+    }
+    if result_payload.is_some() {
+        return None;
     }
     match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Unsupported => Some(HelperFnAddrSkip::Other),
@@ -934,8 +1041,9 @@ fn emit_helper_call_target_fn(
     func: &ItemFn,
     register_fnaddr: bool,
     register_as: Option<&Ident>,
+    attr_name: &str,
 ) -> syn::Result<Option<(Ident, Ident, proc_macro2::TokenStream)>> {
-    if let Some(reason) = trampoline_skip_reason(func) {
+    if let Some(reason) = trampoline_skip_reason(func, attr_name) {
         if register_fnaddr {
             report_helper_fnaddr_skip(&func.sig.ident, reason);
         }
@@ -980,23 +1088,43 @@ fn emit_helper_call_target_fn(
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
     // `unsafe` wrapper there would be an unused-unsafe warning).
-    let call_expr = if func.sig.unsafety.is_some() {
+    let mut call_expr = if func.sig.unsafety.is_some() {
         quote! { unsafe { #helper_name(#(#converted_args),*) } }
     } else {
         quote! { #helper_name(#(#converted_args),*) }
     };
-    let fnaddr_call_expr = if func.sig.unsafety.is_some() {
+    let mut fnaddr_call_expr = if func.sig.unsafety.is_some() {
         quote! { unsafe { #helper_name(#(#fnaddr_args),*) } }
     } else {
         quote! { #helper_name(#(#fnaddr_args),*) }
     };
+    let result_payload = result_exc_payload(&func.sig.output);
+    let return_kind = if let Some(ok_ty) = result_payload {
+        helper_call_kind_for_type(ok_ty)
+    } else {
+        helper_call_kind_for_return(&func.sig.output)
+    };
+    if let Some(ok_ty) = result_payload {
+        let Some(wrapped) = wrap_result_exc_call(call_expr, return_kind, ok_ty) else {
+            return Ok(None);
+        };
+        call_expr = wrapped;
+        let Some(fnaddr_wrapped) = wrap_result_exc_call(fnaddr_call_expr, return_kind, ok_ty)
+        else {
+            return Ok(None);
+        };
+        fnaddr_call_expr = fnaddr_wrapped;
+    }
     let arity = func.sig.inputs.len() as u8;
     let shim_registration = if register_fnaddr && !has_float_arg {
         emit_helper_fnaddr_registration(fnaddr_path_name, &trace_target_name, arity)
     } else {
         quote! {}
     };
-    let return_kind = helper_call_kind_for_return(&func.sig.output);
+    let abi_return_ty = result_payload.or_else(|| match &func.sig.output {
+        ReturnType::Type(_, ty) => Some(ty.as_ref()),
+        ReturnType::Default => None,
+    });
     let wrapper = match return_kind {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
@@ -1007,11 +1135,16 @@ fn emit_helper_call_target_fn(
             }
         },
         HelperCallKind::Int | HelperCallKind::Ref => {
-            let ReturnType::Type(_, ty) = &func.sig.output else {
-                return Ok(None);
-            };
-            let Some(converted_return) = helper_return_to_i64(call_expr.clone(), ty) else {
-                return Ok(None);
+            let converted_return = if result_payload.is_some() {
+                call_expr.clone()
+            } else {
+                let Some(ty) = abi_return_ty else {
+                    return Ok(None);
+                };
+                let Some(converted) = helper_return_to_i64(call_expr.clone(), ty) else {
+                    return Ok(None);
+                };
+                converted
             };
             quote! {
                 #[doc(hidden)]
@@ -1023,7 +1156,7 @@ fn emit_helper_call_target_fn(
             }
         }
         HelperCallKind::Float => {
-            let ReturnType::Type(_, ty) = &func.sig.output else {
+            let Some(ty) = abi_return_ty else {
                 return Ok(None);
             };
             let float_wrapper = quote! {
@@ -1074,11 +1207,16 @@ fn emit_helper_call_target_fn(
                 }
             },
             HelperCallKind::Int | HelperCallKind::Ref => {
-                let ReturnType::Type(_, ty) = &func.sig.output else {
-                    return Ok(None);
-                };
-                let Some(converted_return) = helper_return_to_i64(fnaddr_call_expr, ty) else {
-                    return Ok(None);
+                let converted_return = if result_payload.is_some() {
+                    fnaddr_call_expr
+                } else {
+                    let Some(ty) = abi_return_ty else {
+                        return Ok(None);
+                    };
+                    let Some(converted) = helper_return_to_i64(fnaddr_call_expr, ty) else {
+                        return Ok(None);
+                    };
+                    converted
                 };
                 quote! {
                     #[doc(hidden)]
@@ -1649,7 +1787,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -1771,7 +1909,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -1881,7 +2019,7 @@ fn expand_call_surface_attr(
     let marker = format_ident!("{marker_name}");
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, false, None) {
+        match emit_helper_call_target_fn(&func, false, None, attr_name) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2649,7 +2787,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         ..func.clone()
     };
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name)) {
+        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable") {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2853,7 +2991,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // same word-ABI entry `#[dont_look_inside]` emits. The public name is
     // the dispatch wrapper; the adapter calls that, matching
     // `getfunctionptr` of the decorated function.
-    let call_target_fn = match emit_helper_call_target_fn(&func, false, None) {
+    let call_target_fn = match emit_helper_call_target_fn(&func, false, None, "look_inside_iff") {
         Ok(Some((_, _, tokens))) => Some(tokens),
         Ok(None) => None,
         Err(err) => return err.to_compile_error().into(),
@@ -3026,7 +3164,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // A helper it declines — a generic, or a parameter type the trampoline
     // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
     // path this expansion had before.
-    let native_entry = match emit_helper_call_target_fn(&func, false, None) {
+    let native_entry = match emit_helper_call_target_fn(&func, false, None, "jit_inline") {
         Ok(Some((trace_target, _concrete, wrapper))) => {
             let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
                 Ok(classes) => classes,
@@ -3905,54 +4043,81 @@ mod tests {
         syn::parse_str(src).expect("function parses")
     }
 
+    fn skip(src: &str) -> Option<HelperFnAddrSkip> {
+        trampoline_skip_reason(&parse_fn(src), "dont_look_inside")
+    }
+
     #[test]
     fn trampoline_skip_reason_classifies_each_listed_cause() {
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f<T>(x: T) -> i64 { 0 }")),
+            skip("fn f<T>(x: T) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::Generic)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(s: &str) -> i64 { 0 }")),
+            skip("fn f(s: &str) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(xs: &[u8]) -> i64 { 0 }")),
+            skip("fn f(xs: &[u8]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(p: *const [u8]) -> i64 { 0 }")),
+            skip("fn f(p: *const [u8]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(p: *mut [u8]) -> i64 { 0 }")),
+            skip("fn f(p: *mut [u8]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(p: *const dyn Trait) -> i64 { 0 }")),
+            skip("fn f(p: *const dyn Trait) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f() -> *const [u8] { loop {} }")),
+            skip("fn f() -> *const [u8] { loop {} }"),
             Some(HelperFnAddrSkip::Other)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(x: i64) -> Result<i64, ()> { Ok(x) }")),
+            skip("fn f(x: i64) -> Result<&[u8], PyError> { Ok(&[]) }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(x: i64) -> Result<i64, ()> { Ok(x) }"),
             Some(HelperFnAddrSkip::ResultReturn)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(&self, x: i64) -> i64 { x }")),
+            skip("fn f(x: i64) -> Result<Vec<i64>, PyError> { Ok(Vec::new()) }"),
+            Some(HelperFnAddrSkip::ResultReturn)
+        );
+        assert_eq!(
+            skip("fn f(x: i64) -> Result<i64, RBigIntError> { Ok(x) }"),
+            Some(HelperFnAddrSkip::ResultReturn)
+        );
+        assert_eq!(
+            trampoline_skip_reason(
+                &parse_fn("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }"),
+                "dont_look_inside_cannot_raise",
+            ),
+            Some(HelperFnAddrSkip::ResultReturn)
+        );
+        assert_eq!(
+            skip("fn f(&self, x: i64) -> i64 { x }"),
             Some(HelperFnAddrSkip::MethodReceiver)
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(x: String) -> i64 { 0 }")),
+            skip("fn f(x: String) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::Other)
         );
+        assert_eq!(skip("fn f(x: i64) -> i64 { x }"), None);
+        assert_eq!(skip("fn f(a: f64, b: f64) -> f64 { a }"), None);
+        assert_eq!(skip("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }"), None);
+        assert_eq!(skip("fn f() -> Result<(), PyError> { Ok(()) }"), None);
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(x: i64) -> i64 { x }")),
+            skip("fn f(x: i64) -> Result<bool, crate::PyError> { Ok(true) }"),
             None
         );
         assert_eq!(
-            trampoline_skip_reason(&parse_fn("fn f(a: f64, b: f64) -> f64 { a }")),
+            skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
         );
     }

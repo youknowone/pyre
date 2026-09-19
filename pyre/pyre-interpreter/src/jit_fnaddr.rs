@@ -6453,4 +6453,40 @@ mod tests {
             "(i64, i64) -> f64 trampoline should be auto-registered"
         );
     }
+
+    #[majit_macros::dont_look_inside]
+    fn probe_result_word(flag: i64) -> Result<i64, crate::PyError> {
+        if flag == 0 {
+            Err(crate::PyError::type_error("probe"))
+        } else {
+            Ok(flag + 1)
+        }
+    }
+
+    #[test]
+    fn registered_result_trampoline_publishes_error_out_of_band() {
+        crate::typedef::init_typeobjects();
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let addr = bindings
+            .get("pyre_interpreter::jit_fnaddr::tests::probe_result_word")
+            .copied()
+            .expect("Result<i64, PyError> trampoline should be auto-registered");
+        let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(addr as usize) };
+
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+        assert_eq!(f(4), 5);
+        assert_eq!(
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get()),
+            0,
+            "Ok path must not publish an exception"
+        );
+
+        let err = f(0);
+        assert_eq!(err, 0);
+        assert_ne!(
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get()),
+            0,
+            "Err path must publish through BH_LAST_EXC_VALUE"
+        );
+    }
 }

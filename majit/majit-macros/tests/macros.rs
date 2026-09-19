@@ -1001,6 +1001,7 @@ mod jit_struct {
 
 mod helper_fnaddr_registry {
     use majit_macros::dont_look_inside;
+    use std::cell::Cell;
 
     #[dont_look_inside]
     fn copysign(mag: f64, sign: f64) -> f64 {
@@ -1010,6 +1011,33 @@ mod helper_fnaddr_registry {
     #[dont_look_inside]
     fn hypot_sq(a: i64, b: i64) -> f64 {
         ((a * a + b * b) as f64).sqrt()
+    }
+
+    thread_local! {
+        static PUBLISHED: Cell<i64> = const { Cell::new(0) };
+    }
+
+    struct PyError(i64);
+
+    impl majit_ir::helper_fnaddr::ResidualError for PyError {
+        fn publish_residual(self) {
+            PUBLISHED.with(|cell| cell.set(self.0));
+        }
+    }
+
+    #[dont_look_inside]
+    fn maybe_div(a: i64, b: i64) -> Result<i64, PyError> {
+        if b == 0 { Err(PyError(7)) } else { Ok(a / b) }
+    }
+
+    #[dont_look_inside]
+    fn maybe_flag(ok: i64) -> Result<bool, PyError> {
+        if ok == 0 { Err(PyError(11)) } else { Ok(true) }
+    }
+
+    #[dont_look_inside]
+    fn maybe_unit(ok: i64) -> Result<(), PyError> {
+        if ok == 0 { Err(PyError(13)) } else { Ok(()) }
     }
 
     #[test]
@@ -1033,5 +1061,56 @@ mod helper_fnaddr_registry {
         });
         assert!(found_ff, "(f64, f64) -> f64 trampoline was not registered");
         assert!(found_ii, "(i64, i64) -> f64 trampoline was not registered");
+    }
+
+    #[test]
+    fn registered_result_trampolines_publish_error_out_of_band() {
+        let mut found_div = false;
+        let mut found_flag = false;
+        let mut found_unit = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::maybe_div") {
+                let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                PUBLISHED.with(|cell| cell.set(0));
+                assert_eq!(f(10, 2), 5);
+                assert_eq!(PUBLISHED.with(|cell| cell.get()), 0);
+                assert_eq!(f(10, 0), 0);
+                assert_eq!(PUBLISHED.with(|cell| cell.get()), 7);
+                assert_eq!(desc.arity, 2);
+                found_div = true;
+            }
+            if desc.path.ends_with("::maybe_flag") {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                PUBLISHED.with(|cell| cell.set(0));
+                assert_eq!(f(1), 1);
+                assert_eq!(PUBLISHED.with(|cell| cell.get()), 0);
+                assert_eq!(f(0), 0);
+                assert_eq!(PUBLISHED.with(|cell| cell.get()), 11);
+                assert_eq!(desc.arity, 1);
+                found_flag = true;
+            }
+            if desc.path.ends_with("::maybe_unit") {
+                let f: extern "C" fn(i64) = unsafe { std::mem::transmute(desc.get()) };
+                PUBLISHED.with(|cell| cell.set(0));
+                f(1);
+                assert_eq!(PUBLISHED.with(|cell| cell.get()), 0);
+                f(0);
+                assert_eq!(PUBLISHED.with(|cell| cell.get()), 13);
+                assert_eq!(desc.arity, 1);
+                found_unit = true;
+            }
+        });
+        assert!(
+            found_div,
+            "Result<i64, PyError> trampoline was not registered"
+        );
+        assert!(
+            found_flag,
+            "Result<bool, PyError> trampoline was not registered"
+        );
+        assert!(
+            found_unit,
+            "Result<(), PyError> trampoline was not registered"
+        );
     }
 }
