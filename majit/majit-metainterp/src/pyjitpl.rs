@@ -6697,7 +6697,9 @@ impl<M: Clone> MetaInterp<M> {
             .as_mut()
             .expect("vable op requires active tracing");
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
-        let _clear = ClearReplaceFrames::new(ctx);
+        // SAFETY: the guard is a local of this call and `ctx` is borrowed for
+        // longer, so it is dropped while the `TraceCtx` it names is alive.
+        let _clear = unsafe { ClearReplaceFrames::new(ctx) };
         f(ctx)
     }
 

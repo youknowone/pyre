@@ -1414,18 +1414,23 @@ impl TraceCtx {
     pub fn clear_replace_frames(&mut self) {
         self.replace_frames = None;
     }
-
-    /// [`ClearReplaceFrames`] over `self`.
-    pub fn clear_replace_frames_guard(&mut self) -> impl Drop + use<> {
-        ClearReplaceFrames::new(self)
-    }
 }
 
 /// Clears the replace-frames hook on drop, including unwind.
+///
+/// The hook is installed for the length of one walk, and the walk keeps using
+/// the same `TraceCtx` while it is installed, so the guard cannot hold the
+/// borrow it has to clear through. It holds a raw pointer instead, which is
+/// why constructing it carries a contract rather than a lifetime.
 pub struct ClearReplaceFrames(*mut TraceCtx);
 
 impl ClearReplaceFrames {
-    pub fn new(ctx: &mut TraceCtx) -> Self {
+    /// # Safety
+    /// The guard must be dropped before `ctx` is: bind it to a local of a
+    /// scope that `ctx` outlives (`let _clear = ...` in a body that borrows
+    /// `ctx`), and never move it out of that scope. Dropping it afterwards
+    /// writes the hook slot through a dangling pointer.
+    pub unsafe fn new(ctx: &mut TraceCtx) -> Self {
         Self(ctx)
     }
 }

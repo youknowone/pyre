@@ -152,7 +152,9 @@ pub(super) fn with_replace_frames<Sym: WalkSym, R>(
         ctx.trace_ctx
             .set_replace_frames(Some(walk), &raw mut data as *mut ());
     }
-    let _clear = ctx.trace_ctx.clear_replace_frames_guard();
+    // SAFETY: the guard is a local of this call and `ctx` is borrowed for
+    // longer, so it is dropped while the `TraceCtx` it names is alive.
+    let _clear = unsafe { majit_metainterp::ClearReplaceFrames::new(&mut *ctx.trace_ctx) };
     f(ctx)
 }
 

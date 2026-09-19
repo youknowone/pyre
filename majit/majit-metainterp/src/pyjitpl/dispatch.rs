@@ -3232,7 +3232,9 @@ where
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
-        let _clear = ClearReplaceFrames::new(ctx);
+        // SAFETY: the guard is a local of this call and `ctx` is borrowed for
+        // longer, so it is dropped while the `TraceCtx` it names is alive.
+        let _clear = unsafe { ClearReplaceFrames::new(ctx) };
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local
@@ -3932,7 +3934,9 @@ where
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
-        let _clear = ClearReplaceFrames::new(ctx);
+        // SAFETY: the guard is a local of this call and `ctx` is borrowed for
+        // longer, so it is dropped while the `TraceCtx` it names is alive.
+        let _clear = unsafe { ClearReplaceFrames::new(ctx) };
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {
