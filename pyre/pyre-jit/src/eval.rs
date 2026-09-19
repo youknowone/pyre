@@ -7445,7 +7445,7 @@ fn drive_portal_metatrace(
     assert_eq!(
         canonical.calldescr().arg_classes,
         "iirrr",
-        "portal metatracing requires a PYRE_PORTAL_SPLIT=1 build"
+        "portal metatracing requires the split eval portal"
     );
     let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
         .find(|op| op.opname == "jit_merge_point")
