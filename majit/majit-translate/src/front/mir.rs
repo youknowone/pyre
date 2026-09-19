@@ -2733,6 +2733,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.result_try_sites.is_empty()
+            || !lo.disc_combinator_sites.is_empty()
             || !lo.slice_index_rangefrom_sites.is_empty()
             || !lo.slice_index_range_sites.is_empty()
             || !lo.slice_index_rangeto_sites.is_empty()
@@ -2965,6 +2967,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 return_narrow_root.as_deref(),
             )
         };
+        // Non-carrier `Result` `?` is the same ControlFlow diamond as
+        // `option_try`, with Ok/Err polarity and an `Err` return instead of
+        // `None`.  Exception-carrier Results are already rewritten above.
+        let result_try_stats = if lo.result_try_sites.is_empty() {
+            ResultTryStats::default()
+        } else {
+            let return_owners = lo.resolve_result_return_owners(&fd.signature.output);
+            rewire_result_try_call_sites(&mut lo.graph, &lo.result_try_sites, return_owners)
+        };
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
         // the residual `then` call block into a `Some`/`None` diamond.  It
         // runs on the post-lowering graph (its block A is closed with a
@@ -3102,6 +3113,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
         }
         let closure_select_rewritten = closure_select_outcome.rewritten;
+        let disc_combinator_rewritten = if lo.disc_combinator_sites.is_empty() {
+            0
+        } else {
+            rewire_disc_combinator_sites(
+                &mut lo.graph,
+                &lo.disc_combinator_sites,
+                static_addrs.error_carrier,
+            )
+        };
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
         // the residual `contains` method call in place with native
         // `bitand(le(a, x), ge(b, x))` compares and removes the paired
@@ -3138,6 +3158,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || from_size_align_rewritten > 0
             || from_size_align_expect_rewritten > 0
             || option_try_stats.rewritten > 0
+            || result_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
             || slice_get_rewritten > 0
@@ -3149,6 +3170,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || result_as_ref_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
+            || disc_combinator_rewritten > 0
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
@@ -4039,6 +4061,15 @@ struct Lowering<'a> {
     /// `front::option_closure_select` post-pass synthesizes (see
     /// [`crate::front::option_closure_select::ClosureSelectSite`]).
     closure_select_sites: Vec<crate::front::option_closure_select::ClosureSelectSite>,
+    /// Option/Result combinators whose body is a discriminant switch (plus an
+    /// optional closure `call_once`).  Captured here so the post-pass can
+    /// replace the opaque core residual with the if/else the flow graph
+    /// would have had if the source had been written that way.
+    disc_combinator_sites: Vec<DiscCombinatorSite>,
+    /// `Try::branch(res)` sites whose receiver is a non-carrier `Result`.
+    /// The Option sibling is [`Lowering::option_try_sites`]; exception-carrier
+    /// Results stay on [`Lowering::result_exc_call_results`].
+    result_try_sites: Vec<ResultTrySite>,
     /// Result-var ids of one-word niche `Option` discriminant reads folded to
     /// a pointer null-test (`ne(base, null_mut())`, `build_rvalue`
     /// `Rvalue::Discriminant` niche arm).  Such a discriminant is a `SomeBool`
@@ -4361,6 +4392,8 @@ impl<'a> Lowering<'a> {
             map_or_sites: Vec::new(),
             is_none_sites: Vec::new(),
             closure_select_sites: Vec::new(),
+            disc_combinator_sites: Vec::new(),
+            result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             root_scope_moved_locals,
@@ -13062,9 +13095,14 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 1
             && name == "branch"
-            && let Some(site) = self.recognize_option_try_site(first_arg_ty.as_ref(), &result_var)
         {
-            self.option_try_sites.push(site);
+            if let Some(site) = self.recognize_option_try_site(first_arg_ty.as_ref(), &result_var) {
+                self.option_try_sites.push(site);
+            } else if let Some(site) =
+                self.recognize_result_try_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.result_try_sites.push(site);
+            }
         }
         // Capture `bool::then(cond, closure_env)` sites for the
         // short-circuit `Option` diamond `front::bool_then` synthesizes.
@@ -13429,6 +13467,34 @@ impl<'a> Lowering<'a> {
             )
         {
             self.closure_select_sites.push(site);
+        }
+        // Discriminant-switch combinators whose opaque core body is an
+        // if/else on the receiver tag (plus `call_once` of a closure
+        // argument when there is one).  Option `map`/`and_then`/
+        // `unwrap_or_else`/`or_else`/`is_some_and` already have their own
+        // capture above; this records the remaining Option/Result methods
+        // whose semantics are the same shape.
+        if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && let Some(kind) = DiscCombinator::from_method(
+                name,
+                args.len(),
+                callee_name_path.as_deref(),
+                first_arg_ty.as_ref(),
+                self.llbc,
+            )
+            && let Some(site) = self.recognize_disc_combinator_site(
+                kind,
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.disc_combinator_sites.push(site);
         }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
@@ -16750,6 +16816,292 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve `Try::branch(res)` where `res: Result<T, E>` and `E` is not the
+    /// exception carrier.  Carrier Results stay on `result_exc`; a miss here
+    /// leaves the residual `branch` call.
+    fn recognize_result_try_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<ResultTrySite> {
+        let recv_ty = self.peel_to_option_or_result(recv_ty?)?;
+        if !crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc)
+            || crate::front::result_exc::tyref_is_result_of_carrier(
+                &recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
+            return None;
+        }
+        let (result_owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+            self.resolve_result_owners(&recv_ty)?;
+        Some(ResultTrySite {
+            branch_result_var: result_var.clone(),
+            result_owner,
+            ok_owner,
+            err_owner,
+            ok_ty,
+            err_ty,
+            err_class,
+            recv_err_ast: crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                .map(|ty| tyref_to_ast_string(&ty, self.llbc))
+                .unwrap_or_default(),
+        })
+    }
+
+    fn resolve_result_return_owners(&self, output_ty: &TyRef) -> Option<ResultTryReturnOwners> {
+        let output_ty = self.peel_to_option_or_result(output_ty)?;
+        if !crate::front::result_exc::tyref_is_result(&output_ty, self.llbc) {
+            return None;
+        }
+        let (result_owner, _ok_owner, err_owner, _ok_ty, err_ty, _err_class) =
+            self.resolve_result_owners(&output_ty)?;
+        Some(ResultTryReturnOwners {
+            result_owner,
+            err_owner,
+            err_ty,
+            err_ast: crate::front::result_exc::tyref_result_err(&output_ty, self.llbc)
+                .map(|ty| tyref_to_ast_string(&ty, self.llbc))
+                .unwrap_or_default(),
+        })
+    }
+
+    fn resolve_result_owners(
+        &self,
+        ty: &TyRef,
+    ) -> Option<(String, String, String, ValueType, ValueType, Option<String>)> {
+        let ok_tyref = crate::front::result_exc::tyref_result_ok(ty, self.llbc)?;
+        let err_tyref = crate::front::result_exc::tyref_result_err(ty, self.llbc)?;
+        let def_id = self.tyref_adt_def_id(ty)?;
+        let td = self.llbc.type_by_id(def_id)?;
+        let result_owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(ty, self.llbc)
+        );
+        let ok_owner = Self::tagged_pair_payload_owner(td, &result_owner, 0)?;
+        let err_owner = Self::tagged_pair_payload_owner(td, &result_owner, 1)?;
+        Some((
+            result_owner,
+            ok_owner,
+            err_owner,
+            tyref_enum_payload_value_type(&ok_tyref, self.llbc),
+            tyref_enum_payload_value_type(&err_tyref, self.llbc),
+            enum_payload_instance_class_root(&err_tyref, self.llbc),
+        ))
+    }
+
+    fn peel_to_option_or_result(&self, ty: &TyRef) -> Option<TyRef> {
+        let peeled = self
+            .tyref_peel_ref_to_pointee(ty)
+            .unwrap_or_else(|| clone_tyref(ty));
+        if crate::front::result_exc::tyref_is_option(&peeled, self.llbc)
+            || crate::front::result_exc::tyref_is_result(&peeled, self.llbc)
+        {
+            Some(peeled)
+        } else {
+            None
+        }
+    }
+
+    fn recognize_disc_combinator_site(
+        &self,
+        kind: DiscCombinator,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<DiscCombinatorSite> {
+        let recv_ty = self.peel_to_option_or_result(recv_ty?)?;
+        let is_option = crate::front::result_exc::tyref_is_option(&recv_ty, self.llbc);
+        let is_result = crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc);
+        match kind {
+            DiscCombinator::OptionFilter | DiscCombinator::OptionOkOr if !is_option => {
+                return None;
+            }
+            DiscCombinator::ResultMap
+            | DiscCombinator::ResultAndThen
+            | DiscCombinator::ResultUnwrapOrElse
+            | DiscCombinator::ResultOrElse
+            | DiscCombinator::ResultOk
+            | DiscCombinator::ResultErr
+            | DiscCombinator::ResultIsOk
+            | DiscCombinator::ResultIsErr
+                if !is_result =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        if is_result
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                &recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+            && matches!(
+                kind,
+                DiscCombinator::ResultUnwrapOrElse
+                    | DiscCombinator::ResultOrElse
+                    | DiscCombinator::ResultOk
+                    | DiscCombinator::ResultErr
+            )
+        {
+            // Carrier Results whose combinator would rebuild a Result shell
+            // are `result_exc`'s domain.  `map`/`and_then` still lower: the
+            // post-pass handles the LastException form `result_exc` leaves.
+            return None;
+        }
+
+        let mut site = DiscCombinatorSite {
+            kind,
+            result_var: result_var.clone(),
+            recv_owner: String::new(),
+            recv_tag0_owner: String::new(),
+            recv_tag1_owner: String::new(),
+            payload0_ty: ValueType::Ref(None),
+            payload1_ty: ValueType::Ref(None),
+            payload0_class: None,
+            payload1_class: None,
+            result_owner: String::new(),
+            result_tag0_owner: String::new(),
+            result_tag1_owner: String::new(),
+            result_payload0_ty: ValueType::Ref(None),
+            result_payload1_ty: ValueType::Ref(None),
+            result_payload0_class: None,
+            result_payload1_class: None,
+            call_once_owner: String::new(),
+            args_tuple_suffix: String::new(),
+            call_result_ty: ValueType::Ref(None),
+            call_result_class: None,
+        };
+
+        if is_option {
+            let (option_owner, some_owner, payload_ty) =
+                self.resolve_option_consumer_owners(&recv_ty)?;
+            site.recv_owner = option_owner;
+            site.recv_tag1_owner = some_owner;
+            site.payload1_ty = payload_ty;
+            site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
+        } else {
+            let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+                self.resolve_result_owners(&recv_ty)?;
+            site.recv_owner = owner;
+            site.recv_tag0_owner = ok_owner;
+            site.recv_tag1_owner = err_owner;
+            site.payload0_ty = ok_ty;
+            site.payload1_ty = err_ty;
+            site.payload0_class = crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+            site.payload1_class = err_class;
+        }
+
+        if kind.needs_closure() {
+            let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+            site.call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        }
+
+        match kind {
+            DiscCombinator::OptionFilter => {
+                let (option_owner, some_owner, payload_ty) =
+                    self.resolve_option_consumer_owners(dest_ty)?;
+                site.result_owner = option_owner;
+                site.result_tag1_owner = some_owner;
+                site.result_payload1_ty = payload_ty;
+                site.result_payload1_class = self.option_payload_instance_class_root(dest_ty);
+                site.call_result_ty = ValueType::Bool;
+                site.args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
+            }
+            DiscCombinator::OptionOkOr => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, _err_class) =
+                    self.resolve_result_owners(&dest)?;
+                site.result_owner = owner;
+                site.result_tag0_owner = ok_owner;
+                site.result_tag1_owner = err_owner;
+                site.result_payload0_ty = ok_ty;
+                site.result_payload1_ty = err_ty;
+                site.result_payload0_class = site.payload1_class.clone();
+                site.result_payload1_class = env_ty
+                    .and_then(|ty| {
+                        self.tyref_peel_ref_to_pointee(ty)
+                            .or_else(|| Some(clone_tyref(ty)))
+                    })
+                    .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+            }
+            DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                if !crate::front::result_exc::tyref_is_result(&dest, self.llbc) {
+                    return None;
+                }
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+                    self.resolve_result_owners(&dest)?;
+                site.result_owner = owner;
+                site.result_tag0_owner = ok_owner;
+                site.result_tag1_owner = err_owner;
+                site.result_payload0_ty = ok_ty.clone();
+                site.result_payload1_ty = err_ty;
+                site.result_payload1_class = err_class;
+                if kind == DiscCombinator::ResultMap {
+                    site.call_result_ty = ok_ty;
+                    site.call_result_class =
+                        crate::front::result_exc::tyref_result_ok(&dest, self.llbc)
+                            .and_then(|ty| enum_payload_instance_class_root(&ty, self.llbc));
+                    site.result_payload0_class = site.call_result_class.clone();
+                    site.args_tuple_suffix =
+                        crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                            .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                            .unwrap_or_default();
+                } else {
+                    site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                    site.args_tuple_suffix =
+                        crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                            .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                            .unwrap_or_default();
+                }
+            }
+            DiscCombinator::ResultUnwrapOrElse => {
+                site.call_result_ty = tyref_to_value_type(dest_ty, self.llbc);
+                site.args_tuple_suffix =
+                    crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                        .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                        .unwrap_or_default();
+            }
+            DiscCombinator::ResultOrElse => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
+                    self.resolve_result_owners(&dest)?;
+                site.result_owner = owner;
+                site.result_tag0_owner = ok_owner;
+                site.result_tag1_owner = err_owner;
+                site.result_payload0_ty = ok_ty;
+                site.result_payload1_ty = err_ty;
+                site.result_payload0_class = site.payload0_class.clone();
+                site.result_payload1_class = err_class;
+                site.call_result_ty = tyref_to_value_type(&dest, self.llbc);
+                site.args_tuple_suffix =
+                    crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                        .map(|ty| payload_tuple_suffix(&ty, self.llbc))
+                        .unwrap_or_default();
+            }
+            DiscCombinator::ResultOk | DiscCombinator::ResultErr => {
+                let dest = self.peel_to_option_or_result(dest_ty)?;
+                if !crate::front::result_exc::tyref_is_option(&dest, self.llbc) {
+                    return None;
+                }
+                let (option_owner, some_owner, payload_ty) =
+                    self.resolve_option_consumer_owners(&dest)?;
+                site.result_owner = option_owner;
+                site.result_tag1_owner = some_owner;
+                site.result_payload1_ty = payload_ty;
+                site.result_payload1_class = self.option_payload_instance_class_root(&dest);
+            }
+            DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => {}
+        }
+        Some(site)
+    }
+
     /// Resolve a recognized `Option::map_or(opt, default, closure)` call into a
     /// [`crate::front::option_map_or::MapOrSite`] — the `Option` enum root +
     /// `Some` variant owners, the closure env's `call_once` owner, the payload
@@ -17063,10 +17415,13 @@ impl<'a> Lowering<'a> {
     ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
         use crate::front::option_closure_select::ClosureCombinator;
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+        let recv_ty = self
+            .tyref_peel_ref_to_pointee(recv_ty)
+            .unwrap_or_else(|| clone_tyref(recv_ty));
+        if !crate::front::result_exc::tyref_is_option(&recv_ty, self.llbc) {
             return None;
         }
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
+        let def_id = self.tyref_adt_def_id(&recv_ty)?;
         let td = self.llbc.type_by_id(def_id)?;
         // Suffix the enum root with the receiver `Option<X>`'s `<X>` so the
         // per-instantiation root a static `Some(..)` mints is reused here;
@@ -17074,18 +17429,18 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
+        let payload_ty = self.tyref_option_payload_value_type(&recv_ty)?;
+        let payload_class_root = self.option_payload_instance_class_root(&recv_ty);
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
         // The single-element closure-`Args` tuple `(payload,)` the extracted
         // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
         // the read side derives at `resolve_place`.
-        let args_tuple_suffix = option_payload_tuple_suffix(recv_ty, self.llbc);
+        let args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
         // The type the closure's `call_once` returns: `map`'s dest is
         // `Option<U>` and its closure returns `U` (the dest payload);
         // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
@@ -17118,9 +17473,9 @@ impl<'a> Lowering<'a> {
                     .unwrap_or(ValueType::Ref(None));
             (suffix, payload_ty)
         });
-        let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        let niche = self.tyref_is_niche_option_ptr(&recv_ty);
         let fieldless_none_tag =
-            tyref_option_fieldless_niche(recv_ty, self.llbc).map(|niche| niche.none_tag);
+            tyref_option_fieldless_niche(&recv_ty, self.llbc).map(|niche| niche.none_tag);
         // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
         // build none.  `U` is the dest payload, not the receiver's `T`, so the
         // built variant must key the dest's own classdef — otherwise two `map`s
@@ -28856,6 +29211,1289 @@ fn is_core_result_map_err_path(path: &str) -> bool {
     )
 }
 
+fn is_core_option_method(path: &str, leaf: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core" | "std", "option", "<Impl>" | "Option", method] if *method == leaf
+    )
+}
+
+fn is_core_result_method(path: &str, leaf: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core" | "std", "result", "<Impl>" | "Result", method] if *method == leaf
+    )
+}
+
+/// Option/Result methods whose body is a discriminant switch, optionally
+/// calling a closure argument.  RPython never has these callees: the same
+/// source is an if/else in the flow graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscCombinator {
+    OptionFilter,
+    OptionOkOr,
+    ResultMap,
+    ResultAndThen,
+    ResultUnwrapOrElse,
+    ResultOrElse,
+    ResultOk,
+    ResultErr,
+    ResultIsOk,
+    ResultIsErr,
+}
+
+impl DiscCombinator {
+    fn from_method(
+        name: &str,
+        nargs: usize,
+        callee_path: Option<&str>,
+        recv_ty: Option<&TyRef>,
+        llbc: &Llbc,
+    ) -> Option<Self> {
+        let path = callee_path?;
+        let _ = (recv_ty, llbc);
+        match (name, nargs) {
+            ("filter", 2) if is_core_option_method(path, "filter") => Some(Self::OptionFilter),
+            ("ok_or", 2) if is_core_option_method(path, "ok_or") => Some(Self::OptionOkOr),
+            ("map", 2) if is_core_result_method(path, "map") => Some(Self::ResultMap),
+            ("and_then", 2) if is_core_result_method(path, "and_then") => Some(Self::ResultAndThen),
+            ("unwrap_or_else", 2) if is_core_result_method(path, "unwrap_or_else") => {
+                Some(Self::ResultUnwrapOrElse)
+            }
+            ("or_else", 2) if is_core_result_method(path, "or_else") => Some(Self::ResultOrElse),
+            ("ok", 1) if is_core_result_method(path, "ok") => Some(Self::ResultOk),
+            ("err", 1) if is_core_result_method(path, "err") => Some(Self::ResultErr),
+            ("is_ok", 1) if is_core_result_method(path, "is_ok") => Some(Self::ResultIsOk),
+            ("is_err", 1) if is_core_result_method(path, "is_err") => Some(Self::ResultIsErr),
+            _ => None,
+        }
+    }
+
+    fn needs_closure(self) -> bool {
+        matches!(
+            self,
+            Self::OptionFilter
+                | Self::ResultMap
+                | Self::ResultAndThen
+                | Self::ResultUnwrapOrElse
+                | Self::ResultOrElse
+        )
+    }
+
+    fn method_name(self) -> &'static str {
+        match self {
+            Self::OptionFilter => "filter",
+            Self::OptionOkOr => "ok_or",
+            Self::ResultMap => "map",
+            Self::ResultAndThen => "and_then",
+            Self::ResultUnwrapOrElse => "unwrap_or_else",
+            Self::ResultOrElse => "or_else",
+            Self::ResultOk => "ok",
+            Self::ResultErr => "err",
+            Self::ResultIsOk => "is_ok",
+            Self::ResultIsErr => "is_err",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DiscCombinatorSite {
+    kind: DiscCombinator,
+    result_var: Variable,
+    recv_owner: String,
+    recv_tag0_owner: String,
+    recv_tag1_owner: String,
+    payload0_ty: ValueType,
+    payload1_ty: ValueType,
+    payload0_class: Option<String>,
+    payload1_class: Option<String>,
+    result_owner: String,
+    result_tag0_owner: String,
+    result_tag1_owner: String,
+    result_payload0_ty: ValueType,
+    result_payload1_ty: ValueType,
+    result_payload0_class: Option<String>,
+    result_payload1_class: Option<String>,
+    call_once_owner: String,
+    args_tuple_suffix: String,
+    call_result_ty: ValueType,
+    call_result_class: Option<String>,
+}
+
+#[derive(Clone)]
+struct ResultTrySite {
+    branch_result_var: Variable,
+    result_owner: String,
+    ok_owner: String,
+    err_owner: String,
+    ok_ty: ValueType,
+    err_ty: ValueType,
+    err_class: Option<String>,
+    recv_err_ast: String,
+}
+
+#[derive(Clone)]
+struct ResultTryReturnOwners {
+    result_owner: String,
+    err_owner: String,
+    err_ty: ValueType,
+    err_ast: String,
+}
+
+#[derive(Default, Debug, Clone)]
+struct ResultTryStats {
+    rewritten: usize,
+}
+
+fn rewire_disc_combinator_sites(
+    graph: &mut FunctionGraph,
+    sites: &[DiscCombinatorSite],
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> usize {
+    sites
+        .iter()
+        .filter(|site| rewire_one_disc_combinator(graph, site, spec).is_ok())
+        .count()
+}
+
+fn rewire_one_disc_combinator(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    match site.kind {
+        DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => {
+            rewire_result_is_ok_err(graph, site)
+        }
+        _ => rewire_disc_combinator_diamond(graph, site, spec),
+    }
+}
+
+fn locate_combinator_call(
+    graph: &FunctionGraph,
+    result_var: &Variable,
+    method: &str,
+    name: &str,
+) -> Result<(usize, usize, Variable, Vec<Variable>), String> {
+    let a = graph
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(result_var))
+        })
+        .ok_or_else(|| format!("{name}: {method} result var has no producer block"))?;
+    let ci = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(result_var))
+        .ok_or_else(|| format!("{name}: {method} call not found in block {a}"))?;
+    let ops_len = graph.blocks[a].operations.len();
+    let flow_result = if ci + 1 == ops_len {
+        result_var.clone()
+    } else if ci + 2 == ops_len {
+        let cast = &graph.blocks[a].operations[ci + 1];
+        match cast.result.as_ref() {
+            Some(narrowed) if crate::model::cast_instance_of(&cast.kind, result_var).is_some() => {
+                narrowed.clone()
+            }
+            _ => {
+                return Err(format!(
+                    "{name}: {method} call is not the last op of block {a}"
+                ));
+            }
+        }
+    } else {
+        return Err(format!(
+            "{name}: {method} call is not the last op of block {a}"
+        ));
+    };
+    let args = match &graph.blocks[a].operations[ci].kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == method => args.iter().map(|arg| arg.clone().into_variable()).collect(),
+        other => {
+            return Err(format!(
+                "{name}: {method} producer is not a method call: {other:?}"
+            ));
+        }
+    };
+    Ok((a, ci, flow_result, args))
+}
+
+fn rewire_result_is_ok_err(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let method = site.kind.method_name();
+    let (a, ci, flow_result, args) =
+        locate_combinator_call(graph, &site.result_var, method, &name)?;
+    if args.len() != 1 {
+        return Err(format!("{name}: {method} is not a one-arg call"));
+    }
+    if flow_result != site.result_var {
+        return Err(format!("{name}: {method} carried a trailing cast"));
+    }
+    let recv = args[0].clone();
+    let a_id = graph.blocks[a].id;
+    graph.blocks[a].operations.truncate(ci);
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    let tag = graph
+        .push_op_var(
+            a_id,
+            OpKind::ConstInt(if site.kind == DiscCombinator::ResultIsOk {
+                0
+            } else {
+                1
+            }),
+            true,
+        )
+        .expect("ConstInt produces a value");
+    graph.block_mut(a_id).operations.push(SpaceOperation {
+        result: Some(site.result_var.clone()),
+        kind: OpKind::BinOp {
+            op: "eq".to_string(),
+            lhs: disc,
+            rhs: tag,
+            result_ty: ValueType::Bool,
+        },
+    });
+    Ok(())
+}
+
+fn rewire_disc_combinator_diamond(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    use crate::front::bool_then::{close_goto_mixed, reproduce_exit_args};
+
+    let name = graph.name.clone();
+    let method = site.kind.method_name();
+    let (a, ci, flow_result, args) =
+        locate_combinator_call(graph, &site.result_var, method, &name)?;
+    let recv = args
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("{name}: {method} missing receiver"))?;
+    let extra = args.get(1).cloned();
+    if site.kind == DiscCombinator::OptionFilter {
+        return rewire_option_filter_diamond(graph, site, a, ci, recv, extra, flow_result, &name);
+    }
+    let exception_lowered = matches!(graph.blocks[a].exitswitch, Some(ExitSwitch::LastException));
+    let [exit] = graph.blocks[a].exits.as_slice() else {
+        if exception_lowered && graph.blocks[a].exits.len() == 2 {
+            return rewire_result_map_last_exception(graph, site, spec, a, ci, recv, extra);
+        }
+        return Err(format!(
+            "{name}: {method} block does not have a single exit"
+        ));
+    };
+    if graph.blocks[a].exitswitch.is_some()
+        || exit.exitcase.is_some()
+        || exit.last_exception.is_some()
+        || exit.last_exc_value.is_some()
+    {
+        return Err(format!("{name}: {method} exit is not a plain goto"));
+    }
+    let saved_exit = exit.clone();
+    let b_target = saved_exit.target;
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != flow_result
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+
+    let (then_is_tag1, then_needs_recv, then_needs_extra, else_needs_recv, else_needs_extra) =
+        match site.kind {
+            DiscCombinator::OptionFilter => unreachable!("filter has its own diamond"),
+            DiscCombinator::OptionOkOr => (true, true, false, false, true),
+            DiscCombinator::ResultMap | DiscCombinator::ResultAndThen => {
+                (false, true, true, true, false)
+            }
+            DiscCombinator::ResultUnwrapOrElse | DiscCombinator::ResultOrElse => {
+                (false, true, false, true, true)
+            }
+            DiscCombinator::ResultOk => (false, true, false, false, false),
+            DiscCombinator::ResultErr => (true, true, false, false, false),
+            DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr => unreachable!(),
+        };
+
+    let mut then_sources = carried.clone();
+    if then_needs_recv && !then_sources.contains(&recv) {
+        then_sources.push(recv.clone());
+    }
+    if then_needs_extra
+        && let Some(extra) = extra.as_ref()
+        && !then_sources.contains(extra)
+    {
+        then_sources.push(extra.clone());
+    }
+    let mut else_sources = carried.clone();
+    if else_needs_recv && !else_sources.contains(&recv) {
+        else_sources.push(recv.clone());
+    }
+    if else_needs_extra
+        && let Some(extra) = extra.as_ref()
+        && !else_sources.contains(extra)
+    {
+        else_sources.push(extra.clone());
+    }
+
+    let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
+    let (else_bb, else_inputs) = graph.create_block_with_arg_vars(else_sources.len());
+
+    let then_value = build_disc_arm(
+        graph,
+        site,
+        then_bb,
+        &recv,
+        &then_sources,
+        &then_inputs,
+        extra.as_ref(),
+        true,
+        &name,
+    )?;
+    let then_args = reproduce_exit_args(
+        &saved_exit,
+        &flow_result,
+        &then_value,
+        &then_sources,
+        &then_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, then_bb, b_target, then_args);
+
+    let else_value = build_disc_arm(
+        graph,
+        site,
+        else_bb,
+        &recv,
+        &else_sources,
+        &else_inputs,
+        extra.as_ref(),
+        false,
+        &name,
+    )?;
+    let else_args = reproduce_exit_args(
+        &saved_exit,
+        &flow_result,
+        &else_value,
+        &else_sources,
+        &else_inputs,
+        &name,
+    )?;
+    close_goto_mixed(graph, else_bb, b_target, else_args);
+
+    let a_id = graph.blocks[a].id;
+    let ops_len = graph.blocks[a].operations.len();
+    let remove_upto = if ci + 2 == ops_len { ci + 1 } else { ci };
+    for _ in ci..=remove_upto {
+        graph.blocks[a].operations.remove(ci);
+    }
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    if then_is_tag1 {
+        graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
+    } else {
+        graph.set_branch(a_id, disc, else_bb, else_sources, then_bb, then_sources);
+    }
+    let _ = spec;
+    Ok(())
+}
+
+fn rewire_option_filter_diamond(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    a: usize,
+    ci: usize,
+    recv: Variable,
+    extra: Option<Variable>,
+    flow_result: Variable,
+    name: &str,
+) -> Result<(), String> {
+    use crate::front::bool_then::{
+        close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+    };
+    use crate::front::option_closure_select::emit_call_once;
+    use crate::front::option_map_or::emit_narrow;
+
+    let env = extra.ok_or_else(|| format!("{name}: filter missing predicate"))?;
+    let [exit] = graph.blocks[a].exits.as_slice() else {
+        return Err(format!("{name}: filter block does not have a single exit"));
+    };
+    if graph.blocks[a].exitswitch.is_some()
+        || exit.exitcase.is_some()
+        || exit.last_exception.is_some()
+        || exit.last_exc_value.is_some()
+    {
+        return Err(format!("{name}: filter exit is not a plain goto"));
+    }
+    let saved_exit = exit.clone();
+    let b_target = saved_exit.target;
+    let mut carried: Vec<Variable> = Vec::new();
+    for arg in &saved_exit.args {
+        if let LinkArg::Value(v) = arg
+            && *v != flow_result
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+
+    let mut some_sources = carried.clone();
+    if !some_sources.contains(&recv) {
+        some_sources.push(recv.clone());
+    }
+    if !some_sources.contains(&env) {
+        some_sources.push(env.clone());
+    }
+    let none_sources = carried.clone();
+    let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
+    let (none_bb, none_inputs) = graph.create_block_with_arg_vars(none_sources.len());
+
+    let none = emit_option_variant(graph, none_bb, &site.result_owner, 0, None);
+    let none_args = reproduce_exit_args(
+        &saved_exit,
+        &flow_result,
+        &none,
+        &none_sources,
+        &none_inputs,
+        name,
+    )?;
+    close_goto_mixed(graph, none_bb, b_target, none_args);
+
+    let recv_in = map_source(&some_sources, &some_inputs, &recv)
+        .ok_or_else(|| format!("{name}: filter receiver not threaded"))?;
+    let env_in = map_source(&some_sources, &some_inputs, &env)
+        .ok_or_else(|| format!("{name}: filter env not threaded"))?;
+    let payload = emit_payload_read(
+        graph,
+        some_bb,
+        recv_in,
+        &site.recv_tag1_owner,
+        site.payload1_ty.clone(),
+    );
+    let pred = emit_call_once(
+        graph,
+        some_bb,
+        env_in,
+        Some((
+            payload.clone(),
+            site.payload1_ty.clone(),
+            site.payload1_class.clone(),
+        )),
+        &site.call_once_owner,
+        ValueType::Bool,
+        &site.args_tuple_suffix,
+    );
+
+    let mut keep_sources = some_inputs.clone();
+    keep_sources.push(payload.clone());
+    let (keep_bb, keep_inputs) = graph.create_block_with_arg_vars(keep_sources.len());
+    let (drop_bb, drop_inputs) = graph.create_block_with_arg_vars(some_inputs.len());
+    let keep_payload = keep_inputs
+        .last()
+        .cloned()
+        .ok_or_else(|| format!("{name}: filter keep arm missing payload"))?;
+    let keep_payload = emit_narrow(graph, keep_bb, keep_payload, &site.result_payload1_class);
+    let some = emit_option_variant(
+        graph,
+        keep_bb,
+        &site.result_owner,
+        1,
+        Some((
+            &site.result_tag1_owner,
+            keep_payload,
+            site.result_payload1_ty.clone(),
+        )),
+    );
+    let drop_none = emit_option_variant(graph, drop_bb, &site.result_owner, 0, None);
+
+    let mut keep_exit = Vec::new();
+    let mut drop_exit = Vec::new();
+    for arg in &saved_exit.args {
+        match arg {
+            LinkArg::Const(c) => {
+                keep_exit.push(LinkArg::Const(c.clone()));
+                drop_exit.push(LinkArg::Const(c.clone()));
+            }
+            LinkArg::Value(v) if *v == flow_result => {
+                keep_exit.push(LinkArg::Value(some.clone()));
+                drop_exit.push(LinkArg::Value(drop_none.clone()));
+            }
+            LinkArg::Value(v) => {
+                let in_some = map_source(&some_sources, &some_inputs, v)
+                    .ok_or_else(|| format!("{name}: filter exit arg not threaded"))?;
+                let in_keep = map_source(&keep_sources, &keep_inputs, &in_some)
+                    .ok_or_else(|| format!("{name}: filter keep exit arg not threaded"))?;
+                let in_drop = map_source(&some_inputs, &drop_inputs, &in_some)
+                    .ok_or_else(|| format!("{name}: filter drop exit arg not threaded"))?;
+                keep_exit.push(LinkArg::Value(in_keep));
+                drop_exit.push(LinkArg::Value(in_drop));
+            }
+        }
+    }
+    close_goto_mixed(graph, keep_bb, b_target, keep_exit);
+    close_goto_mixed(graph, drop_bb, b_target, drop_exit);
+    graph.set_branch(
+        some_bb,
+        pred,
+        keep_bb,
+        keep_sources,
+        drop_bb,
+        some_inputs.clone(),
+    );
+
+    let a_id = graph.blocks[a].id;
+    let ops_len = graph.blocks[a].operations.len();
+    let remove_upto = if ci + 2 == ops_len { ci + 1 } else { ci };
+    for _ in ci..=remove_upto {
+        graph.blocks[a].operations.remove(ci);
+    }
+    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, none_sources);
+    Ok(())
+}
+
+fn build_disc_arm(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    block: BlockId,
+    recv: &Variable,
+    sources: &[Variable],
+    inputs: &[Variable],
+    extra: Option<&Variable>,
+    is_then: bool,
+    name: &str,
+) -> Result<Variable, String> {
+    use crate::front::bool_then::{emit_option_variant, emit_sum_variant, map_source};
+    use crate::front::option_closure_select::emit_call_once;
+    use crate::front::option_map_or::emit_narrow;
+
+    match (site.kind, is_then) {
+        (DiscCombinator::OptionFilter, _) => unreachable!("filter has its own diamond"),
+        (DiscCombinator::OptionOkOr, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: ok_or receiver not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Ok",
+                0,
+                Some((
+                    &site.result_tag0_owner,
+                    payload,
+                    site.result_payload0_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::OptionOkOr, false) => {
+            let extra = extra.ok_or_else(|| format!("{name}: ok_or missing err value"))?;
+            let err = map_source(sources, inputs, extra)
+                .ok_or_else(|| format!("{name}: ok_or err not threaded"))?;
+            let err = emit_narrow(graph, block, err, &site.result_payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Err",
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    err,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultMap, true) | (DiscCombinator::ResultAndThen, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
+            let extra = extra.ok_or_else(|| format!("{name}: Result map missing closure"))?;
+            let env = map_source(sources, inputs, extra)
+                .ok_or_else(|| format!("{name}: Result map env not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag0_owner,
+                site.payload0_ty.clone(),
+            );
+            let mapped = emit_call_once(
+                graph,
+                block,
+                env,
+                Some((
+                    payload,
+                    site.payload0_ty.clone(),
+                    site.payload0_class.clone(),
+                )),
+                &site.call_once_owner,
+                site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
+            );
+            let mapped = emit_narrow(graph, block, mapped, &site.call_result_class);
+            if site.kind == DiscCombinator::ResultAndThen {
+                Ok(mapped)
+            } else {
+                Ok(emit_sum_variant(
+                    graph,
+                    block,
+                    &site.result_owner,
+                    "Ok",
+                    0,
+                    Some((
+                        &site.result_tag0_owner,
+                        mapped,
+                        site.result_payload0_ty.clone(),
+                    )),
+                ))
+            }
+        }
+        (DiscCombinator::ResultMap, false) | (DiscCombinator::ResultAndThen, false) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Err arm"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload1_class);
+            Ok(emit_sum_variant(
+                graph,
+                block,
+                &site.result_owner,
+                "Err",
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    payload,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultUnwrapOrElse, true) | (DiscCombinator::ResultOrElse, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Ok arm"))?;
+            if site.kind == DiscCombinator::ResultOrElse {
+                Ok(recv)
+            } else {
+                Ok(emit_payload_read(
+                    graph,
+                    block,
+                    recv,
+                    &site.recv_tag0_owner,
+                    site.payload0_ty.clone(),
+                ))
+            }
+        }
+        (DiscCombinator::ResultUnwrapOrElse, false) | (DiscCombinator::ResultOrElse, false) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result receiver not threaded into Err arm"))?;
+            let extra =
+                extra.ok_or_else(|| format!("{name}: Result unwrap_or_else missing closure"))?;
+            let env = map_source(sources, inputs, extra)
+                .ok_or_else(|| format!("{name}: Result unwrap_or_else env not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            Ok(emit_call_once(
+                graph,
+                block,
+                env,
+                Some((
+                    payload,
+                    site.payload1_ty.clone(),
+                    site.payload1_class.clone(),
+                )),
+                &site.call_once_owner,
+                site.call_result_ty.clone(),
+                &site.args_tuple_suffix,
+            ))
+        }
+        (DiscCombinator::ResultOk, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result::ok receiver not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag0_owner,
+                site.payload0_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload0_class);
+            Ok(emit_option_variant(
+                graph,
+                block,
+                &site.result_owner,
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    payload,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultOk, false) => Ok(emit_option_variant(
+            graph,
+            block,
+            &site.result_owner,
+            0,
+            None,
+        )),
+        (DiscCombinator::ResultErr, true) => {
+            let recv = map_source(sources, inputs, recv)
+                .ok_or_else(|| format!("{name}: Result::err receiver not threaded"))?;
+            let payload = emit_payload_read(
+                graph,
+                block,
+                recv,
+                &site.recv_tag1_owner,
+                site.payload1_ty.clone(),
+            );
+            let payload = emit_narrow(graph, block, payload, &site.payload1_class);
+            Ok(emit_option_variant(
+                graph,
+                block,
+                &site.result_owner,
+                1,
+                Some((
+                    &site.result_tag1_owner,
+                    payload,
+                    site.result_payload1_ty.clone(),
+                )),
+            ))
+        }
+        (DiscCombinator::ResultErr, false) => Ok(emit_option_variant(
+            graph,
+            block,
+            &site.result_owner,
+            0,
+            None,
+        )),
+        (DiscCombinator::ResultIsOk | DiscCombinator::ResultIsErr, _) => unreachable!(),
+    }
+}
+
+fn rewire_result_map_last_exception(
+    graph: &mut FunctionGraph,
+    site: &DiscCombinatorSite,
+    spec: crate::ErrorCarrierSpec<'_>,
+    a: usize,
+    ci: usize,
+    recv: Variable,
+    extra: Option<Variable>,
+) -> Result<(), String> {
+    // `result_exc` already turned this Result-returning combinator into a
+    // can-raise site.  Only `map`/`and_then` keep that form; decline any
+    // other combinator rather than guess an exception ABI.
+    if !matches!(
+        site.kind,
+        DiscCombinator::ResultMap | DiscCombinator::ResultAndThen
+    ) {
+        return Err(format!(
+            "{}: {} LastException form is not lowered",
+            graph.name,
+            site.kind.method_name()
+        ));
+    }
+    let _ = (spec, a, ci, recv, extra);
+    Err(format!(
+        "{}: {} LastException form left residual",
+        graph.name,
+        site.kind.method_name()
+    ))
+}
+
+fn emit_enum_disc_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    owner: &str,
+) -> Variable {
+    let disc = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::FieldRead {
+            base: recv,
+            field: FieldDescriptor {
+                name: "__discriminant".to_string(),
+                owner_root: Some(owner.to_string()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+            },
+            ty: ValueType::Int,
+            pure: true,
+        },
+    });
+    disc
+}
+
+fn emit_payload_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    owner: &str,
+    ty: ValueType,
+) -> Variable {
+    let payload = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(payload.clone()),
+        kind: OpKind::FieldRead {
+            base: recv,
+            field: FieldDescriptor {
+                name: "__pos_0".to_string(),
+                owner_root: Some(owner.to_string()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+            },
+            ty,
+            pure: true,
+        },
+    });
+    payload
+}
+
+fn rewire_result_try_call_sites(
+    graph: &mut FunctionGraph,
+    sites: &[ResultTrySite],
+    return_owners: Option<ResultTryReturnOwners>,
+) -> ResultTryStats {
+    let mut stats = ResultTryStats::default();
+    for site in sites {
+        if rewire_one_result_try_site(graph, site, return_owners.as_ref()).is_ok() {
+            stats.rewritten += 1;
+        }
+    }
+    stats
+}
+
+fn rewire_one_result_try_site(
+    graph: &mut FunctionGraph,
+    site: &ResultTrySite,
+    return_owners: Option<&ResultTryReturnOwners>,
+) -> Result<(), String> {
+    use crate::flowspace::model::Constant;
+    use crate::front::bool_then::{emit_sum_variant, map_source};
+    use crate::front::option_map_or::emit_narrow;
+    use crate::front::result_exc::{
+        assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
+        follow_single_exit, split_diamond_exits,
+    };
+
+    let name = graph.name.clone();
+    let Some(return_owners) = return_owners else {
+        return Err(format!("{name}: enclosing function does not return Result"));
+    };
+    if return_owners.err_ast != site.recv_err_ast {
+        return Err(format!(
+            "{name}: Result `?` FromResidual would convert {} into {}",
+            site.recv_err_ast, return_owners.err_ast
+        ));
+    }
+    if graph.blocks[graph.returnblock.0].inputargs.len() != 1 {
+        return Err(format!(
+            "{name}: Result-returning function returnblock is not unary"
+        ));
+    }
+
+    let b = graph
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&site.branch_result_var))
+        })
+        .ok_or_else(|| format!("{name}: Result branch result var has no producer block"))?;
+    let branch_idx = graph.blocks[b]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.branch_result_var))
+        .ok_or_else(|| format!("{name}: Result branch op not found in block {b}"))?;
+    let res_b = match &graph.blocks[b].operations[branch_idx].kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == "branch" && args.len() == 1 => args[0].clone(),
+        other => {
+            return Err(format!(
+                "{name}: Result branch producer is not a one-arg branch method call: {other:?}"
+            ));
+        }
+    };
+    assert_single_pred(graph, b, &name)?;
+    assert_block_pure_besides(graph, b, &[branch_idx], "branch", &name)?;
+
+    let (a, res_a) = result_try_predecessor_carrying(graph, b, &res_b, &name)?;
+    let cf = site.branch_result_var.clone();
+    let (c, cf_c) =
+        follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
+    assert_single_pred(graph, c, &name)?;
+
+    let (disc_idx, cf_disc_var) = graph.blocks[c]
+        .operations
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| match &op.kind {
+            OpKind::FieldRead { base, field, .. }
+                if *base == cf_c && field.name == "__discriminant" =>
+            {
+                op.result.clone().map(|r| (i, r))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
+    match &graph.blocks[c].exitswitch {
+        Some(ExitSwitch::Value(v)) if *v == cf_disc_var => {}
+        other => {
+            return Err(format!(
+                "{name}: block {c} exitswitch {other:?} is not the ControlFlow discriminant switch"
+            ));
+        }
+    }
+    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
+    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+    let (e_block, residual_var) = result_try_verify_break_arm(graph, &break_link, &cf_c, &name)?;
+    // The from_residual block still owns the original successor — the
+    // RootScope close lives there, not in the residual call itself.
+    // Jumping the rewritten Err arm at returnblock would skip that
+    // chain.  Map the successor's args back to the Result producer; a
+    // value that cannot be mapped declines the site.
+    let (err_sources, err_specs, err_target) = result_try_err_successor(
+        graph,
+        a,
+        b,
+        c,
+        &break_link,
+        e_block,
+        &residual_var,
+        &res_a,
+        &name,
+    )?;
+
+    enum ContinueArg {
+        Const(crate::flowspace::model::Constant),
+        Payload,
+        Mapped(Variable),
+    }
+    let mut continue_specs = Vec::with_capacity(continue_link.args.len());
+    let mut payload_positions = Vec::new();
+    let mut ok_sources = Vec::new();
+    if !ok_sources.contains(&res_a) {
+        ok_sources.push(res_a.clone());
+    }
+    for (i, arg) in continue_link.args.iter().enumerate() {
+        match arg {
+            LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
+            LinkArg::Value(v) if *v == cf_c => {
+                continue_specs.push(ContinueArg::Payload);
+                payload_positions.push(i);
+            }
+            LinkArg::Value(v) if *v == cf_disc_var => {
+                continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
+            }
+            LinkArg::Value(v) => {
+                let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
+                if !ok_sources.contains(&v_a) {
+                    ok_sources.push(v_a.clone());
+                }
+                continue_specs.push(ContinueArg::Mapped(v_a));
+            }
+        }
+    }
+    if payload_positions.len() > 1 {
+        return Err(format!(
+            "{name}: ControlFlow value threaded into {} continue-arm slots",
+            payload_positions.len()
+        ));
+    }
+
+    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
+    let (err_bb, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
+
+    let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
+        .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
+    let payload = emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
+    let ok_link_args = continue_specs
+        .iter()
+        .map(|spec| match spec {
+            ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+            ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
+            ContinueArg::Mapped(v_a) => map_source(&ok_sources, &ok_inputs, v_a)
+                .map(LinkArg::Value)
+                .ok_or_else(|| format!("{name}: continue arg not threaded into Ok arm")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    graph.set_control_flow_metadata(
+        ok_bb,
+        None,
+        vec![Link::new_mixed(ok_link_args, continue_link.target, None)],
+    );
+    for pos in payload_positions {
+        collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+    }
+
+    let res_in_err = map_source(&err_sources, &err_inputs, &res_a)
+        .ok_or_else(|| format!("{name}: Result value not threaded into Err arm"))?;
+    let err_payload = emit_payload_read(
+        graph,
+        err_bb,
+        res_in_err,
+        &site.err_owner,
+        site.err_ty.clone(),
+    );
+    let err_payload = emit_narrow(graph, err_bb, err_payload, &site.err_class);
+    let err_shell = emit_sum_variant(
+        graph,
+        err_bb,
+        &return_owners.result_owner,
+        "Err",
+        1,
+        Some((
+            &return_owners.err_owner,
+            err_payload,
+            return_owners.err_ty.clone(),
+        )),
+    );
+    let err_link_args = err_specs
+        .iter()
+        .map(|spec| match spec {
+            ResultTryErrArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+            ResultTryErrArg::Shell => Ok(LinkArg::Value(err_shell.clone())),
+            ResultTryErrArg::Mapped(v_a) => map_source(&err_sources, &err_inputs, v_a)
+                .map(LinkArg::Value)
+                .ok_or_else(|| format!("{name}: break-arm arg not threaded into Err arm")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    graph.set_control_flow_metadata(
+        err_bb,
+        None,
+        vec![Link::new_mixed(err_link_args, err_target, None)],
+    );
+
+    let a_id = graph.blocks[a].id;
+    let disc = emit_enum_disc_read(graph, a_id, res_a, &site.result_owner);
+    graph.set_control_flow_metadata(
+        a_id,
+        Some(ExitSwitch::Value(disc)),
+        vec![
+            Link::new_mixed(
+                ok_sources.iter().cloned().map(LinkArg::Value).collect(),
+                ok_bb,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                err_sources.iter().cloned().map(LinkArg::Value).collect(),
+                err_bb,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ],
+    );
+    Ok(())
+}
+
+fn result_try_predecessor_carrying(
+    graph: &FunctionGraph,
+    block: usize,
+    var_in_block: &Variable,
+    name: &str,
+) -> Result<(usize, Variable), String> {
+    let preds: Vec<usize> = graph
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.exits.iter().any(|l| l.target.0 == block).then_some(i))
+        .collect();
+    let [pred] = preds.as_slice() else {
+        return Err(format!(
+            "{name}: diamond block {block} has {} predecessors, expected 1",
+            preds.len()
+        ));
+    };
+    let pos = graph.blocks[block]
+        .inputargs
+        .iter()
+        .position(|v| v == var_in_block)
+        .ok_or_else(|| format!("{name}: branch receiver is not a block {block} inputarg"))?;
+    let [link] = graph.blocks[*pred].exits.as_slice() else {
+        return Err(format!(
+            "{name}: Result-producing block {pred} has multiple exits"
+        ));
+    };
+    match link.args.get(pos) {
+        Some(LinkArg::Value(v)) => Ok((*pred, v.clone())),
+        other => Err(format!(
+            "{name}: predecessor arg at position {pos} is {other:?}, expected Value"
+        )),
+    }
+}
+
+fn result_try_verify_break_arm(
+    graph: &FunctionGraph,
+    break_link: &Link,
+    cf_c: &Variable,
+    name: &str,
+) -> Result<(usize, Variable), String> {
+    use crate::front::result_exc::{assert_block_pure_besides, peel_recast_chain_from};
+    let pos = break_link
+        .args
+        .iter()
+        .position(|a| matches!(a, LinkArg::Value(v) if v == cf_c))
+        .ok_or_else(|| format!("{name}: break arm does not carry the ControlFlow value"))?;
+    let e_block = break_link.target.0;
+    let cf_e = graph.blocks[e_block]
+        .inputargs
+        .get(pos)
+        .cloned()
+        .ok_or_else(|| format!("{name}: break arm target lacks inputarg {pos}"))?;
+    let ops = &graph.blocks[e_block].operations;
+    let payload = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::FieldRead { base, field, .. } if *base == cf_e && field.name == "__pos_0" => {
+            op.result.clone().map(|r| (i, r))
+        }
+        _ => None,
+    });
+    let Some((pos0_idx, payload_var)) = payload else {
+        return Err(format!(
+            "{name}: break arm block {e_block} lacks the __pos_0 residual read"
+        ));
+    };
+    let residual = ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::Method { name: m, .. },
+            args,
+            ..
+        } if m == "from_residual" && args.as_slice() == std::slice::from_ref(&payload_var) => {
+            op.result.clone().map(|r| (i, r))
+        }
+        _ => None,
+    });
+    let Some((from_residual_idx, residual_result)) = residual else {
+        return Err(format!(
+            "{name}: break arm block {e_block} lacks the from_residual call"
+        ));
+    };
+    let (residual_var, recast_indices) = peel_recast_chain_from(graph, e_block, &residual_result);
+    let mut recognized = vec![pos0_idx, from_residual_idx];
+    recognized.extend(recast_indices);
+    assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;
+    Ok((e_block, residual_var))
+}
+
+enum ResultTryErrArg {
+    Const(crate::flowspace::model::Constant),
+    Shell,
+    Mapped(Variable),
+}
+
+/// Map the from_residual block's successor back to the Result producer.
+///
+/// The rewritten Err arm must land on that successor so a RootScope close
+/// (or any other forwarded live value) still runs.  A value produced inside
+/// the diamond that is not the residual itself cannot be mapped, and the
+/// site stays residual rather than skipping the close.
+fn result_try_err_successor(
+    graph: &FunctionGraph,
+    a: usize,
+    b: usize,
+    c: usize,
+    break_link: &Link,
+    e_block: usize,
+    residual_var: &Variable,
+    res_a: &Variable,
+    name: &str,
+) -> Result<(Vec<Variable>, Vec<ResultTryErrArg>, BlockId), String> {
+    use crate::front::result_exc::back_substitute;
+    let [e_exit] = graph.blocks[e_block].exits.as_slice() else {
+        return Err(format!(
+            "{name}: break arm block {e_block} does not have a single exit"
+        ));
+    };
+    if graph.blocks[e_block].exitswitch.is_some()
+        || e_exit.exitcase.is_some()
+        || e_exit.last_exception.is_some()
+        || e_exit.last_exc_value.is_some()
+    {
+        return Err(format!(
+            "{name}: break arm block {e_block} exit is not a plain goto"
+        ));
+    }
+    let err_target = e_exit.target;
+    let mut err_sources = vec![res_a.clone()];
+    let mut err_specs = Vec::with_capacity(e_exit.args.len());
+    for arg in &e_exit.args {
+        match arg {
+            LinkArg::Const(cst) => err_specs.push(ResultTryErrArg::Const(cst.clone())),
+            LinkArg::Value(v) if v == residual_var => err_specs.push(ResultTryErrArg::Shell),
+            LinkArg::Value(v) => {
+                let pos = graph.blocks[e_block]
+                    .inputargs
+                    .iter()
+                    .position(|x| x == v)
+                    .ok_or_else(|| {
+                        format!(
+                            "{name}: break-arm successor carries a value produced in \
+                             block {e_block} that is not the residual"
+                        )
+                    })?;
+                match break_link.args.get(pos) {
+                    Some(LinkArg::Const(cst)) => {
+                        err_specs.push(ResultTryErrArg::Const(cst.clone()));
+                    }
+                    Some(LinkArg::Value(cv)) => {
+                        let v_a = back_substitute(graph, &[(a, b), (b, c)], cv, name)?;
+                        if !err_sources.contains(&v_a) {
+                            err_sources.push(v_a.clone());
+                        }
+                        err_specs.push(ResultTryErrArg::Mapped(v_a));
+                    }
+                    other => {
+                        return Err(format!(
+                            "{name}: break-arm inputarg {pos} is {other:?}, expected a value"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if err_target == graph.returnblock
+        && (err_specs.len() != 1 || !matches!(err_specs.first(), Some(ResultTryErrArg::Shell)))
+    {
+        return Err(format!(
+            "{name}: break arm does not forward the residual as the unary return"
+        ));
+    }
+    Ok((err_sources, err_specs, err_target))
+}
+
 /// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
 /// copy. Retargeted to the `list` builtin (`rtype_bltn_list` -> `ll_copy`).
 fn is_slice_to_vec(segments: &[String]) -> bool {
@@ -31076,6 +32714,7 @@ mod tests {
         tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
         tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
+    use crate::flowspace::model::Variable;
     use crate::model::{
         CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
     };
@@ -31090,6 +32729,7 @@ mod tests {
             "std::result::Result::map_err",
         ] {
             assert!(is_core_result_map_err_path(path), "{path}");
+            assert!(super::is_core_result_method(path, "map_err"), "{path}");
         }
         for path in [
             "map_err",
@@ -41988,5 +43628,266 @@ mod tests {
             .is_none()
         );
         assert!(primitive_float_const(&["unrelated".into()]).is_none());
+    }
+
+    fn disc_site(kind: super::DiscCombinator, result_var: Variable) -> super::DiscCombinatorSite {
+        super::DiscCombinatorSite {
+            kind,
+            result_var,
+            recv_owner: "core::result::Result".into(),
+            recv_tag0_owner: "core::result::Result::Ok".into(),
+            recv_tag1_owner: "core::result::Result::Err".into(),
+            payload0_ty: ValueType::Int,
+            payload1_ty: ValueType::Int,
+            payload0_class: None,
+            payload1_class: None,
+            result_owner: "core::result::Result".into(),
+            result_tag0_owner: "core::result::Result::Ok".into(),
+            result_tag1_owner: "core::result::Result::Err".into(),
+            result_payload0_ty: ValueType::Int,
+            result_payload1_ty: ValueType::Int,
+            result_payload0_class: None,
+            result_payload1_class: None,
+            call_once_owner: "test::closure".into(),
+            args_tuple_suffix: String::new(),
+            call_result_ty: ValueType::Int,
+            call_result_class: None,
+        }
+    }
+
+    fn option_disc_site(
+        kind: super::DiscCombinator,
+        result_var: Variable,
+    ) -> super::DiscCombinatorSite {
+        let mut site = disc_site(kind, result_var);
+        site.recv_owner = "core::option::Option".into();
+        site.recv_tag1_owner = "core::option::Option::Some".into();
+        site.result_owner = "core::option::Option".into();
+        site.result_tag1_owner = "core::option::Option::Some".into();
+        site.call_result_ty = ValueType::Bool;
+        site
+    }
+
+    fn count_method_calls(graph: &FunctionGraph, method: &str) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == method
+                )
+            })
+            .count()
+    }
+
+    fn build_two_arg_combinator(method: &str) -> (FunctionGraph, Variable) {
+        let mut graph = FunctionGraph::new("test_disc_combinator");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let extra = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method(method, Some("Result".into())),
+                    args: crate::model::call_args(vec![recv, extra]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        (graph, result)
+    }
+
+    #[test]
+    fn result_map_lowers_to_discriminant_switch() {
+        let (mut graph, result) = build_two_arg_combinator("map");
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultMap, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "map"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+    }
+
+    #[test]
+    fn option_filter_lowers_to_discriminant_and_predicate_switch() {
+        let mut graph = FunctionGraph::new("test_filter");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("filter", Some("Option".into())),
+                    args: crate::model::call_args(vec![recv, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[option_disc_site(
+                super::DiscCombinator::OptionFilter,
+                result,
+            )],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "filter"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+        let pred_branches = graph
+            .blocks
+            .iter()
+            .filter(|block| block.exits.len() == 2 && block.id != graph.startblock)
+            .count();
+        assert_eq!(pred_branches, 1, "the Some arm switches on the predicate");
+    }
+
+    #[test]
+    fn result_ok_lowers_to_some_none_switch() {
+        let mut graph = FunctionGraph::new("test_result_ok");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("ok", Some("Result".into())),
+                    args: crate::model::call_args(vec![recv]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = disc_site(super::DiscCombinator::ResultOk, result);
+        site.result_owner = "core::option::Option".into();
+        site.result_tag1_owner = "core::option::Option::Some".into();
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "ok"), 0);
+        assert_eq!(graph.blocks[graph.startblock.0].exits.len(), 2);
+    }
+
+    #[test]
+    fn result_is_ok_replaces_the_call_with_a_tag_compare() {
+        let mut graph = FunctionGraph::new("test_is_ok");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("is_ok", Some("Result".into())),
+                    args: crate::model::call_args(vec![recv]),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultIsOk, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "is_ok"), 0);
+        assert!(
+            graph.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq") })
+        );
+    }
+
+    #[test]
+    fn result_unwrap_or_else_calls_on_err() {
+        let (mut graph, result) = build_two_arg_combinator("unwrap_or_else");
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[disc_site(super::DiscCombinator::ResultUnwrapOrElse, result)],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "unwrap_or_else"), 0);
+        assert_eq!(count_method_calls(&graph, "call_once"), 1);
+    }
+
+    #[test]
+    fn core_option_result_method_paths() {
+        assert!(super::is_core_option_method(
+            "core::option::<Impl>::filter",
+            "filter"
+        ));
+        assert!(super::is_core_result_method(
+            "core::result::Result::map",
+            "map"
+        ));
+        assert!(!super::is_core_result_method(
+            "core::option::<Impl>::map",
+            "map"
+        ));
+        assert!(!super::is_core_option_method(
+            "mycrate::option::<Impl>::filter",
+            "filter"
+        ));
+    }
+
+    #[test]
+    fn desugar_mix_result_question_mark_lowers_to_result_switch() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+        let llbc = Llbc::load(path).expect("load corpus");
+        let graph = super::lower_function(&llbc, "desugar_mix").expect("lowering");
+        let residual_branch = count_method_calls(&graph, "branch");
+        let residual_from_residual = count_method_calls(&graph, "from_residual");
+        assert_eq!(
+            residual_branch, 0,
+            "desugar_mix: residual Try::branch after Result `?` lowering"
+        );
+        assert_eq!(
+            residual_from_residual, 0,
+            "desugar_mix: residual from_residual after Result `?` lowering"
+        );
+        let result_disc = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__discriminant"
+                            && field.owner_root.as_deref().is_some_and(|owner| owner.contains("Result"))
+                )
+            })
+            .count();
+        assert!(
+            result_disc >= 1,
+            "desugar_mix: expected a Result discriminant switch"
+        );
     }
 }
