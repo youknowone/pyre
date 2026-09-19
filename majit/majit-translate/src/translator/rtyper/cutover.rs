@@ -2253,6 +2253,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // non-overwriting, between-passes seeding contract as the unsafe-fn
     // stubs above.
     register_foreign_stdlib_externals(registry);
+    // Opaque `f64` methods the front remaps to `ll_math::math_*` C
+    // llexternals (`f64_method_llexternal`).  The `std::f64::<Impl>::floor`
+    // rows in FOREIGN_STDLIB_EXTERNALS no longer match those callsites;
+    // register the emitted crate path from the same table the front reads.
+    register_ll_math_llexternals(registry);
     // Foreign opaque-ADT method externals (`<BigInt as Add>::add`, …) the
     // LLBC collected.  `impl_method_owner` declines the Method hint for an
     // opaque owner, so these residualize as `FunctionPath` calls; declare
@@ -3176,6 +3181,37 @@ pub(crate) fn register_deref_write_external(registry: &CallRegistry) {
 pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
         register_opaque_external(registry, segments, argnames, return_lltype.clone());
+    }
+}
+
+/// Register every `f64_method_llexternal` name as `["ll_math", name]`.
+///
+/// The front rewrites opaque `f64::{floor,ceil,hypot,…}` calls to
+/// `FunctionPath { segments: ["ll_math", "math_floor"] }` (the C
+/// llexternal).  Walking `F64_METHOD_LLEXTERNALS` — the same table
+/// `f64_method_llexternal` is — keeps that path resolvable without a
+/// hand list at this call site.  The annotator result is `Float` for
+/// every row: that is the C llexternal / front `result_ty`, matching
+/// `register_external(..., [float], float)` even when the `ll_math_*`
+/// wrapper returns `Result<f64, MathError>`.  Arity comes from the
+/// table (unary vs `hypot`/`atan2`/`copysign`/`pow`).
+pub(crate) fn register_ll_math_llexternals(registry: &CallRegistry) {
+    use crate::translator::rtyper::lltypesystem::module::ll_math::F64_METHOD_LLEXTERNALS;
+    for row in F64_METHOD_LLEXTERNALS {
+        let argnames: &[&str] = match row.arity {
+            1 => &["x"],
+            2 => &["x", "y"],
+            arity => panic!(
+                "F64_METHOD_LLEXTERNALS[{}]: llexternal arity must be 1 or 2, got {arity}",
+                row.method
+            ),
+        };
+        register_opaque_external(
+            registry,
+            &["ll_math", row.name],
+            argnames,
+            LowLevelType::Float,
+        );
     }
 }
 
@@ -7912,5 +7948,89 @@ mod tests {
         ));
         let result = build_stub_pygraph_for_lltype("synth".to_string(), sig, func_ll);
         assert!(result.is_none(), "Func lltype must surface as None");
+    }
+
+    #[test]
+    fn call_registry_resolves_ll_math_math_floor_function_path() {
+        // The front remaps opaque `f64::floor` to
+        // `FunctionPath { segments: ["ll_math", "math_floor"] }`.  That
+        // path must be in the CallRegistry after the same populate the
+        // production builder runs; a miss is the
+        // "not registered in CallRegistry, not in HOST_ENV" hard error.
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::module::ll_math::F64_METHOD_LLEXTERNALS;
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(
+            &crate::codewriter::call::GraphStore::default(),
+            &[],
+            &[],
+            &registry,
+        )
+        .unwrap();
+        let key = FunctionPathKey::from_segments(["ll_math", "math_floor"]);
+        let floor = registry.lookup(&key).unwrap_or_else(|| {
+            panic!(
+                "FunctionPath {{ segments: [\"ll_math\", \"math_floor\"] }} \
+                 is not registered in CallRegistry"
+            )
+        });
+        assert_eq!(
+            floor.function_desc.borrow().signature.argnames,
+            ["x".to_string()]
+        );
+        for row in F64_METHOD_LLEXTERNALS {
+            let entry = registry
+                .lookup(&FunctionPathKey::from_segments(["ll_math", row.name]))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "FunctionPath {{ segments: [\"ll_math\", {:?}] }} \
+                         is not registered in CallRegistry",
+                        row.name
+                    )
+                });
+            assert_eq!(
+                entry.function_desc.borrow().signature.argnames.len(),
+                row.arity,
+                "{}",
+                row.name
+            );
+            let stub = entry
+                .function_desc
+                .borrow()
+                .cache
+                .borrow()
+                .get(&crate::annotator::description::GraphCacheKey::None)
+                .cloned()
+                .unwrap_or_else(|| panic!("{} stub is prefilled", row.name));
+            let graph = stub.graph.borrow();
+            let start = graph.startblock.borrow();
+            let link = start.exits[0].borrow();
+            let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+                panic!(
+                    "{} stub return arg must be a pre-annotated Variable",
+                    row.name
+                );
+            };
+            let annotation = ret.annotation.borrow();
+            let annotation = annotation
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} stub return is pre-annotated", row.name));
+            assert!(
+                matches!(&**annotation, SomeValue::Float(_)),
+                "{} llexternal annotates as float (C result / front result_ty), \
+                 got {annotation:?}; wrapper_raises={}",
+                row.name,
+                row.wrapper_raises
+            );
+        }
+        let hypot = registry
+            .lookup(&FunctionPathKey::from_segments(["ll_math", "math_hypot"]))
+            .expect("math_hypot");
+        assert_eq!(
+            hypot.function_desc.borrow().signature.argnames,
+            ["x".to_string(), "y".to_string()]
+        );
     }
 }

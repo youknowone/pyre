@@ -2935,6 +2935,36 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_wtf8_root_projects_pyobject_instance_to_somestring() {
+        // `w_str_get_wtf8(obj)` paints dest through this string-root
+        // marker (`front/mir.rs` `cast_instance_call_result("Wtf8", …,
+        // ValueType::Str)`).  `project_struct_field_type("Wtf8")` is
+        // SomeString; a PyObject instance operand must narrow to that
+        // shell rather than keep SomeInstance.
+        let bk = bk();
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_obj = SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            Default::default(),
+        ));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("Wtf8"))
+            .expect("Wtf8 root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("string-root cast_instance_intrinsic must accept a PyObject instance");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "Wtf8 root must project dest as SomeString, got {out:?}"
+        );
+    }
+
+    #[test]
     fn call_builtin_unknown_name_errors() {
         let bk = bk();
         let err = call_builtin(&bk, "definitely_not_a_builtin", &[], &no_kwds()).unwrap_err();

@@ -91,6 +91,24 @@ pub(crate) fn register_external_functions() -> Result<&'static [ExtFuncEntry], T
                 )?);
             }
         }
+        // The front emits the C llexternal crate path (`ll_math::math_floor`),
+        // not the Python `math.floor` host the loops above key on.  Register
+        // that spelling from the same table the front reads so the two
+        // naming worlds meet.  Result is always `float`: that is the C
+        // llexternal / `register_external(..., [float], float)` annotation,
+        // even when `ll_math_ceil` (the wrapper) returns `Result`.
+        for row in super::lltypesystem::module::ll_math::F64_METHOD_LLEXTERNALS {
+            let args = vec![ExternalAnnotation::Float; row.arity];
+            entries.push(extfunc::register_external(
+                HostObject::new_builtin_callable(format!("ll_math.{}", row.name)),
+                args,
+                Some(ExternalAnnotation::Float),
+                Some(format!("ll_math.{}", row.name)),
+                None,
+                None,
+                true,
+            )?);
+        }
         Ok(entries)
     });
     match result {
@@ -130,6 +148,50 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| entry.name == "ll_math.ll_math_isfinite")
+        );
+    }
+
+    #[test]
+    fn registers_f64_method_llexternal_crate_paths() {
+        let entries = register_external_functions().expect("register extfuncregistry");
+        for row in super::super::lltypesystem::module::ll_math::F64_METHOD_LLEXTERNALS {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name == format!("ll_math.{}", row.name))
+                .unwrap_or_else(|| panic!("missing crate-path external {}", row.name));
+            assert_eq!(entry.signature_args.len(), row.arity, "{}", row.name);
+            assert!(
+                entry
+                    .signature_args
+                    .iter()
+                    .all(|arg| *arg == ExternalAnnotation::Float),
+                "{}",
+                row.name
+            );
+            assert_eq!(
+                entry.signature_result,
+                ExternalAnnotation::Float,
+                "{}",
+                row.name
+            );
+        }
+        let floor = entries
+            .iter()
+            .find(|entry| entry.name == "ll_math.math_floor")
+            .expect("math_floor");
+        let ceil = entries
+            .iter()
+            .find(|entry| entry.name == "ll_math.math_ceil")
+            .expect("math_ceil");
+        assert_eq!(floor.signature_args, vec![ExternalAnnotation::Float]);
+        assert_eq!(ceil.signature_args, vec![ExternalAnnotation::Float]);
+        let hypot = entries
+            .iter()
+            .find(|entry| entry.name == "ll_math.math_hypot")
+            .expect("math_hypot");
+        assert_eq!(
+            hypot.signature_args,
+            vec![ExternalAnnotation::Float, ExternalAnnotation::Float]
         );
     }
 

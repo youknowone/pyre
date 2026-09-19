@@ -101,11 +101,12 @@
 use majit_charon_reader::{
     Llbc,
     ullbc::{
-        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, NameSeg, Operand,
-        Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind, SwitchTargets, TermKind,
-        TyRef, TypeDecl, TypeDeclKind, Unstructured,
+        BasicBlock, CallClass, CallFunc, CallKind, CallPayload, FunDecl, FunId, GlobalDecl,
+        NameSeg, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, StmtKind,
+        SwitchTargets, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured,
     },
 };
+use std::cell::RefCell;
 
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
@@ -210,7 +211,8 @@ pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_a
 }
 
 /// Lower one already-linked artefact. The caller applied
-/// [`discover_transparent_scalar_kinds`] across the whole set first so
+/// [`discover_transparent_scalar_kinds`] and
+/// [`discover_foldable_const_lits`] across the whole set first so
 /// this crate can be dropped before the next file is parsed.
 pub(crate) fn build_semantic_program_from_prelinked_llbc(
     llbc: &Llbc,
@@ -9193,8 +9195,14 @@ impl<'a> Lowering<'a> {
     /// flow graphs carry module-level constants as `Constant(value)`,
     /// so config bools like `WITHPREBUILTINT` constant-fold their
     /// guarded branches instead of minting a synthetic 0-arg call no
-    /// registry can resolve.  Non-trivial initializers (multi-block,
-    /// calls, aggregates) return `None` and keep the Call fallback.
+    /// registry can resolve.  Aggregates and any `Call` other than
+    /// `core::mem::size_of` / `align_of` return `None` and keep the
+    /// Call fallback.
+    ///
+    /// A defining crate's initializer is absent from a dependent
+    /// artefact (`opacity: Foreign`). After the local body and the
+    /// `core::num` associated-const lanes fail, fold to the literal
+    /// harvested from the crate that owns the const.
     fn const_eval_global(&self, def_id: u64) -> Option<OpKind> {
         let g = self.llbc.global_by_id(def_id)?;
         // Only an immutable, non-thread-local global folds to its init
@@ -9206,29 +9214,26 @@ impl<'a> Lowering<'a> {
         // is taken elsewhere.)  `global_kind` does not distinguish
         // `static mut` from `static`, so the mutability comes from the
         // `static mut` keyword in Charon's recorded `source_text`.
-        if g.rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("ThreadLocal")
-        {
+        if global_is_thread_local(g) {
             return None;
         }
-        let is_static_mut = g
+        if global_source_text_is_static_mut(g) {
+            return None;
+        }
+        let local = g
             .rest
-            .get("item_meta")
-            .and_then(|m| m.get("source_text"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| s.contains("static mut"));
-        if is_static_mut {
-            return None;
-        }
-        let init_id = g.rest.get("init")?.as_u64()?;
-        let fd = self.llbc.fn_by_id(init_id)?;
-        if let Some(u) = fd.unstructured() {
-            const_eval_init_body(self.llbc, &u)
-        } else {
-            const_eval_core_num_associated_const(self.llbc, def_id).and_then(const_lit_to_op)
-        }
+            .get("init")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|init_id| self.llbc.fn_by_id(init_id))
+            .and_then(|fd| {
+                if let Some(u) = fd.unstructured() {
+                    const_eval_init_body(self.llbc, &u)
+                } else {
+                    const_eval_core_num_associated_const(self.llbc, def_id)
+                        .and_then(const_lit_to_op)
+                }
+            });
+        local.or_else(|| foldable_const_lit(&g.item_meta.name_path()))
     }
 
     /// Fold a `NamedConst` global whose initializer is exactly
@@ -10165,15 +10170,36 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_get_wtf8(obj)` is `_utf8`.  pyre_cpu's `bh_str*`
-                // family reads the `W_UnicodeObject` itself (byte_len +
-                // the `value` indirection), so the field is identity on
-                // the object — the same model `as_bytes` uses one step
-                // down.  Alias and mark the dest as a byte view so
-                // `as_bytes()[i]` / `len` become `strgetitem` / `strlen`
-                // on the object, not on a fat `&Wtf8`.
+                // `w_str_get_wtf8(obj)` is `_utf8`.  The receiver is a
+                // `PyObjectRef`, so aliasing dest to args[0] would paint
+                // dest `SomeInstance(pyobject::PyObject)` and every later
+                // string op would union `String ∪ Instance` or dispatch
+                // `InstanceRepr` (no `rtype_len` / `rtype_eq`).  Project
+                // dest as `ValueType::Str` through the existing
+                // `__cast_instance_intrinsic` string-root seam
+                // (`project_struct_field_type("Wtf8")` → `SomeString`;
+                // `cast_instance_call_result` result_ty `Str`).  The
+                // marker is jitcode-identity (`cast_pointer` /
+                // `cast_opaque_ptr` → `same_as`; Skip folds it to the
+                // operand), so the machine value stays the receiver.
+                // Mark dest a byte view so `as_bytes()[i]` / `len` still
+                // plant `strgetitem` / `strlen`.
                 if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let dest = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(dest.clone()),
+                        kind: crate::model::cast_instance_call_result(
+                            "Wtf8",
+                            args[0].clone(),
+                            ValueType::Str,
+                        ),
+                    });
+                    self.local_var[dest_local] = Some(dest);
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -15353,8 +15379,10 @@ impl<'a> Lowering<'a> {
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
-    /// `w_str_get_wtf8(obj)` — `_utf8`.  pyre_cpu treats the
-    /// `W_UnicodeObject` as the STR, so the field is identity.
+    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the receiver's
+    /// machine value projected as `ValueType::Str` (`Wtf8` string-root
+    /// `__cast_instance_intrinsic`), not a residual call and not an
+    /// alias that keeps the `PyObject` instance type.
     fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -26022,6 +26050,123 @@ fn tyref_transparent_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
     }
 }
 
+thread_local! {
+    /// Foldable const literals harvested from the whole linked LLBC set.
+    ///
+    /// The streaming driver parses one artefact at a time and drops it,
+    /// so a defining crate's initializer body is gone by the time a
+    /// dependent crate's read is lowered. The harvest stores the folded
+    /// value, keyed by the full `item_meta.name_path()`, for
+    /// [`Lowering::const_eval_global`] to consult after the local
+    /// initializer lanes fail. Thread-local, not a process-global lock:
+    /// one translate pipeline runs on one thread, matching
+    /// [`crate::local_crates::register_local_crate_roots`].
+    static FOLDABLE_CONST_LITS: RefCell<Vec<(String, OpKind)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn global_is_thread_local(g: &GlobalDecl) -> bool {
+    g.rest
+        .get("global_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("ThreadLocal")
+}
+
+fn global_source_text_is_static_mut(g: &GlobalDecl) -> bool {
+    g.item_meta
+        .source_text
+        .as_deref()
+        .is_some_and(|s| s.contains("static mut"))
+        || g.rest
+            .get("item_meta")
+            .and_then(|m| m.get("source_text"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| s.contains("static mut"))
+}
+
+/// Harvest foldable const literals from one artefact.
+///
+/// A global whose initializer Charon kept as a body folds under the
+/// same gates as [`Lowering::const_eval_global`]: not a `ThreadLocal`,
+/// not a `static mut`, body present, and [`const_eval_init_body_lit`]
+/// succeeds — including a `size_of` / `align_of` Call, which is the
+/// only Call shape that evaluator will fold. Dependency artefacts
+/// record the same item as `opacity: Foreign` with no body; the
+/// defining crate's harvest is what a later lowering consults for
+/// those reads.
+///
+/// `item_meta.name_path()` renders every trait-impl segment as
+/// `"<Impl>"`, so two associated consts in one module share a path
+/// (`::<Impl>::CPYTHON_IMMUTABLETYPE`) and can fold to different
+/// values. A path that names more than one global in this artefact is
+/// not an identity, so it is left unharvested rather than folded or
+/// asserted.
+pub(crate) fn discover_foldable_const_lits(llbc: &Llbc) -> Vec<(String, OpKind)> {
+    let mut paths: Vec<String> = llbc
+        .iter_global_decls()
+        .map(|g| g.item_meta.name_path())
+        .collect();
+    paths.sort();
+    let mut ambiguous: Vec<String> = Vec::new();
+    for pair in paths.windows(2) {
+        if pair[0] == pair[1] && ambiguous.last() != Some(&pair[0]) {
+            ambiguous.push(pair[0].clone());
+        }
+    }
+    let mut discovered = Vec::new();
+    for g in llbc.iter_global_decls() {
+        if global_is_thread_local(g) || global_source_text_is_static_mut(g) {
+            continue;
+        }
+        let path = g.item_meta.name_path();
+        if ambiguous.binary_search(&path).is_ok() {
+            continue;
+        }
+        let Some(init_id) = g.rest.get("init").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let Some(fd) = llbc.fn_by_id(init_id) else {
+            continue;
+        };
+        let Some(u) = fd.unstructured() else {
+            continue;
+        };
+        let Some(op) = const_eval_init_body(llbc, &u) else {
+            continue;
+        };
+        discovered.push((path, op));
+    }
+    discovered
+}
+
+/// Replace this thread's harvested foldable-const set with one
+/// pipeline invocation's merged literals. A later invocation on the
+/// same thread overwrites. Two artefacts that fold the same full path
+/// to different values is a bug, not a silent winner.
+pub(crate) fn register_foldable_const_lits(entries: impl IntoIterator<Item = (String, OpKind)>) {
+    let mut lits: Vec<(String, OpKind)> = Vec::new();
+    for (path, lit) in entries {
+        match lits.binary_search_by(|(known, _)| known.cmp(&path)) {
+            Ok(index) => assert_eq!(
+                lits[index].1, lit,
+                "foldable const {path} has inconsistent linked definitions"
+            ),
+            Err(index) => lits.insert(index, (path, lit)),
+        }
+    }
+    FOLDABLE_CONST_LITS.with(|slot| *slot.borrow_mut() = lits);
+}
+
+fn foldable_const_lit(path: &str) -> Option<OpKind> {
+    FOLDABLE_CONST_LITS.with(|slot| {
+        let lits = slot.borrow();
+        let index = lits
+            .binary_search_by(|(known, _)| known.as_str().cmp(path))
+            .ok()?;
+        Some(lits[index].1.clone())
+    })
+}
+
 /// Link complete transparent-scalar declarations to opaque dependency views.
 ///
 /// Charon keeps `repr(transparent)` in an external declaration's layout but
@@ -26057,14 +26202,19 @@ pub(crate) fn discover_transparent_scalar_kinds(
 
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
     let mut discovered = Vec::new();
+    let mut foldable_consts = Vec::new();
     for llbc in llbcs {
         discovered.extend(discover_transparent_scalar_kinds(llbc));
+        foldable_consts.extend(discover_foldable_const_lits(llbc));
     }
     discovered.sort_by(|a, b| a.0.cmp(&b.0));
     discovered.dedup();
+    foldable_consts.sort_by(|a, b| a.0.cmp(&b.0));
+    foldable_consts.dedup();
     for llbc in llbcs {
         llbc.register_transparent_scalar_kinds(discovered.iter().cloned());
     }
+    register_foldable_const_lits(foldable_consts);
 }
 
 /// `Arg<T>` from `rustpython_compiler_core::bytecode::instruction` —
@@ -29309,8 +29459,9 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
 /// a shift or negation drags an overflow-assert diamond along — so fold
 /// it here: execute literal assigns, follow each `Assert` whose
 /// condition evaluates to its `expected` value (rustc already
-/// const-checked the initializer), and bail to the residual `Call`
-/// lowering on any other shape.
+/// const-checked the initializer), fold a `core::mem::size_of` /
+/// `align_of` Call terminator to the target layout width, and bail to
+/// the residual `Call` lowering on any other shape.
 fn const_eval_init_body(llbc: &Llbc, u: &Unstructured) -> Option<OpKind> {
     const_lit_to_op(const_eval_init_body_lit(llbc, u, 0)?)
 }
@@ -29384,7 +29535,9 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
         let block = u.body.get(bb)?;
         for stmt in &block.statements {
             match stmt.stmt_kind() {
-                Ok(StmtKind::StorageLive(_)) | Ok(StmtKind::StorageDead(_)) => {}
+                Ok(StmtKind::StorageLive(_))
+                | Ok(StmtKind::StorageDead(_))
+                | Ok(StmtKind::PlaceMention(_)) => {}
                 Ok(StmtKind::Assign(place, rvalue)) => {
                     let PlaceKind::Local(dst) = place.kind else {
                         return None;
@@ -29424,10 +29577,125 @@ fn const_eval_init_body_lit(llbc: &Llbc, u: &Unstructured, depth: usize) -> Opti
                 }
                 bb = target as usize;
             }
+            TermKind::Call { call, target, .. } => {
+                let PlaceKind::Local(dst) = call.dest.kind else {
+                    return None;
+                };
+                locals.insert(dst, const_eval_size_align_call(llbc, &call)?);
+                bb = target as usize;
+            }
             _ => return None,
         }
     }
     None
+}
+
+/// Fold a const-init `Call` terminator only when it is nullary
+/// `core::mem::size_of` / `align_of`. Any other callee stays unharvested:
+/// that refusal is the fail-closed default
+/// [`const_eval_init_body_lit`] used before this exemption.
+fn const_eval_size_align_call(llbc: &Llbc, call: &CallPayload) -> Option<ConstLit> {
+    if !call.args.is_empty() {
+        return None;
+    }
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let want_align = match llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+        "core::mem::size_of" => false,
+        "core::mem::align_of" => true,
+        _ => return None,
+    };
+    let ty = reg.generics.get("types")?.as_array()?.first()?;
+    let bytes = size_align_of_tyexpr(llbc, want_align, ty)?;
+    Some(const_narrow_to_target(
+        const_literal_ty(llbc, &call.dest.ty),
+        ConstLit::UInt(bytes),
+    ))
+}
+
+/// Byte size / alignment of a `size_of` / `align_of` type argument.
+///
+/// Primitive widths (including `usize` / `isize`) come from the
+/// translation target, not from the host `size_of::<usize>()` and not
+/// from the artefact's extraction-host `target_pointer_size`. Harvest
+/// runs inside the translation pipeline
+/// (`discover_foldable_const_lits` via
+/// `build_semantic_program_via_active_frontend` and the prepass), once
+/// per TARGET. `layout::target_word_size` reads
+/// `CARGO_CFG_TARGET_POINTER_WIDTH` — Cargo sets that to the crate
+/// target even in a build.rs running on a wider host — and only falls
+/// back to the host width when that cfg is unset (the host *is* the
+/// target). A wasm32 prepass therefore harvests 4, not the host's 8.
+///
+/// ADT arguments reuse the same Charon `layout_for_target` lane
+/// [`Lowering::fold_size_const_global`] uses. Anything else (tuple,
+/// slice, an unresolved layout) stays unharvested.
+fn size_align_of_tyexpr(llbc: &Llbc, want_align: bool, ty: &serde_json::Value) -> Option<u64> {
+    let body = tyexpr_body(llbc, ty)?;
+    if let Some(lit) = body.get("Literal") {
+        return primitive_size_align(want_align, lit);
+    }
+    let adt = inline_adt_def_id(body).or_else(|| resolve_tyexpr_to_adt_def_id_free(llbc, ty))?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let layout = llbc.type_by_id(adt)?.layout_for_target(&target)?;
+    if want_align {
+        layout.align
+    } else {
+        layout.size
+    }
+}
+
+fn tyexpr_body<'a>(llbc: &'a Llbc, ty: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    if let Some(arr) = ty
+        .get("HashConsedValue")
+        .and_then(serde_json::Value::as_array)
+    {
+        return arr.get(1);
+    }
+    if let Some(id) = ty.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_body(id);
+    }
+    Some(ty)
+}
+
+fn primitive_size_align(want_align: bool, lit: &serde_json::Value) -> Option<u64> {
+    let word = crate::layout::target_word_size() as u64;
+    let (size, align) = if let Some(width) = lit.get("UInt").and_then(serde_json::Value::as_str) {
+        match width {
+            "U8" => (1, 1),
+            "U16" => (2, 2),
+            "U32" => (4, 4),
+            "U64" => (8, 8),
+            "U128" => (16, 16),
+            "Usize" => (word, word),
+            _ => return None,
+        }
+    } else if let Some(width) = lit.get("Int").and_then(serde_json::Value::as_str) {
+        match width {
+            "I8" => (1, 1),
+            "I16" => (2, 2),
+            "I32" => (4, 4),
+            "I64" => (8, 8),
+            "I128" => (16, 16),
+            "Isize" => (word, word),
+            _ => return None,
+        }
+    } else if let Some(width) = lit.get("Float").and_then(serde_json::Value::as_str) {
+        match width {
+            "F32" => (4, 4),
+            "F64" => (8, 8),
+            _ => return None,
+        }
+    } else if lit.get("Bool").is_some() {
+        (1, 1)
+    } else {
+        return None;
+    };
+    Some(if want_align { align } else { size })
 }
 
 fn decode_const_lit(value: &serde_json::Value) -> Option<ConstLit> {
@@ -40335,6 +40603,819 @@ mod tests {
             "i64"
         );
     }
+
+    fn span_json() -> serde_json::Value {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 16}
+        }})
+    }
+
+    fn item_meta_json(path: &[&str], source_text: &str, is_local: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span_json(),
+            "source_text": source_text,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": is_local
+        })
+    }
+
+    fn u32_ty() -> serde_json::Value {
+        serde_json::json!({"Literal": {"UInt": "U32"}})
+    }
+
+    fn usize_ty() -> serde_json::Value {
+        serde_json::json!({"Literal": {"UInt": "Usize"}})
+    }
+
+    fn empty_generics() -> serde_json::Value {
+        serde_json::json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []})
+    }
+
+    fn unsigned_const(width: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {"Literal": {"Scalar": {"Unsigned": [width, text]}}},
+            "ty": u32_ty()
+        })
+    }
+
+    fn literal_init_body(value: &str) -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"Use": {"Const": unsigned_const("U32", value)}}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn add_init_body(lhs: &str, rhs: &str) -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"BinaryOp": [
+                            "Add",
+                            {"Const": unsigned_const("U32", lhs)},
+                            {"Const": unsigned_const("U32", rhs)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn call_init_body() -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": 2}},
+                            "generics": empty_generics()
+                        }},
+                        "args": [],
+                        "dest": {"kind": {"Local": 0}, "ty": ty}
+                    },
+                    "target": 1,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn unsigned_usize_const(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": {"Literal": {"Scalar": {"Unsigned": ["Usize", text]}}},
+            "ty": usize_ty()
+        })
+    }
+
+    fn size_of_fun(def_id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(&["core", "mem", "size_of"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "body": "Opaque"
+        })
+    }
+
+    fn init_usize_fun(def_id: u64, path: &[&str], body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+            "is_global_initializer": def_id,
+            "body": body
+        })
+    }
+
+    fn named_usize_const_global(
+        def_id: u64,
+        path: &[&str],
+        source_text: &str,
+        is_local: bool,
+        init: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, source_text, is_local),
+            "global_kind": "NamedConst",
+            "ty": usize_ty(),
+            "init": init
+        })
+    }
+
+    fn size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": size_of_id}},
+                            "generics": {
+                                "regions": [],
+                                "types": [ty],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }},
+                        "args": [],
+                        "dest": {"kind": {"Local": 0}, "ty": ty}
+                    },
+                    "target": 2,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn two_times_size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty},
+                {"index": 1, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": {"Regular": size_of_id}},
+                            "generics": {
+                                "regions": [],
+                                "types": [ty],
+                                "const_generics": [],
+                                "trait_refs": []
+                            }
+                        }},
+                        "args": [],
+                        "dest": {"kind": {"Local": 1}, "ty": ty}
+                    },
+                    "target": 1,
+                    "on_unwind": 1
+                }}}
+            }, {
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"BinaryOp": [
+                            "Mul",
+                            {"Const": unsigned_usize_const("2")},
+                            {"Copy": {"kind": {"Local": 1}, "ty": ty}}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn add_named_const_init_body(global_id: u64, rhs: &str) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 0}, "ty": ty},
+                        {"BinaryOp": [
+                            "Add",
+                            {"Copy": {"kind": {"Global": {
+                                "generics": empty_generics(),
+                                "id": global_id
+                            }}, "ty": ty}},
+                            {"Const": unsigned_usize_const(rhs)}
+                        ]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }]
+        }})
+    }
+
+    fn reader_usize_fun(path: &[&str], global_id: u64) -> serde_json::Value {
+        let ty = usize_ty();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": {"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
+                                "ty": ty
+                            }}}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn init_fun(def_id: u64, path: &[&str], body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": u32_ty()},
+            "is_global_initializer": def_id,
+            "body": body
+        })
+    }
+
+    fn named_const_global(
+        def_id: u64,
+        path: &[&str],
+        source_text: &str,
+        is_local: bool,
+        global_kind: &str,
+        init: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta_json(path, source_text, is_local),
+            "global_kind": global_kind,
+            "ty": u32_ty(),
+            "init": init
+        })
+    }
+
+    fn reader_fun(path: &[&str], global_id: u64) -> serde_json::Value {
+        let ty = u32_ty();
+        serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(path, "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": ty}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span_json(),
+                        "kind": {"Assign": [
+                            {"kind": {"Local": 0}, "ty": ty},
+                            {"Use": {"Copy": {
+                                "kind": {"Global": {"generics": empty_generics(), "id": global_id}},
+                                "ty": ty
+                            }}}
+                        ]}
+                    }],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        })
+    }
+
+    fn const_artifact(
+        crate_name: &str,
+        fun_decls: serde_json::Value,
+        global_decls: serde_json::Value,
+    ) -> Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": crate_name,
+                "type_decls": [],
+                "fun_decls": fun_decls,
+                "global_decls": global_decls,
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("const fixture Llbc parses")
+    }
+
+    fn folded_uints(graph: &crate::model::FunctionGraph) -> Vec<u64> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match op.kind {
+                OpKind::ConstUInt(n) => Some(n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn nullary_calls_ending(graph: &crate::model::FunctionGraph, leaf: &str) -> usize {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        ..
+                    } if args.is_empty() && segments.last().map(String::as_str) == Some(leaf)
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_harvests_named_const_literal() {
+        let path = ["pyre_object", "intobject", "W_INT_USER_GC_TYPE_ID"];
+        let defining = const_artifact(
+            "pyre_object",
+            serde_json::json!([null, init_fun(1, &path, literal_init_body("185"))]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const W_INT_USER_GC_TYPE_ID: u32 = 185;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        assert_eq!(
+            super::discover_foldable_const_lits(&defining),
+            vec![(
+                "pyre_object::intobject::W_INT_USER_GC_TYPE_ID".into(),
+                OpKind::ConstUInt(185)
+            )]
+        );
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_skips_thread_local_static_mut_and_call() {
+        let tl = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &["fixture", "TLS"], literal_init_body("1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["fixture", "TLS"],
+                    "thread_local!",
+                    true,
+                    "ThreadLocal",
+                    1
+                )
+            ]),
+        );
+        let static_mut = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &["fixture", "COUNTER"], literal_init_body("0"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["fixture", "COUNTER"],
+                    "pub static mut COUNTER: u32 = 0;",
+                    true,
+                    "Static",
+                    1
+                )
+            ]),
+        );
+        let call = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &["fixture", "COMPUTED"], call_init_body())
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["fixture", "COMPUTED"],
+                    "pub const COMPUTED: u32 = f();",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        assert!(super::discover_foldable_const_lits(&tl).is_empty());
+        assert!(super::discover_foldable_const_lits(&static_mut).is_empty());
+        assert!(super::discover_foldable_const_lits(&call).is_empty());
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_skips_non_unique_name_path() {
+        let path = ["fixture", "<Impl>", "CPYTHON_IMMUTABLETYPE"];
+        let shared = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_fun(1, &path, literal_init_body("1")),
+                init_fun(2, &path, literal_init_body("0"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "const CPYTHON_IMMUTABLETYPE: bool = true;",
+                    true,
+                    "NamedConst",
+                    1
+                ),
+                named_const_global(
+                    2,
+                    &path,
+                    "const CPYTHON_IMMUTABLETYPE: bool = false;",
+                    true,
+                    "NamedConst",
+                    2
+                )
+            ]),
+        );
+        assert!(super::discover_foldable_const_lits(&shared).is_empty());
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_harvests_size_of_usize() {
+        let path = ["fixture", "LOWLEVEL_STRING_LEN_OFFSET"];
+        let defining = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                init_usize_fun(1, &path, size_of_usize_init_body(2)),
+                size_of_fun(2)
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &path,
+                    "pub const LOWLEVEL_STRING_LEN_OFFSET: usize = size_of::<usize>();",
+                    true,
+                    1
+                )
+            ]),
+        );
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(
+            super::discover_foldable_const_lits(&defining),
+            vec![(
+                "fixture::LOWLEVEL_STRING_LEN_OFFSET".into(),
+                OpKind::ConstUInt(word)
+            )]
+        );
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_harvests_composed_size_of_arith() {
+        let chars_path = ["fixture", "LOWLEVEL_STRING_CHARS_OFFSET"];
+        let base_path = ["fixture", "LOWLEVEL_STR_BASE_SIZE"];
+        let defining = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                null,
+                size_of_fun(2),
+                init_usize_fun(3, &chars_path, two_times_size_of_usize_init_body(2)),
+                init_usize_fun(4, &base_path, add_named_const_init_body(1, "1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &chars_path,
+                    "pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * size_of::<usize>();",
+                    true,
+                    3
+                ),
+                named_usize_const_global(
+                    2,
+                    &base_path,
+                    "pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;",
+                    true,
+                    4
+                )
+            ]),
+        );
+        let word = crate::layout::target_word_size() as u64;
+        let harvested = super::discover_foldable_const_lits(&defining);
+        assert_eq!(
+            harvested,
+            vec![
+                (
+                    "fixture::LOWLEVEL_STRING_CHARS_OFFSET".into(),
+                    OpKind::ConstUInt(word * 2)
+                ),
+                (
+                    "fixture::LOWLEVEL_STR_BASE_SIZE".into(),
+                    OpKind::ConstUInt(word * 2 + 1)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_folds_foreign_composed_size_of() {
+        let chars_path = ["fixture", "LOWLEVEL_STRING_CHARS_OFFSET"];
+        let base_path = ["fixture", "LOWLEVEL_STR_BASE_SIZE"];
+        let defining = const_artifact(
+            "fixture",
+            serde_json::json!([
+                null,
+                null,
+                size_of_fun(2),
+                init_usize_fun(3, &chars_path, two_times_size_of_usize_init_body(2)),
+                init_usize_fun(4, &base_path, add_named_const_init_body(1, "1"))
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &chars_path,
+                    "pub const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * size_of::<usize>();",
+                    true,
+                    3
+                ),
+                named_usize_const_global(
+                    2,
+                    &base_path,
+                    "pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;",
+                    true,
+                    4
+                )
+            ]),
+        );
+        let mut opaque_init = init_usize_fun(1, &base_path, serde_json::json!("Opaque"));
+        opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
+        let dependent = const_artifact(
+            "dependent",
+            serde_json::json!([
+                reader_usize_fun(&["dependent", "read_base"], 1),
+                opaque_init
+            ]),
+            serde_json::json!([
+                null,
+                named_usize_const_global(
+                    1,
+                    &base_path,
+                    "pub const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;",
+                    false,
+                    1
+                )
+            ]),
+        );
+        let llbcs = [defining, dependent];
+        super::register_foldable_const_lits(Vec::new());
+        let unlinked = super::lower_function(&llbcs[1], "read_base").expect("unlinked lowers");
+        assert!(
+            folded_uints(&unlinked).is_empty(),
+            "a Foreign size_of-arith const without a harvest must not fold: {unlinked:?}"
+        );
+        assert_eq!(
+            nullary_calls_ending(&unlinked, "LOWLEVEL_STR_BASE_SIZE"),
+            1,
+            "the unlinked read stays a nullary call on the const path"
+        );
+
+        super::link_transparent_scalar_types(&llbcs);
+        let graph = super::lower_function(&llbcs[1], "read_base").expect("linked lowers");
+        let word = crate::layout::target_word_size() as u64;
+        assert_eq!(folded_uints(&graph), vec![word * 2 + 1]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "LOWLEVEL_STR_BASE_SIZE"),
+            0,
+            "the linked composed size_of read must not remain a nullary call: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_folds_foreign_global_to_literal() {
+        let path = ["pyre_object", "intobject", "W_INT_USER_GC_TYPE_ID"];
+        let defining = const_artifact(
+            "pyre_object",
+            serde_json::json!([null, init_fun(1, &path, literal_init_body("185"))]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const W_INT_USER_GC_TYPE_ID: u32 = 185;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        let mut opaque_init = init_fun(1, &path, serde_json::json!("Opaque"));
+        opaque_init["item_meta"]["is_local"] = serde_json::json!(false);
+        let dependent = const_artifact(
+            "pyre_interpreter",
+            serde_json::json!([reader_fun(&["pyre_interpreter", "read_id"], 1), opaque_init]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const W_INT_USER_GC_TYPE_ID: u32 = 185;",
+                    false,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        let llbcs = [defining, dependent];
+        super::register_foldable_const_lits(Vec::new());
+        let unlinked = super::lower_function(&llbcs[1], "read_id").expect("unlinked lowers");
+        assert!(
+            folded_uints(&unlinked).is_empty(),
+            "a Foreign const without a harvest must not fold: {unlinked:?}"
+        );
+        assert_eq!(
+            nullary_calls_ending(&unlinked, "W_INT_USER_GC_TYPE_ID"),
+            1,
+            "the unlinked read stays a nullary call on the const path"
+        );
+
+        super::link_transparent_scalar_types(&llbcs);
+        let graph = super::lower_function(&llbcs[1], "read_id").expect("linked lowers");
+        assert_eq!(folded_uints(&graph), vec![185]);
+        assert_eq!(
+            nullary_calls_ending(&graph, "W_INT_USER_GC_TYPE_ID"),
+            0,
+            "the linked read must not remain a nullary call: {graph:?}"
+        );
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_keys_the_full_name_path() {
+        let a = const_artifact(
+            "crate_a",
+            serde_json::json!([
+                null,
+                init_fun(1, &["crate_a", "SIZE"], literal_init_body("4"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["crate_a", "SIZE"],
+                    "pub const SIZE: u32 = 4;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        let b = const_artifact(
+            "crate_b",
+            serde_json::json!([
+                null,
+                init_fun(1, &["crate_b", "SIZE"], literal_init_body("8"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &["crate_b", "SIZE"],
+                    "pub const SIZE: u32 = 8;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        super::link_transparent_scalar_types(&[a, b]);
+        assert_eq!(
+            super::foldable_const_lit("crate_a::SIZE"),
+            Some(OpKind::ConstUInt(4))
+        );
+        assert_eq!(
+            super::foldable_const_lit("crate_b::SIZE"),
+            Some(OpKind::ConstUInt(8))
+        );
+        assert!(super::foldable_const_lit("SIZE").is_none());
+    }
+
+    #[test]
+    fn linked_foldable_const_lit_local_body_wins_over_linked() {
+        let path = ["fixture", "VALUE"];
+        let local = const_artifact(
+            "fixture",
+            serde_json::json!([
+                reader_fun(&["fixture", "read_value"], 1),
+                init_fun(1, &path, add_init_body("90", "9"))
+            ]),
+            serde_json::json!([
+                null,
+                named_const_global(
+                    1,
+                    &path,
+                    "pub const VALUE: u32 = 90 + 9;",
+                    true,
+                    "NamedConst",
+                    1
+                )
+            ]),
+        );
+        super::register_foldable_const_lits(vec![(
+            "fixture::VALUE".into(),
+            OpKind::ConstUInt(185),
+        )]);
+        let graph = super::lower_function(&local, "read_value").expect("local body lowers");
+        assert_eq!(folded_uints(&graph), vec![99]);
+        assert_eq!(nullary_calls_ending(&graph, "VALUE"), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "inconsistent linked definitions")]
+    fn register_foldable_const_lits_asserts_inconsistent_values() {
+        super::register_foldable_const_lits([
+            ("crate::SIZE".into(), OpKind::ConstUInt(4)),
+            ("crate::SIZE".into(), OpKind::ConstUInt(8)),
+        ]);
+    }
+
     /// The `Vec` index fold must accept a `usize` index.
     ///
     /// `usize` types as `Unsigned`, not `Int`, so gating on `Int` alone left

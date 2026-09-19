@@ -392,8 +392,28 @@ pub fn new_unary_math_function(
     }
 }
 
-/// The C llexternal an Opaque `f64` inherent method stands for, as
-/// `(arity, name)`.
+/// One Opaque `f64` inherent method the front remaps to an ll_math C
+/// llexternal.  The front emits `FunctionPath { segments: ["ll_math", name] }`;
+/// CallRegistry / extfuncregistry registration walks this table so the
+/// emitted path and the registered path cannot drift.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct F64MethodLlexternal {
+    /// Rust `f64` inherent-method leaf (`floor`, `powf`, `ln`, …).
+    pub method: &'static str,
+    /// Call-site arity after the front rewrites the method as a free
+    /// function (`f64::floor(self)` → 1, `f64::hypot(self, other)` → 2).
+    pub arity: usize,
+    /// Upstream llexternal name: `math_` + the C function.
+    pub name: &'static str,
+    /// `true` when the `ll_math_*` wrapper returns `Result<f64, MathError>`
+    /// rather than a bare `f64`.  The C llexternal itself, and the
+    /// front-emitted `FunctionPath` result, stay `f64` in either case
+    /// (`register_external(..., [float], float)` plus an error-raising
+    /// `llimpl`).
+    pub wrapper_raises: bool,
+}
+
+/// The C llexternal an Opaque `f64` inherent method stands for.
 ///
 /// Rust's `f64` methods are the same libm entry points upstream registers
 /// module-level here (`math_log = llexternal('log', ...)`, and one
@@ -402,39 +422,175 @@ pub fn new_unary_math_function(
 /// instead of an un-lowerable host call.  The names are the upstream ones,
 /// `math_` + the C function; `cbrt` and `exp2` have no upstream registration
 /// and follow the same scheme.
+pub const F64_METHOD_LLEXTERNALS: &[F64MethodLlexternal] = &[
+    // Explicit module-level registrations.
+    F64MethodLlexternal {
+        method: "hypot",
+        arity: 2,
+        name: "math_hypot",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "atan2",
+        arity: 2,
+        name: "math_atan2",
+        wrapper_raises: false,
+    },
+    F64MethodLlexternal {
+        method: "copysign",
+        arity: 2,
+        name: "math_copysign",
+        wrapper_raises: false,
+    },
+    F64MethodLlexternal {
+        method: "powf",
+        arity: 2,
+        name: "math_pow",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "floor",
+        arity: 1,
+        name: "math_floor",
+        wrapper_raises: false,
+    },
+    F64MethodLlexternal {
+        method: "ceil",
+        arity: 1,
+        name: "math_ceil",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "ln",
+        arity: 1,
+        name: "math_log",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "log10",
+        arity: 1,
+        name: "math_log10",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "ln_1p",
+        arity: 1,
+        name: "math_log1p",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "sqrt",
+        arity: 1,
+        name: "math_sqrt",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "sin",
+        arity: 1,
+        name: "math_sin",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "cos",
+        arity: 1,
+        name: "math_cos",
+        wrapper_raises: true,
+    },
+    // `unary_math_functions`.
+    F64MethodLlexternal {
+        method: "exp",
+        arity: 1,
+        name: "math_exp",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "acos",
+        arity: 1,
+        name: "math_acos",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "asin",
+        arity: 1,
+        name: "math_asin",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "atan",
+        arity: 1,
+        name: "math_atan",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "tan",
+        arity: 1,
+        name: "math_tan",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "cosh",
+        arity: 1,
+        name: "math_cosh",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "sinh",
+        arity: 1,
+        name: "math_sinh",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "tanh",
+        arity: 1,
+        name: "math_tanh",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "acosh",
+        arity: 1,
+        name: "math_acosh",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "asinh",
+        arity: 1,
+        name: "math_asinh",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "atanh",
+        arity: 1,
+        name: "math_atanh",
+        wrapper_raises: true,
+    },
+    F64MethodLlexternal {
+        method: "exp_m1",
+        arity: 1,
+        name: "math_expm1",
+        wrapper_raises: true,
+    },
+    // C99 libm entry points with no upstream registration.
+    F64MethodLlexternal {
+        method: "cbrt",
+        arity: 1,
+        name: "math_cbrt",
+        wrapper_raises: false,
+    },
+    F64MethodLlexternal {
+        method: "exp2",
+        arity: 1,
+        name: "math_exp2",
+        wrapper_raises: false,
+    },
+];
+
+/// The C llexternal an Opaque `f64` inherent method stands for, as
+/// `(arity, name)`.
 pub fn f64_method_llexternal(method: &str) -> Option<(usize, &'static str)> {
-    Some(match method {
-        // Explicit module-level registrations.
-        "hypot" => (2, "math_hypot"),
-        "atan2" => (2, "math_atan2"),
-        "copysign" => (2, "math_copysign"),
-        "powf" => (2, "math_pow"),
-        "floor" => (1, "math_floor"),
-        "ceil" => (1, "math_ceil"),
-        "ln" => (1, "math_log"),
-        "log10" => (1, "math_log10"),
-        "ln_1p" => (1, "math_log1p"),
-        "sqrt" => (1, "math_sqrt"),
-        "sin" => (1, "math_sin"),
-        "cos" => (1, "math_cos"),
-        // `unary_math_functions`.
-        "exp" => (1, "math_exp"),
-        "acos" => (1, "math_acos"),
-        "asin" => (1, "math_asin"),
-        "atan" => (1, "math_atan"),
-        "tan" => (1, "math_tan"),
-        "cosh" => (1, "math_cosh"),
-        "sinh" => (1, "math_sinh"),
-        "tanh" => (1, "math_tanh"),
-        "acosh" => (1, "math_acosh"),
-        "asinh" => (1, "math_asinh"),
-        "atanh" => (1, "math_atanh"),
-        "exp_m1" => (1, "math_expm1"),
-        // C99 libm entry points with no upstream registration.
-        "cbrt" => (1, "math_cbrt"),
-        "exp2" => (1, "math_exp2"),
-        _ => return None,
-    })
+    F64_METHOD_LLEXTERNALS
+        .iter()
+        .find(|row| row.method == method)
+        .map(|row| (row.arity, row.name))
 }
 
 pub(crate) fn _revdb_frexp(x: f64) -> (f64, i64) {
@@ -568,5 +724,55 @@ mod tests {
         // C99 libm names with no `unary_math_functions` registration.
         assert_eq!(f64_method_llexternal("cbrt"), Some((1, "math_cbrt")));
         assert_eq!(f64_method_llexternal("exp2"), Some((1, "math_exp2")));
+    }
+
+    #[test]
+    fn f64_method_llexternals_table_is_the_lookup_source() {
+        assert_eq!(F64_METHOD_LLEXTERNALS.len(), 26);
+        for row in F64_METHOD_LLEXTERNALS {
+            assert_eq!(
+                f64_method_llexternal(row.method),
+                Some((row.arity, row.name)),
+                "{}",
+                row.method
+            );
+            assert!(
+                row.arity == 1 || row.arity == 2,
+                "{}: llexternal arity is 1 or 2, not {}",
+                row.method,
+                row.arity
+            );
+        }
+    }
+
+    #[test]
+    fn ll_math_floor_and_ceil_keep_wrapper_return_asymmetry() {
+        // `ll_math_floor` is the C llexternal alias (`f64`); `ll_math_ceil`
+        // is a `new_unary_math_function` wrapper (`Result<f64, MathError>`).
+        // The front still emits both as `math_*` llexternals with an `f64`
+        // result; this pins that the wrappers themselves are not the same
+        // type, so a registration must not invent one signature for both.
+        let floor: f64 = ll_math_floor(1.5);
+        let ceil: Result<f64, MathError> = ll_math_ceil(1.5);
+        assert_eq!(floor, 1.0);
+        assert_eq!(ceil, Ok(2.0));
+        let floor_row = F64_METHOD_LLEXTERNALS
+            .iter()
+            .find(|row| row.name == "math_floor")
+            .expect("math_floor");
+        let ceil_row = F64_METHOD_LLEXTERNALS
+            .iter()
+            .find(|row| row.name == "math_ceil")
+            .expect("math_ceil");
+        assert!(!floor_row.wrapper_raises);
+        assert!(ceil_row.wrapper_raises);
+        assert_eq!(floor_row.arity, 1);
+        assert_eq!(ceil_row.arity, 1);
+        let hypot_row = F64_METHOD_LLEXTERNALS
+            .iter()
+            .find(|row| row.name == "math_hypot")
+            .expect("math_hypot");
+        assert_eq!(hypot_row.arity, 2);
+        assert!(hypot_row.wrapper_raises);
     }
 }

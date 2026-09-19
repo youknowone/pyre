@@ -1017,8 +1017,9 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
             args,
             ..
         } if nonraising_core_bridge_opname(segments, args.len()).is_some() => false,
-        // `__strlen` lowers (in `translate_op`) to the same `len` op as
-        // `ArrayLen` on a string-byte-view; `len` raises nothing.
+        // `__strlen` is the Skip-spine `strlen` blackhole marker
+        // (`jtransform.rs`); that op raises nothing.  It is not rewritten
+        // to `len` here — see `is_len_op`.
         OpKind::Call {
             target: crate::model::CallTarget::FunctionPath { segments, .. },
             args,
@@ -2429,27 +2430,41 @@ pub fn translate_op(
                             FlowspaceOp::new("simple_call", vec![bound_method], result),
                         ]);
                     }
-                    // The `len` operation in its four spellings: the
+                    // The `len` operation in its three spellings: the
                     // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
                     // (and the `<str>::is_empty` decomposition) to; the
-                    // `__strlen` synthetic the same front plants when the
-                    // place is a string-byte-view (`as_bytes().len()`);
-                    // the slice-receiver `core::slice::<Impl>::len`; and
-                    // the `<str>::len` method.  Rust lowers `slice.len()` /
+                    // slice-receiver `core::slice::<Impl>::len`; and the
+                    // `<str>::len` method.  Rust lowers `slice.len()` /
                     // `s.len()` to MIR calls to those intrinsics, which
-                    // have no source body to register.  Route all four to
+                    // have no source body to register.  Route all three to
                     // the rtyper's `len` operation (`rtyper.rs "len"
                     // arm` → `Repr.rtype_len`), the same dispatch upstream
                     // `op.len(v)` reaches via `unaryop.py`.  The
                     // rtyper dispatches on the receiver repr: a slice maps
-                    // to `SomeList` (`ll_length`), a `&str` / byte-view to
-                    // `SomeString` (`StringRepr.rtype_len` → `ll_strlen`).
-                    // The helper is registered as an opname graph and
-                    // lowered to the `strlen`/`arraylen_gc` blackhole op
+                    // to `SomeList` (`ll_length`), a `&str` to `SomeString`
+                    // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
+                    // is registered as an opname graph and lowered to the
+                    // `strlen`/`arraylen_gc` blackhole op
                     // (`codewriter::jtransform_opname::lower_graph`), so
                     // these are real `len` ops, not symbolic residuals.
-                    let is_len_op = (segments.len() == 1
-                        && (segments[0] == "__len" || segments[0] == "__strlen"))
+                    //
+                    // `__strlen` is a fourth frontend spelling
+                    // (`front/mir.rs` plants it for `Rvalue::Len` /
+                    // `slice::len` / `Wtf8::len` on a
+                    // `string_byte_view_locals` place).  It is the Skip
+                    // spine's `strlen` blackhole marker, not a `len` op:
+                    // routing it through `len` while the receiver is
+                    // still `SomeInstance(pyobject::PyObject)` dispatches
+                    // `InstanceRepr` (no `rtype_len`) and the annotator's
+                    // `len_SomeInstance` would take `getattr(__len__)` —
+                    // the code-point length, not WTF-8 bytes.  The
+                    // `w_str_get_wtf8` dest is now a `ValueType::Str`
+                    // projection (`__cast_instance_intrinsic` string
+                    // root); `__strlen` stays a name of its own so Skip
+                    // and rtyper do not silently rewrite it.  See
+                    // `strlen_on_w_str_get_wtf8_identity_alias_receiver_is_instance_not_string`
+                    // and `w_str_get_wtf8_cast_projects_dest_as_somestring`.
+                    let is_len_op = (segments.len() == 1 && segments[0] == "__len")
                         || (segments.len() == 4
                             && segments[0] == "core"
                             && segments[1] == "slice"
@@ -5321,6 +5336,299 @@ mod tests {
     }
 
     #[test]
+    fn strlen_on_w_str_get_wtf8_identity_alias_receiver_is_instance_not_string() {
+        // `w_str_get_wtf8(obj)` is `alias_dest_to_arg0(dest, args[0], true)`
+        // (`front/mir.rs`).  The rtyper graph therefore has no
+        // `w_str_get_wtf8` call: dest is `obj`, and a later length on the
+        // marked byte view plants `Call(["__strlen"], [obj])`.  Pin the
+        // annotation / repr at that argument — `AbstractStringRepr.rtype_len`
+        // → `ll_strlen` (`rstr.py`) is only honest if it is `SomeString`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::translator::rtyper::pairtype::ReprClassId;
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
+
+        let mut graph = LegacyGraph::new("strlen_wtf8_identity_alias");
+        let vars = mint_vars(&mut graph, 4);
+        let obj = vars[1].clone();
+        let len_result = vars[2].clone();
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(obj.clone()),
+                    kind: OpKind::Input {
+                        name: "obj".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some("PyObject".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(len_result.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: vec!["__strlen".to_string()],
+                        },
+                        args: crate::model::call_args(vec![obj.clone()]),
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(len_result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        fields.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("PyObject Input must seed a SomeValue cell");
+        let SomeValue::Instance(inst) = &cells[0] else {
+            panic!(
+                "w_str_get_wtf8 identity-alias receiver must be SomeInstance, got {:?}",
+                cells[0]
+            );
+        };
+        assert!(
+            !matches!(cells[0], SomeValue::String(_)),
+            "identity-alias of w_str_get_wtf8(obj) must not seed SomeString"
+        );
+        let classdef = inst
+            .classdef
+            .as_ref()
+            .expect("PyObject class_root must populate classdef");
+        assert_eq!(classdef.borrow().name, "PyObject");
+
+        let pyobject_ref = bk.project_struct_field_type("PyObjectRef");
+        assert!(
+            matches!(pyobject_ref, SomeValue::Instance(_)),
+            "PyObjectRef projects to SomeInstance(pyobject::PyObject), got {pyobject_ref:?}"
+        );
+        assert!(
+            !matches!(pyobject_ref, SomeValue::String(_)),
+            "PyObjectRef must not project to SomeString"
+        );
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        value_map.insert(obj.clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(len_result.clone(), Hlvalue::Variable(Variable::new()));
+        let strlen_op = SpaceOperation {
+            result: Some(len_result.clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__strlen".to_string()],
+                },
+                args: crate::model::call_args(vec![obj.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let err = translate_op(&strlen_op, &value_map, &empty_call_registry())
+            .expect_err("__strlen is not a registered call and not a len op");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not registered in CallRegistry") && msg.contains("__strlen"),
+            "rtyper spine must not silently rewrite __strlen, got: {msg}"
+        );
+
+        // Contrast: the existing `__len` spelling is the rtyper `len` op.
+        let len_op = SpaceOperation {
+            result: Some(len_result.clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__len".to_string()],
+                },
+                args: crate::model::call_args(vec![obj.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&len_op, &value_map, &empty_call_registry())
+            .expect("__len is the existing len spelling");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "len");
+
+        let ann = RPythonAnnotator::new(None, None, Some(bk.clone()), false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("exceptiondata for getinstancerepr");
+        let repr = rtyper
+            .getrepr(&cells[0])
+            .expect("SomeInstance(PyObject) must make InstanceRepr");
+        assert_eq!(Repr::class_name(repr.as_ref()), "InstanceRepr");
+        assert_eq!(
+            Repr::repr_class_id(repr.as_ref()),
+            ReprClassId::InstanceRepr
+        );
+        assert_ne!(Repr::repr_class_id(repr.as_ref()), ReprClassId::StringRepr);
+
+        let spaceop = crate::flowspace::model::SpaceOperation::new(
+            crate::flowspace::operation::OpKind::Len.opname(),
+            vec![],
+            Hlvalue::Variable(Variable::new()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        let err = Repr::rtype_len(repr.as_ref(), &hop).expect_err("InstanceRepr has no rtype_len");
+        assert!(err.is_missing_rtype_operation());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unimplemented operation: 'len'"),
+            "InstanceRepr.rtype_len must be the Repr default, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn w_str_get_wtf8_cast_projects_dest_as_somestring() {
+        // `w_str_get_wtf8(obj)` emits
+        // `cast_instance_call_result("Wtf8", obj, ValueType::Str)`
+        // (`front/mir.rs`), not `alias_dest_to_arg0`.  Dest is a new
+        // Variable whose annotation is SomeString; obj stays
+        // SomeInstance(PyObject).  StringRepr.rtype_len → ll_strlen is
+        // then the honest length of that dest.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeInstance;
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::pairtype::ReprClassId;
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+
+        let mut graph = LegacyGraph::new("w_str_get_wtf8_str_projection");
+        let vars = mint_vars(&mut graph, 4);
+        let obj = vars[1].clone();
+        let dest = vars[2].clone();
+        let cast = crate::model::cast_instance_call_result("Wtf8", obj.clone(), ValueType::Str);
+        assert_eq!(
+            crate::model::cast_instance_root(&cast),
+            Some("Wtf8"),
+            "the producer root is the Wtf8 return of w_str_get_wtf8"
+        );
+        let OpKind::Call { result_ty, .. } = &cast else {
+            panic!("cast_instance_call_result must be a Call");
+        };
+        assert_eq!(
+            result_ty,
+            &ValueType::Str,
+            "dest must be painted ValueType::Str, not the receiver Ref"
+        );
+
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(obj.clone()),
+                    kind: OpKind::Input {
+                        name: "obj".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: Some("PyObject".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(dest.clone()),
+                    kind: cast,
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(dest.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("PyObject Input must seed a SomeValue cell");
+        assert!(
+            matches!(&cells[0], SomeValue::Instance(_)),
+            "the receiver stays SomeInstance, got {:?}",
+            cells[0]
+        );
+
+        let s_obj = SomeValue::Instance(SomeInstance::new(
+            Some(ClassDef::new_standalone("pyobject::PyObject", None)),
+            false,
+            Default::default(),
+        ));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("Wtf8"))
+            .expect("Wtf8 root constant");
+        let s_dest = crate::annotator::builtin::call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_obj), Some(s_root)],
+            &std::collections::HashMap::new(),
+        )
+        .expect("string-root cast must accept a PyObject instance");
+        assert!(
+            matches!(s_dest, SomeValue::String(_)),
+            "w_str_get_wtf8 dest must annotate SomeString, got {s_dest:?}"
+        );
+
+        let shell = valuetype_to_someshell(&ValueType::Str).expect("Str projects");
+        assert!(
+            matches!(shell, SomeValue::String(_)),
+            "ValueType::Str seeds SomeString, got {shell:?}"
+        );
+
+        let ann = RPythonAnnotator::new(None, None, Some(bk.clone()), false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("exceptiondata for getrepr");
+        let repr = rtyper
+            .getrepr(&s_dest)
+            .expect("SomeString must make StringRepr");
+        assert_eq!(Repr::class_name(repr.as_ref()), "StringRepr");
+        assert_eq!(Repr::repr_class_id(repr.as_ref()), ReprClassId::StringRepr);
+        assert_ne!(Repr::repr_class_id(repr.as_ref()), ReprClassId::InstanceRepr);
+    }
+
+    #[test]
     fn translate_op_skips_const_int_define() {
         let value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
@@ -6852,12 +7160,13 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_strlen_marker_lowers_to_len() {
+    fn translate_op_strlen_marker_is_not_a_len_op() {
         // `front::mir` rewrites `Rvalue::Len` / `<[u8]>::len` on a string
-        // byte-view to `Call(["__strlen"])`.  That is the same length
-        // read as `__len` / `ArrayLen`: the rtyper's `len` operation,
-        // which `StringRepr.rtype_len` lowers to `ll_strlen`.  It must
-        // not look up an unregistered CallRegistry path.
+        // byte-view to `Call(["__strlen"])`.  That marker belongs to the
+        // Skip spine (`jtransform.rs` `strlen` blackhole), not the rtyper
+        // `len` arm: rewriting it here would send a `SomeInstance`
+        // receiver through `len_SomeInstance` (`unaryop.py`) and take
+        // `getattr(__len__)` — code-point length, not WTF-8 bytes.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 3);
@@ -6874,11 +7183,13 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("__strlen marker must lower to len");
-        assert_eq!(translated.len(), 1);
-        assert_eq!(translated[0].opname, "len");
-        assert_eq!(translated[0].args.len(), 1);
+        let err = translate_op(&op, &value_map, &empty_call_registry())
+            .expect_err("__strlen is not a registered call and not a len op");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not registered in CallRegistry") && msg.contains("__strlen"),
+            "rtyper spine must not silently rewrite __strlen, got: {msg}"
+        );
         assert!(!op_canraise(&op.kind));
     }
 
