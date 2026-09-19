@@ -781,12 +781,9 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
             // both `set` and every not-yet-processed item.
             let items = crate::builtins::collect_iterable(iterable)?;
             let _roots = pyre_object::gc_roots::push_roots();
-            let sp = pyre_object::gc_roots::shadow_stack_len();
-            let set = pyre_object::gc_roots::pin_root(set);
-            let item_base = sp + 1;
-            for item in items {
-                let _ = pyre_object::gc_roots::pin_root(item);
-            }
+            let sp = pyre_object::gc_roots::publish_roots(&[set]);
+            let item_base = pyre_object::gc_roots::publish_roots(&items);
+            pyre_object::gc_roots::normalize_roots(sp, 1 + items.len());
             let item_len = pyre_object::gc_roots::shadow_stack_len() - item_base;
             for i in 0..item_len {
                 let item = pyre_object::gc_roots::shadow_stack_get(item_base + i);
@@ -1047,10 +1044,7 @@ pub fn dict_merge_value(
     let _ = pyre_object::gc_roots::pin_root(keys_obj);
     let keys =
         crate::builtins::collect_iterable(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
-    let keys_base = pyre_object::gc_roots::shadow_stack_len();
-    for &key in &keys {
-        let _ = pyre_object::gc_roots::pin_root(key);
-    }
+    let keys_base = pyre_object::gc_roots::pin_roots(&keys);
     for index in 0..keys.len() {
         let key = || pyre_object::gc_roots::shadow_stack_get(keys_base + index);
         let val = crate::baseobjspace::getitem(source(), key())?;

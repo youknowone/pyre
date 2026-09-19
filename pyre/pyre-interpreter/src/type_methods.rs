@@ -640,10 +640,10 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // keeps list(set) from observing a concurrent size transition
             // between iterator steps.
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let list = pyre_object::gc_roots::pin_root(list);
+            let root_base = pyre_object::gc_roots::publish_roots(&[list]);
             let items = pyre_object::w_set_items(other);
-            pyre_object::gc_roots::pin_roots(&items);
+            let _ = pyre_object::gc_roots::publish_roots(&items);
+            pyre_object::gc_roots::normalize_roots(root_base, 1 + items.len());
             pyre_object::listobject::w_list_resize_for_extend(
                 pyre_object::gc_roots::shadow_stack_get(root_base),
                 items.len(),
@@ -663,8 +663,7 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             // exception from a later `next()` does not roll back the prefix.
             let _roots = pyre_object::gc_roots::push_roots();
             let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(list);
-            let _ = pyre_object::gc_roots::pin_root(other);
+            let _ = pyre_object::gc_roots::pin_roots(&[list, other]);
             // CPython 3.14 `list_extend_iter_lock_held` obtains the iterator
             // before asking the original iterable for its length hint.
             let iterator =
@@ -3525,10 +3524,8 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
         && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
     {
         let _roots = pyre_object::gc_roots::push_roots();
-        let val_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(val);
-        let meth_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(meth);
+        let val_slot = pyre_object::gc_roots::pin_roots(&[val, meth]);
+        let meth_slot = val_slot + 1;
         let spec_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(
             spec.to_wtf8_buf(),
@@ -6647,9 +6644,8 @@ unsafe fn set_lookup_checked(
     ) -> Result<bool, pyre_object::dictmultiobject::DictKeyError>,
 ) -> Result<bool, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(item);
-    let set = pyre_object::gc_roots::pin_root(set);
+    let sp = pyre_object::gc_roots::pin_roots(&[item, set]);
+    let set = pyre_object::gc_roots::shadow_stack_get(sp + 1);
     let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp))
         .map_err(|err| {
             crate::baseobjspace::wrap_set_element_hash_error(
@@ -6933,9 +6929,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
     // otherwise-unreachable destination dict can be swept while this Rust
     // frame still holds its raw pointer.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(dict);
-    let _ = pyre_object::gc_roots::pin_root(w_data);
+    let root_base = pyre_object::gc_roots::pin_roots(&[dict, w_data]);
     let dict = || pyre_object::gc_roots::shadow_stack_get(root_base);
     let data = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
     unsafe {
@@ -6993,9 +6987,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                         break;
                     };
                     let _iteration_roots = pyre_object::gc_roots::push_roots();
-                    let iteration_roots = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(k);
-                    let _ = pyre_object::gc_roots::pin_root(v);
+                    let iteration_roots = pyre_object::gc_roots::pin_roots(&[k, v]);
                     let k = pyre_object::gc_roots::shadow_stack_get(iteration_roots);
                     let v = pyre_object::gc_roots::shadow_stack_get(iteration_roots + 1);
                     match hashed {
@@ -7027,10 +7019,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 // `dictmultiobject.py update1_keys`
                 let w_keys_view = crate::call::call_function_impl_result(w_method, &[])?;
                 let keys = crate::builtins::collect_iterable(w_keys_view)?;
-                let keys_base = pyre_object::gc_roots::shadow_stack_len();
-                for &key in &keys {
-                    let _ = pyre_object::gc_roots::pin_root(key);
-                }
+                let keys_base = pyre_object::gc_roots::pin_roots(&keys);
                 for i in 0..keys.len() {
                     let k = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
                     let v = crate::baseobjspace::getitem(data(), k)?;
@@ -7045,10 +7034,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 // `merge_from_seq2_lock_held`'s PySequence_Fast error/note
                 // semantics where the versions differ.
                 let pairs = crate::builtins::collect_iterable(data())?;
-                let pairs_base = pyre_object::gc_roots::shadow_stack_len();
-                for &pair in &pairs {
-                    let _ = pyre_object::gc_roots::pin_root(pair);
-                }
+                let pairs_base = pyre_object::gc_roots::pin_roots(&pairs);
                 for idx in 0..pairs.len() {
                     let pair = pyre_object::gc_roots::shadow_stack_get(pairs_base + idx);
                     let entries = dict_update_pair_entries(pair, idx)?;
@@ -7058,9 +7044,7 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                             entries.len()
                         )));
                     }
-                    let entry_base = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(entries[0]);
-                    let _ = pyre_object::gc_roots::pin_root(entries[1]);
+                    let entry_base = pyre_object::gc_roots::pin_roots(&[entries[0], entries[1]]);
                     let k = pyre_object::gc_roots::shadow_stack_get(entry_base);
                     let v = pyre_object::gc_roots::shadow_stack_get(entry_base + 1);
                     dict_store_checked(dict(), k, v)?;

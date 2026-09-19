@@ -1219,13 +1219,15 @@ pub(crate) mod gc_box {
     }
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
-    /// Returns the installation id the matching [`ActiveGcBox`] must present
-    /// to uninstall. A previous box is forgotten, not dropped
-    /// (`replace_singleton_leaking_old`).
-    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> u64 {
+    /// Returns `(generation, installed)`: the installation id the matching
+    /// [`ActiveGcBox`] must present to uninstall, and whether the TLS slot
+    /// was empty (a new live box, not a replacement). A previous box is
+    /// forgotten, not dropped (`replace_singleton_leaking_old`).
+    pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> (u64, bool) {
         let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
-        WASM_ACTIVE_GC.with(|cell| {
+        let installed = WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
+            let installed = guard.0.is_none();
             if let Some(old) = guard.0.take() {
                 std::mem::forget(old);
             }
@@ -1233,8 +1235,9 @@ pub(crate) mod gc_box {
             let raw = guard.0.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
             WASM_ACTIVE_GC_GEN.with(|slot| slot.set(generation));
+            installed
         });
-        generation
+        (generation, installed)
     }
 
     /// Uninstall this thread's box without freeing its nursery.
@@ -1244,22 +1247,25 @@ pub(crate) mod gc_box {
     /// itself is leaked: `gc_sync::replace_singleton_leaking_old`
     /// — a dropped nursery's pages return to the OS and ExtraHeap /
     /// InputArg slabs reuse them, smashing their mutex words.
-    pub(crate) fn clear() {
+    /// Returns `true` when a box was actually removed.
+    pub(crate) fn clear() -> bool {
         WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
         WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
         WASM_ACTIVE_GC.with(|cell| {
             if let Some(gc) = cell.borrow_mut().0.take() {
                 std::mem::forget(gc);
+                true
+            } else {
+                false
             }
-        });
+        })
     }
 
     /// [`clear`] only when `generation` is still the live installation.
     pub(crate) fn clear_if_generation(generation: u64) -> bool {
         let live = WASM_ACTIVE_GC_GEN.with(|slot| slot.get());
         if live == generation && generation != 0 {
-            clear();
-            true
+            clear()
         } else {
             false
         }
@@ -1400,8 +1406,10 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    let generation = gc_box::store(gc);
-    WASM_GC_BOXES.fetch_add(1, Ordering::Release);
+    let (generation, installed) = gc_box::store(gc);
+    if installed {
+        WASM_GC_BOXES.fetch_add(1, Ordering::Release);
+    }
     register_active_hooks(supports_guard_gc_type);
     ActiveGcBox { generation }
 }
@@ -1415,7 +1423,9 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) -> ActiveGcBox {
 /// leftover MiniMark would otherwise treat a test `GcRef` token as a heap
 /// pointer. `install_gc_box` reinstalls the hooks.
 pub fn clear_gc_allocator() {
-    gc_box::clear();
+    if !gc_box::clear() {
+        return;
+    }
     withdraw_root_hooks_if_last_box();
 }
 

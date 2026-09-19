@@ -5957,9 +5957,7 @@ pub(crate) fn or_impl(a: PyObjectRef, b: PyObjectRef, symbol: &str) -> PyResult 
             // snapshots are bare locals no root walker scans; `dict_update1`
             // already brackets its own operands for that reason.
             let _roots = pyre_object::gc_roots::push_roots();
-            let root_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(a);
-            let _ = pyre_object::gc_roots::pin_root(b);
+            let root_base = pyre_object::gc_roots::pin_roots(&[a, b]);
             let src = || pyre_object::gc_roots::shadow_stack_get(root_base);
             let other = || pyre_object::gc_roots::shadow_stack_get(root_base + 1);
             let merged = || pyre_object::gc_roots::shadow_stack_get(root_base + 2);

@@ -806,10 +806,8 @@ fn call_codec(
 ) -> Result<PyObjectRef, crate::PyError> {
     // PyPy `interp_codecs.py _call_codec`.
     let roots = pyre_object::gc_roots::push_roots();
-    let coder_slot = roots.base();
-    let _ = roots.pin_root(w_coder);
+    let coder_slot = roots.pin_roots(&[w_coder, w_obj]);
     let obj_slot = coder_slot + 1;
-    let _ = roots.pin_root(w_obj);
     let call = if let Some(errors) = errors {
         let err_slot = coder_slot + 2;
         let _ = roots.pin_root(w_str_new_managed(errors));
@@ -1270,9 +1268,7 @@ fn charmap_encode_impl(
     // The code points are copied out above, so only the two objects have to
     // survive the collections a table read or a handler call can trigger.
     let _roots = pyre_object::gc_roots::push_roots();
-    let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_unicode);
-    let _ = pyre_object::gc_roots::pin_root(w_mapping);
+    let sp = pyre_object::gc_roots::pin_roots(&[w_unicode, w_mapping]);
     let mut i = 0usize;
     while i < char_len {
         if charmap_output(

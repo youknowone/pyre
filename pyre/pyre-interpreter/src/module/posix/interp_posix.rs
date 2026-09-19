@@ -3959,10 +3959,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "utime: divmod() returned a non-pair",
                 ));
             };
-            let sec_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_sec);
-            let nsec_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_nsec);
+            // Both words are already live; publish them together so the
+            // first normalize cannot move `w_nsec` before it is a root.
+            let sec_slot = pyre_object::gc_roots::pin_roots(&[w_sec, w_nsec]);
+            let nsec_slot = sec_slot + 1;
             // Python's own `//` and `%`, so a negative count of nanoseconds
             // lands on the second below it with a positive remainder.
             //
@@ -10374,16 +10374,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // keyword dictionary the remaining options are looked up in.
                 // Publish them once and read each back at its use.
                 let _roots = pyre_object::gc_roots::push_roots();
-                let positional_base = pyre_object::gc_roots::pin_roots(&[
+                let positional_base = pyre_object::gc_roots::publish_roots(&[
                     bound[0].expect("path is required"),
                     bound[1].expect("argv is required"),
                     bound[2].expect("env is required"),
                 ]);
-                let kwargs_slot = kwargs.map(|kwargs| {
-                    let slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(kwargs);
-                    slot
-                });
+                let kwargs_slot = kwargs.map(|kwargs| pyre_object::gc_roots::publish_roots(&[kwargs]));
+                pyre_object::gc_roots::normalize_roots(
+                    positional_base,
+                    3 + usize::from(kwargs_slot.is_some()),
+                );
                 let positional =
                     |index: usize| pyre_object::gc_roots::shadow_stack_get(positional_base + index);
                 let kwargs = || kwargs_slot.map(pyre_object::gc_roots::shadow_stack_get);
