@@ -1518,8 +1518,13 @@ impl W_Struct {
     /// `_immutable_fields_`).
     fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
         self.ensure_ready()?;
-        let left = w_str_new("Struct('");
-        let right = w_str_new("')");
+        // The delimiters are constants, so they are interned rather than built
+        // per call: `w_str_new` allocates an immortal header and payload, and
+        // `w_str_concat` reclaims neither of its inputs, so constructing them
+        // here grew the heap on every `repr()`.  The interned objects are
+        // allocated once and rooted by the table.
+        let left = pyre_object::intern_str_value("Struct('");
+        let right = pyre_object::intern_str_value("')");
         Ok(unsafe { w_str_concat(w_str_concat(left, self.format), right) })
     }
 
