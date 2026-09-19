@@ -1261,6 +1261,8 @@ fn real_main() {
     let static_pytype_by_struct = pyre_interpreter::pyre_class_pytype_by_struct_addrs();
     let static_ref_addrs = pyre_interpreter::jit_static_ref_addrs();
     let static_int_values = pyre_interpreter::jit_static_int_values();
+    majit_translate::assembler::intern_type_static_addrs(&static_pytype_addrs);
+    majit_translate::assembler::intern_type_static_addrs(&static_pytype_by_struct);
     let static_addrs = majit_translate::HostStaticAddrs {
         pytypes: &static_pytype_addrs,
         pytypes_by_struct: &static_pytype_by_struct,

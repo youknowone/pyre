@@ -95,6 +95,21 @@ pub struct UnitVariantConstDescriptor {
     pub tag: i64,
 }
 
+/// A host `PyType` singleton (`INT_TYPE`, `FLOAT_TYPE`, …) whose runtime
+/// address is written at jitcode-load time.  The translator and the
+/// runtime are different processes, so a baked `&INT_TYPE` is
+/// translator-local; the slot holds a non-canonical sentinel until the
+/// load pass overwrites it with the live static.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TypeStaticConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
+    /// the runtime load pass overwrites with the live type-static address.
+    pub constants_r_index: usize,
+    /// The shared name from `HostStaticAddrs.pytypes` /
+    /// `jit_static_pytype_addrs` — the runtime re-pairs by this key.
+    pub name: String,
+}
+
 /// Body of a `JitCode` — populated once by the assembler after
 /// `transform_graph_to_jitcode` runs the full codewriter pipeline.
 ///
@@ -227,6 +242,13 @@ pub struct JitCodeBody {
     /// carrying the variant's discriminant.  Default empty.
     #[serde(default)]
     pub unit_variant_consts: Vec<UnitVariantConstDescriptor>,
+    /// Host `PyType` singleton constants deferred to runtime
+    /// materialization — [`Self::str_consts`]' shape for type statics:
+    /// each entry names a `constants_r` slot holding a non-canonical
+    /// sentinel the load pass overwrites with the live `&INT_TYPE` (etc.).
+    /// Default empty.
+    #[serde(default)]
+    pub type_static_consts: Vec<TypeStaticConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not
