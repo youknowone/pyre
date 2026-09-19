@@ -63,7 +63,7 @@ pub mod _typing;
 pub mod _warnings;
 pub mod _weakref;
 #[allow(non_snake_case)]
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 pub mod _winapi;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _wmi;

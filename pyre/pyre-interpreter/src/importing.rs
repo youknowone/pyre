@@ -699,7 +699,9 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_warnings);
     // `sys.platform == "win32"` sends shutil (and so tempfile) through the
     // `_winapi` import even though the Windows build installs `posix`.
-    #[cfg(windows)]
+    // The module is the host Win32 surface, so it is present only with
+    // `host_env`, like `msvcrt`.
+    #[cfg(all(windows, feature = "host_env"))]
     pyre_install_module!(_winapi);
     // CPython's private `_wmi` module reaches the local WMI service through
     // COM and is therefore present only on an unsandboxed Windows host.

@@ -1,8 +1,8 @@
 //! The half of `_winapi` that `rustpython_host_env::winapi` backs.
 //!
-//! Split off from [`super`] because it needs the `host_env` layer, which the
-//! module as a whole does not: without it `_winapi` still answers with its
-//! constants and the handful of calls made straight against `windows-sys`.
+//! Split off from [`super`] so the named-pipe, event, mutex, file-mapping,
+//! path and locale calls stay in one place.  The module is compiled only
+//! with `host_env`.
 //!
 //! Each function is registered by hand at the end rather than through
 //! `py_module!`'s `inline_functions`, which cannot be compiled conditionally.
