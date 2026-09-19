@@ -87,6 +87,16 @@ pub type Bytecode = [u8];
 pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static LAST_OPS_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Shape of the last compiled loop body — see [`majit_metainterp::LoopBodyShape`].
+///
+/// Held as two flags rather than the struct itself so the recording stays
+/// lock-free on the compile path; the probe rebuilds the struct inside the same
+/// lock window it reads the counters in, because this is as process-global as
+/// they are.
+pub static LAST_HAS_JUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static LAST_ALWAYS_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[expect(
     dead_code,
     reason = "the jit_interp macro resolves bytecode reads through this trait surface"
@@ -116,9 +126,12 @@ impl BytecodeExt for [u8] {
 fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<Tiny3State> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, _opcodes| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
         COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         LAST_OPS_AFTER.store(ops_after, std::sync::atomic::Ordering::Relaxed);
+        let shape = majit_metainterp::LoopBodyShape::of(opcodes);
+        LAST_HAS_JUMP.store(shape.has_jump, std::sync::atomic::Ordering::Relaxed);
+        LAST_ALWAYS_FAILS.store(shape.has_always_fails, std::sync::atomic::Ordering::Relaxed);
     });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
@@ -136,11 +149,7 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     }
 
     while pc < program.len() {
-        // Still the bare observer/replay form. The single-executor
-        // `jit_merge_point!(driver, program, pc; state)` conversion does not
-        // hold for this interpreter yet, and `trip_count_gate` below is the
-        // permanent assertion that says so — see its second doc paragraph.
-        jit_merge_point!();
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         pc += 1;
 
@@ -361,7 +370,7 @@ mod tests {
     use majit_metainterp::{RefusalKind, refusal_kind};
 
     /// Serializes every JIT entry in this module, so the `COMPILES` window in
-    /// [`jit_tier_is_inert_pending_arm_lowering`] cannot be written by another
+    /// [`jit_tier_is_alive`] cannot be written by another
     /// test running concurrently. The counters are process-wide, and libtest
     /// runs these tests in parallel by default.
     ///
@@ -387,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_tier_is_inert_pending_arm_lowering() {
+    fn jit_tier_is_alive() {
         use std::sync::atomic::Ordering;
 
         const N: i64 = 1001;
@@ -398,8 +407,16 @@ mod tests {
         // would take the plain mutex twice on one thread and deadlock.
         let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
+        LAST_OPS_AFTER.store(0, Ordering::Relaxed);
+        LAST_HAS_JUMP.store(false, Ordering::Relaxed);
+        LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
         let got = mainloop(&compile(&words), 0, 3);
         let compiles = COMPILES.load(Ordering::Relaxed);
+        let ops_after = LAST_OPS_AFTER.load(Ordering::Relaxed);
+        let shape = majit_metainterp::LoopBodyShape {
+            has_jump: LAST_HAS_JUMP.load(Ordering::Relaxed),
+            has_always_fails: LAST_ALWAYS_FAILS.load(Ordering::Relaxed),
+        };
         assert_eq!(got, N, "the interpreter's own trip count moved");
 
         // Read after the run: nothing installs the dispatch JitCode until the
@@ -423,43 +440,33 @@ mod tests {
         causes.sort_unstable();
         assert_eq!(
             causes,
-            [
-                ("OP_PUSH_FLOAT", RefusalKind::UnlowerableStmt),
-                ("OP_PUSH_INT", RefusalKind::UnlowerableStmt),
-            ],
+            Vec::<(&str, RefusalKind)>::new(),
             "a degraded arm's cause moved while its name did not — a different \
              mechanism is refusing it now"
         );
-        // Both arms are refused for the same statement, the widening read of the
-        // operand bytes. Substring, not the whole reason: the macro renders the
-        // snippet with its own token spacing.
-        for a in &t3_arms {
-            assert!(
-                a.reason.contains("from_le_bytes"),
-                "{}'s refusal no longer names the `from_le_bytes` operand read: {}",
-                a.arm,
-                a.reason
-            );
-        }
 
         assert_eq!(
             degraded,
-            ["OP_PUSH_FLOAT", "OP_PUSH_INT"],
-            "the degraded-arm set moved. A MISSING name means that arm lowers \
-             again; once the set is EMPTY the loop body holds no stub, the back \
-             edge can close, and this crate should get a real jit_tier_is_alive \
-             gate instead of this test"
+            Vec::<&str>::new(),
+            "the degraded-arm set moved. A NEW name means an arm silently \
+             stopped lowering and every trace reaching it now aborts"
         );
         assert_eq!(
-            compiles, 0,
-            "count_to({N}) compiled {compiles} loops, but OP_PUSH_INT and \
-             OP_PUSH_FLOAT are abort stubs inside the loop body, so every trace \
-             aborts and nothing closes. A \
-             non-zero count means the tier came alive: replace this test with a \
-             real liveness gate pinning a measured ops_after"
+            compiles, 1,
+            "count_to({N}) compiled {compiles} loops, not the observed 1"
+        );
+        // The body actually closes a loop — see `LoopBodyShape`. A compile
+        // count and an op count together still accept a body that bails out on
+        // its first pass; this is the term that does not. Sound HERE because
+        // this fixture loops: on a straight-line subject a `Jump`-less body is
+        // the right answer, not a defect.
+        assert!(
+            shape.closes_a_loop(),
+            "compiled {ops_after} ops but the body {} ({shape:?})",
+            shape.why_not().unwrap_or("closes a loop")
         );
         println!(
-            "[tier-inert] count_to({N}) = {got} from the interpreter alone, {compiles} loops compiled, degraded {degraded:?}"
+            "[tier-alive] count_to({N}) = {got}, compiled {compiles} loop(s) of {ops_after} ops, degraded {degraded:?}"
         );
     }
 

@@ -14333,7 +14333,7 @@ fn sync_virtualizable_after_guard_failure(
     boxes.push(value_to_vable_identity_bits(&resolved_vable[0]));
 
     unsafe {
-        vinfo.write_boxes_to_heap(frame_u8, &boxes);
+        vinfo.write_boxes(frame_u8, &boxes);
         let frame = &mut *(frame_u8 as *mut PyFrame);
         frame.clear_stack_above(frame.valuestackdepth);
     }

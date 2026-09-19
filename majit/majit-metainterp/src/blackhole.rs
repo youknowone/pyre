@@ -12325,9 +12325,9 @@ fn take_vable_array_descrs<'a>(
     let (array_descr, pos) = read_descr(bh, code, p);
     // `virtualizable.py` `make_sure_not_resized`: the array field is
     // `Ptr(GcArray)`, so `bh_getfield_gc_r` + `bh_getarrayitem_gc_*` is
-    // the only layout `bhimpl_*array*_vable` may touch. `RustVec` /
-    // `EmbeddedArray` would make `bh_getfield_gc_r` load a container
-    // metadata word as the array pointer.
+    // the only layout `bhimpl_*array*_vable` may touch. `EmbeddedArray`
+    // would make `bh_getfield_gc_r` load a container metadata word as
+    // the array pointer.
     match vinfo.array_fields.get(array_idx).map(|a| &a.storage) {
         Some(crate::virtualizable::VableArrayStorage::DirectPointer) => {}
         other => panic!(

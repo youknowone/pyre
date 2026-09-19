@@ -153,7 +153,7 @@ use crate::resume::{
     MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
 };
-use crate::trace_ctx::TraceCtx;
+use crate::trace_ctx::{ClearReplaceFrames, TraceCtx};
 use crate::virtualizable::VirtualizableInfo;
 
 #[inline]
@@ -2247,8 +2247,9 @@ pub struct MetaInterp<M: Clone> {
     /// (`collect_virtualizable_element_values`) at the CloseLoop point. The walk
     /// mutates the array on the trace-ctx shadow only; native `state`'s array is
     /// frozen at trace-start because `synchronize_virtualizable` skips the
-    /// write-back for `RustVec` storage during tracing (the native match body,
-    /// the usual writer, never runs under the single-pass walk). The macro hook
+    /// write-back when `VirtualizableInfo::outer_executor_owns_state` is set
+    /// (the observer/replay merge-point form; the native match body, the usual
+    /// writer, never runs under the single-pass walk). The macro hook
     /// `take`s these and applies them to native `state` via
     /// `writeback_virt_array_state_fields_from_values` before re-entering the
     /// compiled loop, so it resumes at the post-peeled iteration (S_{k+1})
@@ -4602,23 +4603,25 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_frontend_boxes.as_deref()
     }
 
-    /// Seed the live heap pointer on the active `TraceCtx`.
-    /// `vinfo.unwrap_virtualizable_box` is the reader; this only publishes
-    /// the host's current object so initialize / residual can unwrap it.
+    /// Seed `pending_vable_ptr` with the host's current virtualizable.
+    /// `initialize_virtualizable` consumes this before `TraceCtx` exists;
+    /// an already-active trace keeps the pointer its own boxes name
+    /// (`virtualizable.py write_boxes`).
     pub(crate) fn set_vable_ptr(&mut self, ptr: *const u8) {
         self.pending_vable_ptr = ptr;
-        if let Some(ctx) = self.tracing.as_mut() {
-            ctx.set_virtualizable_heap_ptr(ptr);
-        }
     }
 
-    /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`.
+    /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`
+    /// (`pyjitpl.py vable_and_vrefs_before_residual_call` /
+    /// `vable_after_residual_call`). Residual-call and escape paths unwrap
+    /// the identity box, not the host heap pointer: `virtualizable_heap_ptr`
+    /// can name a `snapshot_for_tracing` copy and is not the unwrap source.
     ///
-    /// Residual-call and escape paths in `pyjitpl.py` unwrap the identity
-    /// box, not the host heap pointer. Fall back to
-    /// [`Self::unwrap_standard_virtualizable`] when the box has no concrete
-    /// ref yet.
-    fn unwrap_virtualizable_boxes_last(&self) -> *const u8 {
+    /// Prefers the identity box's own concrete, then the
+    /// `virtualizable_values` shadow via `TraceCtx::standard_virtualizable_ptr`,
+    /// then `self.pending_vable_ptr` — the host seed `set_vable_ptr` writes
+    /// for off-trace / pre-`TraceCtx` readers.
+    pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
         self.tracing
             .as_ref()
             .and_then(|ctx| {
@@ -4628,29 +4631,14 @@ impl<M: Clone> MetaInterp<M> {
                 ));
                 (!ptr.is_null()).then_some(ptr as *const u8)
             })
-            .unwrap_or_else(|| self.unwrap_standard_virtualizable())
-    }
-
-    /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])`.
-    ///
-    /// `pending_vable_ptr` is only the host seed until `TraceCtx` exists
-    /// (`set_vable_ptr` / `sync_before`). Once the boxes are installed the
-    /// identity is the last virtualizable box, matching
-    /// `virtualizable.py unwrap_virtualizable_box`. The sync target
-    /// (`virtualizable_heap_ptr`) can name a `snapshot_for_tracing` copy
-    /// and is not the unwrap source.
-    pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
-        if let Some(ctx) = self.tracing.as_ref()
-            && let Some(ptr) = ctx.standard_virtualizable_ptr()
-        {
-            return ptr as *const u8;
-        }
-        self.pending_vable_ptr
-    }
-
-    /// `pyjitpl.py` unwrap of the standard virtualizable identity.
-    pub fn standard_virtualizable_heap_ptr(&self) -> *const u8 {
-        self.unwrap_standard_virtualizable()
+            .unwrap_or_else(|| {
+                if let Some(ctx) = self.tracing.as_ref()
+                    && let Some(ptr) = ctx.standard_virtualizable_ptr()
+                {
+                    return ptr as *const u8;
+                }
+                self.pending_vable_ptr
+            })
     }
 
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
@@ -5001,11 +4989,11 @@ impl<M: Clone> MetaInterp<M> {
             None => OpRef::input_arg_ref(box_ref_index as u32),
         };
         // The identity's concrete VALUE is the live virtualizable pointer.
-        // For PyFrame `original_boxes[index]` already IS the frame pointer
-        // (== `vable_ptr`), so this is a no-op there. For the state-field
-        // JIT `original_boxes[index]` is the first scalar (stackpos), NOT the
-        // `&state` identity, so prefer `vable_ptr` when it is set
-        // (`virtualizable_heap_ptr` cached it in `sync_before`).
+        // For PyFrame `original_boxes[index]` already IS the frame pointer,
+        // so this is a no-op there. For the state-field JIT
+        // `original_boxes[index]` is the first scalar (stackpos), NOT the
+        // `&state` identity, so prefer the pointer unwrap produced above
+        // (box first, then the `pending_vable_ptr` seed).
         let virtualizable_value = if !virtualizable_ptr.is_null() {
             majit_ir::Value::Ref(majit_ir::GcRef(virtualizable_ptr as usize))
         } else {
@@ -5018,7 +5006,7 @@ impl<M: Clone> MetaInterp<M> {
         // are not vinfo static fields, so the expanded-tail slice
         // `live_values[num_reds..num_reds + total_vable]` would alias
         // scalar slots instead of actual vable elements.  Force the
-        // heap-read path (vable_ptr != null) which always mints fresh
+        // heap-read path (virtualizable_ptr != null) which always mints fresh
         // inputargs from the live heap values.
         let has_expanded_tail =
             info.identity_ref_bank_index.is_none() && live_values.len() >= num_reds + total_vable;
@@ -5104,11 +5092,9 @@ impl<M: Clone> MetaInterp<M> {
                 array_lengths,
             );
         }
-        // pyjitpl.py synchronize_virtualizable parity: TraceCtx needs
-        // the live heap pointer to mirror shadow writes. Mirror here — the
-        // MetaInterp `pending_vable_ptr` was cached before `tracing` existed, so
-        // `set_vable_ptr` could not plumb it through.
-        ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
+        // The heap pointer was written onto `ctx` above, after
+        // `clear_vable_token` forwarded it. `set_vable_ptr` only seeds
+        // `pending_vable_ptr` and does not retarget an active ctx.
         // pyjitpl.py `initialize_virtualizable` closes by asserting the
         // freshly read boxes still match the object it read them from.
         ctx.check_synchronized_virtualizable();
@@ -5761,8 +5747,7 @@ impl<M: Clone> MetaInterp<M> {
                 // is the parallel trace-start entry point and must keep the
                 // same invariant.
                 self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-                ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
-                // pyjitpl.py initialize_virtualizable parity.
+                // initialize_virtualizable establishes the virtualizable heap pointer.
                 self.initialize_virtualizable(&mut ctx, live_values);
                 // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
                 // runs after `initialize_state_from_start`, which has already
@@ -6077,8 +6062,7 @@ impl<M: Clone> MetaInterp<M> {
         // driver matching the descriptor; with the single-portal pyre
         // shell driver this collapses to slot 0.
         self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
-        ctx.set_virtualizable_heap_ptr(self.pending_vable_ptr);
-        // pyjitpl.py initialize_virtualizable parity.
+        // initialize_virtualizable establishes the virtualizable heap pointer.
         self.initialize_virtualizable(&mut ctx, live_values);
         // pyjitpl.py `_compile_and_run_once`: `create_empty_history`
         // runs after `initialize_state_from_start`, which has already
@@ -6650,13 +6634,7 @@ impl<M: Clone> MetaInterp<M> {
             .as_mut()
             .expect("vable op requires active tracing");
         unsafe { ctx.set_replace_frames(Some(Self::walk_miframe_stack), frames.cast()) };
-        struct ClearReplaceFrames(*mut TraceCtx);
-        impl Drop for ClearReplaceFrames {
-            fn drop(&mut self) {
-                unsafe { (*self.0).clear_replace_frames() };
-            }
-        }
-        let _clear = ClearReplaceFrames(ctx);
+        let _clear = ClearReplaceFrames::new(ctx);
         f(ctx)
     }
 
@@ -18901,28 +18879,16 @@ impl<M: Clone> MetaInterp<M> {
     ///                              descr=vinfo.vable_token_descr)
     /// ```
     pub fn vable_and_vrefs_before_residual_call(&mut self) {
-        // pyjitpl.py:3318-3324 — vrefinfo loop over odd indices.
-        let vref_ptrs: Vec<usize> = self
-            .tracing
-            .as_ref()
-            .map(|ctx| {
-                ctx.virtualref_boxes
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (_, ptr))| (i % 2 == 1).then_some(*ptr))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for vref_ptr in vref_ptrs {
-            // SAFETY: vref_ptr was registered by `opimpl_virtual_ref` with a
-            // valid JitVirtualRef pointer; we only flip its token field.
-            unsafe {
-                self.staticdata
-                    .virtualref_info
-                    .tracing_before_residual_call(vref_ptr as *mut u8);
-            }
+        // The `virtualref_boxes` odd-index loop that opens
+        // `pyjitpl.py vable_and_vrefs_before_residual_call`. It lives on
+        // `TraceCtx` so the walker's own residual-call bracket
+        // (`pyre-jit-trace` `try_execute_residual_call_via_executor`) stamps
+        // the same vrefs this does, against the same
+        // `MetaInterpStaticData::virtualref_info`.
+        if let Some(ctx) = self.tracing.as_mut() {
+            ctx.vrefs_before_residual_call();
         }
-        // pyjitpl.py:3326-3334 — vinfo path (FORCE_TOKEN + SETFIELD_GC).
+        // pyjitpl.py vable_and_vrefs_before_residual_call: vinfo path.
         let vinfo = match self.virtualizable_info().cloned() {
             Some(info) => info,
             None => return,
@@ -18936,15 +18902,12 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py: `virtualizable = vinfo.unwrap_virtualizable_box(
         //     self.virtualizable_boxes[-1])`.
-        let vable_ptr = self.unwrap_virtualizable_boxes_last();
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => return,
-        };
-        let vbox = match ctx.standard_virtualizable_box() {
-            Some(b) => b,
-            None => return,
-        };
+        let vable_ptr = self.unwrap_standard_virtualizable();
+        // `vinfo.tracing_before_residual_call(virtualizable)` runs under the
+        // same condition as `pyjitpl.py vable_after_residual_call`: vinfo
+        // present, token-bearing machine, non-null virtualizable. Recording
+        // (`force_token` / `vable_setfield_descr`) stays below, because it
+        // needs the identity box to name.
         if !vable_ptr.is_null() {
             // SAFETY: the host stamps `vable_ptr` to the live virtualizable
             // pointer for the duration of the trace; flipping the token
@@ -18953,6 +18916,14 @@ impl<M: Clone> MetaInterp<M> {
                 vinfo.tracing_before_residual_call(vable_ptr as *mut u8);
             }
         }
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let vbox = match ctx.standard_virtualizable_box() {
+            Some(b) => b,
+            None => return,
+        };
         let force_token = ctx.force_token();
         ctx.vable_setfield_descr(vbox, force_token, vinfo.token_field_descr());
     }

@@ -1417,6 +1417,30 @@ impl TraceCtx {
         self.replace_frames = None;
     }
 
+    /// [`ClearReplaceFrames`] over `self`.
+    pub fn clear_replace_frames_guard(&mut self) -> impl Drop + use<> {
+        ClearReplaceFrames::new(self)
+    }
+}
+
+/// Clears the replace-frames hook on drop, including unwind.
+pub struct ClearReplaceFrames(*mut TraceCtx);
+
+impl ClearReplaceFrames {
+    pub fn new(ctx: &mut TraceCtx) -> Self {
+        Self(ctx)
+    }
+}
+
+impl Drop for ClearReplaceFrames {
+    fn drop(&mut self) {
+        // SAFETY: `new` stores a pointer to a live `TraceCtx`; drop only
+        // writes the hook slot to `None`.
+        unsafe { (*self.0).clear_replace_frames() };
+    }
+}
+
+impl TraceCtx {
     /// `fielddescr.get_vinfo()`. Codewriter emits the vinfo's own
     /// FieldDescr, which already holds the Weak backref.
     fn vinfo_from_fielddescr(
@@ -2998,21 +3022,6 @@ impl TraceCtx {
         }
     }
 
-    /// Whether any virtualizable array is a Rust `Vec` embedded by value in
-    /// the interpreter's live state struct.
-    ///
-    /// Such an array is owned and rewritten by the outer executor on every
-    /// opcode, so the heap — not the trace's shadow — is authoritative for it
-    /// while the walk is in progress.
-    fn has_outer_owned_array(&self, info: &crate::virtualizable::VirtualizableInfo) -> bool {
-        info.array_fields.iter().any(|a| {
-            matches!(
-                a.storage,
-                crate::virtualizable::VableArrayStorage::RustVec { .. }
-            )
-        })
-    }
-
     /// pyjitpl.py `synchronize_virtualizable()`.
     ///
     /// Writes the concrete half of `virtualizable_boxes` (the
@@ -3207,9 +3216,9 @@ impl TraceCtx {
 
     /// `virtualizable.py write_boxes` over the whole shadow.
     ///
-    /// `skip_outer_owned_arrays` names the one storage shape whose write-back
+    /// `skip_when_outer_owned` names the merge-point form whose write-back
     /// is not this function's to make; see the carve-out below.
-    fn write_virtualizable_back(&self, skip_outer_owned_arrays: bool) {
+    fn write_virtualizable_back(&self, skip_when_outer_owned: bool) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -3243,15 +3252,19 @@ impl TraceCtx {
             array_bits.push(items);
             cursor += len;
         }
-        // When the virtualizable array is a Rust `Vec` embedded by value in
-        // the interpreter's live state struct (`RustVec` storage), an outer
-        // executor (the macro-generated mainloop) owns that struct and writes
-        // it on every opcode. The trace's shadow is seeded from that heap and
-        // tracked for IR purposes only; flushing the shadow back here would
-        // clobber the outer executor's writes. The heap is authoritative, so
+        // When the merge point is the bare observer/replay form
+        // (`jit_merge_point!()`), an outer executor (the macro-generated
+        // mainloop) owns the live struct and writes it on every opcode. The
+        // trace's shadow is seeded from that heap and tracked for IR
+        // purposes only; flushing the shadow back here would clobber the
+        // outer executor's writes. The live struct is authoritative, so
         // skip the write-back during tracing — the resume path performs its
-        // own field-aware flush on guard failure.
-        if skip_outer_owned_arrays && self.has_outer_owned_array(info) {
+        // own field-aware flush on guard failure. The `; state`
+        // single-executor close keeps the walk executing, so the flush is
+        // required there: it is the only thing that keeps the live struct
+        // and the shadow equal. `pyjitpl.py synchronize_virtualizable`
+        // always writes because upstream's metainterp IS the interpreter.
+        if skip_when_outer_owned && info.outer_executor_owns_state {
             return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from
@@ -3297,11 +3310,11 @@ impl TraceCtx {
         ) else {
             return;
         };
-        // `RustVec`-stored arrays are owned and rewritten by the outer
-        // executor on every opcode, so the shadow is deliberately not kept
-        // equal to the heap for them — the same carve-out
-        // `synchronize_virtualizable` makes before writing back.
-        if self.has_outer_owned_array(info) {
+        // Observer/replay merge points leave an outer executor owning the
+        // live struct, so the shadow is deliberately not kept equal to it
+        // — the same carve-out `synchronize_virtualizable` makes before
+        // writing back.
+        if info.outer_executor_owns_state {
             return;
         }
         let static_count = info.num_static_extra_boxes;
@@ -3345,74 +3358,6 @@ impl TraceCtx {
                 );
                 cursor += 1;
             }
-        }
-    }
-
-    /// Field-aware variant of [`Self::synchronize_virtualizable`] for the bridge
-    /// resume convergence path.  Differs from the generic-bits version in
-    /// two ways that match `sync_virtualizable_after_guard_failure`
-    /// (`pyre-jit/src/eval.rs`):
-    ///
-    ///   1. Bit conversion is delegated to caller-supplied field-aware
-    ///      callbacks (`static_bits` / `array_bits`) instead of the
-    ///      generic `value_to_raw_bits`, so each slot's i64 representation
-    ///      matches the typed field at its heap offset.
-    ///   2. Array lengths are read live from the heap PyFrame via
-    ///      `VirtualizableInfo::get_array_length(heap_ptr, array_index)`
-    ///      instead of the cached `virtualizable_array_lengths`.
-    ///
-    /// Once `setup_bridge_sym` (`pyre-jit-trace/src/state.rs`) wires this
-    /// in place of the boxed-out `pyjitpl.py:3437
-    /// synchronize_virtualizable` call, the bridge-resume path will be
-    /// idempotent with `rebuild_guard_fail_state`'s
-    /// `sync_virtualizable_after_guard_failure` (same conversion path,
-    /// same length source).  Dormant — no caller yet.
-    pub fn synchronize_virtualizable_field_aware<S, A>(&self, static_bits: S, array_bits: A)
-    where
-        S: Fn(&Value, Type, usize) -> i64,
-        A: Fn(&Value, Type, usize, usize) -> i64,
-    {
-        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
-            return;
-        };
-        let Some(info) = self.virtualizable_info.as_ref() else {
-            return;
-        };
-        let Some(values) = self.virtualizable_values.as_ref() else {
-            return;
-        };
-        let static_count = info.num_static_extra_boxes;
-        if values.len() < static_count {
-            return;
-        }
-        let mut static_bit_vec: Vec<i64> = Vec::with_capacity(static_count);
-        for (field_index, v) in values[..static_count].iter().enumerate() {
-            let ty = info.static_fields[field_index].field_type;
-            static_bit_vec.push(static_bits(v, ty, field_index));
-        }
-        let array_count = info.array_fields.len();
-        let mut array_bit_vec: Vec<Vec<i64>> = Vec::with_capacity(array_count);
-        let mut cursor = static_count;
-        for array_index in 0..array_count {
-            // Live length: pyjitpl.py:3446 mirror via vinfo.get_array_length.
-            // Safety: heap_ptr is cached at trace/bridge entry from
-            // virtualizable_heap_ptr; the live PyFrame lifetime spans the
-            // trace session.
-            let len = unsafe { info.get_array_length(heap_ptr, array_index) };
-            if cursor + len > values.len() {
-                return;
-            }
-            let ty = info.array_fields[array_index].item_type;
-            let mut items: Vec<i64> = Vec::with_capacity(len);
-            for (item_index, v) in values[cursor..cursor + len].iter().enumerate() {
-                items.push(array_bits(v, ty, array_index, item_index));
-            }
-            array_bit_vec.push(items);
-            cursor += len;
-        }
-        // Safety: heap_ptr lifetime per the field cache contract.
-        unsafe {
-            info.write_all_boxes(heap_ptr as *mut u8, &static_bit_vec, &array_bit_vec);
         }
     }
 
@@ -4338,12 +4283,9 @@ impl TraceCtx {
     ///      return True
     /// ```
     ///
-    /// In pyre this is the LIVE entry path used by the jitcode machine
-    /// (`vable_*_indexed`) at trace time. The pyjitpl::nonstandard_virtualizable
-    /// duplicate is reachable only from the legacy `opimpl_*_vable` test
-    /// surface. The two implementations carry the same line-by-line shape so
-    /// the structural divergence is duplication-only — fixing the type-tag
-    /// refactor will let us collapse them into a single entry point.
+    /// This is the only implementation of pyjitpl.py `_nonstandard_virtualizable`.
+    /// `TraceCtx::vable_*` call it; the `opimpl_*_vable` wrappers forward to
+    /// those handlers.
     fn is_nonstandard_virtualizable(
         &mut self,
         pc: usize,
