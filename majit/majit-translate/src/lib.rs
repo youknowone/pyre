@@ -374,6 +374,10 @@ fn merge_hints_from_map(
         };
         if let Some(h) = hints_by_path.get(&path) {
             f.hints.clone_from(h);
+            // BFS reads `_jit_*_` off `FunctionGraph.hints`. Stamping
+            // the harvested bag here means the first
+            // `register_function_graph` already carries `unroll_safe`.
+            front::llbc_hints::merge_hints_into_graph(&mut f.graph, h);
             // A `dont_look_inside` callee returning `*mut PyObject`
             // (`SemanticFunction::returns_objectptr`, set structurally by
             // `front::mir::output_type_is_objectptr`) residualizes as an

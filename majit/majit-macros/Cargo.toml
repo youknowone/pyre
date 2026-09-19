@@ -20,5 +20,9 @@ proc-macro2 = { workspace = true }
 majit-translate = { workspace = true }
 
 [dev-dependencies]
+linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+ctor = { workspace = true }

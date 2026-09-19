@@ -4605,7 +4605,98 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `_ll_2_str_eq_nonnull`'s body in `majit-metainterp::blackhole`
     // once pyre grows the backing GC struct.
 
+    merge_macro_helper_fnaddrs(&mut entries);
+
     (entries, abi_unsound_arguments)
+}
+
+fn intern_fnaddr_path(s: String) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static INTERN: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let mut map = INTERN
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&path) = map.get(&s) {
+        return path;
+    }
+    let leaked: &'static str = Box::leak(s.clone().into_boxed_str());
+    map.insert(s, leaked);
+    leaked
+}
+
+/// Fold the macro-published trampoline slice into the hand-listed table.
+///
+/// A hand-listed path wins. Duplicate registry rows for the same path must
+/// agree on arity. Each row is published as the full `module_path!()::name`
+/// and, when the function is nested and `{crate}::{leaf}` is unique among
+/// full paths, that short alias. `register_macro_helper_trace_fnaddr` then
+/// adds the crate-stripped and `crate::` spellings from those keys.
+fn merge_macro_helper_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut occupied: HashSet<&str> = entries.iter().map(|(path, _)| *path).collect();
+    let mut arities: HashMap<&str, u8> = HashMap::new();
+
+    let mut rows: Vec<(&str, i64, u8)> = Vec::new();
+    majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+        let addr = desc.get() as i64;
+        if addr == 0 {
+            return;
+        }
+        rows.push((desc.path, addr, desc.arity));
+    });
+
+    let mut short_alias_owners: HashMap<String, HashSet<&str>> = HashMap::new();
+    for (path, _, _) in &rows {
+        if let Some((crate_seg, rest)) = path.split_once("::") {
+            let leaf = rest.rsplit("::").next().unwrap_or(rest);
+            if rest != leaf {
+                short_alias_owners
+                    .entry(format!("{crate_seg}::{leaf}"))
+                    .or_default()
+                    .insert(*path);
+            }
+        }
+    }
+    let unique_short_aliases: HashSet<String> = short_alias_owners
+        .into_iter()
+        .filter(|(_, owners)| owners.len() == 1)
+        .map(|(alias, _)| alias)
+        .collect();
+
+    for (full_path, addr, arity) in rows {
+        let mut paths: Vec<&str> = vec![full_path];
+        if let Some((crate_seg, rest)) = full_path.split_once("::") {
+            let leaf = rest.rsplit("::").next().unwrap_or(rest);
+            if rest != leaf {
+                let short = format!("{crate_seg}::{leaf}");
+                if unique_short_aliases.contains(&short) {
+                    paths.push(intern_fnaddr_path(short));
+                }
+            }
+        }
+        for path in paths {
+            match arities.entry(path) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    debug_assert_eq!(
+                        *existing.get(),
+                        arity,
+                        "duplicate helper fnaddr arity mismatch for {path}"
+                    );
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(arity);
+                }
+            }
+            if occupied.contains(path) {
+                continue;
+            }
+            entries.push((path, addr));
+            occupied.insert(path);
+        }
+    }
 }
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
@@ -5431,6 +5522,23 @@ mod tests {
         assert_ne!(
             obj_hint, raw_hint as *const () as usize as i64,
             "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
+    }
+
+    #[test]
+    fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_interpreter::call::register_frame_locals_slot"),
+            "call::register_frame_locals_slot must be registered"
+        );
+        assert!(
+            bindings.contains_key("pyre_interpreter::pyframe::register_frame_locals_slot"),
+            "pyframe::register_frame_locals_slot must be registered"
+        );
+        assert!(
+            !bindings.contains_key("pyre_interpreter::register_frame_locals_slot"),
+            "short alias shared by two full paths must not be emitted"
         );
     }
 
@@ -6316,6 +6424,33 @@ mod tests {
              lacks an `rstr.STR`-equivalent GC layout — registering one would \
              point at a panic-stub that fails at runtime, contradicting \
              `rpython/jit/codewriter/support.py:526-538`'s real comparison body"
+        );
+    }
+
+    #[test]
+    fn macro_registered_float_abi_trampolines_are_callable_through_published_address() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let copysign = bindings
+            .get("pyre_interpreter::objspace::descroperation::float_copysign")
+            .copied()
+            .expect("float_copysign should be auto-registered");
+        let copysign: extern "C" fn(f64, f64) -> f64 =
+            unsafe { std::mem::transmute(copysign as usize) };
+        assert_eq!(copysign(-1.5, 1.0), 1.5);
+        assert_eq!(copysign(1.5, -1.0), -1.5);
+
+        let fmod = bindings
+            .get("pyre_interpreter::objspace::descroperation::jit_float_fmod")
+            .copied()
+            .expect("jit_float_fmod should be auto-registered");
+        let fmod: extern "C" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(fmod as usize) };
+        assert_eq!(fmod(5.0, 2.0), 1.0);
+
+        assert!(
+            bindings
+                .contains_key("pyre_interpreter::objspace::descroperation::jit_w_long_truediv_raw"),
+            "(i64, i64) -> f64 trampoline should be auto-registered"
         );
     }
 }

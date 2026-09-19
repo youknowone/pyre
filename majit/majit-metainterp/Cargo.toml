@@ -37,6 +37,7 @@ __yield-stage-probe = []
 
 [dependencies]
 bitflags = { workspace = true }
+linkme = { workspace = true }
 parking_lot = { workspace = true }
 majit-ir = { workspace = true }
 majit-trace = { workspace = true }
@@ -58,6 +59,7 @@ majit-backend-cranelift = { workspace = true, optional = true }
 majit-backend-dynasm = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+ctor = { workspace = true }
 # Specified directly (not via workspace inheritance) so default-features can
 # be turned off. The host binding (web vs host-import) is chosen explicitly
 # upstream through pyre-jit's `wasm-web` / `wasm-host` features; pulling the

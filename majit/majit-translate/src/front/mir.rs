@@ -54,7 +54,10 @@
 //!     lifetimes).
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
-//!   - `Aggregate` — synthetic `Call(SyntheticTransparentCtor)`.
+//!   - `Aggregate` — named structs lower to `New` + `FieldWrite` (malloc
+//!     then setfield). Transparent newtype wrappers stay a no-op alias.
+//!     Enum variants, tuples, and arrays still emit
+//!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`.
@@ -1706,7 +1709,10 @@ fn derive_program_metadata(
                     .enumerate()
                     .map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        (fname, tyref_to_attr_value_type(&f.ty, llbc))
+                        (
+                            fname,
+                            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
+                        )
                     })
                     .collect();
                 struct_field_attrs.insert(canonical_name.clone(), attr_rows);
@@ -3445,12 +3451,157 @@ fn simplify_lowered_graph(
     // among them.  Ordering the prune first does not remove the need.
     crate::model::clear_unreachable_blocks(graph);
     // Re-thread boxing-cluster operands the dead-var sweeps above stripped out
-    // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
-    // pass can remove the threaded inputarg, restoring the adapter's per-block
-    // operand invariant for cross-block boxing clusters (e.g. `w_int_new`,
-    // whose `intval` payload and `__cast_instance_intrinsic` return chain span the
-    // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
+    // of the `NewWithVtable`-chain blocks' inputargs.  Runs after those sweeps
+    // so no later dead-var pass can remove the threaded inputarg, restoring the
+    // adapter's per-block operand invariant for cross-block boxing clusters
+    // (e.g. `w_int_new`, whose `intval` payload and
+    // `__cast_instance_intrinsic` return chain span the blocks split by the
+    // `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
+    // Named-struct aggregates that boxing fusion did not consume are the
+    // allocation themselves: rewrite the leftover constructor to `new(descr)`
+    // so it never reaches JitCode as an uncallable residual call.  Only the
+    // final simplify runs this — the pre-pass still has consumer rewrites
+    // (`range_iter`, slice-index) that match the constructor.
+    if sweep_dead_vars {
+        lower_struct_aggregate_ctors_to_new(graph);
+    }
+}
+
+/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
+/// stable flavors — the boxing-cluster allocator `fuse_boxing_alloc` keys on.
+fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments } = target else {
+        return false;
+    };
+    let [.., parent, leaf] = segments.as_slice() else {
+        return false;
+    };
+    parent == "lltype"
+        && matches!(
+            leaf.as_str(),
+            "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+        )
+}
+
+/// Rewrite a live named-struct aggregate constructor to `malloc` plus the
+/// field stores already emitted beside it.
+///
+/// Construction is `p = malloc(S); p.f = v`. The MIR front first emits a
+/// `SyntheticTransparentCtor` so `fuse_boxing_alloc`,
+/// `lower_struct_ptr_writes`, and `remove_dead_aggregates` still see the
+/// construct-on-stack spelling; after those passes, a remaining struct
+/// constructor is the allocation and becomes [`OpKind::New`].
+///
+/// Aggregates that still participate in a boxing cluster stay constructors:
+/// the malloc argument, any phi that carries it, and nested named structs
+/// stored into those (the header object fusion reads `ob_type` off).  They
+/// are the cluster's stack value, not the heap object; rewriting them to
+/// `New` would allocate the header separately and leave fusion looking at
+/// a `New` instead of a `SyntheticTransparentCtor`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
+    let malloc_args = boxing_cluster_ctor_results(graph);
+
+    let mut rewritten = 0usize;
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            if malloc_args.contains(result) {
+                continue;
+            }
+            let OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        is_struct: true, ..
+                    },
+                args,
+                result_ty,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !args.is_empty() {
+                continue;
+            }
+            let ValueType::Ref(Some(owner)) = result_ty else {
+                continue;
+            };
+            if owner.is_empty() {
+                continue;
+            }
+            let owner = owner.clone();
+            op.kind = OpKind::New { owner };
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
+/// Variables that still belong to an unfused boxing cluster: each
+/// `lltype::malloc[_typed*]` argument, the phis that carry it, and every
+/// nested named-struct stored into those aggregates.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn boxing_cluster_ctor_results(graph: &FunctionGraph) -> std::collections::HashSet<Variable> {
+    use std::collections::HashSet;
+
+    let mut cluster: HashSet<Variable> = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !call_target_is_gc_malloc(target) {
+                continue;
+            }
+            cluster.extend(args.iter().filter_map(LinkArg::as_variable).cloned());
+        }
+    }
+    let mut growing = true;
+    while growing {
+        growing = false;
+        for block in &graph.blocks {
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if !cluster.contains(arg) {
+                    continue;
+                }
+                for pred in &graph.blocks {
+                    for link in &pred.exits {
+                        if link.target != block.id {
+                            continue;
+                        }
+                        if let Some(v) = link.args.get(slot).and_then(LinkArg::as_variable)
+                            && cluster.insert(v.clone())
+                        {
+                            growing = true;
+                        }
+                    }
+                }
+            }
+            for op in &block.operations {
+                let OpKind::FieldWrite { base, value, .. } = &op.kind else {
+                    continue;
+                };
+                if !cluster.contains(base) {
+                    continue;
+                }
+                if let Some(v) = value.as_variable()
+                    && cluster.insert(v.clone())
+                {
+                    growing = true;
+                }
+            }
+        }
+    }
+    cluster
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
@@ -6166,14 +6317,15 @@ impl<'a> Lowering<'a> {
                 ))
             }
             // `Aggregate(kind, operands)` — tuple / struct / enum-variant
-            // / array construction. Modeled as a synthetic constructor
-            // call (`CallTarget::SyntheticTransparentCtor`), the
-            // CallTarget variant explicitly carved out for "constructors
-            // RPython's rtyper erases before jtransform" — the MIR
-            // driver fits that description (Charon has already resolved
-            // types, so the call is post-frontend-resolution by
-            // construction).  Operands flow as call arguments; the
-            // synthetic name is best-effort from the AggregateKind tag.
+            // / array construction. A named struct is `malloc(GcStruct)`
+            // plus one `setfield` per member; the constructor call is a
+            // temporary marker so boxing fusion and dead-aggregate sweep
+            // still see the construct-on-stack spelling, then
+            // [`lower_struct_aggregate_ctors_to_new`] rewrites it to
+            // `OpKind::New`. Transparent newtype wrappers stay a no-op
+            // alias of their inner operand. Enum variants, tuples, and
+            // arrays keep `CallTarget::SyntheticTransparentCtor` for the
+            // later rewrites that still match that shape.
             Rvalue::Aggregate(kind, operands) => {
                 // A fieldless (C-like) enum variant carries no payload, so
                 // constructing it is just naming its discriminant integer
@@ -6336,9 +6488,9 @@ impl<'a> Lowering<'a> {
                 // `classdesc.py:705`) succeeds for classes whose
                 // `__init__` is not registered with the bookkeeper —
                 // the operand values flow through the FieldWrite chain
-                // below instead.  `SyntheticTransparentCtor` survives
-                // as the marker that downstream jtransform unwraps to
-                // the underlying `SomeInstance(classdef)`.
+                // below instead.  A named struct's constructor is the
+                // malloc marker; [`lower_struct_aggregate_ctors_to_new`]
+                // rewrites it to `OpKind::New` after boxing fusion.
                 let ctor_target = if owner_path.is_empty() {
                     CallTarget::synthetic_transparent_ctor(ctor_name.clone())
                 } else if adt_is_struct {
@@ -7124,6 +7276,10 @@ impl<'a> Lowering<'a> {
                     // consumes `inner`.  It selects the payload projection
                     // below.
                     let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
+                    // A closure env is identified from the type decl's
+                    // `src: Closure` origin, not from the `closure` name
+                    // leaf.  Needed before `resolve_place` consumes `inner`.
+                    let owner_is_closure_env = tyref_is_closure_env(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let base = if let Some(root) = narrow_root {
@@ -7151,18 +7307,19 @@ impl<'a> Lowering<'a> {
                     // A shell variant's payload takes the shell projection:
                     // the `&P` a slice accessor hands back through
                     // `Option`/`Result`/`ControlFlow` is the primitive, not
-                    // a pointer the program stores.  Every other container's
-                    // `&P` field is a reference the program declared and
-                    // keeps its own bank.
-                    let declared = if container_is_enum {
-                        tyref_enum_payload_value_type(&place_ty, self.llbc)
-                    } else {
-                        tyref_to_value_type(&place_ty, self.llbc)
-                    };
-                    let ty = match declared {
-                        ValueType::Ref(None) => tyref_to_value_type(&field_ty, self.llbc),
-                        resolved => resolved,
-                    };
+                    // a pointer the program stores.  A closure-env field
+                    // whose declared type is a shared borrow of a primitive
+                    // is the same integer: the body reads the capture
+                    // through that borrow as a scalar (`Rvalue::Ref`
+                    // aliases the referent).  An ordinary struct's `&P`
+                    // field is a pointer the program stores and compares.
+                    let ty = adt_field_read_value_type(
+                        &place_ty,
+                        &field_ty,
+                        container_is_enum,
+                        owner_is_closure_env,
+                        self.llbc,
+                    );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7977,12 +8134,21 @@ impl<'a> Lowering<'a> {
         // argument, including primitive payloads for which the annotator does
         // not split classdefs.
         let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
-        let owner_root = match head
-            .as_object()
-            .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
-        {
-            Some(suffix) => format!("{owner_leaf}{suffix}"),
-            None => owner_leaf,
+        // Duplicate-leaf hardening drops the shared `closure` /
+        // `closure#N` alias from the field registry.  Field reads of a
+        // capture must key the full crate-stripped path the registry
+        // kept — the same spelling [`tyref_input_class_root`] uses for
+        // the env parameter.
+        let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
+            strip_crate_prefix(&name_path)
+        } else {
+            match head
+                .as_object()
+                .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
+            {
+                Some(suffix) => format!("{owner_leaf}{suffix}"),
+                None => owner_leaf,
+            }
         };
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
@@ -9189,10 +9355,10 @@ impl<'a> Lowering<'a> {
                         .clone();
                 }
                 // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
-                // move.  When both Rust types lower to the same JIT register
-                // bank and Charon's type/layout data proves their byte sizes
-                // equal, the move is the bank's ordinary copy (`same_as`).
-                // This includes `u8 -> #[repr(u8)]` fieldless enums: the enum
+                // move.  `f64 ↔ i64` is `float2longlong` /
+                // `longlong2float`.  Any other pair of equal-size
+                // same-bank types is the bank's ordinary copy (`same_as`),
+                // including `u8 -> #[repr(u8)]` fieldless enums: the enum
                 // is already modelled as its integer tag by
                 // `tyref_to_value_type`, and its `TypeDecl` layout supplies
                 // the matching one-byte size.  A bank crossing or an unknown
@@ -9204,26 +9370,51 @@ impl<'a> Lowering<'a> {
                         fd.item_meta.name_path().as_str(),
                         "core::intrinsics::transmute" | "core::mem::transmute"
                     )
-                    && first_arg_ty.as_ref().is_some_and(|src_ty| {
-                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
-                    })
                 {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "same_as".to_string(),
-                            operand: args[0].clone(),
-                            result_ty: result_ty.clone(),
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    if first_arg_ty.as_ref().is_some_and(|src| {
+                        self.tyref_literal_float_atom(src) == Some("F64")
+                            && self.tyref_literal_int_atom(&call.dest.ty) == Some("I64")
+                    }) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            false,
+                        );
+                    }
+                    if first_arg_ty.as_ref().is_some_and(|src| {
+                        self.tyref_literal_int_atom(src) == Some("I64")
+                            && self.tyref_literal_float_atom(&call.dest.ty) == Some("F64")
+                    }) {
+                        return self.emit_float_bytes_llop(
+                            mir_bb,
+                            dest_local,
+                            target,
+                            args[0].clone(),
+                            true,
+                        );
+                    }
+                    if first_arg_ty.as_ref().is_some_and(|src_ty| {
+                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
+                    }) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "same_as".to_string(),
+                                operand: args[0].clone(),
+                                result_ty: result_ty.clone(),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(res);
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
@@ -10803,43 +10994,39 @@ impl<'a> Lowering<'a> {
                 // `longlong2float.longlong2float(bits)`: reinterpret the integer
                 // bit pattern as an f64 instead of following the opaque core body.
                 if args.len() == 1 && self.is_f64_from_bits(&reg) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "longlong2float".to_string(),
-                                    "longlong2float".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
-                            result_ty: ValueType::Float,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
+                    return self.emit_longlong2float_call(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        true,
+                    );
                 }
                 // `f64::to_bits(x)` is `longlong2float.float2longlong(x)`.
                 if args.len() == 1 && self.is_f64_to_bits(&reg) {
+                    return self.emit_longlong2float_call(
+                        mir_bb,
+                        dest_local,
+                        target,
+                        args[0].clone(),
+                        false,
+                    );
+                }
+                // `f64::to_int_unchecked::<i64>(x)` is `cast_float_to_int`.
+                // Truncation toward zero, undefined outside the signed
+                // range — the same contract as the llop.  A saturating
+                // `as i64` helper is not this spelling and stays residual.
+                if args.len() == 1
+                    && self.is_f64_to_int_unchecked_i64(&reg, &call.dest.ty, first_arg_ty.as_ref())
+                {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec![
-                                    "longlong2float".to_string(),
-                                    "float2longlong".to_string(),
-                                ],
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
+                        kind: OpKind::UnaryOp {
+                            op: "cast_float_to_int".to_string(),
+                            operand: args[0].clone(),
                             result_ty: ValueType::Int,
                         },
                     });
@@ -15156,30 +15343,128 @@ impl<'a> Lowering<'a> {
     /// Its rtyper specialization emits `convert_longlong_bytes_to_float`, the
     /// exact inverse of `float2longlong`.
     fn is_f64_from_bits(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc.fn_by_id(*id).is_some_and(|fd| {
-            let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::from_bits"
-                || path == "std::f64::<Impl>::from_bits"
-                || path.ends_with("::from_bits")
-                || path.contains("from_bits")
-        })
+        self.f64_inherent_method(reg, "from_bits")
     }
 
     /// `f64::to_bits(self)` — the reverse of [`is_f64_from_bits`].
     fn is_f64_to_bits(&self, reg: &RegularCall) -> bool {
+        self.f64_inherent_method(reg, "to_bits")
+    }
+
+    /// Inherent `f64` method at `core::f64::<Impl>::{method}` (or `std::`).
+    fn f64_inherent_method(&self, reg: &RegularCall, method: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             let path = fd.item_meta.name_path();
-            path == "core::f64::<Impl>::to_bits"
-                || path == "std::f64::<Impl>::to_bits"
-                || path.ends_with("::to_bits")
-                || path.contains("to_bits")
+            path.strip_prefix("core::f64::<Impl>::")
+                .or_else(|| path.strip_prefix("std::f64::<Impl>::"))
+                == Some(method)
         })
+    }
+
+    /// `f64::to_int_unchecked::<i64>` — truncation toward zero, undefined
+    /// outside the signed range, which is `cast_float_to_int`.  An i128
+    /// dest, an f32 receiver, or a saturating `as` helper is not this
+    /// spelling.
+    fn is_f64_to_int_unchecked_i64(
+        &self,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+        first_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if self.tyref_literal_int_atom(dest_ty) != Some("I64") {
+            return false;
+        }
+        let path = fd.item_meta.name_path();
+        match path.as_str() {
+            "core::f64::<Impl>::to_int_unchecked" | "std::f64::<Impl>::to_int_unchecked" => true,
+            "core::convert::num::<Impl>::to_int_unchecked"
+            | "core::convert::num::FloatToInt::to_int_unchecked" => {
+                first_arg_ty.is_some_and(|ty| self.tyref_literal_float_atom(ty) == Some("F64"))
+            }
+            _ => false,
+        }
+    }
+
+    /// `transmute::<f64, i64>` / `transmute::<i64, f64>` is the same
+    /// bitcast as `float2longlong` / `longlong2float`.  Emit the llop
+    /// itself so a leaf the walker descends does not residualize a
+    /// typed call.
+    fn emit_float_bytes_llop(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        to_float: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let (op, result_ty) = if to_float {
+            ("convert_longlong_bytes_to_float", ValueType::Float)
+        } else {
+            ("convert_float_bytes_to_longlong", ValueType::Int)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::UnaryOp {
+                op: op.to_string(),
+                operand,
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// Rewrite a 64-bit float/int bitcast to the `longlong2float` pair.
+    /// `to_float` is `longlong2float.longlong2float`; otherwise
+    /// `longlong2float.float2longlong`.
+    fn emit_longlong2float_call(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        target: usize,
+        operand: crate::flowspace::model::Variable,
+        to_float: bool,
+    ) -> Result<(), LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let (leaf, result_ty) = if to_float {
+            ("longlong2float", ValueType::Float)
+        } else {
+            ("float2longlong", ValueType::Int)
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["longlong2float".to_string(), leaf.to_string()],
+                },
+                args: crate::model::call_args(vec![operand]),
+                result_ty,
+            },
+        });
+        self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
     }
 
     /// `f64::is_sign_negative(self)` — `core` has no graph body (Opaque), so the
@@ -18866,6 +19151,22 @@ impl<'a> Lowering<'a> {
     where
         'a: 't,
     {
+        self.tyref_literal_atom(ty, "Int")
+    }
+
+    /// The `Float` width atom (`"F32"` / `"F64"`) of a float literal type.
+    /// `None` for any non-float-literal type.
+    fn tyref_literal_float_atom<'t>(&self, ty: &'t TyRef) -> Option<&'t str>
+    where
+        'a: 't,
+    {
+        self.tyref_literal_atom(ty, "Float")
+    }
+
+    fn tyref_literal_atom<'t>(&self, ty: &'t TyRef, kind: &str) -> Option<&'t str>
+    where
+        'a: 't,
+    {
         let value = match ty {
             TyRef::Inline { value: (_, v) } => v,
             TyRef::Other(v) => v,
@@ -18875,7 +19176,7 @@ impl<'a> Lowering<'a> {
             .as_object()?
             .get("Literal")?
             .as_object()?
-            .get("Int")?
+            .get(kind)?
             .as_str()
     }
 
@@ -23427,6 +23728,70 @@ fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     tyref_to_value_type(&TyRef::Other(node.clone()), llbc)
 }
 
+/// Register-bank kind of an ADT field read.
+///
+/// Prefers the place's post-projection type (generic substitution is
+/// already applied there).  A shell variant peels a shared borrow of a
+/// primitive the way [`tyref_enum_payload_value_type`] does.  A closure-env
+/// field whose declared type is that same borrow is the integer too: the
+/// body reads the capture through the borrow as a scalar (`Rvalue::Ref`
+/// aliases the referent, `resolve_place` collapses `Deref`, and
+/// `Ptr(Signed)` does not exist), so a captured `&usize` is the `usize`.
+/// Without the peel the field stays `Ref` and a later `int_add` assembles
+/// as `int_add/ri>i`.  An ordinary struct's `&P` field is a pointer the
+/// program stores and compares, so it keeps the Ref bank.
+fn adt_field_read_value_type(
+    place_ty: &TyRef,
+    field_ty: &TyRef,
+    container_is_enum: bool,
+    owner_is_closure_env: bool,
+    llbc: &Llbc,
+) -> ValueType {
+    let declared = if container_is_enum {
+        tyref_enum_payload_value_type(place_ty, llbc)
+    } else {
+        tyref_to_value_type(place_ty, llbc)
+    };
+    match declared {
+        ValueType::Ref(None) => {
+            if owner_is_closure_env
+                && let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
+                    .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
+            {
+                return peeled;
+            }
+            tyref_to_value_type(field_ty, llbc)
+        }
+        resolved => resolved,
+    }
+}
+
+/// Whether `td` is a compiler-generated closure environment.
+///
+/// Charon stamps those with `src: { Closure: … }`; ordinary ADTs are
+/// `"TopLevel"`.  Identified from that origin, never from the `closure` /
+/// `closure#N` name leaf.
+fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
+    td.src
+        .as_ref()
+        .is_some_and(|src| src.get("Closure").is_some())
+}
+
+/// Whether `ty` resolves to a closure-env ADT, after peeling reference
+/// wrappers so a `&self` receiver answers the same as a by-value one.
+fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .is_some_and(type_decl_is_closure_env)
+}
+
+fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let pointee = tyref_shared_borrow_primitive_pointee(ty, llbc)?;
+    Some(tyref_to_value_type(&TyRef::Other(pointee), llbc))
+}
+
 /// Register-bank kind of an enum variant's payload — `Option<T>`,
 /// `Result<T, E>`, `ControlFlow<T, _>`, `Bound<T>`.
 ///
@@ -24025,6 +24390,24 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         return ValueType::Str;
     }
     ValueType::Ref(None)
+}
+
+/// Register-class of a struct field, matching [`tyref_to_attr_value_type`]
+/// except for a closure-env capture whose declared type is a shared borrow
+/// of a primitive: seed that attr as the scalar so FORCE does not install
+/// a Ref class field against an Int-banked getfield.  Ordinary struct
+/// fields of reference type stay `Ref`.
+fn tyref_to_attr_value_type_for_struct_field(
+    ty: &TyRef,
+    owner: &TypeDecl,
+    llbc: &Llbc,
+) -> ValueType {
+    if type_decl_is_closure_env(owner)
+        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
+    {
+        return peeled;
+    }
+    tyref_to_attr_value_type(ty, llbc)
 }
 
 /// The bare leaf name of `ty`'s named-ADT root, after stripping
@@ -30523,16 +30906,20 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
-        cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
-        checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, primitive_float_const,
-        push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
-        tyref_positional_aggregate_root, tyref_to_value_type,
+        DecodedConst, FnPtrFamily, adt_field_read_value_type, cast_call_segments,
+        cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
+        charon_type_value_to_ast_string, checked_arith_uint_atom_is_word_sized, decode_literal,
+        fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
+        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, lower_struct_aggregate_ctors_to_new,
+        primitive_float_const, push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
+        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
-    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+    };
     use majit_charon_reader::{Llbc, ullbc::TyRef};
 
     #[test]
@@ -30677,6 +31064,218 @@ mod tests {
             "the orphaned block must be cleared, not left naming the array: {:?}",
             graph.block(forwarding).inputargs
         );
+    }
+
+    fn struct_ctor_graph(pass_to_malloc: bool) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("struct_ctor");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        if pass_to_malloc {
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["runtime_object", "lltype", "malloc_typed"]),
+                    args: crate::model::call_args(vec![result.clone()]),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            );
+        }
+        graph.set_return(entry, Some(result));
+        graph
+    }
+
+    fn struct_ctor_ops(graph: &FunctionGraph) -> (usize, usize, usize) {
+        let mut ctors = 0usize;
+        let mut news = 0usize;
+        let mut field_writes = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => ctors += 1,
+                OpKind::New { owner } if owner == "error::DictKeyError" => news += 1,
+                OpKind::FieldWrite { field, .. } if field.name == "kind" => field_writes += 1,
+                _ => {}
+            }
+        }
+        (ctors, news, field_writes)
+    }
+
+    /// A named struct aggregate is `malloc(GcStruct)` plus one `setfield` per
+    /// member, not a residual constructor call. Transparent newtype wrappers
+    /// are a different arm and stay a no-op alias.
+    #[test]
+    fn named_struct_aggregate_lowers_to_new_plus_field_stores() {
+        let mut graph = struct_ctor_graph(false);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// The rewrite is the last step of the final simplify, after boxing fusion
+    /// and the consumer rewrites that still match a constructor. The pre-pass
+    /// simplify must not steal those constructors.
+    #[test]
+    fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
+        let mut graph = struct_ctor_graph(false);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), false);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// `malloc_typed(T { .. })` is the boxing cluster. Its stack aggregate
+    /// stays a constructor so `fuse_boxing_alloc` can still see it.
+    #[test]
+    fn malloc_typed_struct_ctor_is_left_for_boxing_fusion() {
+        let mut graph = struct_ctor_graph(true);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    fn boxing_cluster_with_nested_header() -> FunctionGraph {
+        let mut graph = FunctionGraph::new("w_new_int");
+        let entry = graph.startblock;
+        let header_owner = "ObjectHeader";
+        let outer_owner = "W_IntObject";
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), header_owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(header_owner.to_string())),
+                },
+                true,
+            )
+            .expect("header ctor");
+        let class_static = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["charon_corpus", "INT_CLASS"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("class static");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor::new("ob_type", Some(header_owner.to_string())),
+                value: LinkArg::Value(class_static),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let outer = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), outer_owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(outer_owner.to_string())),
+                },
+                true,
+            )
+            .expect("outer ctor");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: outer.clone(),
+                field: FieldDescriptor::new("ob_header", Some(outer_owner.to_string())),
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let boxed = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["runtime_object", "lltype", "malloc_typed"]),
+                    args: crate::model::call_args(vec![outer.clone()]),
+                    result_ty: ValueType::Ref(Some(outer_owner.to_string())),
+                },
+                true,
+            )
+            .expect("malloc_typed");
+        graph.set_return(entry, Some(boxed));
+        graph
+    }
+
+    fn boxing_cluster_ctor_new_counts(graph: &FunctionGraph) -> (usize, usize) {
+        let mut ctors = 0usize;
+        let mut news = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => ctors += 1,
+                OpKind::New { .. } => news += 1,
+                _ => {}
+            }
+        }
+        (ctors, news)
+    }
+
+    /// The nested header stored into a `malloc_typed` aggregate is still
+    /// part of the boxing cluster. Rewriting it to `New` would allocate the
+    /// header separately and leave fusion looking at a `New` instead of a
+    /// constructor.
+    #[test]
+    fn malloc_typed_nested_header_ctor_is_left_for_boxing_fusion() {
+        let mut graph = boxing_cluster_with_nested_header();
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
+    }
+
+    /// Final simplify must not steal the cluster either: fusion still has
+    /// to see the construct-on-stack spelling after class addresses land.
+    #[test]
+    fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
+        let mut graph = boxing_cluster_with_nested_header();
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
     /// Every row of the fn-pointer family decision, including the two the
@@ -34747,6 +35346,271 @@ mod tests {
         assert_eq!(copies[0].0.id(), input.id());
     }
 
+    fn scalar_method_call_fixture(
+        caller_name: &str,
+        callee_name: &[&str],
+        src_ty: serde_json::Value,
+        dst_ty: serde_json::Value,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [src_ty.clone()],
+                "output": dst_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": 1,
+                        "locals": [
+                            {"index": 0, "name": null, "span": span(), "ty": dst_ty.clone()},
+                            {"index": 1, "name": "value", "span": span(), "ty": src_ty.clone()}
+                        ]
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": {"Regular": 1}},
+                                                    "generics": {
+                                                        "regions": [],
+                                                        "types": [src_ty.clone(), dst_ty.clone()],
+                                                        "const_generics": [],
+                                                        "trait_refs": []
+                                                    }
+                                                }
+                                            },
+                                            "args": [{
+                                                "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                            }],
+                                            "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(callee_name, false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dst_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("scalar method fixture Llbc parses")
+    }
+
+    fn graph_ops(graph: &crate::model::FunctionGraph) -> Vec<&SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect()
+    }
+
+    #[test]
+    fn int_of_float_projects_to_cast_float_to_int() {
+        let llbc = scalar_method_call_fixture(
+            "to_int_unchecked_i64",
+            &["core", "f64", "<Impl>", "to_int_unchecked"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "to_int_unchecked_i64")
+            .expect("lower f64::to_int_unchecked::<i64>");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "cast_float_to_int" && *result_ty == ValueType::Int
+            )),
+            "f64::to_int_unchecked::<i64> must become cast_float_to_int; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })),
+            "f64::to_int_unchecked::<i64> must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f64_to_bits_projects_to_float2longlong() {
+        let llbc = scalar_method_call_fixture(
+            "f64_to_bits",
+            &["core", "f64", "<Impl>", "to_bits"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"UInt": "U64"}}),
+        );
+        let graph = super::lower_function(&llbc, "f64_to_bits").expect("lower f64::to_bits");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if matches!(segments.as_slice(), [a, b] if a == "longlong2float" && b == "float2longlong")
+            )),
+            "f64::to_bits must become float2longlong; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f32_to_bits_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "f32_to_bits",
+            &["core", "f32", "<Impl>", "to_bits"],
+            serde_json::json!({"Literal": {"Float": "F32"}}),
+            serde_json::json!({"Literal": {"UInt": "U32"}}),
+        );
+        let graph = super::lower_function(&llbc, "f32_to_bits").expect("lower f32::to_bits");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => matches!(
+                    segments.as_slice(),
+                    [a, b] if a == "longlong2float"
+                        && (b == "float2longlong" || b == "longlong2float")
+                ),
+                _ => false,
+            }),
+            "f32::to_bits must not become the f64 bitcast; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "to_bits")
+            )),
+            "f32::to_bits must stay a residual call; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn i128_to_int_unchecked_is_not_projected() {
+        let llbc = scalar_method_call_fixture(
+            "to_int_unchecked_i128",
+            &["core", "f64", "<Impl>", "to_int_unchecked"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I128"}}),
+        );
+        let graph = super::lower_function(&llbc, "to_int_unchecked_i128")
+            .expect("lower f64::to_int_unchecked::<i128>");
+        let ops = graph_ops(&graph);
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_float_to_int"
+            )),
+            "to_int_unchecked::<i128> must not become the 64-bit cast; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "to_int_unchecked")
+            )),
+            "to_int_unchecked::<i128> must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn f64_i64_transmute_projects_to_float_bytes_llop() {
+        let llbc = scalar_method_call_fixture(
+            "transmute_f64_to_i64",
+            &["core", "intrinsics", "transmute"],
+            serde_json::json!({"Literal": {"Float": "F64"}}),
+            serde_json::json!({"Literal": {"Int": "I64"}}),
+        );
+        let graph = super::lower_function(&llbc, "transmute_f64_to_i64")
+            .expect("lower transmute::<f64, i64>");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, result_ty, .. }
+                    if op == "convert_float_bytes_to_longlong" && *result_ty == ValueType::Int
+            )),
+            "transmute::<f64, i64> must become convert_float_bytes_to_longlong; ops={ops:?}"
+        );
+    }
+
     #[test]
     fn equal_size_int_to_float_transmute_stays_residual() {
         let llbc = transmute_lowering_fixture();
@@ -35209,6 +36073,206 @@ mod tests {
         assert!(!int_binop_needs_ptr_to_int("lt", Some(&int), Some(&int)));
         assert!(!int_binop_needs_ptr_to_int("mod", Some(&int), Some(&int)));
         assert!(!int_binop_needs_ptr_to_int("add", Some(&ptr), Some(&ptr)));
+    }
+
+    fn fixture_ty(v: serde_json::Value) -> TyRef {
+        serde_json::from_value::<TyRef>(serde_json::json!({
+            "HashConsedValue": [0, v]
+        }))
+        .expect("fixture TyRef parses")
+    }
+
+    fn shared_borrow_of_usize() -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Ref": [
+                {"Erased": null},
+                {"Literal": {"UInt": "Usize"}},
+                "Shared"
+            ]
+        }))
+    }
+
+    fn shared_borrow_of_u8() -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Ref": [
+                {"Erased": null},
+                {"Literal": {"UInt": "U8"}},
+                "Shared"
+            ]
+        }))
+    }
+
+    fn adt_ty(def_id: u64) -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Adt": {"id": {"Adt": def_id}, "generics": {"types": []}}
+        }))
+    }
+
+    fn type_decl_meta(path: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": {"data": {
+                "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    }
+
+    fn llbc_with_ordinary_and_closure_env() -> Llbc {
+        // def_id 0: ordinary struct named `closure` with src TopLevel — the
+        // name leaf must not decide env-ness.
+        // def_id 1: compiler-generated closure env named `Env` with src Closure.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": type_decl_meta(&["fixture", "BorrowedByte", "closure"]),
+                        "kind": {"Struct": [{
+                            "name": "byte",
+                            "ty": {"Ref": [{"Erased": null}, {"Literal": {"UInt": "U8"}}, "Shared"]},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                        }]},
+                        "src": "TopLevel"
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": type_decl_meta(&["fixture", "try_dispatch_binary_special", "Env"]),
+                        "kind": {"Struct": [{
+                            "name": null,
+                            "ty": {"Ref": [{"Erased": null}, {"Literal": {"UInt": "Usize"}}, "Shared"]},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }]},
+                        "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+                    }
+                ],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn type_decl_is_closure_env_reads_src_not_the_name() {
+        let llbc = llbc_with_ordinary_and_closure_env();
+        let named_closure = llbc.type_by_id(0).expect("ordinary struct");
+        let env = llbc.type_by_id(1).expect("closure env");
+        assert!(
+            !type_decl_is_closure_env(named_closure),
+            "a struct whose leaf is `closure` but whose src is TopLevel is not an env"
+        );
+        assert!(
+            type_decl_is_closure_env(env),
+            "src Closure identifies the env even when the leaf is not `closure`"
+        );
+        assert!(!tyref_is_closure_env(&adt_ty(0), &llbc));
+        assert!(tyref_is_closure_env(&adt_ty(1), &llbc));
+    }
+
+    #[test]
+    fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
+        // `try_dispatch_binary_special::closure::call` captures `operands:
+        // usize` by shared borrow.  `Rvalue::Ref` aliases that integer, so
+        // the field read must be Unsigned; leaving it Ref assembles
+        // `int_add/ri>i` at pc 10 of jitcode `call`.
+        let llbc = llbc_with_ordinary_and_closure_env();
+        let ref_usize = shared_borrow_of_usize();
+        let ref_u8 = shared_borrow_of_u8();
+        assert_eq!(
+            tyref_to_value_type(&ref_usize, &llbc),
+            ValueType::Ref(None),
+            "the global projection stays non-peeling for &usize"
+        );
+        assert_eq!(
+            adt_field_read_value_type(&ref_u8, &ref_u8, false, false, &llbc),
+            ValueType::Ref(None),
+            "an ordinary struct's &u8 field is a stored pointer"
+        );
+        assert_eq!(
+            adt_field_read_value_type(&ref_usize, &ref_usize, false, true, &llbc),
+            ValueType::Unsigned,
+            "a closure-env &usize capture is the usize"
+        );
+        let ordinary = llbc.type_by_id(0).expect("ordinary struct");
+        let env = llbc.type_by_id(1).expect("closure env");
+        assert_eq!(
+            tyref_to_attr_value_type(&ref_u8, &llbc),
+            ValueType::Ref(None),
+            "the generic attr projection does not peel a stored &u8"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&ref_u8, ordinary, &llbc),
+            ValueType::Ref(None),
+            "FORCE-attr rows for an ordinary struct stay Ref"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&ref_usize, env, &llbc),
+            ValueType::Unsigned,
+            "FORCE-attr rows for a closure-env capture match the Int-banked getfield"
+        );
+    }
+
+    #[test]
+    fn resolve_adt_field_keys_a_closure_capture_by_its_full_path() {
+        use super::Lowering;
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["fixture", 0]},
+                            {"Ident": ["try_dispatch_binary_special", 0]},
+                            {"Ident": ["closure", 0]}
+                        ],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"Literal": {"UInt": "Usize"}},
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]}
+                }],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).unwrap();
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let lowering = Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+        )
+        .unwrap();
+        let payload = serde_json::json!([{"Adt": [0, null]}, 0]);
+        let (owner_root, field_name, _, _) = lowering
+            .resolve_adt_field(&payload)
+            .expect("closure field projection must resolve");
+        assert_eq!(field_name, "__pos_0");
+        assert_eq!(
+            owner_root, "try_dispatch_binary_special::closure",
+            "the shared leaf `closure` is withdrawn; the field keys the full path"
+        );
     }
 
     #[test]
