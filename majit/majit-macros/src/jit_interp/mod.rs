@@ -1790,6 +1790,9 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
     if let Err(err) = validate_state_fields(&config, &func) {
         return err.to_compile_error();
     }
+    if let Err(err) = validate_merge_point_forms(&func) {
+        return err.to_compile_error();
+    }
     let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
     let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
@@ -2876,9 +2879,17 @@ impl Parse for MergePointArgs {
 }
 
 /// Whether any `jit_merge_point!` in this body carries `; state`.
+///
+/// The two spans are what `validate_merge_point_forms` reports: a body is
+/// allowed to spell the marker many times, but every one of them has to agree
+/// on who owns the state between passes.
 struct SinglePassCloseScan {
     found: bool,
     first_state: Option<MergePointArgs>,
+    /// First marker carrying `; state` — the walk keeps executing the guest.
+    single_pass_site: Option<proc_macro2::Span>,
+    /// First marker without it — an outer executor keeps executing the guest.
+    outer_owned_site: Option<proc_macro2::Span>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
@@ -2891,12 +2902,16 @@ impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
             .collect::<Vec<_>>()
             .join("::");
         if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
+            let site = mac.path.segments[0].ident.span();
             let args = syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
             if args.state.is_some() {
                 self.found = true;
                 if self.first_state.is_none() {
                     self.first_state = Some(args);
                 }
+                self.single_pass_site.get_or_insert(site);
+            } else {
+                self.outer_owned_site.get_or_insert(site);
             }
         }
         syn::visit::visit_macro(self, mac);
@@ -2907,6 +2922,8 @@ fn scan_single_pass_close(block: &syn::Block) -> SinglePassCloseScan {
     let mut scan = SinglePassCloseScan {
         found: false,
         first_state: None,
+        single_pass_site: None,
+        outer_owned_site: None,
     };
     syn::visit::Visit::visit_block(&mut scan, block);
     scan
@@ -2919,6 +2936,40 @@ fn scan_single_pass_close(block: &syn::Block) -> SinglePassCloseScan {
 /// `VirtualizableInfo::outer_executor_owns_state`.
 fn has_single_pass_close(func: &ItemFn) -> bool {
     scan_single_pass_close(&func.block).found
+}
+
+/// Every `jit_merge_point!` in one body must agree on the merge-point form.
+///
+/// The form answers who keeps executing the guest across a pass: a marker
+/// carrying `; state` closes the loop on the walk itself, while one without it
+/// leaves an outer executor running the live struct. That answer is published
+/// once per interpreter, on `VirtualizableInfo::outer_executor_owns_state`,
+/// and `TraceCtx::synchronize_virtualizable` reads it to decide whether
+/// flushing the trace shadow back into the native state is safe. One field
+/// cannot carry two answers: a body mixing the forms would flush for whichever
+/// form lost the vote, which for an outer-owned marker is exactly the clobber
+/// the carve-out exists to prevent. Reject the mix here, where the author can
+/// see it, rather than resolving it silently.
+fn validate_merge_point_forms(func: &ItemFn) -> syn::Result<()> {
+    let scan = scan_single_pass_close(&func.block);
+    let (Some(outer_owned), Some(single_pass)) = (scan.outer_owned_site, scan.single_pass_site)
+    else {
+        return Ok(());
+    };
+    let mut err = syn::Error::new(
+        single_pass,
+        "this `jit_merge_point!` carries `; state`, so the walk closes the loop \
+         and owns the state between passes",
+    );
+    err.combine(syn::Error::new(
+        outer_owned,
+        "this `jit_merge_point!` in the same function does not, so an outer \
+         executor owns it -- one function declares one ownership mode, because \
+         `VirtualizableInfo::outer_executor_owns_state` is published per \
+         interpreter and decides whether the virtualizable write-back is a \
+         clobber",
+    ));
+    Err(err)
 }
 
 /// Rewrite function body: replace jit_merge_point!() and can_enter_jit!() calls.
@@ -3801,6 +3852,65 @@ fn stmt_is_traced_loop(stmt: &syn::Stmt) -> bool {
 mod tests {
     use super::*;
     use syn::parse_quote;
+
+    /// A body that spells both merge-point forms is rejected, and the
+    /// diagnostic names the field that cannot hold both answers.
+    #[test]
+    fn a_body_mixing_merge_point_forms_is_rejected() {
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                loop {
+                    jit_merge_point!(driver, program, pc; state);
+                    if done {
+                        break;
+                    }
+                    jit_merge_point!();
+                }
+                0
+            }
+        };
+        let err = validate_merge_point_forms(&func)
+            .expect_err("one function may not declare two ownership modes");
+        // Both halves are reported, one span each, so the author sees the two
+        // markers that disagree rather than only the first.
+        let messages: Vec<String> = err.into_iter().map(|e| e.to_string()).collect();
+        assert_eq!(
+            messages.len(),
+            2,
+            "both markers must be named: {messages:?}"
+        );
+        let message = messages.join(" ");
+        assert!(
+            message.contains("outer_executor_owns_state"),
+            "the diagnostic must name the field that cannot hold both \
+             answers: {message}"
+        );
+    }
+
+    /// Repeating ONE form is not a mix: a body is free to spell the marker as
+    /// often as it needs to.
+    #[test]
+    fn a_body_repeating_one_merge_point_form_is_accepted() {
+        let single_pass: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                loop {
+                    jit_merge_point!(driver, program, pc; state);
+                    jit_merge_point!(driver, program, pc; state);
+                }
+            }
+        };
+        assert!(validate_merge_point_forms(&single_pass).is_ok());
+
+        let outer_owned: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                loop {
+                    jit_merge_point!();
+                    jit_merge_point!();
+                }
+            }
+        };
+        assert!(validate_merge_point_forms(&outer_owned).is_ok());
+    }
 
     /// A path in two vocabularies is rejected at parse time, naming the route
     /// that wins. Without the check the `calls` policy is simply never
