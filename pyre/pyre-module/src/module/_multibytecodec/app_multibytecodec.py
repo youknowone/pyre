@@ -8,22 +8,6 @@
 _OMITTED = object()
 
 
-def _codec_errors_arg(name, errors, _str_getitem=str.__getitem__, _whole=slice(None)):
-    # The `errors: str(accept={str, NoneType})` the two `MultibyteCodec`
-    # methods declare: `None` is the "strict" spelling.
-    if errors is None:
-        return "strict"
-    if not isinstance(errors, str):
-        raise TypeError(
-            f"{name}() argument 'errors' must be str or None, "
-            f"not {type(errors).__name__}"
-        )
-    # `text_or_none` is a gateway conversion in PyPy, so rebinding names in
-    # the app module cannot change it.  Capture the two builtin operands in
-    # defaults instead of resolving `str` or `slice` through mutable globals.
-    return _str_getitem(errors, _whole)
-
-
 def _errors_arg(name, position, errors, _str_getitem=str.__getitem__, _whole=slice(None)):
     # The plain `s` the four initializers declare: only a str, and an omitted
     # one means "strict".
@@ -62,10 +46,13 @@ class MultibyteCodec:
         self.name = name
 
     def encode(self, input, errors=None):
-        return _encode(self.name, input, _codec_errors_arg("encode", errors), True)
+        # `_encode` performs the `errors: str(accept={str, NoneType})`
+        # conversion itself, the way PyPy's gateway does, so this is one
+        # dispatch rather than a frame that only normalizes an argument.
+        return _encode(self.name, input, errors, True)
 
     def decode(self, input, errors=None):
-        return _decode(self.name, input, _codec_errors_arg("decode", errors), True)
+        return _decode(self.name, input, errors, True)
 
 
 def _get_errors(self):
