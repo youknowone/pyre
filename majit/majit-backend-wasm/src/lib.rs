@@ -1487,10 +1487,12 @@ pub fn active_gc_collection_counts() -> (usize, usize) {
 }
 
 /// Assemble the inline nursery-bump parameters for this trace's `New` /
-/// `NewWithVtable` ops (rewrite.py malloc-fast-path eligibility over the
-/// gc.py:525-531 nursery address surface), or `None` when no GC is active,
-/// the `gc_stress` feature is compiled in (the fast path would bypass its
-/// per-allocation stress collections), or no allocation op qualifies.
+/// `NewWithVtable` / `CallMallocNursery*` ops (rewrite.py malloc-fast-path
+/// eligibility over the gc.py:525-531 nursery address surface), or `None`
+/// when no GC is active, the `gc_stress` feature is compiled in (the fast
+/// path would bypass its per-allocation stress collections), or no
+/// allocation op qualifies. Post-rewrite `CallMallocNursery*` ops carry size
+/// in operands and do not need the per-tid set that `New*` uses.
 fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
     if majit_gc::gc_stress_enabled() {
         return None;
@@ -7738,6 +7740,79 @@ mod tests {
         let moved = table.slot(0);
         assert_ne!(moved, root, "remembered table slot must be forwarded");
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E701);
+    }
+
+    /// Post-rewrite `CallMallocNursery*` traces must get the same nursery
+    /// free/top addresses a `New` trace would; empty `plain_tids` must not
+    /// block them. `nursery_alloc_params` is the private gatherer that feeds
+    /// `compile_loop`.
+    #[test]
+    fn nursery_alloc_params_accepts_call_malloc_nursery() {
+        use majit_ir::descr::SimpleSizeDescr;
+        use std::sync::Arc;
+
+        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
+        let mut gc = MiniMarkGC::new();
+        let type_id = gc.register_type(TypeInfo::simple(16));
+        let mut backend = WasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let finish = majit_ir::Op::new(majit_ir::OpCode::Finish, &[]);
+        assert!(
+            nursery_alloc_params(&[finish.clone()]).is_none(),
+            "a trace with no allocation op must still return None"
+        );
+
+        let malloc = majit_ir::Op::new(
+            majit_ir::OpCode::CallMallocNursery,
+            &[rb(majit_ir::OpRef::const_int(32))],
+        );
+        malloc.pos().set(majit_ir::OpRef::ref_op(1));
+        let incr = majit_ir::Op::new(
+            majit_ir::OpCode::NurseryPtrIncrement,
+            &[
+                rb(majit_ir::OpRef::ref_op(1)),
+                rb(majit_ir::OpRef::const_int(32)),
+            ],
+        );
+        incr.pos().set(majit_ir::OpRef::ref_op(2));
+        let malloc_params = nursery_alloc_params(&[malloc, incr])
+            .expect("CallMallocNursery must qualify for the inline bump");
+
+        let new_op = majit_ir::Op::new(majit_ir::OpCode::New, &[]);
+        new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, type_id)));
+        new_op.pos().set(majit_ir::OpRef::ref_op(1));
+        let new_params = nursery_alloc_params(&[new_op]).expect("plain New must still qualify");
+        assert_eq!(malloc_params.free_addr, new_params.free_addr);
+        assert_eq!(malloc_params.top_addr, new_params.top_addr);
+        assert_ne!(malloc_params.free_addr, 0);
+        assert_ne!(malloc_params.top_addr, 0);
+
+        for opcode in [
+            majit_ir::OpCode::CallMallocNurseryHeaderless,
+            majit_ir::OpCode::CallMallocNurseryVarsizeFrame,
+        ] {
+            let op = majit_ir::Op::new(opcode, &[rb(majit_ir::OpRef::const_int(32))]);
+            op.pos().set(majit_ir::OpRef::ref_op(1));
+            assert!(
+                nursery_alloc_params(&[op]).is_some(),
+                "{opcode:?} must qualify for the inline bump"
+            );
+        }
+        let varsize = majit_ir::Op::new(
+            majit_ir::OpCode::CallMallocNurseryVarsize,
+            &[
+                rb(majit_ir::OpRef::const_int(0)),
+                rb(majit_ir::OpRef::const_int(8)),
+                rb(majit_ir::OpRef::const_int(4)),
+            ],
+        );
+        varsize.pos().set(majit_ir::OpRef::ref_op(1));
+        assert!(
+            nursery_alloc_params(&[varsize]).is_some(),
+            "CallMallocNurseryVarsize must qualify for the inline bump"
+        );
+        let _ = backend;
     }
 
     /// Spike for the wasm-JITFRAME refactor: prove the shared

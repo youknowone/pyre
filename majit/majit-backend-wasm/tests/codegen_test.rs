@@ -10544,3 +10544,133 @@ fn a_constant_fail_arg_in_a_force_bracket_is_published_as_a_literal() {
     );
     validate_wasm(&bytes);
 }
+
+/// Post-rewrite `CondCallGcWb(obj)` + `GcStore` emits the same barrier helper
+/// sequence a non-elided `SetfieldGc` would; `GcStore` itself stays
+/// barrier-free.
+#[test]
+fn cond_call_gc_wb_emits_the_field_barrier() {
+    const WB_TARGET: i64 = 0x4a11;
+    let inputargs = [
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Ref, 1),
+    ];
+    let wb = make_op(
+        OpCode::CondCallGcWb,
+        &[OpRef::input_arg_ref(0)],
+        OpRef::NONE,
+    );
+    let store = make_op(
+        OpCode::GcStore,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::const_int(8),
+            OpRef::input_arg_ref(1),
+            OpRef::const_int(4),
+        ],
+        OpRef::NONE,
+    );
+    let finish = Op::new(OpCode::Finish, &[]);
+    let with_wb = build_module_with_write_barrier_target(
+        &inputargs,
+        &[wb, store.clone(), finish.clone()],
+        WB_TARGET,
+    );
+    let without_wb =
+        build_module_with_write_barrier_target(&inputargs, &[store, finish], WB_TARGET);
+    validate_wasm(&with_wb);
+    validate_wasm(&without_wb);
+    assert_eq!(
+        direct_write_barrier_call_count(&without_wb, WB_TARGET as i32),
+        0,
+        "GcStore must stay barrier-free"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&with_wb, WB_TARGET as i32),
+        1,
+        "CondCallGcWb must emit the field write-barrier helper"
+    );
+}
+
+/// Post-rewrite `CondCallGcWbArray(obj, index)` + `GcStoreIndexed` emits the
+/// array barrier (`rewrite.py gen_write_barrier_array`), including card
+/// marking when the collector has cards.
+#[test]
+fn cond_call_gc_wb_array_emits_the_array_barrier() {
+    let inputargs = [
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+        InputArg::from_type_rc(Type::Ref, 2),
+    ];
+    let wb = make_op(
+        OpCode::CondCallGcWbArray,
+        &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+        OpRef::NONE,
+    );
+    let store = make_op(
+        OpCode::GcStoreIndexed,
+        &[
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_ref(2),
+            OpRef::const_int(4),
+            OpRef::const_int(16),
+            OpRef::const_int(4),
+        ],
+        OpRef::NONE,
+    );
+    let finish = Op::new(OpCode::Finish, &[]);
+    let wb_helpers = codegen::WriteBarrierHelpers::for_current_gc(WB_FIELD, WB_ARRAY);
+    let with_wb = build_module_with_barrier_helpers(
+        &inputargs,
+        &[wb, store.clone(), finish.clone()],
+        wb_helpers,
+    );
+    let without_wb = build_module_with_barrier_helpers(&inputargs, &[store, finish], wb_helpers);
+    validate_wasm(&with_wb);
+    validate_wasm(&without_wb);
+    assert_eq!(
+        direct_write_barrier_call_count(&without_wb, WB_ARRAY as i32),
+        0,
+        "GcStoreIndexed must stay barrier-free"
+    );
+    assert_eq!(
+        direct_write_barrier_call_count(&with_wb, WB_ARRAY as i32),
+        1,
+        "CondCallGcWbArray must emit the array write-barrier helper"
+    );
+    assert!(
+        count_i32_store8(&with_wb) >= 1,
+        "CondCallGcWbArray must mark a card byte when the collector has cards"
+    );
+}
+
+/// A pre-rewrite `New` + `SetfieldGc` of a ref is unchanged: one barrier
+/// sequence, and compiling the same list twice is byte-identical.
+#[test]
+fn pre_rewrite_new_setfield_gc_is_byte_identical_and_has_one_barrier() {
+    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
+    use std::sync::Arc;
+
+    const WB_TARGET: i64 = 0x4a11;
+    let pointer_field = Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
+    let new_obj = make_op(OpCode::New, &[], OpRef::ref_op(2));
+    new_obj.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, 1)));
+    let store = Op::new(
+        OpCode::SetfieldGc,
+        &[rb(OpRef::ref_op(2)), rb(OpRef::input_arg_ref(0))],
+    );
+    store.setdescr(pointer_field);
+    let finish = Op::new(OpCode::Finish, &[]);
+    let inputargs = [InputArg::from_type_rc(Type::Ref, 0)];
+    let ops = [new_obj, store, finish];
+    let first = build_module_with_write_barrier_target(&inputargs, &ops, WB_TARGET);
+    let second = build_module_with_write_barrier_target(&inputargs, &ops, WB_TARGET);
+    validate_wasm(&first);
+    assert_eq!(first, second, "pre-rewrite traces must stay byte-identical");
+    assert_eq!(
+        direct_write_barrier_call_count(&first, WB_TARGET as i32),
+        1,
+        "a single pre-rewrite SetfieldGc of a ref must emit exactly one barrier"
+    );
+}

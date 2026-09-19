@@ -2002,7 +2002,14 @@ fn ref_store_value_arg(op: &Op) -> Option<usize> {
 /// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
 /// constant reference is an immortal/old object whose store never makes the base
 /// point to young, so it needs no barrier (rewrite.py:930-931).
+///
+/// `CondCallGcWb` / `CondCallGcWbArray` are the rewriter's already-decided
+/// barrier ops (`rewrite.py gen_write_barrier` / `gen_write_barrier_array`);
+/// the stored value is no longer on the op, so the base is `arg(0)`.
 fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
+    if matches!(op.opcode, OpCode::CondCallGcWb | OpCode::CondCallGcWbArray) {
+        return Some(op.arg(0).to_opref());
+    }
     let val = op.arg(ref_store_value_arg(op)?).to_opref();
     // `contains` returns false for constants, matching the gate's `not ConstPtr`.
     ref_values.contains(val).then(|| op.arg(0).to_opref())
@@ -4051,12 +4058,12 @@ pub struct CaInlineParams {
     pub large_threshold: usize,
 }
 
-/// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable`
-/// (rewrite.py's malloc fast path over the gc.py:525-531
-/// `get_nursery_free_addr`/`get_nursery_top_addr` surface, which the x86
-/// backend lowers as `malloc_cond`: load free, bump, compare top, call the
-/// slow path only on overflow). `None` keeps every allocation on the
-/// `wasm_jit_alloc` helper call.
+/// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable` and
+/// the post-rewrite `CallMallocNursery*` ops (rewrite.py's malloc fast path
+/// over the gc.py:525-531 `get_nursery_free_addr`/`get_nursery_top_addr`
+/// surface, which the x86 backend lowers as `malloc_cond`: load free, bump,
+/// compare top, call the slow path only on overflow). `None` keeps every
+/// allocation on the `wasm_jit_alloc` helper call.
 #[derive(Clone)]
 pub struct NurseryAllocParams {
     /// Linear-memory address of the GC's `nursery_free` bump pointer.
