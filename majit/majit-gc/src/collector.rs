@@ -1238,86 +1238,6 @@ pub struct MiniMarkGC {
     stress_collect: bool,
 }
 
-/// Whether a byte at `addr` can be read without SIGBUS / SIGSEGV.
-///
-/// `write` from the address into a pipe returns `EFAULT` for a
-/// reserved commpage or an unmapped hole and does not raise. `mincore`
-/// and `msync` are not substitutes: Darwin lists the commpage in the
-/// process map, and `msync` itself can SIGBUS there. A hardcoded 12 GB
-/// hole is also not a substitute — macos-latest places live
-/// `alloc_with_gc_header` objects inside the range a crash report
-/// labelled reserved.
-#[cfg(unix)]
-fn page_is_mapped(addr: usize) -> bool {
-    unsafe extern "C" {
-        fn write(fd: i32, buf: *const u8, n: usize) -> isize;
-        fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
-    }
-    thread_local! {
-        static PIPE: [i32; 2] = open_cloexec_pipe();
-    }
-    PIPE.with(|fds| {
-        if fds[0] < 0 {
-            return false;
-        }
-        let n = unsafe { write(fds[1], addr as *const u8, 1) };
-        if n == 1 {
-            let mut byte = 0u8;
-            let _ = unsafe { read(fds[0], &mut byte, 1) };
-            true
-        } else {
-            false
-        }
-    })
-}
-
-/// Probe pipe with `O_CLOEXEC`. A bare `pipe()` leaked into children
-/// (`test_subprocess` / `test_tempfile` saw the extra fds).
-#[cfg(target_os = "linux")]
-fn open_cloexec_pipe() -> [i32; 2] {
-    unsafe extern "C" {
-        fn pipe2(fds: *mut i32, flags: i32) -> i32;
-    }
-    // `O_CLOEXEC` — atomic, no fork race between `pipe` and `fcntl`.
-    const O_CLOEXEC: i32 = 0o2000000;
-    let mut fds = [-1i32; 2];
-    if unsafe { pipe2(fds.as_mut_ptr(), O_CLOEXEC) } != 0 {
-        [-1, -1]
-    } else {
-        fds
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn open_cloexec_pipe() -> [i32; 2] {
-    unsafe extern "C" {
-        fn close(fd: i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
-        fn pipe(fds: *mut i32) -> i32;
-    }
-    const F_SETFD: i32 = 2;
-    const FD_CLOEXEC: i32 = 1;
-    let mut fds = [-1i32; 2];
-    if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-        return [-1, -1];
-    }
-    for fd in fds {
-        if unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } != 0 {
-            unsafe {
-                close(fds[0]);
-                close(fds[1]);
-            }
-            return [-1, -1];
-        }
-    }
-    fds
-}
-
-#[cfg(not(unix))]
-fn page_is_mapped(_addr: usize) -> bool {
-    true
-}
-
 impl MiniMarkGC {
     /// Create a new GC with default configuration.
     pub fn new() -> Self {
@@ -1662,46 +1582,6 @@ impl MiniMarkGC {
         addr != 0 && !self.is_tagged_immediate(addr)
     }
 
-    /// Cheap filter before the external-header probe loads a word.
-    ///
-    /// RPython's write barrier only ever sees a typed GC pointer. The
-    /// external-header probe is a pyre fallback for bootstrap objects
-    /// allocated off the managed heaps; a blackhole resume can hand it a
-    /// garbage `struct_ptr` (ARM instruction bits decoded as a Ref).
-    /// Refuse bit-patterns that cannot be a user object pointer. Mapping
-    /// membership is [`page_is_mapped`], not a hardcoded Darwin hole:
-    /// treating `0x844000000..0xb43000000` as reserved rejected live
-    /// `alloc_with_gc_header` objects on macos-latest (`prebuilt_write_
-    /// barrier_registers_root_once_and_traces_children`).
-    fn addr_is_safe_user_word(&self, addr: usize) -> bool {
-        // The first page is never a bootstrap object (crash reports
-        // include `0x8`).
-        if addr < 4096 || !addr.is_multiple_of(GcHeader::ALIGN) {
-            return false;
-        }
-        if !self.is_valid_gc_object(addr) {
-            return false;
-        }
-        #[cfg(target_pointer_width = "64")]
-        {
-            // User pointers live in the low 48 bits. ARM instruction
-            // bits decoded as a Ref (`0xf9400501f9404840`) fail this,
-            // as does any non-canonical x86-64 address.
-            if addr >> 48 != 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Whether `registered_external_header` may even consider `addr`.
-    fn addr_is_safe_header_probe(&self, addr: usize) -> bool {
-        let Some(header_addr) = addr.checked_sub(GcHeader::SIZE) else {
-            return false;
-        };
-        self.addr_is_safe_user_word(addr) && self.addr_is_safe_user_word(header_addr)
-    }
-
     /// incminimark.py range-check parity: nursery membership is a pure
     /// range check; JIT inline nursery bump-alloc must produce GcRefs
     /// indistinguishable from the slow path's, so a side table would
@@ -1724,22 +1604,11 @@ impl MiniMarkGC {
     /// box-probe experiment — so the tid witness stands.
     #[inline]
     fn registered_external_header(&self, addr: usize) -> Option<*mut GcHeader> {
-        if !self.addr_is_safe_header_probe(addr) {
-            return None;
-        }
-        // A headerless `Box::into_raw` at Darwin `MALLOC_SMALL` start
-        // `0xb43000000` has a mapped vtable word and an unmapped
-        // `header_of` (`0xb42fffff8`, the 2026-09-18 nbody SIGBUS).
-        // `mincore` answers that without a 12 GB reserved-range guess.
-        if !page_is_mapped(addr) {
+        if addr < GcHeader::SIZE || !addr.is_multiple_of(GcHeader::ALIGN) {
             return None;
         }
         let vtable = unsafe { *(addr as *const usize) };
         let expected_type_id = *self.vtable_to_type_id.get(&vtable)?;
-        let header_addr = addr - GcHeader::SIZE;
-        if !page_is_mapped(header_addr) {
-            return None;
-        }
         let hdr = unsafe { header_of(addr) };
         if unsafe { (*hdr).type_id() } == expected_type_id {
             Some(hdr)
@@ -12090,27 +11959,6 @@ mod tests {
         assert_eq!(unsafe { *flag_byte }, flag_byte_before);
 
         unsafe { std::alloc::dealloc(base, layout) };
-    }
-
-    #[test]
-    fn write_barrier_does_not_probe_reserved_or_non_user_addresses() {
-        // Blackhole resume has handed `bh_setfield_gc_r` these exact
-        // bit-patterns (`pyre-dynasm` crash reports 2026-09-18). The
-        // external-header probe must return without loading them.
-        // `do_write_barrier` is only called for addresses this host's
-        // probe rejects; a commpage hole on Darwin is a mapped userspace
-        // gap on Linux, and loading it is SIGSEGV (`majit-gc` lib test
-        // on ubuntu-24.04).
-        let mut gc = test_gc(1024);
-        gc.do_write_barrier(GcRef(8));
-        gc.do_write_barrier(GcRef(0xf940_0501_f940_4840));
-        assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
-        assert!(!gc.addr_is_safe_header_probe(8));
-        assert!(!gc.addr_is_safe_header_probe(0xf940_0501_f940_4840));
-        let live = 1usize;
-        assert!(page_is_mapped(std::ptr::addr_of!(live) as usize));
-        #[cfg(unix)]
-        assert!(!page_is_mapped(8));
     }
 
     #[test]
