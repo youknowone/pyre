@@ -490,6 +490,11 @@ jobs:
   cargo-test-linux:
     name: cargo test (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    # `actions: write` for the last step of `cargo-test-steps`, which cancels
+    # the run when this job fails.
+    permissions:
+      contents: read
+      actions: write
     needs: prepare-charon-llbc-linux
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     # Two cargo passes used to measure ~27 min together; PR 1832 run
@@ -668,9 +673,29 @@ jobs:
           --lib -- --ignored --test-threads=1 \
           compiler::tests::test_host_loop_external_jump_to
 
+    - name: Cancel the run (cargo test failed)
+      # A red `cargo test` ends the whole run: the tree does not pass its unit
+      # tests, so the hours the other jobs would still spend measure a tree
+      # that cannot land. Over the 52 failure runs of 2026-09-17..18, 179 of
+      # their 360 runner-hours were spent after the first job had gone red.
+      # `pyre/check.py` has no such step: one backend or platform going red
+      # says nothing about the others, and those legs run to the end.
+      # A PR from a fork gets a read-only token, so there the cancel is
+      # refused and the run carries on as before.
+      if: ${{ failure() }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh run cancel "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" || true
+
   cargo-test-macos:
     name: cargo test (macos-latest)
     runs-on: macos-latest
+    # `actions: write` for the last step of `cargo-test-steps`, which cancels
+    # the run when this job fails.
+    permissions:
+      contents: read
+      actions: write
     needs: prepare-charon-llbc-macos
     if: ${{ !cancelled() && needs.prepare-charon-llbc-macos.result == 'success' }}
     env:
@@ -681,6 +706,11 @@ jobs:
   cargo-test-windows:
     name: cargo test (windows-latest)
     runs-on: windows-latest
+    # `actions: write` for the last step of `cargo-test-steps`, which cancels
+    # the run when this job fails.
+    permissions:
+      contents: read
+      actions: write
     needs: prepare-charon-llbc-windows
     if: ${{ !cancelled() && needs.prepare-charon-llbc-windows.result == 'success' }}
     env:
