@@ -935,7 +935,7 @@ pub use function::*;
 /// `bits()` call is an Opaque Charon body and does not fold.
 pub use gateway::HOPELESS;
 pub use gateway::{
-    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, HOPELESS, MethodOwner,
+    BUILTIN_CODE_TYPE, BuiltinCode, BuiltinCodeFlags, BuiltinCodeFn, MethodOwner,
     Signature, SignatureBuilder, builtin_code_call, builtin_code_get,
     builtin_code_get_fast_natural_arity, builtin_code_get_signature, builtin_code_name,
     builtin_code_new, builtin_code_new_passthrough_args1, builtin_code_new_with_arity,
