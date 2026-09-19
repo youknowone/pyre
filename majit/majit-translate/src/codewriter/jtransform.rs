@@ -19973,6 +19973,51 @@ mod tests {
         }
     }
 
+    /// `rbuiltin.py rtype_cast_int_to_ptr` emits `cast_int_to_ptr`.
+    /// The host-callable path must become that op, not a residual helper.
+    #[test]
+    fn lltype_cast_int_to_ptr_call_becomes_unop() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_int_to_ptr_call");
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![n.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&n),
+            &ValueType::Ref(None),
+            "cast_int_to_ptr_call",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::UnaryOp { op, operand, .. },
+                        ..
+                    }] if op == "cast_int_to_ptr" && operand == &n
+                ));
+            }
+            _ => panic!("expected UnaryOp rewrite"),
+        }
+    }
+
     /// `Transformer._handle_str2unicode_call` records the Str2Unicode
     /// oopspec and appends `-live-` because Unicode decoding can raise.
     #[test]
