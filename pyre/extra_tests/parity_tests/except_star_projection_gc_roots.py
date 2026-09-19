@@ -2,21 +2,17 @@
 # projection walk, so nothing there reaches a relocated child.
 # parity-tests reason: this guards a pyre/PyPy moving-GC allocation invariant.
 
-"""`_exception_group_projection` keys on leaf ADDRESSES; nothing may move them.
+"""`_exception_group_projection` holds live leaf objects, not raw addresses.
 
 `app_group.py _exception_group_projection` keeps the leaves to project in an
 ``identity_dict`` -- the objects themselves -- and then walks the original group
-testing each child against that set.  pyre holds their addresses instead
-(``ExceptionGroupCondition::Identity``), which is sound only while every leaf is
-non-moving: ``w_exception_new_empty_impl`` allocates an exception through
-``try_gc_alloc_stable_raw``, the oldgen, and ``check_new_args`` refuses a member
-that is not a ``BaseException``.
+testing each child against that set.  pyre's ``ExceptionGroupCondition::Identity``
+is that same set as a rooted list of leaves, so a collection inside ``derive``
+forwards every not-yet-tested child instead of dropping it.
 
-This script is the guard on that invariant, not a reproducer -- it passes today
-and is meant to.  It forces a collection from inside ``derive``, i.e. between
-the leaf set being collected and the last child being tested, and asserts the
-projection is still complete.  The day an exception is born in the nursery, the
-address set starts dropping a relocated leaf and this fails.
+This script forces a collection from inside ``derive``, i.e. between the leaf
+set being collected and the last child being tested, and asserts the projection
+is still complete.
 """
 
 import gc

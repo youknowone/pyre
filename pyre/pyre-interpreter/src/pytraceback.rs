@@ -172,24 +172,23 @@ pub fn w_pytraceback_new(
     let roots = pyre_object::gc_roots::push_roots();
     let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
 
-    // This host-side constructor allocates the traceback itself into oldgen:
-    // its Rust caller can hold the returned pointer outside a translated
-    // GC-map slot before publishing it. JIT-emitted traceback nodes do not
-    // have that restriction: their live refs are GC-map roots or traced
-    // object fields, so their size descriptor keeps the ordinary movable
-    // nursery placement used upstream. Before the GC hook is wired
-    // (bootstrap, tests) `try_gc_alloc_stable` returns `None`; fall
-    // back to the leaked `malloc_typed` block.
-    let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
-        PYTRACEBACK_GC_TYPE_ID,
-        PYTRACEBACK_OBJECT_SIZE,
-    );
-    if !raw.is_null() {
-        // The fresh block is a root before `get_instantiate` below can enter
-        // an allocation of its own, matching `FrameBox::new`'s pin of its own
-        // result.  The block is non-moving, so `raw` stays the address.
+    // Nursery, same as `space.allocate_instance(PyTraceback)` /
+    // `malloc_fixedsize`.  The host-side constructor used to take
+    // `try_gc_alloc_stable_raw` so a Rust caller could hold the address
+    // unrooted; pin the block instead so a minor can move it.  JIT-emitted
+    // nodes already use the ordinary movable SizeDescr.  Before the GC
+    // hook is wired (bootstrap, tests) `try_gc_alloc` returns `None`;
+    // fall back to the leaked `malloc_typed` block.
+    let raw = pyre_object::gc_hook::try_gc_alloc(PYTRACEBACK_GC_TYPE_ID, PYTRACEBACK_OBJECT_SIZE)
+        .unwrap_or(std::ptr::null_mut());
+    let tb_slot = if raw.is_null() {
+        None
+    } else {
+        // Root the fresh block before `get_instantiate` below can allocate.
+        let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(raw as PyObjectRef);
-    }
+        Some(slot)
+    };
 
     // Every input is read back through the bracket's own cell rather than
     // reused from the argument: the allocation above may have moved any of
@@ -207,19 +206,17 @@ pub fn w_pytraceback_new(
         w_code: roots.get(inputs + 1),
     };
 
-    if raw.is_null() {
+    let Some(tb_slot) = tb_slot else {
         return pyre_object::lltype::malloc_typed(value) as PyObjectRef;
-    }
-
-    let ptr = raw as *mut PyTraceback;
+    };
+    let raw = pyre_object::gc_roots::shadow_stack_get(tb_slot) as *mut u8;
     unsafe {
-        std::ptr::write(ptr, value);
+        std::ptr::write(raw as *mut PyTraceback, value);
     }
-    // The oldgen traceback references the freshly-born `w_next` /
-    // `w_code` (and, once GC-owned, the frame); remember it for the
-    // next minor tracer.
+    // The node may point at a still-young `w_next` / `w_code` (and, once
+    // GC-owned, the frame); remember it if this alloc spilled old.
     pyre_object::gc_hook::try_gc_write_barrier(raw);
-    ptr as PyObjectRef
+    raw as PyObjectRef
 }
 
 /// # Safety

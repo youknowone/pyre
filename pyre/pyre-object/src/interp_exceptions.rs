@@ -250,10 +250,15 @@ impl ExcKind {
     pub const MAX_DISCRIMINANT: u8 = ExcKind::EOFError as u8;
 }
 
-/// Layout: `[ob_header | kind: ExcKind | args_w: PyObjectRef | …]`
+/// Layout: `[ob_header | kind: ExcKind | args_w | w_cause | w_context |
+/// w_traceback | suppress_context | w_dict | w_weakreflifeline]`.
 ///
-/// `args_w` mirrors `pypy/module/exceptions/interp_exceptions.py:121-124`
-/// `W_BaseException.descr_init`:
+/// Matches `interp_exceptions.py W_BaseException` and every
+/// `_new_exception` class that adds no instance fields (`W_ValueError`,
+/// `W_TypeError`, …).  Subclasses that declare extra slots live in
+/// [`W_ExceptionExtended`].
+///
+/// `args_w` mirrors `W_BaseException.descr_init`:
 ///
 /// ```python
 /// def descr_init(self, space, args_w):
@@ -261,13 +266,12 @@ impl ExcKind {
 /// ```
 ///
 /// PyPy keeps `args_w` as an RPython list and rebuilds the tuple on
-/// every read (`descr_getargs: return space.newtuple(self.args_w)`,
-/// line 153).  Pyre matches that shape line-by-line — the slot points
-/// at a `W_ListObject` (RPython list ↔ pyre `W_ListObject` parity);
-/// `w_exception_get_args` builds a fresh `W_TupleObject` from the
-/// list on every call, and `w_exception_set_args` coerces the
-/// incoming iterable via `fixedview` semantics into a brand-new list
-/// (line 156 `self.args_w = space.fixedview(w_newargs)`).
+/// every read (`descr_getargs: return space.newtuple(self.args_w)`).
+/// Pyre matches that shape — the slot points at an [`RList`]
+/// (`rlist.py` LIST); `w_exception_get_args`
+/// builds a fresh `W_TupleObject` from the list on every call, and
+/// `w_exception_set_args` coerces the incoming iterable via `fixedview`
+/// semantics into a brand-new list (`self.args_w = space.fixedview(w_newargs)`).
 ///
 /// `PY_NULL` means "not yet set" — the `args` getattr arm surfaces an
 /// empty tuple in that case, matching the path where the constructor
@@ -279,36 +283,55 @@ pub struct W_BaseException {
     pub kind: ExcKind,
     pub args_w: PyObjectRef,
     /// `interp_exceptions.py W_BaseException.w_cause = None` —
-    /// `raise X from Y` cause set by `descr_setcause` (line 167-174).
+    /// `raise X from Y` cause set by `descr_setcause`.
     /// `PY_NULL` mirrors PyPy's "internal None" (raises AttributeError
     /// on read in CPython; PyPy returns `space.w_None`).
     pub w_cause: PyObjectRef,
     /// `interp_exceptions.py W_BaseException.w_context = None` —
-    /// chained exception context set by `descr_setcontext`
-    /// (line 183-190).
+    /// chained exception context set by `descr_setcontext`.
     pub w_context: PyObjectRef,
     /// `interp_exceptions.py W_BaseException.w_traceback = None` —
-    /// traceback object stamped by `descr_settraceback` (line 200-205)
+    /// traceback object stamped by `descr_settraceback`
     /// and the `raise` machinery via `OperationError.normalize_exception`.
     pub w_traceback: PyObjectRef,
     /// `interp_exceptions.py W_BaseException.suppress_context =
     /// False` — `raise X from Y` flips this to True via
-    /// `descr_setcause` (line 172).
+    /// `descr_setcause`.
     pub suppress_context: bool,
+    /// `interp_exceptions.py W_BaseException.w_dict = None` — the
+    /// per-instance attribute dict, lazily allocated by `getdict`
+    /// and replaced wholesale by `setdict`.
+    /// Extra attributes (`e.note = ...`, PEP 678 `__notes__`) live
+    /// here.
+    pub w_dict: PyObjectRef,
+    /// Per-object weakref lifeline. Builtin exception classes are
+    /// weakrefable (`weakref.ref(ValueError(1))`), as are user
+    /// subclasses and `new_exception_class` module exceptions. The
+    /// slot lives on this slim prefix so a fieldless instance can
+    /// hold it without the extended layout.
+    pub w_weakreflifeline: PyObjectRef,
+}
+
+/// Extra-field subclasses of `W_BaseException`.
+///
+/// PyPy gives each of `W_OSError`, `W_ImportError`, `W_SyntaxError`,
+/// `W_Unicode*Error`, `W_StopIteration`, `W_NameError`,
+/// `W_AttributeError`, `W_SystemExit`, and `W_BaseExceptionGroup` its
+/// own interp-level class and SizeDescr.  Until those are split, they
+/// share this prefix-compatible extended layout so a `ValueError` can
+/// stay on the slim [`W_BaseException`] SizeDescr (~72) instead of
+/// carrying every unused subclass slot.
+#[repr(C)]
+pub struct W_ExceptionExtended {
+    pub base: W_BaseException,
     /// `interp_exceptions.py W_UnicodeTranslateError.w_object` /
-    /// `:1036 W_UnicodeDecodeError.w_object` /
-    /// `:1154 W_UnicodeEncodeError.w_object`.  The offending string /
+    /// `W_UnicodeDecodeError.w_object` /
+    /// `W_UnicodeEncodeError.w_object`.  The offending string /
     /// bytes object passed to `__init__`.  Populated by
     /// `descr_init`; `PY_NULL` for non-Unicode-error kinds and for
     /// Unicode errors constructed without going through the public
     /// `descr_init` path (matches PyPy's class-default `w_object = None`
     /// — `descr_str` checks `if self.object is None: return ""`).
-    ///
-    /// TODO: PyPy uses three distinct
-    /// `W_UnicodeTranslateError` / `W_UnicodeDecodeError` /
-    /// `W_UnicodeEncodeError` classes each with their own field set.
-    /// Pyre flattens them onto `W_BaseException` to keep a single
-    /// GC type id; per-kind structural split is tracked separately.
     pub w_object: PyObjectRef,
     /// `interp_exceptions.py W_UnicodeTranslateError.w_start`
     /// (and `:1037` / `:1155` for Decode / Encode).
@@ -420,19 +443,6 @@ pub struct W_BaseException {
     /// reproduces the constructor-time spelling, which a later mutation of
     /// `args` must not change; `PY_NULL` selects the derive-from-args path.
     pub w_group_exceptions_repr: PyObjectRef,
-    /// `interp_exceptions.py W_BaseException.w_dict = None` — the
-    /// per-instance attribute dict, lazily allocated by `getdict`
-    /// (`:222-225`) and replaced wholesale by `setdict` (`:227-231`).
-    /// Extra attributes (`e.note = ...`, PEP 678 `__notes__`) live
-    /// here.
-    pub w_dict: PyObjectRef,
-    /// Per-object weakref lifeline.  PyPy's app-level
-    /// `W_ExceptionGroup(W_BaseExceptionGroup, W_Exception)` acquires the
-    /// ordinary heap-type weakref slot even though `W_BaseExceptionGroup`
-    /// itself is not weakrefable.  Pyre flattens all exception payloads into
-    /// this struct, so the storage lives here and the `ExceptionGroup` type
-    /// flag controls whether it is observable.
-    pub w_weakreflifeline: PyObjectRef,
 }
 
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_BaseException, kind);
@@ -442,57 +452,64 @@ pub const EXC_W_CONTEXT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_
 pub const EXC_W_TRACEBACK_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_traceback);
 pub const EXC_SUPPRESS_CONTEXT_OFFSET: usize =
     std::mem::offset_of!(W_BaseException, suppress_context);
-pub const EXC_W_OBJECT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_object);
-pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_start);
-pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_end);
-pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_reason);
-pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_encoding);
-pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_errno);
-pub const EXC_W_WINERROR_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_winerror);
-pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_strerror);
-pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename);
-pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_filename2);
-pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_code);
-pub const EXC_W_VALUE_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_value);
-pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_exc_name);
-pub const EXC_W_ATTR_OBJ_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_attr_obj);
-pub const EXC_W_IMPORT_PATH_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_import_path);
-pub const EXC_W_IMPORT_NAME_FROM_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_import_name_from);
-pub const EXC_W_IMPORT_MSG_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_import_msg);
-pub const EXC_W_SYNTAX_MSG_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_syntax_msg);
-pub const EXC_W_SYNTAX_FILENAME_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_filename);
-pub const EXC_W_SYNTAX_LINENO_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_lineno);
-pub const EXC_W_SYNTAX_OFFSET_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_offset);
-pub const EXC_W_SYNTAX_TEXT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_syntax_text);
-pub const EXC_W_SYNTAX_END_LINENO_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_end_lineno);
-pub const EXC_W_SYNTAX_END_OFFSET_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_end_offset);
-pub const EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_print_file_and_line);
-pub const EXC_W_SYNTAX_METADATA_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_syntax_metadata);
-pub const EXC_W_GROUP_MESSAGE_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_group_message);
-pub const EXC_W_GROUP_EXCEPTIONS_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_group_exceptions);
-pub const EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET: usize =
-    std::mem::offset_of!(W_BaseException, w_group_exceptions_repr);
 pub const EXC_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_dict);
+pub const EXC_W_OBJECT_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_object);
+pub const EXC_W_START_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_start);
+pub const EXC_W_END_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_end);
+pub const EXC_W_REASON_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_reason);
+pub const EXC_W_ENCODING_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_encoding);
+pub const EXC_W_ERRNO_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_errno);
+pub const EXC_W_WINERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_winerror);
+pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_strerror);
+pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_filename);
+pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_filename2);
+pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_code);
+pub const EXC_W_VALUE_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_value);
+pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_exc_name);
+pub const EXC_W_ATTR_OBJ_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_attr_obj);
+pub const EXC_W_IMPORT_PATH_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_import_path);
+pub const EXC_W_IMPORT_NAME_FROM_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_import_name_from);
+pub const EXC_W_IMPORT_MSG_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_import_msg);
+pub const EXC_W_SYNTAX_MSG_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_syntax_msg);
+pub const EXC_W_SYNTAX_FILENAME_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_filename);
+pub const EXC_W_SYNTAX_LINENO_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_lineno);
+pub const EXC_W_SYNTAX_OFFSET_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_offset);
+pub const EXC_W_SYNTAX_TEXT_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_text);
+pub const EXC_W_SYNTAX_END_LINENO_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_end_lineno);
+pub const EXC_W_SYNTAX_END_OFFSET_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_end_offset);
+pub const EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_print_file_and_line);
+pub const EXC_W_SYNTAX_METADATA_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_syntax_metadata);
+pub const EXC_W_GROUP_MESSAGE_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_group_message);
+pub const EXC_W_GROUP_EXCEPTIONS_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_group_exceptions);
+pub const EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, w_group_exceptions_repr);
 pub const EXC_W_WEAKREF_OFFSET: usize = std::mem::offset_of!(W_BaseException, w_weakreflifeline);
 
 /// The pointer slots a traced construction emit must reproduce itself.
 ///
 /// Values are read through their exported byte offsets so this census cannot
-/// drift from the flattened `W_BaseException` layout.
-pub unsafe fn w_exception_traced_construction_slots(
-    obj: PyObjectRef,
-) -> [(usize, PyObjectRef); 33] {
-    const OFFSETS: [usize; 33] = [
+/// drift from the instance layout.  Slim [`W_BaseException`] kinds only
+/// expose the base slots; extra-field kinds also census the extended
+/// payload.
+pub unsafe fn w_exception_traced_construction_slots(obj: PyObjectRef) -> Vec<(usize, PyObjectRef)> {
+    const BASE_OFFSETS: [usize; 3] = [
+        EXC_W_CAUSE_OFFSET,
+        EXC_W_TRACEBACK_OFFSET,
+        EXC_W_DICT_OFFSET,
+    ];
+    const EXTENDED_OFFSETS: [usize; 33] = [
         EXC_W_CAUSE_OFFSET,
         EXC_W_TRACEBACK_OFFSET,
         EXC_W_OBJECT_OFFSET,
@@ -527,35 +544,36 @@ pub unsafe fn w_exception_traced_construction_slots(
         EXC_W_DICT_OFFSET,
         EXC_W_WEAKREF_OFFSET,
     ];
+    let kind = unsafe { (*(obj as *const W_BaseException)).kind };
+    let offsets: &[usize] = if exc_kind_uses_extended_layout(kind) {
+        &EXTENDED_OFFSETS
+    } else {
+        &BASE_OFFSETS
+    };
     let base = obj.cast::<u8>();
-    OFFSETS.map(|offset| {
-        let value = unsafe { base.add(offset).cast::<PyObjectRef>().read() };
-        (offset, value)
-    })
+    offsets
+        .iter()
+        .map(|&offset| {
+            let value = unsafe { base.add(offset).cast::<PyObjectRef>().read() };
+            (offset, value)
+        })
+        .collect()
 }
 
-/// GC trace offsets for `W_BaseException` — `args_w` plus the three
-/// `PyObjectRef`-shaped chained-exception slots per
-/// `interp_exceptions.py W_BaseException` class defaults,
-/// plus the five Unicode*Error per-class slots (w_object / w_start /
-/// w_end / w_reason / w_encoding) that PyPy distributes across the
-/// W_UnicodeTranslateError / W_UnicodeDecodeError / W_UnicodeEncodeError
-/// subclasses, plus the five W_OSError per-class slots (w_errno /
-/// w_winerror / w_strerror / w_filename / w_filename2), plus the W_SystemExit
-/// `w_code` slot, the W_StopIteration `w_value` slot, plus the shared
-/// `w_exc_name` slot (ImportError /
-/// NameError / AttributeError) and the W_AttributeError `w_attr_obj`
-/// slot, plus the three remaining W_ImportError per-class slots
-/// (w_import_path / w_import_name_from / w_import_msg), plus the eight
-/// W_SyntaxError fields and CPython 3.14 `_metadata`, plus the three
-/// `W_BaseExceptionGroup` slots (w_group_message / w_group_exceptions and the
-/// constructor-time sequence repr), plus the lazily-allocated
-/// `w_dict`, plus the heap-type weakref lifeline used by
-/// `ExceptionGroup`
-/// (interp_exceptions.py:113/222-231).  `kind` is a `u8` tag, `message`
-/// is a `*mut String` (raw heap), and `suppress_context` is a bool —
-/// none of those are GC-traced.
-pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 35] = [
+/// GC pointer slots on the slim [`W_BaseException`] layout
+/// (`interp_exceptions.py W_BaseException` class defaults).
+pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 6] = [
+    EXC_ARGS_W_OFFSET,
+    EXC_W_CAUSE_OFFSET,
+    EXC_W_CONTEXT_OFFSET,
+    EXC_W_TRACEBACK_OFFSET,
+    EXC_W_DICT_OFFSET,
+    EXC_W_WEAKREF_OFFSET,
+];
+
+/// GC pointer slots on [`W_ExceptionExtended`] — the slim base plus every
+/// extra-field subclass slot PyPy keeps on a dedicated interp class.
+pub const W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS: [usize; 35] = [
     EXC_ARGS_W_OFFSET,
     EXC_W_CAUSE_OFFSET,
     EXC_W_CONTEXT_OFFSET,
@@ -593,8 +611,56 @@ pub const W_BASE_EXCEPTION_GC_PTR_OFFSETS: [usize; 35] = [
     EXC_W_WEAKREF_OFFSET,
 ];
 
-/// GC type id assigned to `W_BaseException` at JitDriver init time.
+/// GC type id assigned to slim `W_BaseException` at JitDriver init time.
 pub const W_BASE_EXCEPTION_GC_TYPE_ID: u32 = 31;
+
+/// Runtime tid for [`W_ExceptionExtended`].  Assigned at the tail of
+/// `build_gc` so it does not shift the hardcoded / census-pinned ids.
+static W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Publish the GC tid for the extra-field exception layout.
+pub fn set_exception_extended_gc_type_id(tid: u32) {
+    W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL.store(tid, std::sync::atomic::Ordering::Release);
+}
+
+/// Tid of [`W_ExceptionExtended`].  0 until `build_gc` publishes it.
+pub fn exception_extended_gc_type_id() -> u32 {
+    W_EXCEPTION_EXTENDED_GC_TYPE_ID_CELL.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// rlist.py `LIST = GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))`.
+///
+/// Interp-level `list of W_Root` used for `W_BaseException.args_w`.  Not a
+/// Python `list`: no `ob_type` / strategy / typed unbox storage.
+#[repr(C)]
+pub struct RList {
+    pub length: i64,
+    pub items: *mut crate::object_array::ItemsBlock,
+}
+
+pub const RLIST_SIZE: usize = std::mem::size_of::<RList>();
+pub const RLIST_LENGTH_OFFSET: usize = std::mem::offset_of!(RList, length);
+pub const RLIST_ITEMS_OFFSET: usize = std::mem::offset_of!(RList, items);
+
+static RLIST_GC_TYPE_ID_CELL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_rlist_gc_type_id(tid: u32) {
+    debug_assert_ne!(tid, 0, "0 is the unpublished sentinel");
+    RLIST_GC_TYPE_ID_CELL.store(tid, std::sync::atomic::Ordering::Release);
+}
+
+#[majit_macros::dont_look_inside]
+pub fn rlist_gc_type_id() -> u32 {
+    RLIST_GC_TYPE_ID_CELL.load(std::sync::atomic::Ordering::Acquire)
+}
+
+impl crate::lltype::GcType for RList {
+    fn type_id() -> u32 {
+        rlist_gc_type_id()
+    }
+    const SIZE: usize = RLIST_SIZE;
+}
 
 /// Record an old→young edge when a `W_BaseException` slot
 /// (`W_BASE_EXCEPTION_GC_PTR_OFFSETS`) is overwritten after allocation.
@@ -607,14 +673,50 @@ fn exception_write_barrier(obj: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Fixed payload size (`framework.py:811`).
+/// Fixed payload size (`framework.py` `malloc` / `init_gc_object`) of the slim base layout.
 pub const W_BASE_EXCEPTION_SIZE: usize = std::mem::size_of::<W_BaseException>();
+
+/// Payload size of extra-field exception subclasses.
+pub const W_EXCEPTION_EXTENDED_SIZE: usize = std::mem::size_of::<W_ExceptionExtended>();
 
 impl crate::lltype::GcType for W_BaseException {
     fn type_id() -> u32 {
         W_BASE_EXCEPTION_GC_TYPE_ID
     }
     const SIZE: usize = W_BASE_EXCEPTION_SIZE;
+}
+
+impl crate::lltype::GcType for W_ExceptionExtended {
+    fn type_id() -> u32 {
+        exception_extended_gc_type_id()
+    }
+    const SIZE: usize = W_EXCEPTION_EXTENDED_SIZE;
+}
+
+/// True when `kind` is a PyPy class that declares extra instance fields
+/// (or inherits such a class): `W_OSError`, `W_ImportError`,
+/// `W_SyntaxError`, `W_Unicode*Error`, `W_StopIteration`, `W_NameError`,
+/// `W_AttributeError`, `W_SystemExit`, and their `_new_exception`
+/// children.  `_new_exception` classes that add no fields stay on the
+/// slim [`W_BaseException`] layout.
+#[inline]
+pub fn exc_kind_uses_extended_layout(kind: ExcKind) -> bool {
+    matches!(
+        kind,
+        ExcKind::ImportError
+            | ExcKind::ModuleNotFoundError
+            | ExcKind::OSError
+            | ExcKind::FileNotFoundError
+            | ExcKind::StopIteration
+            | ExcKind::NameError
+            | ExcKind::UnboundLocalError
+            | ExcKind::AttributeError
+            | ExcKind::SyntaxError
+            | ExcKind::SystemExit
+            | ExcKind::UnicodeDecodeError
+            | ExcKind::UnicodeEncodeError
+            | ExcKind::UnicodeTranslateError
+    )
 }
 
 /// Allocate a new exception object on the heap.
@@ -673,6 +775,15 @@ pub fn w_exception_new_empty(kind: ExcKind) -> PyObjectRef {
     w_exception_new_empty_impl(kind, false)
 }
 
+/// Allocate the extra-field layout even when `kind` is a slim class.
+///
+/// `interp_group.W_BaseExceptionGroup.descr_new` builds a group instance
+/// tagged as `Exception` / `BaseException` and then writes the group
+/// slots; those slots only exist on [`W_ExceptionExtended`].
+pub fn w_exception_new_empty_extended(kind: ExcKind) -> PyObjectRef {
+    w_exception_new_empty_extended_impl(kind, false)
+}
+
 /// Immortal variant for the prebuilt singletons (`memory_error_singleton` /
 /// `standard_exc_instance`): they are cached in `OnceLock<usize>` (GC-invisible)
 /// and baked into JIT constant pools as immediate pointers, so they must never
@@ -691,15 +802,54 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// `lltype::malloc*` spellings `fuse_boxing_alloc` recognises. Residualise the
 /// whole constructor — the JIT models it by signature as a plain
 /// `PyObjectRef` GCREF and emits a residual call.
+/// `framework.py malloc` for a non-immortal exception. Nursery, same as
+/// `ll_newlist` / `rlist_new`. A born-old instance plus a nursery `args_w`
+/// rlist is a permanent old→young edge: if the setter misses the
+/// remembered set, the next minor recycles the items block and a type-9
+/// walk reads a pointer as capacity.
+fn alloc_exception_nursery<T: crate::lltype::GcType>(value: T) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let tid = T::type_id();
+    let raw = if tid != 0 {
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(tid, T::SIZE))
+            .allocated_or_abort(T::SIZE)
+            .unwrap_or(std::ptr::null_mut())
+    } else {
+        std::ptr::null_mut()
+    };
+    if !raw.is_null() {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+        let raw = crate::gc_roots::shadow_stack_get(slot) as *mut u8;
+        unsafe {
+            std::ptr::write(raw as *mut T, value);
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
+    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
 #[majit_macros::dont_look_inside]
 fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
+    if exc_kind_uses_extended_layout(kind) {
+        return w_exception_new_empty_extended_impl(kind, immortal);
+    }
+    let value = w_exception_base_defaults(kind);
+    if !immortal {
+        return alloc_exception_nursery(value);
+    }
+    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
+fn w_exception_base_defaults(kind: ExcKind) -> W_BaseException {
     let w_class = lookup_exc_class_for_kind(kind);
     let w_class = if w_class != PY_NULL {
         w_class
     } else {
         get_instantiate(&EXCEPTION_TYPE)
     };
-    let value = W_BaseException {
+    W_BaseException {
         ob_header: PyObject {
             ob_type: exc_kind_to_pytype(kind) as *const PyType,
             w_class,
@@ -710,45 +860,34 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_context: PY_NULL,
         w_traceback: PY_NULL,
         suppress_context: false,
-        // `interp_exceptions.py` W_UnicodeTranslateError class
-        // defaults `w_object = w_start = w_end = w_reason = None`
-        // (and `:1035-1039` Decode / `:1153-1157` Encode add
-        // `w_encoding = None`).  PyPy reads `None` as "unset" via
-        // `if self.object is None: return ""`; pyre uses `PY_NULL`
-        // (the args getattr / descr_str arms surface `space.w_None`
-        // when an instance was allocated outside `descr_init`).
+        w_dict: PY_NULL,
+        w_weakreflifeline: PY_NULL,
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn w_exception_new_empty_extended_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
+    let value = W_ExceptionExtended {
+        base: w_exception_base_defaults(kind),
         w_object: PY_NULL,
         w_start: PY_NULL,
         w_end: PY_NULL,
         w_reason: PY_NULL,
         w_encoding: PY_NULL,
-        // `interp_exceptions.py` W_OSError class defaults
-        // `w_errno = w_winerror = w_strerror = w_filename = w_filename2 = None`.
         w_errno: PY_NULL,
         w_winerror: PY_NULL,
         w_strerror: PY_NULL,
         w_filename: PY_NULL,
         w_filename2: PY_NULL,
-        // `interp_exceptions.py` W_OSError class default.
         written: -1,
         blocking_written_arg: false,
-        // `interp_exceptions.py` W_SystemExit class default
-        // `w_code = None`.
         w_code: PY_NULL,
-        // `interp_exceptions.py` W_StopIteration class default
-        // `w_value = None`.
         w_value: PY_NULL,
-        // Shared `name` slot (ImportError / NameError / AttributeError)
-        // + W_AttributeError `obj`; class default `None`.
         w_exc_name: PY_NULL,
         w_attr_obj: PY_NULL,
-        // `interp_exceptions.py` W_ImportError class defaults
-        // `w_msg = w_path = None` (plus `w_name_from`).
         w_import_path: PY_NULL,
         w_import_name_from: PY_NULL,
         w_import_msg: PY_NULL,
-        // `interp_exceptions.py` W_SyntaxError defaults, plus
-        // CPython 3.14's private `_metadata` member.
         w_syntax_msg: PY_NULL,
         w_syntax_filename: PY_NULL,
         w_syntax_lineno: PY_NULL,
@@ -758,37 +897,12 @@ fn w_exception_new_empty_impl(kind: ExcKind, immortal: bool) -> PyObjectRef {
         w_syntax_end_offset: PY_NULL,
         w_syntax_print_file_and_line: PY_NULL,
         w_syntax_metadata: PY_NULL,
-        // `interp_group.py` W_BaseExceptionGroup defaults, stamped by
-        // `descr_new` on the group kinds only.
         w_group_message: PY_NULL,
         w_group_exceptions: PY_NULL,
         w_group_exceptions_repr: PY_NULL,
-        // `interp_exceptions.py w_dict = None` — allocated on the
-        // first `getdict` (`:222-225`).
-        w_dict: PY_NULL,
-        // Only ExceptionGroup exposes this slot; the shared flattened
-        // exception layout keeps it null for every other exception kind.
-        w_weakreflifeline: PY_NULL,
     };
     if !immortal {
-        // GC-manage the exception object: allocate it in the non-moving
-        // oldgen so accessors can deref a bare `*W_BaseException` and the
-        // JIT can carry it as a raw i64 across allocating opcodes without
-        // it moving. Oldgen is mark-sweep, so all carriers must root it
-        // (`walk_in_flight_exception`, the value-stack walker, and the
-        // raw-i64 JIT carriers). Mirrors `w_generator_new`.
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(
-            W_BASE_EXCEPTION_GC_TYPE_ID,
-            W_BASE_EXCEPTION_SIZE,
-        );
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(raw as *mut W_BaseException, value);
-            }
-            crate::gc_hook::try_gc_write_barrier(raw);
-            return raw as PyObjectRef;
-        }
-        return crate::lltype::malloc_typed(value) as PyObjectRef;
+        return alloc_exception_nursery(value);
     }
     crate::lltype::malloc_typed(value) as PyObjectRef
 }
@@ -881,52 +995,111 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
             return crate::tupleobject::w_tuple_new(Vec::new());
         }
         // PyPy: `space.newtuple(self.args_w)`.  `args_w` is an
-        // RPython list (pyre: `W_ListObject`); flatten its items into
-        // a freshly-allocated tuple.
-        let items: Vec<PyObjectRef> = if crate::pyobject::is_list(stored) {
-            let len = crate::listobject::w_list_len(stored) as i64;
-            let mut items = Vec::with_capacity(len as usize);
-            for i in 0..len {
-                items.push(
-                    crate::listobject::w_list_getitem(stored, i)
-                        .unwrap_or(crate::pyobject::PY_NULL),
-                );
-            }
-            items
-        } else if crate::pyobject::is_tuple(stored) {
-            // Legacy compat — pre-list storage path; treat as already
-            // a sequence and rebuild the tuple identically.
-            let len = crate::tupleobject::w_tuple_len(stored) as i64;
-            let mut items = Vec::with_capacity(len as usize);
-            for i in 0..len {
-                items.push(
-                    crate::tupleobject::w_tuple_getitem(stored, i)
-                        .unwrap_or(crate::pyobject::PY_NULL),
-                );
-            }
-            items
-        } else {
-            Vec::new()
-        };
-        crate::tupleobject::w_tuple_new(items)
+        // RPython list (`rlist.py` LIST).
+        crate::tupleobject::w_tuple_new(rlist_items(stored))
     }
 }
 
 /// Build the `args_w` storage list for an exception.
 ///
 /// `interp_exceptions.py` declares `args_w = []` — an RPython
-/// `list of W_Root`, i.e. a plain array of object pointers.  List
-/// *strategies* are a `W_ListObject` feature of the app-level list type
-/// (`objspace/std/listobject.py`) and have no counterpart in an RPython
-/// list, so `args_w` must never take the unboxed `Integer` / `Float`
-/// representation `w_list_new` would pick for `ValueError(7)`, nor the
-/// `Empty` one it picks for `ValueError()`.
-///
-/// Beyond parity this is what keeps the slot readable: the `args` load
-/// fold walks the object items block directly, and declines on any other
-/// strategy, leaving `e.args` as a residual `getattr` call.
+/// `list of W_Root` (`rlist.py` LIST: length + `Ptr(GcArray(OBJECTPTR))`).
 pub fn w_exception_args_new(items: Vec<PyObjectRef>) -> PyObjectRef {
-    crate::listobject::w_list_new_object(items)
+    rlist_new(items)
+}
+
+/// rlist.py `ll_newlist` — allocate a LIST and copy `items` into its
+/// `GcArray(OBJECTPTR)` body. `ll_newlist` always mallocs the items
+/// array, including `length == 0`.
+#[majit_macros::dont_look_inside]
+pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let items_base = crate::gc_roots::shadow_stack_len();
+    for &item in &items {
+        let _ = crate::gc_roots::pin_root(item);
+    }
+    let n = items.len();
+    let rooted: Vec<PyObjectRef> = (0..n)
+        .map(|i| crate::gc_roots::shadow_stack_get(items_base + i))
+        .collect();
+    // Exact-size `malloc(LIST.items.TO, length)`, including 0.
+    // `alloc_list_items_block_gc` would clamp empty to `cap.max(1)`.
+    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(&rooted) };
+    // `alloc_tuple_items_block_gc` roots the block only inside its own
+    // frame, which it pops on return. The header malloc below is a
+    // safepoint, so pin the block here and reload it after — the same
+    // shape `w_tuple_new_array_backed` uses across its struct alloc.
+    let block_slot = if block.is_null() {
+        None
+    } else {
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+        Some(slot)
+    };
+    let reload_block = || -> *mut crate::object_array::ItemsBlock {
+        block_slot
+            .map(crate::gc_roots::shadow_stack_get)
+            .unwrap_or(std::ptr::null_mut()) as *mut crate::object_array::ItemsBlock
+    };
+    // rlist.py `ll_newlist` mallocs the LIST header in the nursery, same
+    // as the items GcArray. A born-old header (`try_gc_alloc_stable_raw`)
+    // plus a nursery items block is a permanent old→young edge: if the
+    // header misses the remembered set, a minor collection moves or
+    // recycles the block and the next scan of the header walks stale
+    // nursery bytes as a type-9 array (GC BUG invalid type_id / huge
+    // holder_offset on StopIteration-heavy tests).
+    let tid = rlist_gc_type_id();
+    let raw = if tid != 0 {
+        crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc(tid, RLIST_SIZE))
+            .allocated_or_abort(RLIST_SIZE)
+            .unwrap_or(std::ptr::null_mut())
+    } else {
+        std::ptr::null_mut()
+    };
+    if !raw.is_null() {
+        let header_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+        let value = RList {
+            length: n as i64,
+            items: reload_block(),
+        };
+        let raw = crate::gc_roots::shadow_stack_get(header_slot) as *mut u8;
+        unsafe {
+            std::ptr::write(raw as *mut RList, value);
+        }
+        crate::gc_hook::try_gc_write_barrier(raw);
+        return raw as PyObjectRef;
+    }
+    let value = RList {
+        length: n as i64,
+        items: reload_block(),
+    };
+    crate::lltype::malloc_typed(value) as PyObjectRef
+}
+
+/// rlist.py `ll_length`.
+#[inline]
+pub unsafe fn rlist_len(list: PyObjectRef) -> usize {
+    if list.is_null() {
+        return 0;
+    }
+    unsafe { (*(list as *const RList)).length.max(0) as usize }
+}
+
+/// rlist.py `ll_getitem_fast` for a known-in-bounds index.
+#[inline]
+pub unsafe fn rlist_getitem(list: PyObjectRef, index: usize) -> PyObjectRef {
+    let list = unsafe { &*(list as *const RList) };
+    debug_assert!(index < list.length.max(0) as usize);
+    let base = unsafe { crate::object_array::items_block_items_base(list.items) };
+    unsafe { *base.add(index) }
+}
+
+fn rlist_items(list: PyObjectRef) -> Vec<PyObjectRef> {
+    let len = unsafe { rlist_len(list) };
+    (0..len)
+        .map(|i| unsafe { rlist_getitem(list, i) })
+        .collect()
 }
 
 /// Raw `args_w` storage for JIT field mirrors.  Unlike
@@ -950,11 +1123,7 @@ pub unsafe fn w_exception_get_args_storage(obj: PyObjectRef) -> PyObjectRef {
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// Stores a `W_ListObject` carrying the constructor / setter items.
-/// Callers (`baseobjspace::coerce_to_list_for_args`) pre-flatten any
-/// iterable into a list via `space.fixedview` semantics so the slot
-/// always holds a list — matching PyPy's `args_w: list of W_Root`
-/// type.
+/// Stores the rlist.py LIST `space.fixedview` produced.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -1066,10 +1235,20 @@ pub unsafe fn w_exception_set_traceback(obj: PyObjectRef, value: PyObjectRef) {
 pub unsafe fn w_exception_getdict(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
         let exc = obj as *mut W_BaseException;
-        if (*exc).w_dict.is_null() {
-            (*exc).w_dict = crate::dictmultiobject::w_dict_new_instance();
-            exception_write_barrier(obj);
+        if !(*exc).w_dict.is_null() {
+            return (*exc).w_dict;
         }
+        // The exception is nursery-allocated.  The instance dict is a
+        // collecting allocation, so the receiver is pinned and the store
+        // goes through the forwarded address.
+        let _roots = crate::gc_roots::push_roots();
+        let obj_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        let w_dict = crate::dictmultiobject::w_dict_new_instance();
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let exc = obj as *mut W_BaseException;
+        (*exc).w_dict = w_dict;
+        exception_write_barrier(obj);
         (*exc).w_dict
     }
 }
@@ -1099,9 +1278,9 @@ pub unsafe fn w_exception_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     }
 }
 
-/// Read the per-exception weakref lifeline.  Only `ExceptionGroup`'s type
-/// advertises this storage; keeping it on the flattened exception payload
-/// matches the object-owned lifeline used by PyPy heap instances.
+/// Read the per-exception weakref lifeline. Builtin exceptions and
+/// their subclasses keep this slot on the slim [`W_BaseException`]
+/// prefix so a fieldless instance can be weakrefable.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -1172,7 +1351,7 @@ pub unsafe fn w_exception_set_suppress_context(obj: PyObjectRef, value: bool) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_object }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_object }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_object', ...)`
@@ -1183,7 +1362,7 @@ pub unsafe fn w_exception_get_object(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_object = value;
+        (*(obj as *mut W_ExceptionExtended)).w_object = value;
         exception_write_barrier(obj);
     }
 }
@@ -1195,7 +1374,7 @@ pub unsafe fn w_exception_set_object(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_start }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_start }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_start', ...)`
@@ -1206,7 +1385,7 @@ pub unsafe fn w_exception_get_start(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_start = value;
+        (*(obj as *mut W_ExceptionExtended)).w_start = value;
         exception_write_barrier(obj);
     }
 }
@@ -1218,7 +1397,7 @@ pub unsafe fn w_exception_set_start(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_end }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_end }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_end', ...)`
@@ -1229,7 +1408,7 @@ pub unsafe fn w_exception_get_end(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_end = value;
+        (*(obj as *mut W_ExceptionExtended)).w_end = value;
         exception_write_barrier(obj);
     }
 }
@@ -1241,7 +1420,7 @@ pub unsafe fn w_exception_set_end(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_reason }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_reason }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_reason', ...)`
@@ -1252,7 +1431,7 @@ pub unsafe fn w_exception_get_reason(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_reason = value;
+        (*(obj as *mut W_ExceptionExtended)).w_reason = value;
         exception_write_barrier(obj);
     }
 }
@@ -1266,7 +1445,7 @@ pub unsafe fn w_exception_set_reason(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_encoding }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_encoding }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_encoding',
@@ -1277,7 +1456,7 @@ pub unsafe fn w_exception_get_encoding(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_encoding = value;
+        (*(obj as *mut W_ExceptionExtended)).w_encoding = value;
         exception_write_barrier(obj);
     }
 }
@@ -1290,7 +1469,7 @@ pub unsafe fn w_exception_set_encoding(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_errno(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_errno }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_errno }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_errno', ...)`
@@ -1301,7 +1480,7 @@ pub unsafe fn w_exception_get_errno(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_errno = value;
+        (*(obj as *mut W_ExceptionExtended)).w_errno = value;
         exception_write_barrier(obj);
     }
 }
@@ -1315,7 +1494,7 @@ pub unsafe fn w_exception_set_errno(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_winerror(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_winerror }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_winerror }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_winerror', ...)`
@@ -1326,7 +1505,7 @@ pub unsafe fn w_exception_get_winerror(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_winerror(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_winerror = value;
+        (*(obj as *mut W_ExceptionExtended)).w_winerror = value;
         exception_write_barrier(obj);
     }
 }
@@ -1338,7 +1517,7 @@ pub unsafe fn w_exception_set_winerror(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_strerror(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_strerror }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_strerror }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_strerror', ...)`
@@ -1349,7 +1528,7 @@ pub unsafe fn w_exception_get_strerror(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_strerror(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_strerror = value;
+        (*(obj as *mut W_ExceptionExtended)).w_strerror = value;
         exception_write_barrier(obj);
     }
 }
@@ -1361,7 +1540,7 @@ pub unsafe fn w_exception_set_strerror(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_filename(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_filename }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_filename }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_filename', ...)`
@@ -1372,7 +1551,7 @@ pub unsafe fn w_exception_get_filename(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_filename(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_filename = value;
+        (*(obj as *mut W_ExceptionExtended)).w_filename = value;
         exception_write_barrier(obj);
     }
 }
@@ -1384,7 +1563,7 @@ pub unsafe fn w_exception_set_filename(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_filename2(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_filename2 }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_filename2 }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_filename2', ...)`
@@ -1395,7 +1574,7 @@ pub unsafe fn w_exception_get_filename2(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_filename2 = value;
+        (*(obj as *mut W_ExceptionExtended)).w_filename2 = value;
         exception_write_barrier(obj);
     }
 }
@@ -1407,7 +1586,7 @@ pub unsafe fn w_exception_set_filename2(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_written(obj: PyObjectRef) -> i64 {
-    unsafe { (*(obj as *const W_BaseException)).written }
+    unsafe { (*(obj as *const W_ExceptionExtended)).written }
 }
 
 /// Store the `W_OSError.written` integer slot.
@@ -1416,7 +1595,7 @@ pub unsafe fn w_exception_get_written(obj: PyObjectRef) -> i64 {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_set_written(obj: PyObjectRef, value: i64) {
-    unsafe { (*(obj as *mut W_BaseException)).written = value };
+    unsafe { (*(obj as *mut W_ExceptionExtended)).written = value };
 }
 
 #[inline]
@@ -1424,7 +1603,7 @@ pub unsafe fn w_exception_set_written(obj: PyObjectRef, value: i64) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_blocking_written_arg(obj: PyObjectRef) -> bool {
-    unsafe { (*(obj as *const W_BaseException)).blocking_written_arg }
+    unsafe { (*(obj as *const W_ExceptionExtended)).blocking_written_arg }
 }
 
 #[inline]
@@ -1432,7 +1611,7 @@ pub unsafe fn w_exception_get_blocking_written_arg(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_blocking_written_arg(obj: PyObjectRef) {
-    unsafe { (*(obj as *mut W_BaseException)).blocking_written_arg = true };
+    unsafe { (*(obj as *mut W_ExceptionExtended)).blocking_written_arg = true };
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_code', ...)`
@@ -1443,7 +1622,7 @@ pub unsafe fn w_exception_set_blocking_written_arg(obj: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_code }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_code }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_code', ...)`
@@ -1454,7 +1633,7 @@ pub unsafe fn w_exception_get_code(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_code = value;
+        (*(obj as *mut W_ExceptionExtended)).w_code = value;
         exception_write_barrier(obj);
     }
 }
@@ -1466,7 +1645,7 @@ pub unsafe fn w_exception_set_code(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_value(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_value }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_value }
 }
 
 /// `interp_exceptions.py readwrite_attrproperty_w('w_value', ...)` —
@@ -1477,7 +1656,7 @@ pub unsafe fn w_exception_get_value(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_value(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_value = value;
+        (*(obj as *mut W_ExceptionExtended)).w_value = value;
         exception_write_barrier(obj);
     }
 }
@@ -1489,7 +1668,7 @@ pub unsafe fn w_exception_set_value(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_name(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_exc_name }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_exc_name }
 }
 
 /// Shared `e.name = ...` writer for ImportError / NameError /
@@ -1500,7 +1679,7 @@ pub unsafe fn w_exception_get_name(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_name(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_exc_name = value;
+        (*(obj as *mut W_ExceptionExtended)).w_exc_name = value;
         exception_write_barrier(obj);
     }
 }
@@ -1511,7 +1690,7 @@ pub unsafe fn w_exception_set_name(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_attr_obj(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_attr_obj }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_attr_obj }
 }
 
 /// `e.obj = ...` writer (W_AttributeError).
@@ -1521,7 +1700,7 @@ pub unsafe fn w_exception_get_attr_obj(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_attr_obj(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_attr_obj = value;
+        (*(obj as *mut W_ExceptionExtended)).w_attr_obj = value;
         exception_write_barrier(obj);
     }
 }
@@ -1533,7 +1712,7 @@ pub unsafe fn w_exception_set_attr_obj(obj: PyObjectRef, value: PyObjectRef) {
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_import_path(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_import_path }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_import_path }
 }
 
 /// `e.path = ...` writer (W_ImportError).
@@ -1543,7 +1722,7 @@ pub unsafe fn w_exception_get_import_path(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_import_path(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_import_path = value;
+        (*(obj as *mut W_ExceptionExtended)).w_import_path = value;
         exception_write_barrier(obj);
     }
 }
@@ -1554,7 +1733,7 @@ pub unsafe fn w_exception_set_import_path(obj: PyObjectRef, value: PyObjectRef) 
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_import_name_from(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_import_name_from }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_import_name_from }
 }
 
 /// `e.name_from = ...` writer (W_ImportError).
@@ -1564,7 +1743,7 @@ pub unsafe fn w_exception_get_import_name_from(obj: PyObjectRef) -> PyObjectRef 
 #[inline]
 pub unsafe fn w_exception_set_import_name_from(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_import_name_from = value;
+        (*(obj as *mut W_ExceptionExtended)).w_import_name_from = value;
         exception_write_barrier(obj);
     }
 }
@@ -1577,7 +1756,7 @@ pub unsafe fn w_exception_set_import_name_from(obj: PyObjectRef, value: PyObject
 /// `obj` must point to a valid `W_BaseException`.
 #[inline]
 pub unsafe fn w_exception_get_import_msg(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_import_msg }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_import_msg }
 }
 
 /// `e.msg = ...` writer (W_ImportError).
@@ -1587,7 +1766,7 @@ pub unsafe fn w_exception_get_import_msg(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_import_msg = value;
+        (*(obj as *mut W_ExceptionExtended)).w_import_msg = value;
         exception_write_barrier(obj);
     }
 }
@@ -1598,7 +1777,7 @@ pub unsafe fn w_exception_set_import_msg(obj: PyObjectRef, value: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_filename(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_filename }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_filename }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_filename` writer.
@@ -1608,7 +1787,7 @@ pub unsafe fn w_exception_get_syntax_filename(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_filename(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_filename = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_filename = value;
         exception_write_barrier(obj);
     }
 }
@@ -1619,7 +1798,7 @@ pub unsafe fn w_exception_set_syntax_filename(obj: PyObjectRef, value: PyObjectR
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_lineno(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_lineno }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_lineno }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_lineno` writer.
@@ -1629,7 +1808,7 @@ pub unsafe fn w_exception_get_syntax_lineno(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_lineno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_lineno = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_lineno = value;
         exception_write_barrier(obj);
     }
 }
@@ -1640,7 +1819,7 @@ pub unsafe fn w_exception_set_syntax_lineno(obj: PyObjectRef, value: PyObjectRef
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_offset(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_offset }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_offset }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_offset` writer.
@@ -1650,7 +1829,7 @@ pub unsafe fn w_exception_get_syntax_offset(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_offset(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_offset = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_offset = value;
         exception_write_barrier(obj);
     }
 }
@@ -1661,7 +1840,7 @@ pub unsafe fn w_exception_set_syntax_offset(obj: PyObjectRef, value: PyObjectRef
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_text(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_text }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_text }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_text` writer.
@@ -1671,7 +1850,7 @@ pub unsafe fn w_exception_get_syntax_text(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_text(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_text = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_text = value;
         exception_write_barrier(obj);
     }
 }
@@ -1682,7 +1861,7 @@ pub unsafe fn w_exception_set_syntax_text(obj: PyObjectRef, value: PyObjectRef) 
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_msg(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_msg }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_msg }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_msg` writer.
@@ -1692,7 +1871,7 @@ pub unsafe fn w_exception_get_syntax_msg(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_msg(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_msg = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_msg = value;
         exception_write_barrier(obj);
     }
 }
@@ -1703,7 +1882,7 @@ pub unsafe fn w_exception_set_syntax_msg(obj: PyObjectRef, value: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_print_file_and_line(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_print_file_and_line }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_print_file_and_line }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_print_file_and_line` writer.
@@ -1713,7 +1892,7 @@ pub unsafe fn w_exception_get_syntax_print_file_and_line(obj: PyObjectRef) -> Py
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_print_file_and_line(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_print_file_and_line = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_print_file_and_line = value;
         exception_write_barrier(obj);
     }
 }
@@ -1724,7 +1903,7 @@ pub unsafe fn w_exception_set_syntax_print_file_and_line(obj: PyObjectRef, value
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_end_lineno(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_end_lineno }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_end_lineno }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_end_lineno` writer.
@@ -1734,7 +1913,7 @@ pub unsafe fn w_exception_get_syntax_end_lineno(obj: PyObjectRef) -> PyObjectRef
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_end_lineno(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_end_lineno = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_end_lineno = value;
         exception_write_barrier(obj);
     }
 }
@@ -1745,7 +1924,7 @@ pub unsafe fn w_exception_set_syntax_end_lineno(obj: PyObjectRef, value: PyObjec
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_end_offset(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_end_offset }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_end_offset }
 }
 
 /// `interp_exceptions.py W_SyntaxError.w_end_offset` writer.
@@ -1755,7 +1934,7 @@ pub unsafe fn w_exception_get_syntax_end_offset(obj: PyObjectRef) -> PyObjectRef
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_end_offset(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_end_offset = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_end_offset = value;
         exception_write_barrier(obj);
     }
 }
@@ -1766,7 +1945,7 @@ pub unsafe fn w_exception_set_syntax_end_offset(obj: PyObjectRef, value: PyObjec
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_syntax_metadata(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_syntax_metadata }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_syntax_metadata }
 }
 
 /// CPython 3.14 `SyntaxError._metadata` writer.
@@ -1776,7 +1955,7 @@ pub unsafe fn w_exception_get_syntax_metadata(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_syntax_metadata(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_syntax_metadata = value;
+        (*(obj as *mut W_ExceptionExtended)).w_syntax_metadata = value;
         exception_write_barrier(obj);
     }
 }
@@ -1787,7 +1966,7 @@ pub unsafe fn w_exception_set_syntax_metadata(obj: PyObjectRef, value: PyObjectR
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_group_message(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_group_message }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_group_message }
 }
 
 /// `interp_group.py` `exc.w_message` writer.
@@ -1797,7 +1976,7 @@ pub unsafe fn w_exception_get_group_message(obj: PyObjectRef) -> PyObjectRef {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_group_message(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_group_message = value;
+        (*(obj as *mut W_ExceptionExtended)).w_group_message = value;
         exception_write_barrier(obj);
     }
 }
@@ -1808,7 +1987,7 @@ pub unsafe fn w_exception_set_group_message(obj: PyObjectRef, value: PyObjectRef
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_group_exceptions(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_group_exceptions }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_group_exceptions }
 }
 
 /// `interp_group.py` `exc.w_exceptions` writer.
@@ -1818,7 +1997,7 @@ pub unsafe fn w_exception_get_group_exceptions(obj: PyObjectRef) -> PyObjectRef 
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_group_exceptions(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_group_exceptions = value;
+        (*(obj as *mut W_ExceptionExtended)).w_group_exceptions = value;
         exception_write_barrier(obj);
     }
 }
@@ -1829,7 +2008,7 @@ pub unsafe fn w_exception_set_group_exceptions(obj: PyObjectRef, value: PyObject
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_get_group_exceptions_repr(obj: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(obj as *const W_BaseException)).w_group_exceptions_repr }
+    unsafe { (*(obj as *const W_ExceptionExtended)).w_group_exceptions_repr }
 }
 
 /// Constructor-time `repr` of the sequence `descr_new` received.
@@ -1839,7 +2018,7 @@ pub unsafe fn w_exception_get_group_exceptions_repr(obj: PyObjectRef) -> PyObjec
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_exception_set_group_exceptions_repr(obj: PyObjectRef, value: PyObjectRef) {
     unsafe {
-        (*(obj as *mut W_BaseException)).w_group_exceptions_repr = value;
+        (*(obj as *mut W_ExceptionExtended)).w_group_exceptions_repr = value;
         exception_write_barrier(obj);
     }
 }
@@ -2449,6 +2628,43 @@ mod tests {
         assert_eq!(
             <W_BaseException as crate::lltype::GcType>::SIZE,
             W_BASE_EXCEPTION_SIZE
+        );
+        assert_eq!(
+            <W_ExceptionExtended as crate::lltype::GcType>::SIZE,
+            W_EXCEPTION_EXTENDED_SIZE
+        );
+        assert!(
+            W_BASE_EXCEPTION_SIZE <= 80,
+            "slim W_BaseException must stay near PyPy SizeDescr 72, got {}",
+            W_BASE_EXCEPTION_SIZE
+        );
+        assert!(
+            W_EXCEPTION_EXTENDED_SIZE > W_BASE_EXCEPTION_SIZE,
+            "extended layout must be larger than the slim base"
+        );
+        assert_eq!(RLIST_SIZE, 16);
+        assert_eq!(RLIST_ITEMS_OFFSET, 8);
+    }
+
+    #[test]
+    fn rlist_new_roundtrip() {
+        let a = crate::intobject::w_int_new(7);
+        let b = crate::intobject::w_int_new(8);
+        let list = rlist_new(vec![a, b]);
+        assert_eq!(unsafe { rlist_len(list) }, 2);
+        assert_eq!(
+            unsafe { crate::intobject::w_int_get_value(rlist_getitem(list, 0)) },
+            7
+        );
+        assert_eq!(
+            unsafe { crate::intobject::w_int_get_value(rlist_getitem(list, 1)) },
+            8
+        );
+        let empty = rlist_new(Vec::new());
+        assert_eq!(unsafe { rlist_len(empty) }, 0);
+        assert!(
+            !unsafe { (*(empty as *const RList)).items }.is_null(),
+            "ll_newlist mallocs a 0-length items array"
         );
     }
 }

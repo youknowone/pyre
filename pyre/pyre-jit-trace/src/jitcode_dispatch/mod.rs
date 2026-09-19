@@ -5662,6 +5662,21 @@ fn loopinvariant_now_known<Sym: WalkSym>(
         .call_loopinvariant_now_known(descr_key, arg0_int, result, 0);
 }
 
+fn walk_body_has_exception_handler<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    code: &[u8],
+) -> bool {
+    let jitcode_index = if ctx.is_top_level {
+        ctx.session.borrow().recording_jitcode_index
+    } else {
+        ctx.inline_callee_consts
+            .map_or(-1, |consts| consts.jitcode_index)
+    };
+    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
+        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
+    })
+}
+
 /// Resolve a residual-call funcptr OpRef to the concrete function
 /// pointer integer that RPython's heapcache keys on
 /// (`heapcache.py` calls `allboxes[0].getint()`).
@@ -5686,21 +5701,6 @@ fn funcptr_concrete_int<Sym: WalkSym>(
         Some(majit_ir::Value::Int(v)) => Some(v),
         _ => None,
     }
-}
-
-fn walk_body_has_exception_handler<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    code: &[u8],
-) -> bool {
-    let jitcode_index = if ctx.is_top_level {
-        ctx.session.borrow().recording_jitcode_index
-    } else {
-        ctx.inline_callee_consts
-            .map_or(-1, |consts| consts.jitcode_index)
-    };
-    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
-        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
-    })
 }
 
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port for residual calls
@@ -10741,10 +10741,11 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
     if expected_typeobj.is_null() || ctx.trace_ctx.heap_cache().is_unescaped(obj) {
         return Ok(());
     }
-    // A ConstPtr interned / co_consts box already is the exact builtin.
-    // Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every iteration is
-    // the leftover the `guard_value` comment below exists to kill;
-    // for a compile-time constant the proof is the object itself.
+    // A ConstPtr interned / co_consts / builtin-method box already is the
+    // exact builtin. Recording GETFIELD_GC_R(w_class)+GUARD_VALUE every
+    // iteration doubled `list_ops` guard failures. Heap instances handed
+    // through `inline_call` can have `__class__` reassigned; those are not
+    // `is_constant()` interned boxes with a matching live `w_class`.
     if obj.is_constant()
         && let Some(concrete) = walker_concrete_ref_object(ctx, obj)
         && !concrete.is_null()
@@ -10752,8 +10753,6 @@ fn walker_guard_exact_w_class<Sym: WalkSym>(
             && pyre_object::tagged_int::is_tagged_int(concrete))
         && std::ptr::eq(unsafe { (*concrete).w_class }, expected_typeobj)
     {
-        // Exact class implies the layout vtable; a later unbox / GuardClass
-        // of this ConstPtr already has its own `already_this_class` fold.
         return Ok(());
     }
     // Every predicate that admits one of these folds — `is_exact_builtin_instance`,

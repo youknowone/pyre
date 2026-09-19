@@ -1237,6 +1237,48 @@ pub fn stringpiece_size_descr() -> DescrRef {
     STRINGPIECE_DESCR_GROUP.size_descr.clone()
 }
 
+/// rlist.py LIST — interp-level `list of W_Root` used for exception `args_w`.
+static RLIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::interp_exceptions as exc;
+    build_bare_gcstruct_descr_group(
+        exc::RLIST_SIZE,
+        exc::rlist_gc_type_id(),
+        &[
+            (
+                "length",
+                exc::RLIST_LENGTH_OFFSET,
+                8,
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "items",
+                exc::RLIST_ITEMS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "rlist.LIST",
+    )
+});
+
+pub fn rlist_size_descr() -> DescrRef {
+    RLIST_DESCR_GROUP.size_descr.clone()
+}
+
+pub fn rlist_length_descr() -> DescrRef {
+    field_descr_from_group(&RLIST_DESCR_GROUP, 0)
+}
+
+pub fn rlist_items_descr() -> DescrRef {
+    field_descr_from_group(&RLIST_DESCR_GROUP, 1)
+}
+
 static W_INT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
         std::mem::size_of::<W_IntObject>(),
@@ -1291,6 +1333,54 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         ],
         "W_FloatObject",
         "floatobject::W_FloatObject",
+    )
+});
+
+static W_COMPLEX_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<W_ComplexObject>(),
+        W_COMPLEX_GC_TYPE_ID,
+        &COMPLEX_TYPE as *const _ as usize,
+        &[
+            (
+                "real",
+                COMPLEX_REAL_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
+                "imag",
+                COMPLEX_IMAG_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
+                "w_dict",
+                COMPLEX_W_DICT_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "w_slots",
+                COMPLEX_W_SLOTS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
+        "W_ComplexObject",
+        "complexobject::W_ComplexObject",
     )
 });
 
@@ -3399,6 +3489,10 @@ pub fn make_array_descr_with_full_id(
 
 // Range iterator field descriptors.
 
+use pyre_object::complexobject::{
+    COMPLEX_IMAG_OFFSET, COMPLEX_REAL_OFFSET, COMPLEX_W_DICT_OFFSET, COMPLEX_W_SLOTS_OFFSET,
+    W_COMPLEX_GC_TYPE_ID, W_ComplexObject,
+};
 use pyre_object::floatobject::{
     FLOAT_FLOATVAL_OFFSET, FLOAT_W_DICT_OFFSET, FLOAT_W_SLOTS_OFFSET, W_FloatObject,
 };
@@ -3420,7 +3514,8 @@ use pyre_object::interp_exceptions::{
     EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
     EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
     EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
-    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, exc_kind_to_pytype,
+    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, W_EXCEPTION_EXTENDED_SIZE,
+    exc_kind_to_pytype, exc_kind_uses_extended_layout, exception_extended_gc_type_id,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -3429,7 +3524,7 @@ use pyre_object::{
     INT_ARRAY_LEN_OFFSET, INT_INTVAL_OFFSET, W_ListObject, W_TupleObject,
 };
 // Re-import the rest without duplication
-use pyre_object::{FLOAT_TYPE, INT_TYPE};
+use pyre_object::{COMPLEX_TYPE, FLOAT_TYPE, INT_TYPE};
 
 /// Field descriptor for `PyObject.w_class` (Ref, `w_class?`).
 ///
@@ -4795,6 +4890,14 @@ pub fn float_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_DESCR_GROUP, 0)
 }
 
+pub fn complex_real_descr() -> DescrRef {
+    field_descr_from_group(&W_COMPLEX_DESCR_GROUP, 0)
+}
+
+pub fn complex_imag_descr() -> DescrRef {
+    field_descr_from_group(&W_COMPLEX_DESCR_GROUP, 1)
+}
+
 /// FieldDescr for `W_LongObject.value` (the `*mut BigInt` gc-pointer), for the
 /// inline-NEW boxing of a `jit_w_long_*_raw` result.
 pub fn long_value_descr() -> DescrRef {
@@ -5079,6 +5182,12 @@ pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
 }
 
+/// Size descriptor for `W_ComplexObject` allocation via NewWithVtable.
+/// vtable = &COMPLEX_TYPE (ob_type for virtual materialization).
+pub fn w_complex_size_descr() -> DescrRef {
+    W_COMPLEX_DESCR_GROUP.size_descr.clone()
+}
+
 /// Size descriptor for W_LongObject allocation via NewWithVtable (the inline
 /// boxing of a bigint result). vtable = &LONG_TYPE (ob_type).
 pub fn w_long_size_descr() -> DescrRef {
@@ -5120,17 +5229,121 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
-/// SizeDescr + field descrs for `W_BaseException` allocation via
-/// NewWithVtable, one set per `ExcKind`.  The vtable (`ob_type`) differs
-/// per kind (`exc_kind_to_pytype`), so each kind owns its group; the
-/// constructor-written fields — `kind`, `w_class`, `args_w`, and
-/// `suppress_context` — share the same offsets across kinds. `w_context`
-/// is written separately by the raise lowering; the remaining pointer slots
-/// stay zeroed by GC pointer clearing (PY_NULL), matching `w_exception_new_empty`.
+/// SizeDescr + field descrs for exception allocation via NewWithVtable,
+/// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
+/// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
+/// classes use the slim [`W_BaseException`] SizeDescr; extra-field
+/// subclasses use [`W_ExceptionExtended`].  The constructor-written
+/// fields — `kind`, `w_class`, `args_w` — share the same offsets and
+/// indices across both layouts. `w_context` is written separately by the
+/// raise lowering; remaining pointer slots stay zeroed by GC pointer
+/// clearing (PY_NULL), matching `w_exception_new_empty`.
 fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+    if !exc_kind_uses_extended_layout(kind) {
+        return build_object_descr_group_keyed_only(
+            W_BASE_EXCEPTION_SIZE,
+            pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID,
+            exc_kind_to_pytype(kind) as *const _ as usize,
+            &[
+                (
+                    "W_BaseException.kind",
+                    EXC_KIND_OFFSET,
+                    1,
+                    Type::Int,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_class",
+                    W_CLASS_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.args_w",
+                    EXC_ARGS_W_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_context",
+                    EXC_W_CONTEXT_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_cause",
+                    EXC_W_CAUSE_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_traceback",
+                    EXC_W_TRACEBACK_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_dict",
+                    EXC_W_DICT_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.w_weakreflifeline",
+                    EXC_W_WEAKREF_OFFSET,
+                    WORD,
+                    Type::Ref,
+                    false,
+                    false,
+                    false,
+                ),
+                (
+                    "W_BaseException.suppress_context",
+                    EXC_SUPPRESS_CONTEXT_OFFSET,
+                    1,
+                    Type::Int,
+                    false,
+                    false,
+                    false,
+                ),
+            ],
+            "W_BaseException",
+        );
+    }
+    let extended_tid = exception_extended_gc_type_id();
+    #[cfg(not(test))]
+    assert_ne!(
+        extended_tid, 0,
+        "W_ExceptionExtended GC type id is not initialised"
+    );
+    let extended_tid = if extended_tid == 0 {
+        pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID
+    } else {
+        extended_tid
+    };
     build_object_descr_group_keyed_only(
-        W_BASE_EXCEPTION_SIZE,
-        W_BASE_EXCEPTION_GC_TYPE_ID,
+        W_EXCEPTION_EXTENDED_SIZE,
+        extended_tid,
         exc_kind_to_pytype(kind) as *const _ as usize,
         &[
             // `kind` is a `u8` tag (1 byte, unsigned).
@@ -5489,15 +5702,10 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        // Out of both name registries: the per-kind vtable means a shared
-        // "W_BaseException" name-registry slot would be first-write-wins and
-        // lose the other kinds' vtables.  NewWithVtable embeds the SizeDescr
-        // in the op, so the name-registry publish is not needed here.  The
-        // `_cache_size` identity is still required: `resolve_gc_tid` reads the
-        // header tid for a serialized `BhDescr` out of that slot, and every
-        // kind shares one layout and one `W_BASE_EXCEPTION_GC_TYPE_ID`, so one
-        // key for all of them is exactly the STRUCT identity they have.
-        "W_BaseException",
+        // Extra-field kinds share one STRUCT identity distinct from the
+        // slim `W_BaseException` key above, so `_cache_size` cannot
+        // first-write-wins the 72-byte SizeDescr onto an OSError.
+        "W_ExceptionExtended",
     )
 }
 
@@ -5586,7 +5794,13 @@ pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
-    field_descr_from_group(cache[idx].as_ref().unwrap(), 5)
+    let group = cache[idx].as_ref().unwrap();
+    let field = group
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == EXC_W_TRACEBACK_OFFSET)
+        .expect("exception descr group has no w_traceback field");
+    field_descr_from_group(group, field)
 }
 
 static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -5784,6 +5998,14 @@ pub fn ec_sys_exc_value_descr() -> DescrRef {
     ec_field_descr(pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET)
 }
 
+/// Field descr for `ExecutionContext::current_gen_or_coroutine`, the slot
+/// `executioncontext.py sys_exc_info` reads after a null `sys_exc_operror`.
+/// Same group as [`ec_sys_exc_value_descr`] so a POP_EXCEPT restore of the
+/// exception slot and this generator-head pin share one struct identity.
+pub fn ec_current_gen_or_coroutine_descr() -> DescrRef {
+    ec_field_descr(pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET)
+}
+
 /// Field descr for `ExecutionContext::topframeref`, used by the JIT lowering
 /// of `executioncontext.py enter` / `:96-97 leave` at an inlined call:
 /// `frame.f_backref = self.topframeref` reads it and
@@ -5939,6 +6161,11 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
             pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
         ),
         profilefunc,
+        field(
+            6,
+            "current_gen_or_coroutine",
+            pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET,
+        ),
     ];
     // `index_in_parent` is the field's rank by byte offset
     // (`jitcode/assembler.rs`'s `field_specs_from_layout`), and once a parent
@@ -6448,6 +6675,7 @@ mod tests {
             ("W_RangeIterObject", w_range_iter_size_descr()),
             ("W_RangeObject", w_range_size_descr()),
             ("W_FloatObject", w_float_size_descr()),
+            ("W_ComplexObject", w_complex_size_descr()),
             ("W_LongObject", w_long_size_descr()),
             ("W_TupleObject", w_tuple_size_descr()),
             ("W_TupleIter", tuple_iter_size_descr()),
@@ -6607,6 +6835,7 @@ mod tests {
     fn exception_size_descr_clears_every_runtime_traced_gc_field() {
         let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
         let size = descr.as_size_descr().expect("W_BaseException SizeDescr");
+        assert_eq!(size.size(), W_BASE_EXCEPTION_SIZE);
         let mut actual: Vec<usize> = size.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
         actual.sort_unstable();
         actual.dedup();
@@ -6616,6 +6845,16 @@ mod tests {
         expected.sort_unstable();
         expected.dedup();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn oserror_size_descr_uses_the_extended_layout() {
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::OSError);
+        let size = descr
+            .as_size_descr()
+            .expect("W_ExceptionExtended SizeDescr");
+        assert_eq!(size.size(), W_EXCEPTION_EXTENDED_SIZE);
+        assert!(size.size() > W_BASE_EXCEPTION_SIZE);
     }
 
     #[test]
@@ -7412,6 +7651,11 @@ mod tests {
                 pyre_interpreter::EC_PROFILEFUNC_OFFSET,
                 ec_profilefunc_descr(),
             ),
+            (
+                "current_gen_or_coroutine",
+                pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET,
+                ec_current_gen_or_coroutine_descr(),
+            ),
         ] {
             let (field_size, field_type) = if name == "profilefunc" {
                 (std::mem::size_of::<usize>(), Type::Int)
@@ -7649,6 +7893,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("floatobject::W_FloatObject", || {
         LazyLock::force(&W_FLOAT_DESCR_GROUP);
+    }),
+    ("complexobject::W_ComplexObject", || {
+        LazyLock::force(&W_COMPLEX_DESCR_GROUP);
     }),
     ("longobject::W_LongObject", || {
         LazyLock::force(&W_LONG_DESCR_GROUP);
@@ -8378,6 +8625,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "topframeref" => Some(ec_topframeref_descr()),
                     "w_tracefunc" => Some(ec_w_tracefunc_descr()),
                     "profilefunc" => Some(ec_profilefunc_descr()),
+                    "current_gen_or_coroutine" => Some(ec_current_gen_or_coroutine_descr()),
                     _ => None,
                 };
                 if let Some(canonical) = canonical
@@ -8498,6 +8746,12 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 }
                 ("W_FloatObject" | "pyre_object::floatobject::W_FloatObject", "floatval") => {
                     return float_floatval_descr();
+                }
+                ("W_ComplexObject" | "pyre_object::complexobject::W_ComplexObject", "real") => {
+                    return complex_real_descr();
+                }
+                ("W_ComplexObject" | "pyre_object::complexobject::W_ComplexObject", "imag") => {
+                    return complex_imag_descr();
                 }
                 _ => {}
             }
