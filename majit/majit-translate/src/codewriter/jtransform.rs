@@ -762,7 +762,9 @@ pub(crate) enum JitMarkerKey {
 /// own descr for it.
 pub const LIST_INT_ITEMS_ARRAY: &str = "GcArray<i64>";
 pub const LIST_FLOAT_ITEMS_ARRAY: &str = "GcArray<f64>";
-pub const LIST_OBJ_ITEMS_ARRAY: &str = "GcArray<PyObjectRef>";
+/// The object block is the one `front::mir` already names for tuple items,
+/// frame locals and mro blocks.
+pub const LIST_OBJ_ITEMS_ARRAY: &str = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
 
 /// pyre's own driver receiver types, and the
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its

@@ -2672,13 +2672,12 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
             Some(w_int_new(ll_list_int_getitem_fast(list, idx as usize)))
         }
         ListStrategy::IntOrFloat => {
-            let items = list.int_items.as_slice();
-            let len = items.len() as i64;
+            let len = ll_list_int_length(list) as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return None;
             }
-            let value = items[idx as usize];
+            let value = ll_list_int_getitem_fast(list, idx as usize);
             Some(if int_or_float_is_int(value) {
                 w_int_new(int_or_float_decode_int(value))
             } else {
@@ -2778,13 +2777,13 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
             }
         }
         ListStrategy::IntOrFloat => {
-            let len = list.int_items.len() as i64;
+            let len = ll_list_int_length(list) as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return false;
             }
             if let Some(value) = int_or_float_encode_item(value) {
-                list.int_items[idx as usize] = value;
+                ll_list_int_setitem_fast(list, idx as usize, value);
                 true
             } else {
                 let obj = switch_to_object_strategy(list);
