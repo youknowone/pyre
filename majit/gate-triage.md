@@ -26,6 +26,7 @@ cover the condition they diagnose.
 | `MAJIT_DYNASM_EXEC_DIAG` | OFF | Reports dynasm trace execution; remove when trace entry is covered by ordinary telemetry. |
 | `MAJIT_FNPTR_INDIRECT` | OFF | Enables indirect function-pointer lowering; retain while that lowering remains a build configuration. |
 | `MAJIT_GC_FREELIST_DIAG` | OFF | Reports GC freelist allocation and reuse; remove when freelist accounting has sufficient invariant tests. |
+| `MAJIT_HELPER_FNADDR_SKIP` | OFF | Counts each `#[dont_look_inside]` / `#[elidable]`-family function that got no residual trampoline, by reason (`generic`, `fat-pointer arg`, `Result return`, `method receiver`, `other`); remove when every annotated residual is either published or covered by an ordinary skip test. |
 | `MAJIT_GC_ITEMSBLOCK` | ON | Selects GC-managed list item blocks; `0`, `off`, or `false` restores the fallback, which can be removed after deleting the alternate representation. |
 | `MAJIT_JTRANSFORM_SHADOW` | OFF | Compares shadow and primary jtransform results; remove after deleting the shadow implementation. |
 | `MAJIT_MIR_FRAMESTATE` | ON | Selects framestate-threaded MIR lowering; `0` or `false` restores the older lowering, and the escape hatch retires with that path. |

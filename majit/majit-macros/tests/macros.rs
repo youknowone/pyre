@@ -998,3 +998,40 @@ mod jit_struct {
         assert!(std::sync::Arc::ptr_eq(&parent, &node_size));
     }
 }
+
+mod helper_fnaddr_registry {
+    use majit_macros::dont_look_inside;
+
+    #[dont_look_inside]
+    fn copysign(mag: f64, sign: f64) -> f64 {
+        mag.copysign(sign)
+    }
+
+    #[dont_look_inside]
+    fn hypot_sq(a: i64, b: i64) -> f64 {
+        ((a * a + b * b) as f64).sqrt()
+    }
+
+    #[test]
+    fn registered_float_abi_trampolines_are_callable_through_published_address() {
+        let mut found_ff = false;
+        let mut found_ii = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::copysign") {
+                let f: extern "C" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(-1.5, 1.0), 1.5);
+                assert_eq!(f(1.5, -1.0), -1.5);
+                assert_eq!(desc.arity, 2);
+                found_ff = true;
+            }
+            if desc.path.ends_with("::hypot_sq") {
+                let f: extern "C" fn(i64, i64) -> f64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(3, 4), 5.0);
+                assert_eq!(desc.arity, 2);
+                found_ii = true;
+            }
+        });
+        assert!(found_ff, "(f64, f64) -> f64 trampoline was not registered");
+        assert!(found_ii, "(i64, i64) -> f64 trampoline was not registered");
+    }
+}

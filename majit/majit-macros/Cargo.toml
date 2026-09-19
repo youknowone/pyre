@@ -20,5 +20,6 @@ proc-macro2 = { workspace = true }
 majit-translate = { workspace = true }
 
 [dev-dependencies]
+linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
