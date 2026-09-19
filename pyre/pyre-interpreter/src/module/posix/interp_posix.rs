@@ -7176,7 +7176,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "pread: negative length",
                         ));
                     }
-                    let n = length as usize;
+                    // unwrap_spec(length=int): space.int_w is a machine
+                    // word. A value that does not fit usize is OverflowError,
+                    // not a wrapped allocation size.
+                    let n = usize::try_from(length).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "Python int too large to convert to C ssize_t",
+                        )
+                    })?;
                     let mut buf = Vec::new();
                     buf.try_reserve_exact(n)
                         .map_err(|_| crate::PyError::memory_error(""))?;
@@ -8317,7 +8324,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             fields.push(pyre_object::w_int_new(ru.ru_nsignals));
             fields.push(pyre_object::w_int_new(ru.ru_nvcsw));
             fields.push(pyre_object::w_int_new(ru.ru_nivcsw));
-            Ok(crate::_structseq::new_instance(cls, fields.take()))
+            // `_make_struct_rusage` calls `struct_rusage((...))`, so a
+            // rebound type's constructor is observable.
+            let tuple = pyre_object::w_tuple_new(fields.take());
+            crate::call::call_function_impl_result(cls, &[tuple])
         }
 
         fn wait_with_rusage<F>(wait: F) -> Result<PyObjectRef, crate::PyError>
