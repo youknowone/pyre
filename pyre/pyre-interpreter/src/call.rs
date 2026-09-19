@@ -667,10 +667,15 @@ thread_local! {
 pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
     LAST_EXEC_CTX.with(|c| {
         let previous = c.replace(ctx);
+        if previous == ctx {
+            return;
+        }
         if previous.is_null() && !ctx.is_null() {
             crate::module::thread::register_execution_context(ctx);
         } else if !previous.is_null() && ctx.is_null() {
             crate::module::thread::unregister_execution_context();
+        } else if !previous.is_null() && !ctx.is_null() {
+            crate::module::thread::replace_execution_context(ctx);
         }
     });
 }
@@ -712,6 +717,28 @@ pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
     take_last_exec_ctx()
 }
 
+/// Owns the on-demand ExecutionContext created when the threadlocals slot is
+/// empty.  Drop is the thread-exit counterpart of `leave_thread`: it clears
+/// that slot before the allocation is freed, so `EXECUTION_CONTEXTS` cannot
+/// keep a pointer into a dropped `Rc`.
+struct FallbackEcGuard {
+    ec: std::rc::Rc<crate::PyExecutionContext>,
+}
+
+impl Drop for FallbackEcGuard {
+    fn drop(&mut self) {
+        let ptr = std::rc::Rc::as_ptr(&self.ec);
+        // `set_last_exec_ctx` uses `.with` and panics if `LAST_EXEC_CTX` has
+        // already been destroyed; `ForcePlainEvalGuard` uses `try_with` for
+        // the same TLS-destructor window.
+        match LAST_EXEC_CTX.try_with(|c| c.get() == ptr) {
+            Ok(true) => set_last_exec_ctx(std::ptr::null()),
+            Ok(false) => {}
+            Err(_) => crate::module::thread::unregister_execution_context(),
+        }
+    }
+}
+
 /// `baseobjspace.py getexecutioncontext` untranslated path: if the
 /// threadlocals slot is empty, `enter_thread` / `createexecutioncontext`
 /// installs one. Used by `repr_enter` so a missing EC is not treated
@@ -722,15 +749,15 @@ pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
         return existing;
     }
     thread_local! {
-        static FALLBACK_EC: std::cell::RefCell<Option<std::rc::Rc<crate::PyExecutionContext>>> =
+        static FALLBACK_EC: std::cell::RefCell<Option<FallbackEcGuard>> =
             const { std::cell::RefCell::new(None) };
     }
     FALLBACK_EC.with(|slot| {
         let mut guard = slot.borrow_mut();
-        if guard.is_none() {
-            *guard = Some(std::rc::Rc::new(crate::PyExecutionContext::default()));
-        }
-        let ptr = std::rc::Rc::as_ptr(guard.as_ref().unwrap());
+        let fallback = guard.get_or_insert_with(|| FallbackEcGuard {
+            ec: std::rc::Rc::new(crate::PyExecutionContext::default()),
+        });
+        let ptr = std::rc::Rc::as_ptr(&fallback.ec);
         set_last_exec_ctx(ptr);
         ptr
     })

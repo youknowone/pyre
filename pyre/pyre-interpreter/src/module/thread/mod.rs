@@ -372,6 +372,13 @@ pub(crate) fn unregister_execution_context() {
     EXECUTION_CONTEXTS.lock().shift_remove(&current_ident());
 }
 
+/// Point this thread's `_valuedict` slot at a different live EC without the
+/// first-install `signals_enabled` write.  Used when the fallback context is
+/// replaced by the thread's real one.
+pub(crate) fn replace_execution_context(ec: *const crate::PyExecutionContext) {
+    EXECUTION_CONTEXTS.lock().insert(current_ident(), ec as usize);
+}
+
 pub(crate) fn take_async_exception(ec: *mut crate::PyExecutionContext) -> PyObjectRef {
     let _contexts = EXECUTION_CONTEXTS.lock();
     unsafe {
@@ -2839,4 +2846,58 @@ crate::py_module! {
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let _ = ns;
     },
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fallback_ec_registry_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_executioncontext_unregisters_on_thread_exit() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ptr = crate::call::ensure_executioncontext();
+            assert!(!ptr.is_null());
+            let ident = current_ident();
+            assert_eq!(
+                EXECUTION_CONTEXTS.lock().get(&ident).copied(),
+                Some(ptr as usize)
+            );
+            tx.send(ident).unwrap();
+        })
+        .join()
+        .unwrap();
+        let ident = rx.recv().unwrap();
+        assert!(
+            !EXECUTION_CONTEXTS.lock().contains_key(&ident),
+            "fallback EC must leave EXECUTION_CONTEXTS before its TLS Rc is dropped"
+        );
+    }
+
+    #[test]
+    fn replacing_fallback_executioncontext_updates_registry_and_survives_fallback_drop() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let fallback = crate::call::ensure_executioncontext();
+            let real = Box::leak(Box::new(crate::PyExecutionContext::default()));
+            let real_ptr = real as *const crate::PyExecutionContext;
+            crate::call::set_last_exec_ctx(real_ptr);
+            let ident = current_ident();
+            assert_eq!(
+                EXECUTION_CONTEXTS.lock().get(&ident).copied(),
+                Some(real_ptr as usize)
+            );
+            assert_ne!(fallback as usize, real_ptr as usize);
+            tx.send((ident, real_ptr as usize)).unwrap();
+        })
+        .join()
+        .unwrap();
+        let (ident, real) = rx.recv().unwrap();
+        assert_eq!(
+            EXECUTION_CONTEXTS.lock().get(&ident).copied(),
+            Some(real),
+            "fallback Drop must not unregister the real EC that replaced it"
+        );
+        EXECUTION_CONTEXTS.lock().shift_remove(&ident);
+    }
 }
