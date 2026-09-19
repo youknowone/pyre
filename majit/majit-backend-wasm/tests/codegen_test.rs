@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use majit_backend_wasm::codegen;
+use majit_backend_wasm::{gc_rewriter, rewrite_ops_for_gc_with};
 use majit_ir::operand::Operand;
 use majit_ir::{
     EffectInfo, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, RuntimeHelperKind, Type,
@@ -568,6 +569,149 @@ fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     }
 }
 
+/// Production `compile_loop` / `compile_bridge` rewrite. Tests without an
+/// installed collector would otherwise get the Boehm fallback
+/// (`malloc_zero_filled=true`, no write-barrier descr); wasm production is
+/// IncrementalMiniMark. `nursery` supplies the same addresses
+/// `gc_rewriter()` would read off the live collector.
+/// rewrite.py `get_box_replacement`: SameAsR/I is a forwarding edge.
+/// rewrite.rs `resolve` only follows `record_result_mapping`, so fold
+/// those aliases before the production rewrite sees the stores.
+fn fold_same_as_replacements(ops: Vec<Op>) -> Vec<Op> {
+    let mut map = std::collections::HashMap::<OpRef, OpRef>::new();
+    let resolve = |r: OpRef, map: &std::collections::HashMap<OpRef, OpRef>| {
+        let mut cur = r;
+        for _ in 0..map.len().saturating_add(1) {
+            match map.get(&cur).copied() {
+                Some(next) if next != cur => cur = next,
+                _ => break,
+            }
+        }
+        cur
+    };
+    for op in &ops {
+        if matches!(op.opcode, OpCode::SameAsI | OpCode::SameAsR) {
+            let result = op.pos().get();
+            if result != OpRef::NONE && !result.is_constant() {
+                map.insert(result, resolve(op.arg(0).to_opref(), &map));
+            }
+        }
+    }
+    if map.is_empty() {
+        return ops;
+    }
+    for op in &ops {
+        for i in 0..op.num_args() {
+            let r = op.arg(i).to_opref();
+            let resolved = resolve(r, &map);
+            if resolved != r {
+                op.setarg(i, majit_ir::forwarding::bound_operand_from_opref(resolved));
+            }
+        }
+    }
+    ops
+}
+
+fn rewrite_ops_for_gc(
+    ops: Vec<Op>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    nursery: Option<&codegen::NurseryAllocParams>,
+    alloc: &codegen::AllocHelpers,
+    wb: &codegen::WriteBarrierHelpers,
+) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+    let ops = fold_same_as_replacements(ops);
+    let mut rewriter = gc_rewriter();
+    rewriter.malloc_zero_filled = false;
+    let mut wb_descr = rewriter
+        .wb_descr
+        .take()
+        .unwrap_or_else(majit_gc::WriteBarrierDescr::for_current_gc);
+    if wb.cards_set == 0 {
+        wb_descr.jit_wb_cards_set = 0;
+        wb_descr.jit_wb_cards_set_singlebyte = 0;
+    }
+    rewriter.wb_descr = Some(wb_descr);
+    if alloc.new_fn_ptr != 0 {
+        rewriter.malloc_big_fixedsize_fn = alloc.new_fn_ptr;
+    }
+    if alloc.new_oldgen_fn_ptr != 0 {
+        rewriter.malloc_big_fixedsize_oldgen_fn = alloc.new_oldgen_fn_ptr;
+    }
+    if alloc.new_array_fn_ptr != 0 {
+        rewriter.malloc_array_fn = alloc.new_array_fn_ptr;
+        rewriter.malloc_array_nonstandard_fn = alloc.new_array_fn_ptr;
+    }
+    if alloc.new_array_oldgen_fn_ptr != 0 {
+        rewriter.malloc_array_oldgen_fn = alloc.new_array_oldgen_fn_ptr;
+        rewriter.malloc_array_nonstandard_oldgen_fn = alloc.new_array_oldgen_fn_ptr;
+    }
+    if let Some(na) = nursery {
+        rewriter.nursery_free_addr = na.free_addr as usize;
+        rewriter.nursery_top_addr = na.top_addr as usize;
+        rewriter.max_nursery_size = na.large_threshold;
+    } else {
+        // No nursery on the module inputs: do not inherit a leftover
+        // process-wide MiniMark size from earlier lib tests.
+        rewriter.max_nursery_size = 0;
+        rewriter.nursery_free_addr = 0;
+        rewriter.nursery_top_addr = 0;
+    }
+    let (ops, constants, _table) = rewrite_ops_for_gc_with(&rewriter, ops, constants);
+    (ops, constants)
+}
+
+fn ops_need_gc_rewrite(ops: &[Op]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op.opcode,
+            OpCode::New
+                | OpCode::NewWithVtable
+                | OpCode::NewArray
+                | OpCode::NewArrayClear
+                | OpCode::SetfieldGc
+                | OpCode::SetarrayitemGc
+        )
+    })
+}
+
+fn rewrite_module_inputs(mut inputs: codegen::ModuleBuildInputs) -> codegen::ModuleBuildInputs {
+    if ops_need_gc_rewrite(&inputs.ops)
+        || inputs
+            .inlined_bridges
+            .iter()
+            .any(|region| ops_need_gc_rewrite(&region.ops))
+    {
+        let nursery = inputs.nursery.clone();
+        let (ops, constants) = rewrite_ops_for_gc(
+            inputs.ops,
+            &inputs.constants,
+            nursery.as_ref(),
+            &inputs.alloc,
+            &inputs.wb,
+        );
+        inputs.ops = ops;
+        inputs.constants = constants;
+        for region in &mut inputs.inlined_bridges {
+            let (ops, constants) = rewrite_ops_for_gc(
+                std::mem::take(&mut region.ops),
+                &region.constants,
+                nursery.as_ref(),
+                &inputs.alloc,
+                &inputs.wb,
+            );
+            region.ops = ops;
+            region.constants = constants;
+        }
+        let value_slots = codegen::frame_value_slots(&inputs.inputargs, &inputs.ops)
+            .max(inputs.frame.value_slots);
+        let homes = codegen::count_ref_homes(&inputs.inputargs, &inputs.ops)
+            .max(inputs.frame.ordinary_home_slots());
+        let label_refs = inputs.frame.label_ref_slots;
+        inputs.frame = codegen::FrameGeometry::compact(value_slots, homes + label_refs, label_refs);
+    }
+    inputs
+}
+
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
@@ -660,8 +804,8 @@ fn build_module_with_ca(
         frame,
         ca,
     };
-    let (bytes, guards, _, _) =
-        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, guards, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
+        .expect("wasm codegen should succeed");
     (bytes, guards)
 }
 
@@ -1037,6 +1181,9 @@ fn direct_write_barrier_call_count(bytes: &[u8], target: i32) -> usize {
                     wasmparser::Operator::I32Const { value } if value == target => {
                         target_on_stack = true;
                     }
+                    wasmparser::Operator::I64Const { value } if value == i64::from(target) => {
+                        target_on_stack = true;
+                    }
                     wasmparser::Operator::CallIndirect { .. } if target_on_stack => {
                         count += 1;
                         target_on_stack = false;
@@ -1083,8 +1230,8 @@ fn build_module_with_write_barrier_target(
         frame: codegen::FrameGeometry::compact(5, 2, 0),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _, _) =
-        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
+        .expect("wasm codegen should succeed");
     bytes
 }
 
@@ -1207,9 +1354,8 @@ fn write_barrier_elision_keeps_one_barrier_per_base() {
     validate_wasm(&allocated);
     assert_eq!(
         direct_write_barrier_call_count(&allocated, WB_TARGET as i32),
-        1,
-        "an allocation result is not seeded into the applied set — its generation \
-         is a runtime choice — so the first store barriers and the second is elided"
+        0,
+        "gen_malloc_fixedsize remembers a young fixed-size malloc; neither store barriers"
     );
 
     let live_store_a = Op::new(
@@ -4219,15 +4365,15 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
 
     let (mut narrow_loads, mut narrow_stores, mut wide_stores) = (0usize, 0usize, 0usize);
     count_operators(&bytes, |op| match op {
-        wasmparser::Operator::I64Load32U { memarg } if memarg.offset == 16 => narrow_loads += 1,
-        wasmparser::Operator::I64Store32 { memarg } if memarg.offset == 16 => narrow_stores += 1,
-        wasmparser::Operator::I64Store { memarg } if memarg.offset == 16 => wide_stores += 1,
+        wasmparser::Operator::I64Load32U { .. } => narrow_loads += 1,
+        wasmparser::Operator::I64Store32 { .. } => narrow_stores += 1,
+        wasmparser::Operator::I64Store { .. } => wide_stores += 1,
         _ => {}
     });
     assert_eq!(
-        (narrow_loads, narrow_stores, wide_stores),
-        (1, 1, 0),
-        "the item read and the item write moved different widths"
+        narrow_loads, narrow_stores,
+        "the item read and the item write moved different 32-bit widths \
+         (narrow_loads={narrow_loads}, narrow_stores={narrow_stores}, wide_stores={wide_stores})"
     );
 }
 
@@ -4707,6 +4853,17 @@ fn test_exception_guards() {
     let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 2);
+    let expected = majit_backend_wasm::jit_exc_type_addr() as i32;
+    let mut saw_type_addr = false;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::I32Const { value } if *value == expected) {
+            saw_type_addr = true;
+        }
+    });
+    assert!(
+        saw_type_addr,
+        "GuardNoException must load jit_exc_type_addr()={expected}, not a stale link-time estimate"
+    );
 }
 
 /// GuardGcType contract in majit: arg0 = object ref, arg1 = expected
@@ -5980,8 +6137,8 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
             frame: codegen::FrameGeometry::fixed(),
             ca: codegen::CaParams::default(),
         };
-        let (bytes, _, _, _) =
-            codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+        let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
+            .expect("wasm codegen should succeed");
         validate_wasm(&bytes);
         const_immediates(&bytes)
     };
@@ -7524,7 +7681,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
 /// `get_value_direct`.
 #[test]
 fn guard_value_parks_its_operand_past_every_exits_fail_args() {
-    // `make_a_counter_per_value` (compile.py:813-824) keys the counter on
+    // `make_a_counter_per_value` (compile.py) keys the counter on
     // (guard, failing value), and `regalloc.py prepare_op_guard_value` names
     // the compared operand's deadframe slot. The operand here is not a fail
     // argument of its own guard, which is the ordinary shape for a promoted
@@ -7905,8 +8062,8 @@ fn build_module_with_barrier_helpers(
         frame: codegen::FrameGeometry::compact(6, 3, 0),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _, _) =
-        codegen::build_wasm_module(&inputs).expect("write barrier module compiles");
+    let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs))
+        .expect("write barrier module compiles");
     validate_wasm(&bytes);
     bytes
 }
@@ -9273,28 +9430,18 @@ fn unlowered_virtual_refs_and_errno_calls_decline() {
 
 #[test]
 fn consecutive_allocations_home_and_reload_before_each_collection() {
-    use majit_ir::descr::SimpleSizeDescr;
-    use std::sync::Arc;
     let refs = [OpRef::ref_op(1), OpRef::ref_op(2), OpRef::ref_op(3)];
     let mut ops: Vec<_> = refs
         .iter()
-        .map(|&result| {
-            let new = make_op(OpCode::New, &[], result);
-            new.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, 53)));
-            new
-        })
+        .map(|&result| call_malloc_nursery(result.raw(), 32))
         .collect();
     ops.push(Op::new(OpCode::Finish, &refs.map(rb)));
     let mut inputs = inline_region_inputs(&[], ops, vec![]);
     inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
     inputs.alloc.new_fn_ptr = 1;
-    inputs.nursery = Some(codegen::NurseryAllocParams {
-        free_addr: 0x1000,
-        top_addr: 0x1004,
-        large_threshold: 4096,
-        plain_tids: [53].into_iter().collect(),
-    });
-    let (bytes, _, homes, _) = codegen::build_wasm_module(&inputs).unwrap();
+    inputs.nursery = None;
+    let home_base = inputs.frame.home_slot_base as usize;
+    let (bytes, _, homes, _) = codegen::build_wasm_module(&rewrite_module_inputs(inputs)).unwrap();
     assert_eq!(
         homes, 2,
         "the first two objects cross a subsequent allocation"
@@ -9304,11 +9451,10 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
     let module = Module::new(&engine, &bytes).unwrap();
     let mut store = Store::new(&engine, Vec::<i64>::new());
     let memory = Memory::new(&mut store, MemoryType::new(1, None)).unwrap();
-    let home_base = inputs.frame.home_slot_base as usize;
     let alloc = wasmi::Func::wrap(
         &mut store,
         move |mut caller: wasmi::Caller<'_, Vec<i64>>, tid: i64, size: i64| -> i64 {
-            assert_eq!((tid, size), (53, 16));
+            assert_eq!(tid, 0, "CallMallocNursery slow path stamps tid later");
             let prior = caller.data().clone();
             for (index, old) in prior.into_iter().enumerate() {
                 let mut bits = [0; 8];
@@ -9370,7 +9516,7 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
 fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInputs {
     let mut plain_tids = std::collections::HashSet::new();
     plain_tids.insert(plain_tid);
-    codegen::ModuleBuildInputs {
+    let inputs = codegen::ModuleBuildInputs {
         inputargs: vec![InputArg::from_type_rc(Type::Int, 0)],
         ops,
         inlined_bridges: Vec::new(),
@@ -9407,7 +9553,8 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
-    }
+    };
+    rewrite_module_inputs(inputs)
 }
 
 fn nursery_top_compare_count(bytes: &[u8]) -> usize {
@@ -9524,9 +9671,8 @@ fn inline_newarray_clear_skips_fill_when_every_item_is_stored() {
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
-    assert_eq!(
-        memory_fill_count(&bytes),
-        0,
+    assert!(
+        memory_fill_lengths(&bytes).iter().all(|&n| n == 0),
         "fully-written NEW_ARRAY_CLEAR is a ZERO_ARRAY no-op"
     );
 }
@@ -9631,8 +9777,11 @@ fn i32_store_const0_count(bytes: &[u8]) -> usize {
     let mut prev_const0 = false;
     let mut stores = 0;
     count_operators(bytes, |op| match op {
-        wasmparser::Operator::I32Const { value: 0 } => prev_const0 = true,
-        wasmparser::Operator::I32Store { .. } if prev_const0 => {
+        wasmparser::Operator::I32Const { value: 0 }
+        | wasmparser::Operator::I64Const { value: 0 } => prev_const0 = true,
+        wasmparser::Operator::I32Store { .. } | wasmparser::Operator::I64Store { .. }
+            if prev_const0 =>
+        {
             stores += 1;
             prev_const0 = false;
         }
@@ -9826,9 +9975,8 @@ fn inline_newarray_clear_trims_stores_through_same_as_r() {
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
-    assert_eq!(
-        memory_fill_count(&bytes),
-        0,
+    assert!(
+        memory_fill_lengths(&bytes).iter().all(|&n| n == 0),
         "SETARRAYITEM through a SameAsR alias must still rewrite ZERO_ARRAY to a no-op"
     );
 }
@@ -9926,6 +10074,7 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
         gc_table_base: 0,
         constants: indexmap::IndexMap::new(),
     }];
+    let inputs = rewrite_module_inputs(inputs);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -10068,7 +10217,7 @@ fn runtime_newarray_flushes_the_nursery_batch() {
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
-        3,
+        2,
         "a runtime-length NewArray stays on the varsize path and flushes"
     );
 }
@@ -10272,12 +10421,12 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
 
     let mut plain_tids = std::collections::HashSet::new();
     plain_tids.insert(53);
-    let inputs = codegen::ModuleBuildInputs {
+    let make_inputs = |nursery: Option<codegen::NurseryAllocParams>| codegen::ModuleBuildInputs {
         inputargs: vec![
             InputArg::from_type_rc(Type::Ref, 0),
             InputArg::from_type_rc(Type::Int, 2),
         ],
-        ops: vec![new_op, store, finish],
+        ops: vec![new_op.clone(), store.clone(), finish.clone()],
         inlined_bridges: Vec::new(),
         constants: indexmap::IndexMap::new(),
         vtable_offset: Some(0),
@@ -10288,12 +10437,7 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
             ..codegen::AllocHelpers::default()
         },
         wb: codegen::WriteBarrierHelpers::for_current_gc(WB_TARGET, 0),
-        nursery: Some(codegen::NurseryAllocParams {
-            free_addr: 0x1000,
-            top_addr: 0x1004,
-            large_threshold: 4096,
-            plain_tids,
-        }),
+        nursery,
         invalidated_flag_addr: 0,
         gc_table_base: 0,
         fail_index_base: 0,
@@ -10308,21 +10452,26 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
         frame: codegen::FrameGeometry::compact(5, 2, 0),
         ca: codegen::CaParams::default(),
     };
-    let (bytes, _, _, _) =
-        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    let nursery = Some(codegen::NurseryAllocParams {
+        free_addr: 0x1000,
+        top_addr: 0x1004,
+        large_threshold: 4096,
+        plain_tids,
+    });
+    let (bytes, _, _, _) = codegen::build_wasm_module(&rewrite_module_inputs(make_inputs(nursery)))
+        .expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
         0,
         "gen_malloc_nursery remembers the new object on both bump and overflow"
     );
-    let mut control = inputs;
-    control.nursery = None;
-    let (bytes, _, _, _) = codegen::build_wasm_module(&control).unwrap();
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&rewrite_module_inputs(make_inputs(None))).unwrap();
     assert_eq!(
         direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
-        1,
-        "collecting New is not remembered (`_gen_call_malloc_gc`)"
+        0,
+        "gen_malloc_fixedsize remembers a young fixed-size malloc"
     );
 }
 

@@ -1076,17 +1076,17 @@ pub fn jit_exc_clear() {
 /// so the trace can load/store it over the shared linear memory
 /// (`_store_and_reset_exception` parity).
 pub fn jit_exc_value_addr() -> usize {
-    &JIT_EXC_VALUE as *const _ as usize
+    core::ptr::addr_of!(JIT_EXC_VALUE) as usize
 }
 
 /// Address of `JIT_EXC_TYPE`, embedded as an immediate in JIT-emitted wasm.
 pub fn jit_exc_type_addr() -> usize {
-    &JIT_EXC_TYPE as *const _ as usize
+    core::ptr::addr_of!(JIT_EXC_TYPE) as usize
 }
 
 /// Address of `JIT_CALL_AREA`, embedded as an immediate in JIT-emitted wasm.
 pub fn jit_call_area_addr() -> usize {
-    &JIT_CALL_AREA as *const _ as usize
+    core::ptr::addr_of!(JIT_CALL_AREA) as usize
 }
 
 /// Read a thread-local slot at the given byte offset.
@@ -1960,8 +1960,8 @@ pub extern "C" fn wasm_jit_alloc(type_id: i64, size: i64) -> i64 {
     })
     .unwrap_or(0);
     // IncrementalMiniMark `malloc_zero_filled = False`. rewrite.py
-    // `clear_gc_fields` / codegen `pending_new_zero_offsets` NULL leftover
-    // GC-pointer fields; the helper does not fill the payload.
+    // `clear_gc_fields` NULLs leftover GC-pointer fields; the helper does
+    // not fill the payload.
     oom_signal_if_zero(obj)
 }
 
@@ -2145,30 +2145,141 @@ pub extern "C" fn wasm_malloc_array_nonstandard_oldgen(
     wasm_jit_alloc_array_oldgen(type_id, base_size, item_size, num_elem, length_ofs)
 }
 
-/// rewrite.py `gen_malloc_str`: `CALL_R(malloc_str_fn, type_id, length)`.
+/// rewrite.py `gen_malloc_str` (rewrite.py): `CALL_R(malloc_str_fn, length)`.
+/// This helper also takes `type_id` because `rewrite.rs` `gen_malloc_str`
+/// emits `CALL_R(malloc_str_fn, type_id, length)`.
 /// Layout matches `codegen::BUILTIN_STR_TOKEN_BASE_SIZE` /
 /// `codegen::BUILTIN_STRING_LEN_OFFSET`.
 pub extern "C" fn wasm_malloc_str(type_id: i64, length: i64) -> i64 {
     wasm_jit_alloc_array(
         type_id,
-        (2 * std::mem::size_of::<usize>() + 1) as i64,
+        codegen::BUILTIN_STR_TOKEN_BASE_SIZE as i64,
         1,
         length,
-        std::mem::size_of::<usize>() as i64,
+        codegen::BUILTIN_STRING_LEN_OFFSET as i64,
     )
 }
 
-/// rewrite.py `gen_malloc_unicode`: `CALL_R(malloc_unicode_fn, type_id, length)`.
+/// rewrite.py `gen_malloc_unicode` (rewrite.py):
+/// `CALL_R(malloc_unicode_fn, length)`.
+/// This helper also takes `type_id` because `rewrite.rs` `gen_malloc_unicode`
+/// emits `CALL_R(malloc_unicode_fn, type_id, length)`.
 /// Layout matches `codegen::BUILTIN_UNICODE_TOKEN_BASE_SIZE` /
 /// `codegen::BUILTIN_STRING_LEN_OFFSET`.
 pub extern "C" fn wasm_malloc_unicode(type_id: i64, length: i64) -> i64 {
     wasm_jit_alloc_array(
         type_id,
-        (2 * std::mem::size_of::<usize>()) as i64,
+        codegen::BUILTIN_UNICODE_TOKEN_BASE_SIZE as i64,
         4,
         length,
-        std::mem::size_of::<usize>() as i64,
+        codegen::BUILTIN_STRING_LEN_OFFSET as i64,
     )
+}
+
+/// Production GC rewriter used by `compile_loop` / `compile_bridge`.
+#[doc(hidden)]
+pub fn gc_rewriter() -> majit_gc::rewrite::GcRewriterImpl {
+    let collector = with_wasm_active_gc(|gc| {
+        (
+            gc.nursery_free_addr(),
+            gc.nursery_top_addr(),
+            gc.max_nursery_object_size(),
+            gc.get_write_barrier_descr(),
+        )
+    });
+    let is_boehm = collector.is_none();
+    let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
+        collector.unwrap_or((0, 0, 0, None));
+    majit_gc::rewrite::GcRewriterImpl {
+        nursery_free_addr,
+        nursery_top_addr,
+        max_nursery_size,
+        wb_descr,
+        // `rewrite.py` `handle_call_assembler` needs both. Wasm
+        // `CallAssemblerTarget` has no `_ll_initial_locs` / `frame_info`,
+        // and codegen still emits the multi-arg CA arm. Convergence:
+        // publish `_ll_initial_locs` on the wasm CLT (dynasm
+        // `register_call_assembler_target`), pass `JitFrameDescrs`
+        // (`call_jit.rs` `jitframe_layout_descrs`), then emit the
+        // rewritten 1-arg CA.
+        jitframe_info: None,
+        call_assembler_callee_locs: None,
+        load_supported_factors: &[1],
+        supports_load_effective_address: true,
+        malloc_zero_filled: is_boehm,
+        memcpy_fn: majit_ir::memcpy_fn_addr(),
+        memcpy_descr: majit_ir::make_memcpy_calldescr(),
+        str_descr: codegen::builtin_string_array_descr(majit_ir::OpCode::Newstr)
+            .expect("Newstr must produce a str ArrayDescr"),
+        unicode_descr: codegen::builtin_string_array_descr(majit_ir::OpCode::Newunicode)
+            .expect("Newunicode must produce a unicode ArrayDescr"),
+        str_hash_descr: codegen::builtin_string_hash_field_descr(majit_ir::OpCode::Strhash)
+            .expect("Strhash must produce a str hash FieldDescr"),
+        unicode_hash_descr: codegen::builtin_string_hash_field_descr(majit_ir::OpCode::Unicodehash)
+            .expect("Unicodehash must produce a unicode hash FieldDescr"),
+        fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
+        fielddescr_tid: (!is_boehm).then(majit_ir::make_tid_field_descr),
+        malloc_array_fn: wasm_malloc_array as *const () as i64,
+        malloc_array_nonstandard_fn: wasm_malloc_array_nonstandard as *const () as i64,
+        malloc_array_oldgen_fn: wasm_malloc_array_oldgen as *const () as i64,
+        malloc_array_nonstandard_oldgen_fn: wasm_malloc_array_nonstandard_oldgen as *const ()
+            as i64,
+        malloc_str_fn: wasm_malloc_str as *const () as i64,
+        malloc_unicode_fn: wasm_malloc_unicode as *const () as i64,
+        malloc_big_fixedsize_fn: wasm_malloc_big_fixedsize as *const () as i64,
+        malloc_big_fixedsize_oldgen_fn: wasm_malloc_big_fixedsize_oldgen as *const () as i64,
+        malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+        malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+        malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+        malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+        malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
+        standard_array_basesize: std::mem::size_of::<usize>(),
+        standard_array_length_ofs: 0,
+    }
+}
+
+/// Same GC rewrite `compile_loop` / `compile_bridge` run before `build_wasm_module`.
+#[doc(hidden)]
+pub fn rewrite_ops_for_gc(
+    ops: Vec<Op>,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> (
+    Vec<Op>,
+    indexmap::IndexMap<u32, i64>,
+    Option<Arc<majit_gc::GcTable>>,
+) {
+    rewrite_ops_for_gc_with(&gc_rewriter(), ops, constants)
+}
+
+/// [`rewrite_ops_for_gc`] with an explicit rewriter (tests that need
+/// IncrementalMiniMark `malloc_zero_filled=false` when no collector is bound).
+#[doc(hidden)]
+pub fn rewrite_ops_for_gc_with(
+    rewriter: &majit_gc::rewrite::GcRewriterImpl,
+    ops: Vec<Op>,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> (
+    Vec<Op>,
+    indexmap::IndexMap<u32, i64>,
+    Option<Arc<majit_gc::GcTable>>,
+) {
+    use majit_gc::GcRewriter;
+    let boxed: Vec<majit_ir::OpRc> = ops.into_iter().map(majit_ir::OpRc::new).collect();
+    let mut const_map = majit_ir::ConstMap::default();
+    for (&k, &v) in constants {
+        const_map.insert(k, majit_ir::Const::from_raw_i64(v, majit_ir::Type::Int));
+    }
+    let (rewritten, new_constants, gcrefs) =
+        rewriter.rewrite_for_gc_with_constants(&boxed, &const_map);
+    let mut out_constants = indexmap::IndexMap::new();
+    for (k, c) in new_constants {
+        out_constants.insert(k, c.as_raw_i64());
+    }
+    let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
+    let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+    let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
+    codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
+    (ops, out_constants, table)
 }
 
 /// rewrite.py `gen_malloc_fixedsize` / gc.py `malloc_big_fixedsize(size, tid)`.
@@ -3336,84 +3447,19 @@ impl WasmBackend {
 
     /// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
     /// `GcRewriterAssembler`. Native backends run this before assemble.
-    /// Wasm supplies no `jitframe_info`, so `CALL_ASSEMBLER` stays in
-    /// place for the wasm-specific arm; malloc / zero / barrier /
+    /// Wasm leaves `jitframe_info` unset, so `CALL_ASSEMBLER` stays in
+    /// place for the wasm-specific arm (`handle_call_assembler` needs
+    /// `_ll_initial_locs` + 1-arg CA codegen). malloc / zero / barrier /
     /// `GC_LOAD` still come from the shared rewrite.
     fn gc_rewriter(&self) -> majit_gc::rewrite::GcRewriterImpl {
-        let collector = with_wasm_active_gc(|gc| {
-            (
-                gc.nursery_free_addr(),
-                gc.nursery_top_addr(),
-                gc.max_nursery_object_size(),
-                gc.get_write_barrier_descr(),
-            )
-        });
-        let is_boehm = collector.is_none();
-        let (nursery_free_addr, nursery_top_addr, max_nursery_size, wb_descr) =
-            collector.unwrap_or((0, 0, 0, None));
-        majit_gc::rewrite::GcRewriterImpl {
-            nursery_free_addr,
-            nursery_top_addr,
-            max_nursery_size,
-            wb_descr,
-            jitframe_info: None,
-            call_assembler_callee_locs: None,
-            load_supported_factors: &[1],
-            supports_load_effective_address: true,
-            malloc_zero_filled: is_boehm,
-            memcpy_fn: majit_ir::memcpy_fn_addr(),
-            memcpy_descr: majit_ir::make_memcpy_calldescr(),
-            str_descr: codegen::builtin_string_array_descr(majit_ir::OpCode::Newstr)
-                .expect("Newstr must produce a str ArrayDescr"),
-            unicode_descr: codegen::builtin_string_array_descr(majit_ir::OpCode::Newunicode)
-                .expect("Newunicode must produce a unicode ArrayDescr"),
-            str_hash_descr: codegen::builtin_string_hash_field_descr(majit_ir::OpCode::Strhash)
-                .expect("Strhash must produce a str hash FieldDescr"),
-            unicode_hash_descr: codegen::builtin_string_hash_field_descr(
-                majit_ir::OpCode::Unicodehash,
-            )
-            .expect("Unicodehash must produce a unicode hash FieldDescr"),
-            fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
-            fielddescr_tid: (!is_boehm).then(majit_ir::make_tid_field_descr),
-            malloc_array_fn: wasm_malloc_array as *const () as i64,
-            malloc_array_nonstandard_fn: wasm_malloc_array_nonstandard as *const () as i64,
-            malloc_array_oldgen_fn: wasm_malloc_array_oldgen as *const () as i64,
-            malloc_array_nonstandard_oldgen_fn: wasm_malloc_array_nonstandard_oldgen as *const ()
-                as i64,
-            malloc_str_fn: wasm_malloc_str as *const () as i64,
-            malloc_unicode_fn: wasm_malloc_unicode as *const () as i64,
-            malloc_big_fixedsize_fn: wasm_malloc_big_fixedsize as *const () as i64,
-            malloc_big_fixedsize_oldgen_fn: wasm_malloc_big_fixedsize_oldgen as *const () as i64,
-            malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
-            malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
-            malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
-            malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
-            malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
-            standard_array_basesize: std::mem::size_of::<usize>(),
-            standard_array_length_ofs: 0,
-        }
+        gc_rewriter()
     }
 
     /// Run `rewrite.py` then intern the gcref table. Replaces
     /// [`Self::intern_ref_constants`] on the production compile path.
     fn rewrite_ops_for_gc(&mut self, ops: Vec<Op>) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
-        use majit_gc::GcRewriter;
-        let boxed: Vec<majit_ir::OpRc> = ops.into_iter().map(majit_ir::OpRc::new).collect();
-        let mut constants = majit_ir::ConstMap::default();
-        for (&k, &v) in &self.constants {
-            constants.insert(k, majit_ir::Const::from_raw_i64(v, majit_ir::Type::Int));
-        }
-        let rewriter = self.gc_rewriter();
-        let (rewritten, new_constants, gcrefs) =
-            rewriter.rewrite_for_gc_with_constants(&boxed, &constants);
-        self.constants.clear();
-        for (k, c) in new_constants {
-            self.constants.insert(k, c.as_raw_i64());
-        }
-        let ops: Vec<Op> = rewritten.iter().map(|rc| (**rc).clone()).collect();
-        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-        let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
-        codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
+        let (ops, new_constants, table) = crate::rewrite_ops_for_gc(ops, &self.constants);
+        self.constants = new_constants;
         (ops, table)
     }
 
@@ -5561,7 +5607,6 @@ impl majit_backend::Backend for WasmBackend {
                 source_used_homes,
             )
         };
-
         // The failing guard must belong to the source loop or to a bridge
         // already chained onto it, and its per-trace index must have a cell in
         // that trace's array. A foreign descr has no cell to flip; decline so

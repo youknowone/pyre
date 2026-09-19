@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use majit_backend::BackendError;
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
-use majit_ir::descr::SizeDescr;
 use majit_ir::forwarding::Forwarded;
 use majit_ir::operand::Operand;
 use majit_ir::{InputArg, InputArgRc, Op, OpCode, OpRef, Type, Value};
@@ -1083,8 +1082,12 @@ impl Drop for PeepSink<'_, '_> {
     }
 }
 
+fn runtime_addr(get: fn() -> usize) -> i32 {
+    get() as i32
+}
+
 fn emit_call_area_addr(sink: &mut PeepSink<'_, '_>) {
-    sink.i32_const(crate::jit_call_area_addr() as i32);
+    sink.i32_const(runtime_addr(crate::jit_call_area_addr));
 }
 
 /// Invoke the residual-call trampoline, which reads its scratch at
@@ -2005,66 +2008,6 @@ fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
     ref_values.contains(val).then(|| op.arg(0).to_opref())
 }
 
-/// wasm emission's complete SETFIELD_GC write-barrier gate.  The import census
-/// deliberately keeps using [`write_barrier_base`]: it must remain an
-/// un-elided over-approximation so an arm that emits a barrier always has the
-/// `jit_call` import available.  Unlike SETARRAYITEM_GC, a SETFIELD_GC can
-/// carry a non-pointer field descriptor even when its value has a Ref home
-/// (the ForceToken layout is one such case).  rewrite.rs's
-/// `handle_write_barrier_setfield` rejects that store because the collector
-/// does not trace the field.
-fn emitted_write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
-    let base = write_barrier_base(op, ref_values)?;
-    if op.opcode == OpCode::SetfieldGc
-        && !op
-            .getdescr()
-            .and_then(|d| d.as_field_descr().map(|fd| fd.is_pointer_field()))
-            .unwrap_or(false)
-    {
-        return None;
-    }
-    Some(base)
-}
-
-/// Pre-pass `SameAsI`/`SameAsR` forwarding edges by result value id.  The
-/// wasm backend materializes these ops, but rewrite.py keys its applied-barrier
-/// set through their forwarded box identity.
-fn same_as_forwardings(ops: &[Op], num_vars: u32) -> Vec<Option<OpRef>> {
-    let mut forwardings = vec![None; num_vars as usize];
-    for op in ops {
-        if !matches!(op.opcode, OpCode::SameAsI | OpCode::SameAsR) {
-            continue;
-        }
-        let result = op.pos().get();
-        if result == OpRef::NONE || result.is_constant() {
-            continue;
-        }
-        if let Some(slot) = forwardings.get_mut(result.raw() as usize) {
-            *slot = Some(op.arg(0).to_opref());
-        }
-    }
-    forwardings
-}
-
-/// Follow a `SameAsI`/`SameAsR` forwarding chain to its fixed point.  The
-/// bounded walk also makes malformed cyclic forwarding terminate.
-fn resolve_same_as_forwarding(base: OpRef, forwardings: &[Option<OpRef>]) -> OpRef {
-    let mut current = base;
-    for _ in 0..forwardings.len() {
-        if current == OpRef::NONE || current.is_constant() {
-            break;
-        }
-        let Some(next) = forwardings.get(current.raw() as usize).copied().flatten() else {
-            break;
-        };
-        if next == current {
-            break;
-        }
-        current = next;
-    }
-    current
-}
-
 /// `llsupport/gc.py WriteBarrierDescr` as the emitted barrier reads it, paired
 /// with the addresses of the two helpers its arms call.
 ///
@@ -2125,436 +2068,6 @@ impl WriteBarrierHelpers {
             self.if_flag
         };
         i32::from(mask)
-    }
-}
-
-/// `rewrite.py RewriteState._known_lengths`: the constant length a `NEW_ARRAY`
-/// in this trace gave its result.
-///
-/// `emit_label` clears the map, because past a merge point the length is only
-/// known on the path that allocated. A collecting operation does not clear it —
-/// an array's length outlives a collection.
-#[derive(Default)]
-struct KnownArrayLengths(indexmap::IndexMap<OpRef, usize>);
-
-impl KnownArrayLengths {
-    /// `handle_new_array`: `if isinstance(v_length, ConstInt)`, keyed on the
-    /// allocation's own result.
-    fn observe(&mut self, op: &Op, constants: &indexmap::IndexMap<u32, i64>) {
-        match op.opcode {
-            OpCode::Label => self.0.clear(),
-            OpCode::NewArray | OpCode::NewArrayClear => {
-                if let Some(length) = const_operand_value(constants, op.arg(0).to_opref())
-                    && let Ok(length) = usize::try_from(length)
-                {
-                    self.0.insert(op.pos().get(), length);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// `known_length(op, default)`.
-    fn get(&self, base: OpRef, default: usize) -> usize {
-        self.0.get(&base).copied().unwrap_or(default)
-    }
-}
-
-/// `rewrite.py` flush points for `emit_pending_zeros`: LABEL, JUMP,
-/// FINISH, any guard, and any collecting op. A store after one of these
-/// does not cancel a delayed NULL / ZERO_ARRAY — the object is visible
-/// at the flush (deopt, next malloc, merge).
-fn rewrite_pending_zero_flush(op: &Op) -> bool {
-    matches!(
-        op.opcode,
-        OpCode::Label
-            | OpCode::Jump
-            | OpCode::Finish
-            // rewrite.py `transform_to_gc_load` GETFIELD_GC arm:
-            // `emit_pending_zeros` before the load (`test_zero_ptr_field_before_getfield`).
-            | OpCode::GetfieldGcI
-            | OpCode::GetfieldGcR
-            | OpCode::GetfieldGcF
-    ) || op.opcode.is_guard()
-        || op.opcode.can_malloc()
-}
-
-/// rewrite.py emits `ZERO_ARRAY` before later reads; a GETARRAYITEM /
-/// GETINTERIORFIELD of this array must not see a later SETARRAYITEM as
-/// covering the slot.
-fn observes_array_items(op: &Op, array: OpRef, forwardings: &[Option<OpRef>]) -> bool {
-    matches!(
-        op.opcode,
-        OpCode::GetarrayitemGcI
-            | OpCode::GetarrayitemGcR
-            | OpCode::GetarrayitemGcF
-            | OpCode::GetarrayitemGcPureI
-            | OpCode::GetarrayitemGcPureR
-            | OpCode::GetarrayitemGcPureF
-            | OpCode::GetinteriorfieldGcI
-            | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF
-            // rewrite.py lowers GETARRAYITEM to these; wasm executes
-            // them, so a later SETARRAYITEM must not cancel ZERO_ARRAY
-            // for a slot the load already observed.
-            | OpCode::GcLoadIndexedI
-            | OpCode::GcLoadIndexedR
-            | OpCode::GcLoadIndexedF
-    ) && resolve_same_as_forwarding(op.arg(0).to_opref(), forwardings) == array
-}
-
-/// rewrite.py `could_merge_with_next_guard`: a comparison whose next
-/// op is GUARD_TRUE / GUARD_FALSE / COND_CALL on that result, or any
-/// ovf op, flushes pending zeros before the comparison.
-fn could_merge_with_next_guard(op: &Op, i: usize, operations: &[Op]) -> bool {
-    if !op.opcode.is_comparison() {
-        return op.opcode.is_ovf();
-    }
-    let Some(next_op) = operations.get(i + 1) else {
-        return false;
-    };
-    if !matches!(
-        next_op.opcode,
-        OpCode::GuardTrue
-            | OpCode::GuardFalse
-            | OpCode::CondCallN
-            | OpCode::CondCallValueI
-            | OpCode::CondCallValueR
-    ) {
-        return false;
-    }
-    next_op.arg(0).to_opref() == op.pos().get()
-}
-
-/// rewrite.py `emit_pending_zeros` rewrite of the `ZERO_ARRAY` emitted
-/// by `handle_clear_array_contents`.
-enum ZeroArrayPlan {
-    /// `NEW_ARRAY`, length 0, or every index written (`ConstInt(0)`).
-    Skip,
-    /// Const-length CLEAR: items `[start, start+count)`.
-    Items { start: usize, count: usize },
-    /// Runtime-length CLEAR: items `0..length`.
-    Runtime,
-}
-
-/// IncrementalMiniMark is `malloc_zero_filled=false`, so native rewrite
-/// emits `ZERO_ARRAY` only for `NEW_ARRAY_CLEAR` and then trims any
-/// written prefix/suffix (`emit_pending_zeros`). Plain `NEW_ARRAY`
-/// never emits `ZERO_ARRAY`.
-fn newarray_zero_plan(
-    op: &Op,
-    ops: &[Op],
-    op_idx: usize,
-    constants: &indexmap::IndexMap<u32, i64>,
-    length_const: Option<i64>,
-    forwardings: &[Option<OpRef>],
-) -> ZeroArrayPlan {
-    match op.opcode {
-        OpCode::NewArray => ZeroArrayPlan::Skip,
-        OpCode::NewArrayClear => match length_const {
-            Some(0) => ZeroArrayPlan::Skip,
-            Some(len) => usize::try_from(len).map_or(ZeroArrayPlan::Runtime, |n| {
-                if n == 0 {
-                    ZeroArrayPlan::Skip
-                } else {
-                    trimmed_zero_array(ops, op_idx, op.pos().get(), n, constants, forwardings)
-                }
-            }),
-            None => ZeroArrayPlan::Runtime,
-        },
-        _ => ZeroArrayPlan::Skip,
-    }
-}
-
-/// rewrite.py `emit_pending_zeros` / `_setarrayitems_occurred`: a sparse
-/// set of constant indexes, then walk `start`/`stop` on membership.
-fn trimmed_zero_array(
-    ops: &[Op],
-    op_idx: usize,
-    array: OpRef,
-    length: usize,
-    constants: &indexmap::IndexMap<u32, i64>,
-    forwardings: &[Option<OpRef>],
-) -> ZeroArrayPlan {
-    // rewrite.py `remember_setarrayitem_occurred` keys through
-    // `get_box_replacement`; SameAsR aliases of the NEW_ARRAY_CLEAR
-    // result must still cancel the matching ZERO_ARRAY indexes.
-    let array = resolve_same_as_forwarding(array, forwardings);
-    let mut written = indexmap::IndexSet::<usize>::new();
-    for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
-        if rewrite_pending_zero_flush(later)
-            || could_merge_with_next_guard(later, j, ops)
-            || observes_array_items(later, array, forwardings)
-        {
-            break;
-        }
-        if later.opcode != OpCode::SetarrayitemGc {
-            continue;
-        }
-        if resolve_same_as_forwarding(later.arg(0).to_opref(), forwardings) != array {
-            continue;
-        }
-        let Some(idx) = const_operand_value(constants, later.arg(1).to_opref()) else {
-            continue;
-        };
-        if let Ok(i) = usize::try_from(idx)
-            && i < length
-        {
-            written.insert(i);
-        }
-    }
-    let mut start = 0;
-    while start < length && written.contains(&start) {
-        start += 1;
-    }
-    let mut stop = length;
-    while stop > start && written.contains(&(stop - 1)) {
-        stop -= 1;
-    }
-    if start >= stop {
-        ZeroArrayPlan::Skip
-    } else {
-        ZeroArrayPlan::Items {
-            start,
-            count: stop - start,
-        }
-    }
-}
-
-/// `rewrite.py clear_gc_fields` + `consider_setfield_gc` + `emit_pending_zeros`.
-///
-/// IncrementalMiniMark does not zero-fill. Native rewrite only NULLs
-/// unwritten GC-pointer fields (`descr.gc_fielddescrs`) and drops any
-/// offset a later `SETFIELD_GC` writes before the next flush. The class
-/// word is omitted when `handle_new` already stamped `w_class_obj`
-/// (`rewrite.rs clear_gc_fields`); a `NEW_WITH_VTABLE` vtable store is
-/// the same as `emit_setfield` after `handle_new_fixedsize`.
-///
-/// Wasm skips that rewrite and would otherwise `memory.fill` the whole
-/// `New` payload, including scalar fields rewrite never touches.
-fn pending_new_zero_offsets(
-    descr: &dyn majit_ir::descr::SizeDescr,
-    ops: &[Op],
-    op_idx: usize,
-    obj: OpRef,
-    write_vtable_offset: Option<usize>,
-    stamp_w_class: bool,
-    forwardings: &[Option<OpRef>],
-) -> Vec<usize> {
-    let class_word = descr.class_word_field().map(|fd| fd.offset());
-    let skip_class_word = stamp_w_class && class_word.is_some();
-    let obj = resolve_same_as_forwarding(obj, forwardings);
-    let mut pending: Vec<usize> = descr
-        .gc_fielddescrs()
-        .iter()
-        .map(|fd| fd.offset())
-        .filter(|&ofs| !(skip_class_word && class_word == Some(ofs)))
-        .filter(|&ofs| write_vtable_offset != Some(ofs))
-        .collect();
-    if pending.is_empty() {
-        return pending;
-    }
-    for (j, later) in ops.iter().enumerate().skip(op_idx + 1) {
-        if rewrite_pending_zero_flush(later) || could_merge_with_next_guard(later, j, ops) {
-            break;
-        }
-        if later.opcode != OpCode::SetfieldGc {
-            continue;
-        }
-        if resolve_same_as_forwarding(later.arg(0).to_opref(), forwardings) != obj {
-            continue;
-        }
-        let descr = later.getdescr();
-        let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) else {
-            continue;
-        };
-        let ofs = fd.offset();
-        pending.retain(|&pending_ofs| pending_ofs != ofs);
-        if pending.is_empty() {
-            break;
-        }
-    }
-    pending
-}
-
-/// rewrite.py `emit_pending_zeros` GC_STORE of NULL at each leftover
-/// offset. Pointer-width (`WORD`) like `emit_gc_store_or_indexed(..., WORD)`.
-fn emit_pending_null_fields(sink: &mut PeepSink<'_, '_>, base_local: u32, offsets: &[usize]) {
-    for &ofs in offsets {
-        sink.local_get(base_local);
-        sink.i32_wrap_i64();
-        sink.i32_const(0);
-        sink.i32_store(MemArg {
-            offset: ofs as u64,
-            align: 2,
-            memory_index: 0,
-        });
-    }
-}
-
-/// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
-/// length store: items only, starting at `basesize`. IncrementalMiniMark
-/// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
-fn emit_zero_array_item_range(
-    sink: &mut PeepSink<'_, '_>,
-    value_types: &ValueLocals,
-    result: u32,
-    dest_ofs: i64,
-    bytes: u32,
-) {
-    if bytes == 0 {
-        return;
-    }
-    sink.local_get(value_types.local(result));
-    sink.i32_wrap_i64();
-    if dest_ofs != 0 {
-        sink.i32_const(dest_ofs as i32);
-        sink.i32_add();
-    }
-    sink.i32_const(0);
-    sink.i32_const(bytes as i32);
-    sink.memory_fill(0);
-}
-
-/// rewrite.py `handle_clear_array_contents` / `ZERO_ARRAY` after the
-/// length store: items only, starting at `basesize`. IncrementalMiniMark
-/// does not zero-fill; a plain `NEW_ARRAY` never reaches here.
-fn emit_zero_array_plan(
-    sink: &mut PeepSink<'_, '_>,
-    constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &ValueLocals,
-    result: u32,
-    base_size: i64,
-    item_size: i64,
-    length: OpRef,
-    plan: &ZeroArrayPlan,
-) {
-    if item_size <= 0 {
-        return;
-    }
-    match *plan {
-        ZeroArrayPlan::Skip => {}
-        ZeroArrayPlan::Items { start, count } => {
-            // wasm32 memory.fill takes an i32 length; a truncated cast
-            // would zero a prefix and leave the rest dirty. Skip rather
-            // than emit a shorter fill (`handle_new_array` already sent
-            // oversized constants to the collecting helper).
-            let Some(item_size) = u32::try_from(item_size).ok() else {
-                return;
-            };
-            let Some(count) = u32::try_from(count).ok() else {
-                return;
-            };
-            let Some(bytes) = item_size.checked_mul(count) else {
-                return;
-            };
-            let dest = base_size.saturating_add(i64::from(item_size).saturating_mul(start as i64));
-            emit_zero_array_item_range(sink, value_types, result, dest, bytes);
-        }
-        ZeroArrayPlan::Runtime => {
-            let Ok(item_size) = i32::try_from(item_size) else {
-                return;
-            };
-            sink.local_get(value_types.local(result));
-            sink.i32_wrap_i64();
-            if base_size != 0 {
-                sink.i32_const(base_size as i32);
-                sink.i32_add();
-            }
-            sink.i32_const(0);
-            emit_resolve(sink, constants, value_types, length);
-            sink.i32_wrap_i64();
-            if item_size != 1 {
-                sink.i32_const(item_size);
-                sink.i32_mul();
-            }
-            sink.memory_fill(0);
-        }
-    }
-}
-
-/// The element index a card-marking barrier needs, or `None` for a store that
-/// takes the plain barrier.
-///
-/// `rewrite.py gen_write_barrier_array` reaches for `COND_CALL_GC_WB_ARRAY`
-/// only when the collector has cards and the array is not statically known to
-/// be short: a short array is cheaper to remember whole than to card-mark index
-/// by index. SETFIELD_GC carries no index and never card-marks.
-fn write_barrier_card_index(
-    op: &Op,
-    wb: &WriteBarrierHelpers,
-    base_key: OpRef,
-    known_lengths: &KnownArrayLengths,
-) -> Option<OpRef> {
-    /// `gen_write_barrier_array`'s own `LARGE`.
-    const LARGE: usize = 130;
-    if wb.cards_set == 0 || wb.array_fn_ptr == 0 {
-        return None;
-    }
-    if known_lengths.get(base_key, LARGE) < LARGE {
-        return None;
-    }
-    matches!(
-        op.opcode,
-        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc
-    )
-    .then(|| op.arg(1).to_opref())
-}
-
-/// Emit a store write barrier unless the base's forwarded value already has
-/// one on this path. The emitted barrier still receives the store's own base.
-#[allow(clippy::too_many_arguments)]
-fn emit_write_barrier_if_needed(
-    sink: &mut PeepSink<'_, '_>,
-    constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &ValueLocals,
-    jit_call_idx: Option<u32>,
-    residual_type_base: Option<u32>,
-    wb: &WriteBarrierHelpers,
-    op: &Op,
-    base: Option<OpRef>,
-    same_as_forwardings: &[Option<OpRef>],
-    wb_applied: &mut indexmap::IndexSet<OpRef>,
-    known_lengths: &KnownArrayLengths,
-) {
-    let Some(base) = base else {
-        return;
-    };
-    // rewrite.py `handle_write_barrier_setfield` and
-    // `handle_write_barrier_setarrayitem` both open with the same
-    // `write_barrier_applied(val)` test, before either picks an arm.
-    let wb_key = resolve_same_as_forwarding(base, same_as_forwardings);
-    if wb_applied.contains(&wb_key) {
-        return;
-    }
-    let card_index = write_barrier_card_index(op, wb, wb_key, known_lengths);
-    emit_write_barrier(
-        sink,
-        constants,
-        value_types,
-        jit_call_idx,
-        residual_type_base,
-        wb,
-        base,
-        card_index,
-    );
-    // rewrite.rs's `gen_write_barrier`: remember only after the barrier has
-    // been emitted. `gen_write_barrier_array` remembers nothing at all, since
-    // a card records one index and the next store may name another.
-    if card_index.is_none() {
-        wb_applied.insert(wb_key);
-    }
-}
-
-/// `rewrite.rs remember_wb` after a nursery allocation whose every arm is
-/// young. Headerless overflow stays in the nursery (raw bump or 0).
-fn remember_nursery_wb(
-    wb_applied: &mut indexmap::IndexSet<OpRef>,
-    result: OpRef,
-    same_as_forwardings: &[Option<OpRef>],
-) {
-    if result != OpRef::NONE && !result.is_constant() {
-        wb_applied.insert(resolve_same_as_forwarding(result, same_as_forwardings));
     }
 }
 
@@ -4168,6 +3681,9 @@ fn direct_helper_i64_arity(
         | OpCode::CallMallocNurseryVarsize
         | OpCode::Newstr
         | OpCode::Newunicode => Some(5),
+        // rewrite_ops_for_gc lowers SETFIELD_GC / SETARRAYITEM_GC to these.
+        OpCode::CondCallGcWb => Some(1),
+        OpCode::CondCallGcWbArray => Some(2),
         // wasm_jit_write_barrier(base)
         _ => write_barrier_base(op, ref_values).map(|_| 1),
     }
@@ -4555,15 +4071,6 @@ pub struct NurseryAllocParams {
     pub plain_tids: std::collections::HashSet<u32>,
 }
 
-/// `GcRewriterAssembler.round_up_for_allocation`: raise to the nursery
-/// minimum, then 8-align. Shared by the inline `New*` bump and by
-/// `collect_nursery_batches` so a batched total uses the same size the
-/// per-object arm would have asked for.
-fn aligned_nursery_size(payload: i64) -> Option<usize> {
-    let payload = usize::try_from(payload).ok()?;
-    Some(((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7)
-}
-
 /// `Nursery::alloc` 8-aligns the total. The inline VarsizeFrame and
 /// headerless bumps write `nursery_free` themselves, so a wasm32 size that
 /// is only word-aligned has to be raised here or the next object header is
@@ -4573,11 +4080,11 @@ fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
     Some(size.checked_add(7)? & !7)
 }
 
-const BUILTIN_STRING_HASH_OFFSET: usize = 0;
-const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
-const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
-const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
-const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
+pub(crate) const BUILTIN_STRING_HASH_OFFSET: usize = 0;
+pub(crate) const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
+pub(crate) const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+pub(crate) const BUILTIN_STR_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>() + 1;
+pub(crate) const BUILTIN_UNICODE_TOKEN_BASE_SIZE: usize = 2 * std::mem::size_of::<usize>();
 
 #[derive(Debug)]
 struct BuiltinFieldDescr {
@@ -4714,163 +4221,6 @@ fn needs_builtin_string_descr(op: &Op) -> bool {
     !op.has_descr()
         && (builtin_string_array_descr(op.opcode).is_some()
             || builtin_string_hash_field_descr(op.opcode).is_some())
-}
-
-/// One member of a rewrite.py `gen_malloc_nursery` run: consecutive
-/// inline-eligible `New`/`NewWithVtable` and constant-size `NewArray*`
-/// ops share one bump of `batch_total`. Followers are
-/// `NURSERY_PTR_INCREMENT` — `prev + prev_size` — on the fast path. The
-/// slow path still allocates each object through the collecting helper,
-/// because a follower's frame home is only written at its own op.
-#[derive(Clone, Copy)]
-enum NurseryBatchRole {
-    Leader { batch_total: usize },
-    Follower { prev_result: u32, prev_size: usize },
-}
-
-/// `New`/`NewWithVtable` or a constant-size `NewArray*` that the inline
-/// nursery arm would accept. Constant results are excluded: a follower
-/// needs the previous payload pointer in a local. A runtime-length
-/// array stays on the varsize path and is not a batch member.
-fn new_inline_nursery_member(
-    op: &Op,
-    na: &NurseryAllocParams,
-    constants: &indexmap::IndexMap<u32, i64>,
-) -> Option<(usize, u32)> {
-    let result_id = op.pos().get().raw();
-    if OpRef::raw_is_constant(result_id) {
-        return None;
-    }
-    match op.opcode {
-        OpCode::New | OpCode::NewWithVtable => {
-            let descr = op.getdescr()?;
-            let sd = descr.as_size_descr()?;
-            if sd.non_moving() {
-                return None;
-            }
-            if !na.plain_tids.contains(&sd.type_id()) {
-                return None;
-            }
-            let total = aligned_nursery_size(sd.size() as i64)?;
-            (total < na.large_threshold).then_some((total, result_id))
-        }
-        OpCode::NewArray | OpCode::NewArrayClear => {
-            let descr = op.getdescr()?;
-            let ad = descr.as_array_descr()?;
-            if ad.non_moving() {
-                return None;
-            }
-            if !na.plain_tids.contains(&ad.type_id()) {
-                return None;
-            }
-            let length = const_operand_value(constants, op.arg(0).to_opref())?;
-            if length < 0 {
-                return None;
-            }
-            let payload = (ad.base_size() as i64)
-                .checked_add((ad.item_size() as i64).checked_mul(length)?)?;
-            let total = aligned_nursery_size(payload)?;
-            (total < na.large_threshold).then_some((total, result_id))
-        }
-        _ => None,
-    }
-}
-
-/// rewrite.py `gen_malloc_nursery` merge window: keep extending a run
-/// across ops that cannot collect (`SETFIELD_GC` and friends). `LABEL`
-/// and any other `can_malloc` op flush, matching
-/// `emitting_an_operation_that_can_collect`. Combined size stays strictly
-/// below `large_threshold`, the same exclusive bound as
-/// `can_use_nursery`.
-///
-/// `region_starts` are the first op indices of inlined-bridge regions in
-/// the merged stream. Those regions are alternative control-flow paths,
-/// so a region's allocation must not follow an owner-side leader.
-fn collect_nursery_batches(
-    ops: &[Op],
-    nursery: Option<&NurseryAllocParams>,
-    constants: &indexmap::IndexMap<u32, i64>,
-    region_starts: &[usize],
-) -> Vec<Option<NurseryBatchRole>> {
-    let mut out = vec![None; ops.len()];
-    let Some(na) = nursery else {
-        return out;
-    };
-    let mut at_region_start = vec![false; ops.len()];
-    for &start in region_starts {
-        if let Some(slot) = at_region_start.get_mut(start) {
-            *slot = true;
-        }
-    }
-    let mut run: Vec<(usize, usize, u32)> = Vec::new();
-    let mut run_total = 0usize;
-    let flush = |out: &mut [Option<NurseryBatchRole>], run: &mut Vec<(usize, usize, u32)>| {
-        if run.len() >= 2 {
-            let batch_total: usize = run.iter().map(|entry| entry.1).sum();
-            out[run[0].0] = Some(NurseryBatchRole::Leader { batch_total });
-            for window in run.windows(2) {
-                out[window[1].0] = Some(NurseryBatchRole::Follower {
-                    prev_result: window[0].2,
-                    prev_size: window[0].1,
-                });
-            }
-        }
-        run.clear();
-    };
-    for (i, op) in ops.iter().enumerate() {
-        if at_region_start[i] {
-            flush(&mut out, &mut run);
-            run_total = 0;
-        }
-        if let Some((total, result_id)) = new_inline_nursery_member(op, na, constants) {
-            if !run.is_empty() && run_total + total < na.large_threshold {
-                run.push((i, total, result_id));
-                run_total += total;
-                continue;
-            }
-            flush(&mut out, &mut run);
-            run.push((i, total, result_id));
-            run_total = total;
-            continue;
-        }
-        if op.opcode == OpCode::Label
-            || op.opcode == OpCode::Jump
-            || op.opcode == OpCode::Finish
-            || op.opcode.can_malloc()
-        {
-            flush(&mut out, &mut run);
-            run_total = 0;
-        }
-    }
-    flush(&mut out, &mut run);
-    out
-}
-
-/// rewrite.py `NURSERY_PTR_INCREMENT(prev, prev_size)` plus the interior
-/// object's tid header. Leaves the payload pointer as i64.
-fn emit_nursery_ptr_increment(
-    sink: &mut PeepSink<'_, '_>,
-    value_types: &ValueLocals,
-    alloc_scratch_local: u32,
-    prev_result: u32,
-    prev_size: usize,
-    type_id: i64,
-) {
-    sink.local_get(value_types.local(prev_result));
-    sink.i32_wrap_i64();
-    sink.i32_const(prev_size as i32);
-    sink.i32_add();
-    sink.local_tee(alloc_scratch_local);
-    sink.i32_const(GcHeader::SIZE as i32);
-    sink.i32_sub();
-    sink.i64_const(type_id);
-    sink.i64_store(MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: 0,
-    });
-    sink.local_get(alloc_scratch_local);
-    sink.i64_extend_i32_u();
 }
 
 /// `__indirect_function_table` indices of the allocation helpers a compiled
@@ -6286,25 +5636,11 @@ fn build_function(
     // Extra i32 scratches when the inline nursery-bump fast path is armed:
     // one holds the loaded `nursery_free` across the bump/commit sequence;
     // runtime varsize array allocation also needs one for the computed
-    // total/new-free word. A third local records whether a batched leader
-    // took the bump so followers can `NURSERY_PTR_INCREMENT` instead of
-    // calling the helper.
-    let nursery_batches = if residual_type_base.is_some() {
-        let region_starts: Vec<usize> = InlinedRegionSpan::collect(ops.len(), inlined_bridges)
-            .iter()
-            .map(|span| span.ops_start)
-            .collect();
-        collect_nursery_batches(ops, nursery, constants, &region_starts)
-    } else {
-        Vec::new()
-    };
-    let has_nursery_batches = nursery_batches.iter().any(Option::is_some);
+    // total/new-free word.
     let base_i32_locals: u32 = 1 + if ca.emit_ca { 3 } else { 0 };
-    let extra_alloc_i32 =
-        u32::from(nursery.is_some() || ca.inline.is_some()) * 2 + u32::from(has_nursery_batches);
+    let extra_alloc_i32 = u32::from(nursery.is_some() || ca.inline.is_some()) * 2;
     let alloc_scratch_local = bridge_slot_local + base_i32_locals;
     let alloc_size_local = alloc_scratch_local + 1;
-    let alloc_batch_flag_local = alloc_size_local + 1;
     // A keyed census must preserve the raw dispatch value until `br_table`.
     // Its counter-address scratch cannot share `bridge_slot_local`, because
     // the latter would replace the selector with a guest-memory address.
@@ -6646,14 +5982,6 @@ fn build_function(
     let mut ovf_flag_live = false;
     let mut fused_guard_at: Option<usize> = None;
     let mut fused_condcall_at: Option<usize> = None;
-    // rewrite.py:41-45 `_write_barrier_applied`, represented by
-    // RewriteState::wb_applied in rewrite.rs.  A base enters this set after
-    // its barrier is emitted or when a nursery allocation produces it; clear
-    // at every potentially-collecting op and LABEL so this describes every
-    // path reaching the next op, including entry through a LABEL loader.
-    let mut wb_applied = indexmap::IndexSet::<OpRef>::new();
-    let mut known_lengths = KnownArrayLengths::default();
-    let same_as_forwardings = same_as_forwardings(ops, num_vars);
     let frame_can_escape = ops
         .iter()
         .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
@@ -6696,13 +6024,9 @@ fn build_function(
 
     for (op_idx, op) in ops.iter().enumerate() {
         set_failarg_lookup_base(table_base_by_op[op_idx]);
-        if op.opcode == OpCode::Label || op.opcode.can_malloc() {
-            wb_applied.clear();
-        }
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
             emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
         }
-        known_lengths.observe(op, constants);
         if op.opcode == OpCode::Label && key_dispatch && labels_passed < num_labels {
             // End of the segment before label j (key-0 / earlier-label path).
             // Branch over the resume loader, then close C_j, emit the loader
@@ -7451,7 +6775,7 @@ fn build_function(
                 // one llgraph's `last_exception is not None` tests. The slot
                 // lives in the host's shared linear memory; load it by absolute
                 // address (the trace imports env.memory).
-                sink.i32_const(crate::jit_exc_type_addr() as i32);
+                sink.i32_const(runtime_addr(crate::jit_exc_type_addr));
                 sink.i64_load(mem64(0));
                 sink.i64_const(0);
                 sink.i64_ne();
@@ -7471,8 +6795,8 @@ fn build_function(
                 //   load pos_exception; CMP expected; guard on equal; then
                 //   _store_and_reset_exception: resloc = pos_exc_value;
                 //   pos_exception = 0; pos_exc_value = 0.
-                let exc_type_addr = crate::jit_exc_type_addr() as i32;
-                let exc_value_addr = crate::jit_exc_value_addr() as i32;
+                let exc_type_addr = runtime_addr(crate::jit_exc_type_addr);
+                let exc_value_addr = runtime_addr(crate::jit_exc_value_addr);
                 sink.i32_const(exc_type_addr);
                 sink.i64_load(mem64(0));
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
@@ -7854,20 +7178,10 @@ fn build_function(
                     sink.local_set(value_types.local(vi));
                 }
             }
-            OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                emit_write_barrier_if_needed(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    jit_call_idx,
-                    residual_type_base,
-                    wb,
-                    op,
-                    emitted_write_barrier_base(op, ref_values),
-                    &same_as_forwardings,
-                    &mut wb_applied,
-                    &known_lengths,
-                );
+            OpCode::SetfieldGc => {
+                panic!("wasm codegen: SetfieldGc must have been lowered by rewrite_ops_for_gc");
+            }
+            OpCode::SetfieldRaw => {
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref()); // struct ptr
                 sink.i32_wrap_i64();
                 let field_offset = field_offset_from_descr(op);
@@ -7933,20 +7247,10 @@ fn build_function(
                     sink.local_set(value_types.local(vi));
                 }
             }
-            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
-                emit_write_barrier_if_needed(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    jit_call_idx,
-                    residual_type_base,
-                    wb,
-                    op,
-                    emitted_write_barrier_base(op, ref_values),
-                    &same_as_forwardings,
-                    &mut wb_applied,
-                    &known_lengths,
-                );
+            OpCode::SetarrayitemGc => {
+                panic!("wasm codegen: SetarrayitemGc must have been lowered by rewrite_ops_for_gc");
+            }
+            OpCode::SetarrayitemRaw => {
                 let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
@@ -7997,21 +7301,6 @@ fn build_function(
                 }
             }
             OpCode::SetinteriorfieldGc | OpCode::SetinteriorfieldRaw => {
-                if op.opcode == OpCode::SetinteriorfieldGc {
-                    emit_write_barrier_if_needed(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        jit_call_idx,
-                        residual_type_base,
-                        wb,
-                        op,
-                        emitted_write_barrier_base(op, ref_values),
-                        &same_as_forwardings,
-                        &mut wb_applied,
-                        &known_lengths,
-                    );
-                }
                 let field = unpack_interior_field(op);
                 let base = emit_scaled_index_addr(
                     &mut sink,
@@ -8230,14 +7519,14 @@ fn build_function(
                 // shared with the host: skipping the op leaves the local null.
                 let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    sink.i32_const(crate::jit_exc_value_addr() as i32);
+                    sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
                     sink.i64_load(mem64(0));
                     sink.local_set(value_types.local(vi));
                 }
-                sink.i32_const(crate::jit_exc_type_addr() as i32);
+                sink.i32_const(runtime_addr(crate::jit_exc_type_addr));
                 sink.i64_const(0);
                 sink.i64_store(mem64(0));
-                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
                 sink.i64_const(0);
                 sink.i64_store(mem64(0));
             }
@@ -8246,7 +7535,7 @@ fn build_function(
                 //   MOV resloc, [pos_exception]
                 let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    sink.i32_const(crate::jit_exc_type_addr() as i32);
+                    sink.i32_const(runtime_addr(crate::jit_exc_type_addr));
                     sink.i64_load(mem64(0));
                     sink.local_set(value_types.local(vi));
                 }
@@ -8255,10 +7544,10 @@ fn build_function(
                 // x86/assembler.py _restore_exception:
                 //   MOV [pos_exc_value], excvalloc
                 //   MOV [pos_exception], exctploc
-                sink.i32_const(crate::jit_exc_value_addr() as i32);
+                sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
                 emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                 sink.i64_store(mem64(0));
-                sink.i32_const(crate::jit_exc_type_addr() as i32);
+                sink.i32_const(runtime_addr(crate::jit_exc_type_addr));
                 emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
                 sink.i64_store(mem64(0));
             }
@@ -8280,8 +7569,10 @@ fn build_function(
                 );
             }
             OpCode::CondCallGcWbArray => {
-                // rewrite.py `gen_write_barrier_array` large arm:
-                // COND_CALL_GC_WB_ARRAY(base, index).
+                // rewrite.py `gen_write_barrier_array`: cards_set == 0
+                // falls through to the plain remembered barrier.
+                let card =
+                    (wb.cards_set != 0 && wb.array_fn_ptr != 0).then(|| op.arg(1).to_opref());
                 emit_write_barrier(
                     &mut sink,
                     constants,
@@ -8290,7 +7581,7 @@ fn build_function(
                     residual_type_base,
                     wb,
                     op.arg(0).to_opref(),
-                    Some(op.arg(1).to_opref()),
+                    card,
                 );
             }
             OpCode::CondCallN => {
@@ -9161,11 +8452,9 @@ fn build_function(
                         frame,
                     );
                 }
-                remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
             }
             OpCode::CallMallocNurseryVarsize => {
-                // The arity-5 array helper can return old-gen, so this arm
-                // does not seed `wb_applied` — same reason as `NewArray`.
+                // The arity-5 array helper can return old-gen.
                 let vi = op.pos().get().raw();
                 let Some(base) = residual_type_base else {
                     return Err(BackendError::Unsupported(
@@ -9338,7 +8627,7 @@ fn build_function(
                     );
                 }
                 // `wasm_jit_alloc` can return old-gen when the nursery cannot
-                // hold the frame. Do not seed `wb_applied`.
+                // hold the frame.
             }
             // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
             // malloc. Use the same propagate-exception exit as the wasm
@@ -10107,826 +9396,14 @@ fn build_function(
             }
 
             // ── Allocation (via trampoline — treated as CALL) ──
-            // llmodel.py bh_new* parity: a `New*` survives
-            // optimization whenever the allocated object escapes the trace
-            // (e.g. reboxed result stored into a namespace). The trace cannot
-            // allocate inline (the GC is host-side), so route through the
-            // `jit_call` trampoline to the `wasm_jit_alloc` helper, then write
-            // the vtable / length fields with pointer-width (i32) stores.
-            OpCode::New | OpCode::NewWithVtable => {
-                let vi = op.pos().get().raw();
-                // llmodel.py:778-782: size, type_id, vtable from the size descr.
-                let descr = op.getdescr();
-                let sd = descr.as_ref().and_then(|d| d.as_size_descr());
-                let (size, type_id, vtable) = sd.map_or_else(
-                    || missing_layout_descr("size descr", op),
-                    |sd| (sd.size() as i64, sd.type_id() as i64, sd.vtable()),
+            // rewrite_ops_for_gc lowers every New / NewWithVtable /
+            // NewArray / NewArrayClear before this match. Production
+            // compile_loop / compile_bridge always run that rewrite.
+            OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
+                panic!(
+                    "wasm codegen: {:?} must have been lowered by rewrite_ops_for_gc",
+                    op.opcode
                 );
-                // `(w_class_offset, w_class)` — the `PyObject.w_class` field
-                // and the class pointer instances of this type carry
-                // (`get_instantiate(vtable_type)`). `fuse_boxing_alloc` drops
-                // the boxing ctor's `ob_header` stores expecting the runtime to
-                // stamp both `ob_type` and `w_class` from the size descr; the
-                // vtable write above covers `ob_type`, this covers `w_class`.
-                let w_class_init = sd.and_then(|sd| {
-                    sd.w_class_obj().and_then(|w_class| {
-                        sd.class_word_field()
-                            .map(|fd| (fd.offset() as u64, w_class))
-                    })
-                });
-                // rewrite.py NEW_WITH_VTABLE `emit_setfield` of the vtable
-                // after `handle_new_fixedsize`; that store cancels the
-                // delayed NULL at the same offset.
-                let write_vtable =
-                    op.opcode == OpCode::NewWithVtable && vtable != 0 && vtable_offset.is_some();
-                let stamp_w_class = w_class_init.is_some_and(|(_, w_class)| w_class != 0);
-                let pending_zeros = sd.map_or_else(Vec::new, |sd| {
-                    pending_new_zero_offsets(
-                        sd,
-                        ops,
-                        op_idx,
-                        op.pos().get(),
-                        vtable_offset.filter(|_| write_vtable),
-                        stamp_w_class,
-                        &same_as_forwardings,
-                    )
-                });
-
-                // `rewrite.rs handle_new`: a `non_moving` descr declines the
-                // nursery outright — both the inline bump and the collecting
-                // helper — and allocates through the old-generation twin, whose
-                // address is the only thing that differs from the nursery call.
-                let non_moving = sd.is_some_and(|sd| sd.non_moving());
-                let alloc_fn_ptr = if non_moving {
-                    alloc.new_oldgen_fn_ptr
-                } else {
-                    alloc.new_fn_ptr
-                };
-                // Inline nursery bump (rewrite.py malloc fast path, x86
-                // `malloc_cond`): total = align8(max(header+size, MIN)); if
-                // `free + total` fits below `nursery_top`, commit the bump and
-                // write the header word (tid, no flags — young objects carry
-                // none) inline; otherwise fall to the collecting helper.
-                // Restricted to plain types (no destructor/weakref side-list)
-                // under the large-object threshold, exactly the helper's own
-                // fast path. Consecutive eligible `New*` ops share one bump
-                // (`gen_malloc_nursery` / `NURSERY_PTR_INCREMENT`).
-                let total_size = aligned_nursery_size(size).unwrap_or(usize::MAX);
-                let inline_nursery = nursery.filter(|_| !non_moving).filter(|na| {
-                    total_size < na.large_threshold
-                        && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
-                });
-                let batch_role = nursery_batches.get(op_idx).and_then(|role| role.as_ref());
-                if let (
-                    Some(base),
-                    Some(_),
-                    Some(NurseryBatchRole::Follower {
-                        prev_result,
-                        prev_size,
-                    }),
-                ) = (residual_type_base, inline_nursery, batch_role)
-                {
-                    // Fast: NURSERY_PTR_INCREMENT(prev, prev_size). Slow: the
-                    // leader overflowed, so this object was never reserved —
-                    // call the helper. The follower's home is written below.
-                    sink.local_get(alloc_batch_flag_local);
-                    sink.if_(BlockType::Result(ValType::I64));
-                    emit_nursery_ptr_increment(
-                        &mut sink,
-                        value_types,
-                        alloc_scratch_local,
-                        *prev_result,
-                        *prev_size,
-                        type_id,
-                    );
-
-                    sink.else_();
-                    sink.i64_const(type_id);
-                    sink.i64_const(size);
-                    sink.i32_const(alloc_fn_ptr as i32);
-                    sink.call_indirect(0, base + 2);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    sink.end();
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else if let (Some(base), Some(na)) = (residual_type_base, inline_nursery) {
-                    let bump_size = match batch_role {
-                        Some(NurseryBatchRole::Leader { batch_total }) => *batch_total,
-                        _ => total_size,
-                    };
-                    // free = *nursery_free; new_free = free + bump
-                    sink.i32_const(na.free_addr as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.local_tee(alloc_scratch_local);
-                    sink.i32_const(bump_size as i32);
-                    sink.i32_add();
-                    // The sum is the committed `nursery_free`, so keep it
-                    // rather than adding it again on the arm that takes it.
-                    sink.local_tee(alloc_size_local);
-                    // new_free > *nursery_top → slow path
-                    sink.i32_const(na.top_addr as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i32_gt_u();
-                    sink.if_(BlockType::Result(ValType::I64));
-                    // Slow: collecting helper. The collection may have moved
-                    // every other live Ref; reload them from their (forwarded)
-                    // homes — only here, the fast path moves nothing. Skip the
-                    // fresh result (still on the operand stack; its home is
-                    // written by store-on-def below).
-                    sink.i64_const(type_id);
-                    sink.i64_const(size);
-                    sink.i32_const(alloc_fn_ptr as i32);
-                    sink.call_indirect(0, base + 2);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
-                        sink.i32_const(0);
-                        sink.local_set(alloc_batch_flag_local);
-                    }
-                    sink.else_();
-                    // Commit: *nursery_free = free + bump.
-                    sink.i32_const(na.free_addr as i32);
-                    sink.local_get(alloc_size_local);
-                    sink.i32_store(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    // Header word: `GcHeader::new(tid)` — flags 0.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i64_const(type_id);
-                    sink.i64_store(MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    });
-
-                    if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
-                        sink.i32_const(1);
-                        sink.local_set(alloc_batch_flag_local);
-                    }
-                    // Result payload pointer = free + header size.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i64_extend_i32_u();
-                    sink.end();
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else if let Some(base) = residual_type_base {
-                    // Direct in-module allocation: `wasm_jit_alloc(type_id, size)`
-                    // is a plain `(i64,i64)->i64` table entry, so call it like an
-                    // eligible residual call — no host hop. Its fn ptr is a table
-                    // index on wasm32.
-                    sink.i64_const(type_id);
-                    sink.i64_const(size);
-                    sink.i32_const(alloc_fn_ptr as i32);
-                    sink.call_indirect(0, base + 2);
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else {
-                    let jit_call = jit_call_idx.expect("New op present but jit_call not imported");
-                    // func_ptr = wasm_jit_alloc
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(alloc_fn_ptr);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    // num_args = 2
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(2);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    // arg0 = type_id
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(type_id);
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-                    // arg1 = size
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(size);
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
-                    // call trampoline
-                    emit_jit_call(&mut sink, jit_call);
-
-                    if !OpRef::raw_is_constant(vi) {
-                        // result pointer
-                        emit_call_area_addr(&mut sink);
-                        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                        sink.local_set(value_types.local(vi));
-                    }
-                }
-
-                // The check `rewrite.py` `_gen_call_malloc_gc` puts after a
-                // collecting malloc: the vtable and class-word stores below
-                // address the result directly and must not run on a NULL.
-                emit_memory_error_check(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.pos().get(),
-                    residual_type_base,
-                    ca.ca_reload_fn_ptr,
-                    ca.jf_top_addr,
-                );
-                if !OpRef::raw_is_constant(vi) {
-                    // llmodel.py write_int_at_mem(res, vtable_offset,
-                    // WORD, vtable). The `ob_type` field is pointer-width: 4
-                    // bytes on wasm32 (GuardClass reads it as i32), so store
-                    // the low 32 bits to avoid clobbering the next field.
-                    if write_vtable {
-                        let vt_off = vtable_offset.unwrap() as u64;
-                        sink.local_get(value_types.local(vi));
-                        sink.i32_wrap_i64();
-                        sink.i32_const(vtable as i32);
-                        sink.i32_store(MemArg {
-                            offset: vt_off,
-                            align: 2,
-                            memory_index: 0,
-                        });
-                    }
-                    // Stamp `w_class = get_instantiate(vtable_type)` so the
-                    // materialized builtin box carries the class pointer
-                    // OptVirtualize folded its `w_class` header reads to. Mirrors
-                    // dynasm `genop_new_with_vtable` (aarch64/assembler.rs).
-                    // Pointer-width (4 bytes on wasm32): store the low 32 bits.
-                    // Without it the nursery-zeroed `w_class` stays 0 and the
-                    // promoted-`w_class` GuardValue fails every iteration on any
-                    // escaping-builtin loop (e.g. `while: lst.append(i)`).
-                    // rewrite.rs `handle_new` stamps `w_class` for both
-                    // New and NewWithVtable before `clear_gc_fields`.
-                    if let Some((w_class_offset, w_class)) = w_class_init
-                        && w_class != 0
-                    {
-                        sink.local_get(value_types.local(vi));
-                        sink.i32_wrap_i64();
-                        sink.i32_const(w_class as i32);
-                        sink.i32_store(MemArg {
-                            offset: w_class_offset,
-                            align: 2,
-                            memory_index: 0,
-                        });
-                    }
-                    // rewrite.py emit_pending_zeros: leftover GC-pointer
-                    // fields only. Scalar payload stays dirty.
-                    emit_pending_null_fields(&mut sink, value_types.local(vi), &pending_zeros);
-                }
-                // The collecting allocation may have moved every other live
-                // Ref; reload them from their (forwarded) homes. Skip the fresh
-                // result — it was allocated after the collection and its home is
-                // written by store-on-def below. The inline-bump path already
-                // emitted this reload inside its slow arm (the fast bump moves
-                // nothing).
-                if residual_type_base.is_none() || inline_nursery.is_none() {
-                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        skip,
-                        frame,
-                    );
-                }
-                // rewrite.py `gen_malloc_nursery` `remember_write_barrier`:
-                // a nursery-sized New is young on every arm (overflow
-                // collects and retries). Collecting / old-gen New stays
-                // out of the set (`_gen_call_malloc_gc`).
-                if inline_nursery.is_some() {
-                    remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
-                }
-            }
-            OpCode::NewArray | OpCode::NewArrayClear => {
-                let vi = op.pos().get().raw();
-                let descr = op.getdescr();
-                let ad = descr
-                    .as_ref()
-                    .and_then(|d| d.as_array_descr())
-                    .unwrap_or_else(|| missing_layout_descr("array descr", op));
-                let (base_size, item_size) = (ad.base_size() as i64, ad.item_size() as i64);
-                let len_offset = ad.len_descr().map_or(0i64, |ld| ld.offset() as i64);
-                let type_id = ad.type_id() as i64;
-
-                // `rewrite.rs handle_new_array`: a `non_moving` descr declines
-                // both nursery routes and allocates through the old-generation
-                // twin. See the `New` arm.
-                let non_moving = ad.non_moving();
-                let alloc_array_fn_ptr = if non_moving {
-                    alloc.new_array_oldgen_fn_ptr
-                } else {
-                    alloc.new_array_fn_ptr
-                };
-                let nursery = nursery.filter(|_| !non_moving);
-
-                // Inline nursery bump for arrays of a plain type under the
-                // large-object threshold (same fast path as the `New` arm).
-                // Constant lengths keep the existing compile-time total; a
-                // runtime length uses malloc_cond_varsize's precheck against a
-                // compile-time maxlength before computing the bump size.
-                // rewrite.py ZERO_ARRAY after the length store covers
-                // leftover `NewArrayClear` items; plain `NewArray` does not.
-                let length_const = const_operand_value(constants, op.arg(0).to_opref());
-                let zero_plan = newarray_zero_plan(
-                    op,
-                    ops,
-                    op_idx,
-                    constants,
-                    length_const,
-                    &same_as_forwardings,
-                );
-                let inline_nursery_total = length_const.and_then(|len| {
-                    use majit_gc::header::GcHeader;
-                    let len = usize::try_from(len).ok()?;
-                    let payload =
-                        (base_size as usize).checked_add((item_size as usize).checked_mul(len)?)?;
-                    let total =
-                        ((GcHeader::SIZE + payload).max(GcHeader::MIN_NURSERY_OBJ_SIZE) + 7) & !7;
-                    let na = nursery.filter(|na| {
-                        total < na.large_threshold
-                            && u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
-                    })?;
-                    Some((total, len, na))
-                });
-                let inline_nursery_varsize = if length_const.is_none() {
-                    (|| {
-                        use majit_gc::header::GcHeader;
-                        let base_size_usize = usize::try_from(base_size).ok()?;
-                        let item_size_usize = usize::try_from(item_size).ok()?;
-                        let base_total = GcHeader::SIZE.checked_add(base_size_usize)?;
-                        let na = nursery.filter(|na| {
-                            u32::try_from(type_id).is_ok_and(|t| na.plain_tids.contains(&t))
-                        })?;
-                        // malloc_cond_varsize checks the length before doing
-                        // the scaled size calculation.  Use the largest length
-                        // whose rounded total is strictly below the nursery
-                        // large-object boundary, capped to wasm32's usize
-                        // length field.  Totals are eight-byte aligned, so
-                        // round the largest admitted word down after removing
-                        // the exclusive endpoint.
-                        let threshold =
-                            na.large_threshold.saturating_sub(1).min(u32::MAX as usize) & !7;
-                        if threshold < GcHeader::MIN_NURSERY_OBJ_SIZE || base_total > threshold {
-                            return None;
-                        }
-                        let max_len = (threshold - base_total)
-                            .checked_div(item_size_usize)
-                            .unwrap_or(u32::MAX as usize)
-                            .min(u32::MAX as usize);
-                        let max_len = i64::try_from(max_len).ok()?;
-                        Some((max_len, base_total as i64, item_size_usize as i64, na))
-                    })()
-                } else {
-                    None
-                };
-                let batch_role = nursery_batches.get(op_idx).and_then(|role| role.as_ref());
-                if let (
-                    Some(base),
-                    Some((length, _total)),
-                    Some(NurseryBatchRole::Follower {
-                        prev_result,
-                        prev_size,
-                    }),
-                ) = (
-                    residual_type_base,
-                    inline_nursery_total.map(|(total, length, _na)| (length, total)),
-                    batch_role,
-                ) {
-                    sink.local_get(alloc_batch_flag_local);
-                    sink.if_(BlockType::Result(ValType::I64));
-                    emit_nursery_ptr_increment(
-                        &mut sink,
-                        value_types,
-                        alloc_scratch_local,
-                        *prev_result,
-                        *prev_size,
-                        type_id,
-                    );
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(length as i32);
-                    sink.i32_store(MemArg {
-                        offset: len_offset as u64,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.else_();
-                    sink.i64_const(type_id);
-                    sink.i64_const(base_size);
-                    sink.i64_const(item_size);
-                    sink.i64_const(length as i64);
-                    sink.i64_const(len_offset);
-                    sink.i32_const(alloc_array_fn_ptr as i32);
-                    sink.call_indirect(0, base + 5);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    sink.end();
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else if let (Some(base), Some((total_size, length, na))) =
-                    (residual_type_base, inline_nursery_total)
-                {
-                    let bump_size = match batch_role {
-                        Some(NurseryBatchRole::Leader { batch_total }) => *batch_total,
-                        _ => total_size,
-                    };
-                    // free = *nursery_free; new_free = free + bump
-                    sink.i32_const(na.free_addr as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.local_tee(alloc_scratch_local);
-                    sink.i32_const(bump_size as i32);
-                    sink.i32_add();
-                    // The sum is the committed `nursery_free`, so keep it
-                    // rather than adding it again on the arm that takes it.
-                    sink.local_tee(alloc_size_local);
-                    sink.i32_const(na.top_addr as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i32_gt_u();
-                    sink.if_(BlockType::Result(ValType::I64));
-                    // Slow: collecting helper; reload the other live Refs from
-                    // their (forwarded) homes — only here, the fast bump moves
-                    // nothing.
-                    sink.i64_const(type_id);
-                    sink.i64_const(base_size);
-                    sink.i64_const(item_size);
-                    sink.i64_const(length as i64);
-                    sink.i64_const(len_offset);
-                    sink.i32_const(alloc_array_fn_ptr as i32);
-                    sink.call_indirect(0, base + 5);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
-                        sink.i32_const(0);
-                        sink.local_set(alloc_batch_flag_local);
-                    }
-                    sink.else_();
-                    // Commit: *nursery_free = free + bump.
-                    sink.i32_const(na.free_addr as i32);
-                    sink.local_get(alloc_size_local);
-                    sink.i32_store(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    // Header word: `GcHeader::new(tid)` — flags 0.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i64_const(type_id);
-                    sink.i64_store(MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                    // Length field (usize, 4 bytes on wasm32) at
-                    // `payload + len_offset`.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(length as i32);
-                    sink.i32_store(MemArg {
-                        offset: majit_gc::header::GcHeader::SIZE as u64 + len_offset as u64,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    if matches!(batch_role, Some(NurseryBatchRole::Leader { .. })) {
-                        sink.i32_const(1);
-                        sink.local_set(alloc_batch_flag_local);
-                    }
-                    // Result payload pointer = free + header size.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i64_extend_i32_u();
-                    sink.end();
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else if let (Some(base), Some((max_len, base_total, item_size, na))) =
-                    (residual_type_base, inline_nursery_varsize)
-                {
-                    // malloc_cond_varsize: negative lengths compare greater in
-                    // the unsigned precheck and go to the collecting slow path.
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_const(max_len);
-                    sink.i64_gt_u();
-                    sink.if_(BlockType::Result(ValType::I64));
-                    sink.i64_const(type_id);
-                    sink.i64_const(base_size);
-                    sink.i64_const(item_size);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_const(len_offset);
-                    sink.i32_const(alloc_array_fn_ptr as i32);
-                    sink.call_indirect(0, base + 5);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    sink.else_();
-                    // total = round_up_8(max(header + base + item * length,
-                    // MIN_NURSERY_OBJ_SIZE)).
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_const(item_size);
-                    sink.i64_mul();
-                    sink.i64_const(base_total);
-                    sink.i64_add();
-                    sink.i32_wrap_i64();
-                    sink.local_set(alloc_size_local);
-                    sink.local_get(alloc_size_local);
-                    sink.i32_const(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE as i32);
-                    sink.i32_lt_u();
-                    sink.if_(BlockType::Result(ValType::I32));
-                    sink.i32_const(majit_gc::header::GcHeader::MIN_NURSERY_OBJ_SIZE as i32);
-                    sink.else_();
-                    sink.local_get(alloc_size_local);
-                    sink.end();
-                    sink.i32_const(7);
-                    sink.i32_add();
-                    sink.i32_const(-8);
-                    sink.i32_and();
-                    sink.local_set(alloc_size_local);
-
-                    // free = *nursery_free; new_free = free + total
-                    sink.i32_const(na.free_addr as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.local_tee(alloc_scratch_local);
-                    sink.local_get(alloc_size_local);
-                    sink.i32_add();
-                    sink.local_tee(alloc_size_local);
-                    sink.i32_const(na.top_addr as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i32_gt_u();
-                    sink.if_(BlockType::Result(ValType::I64));
-                    sink.i64_const(type_id);
-                    sink.i64_const(base_size);
-                    sink.i64_const(item_size);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_const(len_offset);
-                    sink.i32_const(alloc_array_fn_ptr as i32);
-                    sink.call_indirect(0, base + 5);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        (!OpRef::raw_is_constant(vi)).then_some(vi),
-                        frame,
-                    );
-                    sink.else_();
-                    // Commit: *nursery_free = new_free.
-                    sink.i32_const(na.free_addr as i32);
-                    sink.local_get(alloc_size_local);
-                    sink.i32_store(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    // Header word: `GcHeader::new(tid)` — flags 0.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i64_const(type_id);
-                    sink.i64_store(MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    });
-                    // Length field (usize, 4 bytes on wasm32) at
-                    // `payload + len_offset`.
-                    sink.local_get(alloc_scratch_local);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i32_wrap_i64();
-                    sink.i32_store(MemArg {
-                        offset: majit_gc::header::GcHeader::SIZE as u64 + len_offset as u64,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    // Result payload pointer = free + header size.
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(majit_gc::header::GcHeader::SIZE as i32);
-                    sink.i32_add();
-                    sink.i64_extend_i32_u();
-                    sink.end();
-                    sink.end();
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else if let Some(base) = residual_type_base {
-                    // Direct in-module allocation, like the `New` arm:
-                    // `wasm_jit_alloc_array(type_id, base_size, item_size,
-                    // length, len_offset)` is a `(i64×5)->i64` table entry.
-                    sink.i64_const(type_id);
-                    sink.i64_const(base_size);
-                    sink.i64_const(item_size);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_const(len_offset);
-                    sink.i32_const(alloc_array_fn_ptr as i32);
-                    sink.call_indirect(0, base + 5);
-                    if !OpRef::raw_is_constant(vi) {
-                        sink.local_set(value_types.local(vi));
-                    } else {
-                        sink.drop();
-                    }
-                } else {
-                    let jit_call =
-                        jit_call_idx.expect("NewArray op present but jit_call not imported");
-                    // func_ptr = wasm_jit_alloc_array
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(alloc_array_fn_ptr);
-                    sink.i64_store(mem64(STATIC_CALL_FUNC_OFS));
-                    // num_args = 5
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(5);
-                    sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
-                    // arg0 = type_id
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(type_id);
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
-                    // arg1 = base_size
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(base_size);
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + SLOT_SIZE));
-                    // arg2 = item_size
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(item_size);
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + 2 * SLOT_SIZE));
-                    // arg3 = length (op.arg(0))
-                    emit_call_area_addr(&mut sink);
-                    emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + 3 * SLOT_SIZE));
-                    // arg4 = len_offset
-                    emit_call_area_addr(&mut sink);
-                    sink.i64_const(len_offset);
-                    sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + 4 * SLOT_SIZE));
-                    // call trampoline
-                    emit_jit_call(&mut sink, jit_call);
-
-                    if !OpRef::raw_is_constant(vi) {
-                        emit_call_area_addr(&mut sink);
-                        sink.i64_load(mem64(STATIC_CALL_RESULT_OFS));
-                        sink.local_set(value_types.local(vi));
-                    }
-                }
-                // The check `rewrite.py` `_gen_call_malloc_gc` puts after a
-                // collecting malloc. Here the helper writes the length field
-                // itself, so the NULL escapes into the following item stores
-                // rather than into a store this arm emits.
-                emit_memory_error_check(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    op.pos().get(),
-                    residual_type_base,
-                    ca.ca_reload_fn_ptr,
-                    ca.jf_top_addr,
-                );
-                // `wasm_jit_alloc_array` collects; reload other live Refs. The
-                // inline-bump paths already emitted this inside their slow arms.
-                if residual_type_base.is_none()
-                    || (inline_nursery_total.is_none() && inline_nursery_varsize.is_none())
-                {
-                    let skip = (!OpRef::raw_is_constant(vi)).then_some(vi);
-                    emit_reload_frame_if_necessary(
-                        &mut sink,
-                        residual_type_base,
-                        ca.ca_reload_fn_ptr,
-                        ca.jf_top_addr,
-                    );
-                    emit_reload_refs_from_homes(
-                        &mut sink,
-                        value_types,
-                        ref_homes,
-                        &liveness,
-                        op_idx,
-                        skip,
-                        frame,
-                    );
-                }
-                // rewrite.py `handle_clear_array_contents` / `emit_pending_zeros`.
-                if !OpRef::raw_is_constant(vi) {
-                    emit_zero_array_plan(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        vi,
-                        base_size,
-                        item_size,
-                        op.arg(0).to_opref(),
-                        &zero_plan,
-                    );
-                }
-                // rewrite.py `gen_malloc_nursery` remembers a const-length
-                // nursery array. `gen_malloc_nursery_varsize` does not —
-                // the array may be large and card-marked.
-                if inline_nursery_total.is_some() {
-                    remember_nursery_wb(&mut wb_applied, op.pos().get(), &same_as_forwardings);
-                }
             }
 
             // ── Misc ──
@@ -12876,13 +11353,13 @@ fn emit_memory_error_on_truthy(
     if crate::failguard::exit_frame_with_exception_attached() {
         emit_reload_frame_if_necessary(sink, residual_type_base, ca_reload_fn_ptr, jf_top_addr);
         sink.local_get(0);
-        sink.i32_const(crate::jit_exc_value_addr() as i32);
+        sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
         sink.i64_load(mem64(0));
         sink.i64_store(mem64(FRAME_SLOT_BASE));
-        sink.i32_const(crate::jit_exc_value_addr() as i32);
+        sink.i32_const(runtime_addr(crate::jit_exc_value_addr));
         sink.i64_const(0);
         sink.i64_store(mem64(0));
-        sink.i32_const(crate::jit_exc_type_addr() as i32);
+        sink.i32_const(runtime_addr(crate::jit_exc_type_addr));
         sink.i64_const(0);
         sink.i64_store(mem64(0));
         sink.local_get(0);
