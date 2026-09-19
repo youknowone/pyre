@@ -93,17 +93,14 @@ parking_lot = { workspace = true }
 libffi = { version = "5", features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]
-# Remaining Windows FFI host_env does not wrap 1:1 (WinSock, Bluetooth,
-# IpHelper, SEH). crypt32 store readers are `cert_store` when host_env
-# is on. `EXCEPTION_CONTINUE_SEARCH` for the `faulthandler` vectored
-# exception handler lives in pyre-module.
+# Remaining Windows FFI host_env does not wrap 1:1 (WinSock types, SEH).
+# crypt32 store readers are `cert_store` when host_env is on.
+# `EXCEPTION_CONTINUE_SEARCH` for the `faulthandler` vectored exception
+# handler lives in pyre-module.
 # Kept on the same 0.61 line rustpython-host_env's nt module resolves to, so
 # HANDLE types match at the boundary.
 windows-sys = { version = "0.61", features = [
-    "Win32_Devices_Bluetooth",
     "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Cryptography",

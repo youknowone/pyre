@@ -12,6 +12,8 @@
 /// API.
 #[cfg(any(unix, windows))]
 use super::rsocket_rffi as rffi;
+#[cfg(windows)]
+use rustpython_host_env::socket as host_socket;
 /// The same names again where there is no host layer to reach them through:
 /// the four address converters are arithmetic over the spelling, so they are
 /// written out rather than called, and the entry points below cannot tell.
@@ -740,7 +742,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
-        use windows_sys::Win32::Devices::Bluetooth as bt;
         // ── Address families ──
         cst!("AF_UNSPEC", ws::AF_UNSPEC);
         cst!("AF_INET", ws::AF_INET);
@@ -751,10 +752,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         cst!("AF_LINK", ws::AF_LINK);
         // `socketmodule.c:PyInit__socket` publishes the address families the
         // 3.14 Windows SDK exposes in addition to PyPy's older MSVC census.
-        cst!("AF_SNA", 11);
-        cst!("AF_IRDA", 26);
-        cst!("AF_BLUETOOTH", bt::AF_BTH);
-        cst!("AF_HYPERV", ws::AF_HYPERV);
+        cst!("AF_SNA", host_socket::AF_SNA);
+        cst!("AF_IRDA", host_socket::AF_IRDA);
+        cst!("AF_BLUETOOTH", host_socket::AF_BLUETOOTH);
+        cst!("AF_HYPERV", host_socket::AF_HYPERV);
         // ── Socket types ──
         cst!("SOCK_STREAM", ws::SOCK_STREAM);
         cst!("SOCK_DGRAM", ws::SOCK_DGRAM);
@@ -838,7 +839,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // Bluetooth/RFCOMM constants.  The option names are unsigned SDK
         // words but `PyModule_AddIntConstant` exposes their signed C-long
         // readings on Windows.
-        cst!("BTPROTO_RFCOMM", bt::BTHPROTO_RFCOMM);
+        cst!("BTPROTO_RFCOMM", host_socket::BTHPROTO_RFCOMM);
         cst!("SOL_RFCOMM", 3);
         cst!("SO_BTH_ENCRYPT", 2);
         cst!("SO_BTH_MTU", 0x80000007u32 as i32);
@@ -854,7 +855,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // `SIO_TCP_SET_ACK_FREQUENCY` - the name `socketmodule.c` gives this
         // option on Windows.  It is an ioctl code, not an option number, which
         // is why `setsockopt` and `getsockopt` both special-case it.
-        cst!("TCP_QUICKACK", ws::SIO_TCP_SET_ACK_FREQUENCY as i32);
+        cst!("TCP_QUICKACK", host_socket::SIO_TCP_SET_ACK_FREQUENCY);
         // ── IP-level ──
         cst!("IP_TTL", ws::IP_TTL);
         cst!("IP_TOS", ws::IP_TOS);
@@ -949,20 +950,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         cst!("RCVALL_MAX", 3);
         // Hyper-V socket ABI constants (`hvsocket.h`).  GUIDs and Bluetooth
         // addresses are public strings rather than integer enum members.
-        cst!("HV_PROTOCOL_RAW", 1);
-        cst!("HVSOCKET_CONNECT_TIMEOUT", 1);
-        cst!("HVSOCKET_CONNECTED_SUSPEND", 4);
-        cst!("HVSOCKET_CONNECT_TIMEOUT_MAX", 300_000);
-        cst!("HVSOCKET_ADDRESS_FLAG_PASSTHRU", 1);
+        cst!("HV_PROTOCOL_RAW", host_socket::HV_PROTOCOL_RAW);
+        cst!("HVSOCKET_CONNECT_TIMEOUT", host_socket::HVSOCKET_CONNECT_TIMEOUT);
+        cst!("HVSOCKET_CONNECTED_SUSPEND", host_socket::HVSOCKET_CONNECTED_SUSPEND);
+        cst!("HVSOCKET_CONNECT_TIMEOUT_MAX", host_socket::HVSOCKET_CONNECT_TIMEOUT_MAX);
+        cst!("HVSOCKET_ADDRESS_FLAG_PASSTHRU", host_socket::HVSOCKET_ADDRESS_FLAG_PASSTHRU);
         for (name, value) in [
             ("BDADDR_ANY", "00:00:00:00:00:00"),
             ("BDADDR_LOCAL", "00:00:00:FF:FF:FF"),
-            ("HV_GUID_ZERO", "00000000-0000-0000-0000-000000000000"),
-            ("HV_GUID_WILDCARD", "00000000-0000-0000-0000-000000000000"),
-            ("HV_GUID_BROADCAST", "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"),
-            ("HV_GUID_CHILDREN", "90DB8B89-0D35-4F79-8CE9-49EA0AC8B7CD"),
-            ("HV_GUID_LOOPBACK", "E0E16197-DD56-4A10-9195-5EE7A155A838"),
-            ("HV_GUID_PARENT", "A42E7CDA-D03F-480C-9CC2-A4DE20ABB878"),
+            ("HV_GUID_ZERO", host_socket::HV_GUID_ZERO),
+            ("HV_GUID_WILDCARD", host_socket::HV_GUID_WILDCARD),
+            ("HV_GUID_BROADCAST", host_socket::HV_GUID_BROADCAST),
+            ("HV_GUID_CHILDREN", host_socket::HV_GUID_CHILDREN),
+            ("HV_GUID_LOOPBACK", host_socket::HV_GUID_LOOPBACK),
+            ("HV_GUID_PARENT", host_socket::HV_GUID_PARENT),
         ] {
             crate::module_ns_store(ns, name, pyre_object::w_str_new(value));
         }
@@ -3170,68 +3171,31 @@ fn socket_get_so_protocol(_fd: rffi::Socket) -> Result<libc::c_int, crate::PyErr
 #[cfg(unix)]
 const SUN_PATH_OFFSET: usize = core::mem::offset_of!(libc::sockaddr_un, sun_path);
 
-/// `NDIS_IF_MAX_STRING_SIZE` (`ifdef.h`) — the room
-/// `ConvertInterfaceLuidToNameW` is given for a name.
-#[cfg(all(windows, feature = "host_env"))]
-const NDIS_IF_MAX_STRING_SIZE: usize = 255;
-
-/// The Windows arm of `socket_if_nameindex`: `GetIfTable2Ex` for the table,
-/// then `ConvertInterfaceLuidToNameW` per row, appended to a list built empty.
-///
-/// `rustpython_host_env::socket::if_nameindex` walks the same table but hands
-/// each name back through `String::from_utf16_lossy`, which spends an unpaired
-/// surrogate on U+FFFD; `Py_BuildValue("Iu", ...)` keeps what the call wrote,
-/// so the wide buffer is read as WTF-8 here instead.
+/// The Windows arm of `socket_if_nameindex`: host_env walks `GetIfTable2Ex`
+/// and `ConvertInterfaceLuidToNameW`, and hands each name back as WTF-8.
 #[cfg(all(windows, feature = "host_env"))]
 fn windows_if_nameindex() -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    use windows_sys::Win32::Foundation::NO_ERROR;
-    use windows_sys::Win32::NetworkManagement::IpHelper as ip;
-
-    // Both calls answer with a status of their own instead of setting the last
-    // error, and that status is the one reported.
-    let win32 = |status| interface_io_error(std::io::Error::from_raw_os_error(status as i32));
-
-    let mut table: *mut ip::MIB_IF_TABLE2 = core::ptr::null_mut();
-    let status = unsafe { ip::GetIfTable2Ex(ip::MibIfTableRaw, &mut table) };
-    if status != NO_ERROR {
-        return Err(win32(status));
-    }
+    let interfaces =
+        rustpython_host_env::socket::if_nameindex().map_err(interface_io_error)?;
     // The list is built empty and appended to, so no freshly boxed row waits
     // in a plain vector while the next allocation runs.
     let _roots = pyre_object::gc_roots::push_roots();
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new_empty());
-    let outcome = (|| {
-        for index in 0..unsafe { (*table).NumEntries } as usize {
-            let row = unsafe { &*(*table).Table.as_ptr().add(index) };
-            let mut name = [0u16; NDIS_IF_MAX_STRING_SIZE + 1];
-            let status = unsafe {
-                ip::ConvertInterfaceLuidToNameW(&row.InterfaceLuid, name.as_mut_ptr(), name.len())
-            };
-            if status != NO_ERROR {
-                return Err(win32(status));
-            }
-            let end = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
-            let entry = {
-                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(pyre_object::w_int_new(i64::from(row.InterfaceIndex)));
-                fields.push(pyre_object::w_str_from_wtf8_managed(
-                    rustpython_wtf8::Wtf8Buf::from_wide(&name[..end]),
-                ));
-                pyre_object::w_tuple_new(fields.take())
-            };
-            unsafe {
-                pyre_object::listobject::w_list_append(
-                    pyre_object::gc_roots::shadow_stack_get(list_slot),
-                    entry,
-                )
-            };
-        }
-        Ok(())
-    })();
-    // `FreeMibTable` runs whichever way the walk ended, as it does there.
-    unsafe { ip::FreeMibTable(table.cast()) };
-    outcome?;
+    for (index, name) in interfaces {
+        let entry = {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(pyre_object::w_int_new(i64::from(index)));
+            fields.push(pyre_object::w_str_from_wtf8_managed(name));
+            pyre_object::w_tuple_new(fields.take())
+        };
+        unsafe {
+            pyre_object::listobject::w_list_append(
+                pyre_object::gc_roots::shadow_stack_get(list_slot),
+                entry,
+            )
+        };
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(list_slot))
 }
 
@@ -3310,68 +3274,19 @@ fn ioctl_keepalive_w(obj: pyre_object::PyObjectRef) -> Result<[u32; 3], crate::P
     Ok(values)
 }
 
-/// One `%X` conversion of the scan `setbdaddr` runs: blanks, an optional sign,
-/// an optional `0x` prefix, then hex digits accumulated into the `unsigned
-/// int` the C code declares.  Answers the value and what is left to read.
+/// Write a packed address form into `sockaddr_storage` by size, so a packed
+/// layout whose payload is not aligned (RFCOMM's `BTH_ADDR` at offset 2) is
+/// still stored byte-for-byte.
 #[cfg(windows)]
-fn scan_hex_field(text: &str) -> Option<(u32, &str)> {
-    let text = text.trim_start_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}']);
-    let (negative, text) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
-    };
-    // A `0x` counts as a prefix only when a hex digit follows: otherwise the
-    // conversion stops after the `0` and leaves the `x` to be read.
-    let digits = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(rest) if rest.starts_with(|c: char| c.is_ascii_hexdigit()) => rest,
-        _ => text,
-    };
-    let mut value: u32 = 0;
-    let mut end = 0;
-    for digit in digits.bytes().take_while(u8::is_ascii_hexdigit) {
-        let digit = char::from(digit).to_digit(16).expect("hex digit");
-        value = value.wrapping_mul(16).wrapping_add(digit);
-        end += 1;
+fn write_sockaddr<T>(storage: &mut rffi::sockaddr_storage, value: T) -> rffi::SockLen {
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::from_ref(&value).cast::<u8>(),
+            core::ptr::from_mut(storage).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        );
     }
-    if end == 0 {
-        return None;
-    }
-    Some((if negative { value.wrapping_neg() } else { value }, &digits[end..]))
-}
-
-/// `setbdaddr` — six `%X` fields with a colon between each pair, every one of
-/// them below 256, and a trailing `%c` that makes anything after the sixth a
-/// seventh conversion and so a failure.  The leading field is the most
-/// significant octet, and `BTH_ADDR` carries the six as one number.
-#[cfg(windows)]
-fn parse_bdaddr(name: &str) -> Option<u64> {
-    let mut rest = name;
-    let mut octets = [0u32; 6];
-    for (i, octet) in octets.iter_mut().enumerate() {
-        if i > 0 {
-            rest = rest.strip_prefix(':')?;
-        }
-        (*octet, rest) = scan_hex_field(rest)?;
-    }
-    if !rest.is_empty() || octets.iter().fold(0, |acc, octet| acc | octet) >= 256 {
-        return None;
-    }
-    Some(octets.iter().fold(0u64, |acc, &octet| (acc << 8) | u64::from(octet)))
-}
-
-/// `makebdaddr` — `XX:XX:XX:XX:XX:XX`, most significant octet first.
-#[cfg(windows)]
-fn bdaddr_string(bdaddr: u64) -> String {
-    let octet = |i: u32| (bdaddr >> (8 * i)) & 0xFF;
-    format!(
-        "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-        octet(5),
-        octet(4),
-        octet(3),
-        octet(2),
-        octet(1),
-        octet(0)
-    )
+    core::mem::size_of::<T>() as rffi::SockLen
 }
 
 /// The `AF_BLUETOOTH` case of `getsockaddrarg` (`socketmodule.c:2104-2205`).
@@ -3384,9 +3299,7 @@ fn pack_bluetooth_addr(
     addr: pyre_object::PyObjectRef,
     storage: &mut rffi::sockaddr_storage,
 ) -> Result<rffi::SockLen, crate::PyError> {
-    use windows_sys::Win32::Devices::Bluetooth as bt;
-
-    if proto != bt::BTHPROTO_RFCOMM as libc::c_int {
+    if proto != host_socket::BTHPROTO_RFCOMM as libc::c_int {
         return Err(crate::PyError::os_error(format!(
             "{caller}(): unknown Bluetooth protocol"
         )));
@@ -3407,51 +3320,26 @@ fn pack_bluetooth_addr(
     if name.contains('\0') {
         return Err(wrong_format());
     }
-    let bd_addr = parse_bdaddr(name).ok_or_else(|| crate::PyError::os_error("bad bluetooth address"))?;
-    let bth = bt::SOCKADDR_BTH {
-        addressFamily: bt::AF_BTH,
-        btAddr: bd_addr,
-        serviceClassId: Default::default(),
-        // `k` keeps the low `ULONG` of whatever it is handed rather than
-        // reporting an overflow.
-        port: (unsafe { pyre_object::w_int_get_value(w_channel) }) as u32,
-    };
-    // `SOCKADDR_BTH` is packed, so its `BTH_ADDR` sits two bytes into the
-    // storage and no aligned write reaches it.
-    unsafe { core::ptr::write_unaligned(storage as *mut _ as *mut bt::SOCKADDR_BTH, bth) };
-    Ok(core::mem::size_of::<bt::SOCKADDR_BTH>() as rffi::SockLen)
+    let bd_addr = host_socket::parse_bdaddr(name)
+        .ok_or_else(|| crate::PyError::os_error("bad bluetooth address"))?;
+    // `k` keeps the low `ULONG` of whatever it is handed rather than
+    // reporting an overflow.
+    let port = (unsafe { pyre_object::w_int_get_value(w_channel) }) as u32;
+    Ok(write_sockaddr(
+        storage,
+        host_socket::sockaddr_bth_rfcomm(bd_addr, port),
+    ))
 }
 
 /// The RFCOMM case of `makesockaddr` (`socketmodule.c:1546-1560`) — the address
 /// as a string beside the channel, the shape `bind` and `connect` take back.
 #[cfg(windows)]
 fn unpack_bluetooth_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObjectRef {
-    use windows_sys::Win32::Devices::Bluetooth as bt;
-
-    let bth: bt::SOCKADDR_BTH =
-        unsafe { core::ptr::read_unaligned(storage as *const _ as *const bt::SOCKADDR_BTH) };
+    let (bdaddr, port) = host_socket::unpack_sockaddr_bth(core::ptr::from_ref(storage).cast());
     let mut fields = pyre_object::gc_roots::RootedItems::new();
-    fields.push(pyre_object::w_str_new_managed(&bdaddr_string(bth.btAddr)));
-    fields.push(pyre_object::w_int_new(i64::from(bth.port)));
+    fields.push(pyre_object::w_str_new_managed(&host_socket::format_bdaddr(bdaddr)));
+    fields.push(pyre_object::w_int_new(i64::from(port)));
     pyre_object::w_tuple_new(fields.take())
-}
-
-/// `HV_PROTOCOL_RAW` — the only protocol an `AF_HYPERV` socket is opened with.
-/// `hvsocket.h` defines it; `windows-sys` does not carry that header.
-#[cfg(windows)]
-const HV_PROTOCOL_RAW: libc::c_int = 1;
-
-/// `SOCKADDR_HV` (`hvsocket.h`): the family, a reserved word, and the two
-/// GUIDs a Hyper-V endpoint is named by.  36 bytes, so it fits a
-/// `sockaddr_storage` like every other form here.
-#[cfg(windows)]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SockaddrHv {
-    family: u16,
-    reserved: u16,
-    vm_id: windows_sys::core::GUID,
-    service_id: windows_sys::core::GUID,
 }
 
 /// The single message `PyArg_ParseTuple(args, "UU;...")` produces for every
@@ -3461,33 +3349,11 @@ fn hyperv_address_shape_error() -> crate::PyError {
     crate::PyError::type_error("AF_HYPERV address must be a str tuple (vm_id, service_id)")
 }
 
-/// `UuidFromStringW`, which takes the bare 8-4-4-4-12 spelling and nothing
-/// else: a braced or truncated GUID is rejected here rather than reinterpreted.
 #[cfg(windows)]
-fn parse_hyperv_guid(
-    caller: &str,
-    field: &str,
-    w_text: pyre_object::PyObjectRef,
-) -> Result<windows_sys::core::GUID, crate::PyError> {
-    let units: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_text) }
-        .encode_wide()
-        .collect();
-    let wide = widestring::WideCString::from_vec(units).map_err(|_| {
-        crate::PyError::value_error(format!(
-            "{caller}(): AF_HYPERV address {field} is not a valid UUID string"
-        ))
-    })?;
-    rustpython_host_env::socket::uuid_from_string_w(&wide).map_err(|_| {
-        crate::PyError::value_error(format!(
-            "{caller}(): AF_HYPERV address {field} is not a valid UUID string"
-        ))
-    })
-}
-
-/// The spelling `UuidToStringW` gives a GUID: lower case, unbraced.
-#[cfg(windows)]
-fn hyperv_guid_string(guid: &windows_sys::core::GUID) -> String {
-    rustpython_host_env::socket::uuid_to_string_w(guid).unwrap_or_default()
+fn hyperv_guid_parse_error(caller: &str, field: &str) -> crate::PyError {
+    crate::PyError::value_error(format!(
+        "{caller}(): AF_HYPERV address {field} is not a valid UUID string"
+    ))
 }
 
 /// The `AF_HYPERV` case of `getsockaddrarg` (`socketmodule.c:2643-2712`).
@@ -3498,7 +3364,7 @@ fn pack_hyperv_addr(
     addr: pyre_object::PyObjectRef,
     storage: &mut rffi::sockaddr_storage,
 ) -> Result<rffi::SockLen, crate::PyError> {
-    if proto != HV_PROTOCOL_RAW {
+    if proto != host_socket::HV_PROTOCOL_RAW as libc::c_int {
         return Err(crate::PyError::os_error(format!(
             "{caller}(): unsupported AF_HYPERV protocol: {proto}"
         )));
@@ -3518,27 +3384,31 @@ fn pack_hyperv_addr(
     if !unsafe { pyre_object::is_str(w_vm_id) } || !unsafe { pyre_object::is_str(w_service_id) } {
         return Err(hyperv_address_shape_error());
     }
+    // `UuidFromStringW` takes the bare 8-4-4-4-12 spelling and nothing else:
+    // a braced or truncated GUID is rejected here rather than reinterpreted.
     // Both GUIDs are parsed before either is stored: no step here runs Python,
     // so the two lookups above stay valid across the second parse.
-    let vm_id = parse_hyperv_guid(caller, "vm_id", w_vm_id)?;
-    let service_id = parse_hyperv_guid(caller, "service_id", w_service_id)?;
-    let hv = unsafe { &mut *(storage as *mut _ as *mut SockaddrHv) };
-    *hv = SockaddrHv {
-        family: windows_sys::Win32::Networking::WinSock::AF_HYPERV,
-        reserved: 0,
-        vm_id,
-        service_id,
+    let parse = |field: &str, w_text: pyre_object::PyObjectRef| {
+        let units: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_text) }
+            .encode_wide()
+            .collect();
+        let wide = widestring::WideCString::from_vec(units)
+            .map_err(|_| hyperv_guid_parse_error(caller, field))?;
+        host_socket::uuid_from_string_w(&wide).map_err(|_| hyperv_guid_parse_error(caller, field))
     };
-    Ok(core::mem::size_of::<SockaddrHv>() as rffi::SockLen)
+    Ok(write_sockaddr(
+        storage,
+        host_socket::sockaddr_hv(parse("vm_id", w_vm_id)?, parse("service_id", w_service_id)?),
+    ))
 }
 
 /// The `AF_HYPERV` case of `makesockaddr` (`socketmodule.c:1740-1767`) — the
 /// two GUIDs as strings, the same shape `bind` and `connect` accept.
 #[cfg(windows)]
 fn unpack_hyperv_addr(storage: &rffi::sockaddr_storage) -> pyre_object::PyObjectRef {
-    let hv = unsafe { &*(storage as *const _ as *const SockaddrHv) };
-    let vm_id = hyperv_guid_string(&hv.vm_id);
-    let service_id = hyperv_guid_string(&hv.service_id);
+    let hv = unsafe { &*core::ptr::from_ref(storage).cast::<host_socket::SockaddrHv>() };
+    let vm_id = host_socket::uuid_to_string_w(&hv.vm_id).unwrap_or_default();
+    let service_id = host_socket::uuid_to_string_w(&hv.service_id).unwrap_or_default();
     let mut fields = pyre_object::gc_roots::RootedItems::new();
     fields.push(pyre_object::w_str_new_managed(&vm_id));
     fields.push(pyre_object::w_str_new_managed(&service_id));
@@ -3789,13 +3659,13 @@ fn pack_inet_addr(
     }
 
     #[cfg(windows)]
-    if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
+    if family == host_socket::AF_HYPERV as libc::c_int {
         let addrlen = pack_hyperv_addr(caller, proto, addr, &mut storage)?;
         return Ok((storage, addrlen));
     }
 
     #[cfg(windows)]
-    if family == windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int {
+    if family == host_socket::AF_BTH as libc::c_int {
         let addrlen = pack_bluetooth_addr(caller, proto, addr, &mut storage)?;
         return Ok((storage, addrlen));
     }
@@ -4006,11 +3876,11 @@ fn unpack_inet_addr(
             return unpack_unix_addr(storage, addrlen);
         }
         #[cfg(windows)]
-        if family == windows_sys::Win32::Networking::WinSock::AF_HYPERV as libc::c_int {
+        if family == host_socket::AF_HYPERV as libc::c_int {
             return unpack_hyperv_addr(storage);
         }
         #[cfg(windows)]
-        if family == windows_sys::Win32::Devices::Bluetooth::AF_BTH as libc::c_int {
+        if family == host_socket::AF_BTH as libc::c_int {
             return unpack_bluetooth_addr(storage);
         }
         pyre_object::w_tuple_new(vec![])
@@ -5725,7 +5595,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // ioctl code that `setsockopt` itself rejects.  A bytes value is
             // not covered there either and still goes the ordinary way.
             #[cfg(windows)]
-            if name == windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int
+            if name == host_socket::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int
                 && unsafe { pyre_object::is_int(val) }
             {
                 let flag = (unsafe { pyre_object::w_int_get_value(val) }) as libc::c_int;
@@ -5792,7 +5662,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // rather than asking WinSock, which has no call that reads an
                 // ioctl's current setting.
                 #[cfg(windows)]
-                if name == windows_sys::Win32::Networking::WinSock::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int {
+                if name == host_socket::SIO_TCP_SET_ACK_FREQUENCY as libc::c_int {
                     return Ok(pyre_object::w_int_new(socket_get_attr_i64(
                         args[0],
                         "_quickack",
@@ -5846,7 +5716,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         ns,
         "ioctl",
         crate::make_builtin_function("ioctl", |args| {
-            use windows_sys::Win32::Networking::WinSock as ws;
+            #[cfg(feature = "host_env")]
+            use rustpython_host_env::socket::{
+                SIO_KEEPALIVE_VALS, SIO_LOOPBACK_FAST_PATH, SIO_RCVALL,
+            };
+            #[cfg(not(feature = "host_env"))]
+            use windows_sys::Win32::Networking::WinSock::{
+                SIO_KEEPALIVE_VALS, SIO_LOOPBACK_FAST_PATH, SIO_RCVALL,
+            };
 
             if args.len() != 3 {
                 return Err(crate::PyError::type_error(format!(
@@ -5857,7 +5734,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(args[0])?;
             let cmd = ioctl_command_w(args[1], "argument 1")?;
             let returned = match cmd {
-                ws::SIO_RCVALL | ws::SIO_LOOPBACK_FAST_PATH => {
+                SIO_RCVALL | SIO_LOOPBACK_FAST_PATH => {
                     let value = masked_ulong_w(args[2])?;
                     #[cfg(feature = "host_env")]
                     {
@@ -5869,7 +5746,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         None
                     }
                 }
-                ws::SIO_KEEPALIVE_VALS => {
+                SIO_KEEPALIVE_VALS => {
                     let [onoff, keepalivetime, keepaliveinterval] = ioctl_keepalive_w(args[2])?;
                     #[cfg(feature = "host_env")]
                     {
