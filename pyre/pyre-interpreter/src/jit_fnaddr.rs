@@ -3276,6 +3276,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa2(
         &mut entries,
+        "pyre_object::unicodeobject::jit_str_startswith",
+        "pyre_object::jit_str_startswith",
+        pyre_object::unicodeobject::jit_str_startswith,
+    );
+    cpa2(
+        &mut entries,
+        "pyre_object::unicodeobject::jit_str_endswith",
+        "pyre_object::jit_str_endswith",
+        pyre_object::unicodeobject::jit_str_endswith,
+    );
+    cpa2(
+        &mut entries,
         "pyre_object::bytesobject::jit_bytes_contains",
         "pyre_object::jit_bytes_contains",
         pyre_object::bytesobject::jit_bytes_contains,
@@ -5885,21 +5897,40 @@ mod tests {
             str_contains
         );
         assert_eq!(bindings["pyre_object::jit_str_contains"], str_contains);
+        let startswith =
+            pyre_object::unicodeobject::jit_str_startswith as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::unicodeobject::jit_str_startswith"],
+            startswith
+        );
+        assert_eq!(bindings["pyre_object::jit_str_startswith"], startswith);
+        let endswith = pyre_object::unicodeobject::jit_str_endswith as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::unicodeobject::jit_str_endswith"],
+            endswith
+        );
+        assert_eq!(bindings["pyre_object::jit_str_endswith"], endswith);
         let bytes_contains =
             pyre_object::bytesobject::jit_bytes_contains as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_object::bytesobject::jit_bytes_contains"],
             bytes_contains
         );
+        assert_eq!(bindings["pyre_object::jit_bytes_contains"], bytes_contains);
         let bytes_byte =
             pyre_object::bytesobject::jit_bytes_contains_byte as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_object::bytesobject::jit_bytes_contains_byte"],
             bytes_byte
         );
+        assert_eq!(bindings["pyre_object::jit_bytes_contains_byte"], bytes_byte);
         let list_int = crate::listobject::jit_list_contains_int as *const () as usize as i64;
         assert_eq!(
             bindings["pyre_interpreter::listobject::jit_list_contains_int"],
+            list_int
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::jit_list_contains_int"],
             list_int
         );
     }

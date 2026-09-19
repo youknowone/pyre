@@ -21406,6 +21406,12 @@ fn contains_str(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyEr
 fn contains_bytes_like(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyError> {
     use pyre_object::*;
     unsafe {
+        if is_bytes(haystack) && is_bytes(needle) {
+            return Ok(pyre_object::bytesobject::jit_bytes_contains(
+                haystack as i64,
+                needle as i64,
+            ) != 0);
+        }
         let receiver = simple_buffer_bytes(haystack)?
             .expect("bytes/bytearray receiver always exports a buffer");
         let result = if is_int(needle) || is_long(needle) {
@@ -21424,16 +21430,11 @@ fn contains_bytes_like(haystack: PyObjectRef, needle: PyObjectRef) -> Result<boo
         } else {
             match simple_buffer_bytes(needle) {
                 Ok(Some(sub)) => {
-                    let value = if is_bytes(haystack) && is_bytes(needle) {
-                        pyre_object::bytesobject::jit_bytes_contains(haystack as i64, needle as i64)
-                            != 0
-                    } else {
-                        sub.as_bytes().is_empty()
-                            || receiver
-                                .as_bytes()
-                                .windows(sub.as_bytes().len())
-                                .any(|window| window == sub.as_bytes())
-                    };
+                    let value = sub.as_bytes().is_empty()
+                        || receiver
+                            .as_bytes()
+                            .windows(sub.as_bytes().len())
+                            .any(|window| window == sub.as_bytes());
                     sub.release();
                     Ok(value)
                 }
@@ -21488,7 +21489,10 @@ fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
             && pyre_object::listobject::is_plain_int1(needle)
             && pyre_object::is_int(needle)
     } {
-        return crate::listobject::contains_int_list_locked(haystack, needle);
+        // Call the registered residual, not `contains_int_list_locked`.
+        // That helper is `dont_look_inside` and returns `Result`, so the
+        // codewriter has no word-ABI target for it; descent would decline.
+        return Ok(crate::listobject::jit_list_contains_int(haystack as i64, needle as i64) != 0);
     }
     Ok(matches!(
         crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false)?,

@@ -22778,7 +22778,10 @@ fn walker_str_pair_operands<Sym: WalkSym>(
 /// Admission for `COMPARE_OP_DESCENT` on tags 6/7.  Same job as the
 /// exact-numeric gate on tags 0..=5: do not start a sub-walk whose body
 /// can run Python (`__hash__` / `__eq__` / a subclass `__contains__`).
-/// A declining residual would re-run those side effects.
+/// A declining residual would re-run those side effects.  This is not
+/// a type-specialization fold: it is the callback-free gate the other
+/// compare-op descent already uses.  Removing it would re-run a stored
+/// `__eq__` when the sub-walk then declines.
 ///
 /// Exact `str`/`bytes` plus a needle whose membership is an elidable
 /// find (another exact `str`/`bytes`, or a byte in `range(256)`), and
