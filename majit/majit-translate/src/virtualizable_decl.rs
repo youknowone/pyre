@@ -26,7 +26,6 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use crate::codewriter::call::names_same_type;
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::model::{ConstValue, HostObject};
 
@@ -124,9 +123,17 @@ fn lookup<'a>(
     if let Some(fields) = registered.get(class_key) {
         return Some(fields);
     }
-    let mut matches = registered
-        .iter()
-        .filter(|(key, _)| names_same_type(class_key, key));
+    // Directional, not `names_same_type`: a QUALIFIED lookup key may resolve a
+    // shorter registered one, because the suffix is then the same type seen
+    // without its path. The reverse is not true -- a bare `Frame` host key
+    // suffix-matches a registered `a::Frame` that names a different class, and
+    // resolving it would stamp `_virtualizable_` onto an unrelated one and
+    // send it down the virtualizable lowering.
+    let mut matches = registered.iter().filter(|(key, _)| {
+        class_key
+            .strip_suffix(key.as_str())
+            .is_some_and(|prefix| prefix.ends_with("::"))
+    });
     match (matches.next(), matches.next()) {
         (None, _) => None,
         (Some((_, fields)), None) => Some(fields),
@@ -142,6 +149,19 @@ fn lookup<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare host key must not pick up a QUALIFIED registration: the two
+    /// share a last segment and nothing else, and resolving it would stamp
+    /// `_virtualizable_` onto a class that never declared it.
+    #[test]
+    fn a_bare_class_key_does_not_resolve_a_qualified_registration() {
+        let mut registered = HashMap::new();
+        registered.insert("a::Frame".to_string(), vec!["pc".to_string()]);
+        assert!(lookup(&registered, "Frame").is_none());
+        // The direction that IS a resolution: a qualified key naming the same
+        // type as a registered shorter one.
+        assert!(lookup(&registered, "x::a::Frame").is_some());
+    }
 
     #[test]
     fn stamp_host_virtualizable_writes_the_declared_list() {
