@@ -23571,6 +23571,17 @@ fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// — PyPy: `_frozen_importlib/interp_import.py:interp___import__`.
 fn builtin_dunder_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // Keyword / wrong-arity gateway.  Hidden so a red `args.len()` on
+    // `__majit_wrap_builtin_dunder_import` does not drag `bind_builtin_kwargs`
+    // (`format!`, `Vec`, filter closures) into the look-inside body after
+    // an effect — that was the `__majit_stringbuilder_new` decline.
+    builtin_dunder_import_keyword(args)
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn builtin_dunder_import_keyword(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     // `__import__(name, globals, locals, fromlist, level)` — PyPy's gateway
     // binds the five named slots before the import runs.  Use the shared
     // flat-ABI equivalent so duplicate positional/keyword values, unknown
@@ -23596,8 +23607,54 @@ fn import_bound_objects(
     level_obj: PyObjectRef,
 ) -> Result<PyObjectRef, crate::PyError> {
     if !unsafe { pyre_object::is_str(name_obj) } {
-        return Err(crate::PyError::type_error("module name must be a string"));
+        return Err(module_name_must_be_string());
     }
+    // `interp___import__` after `@unwrap_spec(level=int)`: an omitted or
+    // exact-int level does not run `__index__`, so nothing here collects
+    // and the fast path must not pin (a pin is an effect in front of
+    // `_gcd_import`).
+    if level_obj.is_null() || unsafe { pyre_object::is_int(level_obj) } {
+        let level = if level_obj.is_null() {
+            0
+        } else {
+            unsafe { pyre_object::w_int_get_value(level_obj) }
+        };
+        let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
+            return crate::importing::dunder_import_name_obj(
+                name_obj, w_globals, w_locals, w_fromlist, level,
+            );
+        };
+        return crate::importing::dunder_import_w(
+            name,
+            name_obj,
+            w_globals,
+            w_locals,
+            w_fromlist,
+            level,
+            crate::call::getexecutioncontext(),
+        );
+    }
+    import_bound_objects_index_level(name_obj, w_globals, w_locals, w_fromlist, level_obj)
+}
+
+/// TypeError for a non-str module name.  The message is a `Wtf8Buf` ctor
+/// (`__majit_stringbuilder_new`); keep it off the look-inside graph.
+#[majit_macros::dont_look_inside]
+pub(crate) fn module_name_must_be_string() -> crate::PyError {
+    crate::PyError::type_error("module name must be a string")
+}
+
+/// `@unwrap_spec(level=int)` miss: run `__index__` and pin across it.
+/// Hidden so a red `is_int` does not drag `push_roots` / pin closures into
+/// the `__import__` look-inside body.
+#[majit_macros::dont_look_inside]
+pub(crate) fn import_bound_objects_index_level(
+    name_obj: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level_obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
     // Keep the wrapped name live across `level.__index__`: the precise
     // collector can relocate a young string while the index protocol runs.
     let _name_roots = pyre_object::gc_roots::push_roots();
@@ -23606,21 +23663,27 @@ fn import_bound_objects(
     // The other three bound arguments outlive `level.__index__` too, and each
     // is a kind the nursery relocates: two dicts and the `fromlist` tuple.
     // Publish them beside the name and read every one back below.
-    let globals_slot = (!w_globals.is_null()).then(|| {
+    let globals_slot = if w_globals.is_null() {
+        None
+    } else {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_globals);
-        slot
-    });
-    let locals_slot = (!w_locals.is_null()).then(|| {
+        Some(slot)
+    };
+    let locals_slot = if w_locals.is_null() {
+        None
+    } else {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_locals);
-        slot
-    });
-    let fromlist_slot = (!w_fromlist.is_null()).then(|| {
+        Some(slot)
+    };
+    let fromlist_slot = if w_fromlist.is_null() {
+        None
+    } else {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_fromlist);
-        slot
-    });
+        Some(slot)
+    };
     // `@unwrap_spec(level=int)` — an omitted level defaults to 0; a supplied
     // non-integer raises through the index protocol rather than defaulting.
     let level = if level_obj.is_null() {
@@ -23639,11 +23702,9 @@ fn import_bound_objects(
     // such spelling goes straight to the app-level bootstrap.  Re-read the
     // name through its root: `space_index_w` above may have moved it.
     let name_obj = pyre_object::gc_roots::shadow_stack_get(name_slot);
-    let read = |slot: Option<usize>| {
-        slot.map_or(
-            pyre_object::PY_NULL,
-            pyre_object::gc_roots::shadow_stack_get,
-        )
+    let read = |slot: Option<usize>| match slot {
+        Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+        None => pyre_object::PY_NULL,
     };
     let (globals, locals, fromlist) = (read(globals_slot), read(locals_slot), read(fromlist_slot));
     let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
@@ -23651,7 +23712,7 @@ fn import_bound_objects(
             name_obj, globals, locals, fromlist, level,
         );
     };
-    crate::importing::dunder_import(name, globals, locals, fromlist, level, exec_ctx)
+    crate::importing::dunder_import_w(name, name_obj, globals, locals, fromlist, level, exec_ctx)
 }
 
 /// Gateway target for `builtins.__import__`.

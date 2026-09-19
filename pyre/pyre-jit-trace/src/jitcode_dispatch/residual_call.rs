@@ -7086,21 +7086,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
-    // Cached `import math` / `from math import pi`: `_gcd_import` hit
-    // recorded as a non-forcing residual instead of CallMayForce through
-    // `__import__`.  PyPy's `test_import.test_import_in_function` wants
-    // `guard_not_invalidated` only; look-inside of the wrapper is still
-    // refused (un-lowered helpers), so the walker records the cache read.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && let Some(outcome) = spec_gate(SpecFold::ImportCached, || {
-            try_walker_specialize_import_cached(ctx, code, op, &r_args, dst)
-        })?
-    {
-        return Ok((outcome, op.next_pc));
-    }
-
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
@@ -7115,6 +7100,20 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         dst,
     )? {
         return Ok(inlined);
+    }
+
+    // Cached `import math` / `from math import pi`: `_gcd_import` hit
+    // recorded as a non-forcing residual when look-inside of `__import__`
+    // is still refused.  Tried after the descent so a walkable wrapper
+    // produces the PyPy field-read shape instead of this CallR.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && let Some(outcome) = spec_gate(SpecFold::ImportCached, || {
+            try_walker_specialize_import_cached(ctx, code, op, &r_args, dst)
+        })?
+    {
+        return Ok((outcome, op.next_pc));
     }
 
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
