@@ -370,8 +370,9 @@ pub struct PendingAbortBlackhole {
     /// blackhole's `getarrayitem_vable_*` read the real object.  `None` when
     /// the state has no virtualizable array.
     pub virt_array_values: Option<Vec<i64>>,
-    /// The trace's virtualizable identity (`MetaInterp::set_vable_ptr`, mirrored
-    /// onto the ctx at trace entry).  `0` when the state has none.
+    /// The trace's virtualizable identity (`initialize_virtualizable` writes
+    /// it onto the ctx; `set_vable_ptr` only seeds `pending_vable_ptr`).
+    /// `0` when the state has none.
     pub virtualizable_ptr: i64,
     /// `metainterp.last_exc_value` as `blackhole.py:1811-1814` reads it —
     /// snapshotted at the abort because the accounting that follows clears the

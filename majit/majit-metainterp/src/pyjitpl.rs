@@ -4999,11 +4999,11 @@ impl<M: Clone> MetaInterp<M> {
             None => OpRef::input_arg_ref(box_ref_index as u32),
         };
         // The identity's concrete VALUE is the live virtualizable pointer.
-        // For PyFrame `original_boxes[index]` already IS the frame pointer
-        // (== `vable_ptr`), so this is a no-op there. For the state-field
-        // JIT `original_boxes[index]` is the first scalar (stackpos), NOT the
-        // `&state` identity, so prefer `vable_ptr` when it is set
-        // (`virtualizable_heap_ptr` cached it in `sync_before`).
+        // For PyFrame `original_boxes[index]` already IS the frame pointer,
+        // so this is a no-op there. For the state-field JIT
+        // `original_boxes[index]` is the first scalar (stackpos), NOT the
+        // `&state` identity, so prefer the pointer unwrap produced above
+        // (box first, then the `pending_vable_ptr` seed).
         let virtualizable_value = if !virtualizable_ptr.is_null() {
             majit_ir::Value::Ref(majit_ir::GcRef(virtualizable_ptr as usize))
         } else {
@@ -5016,7 +5016,7 @@ impl<M: Clone> MetaInterp<M> {
         // are not vinfo static fields, so the expanded-tail slice
         // `live_values[num_reds..num_reds + total_vable]` would alias
         // scalar slots instead of actual vable elements.  Force the
-        // heap-read path (vable_ptr != null) which always mints fresh
+        // heap-read path (virtualizable_ptr != null) which always mints fresh
         // inputargs from the live heap values.
         let has_expanded_tail =
             info.identity_ref_bank_index.is_none() && live_values.len() >= num_reds + total_vable;
@@ -5102,11 +5102,9 @@ impl<M: Clone> MetaInterp<M> {
                 array_lengths,
             );
         }
-        // pyjitpl.py synchronize_virtualizable parity: TraceCtx needs
-        // the live heap pointer to mirror shadow writes. Mirror here — the
-        // MetaInterp `pending_vable_ptr` was cached before `tracing` existed, so
-        // `set_vable_ptr` could not plumb it through.
-        ctx.set_virtualizable_heap_ptr(virtualizable_ptr as *const u8);
+        // The heap pointer was written onto `ctx` above, after
+        // `clear_vable_token` forwarded it. `set_vable_ptr` only seeds
+        // `pending_vable_ptr` and does not retarget an active ctx.
         // pyjitpl.py `initialize_virtualizable` closes by asserting the
         // freshly read boxes still match the object it read them from.
         ctx.check_synchronized_virtualizable();
