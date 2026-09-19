@@ -8306,6 +8306,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::PyError::runtime_error("resource module is not initialized")
             })?;
             let cls = crate::baseobjspace::getattr_str(resource, "struct_rusage")?;
+            // Field boxing and the argument tuple can collect, so the type is
+            // pinned before the first allocation and re-read for the call.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cls);
             let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
             let mut fields = pyre_object::gc_roots::RootedItems::new();
             fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_utime)));
@@ -8327,7 +8332,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // `_make_struct_rusage` calls `struct_rusage((...))`, so a
             // rebound type's constructor is observable.
             let tuple = pyre_object::w_tuple_new(fields.take());
-            crate::call::call_function_impl_result(cls, &[tuple])
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                &[tuple],
+            )
         }
 
         fn wait_with_rusage<F>(wait: F) -> Result<PyObjectRef, crate::PyError>
