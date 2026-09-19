@@ -54,7 +54,10 @@
 //!     lifetimes).
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
-//!   - `Aggregate` — synthetic `Call(SyntheticTransparentCtor)`.
+//!   - `Aggregate` — named structs lower to `New` + `FieldWrite` (malloc
+//!     then setfield). Transparent newtype wrappers stay a no-op alias.
+//!     Enum variants, tuples, and arrays still emit
+//!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`.
@@ -3465,12 +3468,106 @@ fn simplify_lowered_graph(
     // among them.  Ordering the prune first does not remove the need.
     crate::model::clear_unreachable_blocks(graph);
     // Re-thread boxing-cluster operands the dead-var sweeps above stripped out
-    // of the `NewWithVtable`-chain blocks' inputargs.  Runs last so no later
-    // pass can remove the threaded inputarg, restoring the adapter's per-block
-    // operand invariant for cross-block boxing clusters (e.g. `w_int_new`,
-    // whose `intval` payload and `__cast_instance_intrinsic` return chain span the
-    // blocks split by the `get_instantiate` / `gc_interp::enabled` calls).
+    // of the `NewWithVtable`-chain blocks' inputargs.  Runs after those sweeps
+    // so no later dead-var pass can remove the threaded inputarg, restoring the
+    // adapter's per-block operand invariant for cross-block boxing clusters
+    // (e.g. `w_int_new`, whose `intval` payload and
+    // `__cast_instance_intrinsic` return chain span the blocks split by the
+    // `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
+    // Named-struct aggregates that boxing fusion did not consume are the
+    // allocation themselves: rewrite the leftover constructor to `new(descr)`
+    // so it never reaches JitCode as an uncallable residual call.  Only the
+    // final simplify runs this — the pre-pass still has consumer rewrites
+    // (`range_iter`, slice-index) that match the constructor.
+    if sweep_dead_vars {
+        lower_struct_aggregate_ctors_to_new(graph);
+    }
+}
+
+/// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
+/// stable flavors — the boxing-cluster allocator `fuse_boxing_alloc` keys on.
+fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
+    let CallTarget::FunctionPath { segments } = target else {
+        return false;
+    };
+    let [.., parent, leaf] = segments.as_slice() else {
+        return false;
+    };
+    parent == "lltype"
+        && matches!(
+            leaf.as_str(),
+            "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+        )
+}
+
+/// Rewrite a live named-struct aggregate constructor to `malloc` plus the
+/// field stores already emitted beside it.
+///
+/// Construction is `p = malloc(S); p.f = v`. The MIR front first emits a
+/// `SyntheticTransparentCtor` so `fuse_boxing_alloc`,
+/// `lower_struct_ptr_writes`, and `remove_dead_aggregates` still see the
+/// construct-on-stack spelling; after those passes, a remaining struct
+/// constructor is the allocation and becomes [`OpKind::New`].
+///
+/// Aggregates passed to `lltype::malloc[_typed*]` stay constructors: they
+/// are the boxing cluster's stack value, not the heap object.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
+    use crate::flowspace::model::Variable;
+    use std::collections::HashSet;
+
+    let mut malloc_args: HashSet<Variable> = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !call_target_is_gc_malloc(target) {
+                continue;
+            }
+            malloc_args.extend(args.iter().filter_map(LinkArg::as_variable).cloned());
+        }
+    }
+
+    let mut rewritten = 0usize;
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            let Some(result) = op.result.as_ref() else {
+                continue;
+            };
+            if malloc_args.contains(result) {
+                continue;
+            }
+            let OpKind::Call {
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        is_struct: true, ..
+                    },
+                args,
+                result_ty,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !args.is_empty() {
+                continue;
+            }
+            let ValueType::Ref(Some(owner)) = result_ty else {
+                continue;
+            };
+            if owner.is_empty() {
+                continue;
+            }
+            let owner = owner.clone();
+            op.kind = OpKind::New { owner };
+            rewritten += 1;
+        }
+    }
+    rewritten
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
@@ -6186,14 +6283,15 @@ impl<'a> Lowering<'a> {
                 ))
             }
             // `Aggregate(kind, operands)` — tuple / struct / enum-variant
-            // / array construction. Modeled as a synthetic constructor
-            // call (`CallTarget::SyntheticTransparentCtor`), the
-            // CallTarget variant explicitly carved out for "constructors
-            // RPython's rtyper erases before jtransform" — the MIR
-            // driver fits that description (Charon has already resolved
-            // types, so the call is post-frontend-resolution by
-            // construction).  Operands flow as call arguments; the
-            // synthetic name is best-effort from the AggregateKind tag.
+            // / array construction. A named struct is `malloc(GcStruct)`
+            // plus one `setfield` per member; the constructor call is a
+            // temporary marker so boxing fusion and dead-aggregate sweep
+            // still see the construct-on-stack spelling, then
+            // [`lower_struct_aggregate_ctors_to_new`] rewrites it to
+            // `OpKind::New`. Transparent newtype wrappers stay a no-op
+            // alias of their inner operand. Enum variants, tuples, and
+            // arrays keep `CallTarget::SyntheticTransparentCtor` for the
+            // later rewrites that still match that shape.
             Rvalue::Aggregate(kind, operands) => {
                 // A fieldless (C-like) enum variant carries no payload, so
                 // constructing it is just naming its discriminant integer
@@ -6356,9 +6454,9 @@ impl<'a> Lowering<'a> {
                 // `classdesc.py:705`) succeeds for classes whose
                 // `__init__` is not registered with the bookkeeper —
                 // the operand values flow through the FieldWrite chain
-                // below instead.  `SyntheticTransparentCtor` survives
-                // as the marker that downstream jtransform unwraps to
-                // the underlying `SomeInstance(classdef)`.
+                // below instead.  A named struct's constructor is the
+                // malloc marker; [`lower_struct_aggregate_ctors_to_new`]
+                // rewrites it to `OpKind::New` after boxing fusion.
                 let ctor_target = if owner_path.is_empty() {
                     CallTarget::synthetic_transparent_ctor(ctor_name.clone())
                 } else if adt_is_struct {
@@ -30821,12 +30919,14 @@ mod tests {
         cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
         checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
         int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling, primitive_float_const,
-        push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
-        tyref_positional_aggregate_root, tyref_to_value_type,
+        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
+        lower_struct_aggregate_ctors_to_new, primitive_float_const, push_cast_ptr_to_int,
+        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_value_type,
     };
-    use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
+    use crate::model::{
+        CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
+    };
     use majit_charon_reader::{Llbc, ullbc::TyRef};
 
     #[test]
@@ -30971,6 +31071,105 @@ mod tests {
             "the orphaned block must be cleared, not left naming the array: {:?}",
             graph.block(forwarding).inputargs
         );
+    }
+
+    fn struct_ctor_graph(pass_to_malloc: bool) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("struct_ctor");
+        let entry = graph.startblock;
+        let owner = "error::DictKeyError";
+        let result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["error".to_string()],
+                        "DictKeyError",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            )
+            .expect("struct ctor");
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("payload");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: result.clone(),
+                field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        if pass_to_malloc {
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["runtime_object", "lltype", "malloc_typed"]),
+                    args: crate::model::call_args(vec![result.clone()]),
+                    result_ty: ValueType::Ref(Some(owner.to_string())),
+                },
+                true,
+            );
+        }
+        graph.set_return(entry, Some(result));
+        graph
+    }
+
+    fn struct_ctor_ops(graph: &FunctionGraph) -> (usize, usize, usize) {
+        let mut ctors = 0usize;
+        let mut news = 0usize;
+        let mut field_writes = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => ctors += 1,
+                OpKind::New { owner } if owner == "error::DictKeyError" => news += 1,
+                OpKind::FieldWrite { field, .. } if field.name == "kind" => field_writes += 1,
+                _ => {}
+            }
+        }
+        (ctors, news, field_writes)
+    }
+
+    /// A named struct aggregate is `malloc(GcStruct)` plus one `setfield` per
+    /// member, not a residual constructor call. Transparent newtype wrappers
+    /// are a different arm and stay a no-op alias.
+    #[test]
+    fn named_struct_aggregate_lowers_to_new_plus_field_stores() {
+        let mut graph = struct_ctor_graph(false);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 1);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// The rewrite is the last step of the final simplify, after boxing fusion
+    /// and the consumer rewrites that still match a constructor. The pre-pass
+    /// simplify must not steal those constructors.
+    #[test]
+    fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
+        let mut graph = struct_ctor_graph(false);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), false);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// `malloc_typed(T { .. })` is the boxing cluster. Its stack aggregate
+    /// stays a constructor so `fuse_boxing_alloc` can still see it.
+    #[test]
+    fn malloc_typed_struct_ctor_is_left_for_boxing_fusion() {
+        let mut graph = struct_ctor_graph(true);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
     }
 
     /// Every row of the fn-pointer family decision, including the two the
