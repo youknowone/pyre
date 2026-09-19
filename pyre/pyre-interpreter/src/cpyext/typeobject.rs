@@ -741,11 +741,12 @@ pub(super) unsafe fn stamp_ob_size(raw: *mut CPyObject, w_obj: PyObjectRef, size
 /// What `tp_basicsize` a synthesized mirror of `w_type` carries.
 ///
 /// The modules whose mirrors have fields of their own each answer for their
-/// own types and 0 for everything else; every other type this runtime defines
-/// is exactly the header, and says so.  A ready type never carries a zero
-/// here -- an extension reads the field to size an allocation, and Cython's
-/// `__Pyx_ImportType` refuses to import a class whose basicsize is under the
-/// struct it declared.
+/// own types and 0 for everything else.  A type that only has a declared
+/// layout (the typedef table `cpython_type_layout` publishes) uses that size;
+/// only a type with neither falls back to the header.  A ready type never
+/// carries a zero here -- an extension reads the field to size an allocation,
+/// and Cython's `__Pyx_ImportType` refuses to import a class whose basicsize
+/// is under the struct it declared.
 fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     let size = [
         heap_type_basicsize(w_type),
@@ -760,6 +761,9 @@ fn mirror_basicsize(w_type: PyObjectRef) -> isize {
     ]
     .into_iter()
     .find(|&size| size != 0)
+    .or_else(|| {
+        crate::typedef::cpython_type_layout(w_type).map(|(basicsize, _)| basicsize as isize)
+    })
     .unwrap_or(size_of::<CPyObject>() as isize);
     // `type_attach`, "Make sure Py_SIZE() can cast to PyVarObject": a block
     // whose length is read has to have room for the word that holds it.
@@ -787,9 +791,13 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         true => TpFlags::PY_TPFLAGS_IMMUTABLETYPE,
         false => TpFlags::empty(),
     };
+    // Compute the size while `tp_name` is still null: `declared_type_layout`
+    // treats a named block not yet in `TYPE_NAMES` as a C declaration, and
+    // this mirror has been linked but not filled.
+    let basicsize = mirror_basicsize(w_type);
     unsafe {
         (*mirror).tp_name = pointer;
-        (*mirror).tp_basicsize = mirror_basicsize(w_type);
+        (*mirror).tp_basicsize = basicsize;
         (*mirror).tp_itemsize = mirror_itemsize(w_type);
         (*mirror).tp_flags = TpFlags::PY_TPFLAGS_DEFAULT
             | TpFlags::PY_TPFLAGS_READY
