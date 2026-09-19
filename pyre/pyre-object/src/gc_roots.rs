@@ -449,12 +449,6 @@ pub struct RootScope {
     /// called. Will be replaced with a backend
     /// `RootSet::Handle` once the active GC consumes the stack.
     save_point: usize,
-    /// Resolved thread-local stack cell. RPython keeps the shadow-stack
-    /// base/top address live for the whole root bracket; caching the cell here
-    /// avoids resolving TLS again for every generated slot write/read. It names
-    /// the [`RootStack`] and not its buffer, so a `grow` under this bracket
-    /// leaves it valid.
-    stack_slot: *const RootStack,
     /// A root bracket belongs to the thread whose shadow stack supplied this
     /// save point. Moving it could truncate an unrelated thread's stack.
     _not_send: PhantomData<*const ()>,
@@ -465,11 +459,8 @@ impl RootScope {
     /// [`push_roots`] so the API surface stays uniform across phases.
     #[inline]
     fn new() -> Self {
-        let stack_slot = shadow_stack_cell();
-        let save_point = shadow_stack_cell_len(stack_slot);
         Self {
-            save_point,
-            stack_slot,
+            save_point: shadow_stack_len(),
             _not_send: PhantomData,
         }
     }
@@ -480,40 +471,43 @@ impl RootScope {
         self.save_point
     }
 
-    /// Scope-local [`pin_root`] using the already-resolved root-stack cell.
+    /// Scope-local [`pin_root`] on this thread's root-stack cell.
     #[majit_macros::dont_look_inside_cannot_raise]
     #[must_use = "a pinned root may have been normalized; use the returned live word or bind it to `let _ =` for liveness-only pins"]
     pub fn pin_root(&self, root: PyObjectRef) -> PyObjectRef {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
+        let stack_slot = shadow_stack_cell();
         // SAFETY: `stack_slot` is this thread's root-stack cell, alive for the
         // bracket; `incr_stack` returns the slot it just claimed.
         let index = unsafe {
-            let stack = &*self.stack_slot;
+            let stack = &*stack_slot;
             let index = stack.len();
             *stack.incr_stack() = root;
             index
         };
         // SAFETY: `stack_slot` is this thread's live root-stack cell.
-        normalize_published_slot(unsafe { &*self.stack_slot }, index)
+        normalize_published_slot(unsafe { &*stack_slot }, index)
     }
 
-    /// Scope-local [`shadow_stack_get`] using the cached cell.
+    /// Scope-local [`shadow_stack_get`] on this thread's root-stack cell.
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn get(&self, index: usize) -> PyObjectRef {
+        let stack_slot = shadow_stack_cell();
         // SAFETY: same cell; `slot` bounds-checks `index`.
-        unsafe { *(*self.stack_slot).slot(index) }
+        unsafe { *(*stack_slot).slot(index) }
     }
 
-    /// Scope-local [`publish_roots`] using the cached cell.
+    /// Scope-local [`publish_roots`] on this thread's root-stack cell.
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn publish(&self, roots: &[PyObjectRef]) -> usize {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
+        let stack_slot = shadow_stack_cell();
         // SAFETY: this thread's cell, alive for the bracket; `incr_stack`
         // returns the slot it just claimed.
         unsafe {
-            let stack = &*self.stack_slot;
+            let stack = &*stack_slot;
             let base = stack.len();
             for &root in roots {
                 *stack.incr_stack() = root;
@@ -532,14 +526,15 @@ impl RootScope {
         base
     }
 
-    /// Scope-local [`normalize_roots`] using the cached cell.
+    /// Scope-local [`normalize_roots`] on this thread's root-stack cell.
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn normalize(&self, base: usize, len: usize) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
+        let stack_slot = shadow_stack_cell();
         // SAFETY: `publish` claimed every index in this range, and
         // `stack_slot` is this thread's live root-stack cell.
-        let _ = normalize_published_run(unsafe { &*self.stack_slot }, base, len);
+        let _ = normalize_published_run(unsafe { &*stack_slot }, base, len);
     }
 
     /// [`normalize`](Self::normalize), reporting whether any slot in the run
@@ -552,23 +547,25 @@ impl RootScope {
     pub fn normalize_moved(&self, base: usize, len: usize) -> bool {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
+        let stack_slot = shadow_stack_cell();
         // SAFETY: this thread's live cell; `publish` claimed the range.
-        normalize_published_run(unsafe { &*self.stack_slot }, base, len)
+        normalize_published_run(unsafe { &*stack_slot }, base, len)
     }
 
-    /// Scope-local [`shadow_stack_set`] using the cached cell — the write a
-    /// slot whose contents change over the bracket takes on each update.
+    /// Scope-local [`shadow_stack_set`] on this thread's root-stack cell — the
+    /// write a slot whose contents change over the bracket takes on each update.
     #[majit_macros::dont_look_inside_cannot_raise]
     pub fn set(&self, index: usize, root: PyObjectRef) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
+        let stack_slot = shadow_stack_cell();
         // Publish the raw value before the query, for the reason [`pin_root`]
         // gives: the slot is what a walker reads, so it must name the value
         // before anything consults the collector about it.
         // SAFETY: same cell; `slot` bounds-checks `index`.
-        unsafe { *(*self.stack_slot).slot(index) = root };
+        unsafe { *(*stack_slot).slot(index) = root };
         // SAFETY: `stack_slot` is this thread's live root-stack cell.
-        normalize_published_slot(unsafe { &*self.stack_slot }, index);
+        normalize_published_slot(unsafe { &*stack_slot }, index);
     }
 }
 
@@ -584,8 +581,8 @@ impl Drop for RootScope {
 ///
 /// This is the bracket's close spelled as a call taking the guard by
 /// reference. A crate that sees `RootScope` only as an opaque cross-crate
-/// stub cannot read `save_point` and `stack_slot` to close a bracket inline,
-/// but it can name this function; the two field reads then happen behind it.
+/// stub cannot read `save_point` to close a bracket inline, but it can name
+/// this function; the field read then happens behind it.
 ///
 /// A residual for the same reason `pin_root` and `shadow_stack_cell_truncate`
 /// are: the bracket's helpers are named by the runtime rather than looked
@@ -597,15 +594,16 @@ pub fn root_scope_close(scope: &RootScope) {
     assert_shadow_stack_not_walking();
     // `truncate` is a no-op if `save_point >= len()`, which is
     // the steady-state case for an empty bracket.
-    shadow_stack_cell_truncate(scope.stack_slot, scope.save_point);
+    shadow_stack_cell_truncate(shadow_stack_cell(), scope.save_point);
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.
-// Do not mark this `dont_look_inside`: `RootScope` is a two-word by-value ADT,
-// but the residual-call classifier would encode it as a one-word `ref` token.
-#[inline]
+///
+/// Residualised: `RootScope` is one word (`save_point`), which the residual
+/// ABI can carry.  `rlib/jit.py` `@dont_look_inside`.
+#[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
 }
@@ -1183,14 +1181,13 @@ mod tests {
         let _roots = push_roots();
     }
 
-    /// `RootScope` carries the saved top plus the resolved root-stack cell,
-    /// matching RPython's base/top pair. Trap unintended growth beyond those
-    /// two words.
+    /// `RootScope` carries only the saved top; the root-stack cell is
+    /// re-resolved. Trap unintended growth beyond that one word.
     #[test]
-    fn root_scope_payload_is_two_words() {
+    fn root_scope_payload_is_one_word() {
         assert_eq!(
             std::mem::size_of::<RootScope>(),
-            2 * std::mem::size_of::<usize>()
+            std::mem::size_of::<usize>()
         );
     }
 
