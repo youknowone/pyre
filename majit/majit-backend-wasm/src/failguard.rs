@@ -468,9 +468,9 @@ mod tests {
     #[test]
     fn set_savedata_on_a_force_snapshot_writes_the_live_jitframe() {
         let _serialized = super::FAIL_DESCR_TEST_LOCK.lock();
-        use majit_backend::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
+        use majit_backend::jitframe::{JitFrame, alloc_off_gc_jitframe, free_off_gc_jitframe};
 
-        let jf = alloc_off_gc_jitframe(4);
+        let jf = alloc_off_gc_jitframe(JitFrame::alloc_size(4));
         let mut frame = WasmFrameData::boxed(vec![1], fail_descr(vec![Type::Int]), 0);
         frame.attach_origin_jf(jf);
         frame.set_savedata(GcRef(0x51));
