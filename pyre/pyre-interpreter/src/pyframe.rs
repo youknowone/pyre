@@ -95,11 +95,16 @@ pub mod frame_locals_proxy {
     /// every entry of `extra` as a `(key, value)` pair on top of the caller's
     /// bracket, and report how many.
     ///
-    /// Its own function, and deliberately UNHINTED: this loop is bounded by
-    /// the dict's length, which is red, where the slot scan it follows is
-    /// bounded by the green `locals_plus_names`.  `contains_loop` therefore
-    /// declines this graph and the extras walk stays one residual call.
-    fn pin_extra_locals_entries(extra: PyObjectRef) -> usize {
+    /// Pins into `roots` on purpose — a nested `push_roots` would rewind
+    /// those slots on drop before the caller could read them.  Deliberately
+    /// UNHINTED: this loop is bounded by the dict's length, which is red,
+    /// where the slot scan it follows is bounded by the green
+    /// `locals_plus_names`.  `contains_loop` therefore declines this graph
+    /// and the extras walk stays one residual call.
+    fn pin_extra_locals_entries(
+        roots: &pyre_object::gc_roots::RootScope,
+        extra: PyObjectRef,
+    ) -> usize {
         // `pin_root` itself is a forwarding query, so a sequential pin of
         // the remaining pairs would leave them unrooted across that
         // safepoint. Publish the whole snapshot first.
@@ -109,7 +114,7 @@ pub mod frame_locals_proxy {
             live.push(key);
             live.push(value);
         }
-        let _ = pyre_object::gc_roots::pin_roots(&live);
+        let _ = roots.pin_roots(&live);
         live.len() / 2
     }
 
@@ -434,9 +439,12 @@ pub mod frame_locals_proxy {
         ///
         /// Each pair is pinned as it is produced: a slot's key is a freshly
         /// allocated string, so an earlier pair left in a native `Vec` would
-        /// not survive a later name's allocation.  The caller owns the
-        /// bracket these pins live in and must not have pinned anything else
-        /// above its base, since the slots are addressed relative to it.
+        /// not survive a later name's allocation.  Pins into `roots` on
+        /// purpose — a nested `push_roots` would rewind those slots on
+        /// drop before the caller could read them.  The pairs start at the
+        /// bracket's top as this scan finds it, so a caller that pinned
+        /// something first reads its own entries from there rather than from
+        /// `roots.base()`.
         ///
         /// `@jit.unroll_safe` for the same reason as
         /// [`Self::locals_plus_value`]: the slot scan is bounded by
@@ -445,11 +453,15 @@ pub mod frame_locals_proxy {
         /// dict's length instead, so it lives in its own unhinted function
         /// and stays a residual call.
         #[majit_macros::unroll_safe]
-        fn pin_entries(&self) -> usize {
+        fn pin_entries(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
             let mut count = 0;
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
+            // The first slot this scan claims. Reading it from the bracket
+            // rather than from `roots.base()` keeps the pair arithmetic below
+            // correct for a caller that had already pinned something.
+            let mut next_slot = roots.publish(&[]);
             // A plain loop rather than a closure over `self`, for the reason
             // [`PyFrame::frame_locals_proxy_snapshot`] gives.
             for (index, name, cell_slot) in locals_plus_names(code) {
@@ -470,18 +482,16 @@ pub mod frame_locals_proxy {
                 }
                 // The key allocates and the value does not, so claim the key's
                 // slot first, pin the value, and only then build the name.
-                let key_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
-                let _ = pyre_object::gc_roots::pin_root(value);
-                pyre_object::gc_roots::shadow_stack_set(
-                    key_slot,
-                    pyre_object::w_str_new_managed(name),
-                );
+                let key_slot = next_slot;
+                next_slot += 2;
+                let _ = roots.pin_root(pyre_object::PY_NULL);
+                let _ = roots.pin_root(value);
+                roots.set(key_slot, pyre_object::w_str_new_managed(name));
                 count += 1;
             }
             let extra = self.frame().get_extra_locals();
             if !extra.is_null() {
-                count += pin_extra_locals_entries(extra);
+                count += pin_extra_locals_entries(roots, extra);
             }
             count
         }
@@ -746,7 +756,7 @@ pub mod frame_locals_proxy {
             // hands that back; it does not build a cursor.
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
-            let count = self.pin_entries();
+            let count = self.pin_entries(&roots);
             let mut keys: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in (0..count).rev() {
                 keys.push(roots.get(base + index * 2));
@@ -755,17 +765,32 @@ pub mod frame_locals_proxy {
         }
 
         fn __contains__(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
+            // `framelocalsproxy_contains`: the first bound locals-plus slot
+            // whose name hashes and compares equal to `key`, else
+            // `f_extra_locals`.  Materializing the mapping allocated a string
+            // per bound local for a yes/no.
+            //
+            // `locals_plus_value` and the extras lookup both allocate, so
+            // reload the key from its root between them.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
-            let mapping = self.mapping()?;
-            crate::baseobjspace::contains(mapping, roots.get(key_slot))
+            if self.locals_plus_value(roots.get(key_slot))?.is_some() {
+                return Ok(true);
+            }
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                return Ok(false);
+            }
+            let extra_slot = key_slot + 1;
+            let _ = roots.pin_root(extra);
+            crate::baseobjspace::contains(roots.get(extra_slot), roots.get(key_slot))
         }
 
         fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
-            let count = self.pin_entries();
+            let count = self.pin_entries(&roots);
             let mut keys: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in 0..count {
                 keys.push(roots.get(base + index * 2));
@@ -776,7 +801,7 @@ pub mod frame_locals_proxy {
         fn values(&self) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
-            let count = self.pin_entries();
+            let count = self.pin_entries(&roots);
             let mut values: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in 0..count {
                 values.push(roots.get(base + index * 2 + 1));
@@ -790,8 +815,8 @@ pub mod frame_locals_proxy {
             // the next iteration.  Publish both and read them back.
             let roots = pyre_object::gc_roots::push_roots();
             let pairs_base = roots.base();
-            let count = self.pin_entries();
-            let out_base = pyre_object::gc_roots::shadow_stack_len();
+            let count = self.pin_entries(&roots);
+            let out_base = roots.publish(&[]);
             for index in 0..count {
                 let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
                     roots.get(pairs_base + index * 2),
@@ -814,7 +839,18 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             #[default(pyre_object::w_none())] default: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            self.call_mapping_method("get", &[key, default])
+            // `framelocalsproxy_get` is `framelocalsproxy_getitem` with a miss
+            // turned into `default`.  Routing through the snapshot dict paid a
+            // string per bound local for a single lookup.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.publish(&[key, default]);
+            roots.normalize(key_slot, 2);
+            let default_slot = key_slot + 1;
+            match self.__getitem__(roots.get(key_slot)) {
+                Ok(value) => Ok(value),
+                Err(err) if err.kind == crate::PyErrorKind::KeyError => Ok(roots.get(default_slot)),
+                Err(err) => Err(err),
+            }
         }
 
         fn update(&mut self, other: PyObjectRef) -> Result<(), crate::PyError> {
@@ -6613,7 +6649,7 @@ fn finditem_str_object(
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let key_slot = object_slot + 1;
     let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     match crate::baseobjspace::getitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(v) if !v.is_null() => Ok(Some(v)),
@@ -6635,7 +6671,7 @@ fn setitem_str_object(
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
     let _ = roots.pin_root(value);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let key_slot = object_slot + 2;
     let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     crate::baseobjspace::setitem(
         roots.get(object_slot),
@@ -6651,7 +6687,7 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let key_slot = object_slot + 1;
     let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     match crate::baseobjspace::delitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(_) => Ok(()),
@@ -7101,5 +7137,110 @@ mod tests {
             !mark_compatible_stack(obj, iter),
             "Iterator target rejects Object source"
         );
+    }
+
+    fn nested_function_frame(source: &str) -> super::FrameBox {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let outer = crate::compile_exec(source).expect("compile");
+        let code = super::code_constants(&outer)
+            .iter()
+            .find_map(|constant| match constant {
+                crate::bytecode::ConstantData::Code { code } => Some(code.as_ref()),
+                _ => None,
+            })
+            .expect("nested function code");
+        assert!(
+            code.flags.contains(crate::CodeFlags::OPTIMIZED),
+            "function frames expose FrameLocalsProxy"
+        );
+        let w_code = crate::pycode::box_code_constant(code);
+        let w_globals = pyre_object::w_dict_new();
+        super::createframe_obj(w_code as *const (), w_globals, std::ptr::null(), None)
+            .expect("frame")
+    }
+
+    #[test]
+    fn frame_locals_proxy_contains_len_keys_getitem() {
+        // Bound slots answer membership, length, keys and subscript from the
+        // fast array; unbound slots are skipped; extras follow without
+        // replacing a bound name.
+        let mut frame = nested_function_frame("def f(a):\n    b = 1\n");
+        let bound = pyre_object::w_int_new(7);
+        frame.set_locals_w(0, bound);
+        let proxy = frame.fget_getdictscope().expect("proxy");
+        assert!(
+            super::frame_locals_proxy::viewed_frame(proxy).is_some(),
+            "optimized frame.f_locals is a FrameLocalsProxy"
+        );
+
+        let roots = pyre_object::gc_roots::push_roots();
+        let proxy_slot = roots.base();
+        let _ = roots.pin_root(proxy);
+        let _ = roots.pin_root(bound);
+        let a_slot = proxy_slot + 2;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("a"));
+        let b_slot = a_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("b"));
+        let missing_slot = b_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("missing"));
+
+        assert!(crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(a_slot)).unwrap());
+        assert!(!crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(b_slot)).unwrap());
+        assert!(
+            !crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(missing_slot)).unwrap()
+        );
+
+        let got = crate::baseobjspace::getitem(roots.get(proxy_slot), roots.get(a_slot)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(got) }, 7);
+
+        let len = crate::baseobjspace::len(roots.get(proxy_slot)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(len) }, 1);
+
+        let extra_key_slot = missing_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("extra"));
+        let extra_val_slot = extra_key_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_int_new(9));
+        crate::baseobjspace::setitem(
+            roots.get(proxy_slot),
+            roots.get(extra_key_slot),
+            roots.get(extra_val_slot),
+        )
+        .unwrap();
+
+        assert!(
+            crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(extra_key_slot))
+                .unwrap()
+        );
+        let len = crate::baseobjspace::len(roots.get(proxy_slot)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(len) }, 2);
+
+        let keys = crate::baseobjspace::call_method(roots.get(proxy_slot), "keys", &[]);
+        assert!(
+            !keys.is_null(),
+            "keys() failed: {:?}",
+            crate::call::take_call_error()
+        );
+        unsafe {
+            assert_eq!(pyre_object::w_list_len(keys), 2);
+            let k0 = pyre_object::w_list_getitem(keys, 0).unwrap();
+            let k1 = pyre_object::w_list_getitem(keys, 1).unwrap();
+            assert_eq!(pyre_object::w_str_get_wtf8(k0).as_bytes(), b"a");
+            assert_eq!(pyre_object::w_str_get_wtf8(k1).as_bytes(), b"extra");
+        }
+    }
+
+    #[test]
+    fn frame_locals_proxy_contains_rejects_unhashable() {
+        let mut frame = nested_function_frame("def f(a):\n    return a\n");
+        let proxy = frame.fget_getdictscope().expect("proxy");
+        let roots = pyre_object::gc_roots::push_roots();
+        let proxy_slot = roots.base();
+        let _ = roots.pin_root(proxy);
+        let key_slot = proxy_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+        let err = crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(key_slot))
+            .expect_err("unhashable key");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
     }
 }

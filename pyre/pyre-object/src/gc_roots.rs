@@ -731,14 +731,14 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
     // fresh allocation must already be visible to that collector before we
     // enter the query safepoint.  RPython's push_roots writes the livevar to
     // the shadow stack before calling the allocation/GC slow path for the
-    // same reason.
-    let index = with_shadow_stack(|stack| {
+    // same reason.  One `with_shadow_stack` resolves the thread-local cell
+    // once for both the push and the normalize, matching `RootScope::pin_root`.
+    with_shadow_stack(|stack| {
         let index = stack.len();
         // SAFETY: `incr_stack` returns the slot it just claimed.
         unsafe { *stack.incr_stack() = root };
-        index
-    });
-    with_shadow_stack(|stack| normalize_published_slot(stack, index))
+        normalize_published_slot(stack, index)
+    })
 }
 
 /// Reload the current top shadow-stack entry after a call that may have moved
