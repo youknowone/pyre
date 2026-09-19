@@ -135,6 +135,7 @@ pub mod jitcode_dispatch;
 pub mod jitcode_runtime;
 pub mod liveness;
 pub mod llbc_fingerprint;
+pub mod operator_continuation;
 pub mod py_coord;
 pub mod pyjitcode;
 pub mod pyjitpl;

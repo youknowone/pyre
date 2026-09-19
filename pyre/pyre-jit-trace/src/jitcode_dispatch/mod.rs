@@ -6740,6 +6740,43 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
     })
 }
 
+/// An operator's own tail, paused between the caller's opcode and the
+/// dunder inlined under it.
+///
+/// [`ctor_continuation_parent_frame`]'s sibling for every operator whose
+/// result is not the callee's return value; the jitcode it names is
+/// `crate::operator_continuation`'s, and that module's doc carries why the
+/// level has to exist at all.
+///
+/// `boxes` is empty because the level's whole state is the pending
+/// call-result slot the dunder is about to fill, and a resume section never
+/// carries one (`get_list_of_active_boxes(in_a_call=True)`). `blackhole` is
+/// `None` because the level owns no register banks to force, and
+/// `call_stack_overrides` is empty because it has no operand stack.
+pub(crate) fn operator_continuation_parent_frame(
+    tail: crate::operator_continuation::OperatorTail,
+) -> Option<InlineParentFrame> {
+    let jitcode_index = crate::operator_continuation::jitcode_index(tail)?;
+    let resume_pc = crate::operator_continuation::resume_pc(tail)?;
+    Some(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        // The tail has no Python code object and so no Python pc. `Backxlat`
+        // over a codeless jitcode is what already answers `u32::MAX` for such
+        // a frame, which is the existing spelling for "no Python coordinate".
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+        resume_marker_jit_pc: Some(resume_pc),
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    })
+}
+
 /// RAII guard for one framestack level. Pop on drop so `?` and nested
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);

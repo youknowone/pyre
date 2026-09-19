@@ -484,6 +484,7 @@ spec_folds! {
     FormatWithSpecInt    => ("format_with_spec_int",     "residual_call", "-"),
     BinarySliceStr       => ("binary_slice_str",         "residual_call", "-"),
     SubscrUserGetitem    => ("subscr_user_getitem",      "inline_call",   "subscr"),
+    LenUserDunder        => ("len_user_dunder",          "inline_call",   "-"),
 }
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();

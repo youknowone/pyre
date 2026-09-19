@@ -5516,6 +5516,50 @@ fn _len(obj: PyObjectRef) -> PyResult {
     len_slot(obj)
 }
 
+/// Resolve the `__len__` call [`_len`] dispatches without executing it.  The
+/// trace-side admission counterpart of [`getitem_fast_path`]: the caller pins
+/// the receiver's type and version tag, which is what makes the returned
+/// descriptor the one [`_len`] would have found.
+///
+/// [`subclass_special_override`] is the whole gate, so the receivers whose
+/// length is a layout read rather than a call — an exact builtin, and a
+/// subclass that only inherits its builtin `__len__` — return `None` and keep
+/// the [`len_slot`] path.
+///
+/// Everything [`len_w`] does with the result is [`len_result_tail`], which the
+/// caller owes in full.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn len_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe {
+        if w_obj.is_null() {
+            return None;
+        }
+        let (method, w_type) = subclass_special_override(w_obj, "__len__")?;
+        let version_tag = w_type_version_tag(w_type);
+        if version_tag == 0 {
+            return None;
+        }
+        Some((w_type, version_tag, method))
+    }
+}
+
+/// The tail of [`len_w`] after the `__len__` call: `space.index` over what it
+/// returned, then [`_check_len_result`] over that.
+///
+/// Split out of [`len_w`] so a caller that obtained the [`_len`] result by
+/// another route applies the same two checks to it.  `pyre-jit-trace`'s
+/// `operator_continuation` is that caller: a guard failure inside an inlined
+/// app-level `__len__` resumes into a level whose whole body is this
+/// function, which is the only way the operator's own checks survive the
+/// deopt.  `builtins.rs builtin_len` boxes the machine length it answers, so
+/// app-level `len()` is an exact `int` whatever `__len__` returned.
+pub fn len_result_tail(w_res: PyObjectRef) -> Result<i64, crate::PyError> {
+    let w_index = space_index(w_res)?;
+    _check_len_result(w_index)
+}
+
 /// `pypy/objspace/descroperation.py len` — preserve the wrapped
 /// integer returned by `space.index`, but validate negativity and overflow
 /// before exposing it to app-level `len()`.
@@ -16009,9 +16053,7 @@ fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
 /// before `_check_len_result` so `__index__` is consulted but `__int__`
 /// is NOT — matching PyPy's stricter contract.
 pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let w_res = _len(w_obj)?;
-    let w_index = space_index(w_res)?;
-    _check_len_result(w_index)
+    len_result_tail(_len(w_obj)?)
 }
 
 /// pypy/objspace/descroperation.py `_index` + line 622-627 `index`.
