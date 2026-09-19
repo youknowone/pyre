@@ -9665,7 +9665,8 @@ impl<'a> Lowering<'a> {
                 // unregistered clone/to_owned/to_string.
                 if args.len() == 1
                     && (self.is_to_string_identity(&reg, first_arg_ty.as_ref())
-                        || self.is_string_clone_identity(&reg, first_arg_ty.as_ref()))
+                        || self.is_string_clone_identity(&reg, first_arg_ty.as_ref())
+                        || self.is_copy_scalar_or_thin_ptr_clone(&reg, first_arg_ty.as_ref()))
                     // A `Wtf8::to_wtf8_buf` that defines a proven mutable
                     // accumulator is not the ordinary immutable-string copy
                     // this identity arm models.  Its later `push*` calls and
@@ -9680,6 +9681,104 @@ impl<'a> Lowering<'a> {
                         && is_builder_mode_accumulator(self.body, self.llbc, dest_local))
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `T::default()` for a Copy scalar or thin-pointer `T` is the
+                // zero of that kind — an RPython constant, not a residual
+                // `core` body.
+                if args.is_empty()
+                    && self.is_scalar_or_ptr_default(&reg, &call.dest.ty)
+                    && let Some(zero) = self.emit_zero_constant_of_ty(bb_id, &call.dest.ty)
+                {
+                    self.local_var[dest_local] = Some(zero);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `<*mut T>::add` / `<*const T>::add` is `raw_ptradd` scaled
+                // by the pointee size (`rewrite_op_direct_ptradd`).  The
+                // pointer is a Ref at this layer, so take the address
+                // integer first — otherwise the add assembles as
+                // `int_add/ri>i`, an opname with no blackhole handler.
+                if args.len() == 2
+                    && let Some(pointee_size) =
+                        self.ptr_add_pointee_size(&reg, first_arg_ty.as_ref())
+                {
+                    let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+                        let res =
+                            graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        res
+                    };
+                    let offset = if pointee_size == 0 {
+                        args[0].clone()
+                    } else {
+                        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
+                        self.cast_ptr_to_int_src
+                            .insert(addr.clone(), args[0].clone());
+                        let rhs = if pointee_size == 1 {
+                            args[1].clone()
+                        } else {
+                            let scale = push_op(&mut self.graph, OpKind::ConstInt(pointee_size));
+                            push_op(
+                                &mut self.graph,
+                                OpKind::BinOp {
+                                    op: "mul".to_string(),
+                                    lhs: args[1].clone(),
+                                    rhs: scale,
+                                    result_ty: ValueType::Int,
+                                },
+                            )
+                        };
+                        push_op(
+                            &mut self.graph,
+                            OpKind::BinOp {
+                                op: "add".to_string(),
+                                lhs: addr,
+                                rhs,
+                                result_ty: ValueType::Int,
+                            },
+                        )
+                    };
+                    self.local_var[dest_local] = Some(offset);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `core::ptr::write` of a Copy scalar or thin pointer is a
+                // raw store into the already-allocated object.  An aggregate
+                // write is left for `lower_struct_ptr_writes`.
+                if args.len() == 2
+                    && let Some((item_ty, itemsize, is_item_signed)) =
+                        self.ptr_write_store_descr(&reg, second_arg_ty.as_ref())
+                {
+                    let offset = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(offset.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::RawStore {
+                            base: args[0].clone(),
+                            offset,
+                            value: args[1].clone(),
+                            item_ty,
+                            itemsize,
+                            is_item_signed,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -11477,6 +11576,21 @@ impl<'a> Lowering<'a> {
                 // allocation, not an alias of the source.)
                 let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
                     (vec!["list".to_string()], None)
+                } else if args.is_empty() && is_alloc_vec_new_segments(&segments) {
+                    // `Vec::new()` is the empty-list constructor.  Retarget
+                    // onto the `vec::Vec::new` path `flowspace_adapter`
+                    // already rewrites to `newlist()` / `ll_newemptylist`.
+                    (
+                        vec!["vec".to_string(), "Vec".to_string(), "new".to_string()],
+                        None,
+                    )
+                } else if args.len() == 2 && is_alloc_vec_push_segments(&segments) {
+                    // `Vec::push` is list append.  The adapter already maps
+                    // `vec::Vec::push` onto `getattr(recv, "append")`.
+                    (
+                        vec!["vec".to_string(), "Vec".to_string(), "push".to_string()],
+                        None,
+                    )
                 } else if args.len() == 2
                     && is_vec_extend_segments(&segments)
                     && second_arg_ty
@@ -14690,6 +14804,115 @@ impl<'a> Lowering<'a> {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+    }
+
+    /// `core::clone::impls::<Impl>::clone` on a Copy scalar or thin-pointer
+    /// pointee is the value itself.  A non-Copy clone (Vec, a named struct)
+    /// keeps its ordinary residual call: the path is not enough.
+    fn is_copy_scalar_or_thin_ptr_clone(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if !is_core_clone_impls_clone_path(fd.item_meta.name_path().as_str()) {
+            return false;
+        }
+        first_arg_ty
+            .and_then(|ty| tyref_clone_pointee_node(ty, self.llbc))
+            .is_some_and(|pointee| json_ty_is_copy_scalar_or_thin_ptr(pointee, self.llbc))
+    }
+
+    /// `core::default::<Impl>::default` / `core::ptr::mut_ptr::<Impl>::default`
+    /// for a scalar or thin-pointer destination: the zero of that kind.
+    fn is_scalar_or_ptr_default(&self, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        is_core_default_path(fd.item_meta.name_path().as_str())
+            && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
+    }
+
+    /// `<*mut T>::add` / `<*const T>::add` when the pointee has a known
+    /// byte size, so the existing `raw_ptradd` / `direct_ptradd` scaling
+    /// can run at the callsite.
+    fn ptr_add_pointee_size(&self, reg: &RegularCall, first_arg_ty: Option<&TyRef>) -> Option<i64> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if !is_core_ptr_add_path(fd.item_meta.name_path().as_str()) {
+            return None;
+        }
+        let pointee = first_arg_ty.and_then(|ty| {
+            tyref_peel_one_raw_ptr_node(ty, self.llbc)
+                .or_else(|| tyref_peel_one_ref_node(ty, self.llbc))
+        })?;
+        json_ty_byte_size(pointee, self.llbc)
+    }
+
+    /// `core::ptr::write` of a Copy scalar or thin pointer.  An aggregate
+    /// write stays a residual call so `lower_struct_ptr_writes` can still
+    /// turn a constructor-shaped operand into field stores.
+    fn ptr_write_store_descr(
+        &self,
+        reg: &RegularCall,
+        value_ty: Option<&TyRef>,
+    ) -> Option<(ValueType, usize, bool)> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let fd = self.llbc.fn_by_id(*id)?;
+        if !is_core_ptr_write_path(fd.item_meta.name_path().as_str()) {
+            return None;
+        }
+        let ty = value_ty?;
+        if !tyref_is_copy_scalar_or_thin_ptr(ty, self.llbc) {
+            return None;
+        }
+        json_ty_raw_store_descr(tyref_node(ty, self.llbc)?, self.llbc)
+    }
+
+    fn emit_zero_constant_of_ty(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Option<Variable> {
+        if !tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc) {
+            return None;
+        }
+        let node = tyref_node(dest_ty, self.llbc)
+            .and_then(|node| strip_ty_indirections(node, self.llbc))?;
+        let kind = if json_ty_is_thin_pointer_element(node, self.llbc) {
+            OpKind::ConstRefNull
+        } else {
+            match tyref_to_value_type(dest_ty, self.llbc) {
+                ValueType::Int => OpKind::ConstInt(0),
+                ValueType::Unsigned => OpKind::ConstUInt(0),
+                ValueType::Bool => OpKind::ConstBool(false),
+                ValueType::Float => OpKind::ConstFloat(0),
+                ValueType::SingleFloat => OpKind::ConstSingleFloat(0),
+                ValueType::Int128 => OpKind::ConstInt128(0),
+                ValueType::UInt128 => OpKind::ConstUInt128(0),
+                ValueType::Ref(_) | ValueType::Str => OpKind::ConstRefNull,
+                ValueType::Void => OpKind::ConstNone,
+                ValueType::StringBuilder | ValueType::State | ValueType::Unknown => {
+                    return None;
+                }
+            }
+        };
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind,
+        });
+        Some(res)
     }
 
     /// `pyre_object::gc_storage::gc_alloc_storage_box::<Wtf8Buf>` is the
@@ -25760,6 +25983,155 @@ fn json_ty_is_statically_sized(node: &serde_json::Value, llbc: &Llbc) -> bool {
     id.as_str() == Some("Tuple") || id.as_object().is_some_and(|m| m.contains_key("Adt"))
 }
 
+/// A Copy scalar: a Charon `Literal` integer, float, `bool`, or `char`.
+/// Arrays, tuples, and named ADTs are not scalars even when they are Copy.
+fn json_ty_is_copy_scalar(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(lit) = obj.get("Literal") else {
+        return false;
+    };
+    if matches!(lit.as_str(), Some("Bool" | "Char")) {
+        return true;
+    }
+    lit.as_object().is_some_and(|lit| {
+        lit.contains_key("Int")
+            || lit.contains_key("UInt")
+            || lit.contains_key("Float")
+            || lit.contains_key("Bool")
+            || lit.contains_key("Char")
+    })
+}
+
+fn json_ty_is_copy_scalar_or_thin_ptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    json_ty_is_copy_scalar(node, llbc) || json_ty_is_thin_pointer_element(node, llbc)
+}
+
+fn tyref_peel_one_ref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node
+        .as_object()?
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))?;
+    strip_ty_indirections(pointee, llbc)
+}
+
+fn tyref_peel_one_raw_ptr_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node
+        .as_object()?
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())?;
+    strip_ty_indirections(pointee, llbc)
+}
+
+/// The pointee of `&self` for `Clone::clone`, or the type itself when the
+/// argument is already a by-value Copy scalar / thin pointer.
+fn tyref_clone_pointee_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    tyref_peel_one_ref_node(ty, llbc).or_else(|| strip_ty_indirections(tyref_node(ty, llbc)?, llbc))
+}
+
+fn tyref_is_copy_scalar_or_thin_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| json_ty_is_copy_scalar_or_thin_ptr(node, llbc))
+}
+
+fn json_ty_literal_byte_size(node: &serde_json::Value) -> Option<i64> {
+    let lit = node.as_object()?.get("Literal")?;
+    if lit.as_str() == Some("Bool") {
+        return Some(1);
+    }
+    if lit.as_str() == Some("Char") {
+        return Some(4);
+    }
+    let lit = lit.as_object()?;
+    if lit.contains_key("Bool") {
+        return Some(1);
+    }
+    if lit.contains_key("Char") {
+        return Some(4);
+    }
+    let word = crate::layout::target_word_size() as i64;
+    let int_atom = lit
+        .get("UInt")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| lit.get("Int").and_then(serde_json::Value::as_str));
+    if let Some(atom) = int_atom {
+        return Some(match atom {
+            "U8" | "I8" => 1,
+            "U16" | "I16" => 2,
+            "U32" | "I32" => 4,
+            "U64" | "I64" => 8,
+            "U128" | "I128" => 16,
+            "Usize" | "Isize" => word,
+            _ => return None,
+        });
+    }
+    match lit.get("Float").and_then(serde_json::Value::as_str) {
+        Some("F32") => Some(4),
+        Some("F64") => Some(8),
+        _ => None,
+    }
+}
+
+fn json_ty_byte_size(node: &serde_json::Value, llbc: &Llbc) -> Option<i64> {
+    let node = strip_ty_indirections(node, llbc)?;
+    if json_ty_is_thin_pointer_element(node, llbc) {
+        return Some(crate::layout::target_word_size() as i64);
+    }
+    if let Some(size) = json_ty_literal_byte_size(node) {
+        return Some(size);
+    }
+    let adt = inline_adt_def_id(node)?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    llbc.type_by_id(adt)?
+        .layout_for_target(&target)?
+        .size
+        .map(|size| size as i64)
+}
+
+fn json_ty_raw_store_descr(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<(ValueType, usize, bool)> {
+    let node = strip_ty_indirections(node, llbc)?;
+    if json_ty_is_thin_pointer_element(node, llbc) {
+        return Some((ValueType::Int, crate::layout::target_word_size(), false));
+    }
+    let size = json_ty_literal_byte_size(node)? as usize;
+    let lit = node.as_object()?.get("Literal")?;
+    if matches!(lit.as_str(), Some("Bool" | "Char")) {
+        return Some((ValueType::Int, size, false));
+    }
+    let lit = lit.as_object()?;
+    if lit.contains_key("Bool") || lit.contains_key("Char") {
+        return Some((ValueType::Int, size, false));
+    }
+    if lit.get("Float").and_then(serde_json::Value::as_str) == Some("F32") {
+        return Some((ValueType::SingleFloat, size, false));
+    }
+    if lit.contains_key("Float") {
+        return Some((ValueType::Float, size, false));
+    }
+    if lit.get("UInt").and_then(serde_json::Value::as_str) == Some("U128") {
+        return Some((ValueType::UInt128, size, false));
+    }
+    if lit.get("Int").and_then(serde_json::Value::as_str) == Some("I128") {
+        return Some((ValueType::Int128, size, true));
+    }
+    if lit.contains_key("UInt") {
+        return Some((ValueType::Unsigned, size, false));
+    }
+    if lit.contains_key("Int") {
+        return Some((ValueType::Int, size, true));
+    }
+    None
+}
+
 /// Does the iterator ADT named by `path` hand back a reference *it* added,
 /// rather than the element itself?
 ///
@@ -29355,6 +29727,47 @@ fn is_core_result_map_err_path(path: &str) -> bool {
     )
 }
 
+fn is_core_clone_impls_clone_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "clone", "impls", "<Impl>", "clone"]
+    )
+}
+
+fn is_core_default_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "default", "<Impl>", "default"] | ["core", "ptr", "mut_ptr", "<Impl>", "default"]
+    )
+}
+
+fn is_core_ptr_add_path(path: &str) -> bool {
+    matches!(
+        path.split("::").collect::<Vec<_>>().as_slice(),
+        ["core", "ptr", "mut_ptr" | "const_ptr", "<Impl>", "add"]
+    )
+}
+
+fn is_core_ptr_write_path(path: &str) -> bool {
+    path == "core::ptr::write"
+}
+
+fn is_alloc_vec_new_segments(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [a, b, c, d]
+            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && d == "new"
+    )
+}
+
+fn is_alloc_vec_push_segments(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [a, b, c, d]
+            if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") && d == "push"
+    )
+}
+
 fn is_core_option_method(path: &str, leaf: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
@@ -32884,6 +33297,80 @@ mod tests {
         ] {
             assert!(!is_core_result_map_err_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn std_extern_path_predicates_match_exact_full_paths_only() {
+        assert!(super::is_core_clone_impls_clone_path(
+            "core::clone::impls::<Impl>::clone"
+        ));
+        assert!(!super::is_core_clone_impls_clone_path(
+            "core::clone::<Impl>::clone"
+        ));
+        assert!(!super::is_core_clone_impls_clone_path(
+            "alloc::vec::<Impl>::clone"
+        ));
+
+        assert!(super::is_core_default_path(
+            "core::default::<Impl>::default"
+        ));
+        assert!(super::is_core_default_path(
+            "core::ptr::mut_ptr::<Impl>::default"
+        ));
+        assert!(!super::is_core_default_path(
+            "core::ptr::const_ptr::<Impl>::default"
+        ));
+        assert!(!super::is_core_default_path(
+            "core::default::Default::default"
+        ));
+
+        assert!(super::is_core_ptr_add_path(
+            "core::ptr::mut_ptr::<Impl>::add"
+        ));
+        assert!(super::is_core_ptr_add_path(
+            "core::ptr::const_ptr::<Impl>::add"
+        ));
+        assert!(!super::is_core_ptr_add_path(
+            "core::ptr::mut_ptr::<Impl>::wrapping_add"
+        ));
+        assert!(!super::is_core_ptr_add_path(
+            "core::ptr::mut_ptr::<Impl>::offset"
+        ));
+
+        assert!(super::is_core_ptr_write_path("core::ptr::write"));
+        assert!(!super::is_core_ptr_write_path("core::ptr::write_unaligned"));
+        assert!(!super::is_core_ptr_write_path("core::ptr::write_bytes"));
+
+        assert!(super::is_alloc_vec_new_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "new".into(),
+        ]));
+        assert!(super::is_alloc_vec_new_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "Vec".into(),
+            "new".into(),
+        ]));
+        assert!(!super::is_alloc_vec_new_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "with_capacity".into(),
+        ]));
+        assert!(super::is_alloc_vec_push_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "push".into(),
+        ]));
+        assert!(!super::is_alloc_vec_push_segments(&[
+            "alloc".into(),
+            "vec".into(),
+            "<Impl>".into(),
+            "push_str".into(),
+        ]));
     }
 
     #[test]
@@ -37452,6 +37939,505 @@ mod tests {
             }
         });
         Llbc::from_slice(file.to_string().as_bytes()).expect("scalar method fixture Llbc parses")
+    }
+
+    fn std_extern_call_fixture(
+        caller_name: &str,
+        callee_name: &[&str],
+        arg_tys: &[serde_json::Value],
+        dest_ty: serde_json::Value,
+    ) -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| {
+                        if *segment == "<Impl>" {
+                            serde_json::json!({"Impl": {"kind": "InherentImplBlock"}})
+                        } else {
+                            serde_json::json!({"Ident": [segment, 0]})
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let mut locals = vec![serde_json::json!({
+            "index": 0,
+            "name": null,
+            "span": span(),
+            "ty": dest_ty.clone()
+        })];
+        for (i, ty) in arg_tys.iter().enumerate() {
+            locals.push(serde_json::json!({
+                "index": i + 1,
+                "name": format!("arg{i}"),
+                "span": span(),
+                "ty": ty
+            }));
+        }
+        let call_args: Vec<serde_json::Value> = arg_tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                serde_json::json!({
+                    "Copy": {"kind": {"Local": i + 1}, "ty": ty}
+                })
+            })
+            .collect();
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", caller_name], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": arg_tys.to_vec(),
+                "output": dest_ty.clone()
+            },
+            "body": {
+                "Unstructured": {
+                    "span": span(),
+                    "locals": {
+                        "arg_count": arg_tys.len(),
+                        "locals": locals
+                    },
+                    "body": [
+                        {
+                            "statements": [],
+                            "terminator": {
+                                "span": span(),
+                                "kind": {
+                                    "Call": {
+                                        "call": {
+                                            "func": {
+                                                "Regular": {
+                                                    "kind": {"Fun": {"Regular": 1}},
+                                                    "generics": generics.clone()
+                                                }
+                                            },
+                                            "args": call_args,
+                                            "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        },
+                                        "target": 2,
+                                        "on_unwind": 1
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "UnwindResume"}
+                        },
+                        {
+                            "statements": [],
+                            "terminator": {"span": span(), "kind": "Return"}
+                        }
+                    ]
+                }
+            }
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta(callee_name, false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": arg_tys.to_vec(),
+                "output": dest_ty.clone()
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [],
+                "fun_decls": [caller, callee],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("std extern fixture Llbc parses")
+    }
+
+    fn call_leafs(ops: &[&SpaceOperation]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn copy_scalar_clone_is_the_value_itself() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let recv = serde_json::json!({"Ref": ["_", i64_ty.clone(), "Shared"]});
+        let llbc = std_extern_call_fixture(
+            "clone_i64",
+            &["core", "clone", "impls", "<Impl>", "clone"],
+            &[recv],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "clone_i64").expect("lower Copy clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "Copy clone must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn non_copy_clone_lookalike_stays_residual() {
+        let adt = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let recv = serde_json::json!({"Ref": ["_", adt.clone(), "Shared"]});
+        let llbc = std_extern_call_fixture(
+            "clone_vec",
+            &["core", "clone", "impls", "<Impl>", "clone"],
+            &[recv],
+            adt,
+        );
+        let graph = super::lower_function(&llbc, "clone_vec").expect("lower non-Copy clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "a non-Copy clone must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn clone_lookalike_path_stays_residual() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let recv = serde_json::json!({"Ref": ["_", i64_ty.clone(), "Shared"]});
+        let llbc = std_extern_call_fixture(
+            "clone_blanket",
+            &["core", "clone", "<Impl>", "clone"],
+            &[recv],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "clone_blanket").expect("lower lookalike clone");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "clone"),
+            "core::clone::<Impl>::clone must not use the impls identity; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_default_is_the_zero_constant() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = std_extern_call_fixture(
+            "default_i64",
+            &["core", "default", "<Impl>", "default"],
+            &[],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "default_i64").expect("lower scalar default");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(0))),
+            "i64::default must become ConstInt(0); ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "scalar default must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn pointer_default_is_a_null_constant() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let llbc = std_extern_call_fixture(
+            "default_mut_ptr",
+            &["core", "ptr", "mut_ptr", "<Impl>", "default"],
+            &[],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "default_mut_ptr").expect("lower ptr default");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+            "*mut T::default must become ConstRefNull; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "pointer default must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn default_lookalike_path_stays_residual() {
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let llbc = std_extern_call_fixture(
+            "default_trait",
+            &["core", "default", "Default", "default"],
+            &[],
+            i64_ty,
+        );
+        let graph = super::lower_function(&llbc, "default_trait").expect("lower lookalike default");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+            "Default::default must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_of_bytes_is_unscaled_add() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "add_u8",
+            &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_u8").expect("lower *mut u8::add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "*mut u8::add must become int_add; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "*mut u8::add must not scale; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "add"),
+            "*mut u8::add must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_of_i64_scales_by_pointee_size() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "add_i64",
+            &["core", "ptr", "const_ptr", "<Impl>", "add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "add_i64").expect("lower *const i64::add");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstInt(8))),
+            "*const i64::add must multiply by 8; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "mul")),
+            "*const i64::add must emit int_mul; ops={ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add")),
+            "*const i64::add must emit int_add; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_lookalike_stays_residual() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"UInt": "U8"}}, "Mut"]
+        });
+        let usize_ty = serde_json::json!({"Literal": {"UInt": "Usize"}});
+        let llbc = std_extern_call_fixture(
+            "wrapping_add",
+            &["core", "ptr", "mut_ptr", "<Impl>", "wrapping_add"],
+            &[ptr_ty.clone(), usize_ty],
+            ptr_ty,
+        );
+        let graph = super::lower_function(&llbc, "wrapping_add").expect("lower wrapping_add");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops).iter().any(|leaf| *leaf == "wrapping_add"),
+            "wrapping_add must stay residual; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_write_of_scalar_is_a_raw_store() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let unit = serde_json::json!({
+            "Adt": {"id": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let llbc = std_extern_call_fixture(
+            "write_i64",
+            &["core", "ptr", "write"],
+            &[ptr_ty, i64_ty],
+            unit,
+        );
+        let graph = super::lower_function(&llbc, "write_i64").expect("lower ptr::write");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::RawStore {
+                    itemsize: 8,
+                    is_item_signed: true,
+                    ..
+                }
+            )),
+            "ptr::write of i64 must become RawStore; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops).iter().any(|leaf| *leaf == "write"),
+            "scalar ptr::write must not residualize; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn ptr_write_lookalike_stays_residual() {
+        let ptr_ty = serde_json::json!({
+            "RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]
+        });
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let unit = serde_json::json!({
+            "Adt": {"id": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let llbc = std_extern_call_fixture(
+            "write_unaligned",
+            &["core", "ptr", "write_unaligned"],
+            &[ptr_ty, i64_ty],
+            unit,
+        );
+        let graph = super::lower_function(&llbc, "write_unaligned").expect("lower write_unaligned");
+        let ops = graph_ops(&graph);
+        assert!(
+            call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "write_unaligned"),
+            "write_unaligned must stay residual; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::RawStore { .. })),
+            "write_unaligned must not become RawStore; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn vec_new_retargets_to_the_empty_list_constructor() {
+        let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let llbc =
+            std_extern_call_fixture("vec_new", &["alloc", "vec", "<Impl>", "new"], &[], vec_ty);
+        let graph = super::lower_function(&llbc, "vec_new").expect("lower Vec::new");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
+            )),
+            "alloc::vec::<Impl>::new must retarget to vec::Vec::new; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn vec_push_retargets_to_list_append() {
+        let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let i64_ty = serde_json::json!({"Literal": {"Int": "I64"}});
+        let unit = serde_json::json!({
+            "Adt": {"id": "Tuple", "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}
+        });
+        let llbc = std_extern_call_fixture(
+            "vec_push",
+            &["alloc", "vec", "<Impl>", "push"],
+            &[vec_ty, i64_ty],
+            unit,
+        );
+        let graph = super::lower_function(&llbc, "vec_push").expect("lower Vec::push");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["vec".to_string(), "Vec".to_string(), "push".to_string()]
+            )),
+            "alloc::vec::<Impl>::push must retarget to vec::Vec::push; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn vec_new_lookalike_stays_on_its_own_path() {
+        let vec_ty = serde_json::json!({"Adt": {"id": {"Adt": 0}, "generics": {"types": []}}});
+        let llbc = std_extern_call_fixture(
+            "vec_with_capacity",
+            &["alloc", "vec", "<Impl>", "with_capacity"],
+            &[serde_json::json!({"Literal": {"UInt": "Usize"}})],
+            vec_ty,
+        );
+        let graph =
+            super::lower_function(&llbc, "vec_with_capacity").expect("lower Vec::with_capacity");
+        let ops = graph_ops(&graph);
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "with_capacity")
+            )),
+            "Vec::with_capacity must not take the Vec::new retarget; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
+            )),
+            "Vec::with_capacity must not become vec::Vec::new; ops={ops:?}"
+        );
     }
 
     fn graph_ops(graph: &crate::model::FunctionGraph) -> Vec<&SpaceOperation> {
