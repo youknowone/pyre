@@ -2392,6 +2392,13 @@ pub fn ll_list_float_length(l: &W_ListObject) -> usize {
     l.float_items.len()
 }
 
+/// `ll_getitem_fast` for the Float strategy (rlist.py:375
+/// `'list.getitem(l, index)'`): raw unboxed read at a known-in-bounds index.
+#[majit_macros::oopspec("list.float_getitem(l, index)")]
+pub fn ll_list_float_getitem_fast(l: &W_ListObject, index: usize) -> f64 {
+    l.float_items.as_slice()[index]
+}
+
 /// `ll_setitem_fast` for the Float strategy (rlist.py
 /// `'list.setitem(l, index, item)'`): raw unboxed write at a known-in-bounds
 /// index.
@@ -2679,13 +2686,12 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
             })
         }
         ListStrategy::Float => {
-            let items = list.float_items.as_slice();
-            let len = items.len() as i64;
+            let len = ll_list_float_length(list) as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(w_float_new(items[idx as usize]))
+            Some(w_float_new(ll_list_float_getitem_fast(list, idx as usize)))
         }
         ListStrategy::Bytes => {
             let len = list.bytes_items.len() as i64;
@@ -2786,7 +2792,7 @@ pub unsafe fn w_list_setitem_inner(obj: PyObjectRef, index: i64, value: PyObject
             }
         }
         ListStrategy::Float => {
-            let len = list.float_items.len() as i64;
+            let len = ll_list_float_length(list) as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return false;

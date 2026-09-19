@@ -756,6 +756,14 @@ pub(crate) enum JitMarkerKey {
     LoopHeader,
 }
 
+/// ARRAY identity of the list backing blocks, the key `cpu.arraydescrof`
+/// caches on.  `rlist.py` has one `GcArray(ITEM)` lltype per item kind, so
+/// every access to such a block names the same ArrayDescr as the runtime's
+/// own descr for it.
+pub const LIST_INT_ITEMS_ARRAY: &str = "GcArray<i64>";
+pub const LIST_FLOAT_ITEMS_ARRAY: &str = "GcArray<f64>";
+pub const LIST_OBJ_ITEMS_ARRAY: &str = "GcArray<PyObjectRef>";
+
 /// pyre's own driver receiver types, and the
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its
 /// own portal via `portal_jd_index`. Another embedding pipeline names its
@@ -6803,7 +6811,7 @@ impl<'a> Transformer<'a> {
                                 base: block,
                                 index,
                                 item_ty: ValueType::Int,
-                                array_type_id: None,
+                                array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
                                 pure: false,
                             },
@@ -6845,7 +6853,7 @@ impl<'a> Transformer<'a> {
                                 base: block,
                                 index,
                                 item_ty: ValueType::Int,
-                                array_type_id: None,
+                                array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
                                 pure: true,
                             },
@@ -6880,7 +6888,7 @@ impl<'a> Transformer<'a> {
                                 index,
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Int,
-                                array_type_id: None,
+                                array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
                             },
                         },
@@ -6921,7 +6929,7 @@ impl<'a> Transformer<'a> {
                             result: op.result.clone(),
                             kind: OpKind::ArrayLen {
                                 base: block,
-                                array_type_id: None,
+                                array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
                             },
                         },
@@ -6988,6 +6996,39 @@ impl<'a> Transformer<'a> {
                     }],
                 )
             }
+            "list.float_getitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.float_getitem → getfield_gc_r(float_items.block) + getarrayitem_gc_f",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new(
+                                    "float_items.block",
+                                    Some(LIST_OWNER.to_string()),
+                                ),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayRead {
+                                base: block,
+                                index,
+                                item_ty: ValueType::Float,
+                                array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
+                                nolength: false,
+                                pure: false,
+                            },
+                        },
+                    ],
+                )
+            }
             "list.float_setitem" => {
                 let l = args.first()?.clone();
                 let index = args.get(1)?.clone();
@@ -7015,7 +7056,7 @@ impl<'a> Transformer<'a> {
                                 index,
                                 value: crate::model::LinkArg::Value(value),
                                 item_ty: ValueType::Float,
-                                array_type_id: None,
+                                array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
                             },
                         },
@@ -7048,7 +7089,7 @@ impl<'a> Transformer<'a> {
                             result: op.result.clone(),
                             kind: OpKind::ArrayLen {
                                 base: block,
-                                array_type_id: None,
+                                array_type_id: Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
                                 nolength: false,
                             },
                         },
@@ -19540,7 +19581,7 @@ mod tests {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
                 assert!(matches!(item_ty, ValueType::Int));
-                assert_eq!(array_type_id, &None);
+                assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
                 // `list.int_getitem` is the mutable (non-foldable) read.
                 assert!(!pure);
@@ -19610,7 +19651,7 @@ mod tests {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
                 assert!(matches!(item_ty, ValueType::Int));
-                assert_eq!(array_type_id, &None);
+                assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
                 // The foldable element load — `getarrayitem_gc_i_pure`.
                 assert!(pure);
@@ -19668,7 +19709,7 @@ mod tests {
                 assert_eq!(idx, &index);
                 assert_eq!(written.as_variable(), Some(&value));
                 assert!(matches!(item_ty, ValueType::Int));
-                assert_eq!(array_type_id, &None);
+                assert_eq!(array_type_id, &Some(LIST_INT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
             }
             other => panic!("expected ArrayWrite, got {other:?}"),
@@ -19902,7 +19943,7 @@ mod tests {
                 assert_eq!(idx, &index);
                 assert_eq!(written.as_variable(), Some(&value));
                 assert!(matches!(item_ty, ValueType::Float));
-                assert_eq!(array_type_id, &None);
+                assert_eq!(array_type_id, &Some(LIST_FLOAT_ITEMS_ARRAY.to_string()));
                 assert!(!nolength);
             }
             other => panic!("expected ArrayWrite, got {other:?}"),
