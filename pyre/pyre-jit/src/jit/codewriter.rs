@@ -16063,11 +16063,16 @@ pub fn register_portal_jitdriver(code: &pyre_interpreter::CodeObject) -> bool {
     // `call.py get_jitcode` / `self.jitcodes[graph]` after the one
     // `codewriter.py make_jitcodes` drain. RPython runs that drain once at
     // warmspot; a later `compile_and_run_once` of the same portal only looks
-    // the populated entry up.
+    // the populated entry up. The lookup must also confirm the portal was
+    // registered, because the jitcode cache is shared with callee compilation.
     if writer
         .callcontrol()
-        .find_compiled_jitcode_arc(code_ptr)
+        .jitdriver_sd_from_portal_graph(code_ptr)
         .is_some()
+        && writer
+            .callcontrol()
+            .find_compiled_jitcode_arc(code_ptr)
+            .is_some()
     {
         return true;
     }
