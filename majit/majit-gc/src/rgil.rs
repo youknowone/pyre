@@ -137,18 +137,77 @@ impl Mutex2 {
     }
 }
 
+/// `mutex_gil_stealer`, as the queue its own comment describes:
+/// "Enter the waiting queue from the end. Assuming a roughly first-in-first-out
+/// order, this gives the threads a round-robin chance."
+///
+/// A plain mutex does not give that order. It hands ownership to whichever
+/// waiter the platform picks, and a thread that just released it can retake it
+/// before a sleeping waiter is even scheduled — macOS's `firstfit` mutex barges
+/// in favour of the running thread by design, and a futex-backed one is no
+/// fairer under sustained contention. What starves is the thread that blocks:
+/// with five mutators in a `gc.collect()` loop, a thread returning from a
+/// blocking call re-entered this queue and lost it thousands of times in a row
+/// (`test_stop_the_world_during_finalization`: 1385 of 1429 samples parked
+/// here, ~2 s per shutdown against CPython's 0.05 s).
+///
+/// A ticket is that order, stated rather than assumed: a thread takes the next
+/// number on arrival and is served in turn.
+struct StealerQueue {
+    /// The next ticket to hand out.
+    next: AtomicUsize,
+    /// The ticket being served. Held only across the handoff, never across the
+    /// steal loop itself.
+    serving: Mutex<usize>,
+    cond: Condvar,
+}
+
+impl StealerQueue {
+    const fn new() -> Self {
+        StealerQueue {
+            next: AtomicUsize::new(0),
+            serving: Mutex::new(0),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Take a ticket and wait for it. Stands in for `mutex1_lock`; the returned
+    /// guard is what `mutex1_unlock` would end.
+    fn lock(&self) -> StealerTicket<'_> {
+        let mine = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut serving = self.serving.lock().unwrap();
+        while *serving != mine {
+            serving = self.cond.wait(serving).unwrap();
+        }
+        StealerTicket { queue: self }
+    }
+}
+
+struct StealerTicket<'a> {
+    queue: &'a StealerQueue,
+}
+
+impl Drop for StealerTicket<'_> {
+    fn drop(&mut self) {
+        *self.queue.serving.lock().unwrap() += 1;
+        // Every waiter sleeps on one condvar and only one of them holds the
+        // next ticket, so the wake has to be a broadcast.
+        self.queue.cond.notify_all();
+    }
+}
+
 /// thread_gil.c:89-90. Held in one cell because `rpy_init_mutexes` re-creates
 /// both of them together. The native wait queues do not retain the parent
 /// threads when the child replaces these synchronization objects.
 struct GilMutexes {
-    stealer: Mutex<()>,
+    stealer: StealerQueue,
     gil: Mutex2,
 }
 
 impl GilMutexes {
     const fn new() -> Self {
         GilMutexes {
-            stealer: Mutex::new(()),
+            stealer: StealerQueue::new(),
             gil: Mutex2::new_locked(),
         }
     }
@@ -401,7 +460,7 @@ fn acquire_slow_path(ident: usize) {
     // first-in-first-out order, this gives the threads a round-robin chance.
     {
         let mutexes = mutexes();
-        let _stealer = mutexes.stealer.lock().unwrap();
+        let _stealer = mutexes.stealer.lock();
         let mut gil = mutexes.gil.loop_start();
 
         // We are now the stealer thread. Steals!
