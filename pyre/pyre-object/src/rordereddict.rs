@@ -168,6 +168,16 @@ pub struct LiveIterMut<'a, K, V> {
     _mark: std::marker::PhantomData<&'a mut Option<Entry<K, V>>>,
 }
 
+// `entries` is derived from the `&'a mut [Option<Entry<K, V>>]` handed to
+// `new`, so the iterator holds that slice's unique borrow, and `front` / `back`
+// only ever move toward each other — no index is yielded twice and the two ends
+// cannot hand out the same item. That makes the raw pointer carry exactly the
+// thread-safety of `slice::IterMut`, whose bounds these mirror; storing it as a
+// pointer rather than a `FilterMap<slice::IterMut<_>>` is what dropped the auto
+// traits the iterator used to infer.
+unsafe impl<K: Send, V: Send> Send for LiveIterMut<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for LiveIterMut<'_, K, V> {}
+
 impl<'a, K, V> LiveIterMut<'a, K, V> {
     fn new(entries: &'a mut [Option<Entry<K, V>>]) -> Self {
         let len = entries.len();
