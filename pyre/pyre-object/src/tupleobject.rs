@@ -248,6 +248,13 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
 /// residual returning the fresh object pointer.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    w_tuple_new_from_slice(&items)
+}
+
+/// Slice-taking core of [`w_tuple_new`]. Residualized for the same
+/// moving-collector shadow-stack plumbing the tracer cannot model.
+#[majit_macros::dont_look_inside]
+pub fn w_tuple_new_from_slice(items: &[PyObjectRef]) -> PyObjectRef {
     if items.len() == 2 {
         // PyPy can use `_ff` here because its object space gives plain floats
         // value identity.  Pyre follows Python 3.14 pointer identity: `(x, x)`
@@ -264,7 +271,7 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         }
         return makespecialisedtuple2(items[0], items[1]);
     }
-    w_tuple_new_array_backed(items)
+    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
 }
 
 /// Word-ABI residual of a 1-tuple.
@@ -291,7 +298,7 @@ pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
 /// Residualized for the same GC-allocator reason as `w_tuple_new`.
 #[majit_macros::dont_look_inside]
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
-    w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
+    w_tuple_new_array_backed_impl(&items, get_instantiate(&TUPLE_TYPE), false)
 }
 
 /// Build the array-backed layout used by a tuple user subclass. This is the
@@ -302,11 +309,11 @@ pub fn w_tuple_subclass_new_array_backed(
     items: Vec<PyObjectRef>,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    w_tuple_new_array_backed_impl(items, w_class, true)
+    w_tuple_new_array_backed_impl(&items, w_class, true)
 }
 
 fn w_tuple_new_array_backed_impl(
-    items: Vec<PyObjectRef>,
+    items: &[PyObjectRef],
     w_class: PyObjectRef,
     user_layout: bool,
 ) -> PyObjectRef {
@@ -321,14 +328,14 @@ fn w_tuple_new_array_backed_impl(
     // post-relocation address. The `items_block` is filled only AFTER
     // those mallocs, from the relocated shadow-stack slots, mirroring
     // `pop_roots` reading the (possibly-moved) values back: the local
-    // `items` Vec still holds pre-collection addresses, and the
+    // `items` slice still holds pre-collection addresses, and the
     // `std::alloc`'d `items_block` is invisible to the collector until
     // `wrappeditems` is set, so filling it before the tuple malloc would
     // leave it pointing at evacuated nursery slots.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     let len = items.len();
-    for &item in &items {
+    for &item in items {
         let _ = crate::gc_roots::pin_root(item);
     }
 
@@ -386,10 +393,22 @@ fn w_tuple_new_array_backed_impl(
     // last allocation here, so it stays put until `wrappeditems` is set;
     // `alloc_tuple_items_block_gc` re-pins the relocated values across its
     // own (collecting) block malloc. Gate off it is the std::alloc block.
-    let relocated: Vec<PyObjectRef> = (0..len)
-        .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
-        .collect();
-    let mut items_block = unsafe { alloc_tuple_items_block_gc(&relocated) };
+    // Fixed-arity helpers top out at 8; longer tuples fall back to a Vec.
+    const STACK_CAP: usize = 8;
+    let mut stack_buf = [PY_NULL; STACK_CAP];
+    let heap_buf: Vec<PyObjectRef>;
+    let relocated: &[PyObjectRef] = if len <= STACK_CAP {
+        for i in 0..len {
+            stack_buf[i] = crate::gc_roots::shadow_stack_get(save_point + i);
+        }
+        &stack_buf[..len]
+    } else {
+        heap_buf = (0..len)
+            .map(|i| crate::gc_roots::shadow_stack_get(save_point + i))
+            .collect();
+        &heap_buf
+    };
+    let mut items_block = unsafe { alloc_tuple_items_block_gc(relocated) };
     // `alloc_tuple_items_block_gc` roots the fresh block only inside its own
     // `push_roots` frame, which it pops on return, so from here the block is a
     // livevar of *this* frame across the barrier below. That barrier is a

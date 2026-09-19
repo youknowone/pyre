@@ -7,7 +7,7 @@ use pyre_object::{
     is_list, is_list_iter, is_range_iter, is_seq_iter, is_str, is_tuple, is_tuple_iter, w_dict_new,
     w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem, w_list_len, w_list_new,
     w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8, w_str_len,
-    w_tuple_getitem, w_tuple_len, w_tuple_new,
+    w_tuple_getitem, w_tuple_len, w_tuple_new, w_tuple_new_from_slice,
 };
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -354,7 +354,7 @@ macro_rules! define_known_function_call_helper {
 macro_rules! define_flat_ref_helper {
     ($inner:ident, $name:ident $(, $arg:ident)*) => {
         pub extern "C" fn $name($($arg: i64),*) -> i64 {
-            $inner(&[$($arg),*])
+            $inner(&[$($arg as PyObjectRef),*])
         }
     };
 }
@@ -642,10 +642,23 @@ pub fn build_list_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
 pub fn build_tuple_from_refs(items: &[PyObjectRef]) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(items);
-    let live: Vec<PyObjectRef> = (0..items.len())
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
-        .collect();
-    w_tuple_new(live)
+    // Fixed-arity helpers top out at 8; longer tuples fall back to a Vec.
+    const STACK_CAP: usize = 8;
+    let len = items.len();
+    let mut stack_buf = [PY_NULL; STACK_CAP];
+    let heap_buf: Vec<PyObjectRef>;
+    let live: &[PyObjectRef] = if len <= STACK_CAP {
+        for i in 0..len {
+            stack_buf[i] = pyre_object::gc_roots::shadow_stack_get(base + i);
+        }
+        &stack_buf[..len]
+    } else {
+        heap_buf = (0..len)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect();
+        &heap_buf
+    };
+    w_tuple_new_from_slice(live)
 }
 
 /// BUILD_MAP evaluation, shared by the interpreter (`build_map`) and the JIT
@@ -969,30 +982,21 @@ pub fn binary_slice_values(
     }
 }
 
-fn i64_args_as_refs(args: &[i64]) -> Vec<PyObjectRef> {
-    let mut items = Vec::with_capacity(args.len());
-    for &arg in args {
-        items.push(arg as PyObjectRef);
-    }
-    items
+fn build_list_from_args(args: &[PyObjectRef]) -> i64 {
+    build_list_from_refs(args) as i64
 }
 
-fn build_list_from_args(args: &[i64]) -> i64 {
-    build_list_from_refs(&i64_args_as_refs(args)) as i64
+fn build_tuple_from_args(args: &[PyObjectRef]) -> i64 {
+    build_tuple_from_refs(args) as i64
 }
 
-fn build_tuple_from_args(args: &[i64]) -> i64 {
-    build_tuple_from_refs(&i64_args_as_refs(args)) as i64
-}
-
-fn build_map_from_args(args: &[i64]) -> i64 {
-    let items = i64_args_as_refs(args);
+fn build_map_from_args(args: &[PyObjectRef]) -> i64 {
     // Legacy fixed-arity BUILD_MAP residual reached only on the blackhole /
     // deopt path (the codewriter lowers BUILD_MAP through the array-based
     // `bh_build_map_from_array`).  An unhashable key raises; signal it through
     // `BH_LAST_EXC_VALUE` and return PY_NULL, like the other blackhole-only
     // residuals.
-    match build_map_from_refs(&items) {
+    match build_map_from_refs(args) {
         Ok(dict) => dict as i64,
         Err(mut err) => {
             let exc_obj = err.to_exc_object();
