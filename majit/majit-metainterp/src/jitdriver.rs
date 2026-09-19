@@ -21,22 +21,26 @@ thread_local! {
     /// rebuilding it on every guard failure is pure waste (the dominant
     /// per-deopt cost). Built once, lent via [`BackEdgeBhBuilder`], and
     /// re-pooled on drop, mirroring `call_jit.rs`'s `BH_BUILDER_RD`.
-    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<crate::blackhole::BlackholeInterpBuilder>> =
+    /// The slot holds a `Box` so a lease moves one pointer rather than the
+    /// builder itself (`warmspot.py` keeps one `BlackholeInterpBuilder` and
+    /// `blackhole.py resume_in_blackhole` reaches it through
+    /// `metainterp_sd.blackholeinterpbuilder`).
+    static BACK_EDGE_BH_BUILDER: std::cell::RefCell<Option<Box<crate::blackhole::BlackholeInterpBuilder>>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// RAII lease of the thread-local back-edge blackhole builder. Takes the
-/// pooled builder out for the duration of one resume and returns it on drop,
+/// pooled `Box` out for the duration of one resume and returns it on drop,
 /// so every early `return` in the resume path re-pools it. If the slot is
 /// empty — first use, or a re-entrant resume already holds it — a fresh
 /// builder is constructed; the surplus is simply dropped when re-pooling.
-struct BackEdgeBhBuilder(Option<crate::blackhole::BlackholeInterpBuilder>);
+struct BackEdgeBhBuilder(Option<Box<crate::blackhole::BlackholeInterpBuilder>>);
 
 impl BackEdgeBhBuilder {
     fn lease() -> Self {
         let builder = BACK_EDGE_BH_BUILDER
             .with(|c| c.borrow_mut().take())
-            .unwrap_or_else(crate::blackhole::build_inline_call_only_bh_builder);
+            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder()));
         Self(Some(builder))
     }
 }
@@ -52,13 +56,13 @@ impl Drop for BackEdgeBhBuilder {
 impl std::ops::Deref for BackEdgeBhBuilder {
     type Target = crate::blackhole::BlackholeInterpBuilder;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("builder leased")
+        self.0.as_deref().expect("builder leased")
     }
 }
 
 impl std::ops::DerefMut for BackEdgeBhBuilder {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().expect("builder leased")
+        self.0.as_deref_mut().expect("builder leased")
     }
 }
 
