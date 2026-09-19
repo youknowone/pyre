@@ -9763,6 +9763,82 @@ fn count_memory_fills(bytes: &[u8]) -> usize {
     fills
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NurseryArmStores {
+    i64: usize,
+    i32: usize,
+    i64_32: usize,
+    i64_16: usize,
+    i64_off0: usize,
+    i32_off0: usize,
+}
+
+fn bump_store(counts: &mut NurseryArmStores, op: &wasmparser::Operator<'_>) {
+    match op {
+        wasmparser::Operator::I64Store { memarg } => {
+            counts.i64 += 1;
+            if memarg.offset == 0 {
+                counts.i64_off0 += 1;
+            }
+        }
+        wasmparser::Operator::I32Store { memarg } => {
+            counts.i32 += 1;
+            if memarg.offset == 0 {
+                counts.i32_off0 += 1;
+            }
+        }
+        wasmparser::Operator::I64Store32 { .. } => counts.i64_32 += 1,
+        wasmparser::Operator::I64Store16 { .. } => counts.i64_16 += 1,
+        wasmparser::Operator::I32Store16 { .. } => counts.i64_16 += 1,
+        _ => {}
+    }
+}
+
+/// Stores in the `CallMallocNursery` overflow `if` (slow) and `else` (fast).
+fn nursery_malloc_arm_stores(bytes: &[u8]) -> (NurseryArmStores, NurseryArmStores) {
+    let mut slow = NurseryArmStores::default();
+    let mut fast = NurseryArmStores::default();
+    let mut pending_overflow = false;
+    let mut depth = 0i32;
+    let mut arm: Option<bool> = None; // false = slow, true = fast
+    count_operators(bytes, |op| {
+        match op {
+            wasmparser::Operator::I32GtU => pending_overflow = true,
+            wasmparser::Operator::If { .. } if pending_overflow && arm.is_none() => {
+                pending_overflow = false;
+                arm = Some(false);
+                depth = 1;
+            }
+            wasmparser::Operator::If { .. }
+            | wasmparser::Operator::Block { .. }
+            | wasmparser::Operator::Loop { .. }
+                if arm.is_some() =>
+            {
+                pending_overflow = false;
+                depth += 1;
+            }
+            wasmparser::Operator::Else if arm == Some(false) && depth == 1 => {
+                arm = Some(true);
+            }
+            wasmparser::Operator::End if arm.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    arm = None;
+                }
+            }
+            other => {
+                pending_overflow = false;
+                match arm {
+                    Some(false) => bump_store(&mut slow, other),
+                    Some(true) => bump_store(&mut fast, other),
+                    None => {}
+                }
+            }
+        }
+    });
+    (slow, fast)
+}
+
 fn tid_gc_store(obj: u32, tid: i64) -> Op {
     make_op(
         OpCode::GcStore,
@@ -10444,6 +10520,57 @@ fn call_malloc_nursery_uses_one_inline_bump() {
 /// `malloc_zero_filled=false`, so a New with no leftover GC-pointer
 /// fields emits no payload fill. The previous wasm lowering filled every
 /// New; that is the skip this test pins.
+#[test]
+fn call_malloc_nursery_tid_store_is_one_fast_path_header_store() {
+    let inputs = nursery_new_inputs(vec![
+        call_malloc_nursery(1, 32),
+        tid_gc_store(1, 53),
+        finish_int_arg0(),
+    ]);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    let (slow, fast) = nursery_malloc_arm_stores(&bytes);
+    // Fast path: bump (i32.store 0 of nursery_free) then one full-width
+    // header store of the tid constant at the bump pointer.
+    assert_eq!(fast.i32_off0, 1, "one nursery_free bump store: {fast:?}");
+    assert_eq!(
+        fast.i64_off0, 1,
+        "exactly one header store between bump and join: {fast:?}"
+    );
+    assert_eq!(fast.i64, 1, "fast path header store is full-width: {fast:?}");
+    assert_eq!(fast.i64_32, 0, "fast path must not HALFWORD-store tid: {fast:?}");
+    assert_eq!(fast.i64_16, 0, "fast path must not HALFWORD-store tid: {fast:?}");
+    // Slow path: HALFWORD tid so old-gen flags survive; no full-width header.
+    let halfword = slow.i64_32 + slow.i64_16;
+    assert_eq!(halfword, 1, "slow path keeps the HALFWORD tid store: {slow:?}");
+    assert_eq!(
+        slow.i64_off0, 0,
+        "slow path must not write a full-width header: {slow:?}"
+    );
+}
+
+#[test]
+fn call_malloc_nursery_without_tid_store_still_zeros_the_header() {
+    let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 32), finish_int_arg0()]);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    let (slow, fast) = nursery_malloc_arm_stores(&bytes);
+    assert_eq!(fast.i32_off0, 1, "one nursery_free bump store: {fast:?}");
+    assert_eq!(
+        fast.i64_off0, 1,
+        "fast path still zeros the header word: {fast:?}"
+    );
+    assert_eq!(fast.i64, 1, "{fast:?}");
+    assert_eq!(
+        slow.i64_32 + slow.i64_16,
+        0,
+        "slow path has no tid store to emit: {slow:?}"
+    );
+    assert_eq!(slow.i64_off0, 0, "slow path does not write the header: {slow:?}");
+}
+
 #[test]
 fn inline_nursery_new_does_not_fill_payload() {
     let inputs = nursery_new_inputs(vec![plain_new(1, 53), finish_int_arg0()], 53);

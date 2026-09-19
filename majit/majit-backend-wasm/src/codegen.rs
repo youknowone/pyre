@@ -4096,6 +4096,41 @@ fn aligned_varsize_frame_bump(size: i64) -> Option<u32> {
     Some(size.checked_add(7)? & !7)
 }
 
+/// `gen_initialize_tid` immediately after `CallMallocNursery`: a constant
+/// HALFWORD store of the type id into the header word at `obj - HDR_SIZE`.
+struct NurseryTidStore {
+    tid: i64,
+    offset: i64,
+    width: usize,
+}
+
+fn nursery_header_tid_store(
+    next: &Op,
+    malloc_result: OpRef,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<NurseryTidStore> {
+    if next.opcode != OpCode::GcStore || next.num_args() < 4 {
+        return None;
+    }
+    if next.arg(0).to_opref() != malloc_result {
+        return None;
+    }
+    let offset = const_operand_value(constants, next.arg(1).to_opref())?;
+    if offset != -(GcHeader::SIZE as i64) {
+        return None;
+    }
+    let width = const_operand_value(constants, next.arg(3).to_opref())?;
+    if width != (std::mem::size_of::<usize>() / 2) as i64 {
+        return None;
+    }
+    let tid = const_operand_value(constants, next.arg(2).to_opref())?;
+    Some(NurseryTidStore {
+        tid,
+        offset,
+        width: width as usize,
+    })
+}
+
 pub(crate) const BUILTIN_STRING_HASH_OFFSET: usize = 0;
 pub(crate) const BUILTIN_STRING_HASH_SIZE: usize = std::mem::size_of::<usize>();
 pub(crate) const BUILTIN_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
@@ -5993,6 +6028,7 @@ fn build_function(
     let mut ovf_flag_live = false;
     let mut fused_guard_at: Option<usize> = None;
     let mut fused_condcall_at: Option<usize> = None;
+    let mut skip_nursery_tid_store_at: Option<usize> = None;
     let frame_can_escape = ops
         .iter()
         .any(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2));
@@ -6034,6 +6070,10 @@ fn build_function(
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
+        if skip_nursery_tid_store_at == Some(op_idx) {
+            skip_nursery_tid_store_at = None;
+            continue;
+        }
         set_failarg_lookup_base(table_base_by_op[op_idx]);
         if frame_can_escape && ref_homes.len() != 0 && op.opcode.can_malloc() {
             emit_jitframe_write_barrier(&mut sink, jit_call_idx, residual_type_base, wb);
@@ -8199,9 +8239,12 @@ fn build_function(
             }
             // rewrite.py `CALL_MALLOC_NURSERY(ConstInt(size))`: size is the
             // already-rounded header+payload total. Fast path is malloc_cond
-            // (bump, zero the header word, return free+HDR). Slow path is
-            // `wasm_jit_alloc(0, payload)` — tid is written afterwards by
-            // `gen_initialize_tid`.
+            // (bump, write the physical header word, return free+HDR). Slow
+            // path is `wasm_jit_alloc(0, payload)` — a following HALFWORD tid
+            // store keeps old-gen TRACK_YOUNG_PTRS. When that store is the
+            // next op, the fast path writes the tid in the same header store
+            // (flags and padding stay zero) and the HALFWORD store runs only
+            // on this slow arm.
             OpCode::CallMallocNursery => {
                 let vi = op.pos().get().raw();
                 let size_const = const_operand_value(constants, op.arg(0).to_opref());
@@ -8215,6 +8258,17 @@ fn build_function(
                 };
                 let inlined = matches!((nursery, bump_size, payload), (Some(_), Some(_), Some(_)));
                 if let (Some(na), Some(bump_size), Some(payload)) = (nursery, bump_size, payload) {
+                    let header_tid = if !OpRef::raw_is_constant(vi) {
+                        ops.get(op_idx + 1).and_then(|next| {
+                            nursery_header_tid_store(next, op.pos().get(), constants)
+                        })
+                    } else {
+                        None
+                    };
+                    let header_word = header_tid.as_ref().map(|s| s.tid).unwrap_or(0);
+                    if header_tid.is_some() {
+                        skip_nursery_tid_store_at = Some(op_idx + 1);
+                    }
                     sink.i32_const(na.free_addr as i32);
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -8252,6 +8306,20 @@ fn build_function(
                         (!OpRef::raw_is_constant(vi)).then_some(vi),
                         frame,
                     );
+                    if let Some(tid_store) = header_tid {
+                        sink.local_tee(value_types.local(vi));
+                        sink.i64_eqz();
+                        sink.if_(BlockType::Empty);
+                        sink.else_();
+                        emit_resolve(&mut sink, constants, value_types, op.pos().get());
+                        sink.i32_wrap_i64();
+                        sink.i32_const(tid_store.offset as i32);
+                        sink.i32_add();
+                        sink.i64_const(tid_store.tid);
+                        emit_sized_int_store(&mut sink, 0, tid_store.width);
+                        sink.end();
+                        sink.local_get(value_types.local(vi));
+                    }
                     sink.else_();
                     sink.i32_const(na.free_addr as i32);
                     sink.local_get(alloc_size_local);
@@ -8260,11 +8328,11 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
-                    // Header word only: `genop_call_malloc_nursery`
-                    // `mov QWORD [rcx], 0`. Payload stays dirty; rewrite
-                    // owns tid / field init (`malloc_zero_filled = False`).
+                    // Physical header word. Tid is the low half when the
+                    // following HALFWORD store was folded in; otherwise zero.
+                    // Payload stays dirty (`malloc_zero_filled = False`).
                     sink.local_get(alloc_scratch_local);
-                    sink.i64_const(0);
+                    sink.i64_const(header_word);
                     sink.i64_store(MemArg {
                         offset: 0,
                         align: 3,
