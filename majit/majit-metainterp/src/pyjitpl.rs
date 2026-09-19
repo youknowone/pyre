@@ -6537,7 +6537,7 @@ impl<M: Clone> MetaInterp<M> {
         );
         let raising_exception = switch.is_some_and(|switch| switch.raising_exception);
         ctx.synchronize_virtualizable_after_guard_failure();
-        let vable = ctx.virtualizable_heap_ptr().map_or(0, |ptr| ptr as i64);
+        let vable = ctx.virtualizable_sync_target().map_or(0, |ptr| ptr as i64);
         if reason == crate::counters::ABORT_TOO_LONG {
             self.blackhole_if_trace_too_long();
         }
