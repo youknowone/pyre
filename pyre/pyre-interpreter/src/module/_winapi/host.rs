@@ -13,9 +13,9 @@
 
 use pyre_object::{PY_NULL, PyObjectRef, w_int_new, w_none, w_tuple_new};
 use rustpython_host_env::winapi as host_winapi;
+use rustpython_host_env::winapi::Handle as HANDLE;
 use std::os::windows::ffi::OsStringExt;
 use widestring::WideCString;
-use windows_sys::Win32::Foundation::HANDLE;
 
 use super::{IntArg, handle_w, w_handle, win32_code};
 

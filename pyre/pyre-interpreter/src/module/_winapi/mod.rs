@@ -26,10 +26,24 @@
 //! `ConnectNamedPipe`, `ReadFile` and `WriteFile` that produces one, which is
 //! what `multiprocessing.connection`'s `PipeConnection` is written against.
 
+#[cfg(feature = "host_env")]
+use rustpython_host_env::winapi::Handle as HANDLE;
+#[cfg(not(feature = "host_env"))]
 use windows_sys::Win32::Foundation::HANDLE;
 
 #[cfg(feature = "host_env")]
 use rustpython_host_env::winapi as host_winapi;
+
+fn invalid_handle_value() -> HANDLE {
+    #[cfg(feature = "host_env")]
+    {
+        rustpython_host_env::overlapped::INVALID_HANDLE_VALUE_ISIZE as HANDLE
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+    }
+}
 
 use crate::PyError;
 
@@ -806,7 +820,7 @@ crate::py_module! {
         crate::module_ns_store(
             ns,
             "INVALID_HANDLE_VALUE",
-            w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE),
+            w_handle(invalid_handle_value()),
         );
         // The launch half, registered by hand: the module is built without
         // `host_env` too, and there it stops at the constants and the calls

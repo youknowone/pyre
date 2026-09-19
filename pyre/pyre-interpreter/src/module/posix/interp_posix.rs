@@ -11383,10 +11383,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
 
         /// The descriptor's handle, or `None` when it names none.
-        fn fd_handle(fd: i32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        fn fd_handle(fd: i32) -> Option<host_nt::Handle> {
             let handle = host_nt::handle_from_fd(fd);
-            (!handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE)
-                .then_some(handle)
+            (!host_nt::is_invalid_handle(handle)).then_some(handle)
         }
 
         // os.dup(fd) -> new_fd.  `_Py_dup` makes the copy non-inheritable, so

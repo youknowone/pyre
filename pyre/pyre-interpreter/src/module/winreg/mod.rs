@@ -780,9 +780,8 @@ mod imp {
     /// units are read here instead and carried across as themselves
     /// (`PyUnicode_FromWideChar`).
     fn query_default_value(key: HKEY, sub_key: &WideCStr) -> Result<Wtf8Buf, crate::PyError> {
-        use windows_sys::Win32::Foundation::{
-            ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_MORE_DATA,
-        };
+        use rustpython_host_env::winreg::{ERROR_INVALID_HANDLE, ERROR_MORE_DATA};
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA};
         // The performance data root answers no default value, and the refusal
         // is spelled here rather than left to the registry.
         if key == host_reg::HKEY_PERFORMANCE_DATA {
@@ -923,10 +922,10 @@ mod imp {
                     &mut data_len,
                 )
             };
-            if rc == windows_sys::Win32::Foundation::ERROR_MORE_DATA {
+            if rc == host_reg::ERROR_MORE_DATA {
                 buf_data_size = buf_data_size
                     .checked_mul(2)
-                    .ok_or_else(|| win_err(windows_sys::Win32::Foundation::ERROR_MORE_DATA))?;
+                    .ok_or_else(|| win_err(host_reg::ERROR_MORE_DATA))?;
                 data.resize(buf_data_size as usize, 0);
                 continue;
             }
@@ -1003,8 +1002,7 @@ mod imp {
             return Err(crate::PyError::overflow_error("value is too long"));
         }
         if key == host_reg::HKEY_PERFORMANCE_DATA {
-            use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
-            return Err(win_err(ERROR_INVALID_HANDLE));
+            return Err(win_err(host_reg::ERROR_INVALID_HANDLE));
         }
         check(host_reg::set_default_value(
             key,
