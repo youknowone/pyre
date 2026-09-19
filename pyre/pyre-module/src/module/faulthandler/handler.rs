@@ -806,7 +806,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // status the hardware would have raised.
                 #[cfg(all(windows, feature = "host_env"))]
                 rustpython_host_env::faulthandler::raise_exception(
-                    EXCEPTION_INT_DIVIDE_BY_ZERO as u32,
+                    rustpython_host_env::faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO,
                     0,
                 );
                 #[cfg(unix)]

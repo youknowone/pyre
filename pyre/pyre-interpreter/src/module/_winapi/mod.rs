@@ -143,7 +143,7 @@ pub mod overlapped;
 mod process {
     use pyre_object::{PyObjectRef, w_int_new, w_none, w_tuple_new};
     use rustpython_host_env::winapi as host_winapi;
-    use rustpython_host_env::winapi::{CSTR_EQUAL, HANDLE, LCMAP_UPPERCASE};
+    use rustpython_host_env::winapi::{CSTR_EQUAL, Handle as HANDLE, LCMAP_UPPERCASE};
     use rustpython_wtf8::Wtf8Buf;
     use widestring::WideCString;
 
