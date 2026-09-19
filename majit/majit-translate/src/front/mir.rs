@@ -11786,27 +11786,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `f64::abs(x)` is `float_abs` (`lloperation.py` /
-                // `rfloat.rtype_abs`).  Opaque in core, so the callsite
-                // would skip as an unregistered FunctionPath.
-                if args.len() == 1 && self.is_f64_abs(&reg) {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::UnaryOp {
-                            op: "abs".to_string(),
-                            operand: args[0].clone(),
-                            result_ty: ValueType::Float,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(res);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // Opaque `f64::{hypot,atan2,copysign,floor,ceil,powf,ln,
                 // exp,sin,cos,sqrt,log10,atan,tan,asin,acos,…}` are the C
                 // llexternals in `ll_math.py` (`math_hypot`, …), listed by
@@ -16739,17 +16718,6 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_nan")
-    }
-
-    /// `f64::abs(self)` — `core` has no graph body (Opaque).  `rfloat`
-    /// / `lloperation.py float_abs` is the corresponding foldable llop.
-    fn is_f64_abs(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::abs")
     }
 
     /// Opaque `f64` math leaves that `ll_math.py` registers as C

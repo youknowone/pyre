@@ -3261,9 +3261,8 @@ impl<'a> Transformer<'a> {
                 }])
             }
             // `lloperation.py float_abs` / `blackhole.py bhimpl_float_abs`.
-            // The front lowers `f64::abs` to UnaryOp("abs"); stamp the
-            // float bank and emit the same `float_abs/f>f` the assembler
-            // already wires.
+            // Stamp the float bank and emit the same `float_abs/f>f` the
+            // assembler already wires.
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
