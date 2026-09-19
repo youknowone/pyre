@@ -1532,12 +1532,19 @@ pub(crate) unsafe fn subclass_special_override(
     obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let obj = pyre_object::gc_roots::pin_root(obj);
+    // Do not pin at the head: `pin_root` / `shadow_stack_get` are
+    // `dont_look_inside`, and a residual on the exact-builtin return is
+    // recorded by every walker that descends this body (`_len` /
+    // `builtin_len_descent`, getitem, binop). Exact builtins never
+    // collect here. MayForce C ABI copies are published in the `jit_*`
+    // shims. Publish only on the override-lookup path, which can
+    // allocate, then reload `obj` before reading `ob_type`.
     if pyre_object::is_exact_builtin_instance(obj) {
         return None;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let obj = pyre_object::gc_roots::pin_root(obj);
     let w_type = crate::typedef::r#type(obj)?;
     let method = lookup_in_type_where(w_type.as_ptr(), name)?;
     // The builtin layout type for `obj` — the canonical type object for its
