@@ -835,6 +835,32 @@ impl Drop for CompileSnapshotRootsGuard {
     }
 }
 
+/// RAII guard that clears `MetaInterp.compile_tracing` on drop.
+///
+/// Compile paths that consume the recorder park it in that slot so
+/// `walk_active_trace_refs` still forwards its ConstPtrs until intern
+/// or drop. The guard empties the slot on every exit, including `?`
+/// and panic, so a leftover recorder cannot outlive the compile window.
+pub(crate) struct CompileTracingGuard(*mut Option<TraceCtx>);
+
+impl CompileTracingGuard {
+    pub(crate) fn new(slot: &mut Option<TraceCtx>) -> Self {
+        Self(slot as *mut _)
+    }
+}
+
+impl Drop for CompileTracingGuard {
+    fn drop(&mut self) {
+        // SAFETY: constructed from `&mut Option<TraceCtx>` on
+        // `MetaInterp.compile_tracing` and dropped before that field
+        // is invalidated. Compile paths that finish intern take the
+        // recorder out first; Drop then stores `None` into an empty slot.
+        unsafe {
+            *self.0 = None;
+        }
+    }
+}
+
 /// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
 /// must number as TAGBOX. `make_constant_box` already refuses that fold
 /// in the optimizer; the tracer can still snapshot the concrete address
@@ -6312,12 +6338,17 @@ impl<M: Clone> MetaInterp<M> {
             &dyn Fn(&JitCellToken, &[Value]) -> Option<()>,
         ) -> R,
     ) -> Option<R> {
-        // Move the trace out while the runtime closures run.  RPython's
-        // MetaInterp owns both history and warmrunnerstate and can mutate the
-        // latter from `do_recursive_call`; keeping `self.tracing` borrowed in
-        // place would artificially prohibit the same disjoint-field access in
-        // Rust.  It is restored before returning.
-        let mut tracing = self.tracing.take()?;
+        // Keep the recorder in `compile_tracing` while the runtime closures
+        // run. RPython's MetaInterp owns both history and warmrunnerstate
+        // and can mutate the latter from `do_recursive_call`; keeping
+        // `self.tracing` borrowed in place would artificially prohibit the
+        // same disjoint-field access in Rust. The walk still finds the
+        // recorder if a collection happens in this window. Restored to
+        // `tracing` before returning. CompileTracingGuard is not used:
+        // it clears the slot on drop, and this path must put the recorder
+        // back so later steps keep recording.
+        self.compile_tracing = self.tracing.take();
+        let tracing = self.compile_tracing.as_mut()?;
         let compiled_loops = &self.compiled_loops;
         let staticdata = &self.staticdata;
         let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
@@ -6493,7 +6524,7 @@ impl<M: Clone> MetaInterp<M> {
             result.is_finish.then_some(())
         };
         let result = f(
-            &mut tracing,
+            tracing,
             &mut self.framestack,
             &resolver,
             &recursive_target,
@@ -6503,7 +6534,7 @@ impl<M: Clone> MetaInterp<M> {
             &recursive_exec_float,
             &recursive_exec_void,
         );
-        self.tracing = Some(tracing);
+        self.tracing = self.compile_tracing.take();
         Some(result)
     }
 
@@ -7263,10 +7294,13 @@ impl<M: Clone> MetaInterp<M> {
         finish_args: &[OpRef],
     ) -> Option<(TreeLoop, indexmap::IndexMap<u32, i64>)> {
         self.force_finish_trace = false;
-        let mut ctx = self.tracing.take()?;
+        self.compile_tracing = self.tracing.take();
+        let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
+        let ctx = self.compile_tracing.as_mut()?;
         let green_key = ctx.green_key;
         ctx.finish(finish_args, crate::make_fail_descr(finish_args.len()));
         let constants = indexmap::IndexMap::new();
+        let ctx = self.compile_tracing.take().unwrap();
         let trace = ctx.into_tree_loop();
         self.warm_state.abort_tracing(green_key, false);
         // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
@@ -7826,10 +7860,16 @@ impl<M: Clone> MetaInterp<M> {
             self.speculative_cut_owned_key = Some(cut_key);
         }
         self.force_finish_trace = false;
-        let mut ctx = self.tracing.take().unwrap();
+        self.compile_tracing = self.tracing.take();
+        let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
         // Cache driver descriptor before ctx is partially consumed below;
         // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
-        let driver_descriptor = ctx.driver_descriptor().cloned();
+        let driver_descriptor = self
+            .compile_tracing
+            .as_ref()
+            .unwrap()
+            .driver_descriptor()
+            .cloned();
         // pyjitpl.py: compile_loop(original_boxes, live_arg_boxes,
         // start) always compiles from the merge point registered by the
         // first header visit — `start` and `original_boxes` come from
@@ -7841,40 +7881,47 @@ impl<M: Clone> MetaInterp<M> {
         // prefix from the guard to the header must be cut off — otherwise
         // the root entry contract pairs the guard's fail-arg inputargs
         // with the merge point's full-shape JUMP and aborts on arity.
-        let n_inputargs = ctx.num_inputargs();
-        let cut_merge_point = ctx
-            .get_merge_point_at(green_key, ctx.header_pc)
-            .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
         // Resolve while `ctx` is still whole (before `ctx.constants` is moved
         // out below) so `patch_new_loop_to_load_virtualizable_fields` can
         // read the heap object via `vinfo.get_array_length(vable, i)`
-        // (compile.py:443).
-        let orig_vable_ptr_loop =
-            self.orig_vable_ptr_for_cut(cut_merge_point, &ctx, driver_descriptor.as_ref());
-        let cross_loop_cut = cut_merge_point.map(|mp| {
-            (
-                mp.green_boxes.clone(),
-                crate::history::TreeLoopCutPosition::new(
-                    mp.position.tree_loop_op_index(n_inputargs),
-                ),
-            )
-        });
-
-        // compile.py:221: call_pure_results = metainterp.call_pure_results
-        let call_pure_results = ctx.call_pure_results.clone();
+        // (compile.py patch_new_loop_to_load_virtualizable_fields). Clone
+        // merge-point data out of the parked ctx
+        // so later `&mut` accesses do not fight a live `&MergePoint`.
+        let (orig_vable_ptr_loop, cross_loop_cut, call_pure_results) = {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            let n_inputargs = ctx.num_inputargs();
+            let cut_merge_point = ctx
+                .get_merge_point_at(green_key, ctx.header_pc)
+                .filter(|mp| mp.position.has_prefix_ops(n_inputargs));
+            let orig_vable_ptr_loop =
+                self.orig_vable_ptr_for_cut(cut_merge_point, ctx, driver_descriptor.as_ref());
+            let cross_loop_cut = cut_merge_point.map(|mp| {
+                (
+                    mp.green_boxes.clone(),
+                    crate::history::TreeLoopCutPosition::new(
+                        mp.position.tree_loop_op_index(n_inputargs),
+                    ),
+                )
+            });
+            // compile.py compile_simple_loop: call_pure_results = metainterp.call_pure_results
+            let call_pure_results = ctx.call_pure_results.clone();
+            (orig_vable_ptr_loop, cross_loop_cut, call_pure_results)
+        };
 
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         // resume.py ResumeDataLoopMemo.number reads encoded arrays directly.
         // The materialized cut adapter still needs snapshots to remap their
         // box namespace; an uncut trace can build the final maps immediately.
-        let byte_snapshot_maps = (cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer())
-            .then(|| snapshot_maps_from_ctx(&mut ctx, &mut constants));
+        let byte_snapshot_maps = {
+            let ctx = self.compile_tracing.as_mut().unwrap();
+            (cross_loop_cut.is_none() && ctx.recorder.has_byte_buffer())
+                .then(|| snapshot_maps_from_ctx(ctx, &mut constants))
+        };
         let snapshots = if byte_snapshot_maps.is_some() {
             Vec::new()
         } else {
-            ctx.take_snapshots()
+            self.compile_tracing.as_mut().unwrap().take_snapshots()
         };
-        let mut recorder = ctx.recorder;
         // RPython heapcache.py:176: every trace gets at least one
         // GUARD_NOT_INVALIDATED. This allows external invalidation
         // (via JitCellToken.invalidate()) to force compiled loops
@@ -7885,7 +7932,15 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2969: GUARD_FUTURE_CONDITION and heapcache.py:176:
         // GUARD_NOT_INVALIDATED are both emitted during tracing in
         // close_loop_args_at (state.rs) via record_guard → capture_resumedata.
-        recorder.close_loop(jump_args);
+        self.compile_tracing
+            .as_mut()
+            .unwrap()
+            .recorder
+            .close_loop(jump_args);
+        // Taking the parked ctx ends walk_active_trace_refs coverage;
+        // compile_snapshot_refs roots the final maps below.
+        let mut ctx = self.compile_tracing.take().unwrap();
+        let mut recorder = ctx.recorder;
         // Only the materialized cut/legacy path needs TreeLoop snapshots.
         // Uncut byte snapshots already live in the final maps above.
         let mut trace = recorder.get_trace();
@@ -9794,10 +9849,11 @@ impl<M: Clone> MetaInterp<M> {
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let retracing_from = self.retracing_from.take();
-        let mut ctx = match self.tracing.take() {
-            Some(ctx) => ctx,
-            None => return false,
-        };
+        self.compile_tracing = self.tracing.take();
+        let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
+        if self.compile_tracing.is_none() {
+            return false;
+        }
         let (
             green_key,
             driver_descriptor,
@@ -9808,8 +9864,13 @@ impl<M: Clone> MetaInterp<M> {
             call_pure_results,
             phase2_input_ops_seed,
         ) = {
-            let driver_descriptor = ctx.driver_descriptor().cloned();
-            // `compile.py:341-347` takes `start` as a parameter; there is no
+            let driver_descriptor = self
+                .compile_tracing
+                .as_ref()
+                .unwrap()
+                .driver_descriptor()
+                .cloned();
+            // `compile.py compile_retrace` takes `start` as a parameter; there is no
             // upstream `compile_retrace` without one. Requiring it here rather
             // than degrading to the uncut path makes the `else { trace }` arm
             // below provably dead, so it can be deleted outright once the
@@ -9821,58 +9882,71 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let retrace_merge_point = ctx
-                .merge_point_at_start(retrace_pos)
-                .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()));
-            // compile.py:347 `trace = metainterp.history.trace.cut_trace_from(
-            // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
-            // caller's single merge-point selection (pyjitpl.py:3019), and
-            // handed straight down, so upstream has no "merge point not found"
-            // state here and there is nothing for a fallback to mirror.
-            //
-            // Proceeding with the UNCUT trace is not a lesser outcome, it is an
-            // undefined one: `combined_ops` still prepends `partial.ops`, which
-            // covers [0, retracing_from), to a body optimized from position 0,
-            // so the prefix appears twice; and `root_inputargs` keeps coming
-            // from `partial.inputargs` while the body references the recorder
-            // namespace. Nothing downstream is built to reject that shape —
-            // `normalize_root_loop_entry_contract` compares LABEL against JUMP
-            // arity within the same optimized output and passes
-            // `root_inputargs` through untouched, and the closing-JUMP cancel
-            // rejects only foreign-target closes, which a self-close is not.
-            //
-            // Refuse instead; the caller reads `false` as pyjitpl.py:3004
-            // "creation of the loop was cancelled".
-            if retrace_merge_point.is_none() {
-                crate::debug::log_one(
-                    "jit-abort",
-                    "compile_retrace: no merge point at retracing_from start \
-                     — declining rather than assembling an uncut trace",
+            let (orig_vable_ptr_retrace, retrace_cut, initial_inputarg_consts, call_pure_results) = {
+                let ctx = self.compile_tracing.as_ref().unwrap();
+                let retrace_merge_point = ctx
+                    .merge_point_at_start(retrace_pos)
+                    .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()));
+                // compile.py compile_retrace `trace = metainterp.history.trace.cut_trace_from(
+                // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
+                // caller's single merge-point selection (pyjitpl.py reached_loop_header), and
+                // handed straight down, so upstream has no "merge point not found"
+                // state here and there is nothing for a fallback to mirror.
+                //
+                // Proceeding with the UNCUT trace is not a lesser outcome, it is an
+                // undefined one: `combined_ops` still prepends `partial.ops`, which
+                // covers [0, retracing_from), to a body optimized from position 0,
+                // so the prefix appears twice; and `root_inputargs` keeps coming
+                // from `partial.inputargs` while the body references the recorder
+                // namespace. Nothing downstream is built to reject that shape —
+                // `normalize_root_loop_entry_contract` compares LABEL against JUMP
+                // arity within the same optimized output and passes
+                // `root_inputargs` through untouched, and the closing-JUMP cancel
+                // rejects only foreign-target closes, which a self-close is not.
+                //
+                // Refuse instead; the caller reads `false` as pyjitpl.py reached_loop_header
+                // "creation of the loop was cancelled".
+                if retrace_merge_point.is_none() {
+                    crate::debug::log_one(
+                        "jit-abort",
+                        "compile_retrace: no merge point at retracing_from start \
+                         — declining rather than assembling an uncut trace",
+                    );
+                    return false;
+                }
+                let n_inputargs = ctx.num_inputargs();
+                let retrace_cut = retrace_merge_point.map(|mp| {
+                    (
+                        mp.green_boxes.clone(),
+                        crate::history::TreeLoopCutPosition::new(
+                            mp.position.tree_loop_op_index(n_inputargs),
+                        ),
+                    )
+                });
+                let orig_vable_ptr_retrace = self.orig_vable_ptr_for_cut(
+                    retrace_merge_point,
+                    ctx,
+                    driver_descriptor.as_ref(),
                 );
-                return false;
-            }
-            let n_inputargs = ctx.num_inputargs();
-            let retrace_cut = retrace_merge_point.map(|mp| {
+                // The recorder carries Const values inline on the OpRef variants
+                // (history.py ConstInt / ConstFloat / ConstPtr), so there is no legacy TraceCtx
+                // ConstantPool to snapshot — this typed-constant map starts fresh.
+                let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
+                let call_pure_results = ctx.call_pure_results.clone();
                 (
-                    mp.green_boxes.clone(),
-                    crate::history::TreeLoopCutPosition::new(
-                        mp.position.tree_loop_op_index(n_inputargs),
-                    ),
+                    orig_vable_ptr_retrace,
+                    retrace_cut,
+                    initial_inputarg_consts,
+                    call_pure_results,
                 )
-            });
-            let orig_vable_ptr_retrace =
-                self.orig_vable_ptr_for_cut(retrace_merge_point, &ctx, driver_descriptor.as_ref());
-            // The recorder carries Const values inline on the OpRef variants
-            // (history.py:227/268/314), so there is no legacy TraceCtx
-            // ConstantPool to snapshot — this typed-constant map starts fresh.
+            };
             let constants: majit_ir::ConstMap<majit_ir::Value> = majit_ir::ConstMap::default();
-            let initial_inputarg_consts = ctx.initial_inputarg_consts.clone();
-            let call_pure_results = ctx.call_pure_results.clone();
 
             // compile.py:358-362 records the closing JUMP on the same history
             // that `cut_trace_from` views. Rust materializes TreeLoop eagerly,
             // so close once, then cut the completed trace.
-            ctx.close_loop(jump_args);
+            self.compile_tracing.as_mut().unwrap().close_loop(jump_args);
+            let ctx = self.compile_tracing.take().unwrap();
             let trace = ctx.into_tree_loop();
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 if crate::majit_log_enabled() {
@@ -10948,16 +11022,7 @@ impl<M: Clone> MetaInterp<M> {
         // Taking it out of `tracing` stops a re-entrant record; dropping it
         // before compile intern would reopen the nursery-ConstPtr window.
         self.compile_tracing = self.tracing.take();
-        let compile_tracing_slot = &raw mut self.compile_tracing;
-        struct CompileTracingGuard(*mut Option<TraceCtx>);
-        impl Drop for CompileTracingGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    *self.0 = None;
-                }
-            }
-        }
-        let _compile_tracing_guard = CompileTracingGuard(compile_tracing_slot);
+        let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
         // compile.py:510 `vable = orig_inpargs[index_of_virtualizable].getref_base()`.
         // Resolve the constant Ref that the tracer stashed for the
         // virtualizable inputarg at trace-start so
@@ -11526,19 +11591,36 @@ impl<M: Clone> MetaInterp<M> {
         );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
-        let mut ctx = self.tracing.take()?;
-        let green_key = ctx.green_key;
-        let driver_descriptor = ctx.driver_descriptor().cloned();
+        self.compile_tracing = self.tracing.take();
+        let _compile_tracing_guard = CompileTracingGuard::new(&mut self.compile_tracing);
+        if self.compile_tracing.is_none() {
+            return None;
+        }
+        let green_key = self.compile_tracing.as_ref().unwrap().green_key;
+        let driver_descriptor = self
+            .compile_tracing
+            .as_ref()
+            .unwrap()
+            .driver_descriptor()
+            .cloned();
         // compile.py:510 parity — capture orig_inpargs[idx].getref_base()
         // before `ctx.recorder` is moved. Used by the send_loop_to_backend
         // hook below.
-        let orig_vable_ptr_simple =
-            self.orig_vable_ptr_from_trace_ctx(&ctx, driver_descriptor.as_ref());
+        let orig_vable_ptr_simple = {
+            let ctx = self.compile_tracing.as_ref().unwrap();
+            self.orig_vable_ptr_from_trace_ctx(ctx, driver_descriptor.as_ref())
+        };
 
-        let call_pure_results = ctx.call_pure_results.clone();
+        let call_pure_results = self
+            .compile_tracing
+            .as_ref()
+            .unwrap()
+            .call_pure_results
+            .clone();
         let mut constants: majit_ir::ConstMap<majit_ir::Value> = Default::default();
         // resume.py ResumeDataLoopMemo.number reads byte arrays directly;
         // keep only the final maps that the optimizer consumes and roots.
+        let mut ctx = self.compile_tracing.take().unwrap();
         let snapshot_maps = snapshot_maps_from_ctx(&mut ctx, &mut constants);
         let recorder = ctx.recorder;
         let trace = recorder.get_trace();
@@ -17002,9 +17084,20 @@ impl<M: Clone> MetaInterp<M> {
                 }
             })
             .collect();
-        if let Some(mut ctx) = self.tracing.take() {
-            self.initialize_virtualizable(&mut ctx, &live);
-            self.tracing = Some(ctx);
+        if self.tracing.is_some() {
+            // `initialize_virtualizable` can collect in `clear_vable_token` /
+            // `force_now`. Park so `walk_active_trace_refs` still forwards
+            // ConstPtrs. CompileTracingGuard is not used: it clears the slot
+            // on drop, and this path must put the recorder back.
+            self.compile_tracing = self.tracing.take();
+            let ctx_ptr = self.compile_tracing.as_mut().unwrap() as *mut TraceCtx;
+            // SAFETY: `initialize_virtualizable` mutates `ctx` and other
+            // MetaInterp fields, but not `compile_tracing` itself. The
+            // pointer is the same split that `tracing.take()` used to
+            // satisfy the borrow checker, parked so a collection in
+            // `force_now` can still walk the recorder.
+            self.initialize_virtualizable(unsafe { &mut *ctx_ptr }, &live);
+            self.tracing = self.compile_tracing.take();
         }
     }
 
