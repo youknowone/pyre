@@ -1,4 +1,4 @@
-name: pyre CPython suite (weekly)
+name: pyre weekly
 
 # Non-gating exploratory run of the FULL CPython suite -- every module,
 # including the ones that fail today -- to catch a recorded verdict going
@@ -7,6 +7,10 @@ name: pyre CPython suite (weekly)
 # `--full` reports a regression against the baseline instead of failing on it,
 # but still exits nonzero, and withholds its report, when its buckets do not
 # account for every module it selected.
+#
+# `sandbox-build` rides the same schedule: the sandbox fails-closed proofs and
+# the wasm web binding's compile check. It shares nothing with the suite but
+# the trigger, and extracts its own LLBC.
 
 on:
   schedule:
@@ -110,3 +114,111 @@ jobs:
       with:
         name: cpython-suite-reports
         path: reports/
+
+  sandbox-build:
+    name: sandbox e2e + wasm web build (ubuntu-24.04)
+    # Here rather than in pyre CI: the job measured about an hour of runner
+    # time per run (2026-09-18, runs 35360056647 and 35374173862), almost all
+    # of it three release builds no other job shares a feature set with.
+    # `workflow_dispatch` runs it on demand for a change that touches the host
+    # seam, the seccomp allowlist or the web binding.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # The sandbox `pyre` binary still pulls pyre-jit, whose build needs the
+      # extracted LLBC.
+      PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
+      CHARON_VERSION: nightly-2026.05.29
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
+        # Restore what pyre CI saved on main and save nothing: an entry written
+        # once a week is evicted before the next run reads it, and until then
+        # it takes about a gigabyte of the 10 GB budget from the other jobs.
+        shared-key: ${{ runner.arch }}
+        save-if: false
+    - name: Cache Charon binary
+      id: charon-cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          .pyre-build/charon
+          .pyre-build/charon-src
+        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
+        restore-keys: |
+          charon-bin-${{ runner.os }}-${{ runner.arch }}-
+    - name: Install Charon
+      if: steps.charon-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/install-charon.py
+    - name: Compute LLBC fingerprint
+      id: llbc-fingerprint
+      shell: bash
+      run: |
+        value="$(scripts/extract-llbc.py --fingerprint majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit)"
+        echo "value=${value}" >> "$GITHUB_OUTPUT"
+    - name: Cache LLBC
+      id: llbc-cache
+      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: build/llbc
+        key: llbc3-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
+        # A miss with no prefix to fall back on restores nothing and re-extracts
+        # all four crates. A loose restore is safe: `extract-llbc.py` re-judges
+        # each crate against the tree and re-extracts the ones that moved.
+        restore-keys: |
+          llbc3-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
+    - name: Extract LLBC
+      if: steps.llbc-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: scripts/extract-llbc.py majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Build pyre-wasm web binding
+      # Compile check only: nothing here runs the browser binding, and the
+      # `pyre/check.py` job overwrites pyre_wasm.wasm with its own wasm-host
+      # build before it snapshots and runs that module. It runs here, and
+      # first, because this job already carries the checkout, toolchain, Cargo
+      # cache and prepared Charon/LLBC set the build needs, and finishes well
+      # inside the wall time of the check.py leg it used to sit in.
+      #
+      # It was placed ahead of check.py on the premise that the two wasm
+      # flavours would share compiled dependencies. Measured: the web build
+      # takes 6m and leaves the later wasm-host build 50s cheaper (2m32 ->
+      # 1m42), because check.py sets RUSTFLAGS the web build does not and half
+      # the graph recompiles under the difference. So the sharing is real and
+      # costs about seven times what it returns.
+      run: |
+        cargo build --release -p pyre-wasm \
+          --target wasm32-unknown-unknown \
+          --no-default-features --features web
+    - name: Build pyre --features sandbox
+      # A green sandbox build is the fails-closed proof: every mediated module
+      # names libc through host_seam::sys, so any direct syscall left outside
+      # the seam fails to compile here. On Linux `sandbox` installs the seccomp
+      # backstop by default, so this also compile-checks the install path.
+      run: cargo build --release -p pyrex --bin pyre --features sandbox
+    - name: Sandbox compile-out fence (clippy)
+      # Extends the fails-closed proof beyond libc. host_seam::sys already makes
+      # a stray `libc::` syscall fail to compile under sandbox; this forbids the
+      # non-libc host surface too (std::fs / std::env / std::io stdio /
+      # std::process / std::net) in the untrusted interpreter. `--no-deps` scopes
+      # it to pyre-interpreter's own code — the trusted `pyre-sandbox` controller
+      # and the host-side build script are exempt. CLIPPY_CONF_DIR points clippy
+      # at ci/clippy-sandbox/clippy.toml, which normal clippy never discovers, so
+      # a green run proves no raw host call survives in sandbox-live code.
+      env:
+        CLIPPY_CONF_DIR: ${{ github.workspace }}/ci/clippy-sandbox
+      run: cargo clippy -p pyre-interpreter --no-deps --features sandbox,dynasm -- -A clippy::all -D clippy::disallowed_methods -D clippy::disallowed_types
+    - name: Run sandbox end-to-end suite
+      # Exercises the compile-out sandbox (virtual FS + escape blocking) through
+      # the controller. On Linux the e2e binary (built `--features sandbox`)
+      # installs the seccomp allowlist, so this run also RUNTIME-VALIDATES it: a
+      # syscall the interpreter needs but the allowlist omits makes the child
+      # SIGSYS (exit 159) and fails the suite.
+      run: cargo test --release -p pyre-sandbox --test e2e_interact -- --ignored --nocapture
