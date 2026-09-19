@@ -833,17 +833,26 @@ impl OptVirtualize {
             // identify, but a spelling that only ever appears on reads never
             // reaches that check, and this is the side that resolves it.
             //
-            // `virtualize.py` `optimize_GETFIELD_GC_*` folds only a field
-            // stored on the virtual. A descr whose `index_in_parent` is not
-            // that slot of this SizeDescr was never stored under its own
-            // identity; answering the slot would forward a different field.
-            // Skip the lookup and take the zero fold below
-            // (`virtualize.py` — the allocation is still zero there).
+            // It does reach here.  `PYFRAME_VABLE_TOKEN_FIELD_DESCR`
+            // (`pyre-jit-trace descr.rs`) describes `PyFrame.vable_token` at
+            // its byte offset with a placeholder `index_in_parent: 0` and no
+            // parent, because the positional census that assigns the real
+            // indices deliberately does not list the field -- upstream carries
+            // it as `rvirtualizable.py` `_setup_repr_llfields`'s appended `('vable_token',
+            // llmemory.GCREF)` and pyre registers it as an extra GC edge so
+            // `clear_gc_fields` zeroes it.  Slot 0 of that layout is
+            // `PyFrame.locals_cells_stack_w`, so `field_idx` addressed the
+            // locals array and `get_field` forwarded a live array pointer as
+            // the frame's token; `emit_force_virtualizable` reads that token
+            // with GETFIELD_GC_R to decide whether the frame is JIT-owned, and
+            // a non-null pointer reads as owned on a frame that has no token.
             //
-            // `vable_token` is a positional GCREF on the PyFrame SizeDescr
-            // (`rvirtualizable.py` `_setup_repr_llfields`), so it identifies
-            // its slot. This skip is for other descr spellings that do not
-            // (header-only / extra-edge fields, a foreign SizeDescr).
+            // A field the positional list does not hold cannot have been stored
+            // under its own identity either, so this is exactly
+            // `virtualize.py` `optimize_GETFIELD_GC_I`'s state: the trace never stored it and the
+            // read answers the zeroed allocation.  Skip the slot lookup and
+            // take the zero fold below -- which for `vable_token` is the
+            // correct value, a virtual frame having never been forced.
             //
             // Not gated on `debug_assertions`: the resolution it guards runs in
             // release, so the guard has to.  `Virtualizable` is not covered --
