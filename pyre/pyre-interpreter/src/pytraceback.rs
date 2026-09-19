@@ -155,22 +155,22 @@ pub fn w_pytraceback_new(
     lineno: i64,
     w_code: PyObjectRef,
 ) -> PyObjectRef {
-    // `frame` is pinned alongside the two managed fields, because the
-    // allocation below can safepoint and a raw `*mut PyFrame` held only in
-    // this function's locals is reachable from no root walker.  Most frames
-    // are allocated non-moving (`FrameBox::new`), which is what lets raw
-    // copies exist elsewhere at all — `FrameBox::deref` reads its raw field
-    // while holding a forwarding-capable `owner_root` it never reads back,
-    // `eval_loop` runs behind a `&mut PyFrame` across a safepoint, and the
-    // blackhole keeps the virtualizable as a bare integer.  It is not every
-    // frame: a compiled trace's inlined-callee frame is a nursery
-    // allocation, so a minor collection triggered by this very allocation
-    // recycles it and any slot built from a pre-allocation copy names freed
-    // bytes for the rest of the node's life.  Upstream needs no bracket
-    // here — a minor relocates the frame and rewrites the slot
-    // (`incminimark.py:2237` / `:2252`).
+    // `pytraceback.py PyTraceback` is an ordinary `W_Root` (`malloc_fixedsize`).
+    // Collecting nursery so a node that dies in the handler does not wait for
+    // a major cycle.  JIT-emitted nodes already use the movable SizeDescr
+    // (`descr.rs jit_emitted_tracebacks_are_movable_but_raw_pointer_objects_are_not`).
+    // Host nodes match that placement because every live traceback pointer is a
+    // traced field (`W_BaseException.w_traceback`, `PyTraceback.w_next`) or a
+    // rooted slot (`fbw_store_journal_root_walker` for `FBW_TRACEBACK_STORE_JOURNAL`).
+    // Blackhole / resume carriers hold the exception as a raw i64, not the node.
+    // `frame` / `w_next` / `w_code` are pinned because this allocation can
+    // safepoint and a raw `*mut PyFrame` held only in locals is reachable from
+    // no root walker.  Most frames are allocated non-moving (`FrameBox::new`);
+    // a compiled trace's inlined-callee frame is a nursery object, so a minor
+    // triggered here would recycle an unrooted copy.
+    let w_class = get_instantiate(&PYTRACEBACK_TYPE);
     let roots = pyre_object::gc_roots::push_roots();
-    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef]);
+    let inputs = pyre_object::gc_roots::pin_roots(&[w_next, w_code, frame as PyObjectRef, w_class]);
 
     // Nursery, same as `space.allocate_instance(PyTraceback)` /
     // `malloc_fixedsize`.  The host-side constructor used to take
@@ -197,7 +197,7 @@ pub fn w_pytraceback_new(
     let value = PyTraceback {
         ob_header: PyObject {
             ob_type: &PYTRACEBACK_TYPE as *const PyType,
-            w_class: get_instantiate(&PYTRACEBACK_TYPE),
+            w_class: roots.get(inputs + 3),
         },
         frame: roots.get(inputs + 2) as *mut crate::pyframe::PyFrame,
         lasti,
@@ -318,12 +318,10 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 /// `walker_specialize_traceback_walk_field`, which folds the raw slot against
 /// a guard that it is not the sentinel.
 ///
-/// `record_application_traceback` stamps the line eagerly, so a recorded node
-/// reaches the first branch — unless its `tb_lasti` names no line, where the
-/// eager walk answers `-1` and stamps the sentinel, and the resolution below
-/// runs and answers `None`.  That timing is not observable: `tb_lasti` and
-/// `tb_lineno` are read-only, so the only other way to hand a live node a
-/// sentinel is the constructor, which lands in the second branch either way.
+/// `record_application_traceback` leaves `lineno=LINENO_NOT_COMPUTED`
+/// (`pytraceback.py PyTraceback.__init__`); the first `tb_lineno` read
+/// resolves it.  A constructor argument that is already a real line
+/// number takes the first branch.
 ///
 /// # Safety
 /// `tb` must point to a valid `PyTraceback`.
@@ -444,42 +442,17 @@ pub unsafe fn record_application_traceback(
         };
         // Keep the exception now being propagated GC-reachable: until a frame
         // catches it, it lives only in the in-flight Rust `PyError`, so a
-        // safepoint's non-moving major would otherwise sweep its old-gen
-        // traceback chain (`tstate->current_exception` parity).
+        // safepoint's major would otherwise sweep the oldgen exception (and
+        // the traceback chain it roots) (`tstate->current_exception` parity).
         crate::eval::set_in_flight_exception(w_exc_object);
-        // `pytraceback.py self.lineno = offset2lineno(self.frame
-        // .pycode, self.lasti)` — pyre resolves the line number eagerly
-        // here rather than leaving the sentinel for the getter.
-        // `_PyTraceBack_FromFrame` records the sentinel instead and
-        // `tb_lineno_get` resolves it, but a node's `tb_lasti` and
-        // `tb_lineno` are both read-only there, so which of the two
-        // moments does the walk is not app-level observable.  An offset
-        // that names no line resolves to `-1`, which IS the sentinel, so
-        // such a node is stamped unresolved and reaches the getter.
-        //
-        // What the eager stamp buys is the JIT fold
-        // `walker_specialize_traceback_walk_field` (pyre-jit-trace): it
-        // reads this slot directly and declines on the sentinel, so a
-        // node that carried the sentinel would decline on every read of
-        // its line.  Frame lifetime is not part of it — the `w_code`
-        // slot below is forwarded unconditionally and is the same
-        // `pycode` upstream reads, which is what makes the getter's
-        // resolution safe at any later point.
-        //
-        // `frame.pycode` is the `PyCode` wrapper; the inner
-        // `CodeObject` is extracted via `pyframe_get_pycode`.
-        //
-        // The `PyCode` PyObjectRef is also captured into the `w_code`
-        // slot so the traceback's source-path / function name metadata
-        // stays GC-rooted in that same case — readers (e.g.
-        // `write_traceback_chain` in `error.rs`) MUST go through
-        // `w_code` rather than dereferencing the `frame` pointer.
+        // `pytraceback.py PyTraceback.__init__` defaults
+        // `lineno=LINENO_NOT_COMPUTED`; `get_lineno` walks
+        // `offset2lineno(self.frame.pycode, self.lasti)` on first read.
+        // The `PyCode` wrapper is captured into `w_code` so source-path /
+        // function name readers (`write_traceback_chain` in `error.rs`)
+        // go through that slot rather than the raw `frame` pointer.
         let w_code = (*frame).pycode as PyObjectRef;
-        let lineno = if w_code.is_null() {
-            LINENO_NOT_COMPUTED
-        } else {
-            crate::pyframe::offset2lineno(w_code, last_instruction as isize) as i64
-        };
+        let lineno = LINENO_NOT_COMPUTED;
         // `tb = operror.get_traceback()` — the read that grows the chain
         // marks the previous head's frame, matching `get_traceback`.
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(w_exc_object);
