@@ -21488,9 +21488,7 @@ fn contains_list(haystack: PyObjectRef, needle: PyObjectRef) -> Result<bool, PyE
             && pyre_object::listobject::is_plain_int1(needle)
             && pyre_object::is_int(needle)
     } {
-        return Ok(
-            pyre_object::listobject::jit_list_contains_int(haystack as i64, needle as i64) != 0,
-        );
+        return crate::listobject::contains_int_list_locked(haystack, needle);
     }
     Ok(matches!(
         crate::listobject::w_list_find_or_count(haystack, needle, 0, i64::MAX, false)?,
