@@ -338,11 +338,7 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         "pymath::math::misc::ulp",
         pymath::math::ulp as *const (),
     );
-    #[cfg(all(
-        any(unix, windows),
-        not(target_arch = "wasm32"),
-        not(feature = "sandbox")
-    ))]
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     {
         let mmap_type: fn() -> pyre_object::PyObjectRef = module::mmap::interp_mmap::mmap_type;
         let addr = mmap_type as *const () as usize as i64;
@@ -427,7 +423,7 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
     }
     // `mmap.mmap` follows the optional SSL tail on ordinary Unix/Windows
     // builds. A sandbox build has no `mmap` module at all.
-    #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(195, typed::<module::mmap::W_MMap>()));
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(

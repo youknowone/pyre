@@ -1592,6 +1592,9 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                         ));
                     }
                     let obj = args[0];
+                    // `__index__` runs user code, so convert before anything
+                    // is read from the mapping: it can close or resize it.
+                    let newsize = mmap_index_w(obj, args[1])?;
                     let access = mmap_get_attr_i64(obj, "_access");
                     if !(access == MMAP_ACCESS_WRITE || access == MMAP_ACCESS_DEFAULT) {
                         return Err(pyre_interpreter::PyError::type_error(
@@ -1600,7 +1603,6 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     }
                     mmap_check_exports(obj, "mmap can't resize with extant buffers exported.")?;
                     let (p, old_len) = mmap_ptr(obj)?;
-                    let newsize = crate::baseobjspace::gateway_int_w(args[1])?;
                     if newsize < 0 {
                         return Err(pyre_interpreter::PyError::value_error(
                             "new_size must be positive",
