@@ -8203,7 +8203,7 @@ impl<M: Clone> MetaInterp<M> {
                         // read-only after `setup_descrs`; `bridgeopt.py:155`
                         // indexes it blind.
                         simple_opt.all_descrs = unroll_opt.all_descrs.clone();
-                        // compile.py:272 `compile_simple_loop` — this retry is
+                        // compile.py `compile_simple_loop` — this retry is
                         // that call, so it optimizes as `SimpleCompileData` does.
                         simple_opt.simple_compile = true;
                         // history.py/261/307: `Const.type` /
@@ -9670,20 +9670,41 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
         // the rare missing-token path does not drain the active retrace.
-        let loop_jitcell_token = {
-            let green_key = match self.tracing.as_ref() {
-                Some(ctx) => ctx.green_key,
-                None => return false,
+        // pyjitpl.py `compile_retrace` `greenkey = original_boxes[:num_green_args]`
+        // is the MATCHED merge point's key, not the trace root.
+        let (green_key, loop_jitcell_token) = {
+            let Some(ctx) = self.tracing.as_ref() else {
+                return false;
             };
+            let Some(retrace_pos) = self.retracing_from else {
+                crate::debug::log_one(
+                    "jit-abort",
+                    "compile_retrace: entered with no retracing_from position",
+                );
+                return false;
+            };
+            let Some(mp) = ctx.merge_point_at_start(retrace_pos) else {
+                crate::debug::log_one(
+                    "jit-abort",
+                    "compile_retrace: no merge point at retracing_from start \
+                     — declining rather than assembling an uncut trace",
+                );
+                return false;
+            };
+            let green_key = mp.green_key;
             // compile.py `compile_retrace` `loop_jitcell_token = metainterp.get_procedure_token(greenkey)`
             // — the warmstate cell, which rejects an invalidated token.
             // `compiled.live_token()` upgrades the side-table Weak without
             // that filter and disagrees exactly when the cell has lost
             // its token.
-            let Some(token) = self.warm_state.get_procedure_token(green_key) else {
+            let token = match mp.green_key_typed.as_ref() {
+                Some(typed) => self.warm_state.get_procedure_token_for_key(typed),
+                None => self.warm_state.get_procedure_token(green_key),
+            };
+            let Some(token) = token else {
                 return false;
             };
-            token
+            (green_key, token)
         };
         let partial = match self.partial_trace.take() {
             Some(p) => p,
@@ -9720,7 +9741,6 @@ impl<M: Clone> MetaInterp<M> {
             call_pure_results,
             phase2_input_ops_seed,
         ) = {
-            let green_key = ctx.green_key;
             let driver_descriptor = ctx.driver_descriptor().cloned();
             // `compile.py:341-347` takes `start` as a parameter; there is no
             // upstream `compile_retrace` without one. Requiring it here rather

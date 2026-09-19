@@ -6642,17 +6642,19 @@ mod tests {
 
     #[test]
     fn new_seeds_green_boxes_from_inputargs_without_a_type_vec() {
-        // GreenBox folds the parallel type list. Rebuilding
-        // `inputarg_types().to_vec()` + `Vec<OpRef>` in `TraceCtx::new`
-        // was two 128 B allocs on every `start_bridge_tracing`.
+        // `TraceCtx::new` does not seed (`pyjitpl.py` starts empty;
+        // bridges stay empty). Primary traces seed via
+        // `seed_compile_and_run_once_merge_point` (`pyjitpl.py` `_compile_and_run_once`).
         let mut recorder = Trace::new();
         let _i = recorder.record_input_arg(Type::Int);
         let _r = recorder.record_input_arg(Type::Ref);
-        let ctx = TraceCtx::new(
+        let mut ctx = TraceCtx::new(
             recorder,
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        assert!(ctx.current_merge_points.is_empty());
+        ctx.seed_compile_and_run_once_merge_point();
         let boxes = &ctx.current_merge_points[0].green_boxes;
         assert_eq!(boxes.len(), 2);
         assert_eq!(boxes[0].ty, Type::Int);
