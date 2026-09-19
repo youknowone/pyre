@@ -7071,7 +7071,10 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 /// driving `w_exception_get_message` for the lower-level error path.
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
-        fn $fn_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn $fn_name(
+            cls: Option<PyObjectRef>,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, crate::PyError> {
             // `interp_exceptions.py W_BaseException.descr_init`:
             // `self.args_w = args_w`.  The string form of the exception
             // is derived from `args_w` on demand (`descr_str`), so the
@@ -7081,7 +7084,18 @@ macro_rules! exc_constructor {
             for &arg in args {
                 let _ = pyre_object::gc_roots::pin_root(arg);
             }
-            let exc = pyre_object::interp_exceptions::w_exception_new_empty($kind);
+            let cls_slot = cls.map(|cls| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(cls);
+                slot
+            });
+            let exc = match cls_slot {
+                Some(slot) => pyre_object::interp_exceptions::w_exception_new_empty_for_class(
+                    $kind,
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                ),
+                None => pyre_object::interp_exceptions::w_exception_new_empty($kind),
+            };
             let exc_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(exc);
             // The allocation above may collect and move the arguments without
@@ -7430,6 +7444,7 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
 /// routes here as `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
 fn os_error_build(
     kind: pyre_object::interp_exceptions::ExcKind,
+    cls: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
     use pyre_object::interp_exceptions;
@@ -7440,6 +7455,18 @@ fn os_error_build(
     // reads the whole slice after the last dispatch.
     let _roots = pyre_object::gc_roots::push_roots();
     let args_base = pyre_object::gc_roots::pin_roots(args);
+    let cls_slot = cls.map(|cls| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        slot
+    });
+    let kind = match cls_slot {
+        Some(slot) => interp_exceptions::exception_layout_kind_for_class(
+            kind,
+            pyre_object::gc_roots::shadow_stack_get(slot),
+        ),
+        None => kind,
+    };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
@@ -8615,16 +8642,24 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(pyre_object::w_none())
 }
 
-fn exc_os_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn exc_os_error(
+    cls: Option<PyObjectRef>,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
         pyre_object::interp_exceptions::ExcKind::OSError,
+        cls,
         args,
     ))
 }
 
-fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn exc_file_not_found_error(
+    cls: Option<PyObjectRef>,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
         pyre_object::interp_exceptions::ExcKind::FileNotFoundError,
+        cls,
         args,
     ))
 }
@@ -8639,7 +8674,7 @@ fn exc_file_not_found_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 /// retagged subclass, `FileNotFoundError` for that dedicated kind).
 fn os_error_family_new(
     args: &[PyObjectRef],
-    ctor: impl Fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    ctor: impl Fn(Option<PyObjectRef>, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied();
     let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
@@ -8667,11 +8702,18 @@ fn os_error_family_new(
     // `os_error_fill_slots` runs `int_w`, which is Python of its own.
     let _roots = pyre_object::gc_roots::push_roots();
     let positional_base = pyre_object::gc_roots::pin_roots(positional);
-    let exc = ctor(if use_init { &[] } else { positional })?;
+    let cls_slot = cls.map(|cls| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        slot
+    });
+    let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let exc = ctor(cls, if use_init { &[] } else { positional })?;
     let exc = pyre_object::gc_roots::pin_root(exc);
     let positional: Vec<PyObjectRef> = (0..positional.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
+    let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
     // Only the exact OSError type remaps the errno to a subclass; resolve the
     // retag target (subclass on a recognised errno, else the called class).
     let w_target = if is_exact_os_error {
@@ -8702,6 +8744,46 @@ pub(crate) fn exc_file_not_found_error_new(
     os_error_family_new(args, exc_file_not_found_error)
 }
 
+/// Shared `__new__` allocation for Unicode*Error: layout follows `cls`,
+/// then `args_w` is stored verbatim.  Type checks live in `descr_init`.
+fn exc_unicode_error_allocate(
+    kind: pyre_object::interp_exceptions::ExcKind,
+    cls: Option<PyObjectRef>,
+    args: &[PyObjectRef],
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = cls.map(|cls| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        slot
+    });
+    let args_base = pyre_object::gc_roots::shadow_stack_len();
+    for &arg in args {
+        let _ = pyre_object::gc_roots::pin_root(arg);
+    }
+    let exc = match cls_slot {
+        Some(slot) => pyre_object::interp_exceptions::w_exception_new_empty_for_class(
+            kind,
+            pyre_object::gc_roots::shadow_stack_get(slot),
+        ),
+        None => pyre_object::interp_exceptions::w_exception_new_empty(kind),
+    };
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let mut rooted_args = Vec::with_capacity(args.len());
+    for i in 0..args.len() {
+        rooted_args.push(pyre_object::gc_roots::shadow_stack_get(args_base + i));
+    }
+    let args_list = pyre_object::interp_exceptions::w_exception_args_new(rooted_args);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_args(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            args_list,
+        )
+    };
+    pyre_object::gc_roots::shadow_stack_get(exc_slot)
+}
+
 /// `pypy/module/exceptions/interp_exceptions.py _new`'s shape
 /// applied to UnicodeTranslateError: allocate the W_BaseException
 /// and store the raw constructor args verbatim into `args_w`.  PyPy's
@@ -8710,40 +8792,43 @@ pub(crate) fn exc_file_not_found_error_new(
 /// invoked by the type-call protocol after `__new__`.  Pyre's
 /// type-call (`call.rs`'s `type_descr_call_impl`) routes through that same `__new__` ⇒
 /// `__init__` sequence, so `__new__` here can stay validation-free.
-fn exc_unicode_translate_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = pyre_object::interp_exceptions::w_exception_new(
+fn exc_unicode_translate_error(
+    cls: Option<PyObjectRef>,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    Ok(exc_unicode_error_allocate(
         pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
-        "",
-    );
-    let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
-    unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
-    Ok(exc)
+        cls,
+        args,
+    ))
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py _new` shape
 /// for UnicodeDecodeError — allocation + raw args_w only.  Encoding,
 /// object, start/end/reason type checks happen in `descr_init` at
 /// `:1041-1059`.
-fn exc_unicode_decode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = pyre_object::interp_exceptions::w_exception_new(
+fn exc_unicode_decode_error(
+    cls: Option<PyObjectRef>,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    Ok(exc_unicode_error_allocate(
         pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
-        "",
-    );
-    let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
-    unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
-    Ok(exc)
+        cls,
+        args,
+    ))
 }
 
 /// `pypy/module/exceptions/interp_exceptions.py _new` shape
 /// for UnicodeEncodeError — allocation + raw args_w only.
-fn exc_unicode_encode_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let exc = pyre_object::interp_exceptions::w_exception_new(
+fn exc_unicode_encode_error(
+    cls: Option<PyObjectRef>,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    Ok(exc_unicode_error_allocate(
         pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
-        "",
-    );
-    let args_list = pyre_object::interp_exceptions::w_exception_args_new(args.to_vec());
-    unsafe { pyre_object::interp_exceptions::w_exception_set_args(exc, args_list) };
-    Ok(exc)
+        cls,
+        args,
+    ))
 }
 
 /// Convert a Unicode error bound through `__index__` and enforce the
@@ -9020,13 +9105,25 @@ macro_rules! exc_new_wrapper {
             let cls = args.first().copied();
             let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
             let (positional, _) = split_builtin_kwargs(rest);
-            let exc = $ctor(positional)?;
+            let _roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = cls.map(|cls| {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(cls);
+                slot
+            });
+            let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+            let exc = $ctor(cls, positional)?;
+            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(exc);
             // Set the exception's w_class to the actual exception type (e.g. AssertionError)
             // so that `type(e) is AssertionError` holds and `except ExcType` via isinstance works.
-            if let Some(cls) = cls {
-                crate::typedef::tag_subclass_instance(exc, cls);
+            if let Some(slot) = cls_slot {
+                crate::typedef::tag_subclass_instance(
+                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                );
             }
-            Ok(exc)
+            Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
         }
     };
 }
@@ -23941,6 +24038,27 @@ mod tests {
         assert_eq!(
             error.message_text(),
             "multiple bases have instance lay-out conflict"
+        );
+    }
+
+    #[test]
+    fn exception_layout_kind_follows_best_base_not_new_gateway() {
+        let _ = new_builtin_module_dict();
+        let value_error = lookup_exc_class("ValueError").unwrap();
+        let stop_iteration = lookup_exc_class("StopIteration").unwrap();
+        assert_eq!(
+            pyre_object::interp_exceptions::exception_layout_kind_for_class(
+                pyre_object::interp_exceptions::ExcKind::ValueError,
+                stop_iteration,
+            ),
+            pyre_object::interp_exceptions::ExcKind::StopIteration,
+        );
+        assert_eq!(
+            pyre_object::interp_exceptions::exception_layout_kind_for_class(
+                pyre_object::interp_exceptions::ExcKind::ValueError,
+                value_error,
+            ),
+            pyre_object::interp_exceptions::ExcKind::ValueError,
         );
     }
 

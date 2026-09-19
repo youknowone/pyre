@@ -970,6 +970,60 @@ pub fn is_canonical_exc_class(cls: PyObjectRef) -> bool {
             .any(|slot| slot.load(std::sync::atomic::Ordering::Acquire) == cls as usize)
 }
 
+/// Canonical `ExcKind` for `cls` when `cls` is a registered builtin
+/// exception class.  Heap subclasses are not registered and answer `None`.
+pub fn kind_of_canonical_exc_class(cls: PyObjectRef) -> Option<ExcKind> {
+    if cls.is_null() {
+        return None;
+    }
+    for (index, slot) in EXC_CLASS_BY_KIND.iter().enumerate() {
+        if slot.load(std::sync::atomic::Ordering::Acquire) == cls as usize {
+            let raw = index as u8;
+            if raw > ExcKind::MAX_DISCRIMINANT {
+                return None;
+            }
+            // Discriminants are contiguous `0..=MAX_DISCRIMINANT`.
+            return Some(unsafe { std::mem::transmute::<u8, ExcKind>(raw) });
+        }
+    }
+    None
+}
+
+/// The canonical kind whose instance layout `cls` extends.
+///
+/// `typeobject.py find_best_base` picks the most derived base layout, so
+/// `class VS(ValueError, StopIteration)` carries StopIteration's fields even
+/// though ValueError supplies `__new__`.  Allocating by `kind` alone hands
+/// `StopIteration.__init__` a slim object to write `w_value` past.
+pub fn exception_layout_kind_for_class(kind: ExcKind, cls: PyObjectRef) -> ExcKind {
+    if cls.is_null() {
+        return kind;
+    }
+    let own = lookup_exc_class_for_kind(kind);
+    if own.is_null() {
+        return kind;
+    }
+    if unsafe { crate::typeobject::w_type_get_layout_ptr(cls) }
+        == unsafe { crate::typeobject::w_type_get_layout_ptr(own) }
+    {
+        return kind;
+    }
+    let mut cur = cls;
+    while !cur.is_null() {
+        if let Some(found) = kind_of_canonical_exc_class(cur) {
+            return found;
+        }
+        cur = unsafe { crate::typeobject::w_type_get_best_base(cur) };
+    }
+    kind
+}
+
+/// Allocate for `cls(...)`, where `cls` may be a heap subclass whose best
+/// base owns a wider layout than the class that supplied `__new__`.
+pub fn w_exception_new_empty_for_class(kind: ExcKind, cls: PyObjectRef) -> PyObjectRef {
+    w_exception_new_empty(exception_layout_kind_for_class(kind, cls))
+}
+
 /// `interp_exceptions.py W_BaseException.descr_getargs` parity —
 ///
 /// ```python

@@ -6235,7 +6235,11 @@ mod tests {
             .expect("missing exc");
         let err = unsafe { PyError::from_exc_object(exc) };
 
-        assert_eq!(err.kind, PyErrorKind::ValueError);
+        // `find_best_base` gives VS StopIteration's instance layout even though
+        // ValueError supplies `__new__`, so the instance carries that tag.
+        assert_eq!(err.kind, PyErrorKind::StopIteration);
+        // The object walk answers from the MRO, independently of the tag.
+        assert!(crate::error::exception_object_matches_stop_iteration(exc));
         assert!(err.matches_stop_iteration());
         assert!(PyError::stop_iteration().matches_stop_iteration());
         assert!(!PyError::value_error("not exhausted").matches_stop_iteration());
