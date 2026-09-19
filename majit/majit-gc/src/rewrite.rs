@@ -1478,26 +1478,22 @@ impl GcRewriterImpl {
                 }
             }
         }
-        // Upstream rewrite.py:479-484 rewrites NEW_WITH_VTABLE into allocation
-        // plus full header initialization. Pyre's object layout carries a
-        // separate `w_class` Python-class pointer alongside the vtable. Honor
-        // that descriptor invariant for both fixed-size allocation opcodes:
-        // clear_gc_fields handles both, and the optimizer's force path may
-        // materialize either Virtual or VirtualStruct without a duplicate
-        // SETFIELD_GC for this header slot.
+        // rewrite.py `self.clear_gc_fields(descr, op)` — record every
+        // GC-pointer field's byte offset so a pending NULL store is
+        // emitted at the next flush point, unless cleared first by an
+        // explicit SETFIELD_GC (`consider_setfield_gc`).
+        self.clear_gc_fields(descr, obj_ref.clone(), st);
+
+        // Pyre's layout has a `w_class` GCREF beside the vtable. Stamp it
+        // after `clear_gc_fields` so `emit_setfield` can drop the delayed
+        // NULL the same way a later SETFIELD_GC would
+        // (`rewrite.py` `consider_setfield_gc`).
         if let Some(w_class) = descr.w_class_obj()
             && w_class != 0
             && let Some(w_class_fd) = descr.class_word_field()
         {
-            self.gen_initialize_w_class(obj_ref.clone(), w_class, w_class_fd.as_ref(), st);
+            self.gen_initialize_w_class(obj_ref, w_class, w_class_fd.as_ref(), st);
         }
-
-        // rewrite.py `self.clear_gc_fields(descr, op)` — record every
-        // GC-pointer field's byte offset so a pending NULL store is
-        // emitted at the next flush point, unless cleared first by an
-        // explicit SETFIELD_GC (rewrite.py:506-512).  No-op under pyre's
-        // default zero-fill nursery (see `malloc_zero_filled`).
-        self.clear_gc_fields(descr, obj_ref, st);
     }
 
     /// rewrite.py `clear_gc_fields`.
@@ -1515,17 +1511,6 @@ impl GcRewriterImpl {
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(&result);
         for fd in descr.gc_fielddescrs() {
-            // Skip the declared class-word slot: `handle_new` above already
-            // stored the real class object there, so a delayed NULL would
-            // overwrite it.  Matched by byte position rather than by descr
-            // identity because the slot the layout declares and the descr in
-            // this list can be distinct objects describing the same field.
-            let is_class_word_slot = descr
-                .class_word_field()
-                .is_some_and(|cw| cw.offset() == fd.offset());
-            if is_class_word_slot && descr.w_class_obj().is_some_and(|w| w != 0) {
-                continue;
-            }
             entries.insert(fd.offset() as i64);
         }
     }
@@ -2635,6 +2620,12 @@ impl GcRewriterImpl {
         size: i64,
         st: &mut RewriteState,
     ) {
+        // rewrite.py `consider_setfield_gc`: a store at this offset
+        // cancels the delayed NULL `clear_gc_fields` recorded.
+        let base = st.resolve(ptr.clone());
+        if let Some(entries) = st._delayed_zero_setfields.get_mut(&base.to_opref()) {
+            entries.swap_remove(&ofs);
+        }
         let zero = st.const_int(0);
         self.emit_gc_store_or_indexed(None, ptr, zero, value, size, 1, ofs, st);
     }
@@ -3610,13 +3601,19 @@ impl GcRewriter for GcRewriterImpl {
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
                 | OpCode::CallAssemblerN => {
-                    // rewrite.py always has jitframe descrs. Wasm lowers
-                    // CALL_ASSEMBLER itself (indirect table + nursery
-                    // frame), so a backend that supplies no
-                    // `jitframe_info` leaves the op in place.
+                    // `rewrite.py` always `handle_call_assembler` →
+                    // `gen_malloc_frame` → `gen_malloc_nursery_varsize_frame`,
+                    // which runs `emitting_an_operation_that_can_collect`
+                    // before the call. A backend that has not published
+                    // `jitframe_info` / `_ll_initial_locs` (wasm) leaves
+                    // the op in place but still runs that bookkeeping:
+                    // pending NULL stores flush and the nursery batch
+                    // closes. Convergence: set both fields and delete
+                    // this `is_none` arm.
                     if self.jitframe_info.is_some() {
                         self.handle_call_assembler(op, &mut st);
                     } else {
+                        st.emitting_an_operation_that_can_collect();
                         st.emit_maybe_forwarded(&op_rc);
                     }
                     continue;
@@ -4965,6 +4962,66 @@ mod tests {
         assert_eq!(malloc_count, 2);
     }
 
+    /// wasm (`jitframe_info: None`) leaves CALL_ASSEMBLER in place, but
+    /// `gen_malloc_nursery_varsize_frame` still runs
+    /// `emitting_an_operation_that_can_collect` (rewrite.py)
+    /// before the call: pending NULL stores of the first NEW flush
+    /// before the op, and the second NEW is a fresh CallMallocNursery.
+    #[test]
+    fn test_call_assembler_without_jitframe_flushes_pending_and_breaks_batch() {
+        let mut rw = make_rewriter();
+        assert!(rw.jitframe_info.is_none());
+        rw.malloc_zero_filled = false;
+        let gc_fields = vec![ref_field_descr_at(24)];
+        let descr = size_descr_with_gc_fields(48, 42, gc_fields);
+        let ops = vec![
+            Op::with_descr(OpCode::New, &[], descr),
+            Op::new(OpCode::CallAssemblerN, &[]),
+            Op::with_descr(OpCode::New, &[], size_descr(24, 2)),
+        ];
+
+        let result = rw.rewrite_ops(&ops);
+
+        let call_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::CallAssemblerN)
+            .expect("CallAssemblerN survives when jitframe_info is None");
+        let null_before: Vec<i64> = result[..call_idx]
+            .iter()
+            .filter(|o| o.opcode == OpCode::GcStore)
+            .filter(|o| o.arg(2).to_opref().inline_const_bits() == Some(0))
+            .map(|o| {
+                o.arg(1)
+                    .to_opref()
+                    .inline_const_bits()
+                    .expect("inline ConstInt")
+            })
+            .collect();
+        assert_eq!(
+            null_before,
+            vec![24],
+            "pending NULL GcStore for the first New must flush before CallAssemblerN, got {:?}",
+            result
+        );
+
+        let malloc_count = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CallMallocNursery)
+            .count();
+        assert_eq!(
+            malloc_count, 2,
+            "second New must be a fresh CallMallocNursery, got {:?}",
+            result
+        );
+        assert!(
+            result
+                .iter()
+                .all(|o| o.opcode != OpCode::NurseryPtrIncrement),
+            "CallAssemblerN must close the nursery batch, got {:?}",
+            result
+        );
+    }
+
     // ── Test 8: WB not duplicated for same object ──
 
     #[test]
@@ -5141,7 +5198,7 @@ mod tests {
     }
 
     #[test]
-    fn test_new_initializes_w_class_before_clear_gc_fields() {
+    fn test_new_initializes_w_class_after_clear_gc_fields() {
         let mut rw = make_rewriter();
         rw.fielddescr_vtable = None;
         rw.malloc_zero_filled = false;
