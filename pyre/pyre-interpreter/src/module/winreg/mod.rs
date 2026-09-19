@@ -780,8 +780,9 @@ mod imp {
     /// units are read here instead and carried across as themselves
     /// (`PyUnicode_FromWideChar`).
     fn query_default_value(key: HKEY, sub_key: &WideCStr) -> Result<Wtf8Buf, crate::PyError> {
-        use rustpython_host_env::winreg::{ERROR_INVALID_HANDLE, ERROR_MORE_DATA};
-        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA};
+        use rustpython_host_env::winreg::{
+            ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_INVALID_HANDLE, ERROR_MORE_DATA,
+        };
         // The performance data root answers no default value, and the refusal
         // is spelled here rather than left to the registry.
         if key == host_reg::HKEY_PERFORMANCE_DATA {
