@@ -240,8 +240,6 @@ const MAJIT_ONLY: &[&str] = &[
     // re-landed the fusion with the walker arm it needs, which is the move
     // this file exists to make visible.
     "arraybase_vable/rdd>i",
-    "convert_float_bytes_to_longlong/f>i",
-    "convert_longlong_bytes_to_float/i>f",
     "goto_if_exception_mismatch/iL",
     "newlist_clear/idddd>r",
     "rvmprof_code/ii",

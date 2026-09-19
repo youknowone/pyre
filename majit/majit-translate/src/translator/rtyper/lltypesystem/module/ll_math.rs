@@ -392,6 +392,51 @@ pub fn new_unary_math_function(
     }
 }
 
+/// The C llexternal an Opaque `f64` inherent method stands for, as
+/// `(arity, name)`.
+///
+/// Rust's `f64` methods are the same libm entry points upstream registers
+/// module-level here (`math_log = llexternal('log', ...)`, and one
+/// `new_unary_math_function` external per `unary_math_functions` name), so a
+/// callsite the front cannot walk into becomes a call of the named external
+/// instead of an un-lowerable host call.  The names are the upstream ones,
+/// `math_` + the C function; `cbrt` and `exp2` have no upstream registration
+/// and follow the same scheme.
+pub fn f64_method_llexternal(method: &str) -> Option<(usize, &'static str)> {
+    Some(match method {
+        // Explicit module-level registrations.
+        "hypot" => (2, "math_hypot"),
+        "atan2" => (2, "math_atan2"),
+        "copysign" => (2, "math_copysign"),
+        "powf" => (2, "math_pow"),
+        "floor" => (1, "math_floor"),
+        "ceil" => (1, "math_ceil"),
+        "ln" => (1, "math_log"),
+        "log10" => (1, "math_log10"),
+        "ln_1p" => (1, "math_log1p"),
+        "sqrt" => (1, "math_sqrt"),
+        "sin" => (1, "math_sin"),
+        "cos" => (1, "math_cos"),
+        // `unary_math_functions`.
+        "exp" => (1, "math_exp"),
+        "acos" => (1, "math_acos"),
+        "asin" => (1, "math_asin"),
+        "atan" => (1, "math_atan"),
+        "tan" => (1, "math_tan"),
+        "cosh" => (1, "math_cosh"),
+        "sinh" => (1, "math_sinh"),
+        "tanh" => (1, "math_tanh"),
+        "acosh" => (1, "math_acosh"),
+        "asinh" => (1, "math_asinh"),
+        "atanh" => (1, "math_atanh"),
+        "exp_m1" => (1, "math_expm1"),
+        // C99 libm entry points with no upstream registration.
+        "cbrt" => (1, "math_cbrt"),
+        "exp2" => (1, "math_exp2"),
+        _ => return None,
+    })
+}
+
 pub(crate) fn _revdb_frexp(x: f64) -> (f64, i64) {
     ll_math_frexp(x)
 }
@@ -495,5 +540,33 @@ mod tests {
         assert!(new_unary_math_function("missing", false, false).is_none());
         assert_eq!(_revdb_frexp(8.0), ll_math_frexp(8.0));
         assert_eq!(_revdb_modf(1.25), ll_math_modf(1.25));
+    }
+
+    #[test]
+    fn every_unary_math_function_has_an_f64_method_llexternal() {
+        // `abs` is deliberately absent: `float_abs` is an llop, so the front
+        // lowers `f64::abs` to the operation rather than to an external.
+        for name in UNARY_MATH_FUNCTIONS {
+            if *name == "fabs" {
+                continue;
+            }
+            let method = match *name {
+                "expm1" => "exp_m1",
+                other => other,
+            };
+            assert_eq!(
+                f64_method_llexternal(method).map(|(arity, ext)| (arity, ext.to_owned())),
+                Some((1, format!("math_{name}"))),
+                "{name} is registered by new_unary_math_function but has no \
+                 f64 method spelling"
+            );
+        }
+        assert_eq!(f64_method_llexternal("log1p"), None);
+        assert_eq!(f64_method_llexternal("ln_1p"), Some((1, "math_log1p")));
+        assert_eq!(f64_method_llexternal("hypot"), Some((2, "math_hypot")));
+        assert_eq!(f64_method_llexternal("abs"), None);
+        // C99 libm names with no `unary_math_functions` registration.
+        assert_eq!(f64_method_llexternal("cbrt"), Some((1, "math_cbrt")));
+        assert_eq!(f64_method_llexternal("exp2"), Some((1, "math_exp2")));
     }
 }

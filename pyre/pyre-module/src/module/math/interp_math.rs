@@ -149,162 +149,118 @@ fn float_repr(val: f64) -> String {
 
 // ── 1-arg float→float via pymath ─────────────────────────────────────
 
-macro_rules! pm1 {
-    ($name:ident) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly one argument"
-                )));
-            }
-            map_err(pymath::math::$name(try_get_double(args[0])?))
-        }
+/// True when pymath's `gamma`/`lgamma` returns a finite `Ok`.
+pub fn math1_gamma_result_finite(x: f64, lgamma: bool) -> bool {
+    let result = if lgamma {
+        pymath::math::lgamma(x)
+    } else {
+        pymath::math::gamma(x)
     };
+    matches!(result, Ok(v) if v.is_finite())
 }
 
-/// Like `pm1!`, but an `EDOM` result becomes a value-carrying message
-/// ("<prefix>, got <repr>") instead of the generic "math domain error".
-macro_rules! pm1_edom {
-    ($name:ident, $prefix:literal) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly one argument"
-                )));
-            }
-            let val = try_get_double(args[0])?;
-            match pymath::math::$name(val) {
-                Ok(v) => Ok(floatobject::w_float_new(v)),
-                Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
-                    concat!($prefix, ", got {}"),
-                    float_repr(val)
-                ))),
-                Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-                    "math range error",
-                )),
-            }
-        }
-    };
-}
-
-macro_rules! pm1_plain {
-    ($name:ident) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 1 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly one argument"
-                )));
-            }
-            Ok(floatobject::w_float_new(pymath::math::$name(
-                try_get_double(args[0])?,
-            )))
-        }
-    };
+/// Domain pin via pymath; box the pymath success value.  The walker
+/// still descends the unboxed leaf, which recomputes the operation so
+/// the generated jitcode has a body.  crates.io pymath cannot be walked
+/// (it is not in the Charon artefact).
+fn math1_pymath(
+    name: &str,
+    args: &[PyObjectRef],
+    compute: fn(f64) -> Result<f64, pymath::Error>,
+    edom: fn(f64) -> String,
+) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "{name}() takes exactly one argument"
+        )));
+    }
+    let val = try_get_double(args[0])?;
+    match compute(val) {
+        Ok(v) => pyre_interpreter::objspace::descroperation::_float_pos(v),
+        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(edom(val))),
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
 }
 
 // Trigonometric
-/// `math.sin` after `_get_double`: domain pin, then [`_float_sin`].
 pub fn sin(args: &[PyObjectRef]) -> PyResult {
-    if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "sin() takes exactly one argument",
-        ));
-    }
-    let val = try_get_double(args[0])?;
-    match pymath::math::sin(val) {
-        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
-            val,
-            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_SIN,
-        ),
-        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
-            "expected a finite input, got {}",
-            float_repr(val)
-        ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
-    }
+    math1_pymath("sin", args, pymath::math::sin, |v| {
+        format!("expected a finite input, got {}", float_repr(v))
+    })
 }
 
-/// `math.cos` after `_get_double`: domain pin, then [`_float_cos`].
 pub fn cos(args: &[PyObjectRef]) -> PyResult {
-    if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "cos() takes exactly one argument",
-        ));
-    }
-    let val = try_get_double(args[0])?;
-    match pymath::math::cos(val) {
-        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
-            val,
-            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_COS,
-        ),
-        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
-            "expected a finite input, got {}",
-            float_repr(val)
-        ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
-    }
+    math1_pymath("cos", args, pymath::math::cos, |v| {
+        format!("expected a finite input, got {}", float_repr(v))
+    })
 }
-/// `math.tan` after `_get_double`: domain pin, then [`_float_tan`].
 pub fn tan(args: &[PyObjectRef]) -> PyResult {
-    if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "tan() takes exactly one argument",
-        ));
-    }
-    let val = try_get_double(args[0])?;
-    match pymath::math::tan(val) {
-        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
-            val,
-            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_TAN,
-        ),
-        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
-            "expected a finite input, got {}",
-            float_repr(val)
-        ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
-    }
+    math1_pymath("tan", args, pymath::math::tan, |v| {
+        format!("expected a finite input, got {}", float_repr(v))
+    })
 }
-pm1_edom!(asin, "expected a number in range from -1 up to 1");
-pm1_edom!(acos, "expected a number in range from -1 up to 1");
-pm1!(atan);
-pm1!(sinh);
-pm1!(cosh);
-pm1!(tanh);
-pm1!(asinh);
-pm1_edom!(acosh, "expected argument value not less than 1");
-pm1_edom!(atanh, "expected a number between -1 and 1");
+pub fn asin(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("asin", args, pymath::math::asin, |v| {
+        format!(
+            "expected a number in range from -1 up to 1, got {}",
+            float_repr(v)
+        )
+    })
+}
+pub fn acos(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("acos", args, pymath::math::acos, |v| {
+        format!(
+            "expected a number in range from -1 up to 1, got {}",
+            float_repr(v)
+        )
+    })
+}
+pub fn atan(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("atan", args, pymath::math::atan, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn sinh(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("sinh", args, pymath::math::sinh, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn cosh(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("cosh", args, pymath::math::cosh, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn tanh(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("tanh", args, pymath::math::tanh, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn asinh(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("asinh", args, pymath::math::asinh, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn acosh(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("acosh", args, pymath::math::acosh, |v| {
+        format!(
+            "expected argument value not less than 1, got {}",
+            float_repr(v)
+        )
+    })
+}
+pub fn atanh(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("atanh", args, pymath::math::atanh, |v| {
+        format!("expected a number between -1 and 1, got {}", float_repr(v))
+    })
+}
 
 // Exponential / logarithmic
-/// `math.sqrt` after `_get_double`: domain pin, then [`_float_sqrt`].
 pub fn sqrt(args: &[PyObjectRef]) -> PyResult {
-    if args.len() != 1 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "sqrt() takes exactly one argument",
-        ));
-    }
-    let val = try_get_double(args[0])?;
-    match pymath::math::sqrt(val) {
-        Ok(_) => pyre_interpreter::objspace::descroperation::_float_math1(
-            val,
-            pyre_interpreter::objspace::descroperation::FLOAT_MATH1_SQRT,
-        ),
-        Err(pymath::Error::EDOM) => Err(pyre_interpreter::PyError::value_error(format!(
-            "expected a nonnegative input, got {}",
-            float_repr(val)
-        ))),
-        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
-            "math range error",
-        )),
-    }
+    math1_pymath("sqrt", args, pymath::math::sqrt, |v| {
+        format!("expected a nonnegative input, got {}", float_repr(v))
+    })
 }
 
 /// Checked-arity wrapper pointers installed by `py_module!` for the
@@ -318,6 +274,27 @@ struct MathBuiltinWrappers {
     cos: usize,
     sin: usize,
     tan: usize,
+    atan: usize,
+    exp: usize,
+    log1p: usize,
+    asin: usize,
+    acos: usize,
+    sinh: usize,
+    cosh: usize,
+    tanh: usize,
+    asinh: usize,
+    acosh: usize,
+    atanh: usize,
+    cbrt: usize,
+    exp2: usize,
+    expm1: usize,
+    erf: usize,
+    erfc: usize,
+    gamma: usize,
+    lgamma: usize,
+    ulp: usize,
+    degrees: usize,
+    radians: usize,
     frexp: usize,
     ldexp: usize,
     isqrt: usize,
@@ -326,6 +303,11 @@ struct MathBuiltinWrappers {
     ceil: usize,
     trunc: usize,
     isclose: usize,
+    pow: usize,
+    fmod: usize,
+    copysign: usize,
+    remainder: usize,
+    atan2: usize,
 }
 
 static MATH_WRAPPERS: std::sync::OnceLock<MathBuiltinWrappers> = std::sync::OnceLock::new();
@@ -352,6 +334,27 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         cos: math_wrapper_addr(ns, "cos"),
         sin: math_wrapper_addr(ns, "sin"),
         tan: math_wrapper_addr(ns, "tan"),
+        atan: math_wrapper_addr(ns, "atan"),
+        exp: math_wrapper_addr(ns, "exp"),
+        log1p: math_wrapper_addr(ns, "log1p"),
+        asin: math_wrapper_addr(ns, "asin"),
+        acos: math_wrapper_addr(ns, "acos"),
+        sinh: math_wrapper_addr(ns, "sinh"),
+        cosh: math_wrapper_addr(ns, "cosh"),
+        tanh: math_wrapper_addr(ns, "tanh"),
+        asinh: math_wrapper_addr(ns, "asinh"),
+        acosh: math_wrapper_addr(ns, "acosh"),
+        atanh: math_wrapper_addr(ns, "atanh"),
+        cbrt: math_wrapper_addr(ns, "cbrt"),
+        exp2: math_wrapper_addr(ns, "exp2"),
+        expm1: math_wrapper_addr(ns, "expm1"),
+        erf: math_wrapper_addr(ns, "erf"),
+        erfc: math_wrapper_addr(ns, "erfc"),
+        gamma: math_wrapper_addr(ns, "gamma"),
+        lgamma: math_wrapper_addr(ns, "lgamma"),
+        ulp: math_wrapper_addr(ns, "ulp"),
+        degrees: math_wrapper_addr(ns, "degrees"),
+        radians: math_wrapper_addr(ns, "radians"),
         frexp: math_wrapper_addr(ns, "frexp"),
         ldexp: math_wrapper_addr(ns, "ldexp"),
         isqrt: math_wrapper_addr(ns, "isqrt"),
@@ -360,6 +363,11 @@ pub fn register_jit_builtin_wrappers(ns: PyObjectRef) {
         ceil: math_wrapper_addr(ns, "ceil"),
         trunc: math_wrapper_addr(ns, "trunc"),
         isclose: math_wrapper_addr(ns, "isclose"),
+        pow: math_wrapper_addr(ns, "pow"),
+        fmod: math_wrapper_addr(ns, "fmod"),
+        copysign: math_wrapper_addr(ns, "copysign"),
+        remainder: math_wrapper_addr(ns, "remainder"),
+        atan2: math_wrapper_addr(ns, "atan2"),
     });
     // The generic float folds are identified the same way; they differ only in
     // that one table entry stands for one raw helper rather than one probe fn.
@@ -416,6 +424,74 @@ pub fn is_math_tan_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.tan)
 }
 
+pub fn is_math_atan_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.atan)
+}
+
+pub fn is_math_exp_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.exp)
+}
+
+pub fn is_math_log1p_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.log1p)
+}
+
+pub fn is_math_asin_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.asin)
+}
+
+pub fn is_math_acos_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.acos)
+}
+pub fn is_math_sinh_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.sinh)
+}
+pub fn is_math_cosh_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.cosh)
+}
+pub fn is_math_tanh_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.tanh)
+}
+pub fn is_math_asinh_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.asinh)
+}
+pub fn is_math_acosh_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.acosh)
+}
+pub fn is_math_atanh_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.atanh)
+}
+pub fn is_math_cbrt_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.cbrt)
+}
+pub fn is_math_exp2_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.exp2)
+}
+pub fn is_math_expm1_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.expm1)
+}
+pub fn is_math_erf_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.erf)
+}
+pub fn is_math_erfc_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.erfc)
+}
+pub fn is_math_gamma_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.gamma)
+}
+pub fn is_math_lgamma_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.lgamma)
+}
+pub fn is_math_ulp_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.ulp)
+}
+pub fn is_math_degrees_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.degrees)
+}
+pub fn is_math_radians_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.radians)
+}
+
 /// Callable-identity probes used by the meta-trace walker.  As with
 /// [`is_math_sqrt_function`], compare the immutable BuiltinCode function
 /// pointer rather than a module/name string so rebinding `math.frexp` or
@@ -446,6 +522,22 @@ pub fn is_math_ceil_function(callable: PyObjectRef) -> bool {
 
 pub fn is_math_trunc_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.trunc)
+}
+
+pub fn is_math_pow_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.pow)
+}
+pub fn is_math_fmod_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.fmod)
+}
+pub fn is_math_copysign_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.copysign)
+}
+pub fn is_math_remainder_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.remainder)
+}
+pub fn is_math_atan2_function(callable: PyObjectRef) -> bool {
+    math_wrapper_is(callable, |w| w.atan2)
 }
 
 /// Raw counterparts of `ll_math_floor` / `ll_math_ceil` for a guarded JIT fast
@@ -539,28 +631,6 @@ pub struct MathFloatFold<Raw: 'static> {
 pub type MathFloat1Fold = MathFloatFold<extern "C" fn(f64) -> f64>;
 pub type MathFloat2Fold = MathFloatFold<extern "C" fn(f64, f64) -> f64>;
 
-/// Raw counterpart of a `pm1!`/`pm1_edom!` body: the same `pymath` call, with
-/// every error direction reported as NaN.
-macro_rules! jit_raw1 {
-    ($helper:ident, $name:ident) => {
-        pub extern "C" fn $helper(x: f64) -> f64 {
-            match pymath::math::$name(x) {
-                Ok(v) => v,
-                Err(_) => f64::NAN,
-            }
-        }
-    };
-}
-
-/// Raw counterpart of a `pm1_plain!` body, which has no error direction.
-macro_rules! jit_raw1_plain {
-    ($helper:ident, $name:ident) => {
-        pub extern "C" fn $helper(x: f64) -> f64 {
-            pymath::math::$name(x)
-        }
-    };
-}
-
 macro_rules! jit_raw2 {
     ($helper:ident, $name:ident) => {
         pub extern "C" fn $helper(x: f64, y: f64) -> f64 {
@@ -571,28 +641,6 @@ macro_rules! jit_raw2 {
         }
     };
 }
-
-jit_raw1!(jit_math_asin, asin);
-jit_raw1!(jit_math_acos, acos);
-jit_raw1!(jit_math_atan, atan);
-jit_raw1!(jit_math_sinh, sinh);
-jit_raw1!(jit_math_cosh, cosh);
-jit_raw1!(jit_math_tanh, tanh);
-jit_raw1!(jit_math_asinh, asinh);
-jit_raw1!(jit_math_acosh, acosh);
-jit_raw1!(jit_math_atanh, atanh);
-jit_raw1!(jit_math_cbrt, cbrt);
-jit_raw1!(jit_math_exp, exp);
-jit_raw1!(jit_math_exp2, exp2);
-jit_raw1!(jit_math_expm1, expm1);
-jit_raw1!(jit_math_log1p, log1p);
-jit_raw1!(jit_math_erf, erf);
-jit_raw1!(jit_math_erfc, erfc);
-jit_raw1!(jit_math_gamma, gamma);
-jit_raw1!(jit_math_lgamma, lgamma);
-jit_raw1_plain!(jit_math_ulp, ulp);
-jit_raw1_plain!(jit_math_degrees, degrees);
-jit_raw1_plain!(jit_math_radians, radians);
 
 jit_raw2!(jit_math_pow, pow);
 jit_raw2!(jit_math_fmod, fmod);
@@ -607,84 +655,51 @@ pub extern "C" fn jit_math_hypot(x: f64, y: f64) -> f64 {
     x.hypot(y)
 }
 
-/// `ll_math.py` C llexternals for Opaque
-/// `f64::{ln,exp,sin,cos,tan,powf,sqrt,log10,asin,acos,atan,sinh,cosh,
-/// tanh,asinh,acosh,atanh,exp_m1,ln_1p}`.
+/// `ll_math.py` C llexternals for the Opaque `f64` inherent methods
+/// `ll_math::f64_method_llexternal` names.
 /// IEEE, no raise — the `ll_math_*` wrappers stay around them.
-pub extern "C" fn jit_math_log_raw(x: f64) -> f64 {
-    x.ln()
+macro_rules! jit_math_raw1 {
+    ($($helper:ident => $method:ident),* $(,)?) => {
+        $(
+            pub extern "C" fn $helper(x: f64) -> f64 {
+                x.$method()
+            }
+        )*
+    };
 }
 
-pub extern "C" fn jit_math_exp_raw(x: f64) -> f64 {
-    x.exp()
-}
-
-pub extern "C" fn jit_math_sin_raw(x: f64) -> f64 {
-    x.sin()
-}
-
-pub extern "C" fn jit_math_cos_raw(x: f64) -> f64 {
-    x.cos()
-}
-
-pub extern "C" fn jit_math_tan_raw(x: f64) -> f64 {
-    x.tan()
-}
-
-pub extern "C" fn jit_math_asin_raw(x: f64) -> f64 {
-    x.asin()
-}
-
-pub extern "C" fn jit_math_acos_raw(x: f64) -> f64 {
-    x.acos()
-}
-
-pub extern "C" fn jit_math_atan_raw(x: f64) -> f64 {
-    x.atan()
-}
-
-pub extern "C" fn jit_math_sinh_raw(x: f64) -> f64 {
-    x.sinh()
-}
-
-pub extern "C" fn jit_math_cosh_raw(x: f64) -> f64 {
-    x.cosh()
-}
-
-pub extern "C" fn jit_math_tanh_raw(x: f64) -> f64 {
-    x.tanh()
-}
-
-pub extern "C" fn jit_math_asinh_raw(x: f64) -> f64 {
-    x.asinh()
-}
-
-pub extern "C" fn jit_math_acosh_raw(x: f64) -> f64 {
-    x.acosh()
-}
-
-pub extern "C" fn jit_math_atanh_raw(x: f64) -> f64 {
-    x.atanh()
-}
-
-pub extern "C" fn jit_math_expm1_raw(x: f64) -> f64 {
-    x.exp_m1()
-}
-
-pub extern "C" fn jit_math_log1p_raw(x: f64) -> f64 {
-    x.ln_1p()
+jit_math_raw1! {
+    jit_math_log_raw => ln,
+    jit_math_log10_raw => log10,
+    jit_math_log1p_raw => ln_1p,
+    jit_math_exp_raw => exp,
+    jit_math_exp2_raw => exp2,
+    jit_math_expm1_raw => exp_m1,
+    jit_math_sqrt_raw => sqrt,
+    jit_math_cbrt_raw => cbrt,
+    jit_math_sin_raw => sin,
+    jit_math_cos_raw => cos,
+    jit_math_tan_raw => tan,
+    jit_math_asin_raw => asin,
+    jit_math_acos_raw => acos,
+    jit_math_atan_raw => atan,
+    jit_math_sinh_raw => sinh,
+    jit_math_cosh_raw => cosh,
+    jit_math_tanh_raw => tanh,
+    jit_math_asinh_raw => asinh,
+    jit_math_acosh_raw => acosh,
+    jit_math_atanh_raw => atanh,
 }
 
 pub extern "C" fn jit_math_pow_raw(x: f64, y: f64) -> f64 {
     x.powf(y)
 }
 
-pub extern "C" fn jit_math_sqrt_raw(x: f64) -> f64 {
-    x.sqrt()
-}
-
-pub extern "C" fn jit_math_log10_raw(x: f64) -> f64 {
-    x.log10()
+/// The C `fmod` llexternal, which is also what `%` over two floats lowers
+/// to: `lloperation.py` has no `float_mod`, so the codewriter emits a
+/// residual call of this name instead.
+pub extern "C" fn jit_math_fmod_raw(x: f64, y: f64) -> f64 {
+    x % y
 }
 
 /// Raw `math.isclose(a, b)` with both keyword tolerances left at their
@@ -713,6 +728,7 @@ pub fn is_math_isclose_function(callable: PyObjectRef) -> bool {
     math_wrapper_is(callable, |w| w.isclose)
 }
 
+#[allow(unused_macros)]
 macro_rules! math_fold_table {
     ($table:ident: $entry:ty, $($name:literal => $helper:ident),* $(,)?) => {
         // The length is spelled out from the entry list rather than left to a
@@ -729,42 +745,11 @@ macro_rules! math_fold_table {
     };
 }
 
-/// `sqrt`, `log`, `cos`, `sin`, `tan` and `fabs` are absent: each has a
-/// dedicated specialization that lowers to a tighter shape (a domain-guarded
-/// call with no result guard, or a single `FloatAbs`).
-math_fold_table!(
-    MATH_FLOAT1_FOLDS: MathFloat1Fold,
-    "asin" => jit_math_asin,
-    "acos" => jit_math_acos,
-    "atan" => jit_math_atan,
-    "sinh" => jit_math_sinh,
-    "cosh" => jit_math_cosh,
-    "tanh" => jit_math_tanh,
-    "asinh" => jit_math_asinh,
-    "acosh" => jit_math_acosh,
-    "atanh" => jit_math_atanh,
-    "cbrt" => jit_math_cbrt,
-    "exp" => jit_math_exp,
-    "exp2" => jit_math_exp2,
-    "expm1" => jit_math_expm1,
-    "log1p" => jit_math_log1p,
-    "erf" => jit_math_erf,
-    "erfc" => jit_math_erfc,
-    "gamma" => jit_math_gamma,
-    "lgamma" => jit_math_lgamma,
-    "ulp" => jit_math_ulp,
-    "degrees" => jit_math_degrees,
-    "radians" => jit_math_radians,
-);
+/// All one-arg float builtins now have dedicated leaves.
+static MATH_FLOAT1_FOLDS: [MathFloat1Fold; 0] = [];
 
-math_fold_table!(
-    MATH_FLOAT2_FOLDS: MathFloat2Fold,
-    "pow" => jit_math_pow,
-    "fmod" => jit_math_fmod,
-    "copysign" => jit_math_copysign,
-    "remainder" => jit_math_remainder,
-    "atan2" => jit_math_atan2,
-);
+/// All two-arg float builtins now have dedicated leaves.
+static MATH_FLOAT2_FOLDS: [MathFloat2Fold; 0] = [];
 
 /// The wrapper pointer `py_module!` installed for `math.<name>`, or `None`
 /// for a callable that is not a builtin function.
@@ -816,17 +801,59 @@ pub fn math_float_fold_helper_addrs() -> Vec<i64> {
         .collect()
 }
 
-pm1!(cbrt);
-pm1!(exp);
-pm1!(exp2);
-pm1!(expm1);
-pm1_edom!(log1p, "expected argument value > -1");
+pub fn cbrt(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("cbrt", args, pymath::math::cbrt, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn exp(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("exp", args, pymath::math::exp, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn exp2(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("exp2", args, pymath::math::exp2, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn expm1(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("expm1", args, pymath::math::expm1, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn log1p(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("log1p", args, pymath::math::log1p, |v| {
+        format!("expected argument value > -1, got {}", float_repr(v))
+    })
+}
 
 // Gamma / error
-pm1!(erf);
-pm1!(erfc);
-pm1_edom!(gamma, "expected a noninteger or positive integer");
-pm1_edom!(lgamma, "expected a noninteger or positive integer");
+pub fn erf(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("erf", args, pymath::math::erf, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn erfc(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("erfc", args, pymath::math::erfc, |_| {
+        "math domain error".to_string()
+    })
+}
+pub fn gamma(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("gamma", args, pymath::math::gamma, |v| {
+        format!(
+            "expected a noninteger or positive integer, got {}",
+            float_repr(v)
+        )
+    })
+}
+pub fn lgamma(args: &[PyObjectRef]) -> PyResult {
+    math1_pymath("lgamma", args, pymath::math::lgamma, |v| {
+        format!(
+            "expected a noninteger or positive integer, got {}",
+            float_repr(v)
+        )
+    })
+}
 
 // Misc
 /// `math.fabs` after `_get_double`: the unboxed `_float_abs` leaf.
@@ -838,40 +865,58 @@ pub fn fabs(args: &[PyObjectRef]) -> PyResult {
     }
     pyre_interpreter::objspace::descroperation::_float_abs(try_get_double(args[0])?)
 }
-pm1_plain!(ulp);
+pub fn ulp(args: &[PyObjectRef]) -> PyResult {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "ulp() takes exactly one argument",
+        ));
+    }
+    pyre_interpreter::objspace::descroperation::_float_pos(pymath::math::ulp(try_get_double(
+        args[0],
+    )?))
+}
 
 // ── 2-arg float→float via pymath ─────────────────────────────────────
 
-macro_rules! pm2 {
-    ($name:ident) => {
-        pub fn $name(args: &[PyObjectRef]) -> PyResult {
-            if args.len() != 2 {
-                return Err(pyre_interpreter::PyError::type_error(concat!(
-                    stringify!($name),
-                    "() takes exactly 2 arguments"
-                )));
-            }
-            let x = try_get_double(args[0])?;
-            let y = try_get_double(args[1])?;
-            map_err(pymath::math::$name(x, y))
-        }
-    };
-}
-
-pm2!(pow);
-pm2!(fmod);
-pm2!(copysign);
-pm2!(remainder);
-
-pub fn atan2(args: &[PyObjectRef]) -> PyResult {
+/// Domain pin via pymath; box the pymath success value.  The walker
+/// still descends the unboxed two-arg leaf.
+fn math2_pymath(
+    name: &str,
+    args: &[PyObjectRef],
+    compute: fn(f64, f64) -> Result<f64, pymath::Error>,
+) -> PyResult {
     if args.len() != 2 {
-        return Err(pyre_interpreter::PyError::type_error(
-            "atan2() takes exactly 2 arguments",
-        ));
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "{name}() takes exactly 2 arguments"
+        )));
     }
     let x = try_get_double(args[0])?;
     let y = try_get_double(args[1])?;
-    map_err(pymath::math::atan2(x, y))
+    match compute(x, y) {
+        Ok(v) => pyre_interpreter::objspace::descroperation::_float_pos(v),
+        Err(pymath::Error::EDOM) => {
+            Err(pyre_interpreter::PyError::value_error("math domain error"))
+        }
+        Err(pymath::Error::ERANGE) => Err(pyre_interpreter::PyError::overflow_error(
+            "math range error",
+        )),
+    }
+}
+
+pub fn pow(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("pow", args, pymath::math::pow)
+}
+pub fn fmod(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("fmod", args, pymath::math::fmod)
+}
+pub fn copysign(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("copysign", args, pymath::math::copysign)
+}
+pub fn remainder(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("remainder", args, pymath::math::remainder)
+}
+pub fn atan2(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("atan2", args, pymath::math::atan2)
 }
 
 pub fn hypot(args: &[PyObjectRef]) -> PyResult {
@@ -1131,9 +1176,9 @@ pub fn degrees(args: &[PyObjectRef]) -> PyResult {
             "degrees() takes exactly 1 argument",
         ));
     }
-    Ok(floatobject::w_float_new(pymath::math::degrees(
-        try_get_double(args[0])?,
-    )))
+    pyre_interpreter::objspace::descroperation::_float_pos(pymath::math::degrees(try_get_double(
+        args[0],
+    )?))
 }
 
 pub fn radians(args: &[PyObjectRef]) -> PyResult {
@@ -1142,9 +1187,9 @@ pub fn radians(args: &[PyObjectRef]) -> PyResult {
             "radians() takes exactly 1 argument",
         ));
     }
-    Ok(floatobject::w_float_new(pymath::math::radians(
-        try_get_double(args[0])?,
-    )))
+    pyre_interpreter::objspace::descroperation::_float_pos(pymath::math::radians(try_get_double(
+        args[0],
+    )?))
 }
 
 pub fn isinf(args: &[PyObjectRef]) -> PyResult {

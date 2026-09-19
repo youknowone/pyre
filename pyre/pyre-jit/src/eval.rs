@@ -5743,6 +5743,16 @@ fn build_jit_driver_pair() -> JitDriverPair {
         for addr in pyre_jit_trace::helpers::walker_word_helper_addrs() {
             majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
         }
+        // Published table index of the C-truncating i64 `/` `%` residuals
+        // (`_int_isqrt` records two `_ll_2_int_floordiv` calls).  Take the
+        // address from `jit_trace_fnaddrs` so it matches the value patched
+        // into JitCode; a second `fn as usize` in this crate can be a
+        // different wasm32 table slot.
+        for (path, addr) in pyre_interpreter::jit_trace_fnaddrs() {
+            if matches!(path, "_ll_2_int_floordiv" | "_ll_2_int_mod") {
+                majit_backend_wasm::vouch_residual_call_addr_returning_word(addr);
+            }
+        }
         for addr in pyre_jit_trace::helpers::walker_void_word_helper_addrs() {
             majit_backend_wasm::vouch_residual_call_addr(addr);
         }

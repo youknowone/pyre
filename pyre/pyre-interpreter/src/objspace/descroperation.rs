@@ -3158,6 +3158,36 @@ pub const FLOAT_MATH1_SQRT: i64 = 1;
 pub const FLOAT_MATH1_SIN: i64 = 2;
 pub const FLOAT_MATH1_COS: i64 = 3;
 pub const FLOAT_MATH1_TAN: i64 = 4;
+pub const FLOAT_MATH1_ATAN: i64 = 5;
+pub const FLOAT_MATH1_EXP: i64 = 6;
+pub const FLOAT_MATH1_LOG1P: i64 = 7;
+pub const FLOAT_MATH1_ASIN: i64 = 8;
+pub const FLOAT_MATH1_ACOS: i64 = 9;
+pub const FLOAT_MATH1_SINH: i64 = 10;
+pub const FLOAT_MATH1_COSH: i64 = 11;
+pub const FLOAT_MATH1_TANH: i64 = 12;
+pub const FLOAT_MATH1_ASINH: i64 = 13;
+pub const FLOAT_MATH1_ACOSH: i64 = 14;
+pub const FLOAT_MATH1_ATANH: i64 = 15;
+pub const FLOAT_MATH1_CBRT: i64 = 16;
+pub const FLOAT_MATH1_EXP2: i64 = 17;
+pub const FLOAT_MATH1_EXPM1: i64 = 18;
+pub const FLOAT_MATH1_ERF: i64 = 19;
+pub const FLOAT_MATH1_ERFC: i64 = 20;
+pub const FLOAT_MATH1_GAMMA: i64 = 21;
+pub const FLOAT_MATH1_LGAMMA: i64 = 22;
+pub const FLOAT_MATH1_ULP: i64 = 23;
+pub const FLOAT_MATH1_DEGREES: i64 = 24;
+pub const FLOAT_MATH1_RADIANS: i64 = 25;
+pub const FLOAT_MATH1_LOG: i64 = 26;
+/// Discovery only: `kind` is a hub parameter, so these arms stay in the graph.
+pub const FLOAT_MATH1_MATH2: i64 = 27;
+pub const FLOAT_MATH1_INT_FROM_FLOAT: i64 = 28;
+pub const FLOAT_MATH1_FREXP: i64 = 29;
+pub const FLOAT_MATH1_FREXP_EXP: i64 = 30;
+pub const FLOAT_MATH1_LDEXP: i64 = 31;
+pub const FLOAT_MATH1_ISQRT: i64 = 32;
+pub const FLOAT_MATH1_ISCLOSE: i64 = 33;
 
 /// Hub so `_float_{sqrt,sin,cos,tan}` are jitcodes (`_float_lt` / [`compare_slot`]).
 /// `inline(never)` keeps every arm in the graph when a caller passes a constant.
@@ -3168,7 +3198,68 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_SIN => _float_sin(x),
         FLOAT_MATH1_COS => _float_cos(x),
         FLOAT_MATH1_TAN => _float_tan(x),
+        FLOAT_MATH1_ATAN => _float_atan(x),
+        FLOAT_MATH1_EXP => _float_exp(x),
+        FLOAT_MATH1_LOG1P => _float_log1p(x),
+        FLOAT_MATH1_ASIN => _float_asin(x),
+        FLOAT_MATH1_ACOS => _float_acos(x),
+        FLOAT_MATH1_SINH => _float_sinh(x),
+        FLOAT_MATH1_COSH => _float_cosh(x),
+        FLOAT_MATH1_TANH => _float_tanh(x),
+        FLOAT_MATH1_ASINH => _float_asinh(x),
+        FLOAT_MATH1_ACOSH => _float_acosh(x),
+        FLOAT_MATH1_ATANH => _float_atanh(x),
+        FLOAT_MATH1_CBRT => _float_cbrt(x),
+        FLOAT_MATH1_EXP2 => _float_exp2(x),
+        FLOAT_MATH1_EXPM1 => _float_expm1(x),
+        FLOAT_MATH1_ERF => _float_erf(x),
+        FLOAT_MATH1_ERFC => _float_erfc(x),
+        FLOAT_MATH1_GAMMA => _float_gamma(x),
+        FLOAT_MATH1_LGAMMA => _float_lgamma(x),
+        FLOAT_MATH1_ULP => _float_ulp(x),
+        FLOAT_MATH1_DEGREES => _float_degrees(x),
+        FLOAT_MATH1_RADIANS => _float_radians(x),
+        FLOAT_MATH1_LOG => _float_log(x),
+        FLOAT_MATH1_MATH2 => _float_math2(x, x, 0),
+        FLOAT_MATH1_INT_FROM_FLOAT => _int_from_float(x, 0),
+        FLOAT_MATH1_FREXP => _float_frexp_mantissa(x),
+        FLOAT_MATH1_FREXP_EXP => _int_frexp_exponent(x),
+        FLOAT_MATH1_LDEXP => _float_ldexp(x, 0),
+        FLOAT_MATH1_ISQRT => _int_isqrt(0),
+        FLOAT_MATH1_ISCLOSE => _float_isclose(x, x),
         _ => _float_abs(x),
+    }
+}
+
+pub const FLOAT_MATH2_POW: i64 = 0;
+pub const FLOAT_MATH2_FMOD: i64 = 1;
+pub const FLOAT_MATH2_COPYSIGN: i64 = 2;
+pub const FLOAT_MATH2_REMAINDER: i64 = 3;
+pub const FLOAT_MATH2_ATAN2: i64 = 4;
+
+/// Hub so the two-arg unboxed leaves are jitcodes.
+#[inline(never)]
+pub fn _float_math2(x: f64, y: f64, kind: i64) -> PyResult {
+    match kind {
+        FLOAT_MATH2_FMOD => _float_fmod(x, y),
+        FLOAT_MATH2_COPYSIGN => _float_copysign(x, y),
+        FLOAT_MATH2_REMAINDER => _float_remainder(x, y),
+        FLOAT_MATH2_ATAN2 => _float_atan2(x, y),
+        _ => _float_pow(x, y),
+    }
+}
+
+pub const INT_FROM_FLOAT_FLOOR: i64 = 0;
+pub const INT_FROM_FLOAT_CEIL: i64 = 1;
+pub const INT_FROM_FLOAT_TRUNC: i64 = 2;
+
+/// Hub so the `math.floor`/`ceil`/`trunc` int leaves are jitcodes.
+#[inline(never)]
+pub fn _int_from_float(x: f64, kind: i64) -> PyResult {
+    match kind {
+        INT_FROM_FLOAT_CEIL => _int_from_ceil(x),
+        INT_FROM_FLOAT_TRUNC => _int_from_trunc(x),
+        _ => _int_from_floor(x),
     }
 }
 
@@ -6673,7 +6764,7 @@ pub(crate) fn _int_neg(x: i64) -> PyResult {
 
 /// floatobject.py `descr_pos`: `W_FloatObject(self.floatval)`.
 #[inline(never)]
-pub(crate) fn _float_pos(x: f64) -> PyResult {
+pub fn _float_pos(x: f64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
@@ -6739,6 +6830,221 @@ pub(crate) fn _float_tan(x: f64) -> PyResult {
         w_dict: PY_NULL,
         w_slots: PY_NULL,
     }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_atan`: `W_FloatObject(atan(x))`.
+#[inline(never)]
+pub(crate) fn _float_atan(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.atan(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_exp` after the overflow pin: `W_FloatObject(exp(x))`.
+#[inline(never)]
+pub(crate) fn _float_exp(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.exp(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_log1p` after `x > -1`: `W_FloatObject(log1p(x))`.
+#[inline(never)]
+pub(crate) fn _float_log1p(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.ln_1p(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// ll_math.py `ll_math_asin` after the `[-1, 1]` pin: `W_FloatObject(asin(x))`.
+#[inline(never)]
+pub(crate) fn _float_asin(x: f64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x.asin(),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// Unboxed `W_FloatObject` leaf. `|x| $compute` names the parameter; it is
+/// not a Rust closure (those residualize an extra `new` + call).
+macro_rules! float_math1_leaf {
+    ($fn:ident, |$x:ident| $compute:expr) => {
+        #[inline(never)]
+        pub(crate) fn $fn($x: f64) -> PyResult {
+            Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                ob_header: PyObject {
+                    ob_type: &FLOAT_TYPE as *const PyType,
+                    w_class: get_instantiate(&FLOAT_TYPE),
+                },
+                floatval: $compute,
+                w_dict: PY_NULL,
+                w_slots: PY_NULL,
+            }) as PyObjectRef)
+        }
+    };
+}
+
+float_math1_leaf!(_float_acos, |x| x.acos());
+float_math1_leaf!(_float_sinh, |x| x.sinh());
+float_math1_leaf!(_float_cosh, |x| x.cosh());
+float_math1_leaf!(_float_tanh, |x| x.tanh());
+float_math1_leaf!(_float_asinh, |x| x.asinh());
+float_math1_leaf!(_float_acosh, |x| x.acosh());
+float_math1_leaf!(_float_atanh, |x| x.atanh());
+float_math1_leaf!(_float_cbrt, |x| x.cbrt());
+float_math1_leaf!(_float_exp2, |x| x.exp2());
+float_math1_leaf!(_float_expm1, |x| x.exp_m1());
+// crates.io pymath is not in the Charon artefact, so these residualize.
+// Interpreter `math1_pymath` already boxed the pymath `Ok` via `_float_pos`.
+float_math1_leaf!(_float_erf, |x| pymath::math::erf(x).unwrap_or(f64::NAN));
+float_math1_leaf!(_float_erfc, |x| pymath::math::erfc(x).unwrap_or(f64::NAN));
+float_math1_leaf!(_float_gamma, |x| pymath::math::gamma(x).unwrap_or(f64::NAN));
+float_math1_leaf!(_float_lgamma, |x| {
+    pymath::math::lgamma(x).unwrap_or(f64::NAN)
+});
+float_math1_leaf!(_float_ulp, |x| pymath::math::ulp(x));
+// pymath::math::{degrees,radians} is `x * (180/π)` / `x * (π/180)`.
+float_math1_leaf!(_float_degrees, |x| x * (180.0 / std::f64::consts::PI));
+float_math1_leaf!(_float_radians, |x| x * (std::f64::consts::PI / 180.0));
+float_math1_leaf!(_float_log, |x| x.ln());
+
+/// Unboxed two-arg `W_FloatObject` leaf. `|x, y| $compute` names the
+/// parameters; it is not a Rust closure.
+macro_rules! float_math2_leaf {
+    ($fn:ident, |$x:ident, $y:ident| $compute:expr) => {
+        #[inline(never)]
+        pub(crate) fn $fn($x: f64, $y: f64) -> PyResult {
+            Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                ob_header: PyObject {
+                    ob_type: &FLOAT_TYPE as *const PyType,
+                    w_class: get_instantiate(&FLOAT_TYPE),
+                },
+                floatval: $compute,
+                w_dict: PY_NULL,
+                w_slots: PY_NULL,
+            }) as PyObjectRef)
+        }
+    };
+}
+
+float_math2_leaf!(_float_pow, |x, y| x.powf(y));
+float_math2_leaf!(_float_fmod, |x, y| x % y);
+float_math2_leaf!(_float_copysign, |x, y| x.copysign(y));
+float_math2_leaf!(_float_remainder, |x, y| {
+    pymath::math::remainder(x, y).unwrap_or(f64::NAN)
+});
+float_math2_leaf!(_float_atan2, |x, y| x.atan2(y));
+
+/// `math.floor`/`ceil`/`trunc` after the signed-range pin: `W_IntObject`.
+macro_rules! int_from_float_leaf {
+    ($fn:ident, |$x:ident| $compute:expr) => {
+        #[inline(never)]
+        pub(crate) fn $fn($x: f64) -> PyResult {
+            Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+                ob_header: PyObject {
+                    ob_type: &INT_TYPE as *const PyType,
+                    w_class: get_instantiate(&INT_TYPE),
+                },
+                intval: $compute,
+            }) as PyObjectRef)
+        }
+    };
+}
+
+// The walker pins the signed range before descent, so the unchecked
+// conversion is defined.  `as i64` residualizes as a saturating rustc
+// helper (symbolic fnaddr); `to_int_unchecked` is the fptosi the
+// translator rewrites to `cast_float_to_int`.
+int_from_float_leaf!(_int_from_floor, |x| unsafe {
+    x.floor().to_int_unchecked::<i64>()
+});
+int_from_float_leaf!(_int_from_ceil, |x| unsafe {
+    x.ceil().to_int_unchecked::<i64>()
+});
+int_from_float_leaf!(_int_from_trunc, |x| unsafe { x.to_int_unchecked::<i64>() });
+
+/// ll_math.py `ll_math_frexp` mantissa half after the walker pins a
+/// normal finite non-zero.  The pair is two leaves because a
+/// `(f64, i64)` return residualizes as an aggregate call.
+float_math1_leaf!(_float_frexp_mantissa, |x| {
+    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
+    let sign = bits & i64::MIN;
+    let fraction = bits & ((1i64 << 52) - 1);
+    unsafe { std::mem::transmute::<i64, f64>(sign | (1022i64 << 52) | fraction) }
+});
+
+/// ll_math.py `ll_math_frexp` exponent half after the same pin.
+int_from_float_leaf!(_int_frexp_exponent, |x| {
+    let bits = unsafe { std::mem::transmute::<f64, i64>(x) };
+    let exponent = ((bits >> 52) & 0x7ff) as i64;
+    exponent - 1022
+});
+
+/// ll_math.py `ll_math_ldexp` after the finite-x pin: `x * 2**exp`.
+/// `powf` is the already-lowered `math_pow` leaf; overflow becomes
+/// inf and the walker's finite-result guard resumes in the builtin.
+#[inline(never)]
+pub(crate) fn _float_ldexp(x: f64, exp: i64) -> PyResult {
+    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+        ob_header: PyObject {
+            ob_type: &FLOAT_TYPE as *const PyType,
+            w_class: get_instantiate(&FLOAT_TYPE),
+        },
+        floatval: x * 2.0f64.powf(exp as f64),
+        w_dict: PY_NULL,
+        w_slots: PY_NULL,
+    }) as PyObjectRef)
+}
+
+/// app_math.py `isqrt` on a positive machine int that fits an exact
+/// `f64`.  One ulp correction, written as arithmetic so the body
+/// stays branch-free for `fuse_boxing_alloc`.
+#[inline(never)]
+pub(crate) fn _int_isqrt(n: i64) -> PyResult {
+    let guess = unsafe { (n as f64).sqrt().to_int_unchecked::<i64>() };
+    let too_high = i64::from(guess > n / guess);
+    let too_low = i64::from(guess < n / (guess + 1));
+    let root = guess - too_high + too_low;
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: root,
+    }) as PyObjectRef)
+}
+
+/// interp_math.py `isclose` with both keyword tolerances defaulted,
+/// after the walker pins finite operands.  `|` rather than `||` so
+/// the comparison is one expression.
+#[inline(never)]
+pub(crate) fn _float_isclose(a: f64, b: f64) -> PyResult {
+    let diff = (b - a).abs();
+    let close = (a == b) | (diff <= (1e-9 * b).abs()) | (diff <= (1e-9 * a).abs());
+    Ok(w_bool_from(close))
 }
 
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.

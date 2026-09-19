@@ -118,10 +118,9 @@ pub fn register() {
     );
 }
 
-/// `ll_math.py` C llexternals. The front retargets Opaque
-/// `f64::{hypot,atan2,copysign,floor,ceil,ln,exp,sin,cos,tan,powf,sqrt,
-/// log10,asin,acos,atan,sinh,cosh,tanh,asinh,acosh,atanh,exp_m1,ln_1p}`
-/// to these paths; the raising `ll_math_*` wrappers stay around them.
+/// `ll_math.py` C llexternals. The front retargets the Opaque `f64`
+/// inherent methods `ll_math::f64_method_llexternal` names onto these
+/// paths; the raising `ll_math_*` wrappers stay around them.
 fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
     use module::math::interp_math as math;
 
@@ -138,149 +137,171 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         }
     }
 
-    pair(
+    for (module_path, root_path, fnptr) in [
+        (
+            "ll_math::math_hypot",
+            "math_hypot",
+            math::jit_math_hypot as *const (),
+        ),
+        (
+            "ll_math::math_atan2",
+            "math_atan2",
+            math::jit_math_atan2 as *const (),
+        ),
+        (
+            "ll_math::math_copysign",
+            "math_copysign",
+            math::jit_math_copysign as *const (),
+        ),
+        (
+            "ll_math::math_floor",
+            "math_floor",
+            math::jit_math_floor_raw as *const (),
+        ),
+        (
+            "ll_math::math_ceil",
+            "math_ceil",
+            math::jit_math_ceil_raw as *const (),
+        ),
+        (
+            "ll_math::math_log",
+            "math_log",
+            math::jit_math_log_raw as *const (),
+        ),
+        (
+            "ll_math::math_log10",
+            "math_log10",
+            math::jit_math_log10_raw as *const (),
+        ),
+        (
+            "ll_math::math_log1p",
+            "math_log1p",
+            math::jit_math_log1p_raw as *const (),
+        ),
+        (
+            "ll_math::math_exp",
+            "math_exp",
+            math::jit_math_exp_raw as *const (),
+        ),
+        (
+            "ll_math::math_exp2",
+            "math_exp2",
+            math::jit_math_exp2_raw as *const (),
+        ),
+        (
+            "ll_math::math_expm1",
+            "math_expm1",
+            math::jit_math_expm1_raw as *const (),
+        ),
+        (
+            "ll_math::math_pow",
+            "math_pow",
+            math::jit_math_pow_raw as *const (),
+        ),
+        (
+            "ll_math::math_sqrt",
+            "math_sqrt",
+            math::jit_math_sqrt_raw as *const (),
+        ),
+        (
+            "ll_math::math_cbrt",
+            "math_cbrt",
+            math::jit_math_cbrt_raw as *const (),
+        ),
+        (
+            "ll_math::math_sin",
+            "math_sin",
+            math::jit_math_sin_raw as *const (),
+        ),
+        (
+            "ll_math::math_cos",
+            "math_cos",
+            math::jit_math_cos_raw as *const (),
+        ),
+        (
+            "ll_math::math_tan",
+            "math_tan",
+            math::jit_math_tan_raw as *const (),
+        ),
+        (
+            "ll_math::math_asin",
+            "math_asin",
+            math::jit_math_asin_raw as *const (),
+        ),
+        (
+            "ll_math::math_acos",
+            "math_acos",
+            math::jit_math_acos_raw as *const (),
+        ),
+        (
+            "ll_math::math_atan",
+            "math_atan",
+            math::jit_math_atan_raw as *const (),
+        ),
+        (
+            "ll_math::math_sinh",
+            "math_sinh",
+            math::jit_math_sinh_raw as *const (),
+        ),
+        (
+            "ll_math::math_cosh",
+            "math_cosh",
+            math::jit_math_cosh_raw as *const (),
+        ),
+        (
+            "ll_math::math_tanh",
+            "math_tanh",
+            math::jit_math_tanh_raw as *const (),
+        ),
+        (
+            "ll_math::math_asinh",
+            "math_asinh",
+            math::jit_math_asinh_raw as *const (),
+        ),
+        (
+            "ll_math::math_acosh",
+            "math_acosh",
+            math::jit_math_acosh_raw as *const (),
+        ),
+        (
+            "ll_math::math_atanh",
+            "math_atanh",
+            math::jit_math_atanh_raw as *const (),
+        ),
+        (
+            "ll_math::math_fmod",
+            "math_fmod",
+            math::jit_math_fmod_raw as *const (),
+        ),
+    ] {
+        pair(entries, module_path, root_path, fnptr);
+    }
+
+    fn single(entries: &mut Vec<(&'static str, i64)>, path: &'static str, fnptr: *const ()) {
+        let addr = fnptr as usize as i64;
+        if addr != 0 {
+            entries.push((path, addr));
+        }
+    }
+
+    // `%` over two floats: `lloperation.py` has no `float_mod`, so the
+    // codewriter lowers it to a residual call of this name carrying the C
+    // `fmod` signature rather than the raising wrapper's.
+    single(
         entries,
-        "ll_math::math_hypot",
-        "math_hypot",
-        math::jit_math_hypot as *const (),
+        "ll_math_fmod",
+        math::jit_math_fmod_raw as *const (),
     );
-    pair(
+
+    // `pymath` is outside the extraction set, so every call of it reaches the
+    // artifact as an un-lowerable target.  `ulp` takes and returns one float,
+    // which the residual-call ABI carries, so binding its real address makes
+    // the call executable; the rest of the family returns `Result<f64, _>`,
+    // which is wider than a result slot, and stays unpublished.
+    single(
         entries,
-        "ll_math::math_atan2",
-        "math_atan2",
-        math::jit_math_atan2 as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_copysign",
-        "math_copysign",
-        math::jit_math_copysign as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_floor",
-        "math_floor",
-        math::jit_math_floor_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_ceil",
-        "math_ceil",
-        math::jit_math_ceil_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_log",
-        "math_log",
-        math::jit_math_log_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_exp",
-        "math_exp",
-        math::jit_math_exp_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_sin",
-        "math_sin",
-        math::jit_math_sin_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_cos",
-        "math_cos",
-        math::jit_math_cos_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_tan",
-        "math_tan",
-        math::jit_math_tan_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_pow",
-        "math_pow",
-        math::jit_math_pow_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_sqrt",
-        "math_sqrt",
-        math::jit_math_sqrt_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_log10",
-        "math_log10",
-        math::jit_math_log10_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_asin",
-        "math_asin",
-        math::jit_math_asin_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_acos",
-        "math_acos",
-        math::jit_math_acos_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_atan",
-        "math_atan",
-        math::jit_math_atan_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_sinh",
-        "math_sinh",
-        math::jit_math_sinh_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_cosh",
-        "math_cosh",
-        math::jit_math_cosh_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_tanh",
-        "math_tanh",
-        math::jit_math_tanh_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_asinh",
-        "math_asinh",
-        math::jit_math_asinh_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_acosh",
-        "math_acosh",
-        math::jit_math_acosh_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_atanh",
-        "math_atanh",
-        math::jit_math_atanh_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_expm1",
-        "math_expm1",
-        math::jit_math_expm1_raw as *const (),
-    );
-    pair(
-        entries,
-        "ll_math::math_log1p",
-        "math_log1p",
-        math::jit_math_log1p_raw as *const (),
+        "pymath::math::misc::ulp",
+        pymath::math::ulp as *const (),
     );
 }
 

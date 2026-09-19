@@ -5447,6 +5447,12 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             "int_is_true" | "ptr_nonzero" | "ptr_iszero" | "same_as" => op.clone(),
             s if s.starts_with("int_") || s.starts_with("uint_") => op.clone(),
             s if s.starts_with("float_") || s.starts_with("cast_") => op.clone(),
+            // rfloat.py `float2longlong` / `longlong2float` emit these
+            // llops by name.  The `int_` fallthrough would mint
+            // `int_convert_*`, which has no blackhole handler and no
+            // walker arm (pyjitpl.py's generated unary loop spells the
+            // unprefixed convert).
+            s if s.starts_with("convert_") => op.clone(),
             _ => format!("int_{op}"),
         },
         OpKind::VableForce { .. } => "hint_force_virtualizable".into(),
@@ -6199,6 +6205,28 @@ mod tests {
         };
 
         assert_eq!(op_kind_to_opname_with_kinds(&identity, "rr"), "ptr_eq");
+    }
+
+    #[test]
+    fn convert_float_bytes_keeps_the_rpython_llop_name() {
+        let operand = crate::flowspace::model::Variable::new();
+        for (op, result_ty) in [
+            (
+                "convert_float_bytes_to_longlong",
+                crate::model::ValueType::Int,
+            ),
+            (
+                "convert_longlong_bytes_to_float",
+                crate::model::ValueType::Float,
+            ),
+        ] {
+            let kind = crate::model::OpKind::UnaryOp {
+                op: op.into(),
+                operand: operand.clone(),
+                result_ty,
+            };
+            assert_eq!(op_kind_to_opname(&kind), op);
+        }
     }
 
     #[test]
