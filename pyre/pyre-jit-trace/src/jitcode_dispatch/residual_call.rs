@@ -9206,10 +9206,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // LoadName: descend `getitem_str` = `getdictvalue_no_unwrapping` +
     // `unwrap_cell`.  No handler gate: `except as` is a different
     // `next_instr` green from the inner while (`interp_jit.py
-    // pypyjitdriver.greens`).  A present cell is the live getfield, not
-    // a `version?` pin — `write_cell` in-place does not `mutated()`,
-    // and pinning the whole dict made `DELETE_NAME` of `except as`
-    // retrace the while every iteration.
+    // pypyjitdriver.greens`).
     if ctx.is_authoritative_executor
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
     {

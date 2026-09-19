@@ -10934,7 +10934,7 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     dst_bank: char,
     w_globals: pyre_object::PyObjectRef,
     name: &str,
-    w_code_ptr: usize,
+    pin_version: bool,
 ) -> Result<bool, DispatchError> {
     // Cell fast path applies only to a module dict still in strategy mode
     // whose slot holds a raw value, an `ObjectMutableCell`, or an
@@ -10942,18 +10942,12 @@ fn emit_module_dict_cell_fold<Sym: WalkSym>(
     if let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) {
         if let Some(stored) = crate::state::module_dict_cell_value_direct(w_globals, slot) {
             if !stored.is_null() {
-                // `celldict.py getdictvalue_no_unwrapping` is
-                // `@elidable_promote` on `version?` for every lookup,
-                // cell or raw.  Skip that pin only when this CodeObject
-                // itself `DELETE_NAME`s: `delitem` always `mutated()`,
-                // and a watcher already installed makes
-                // `opimpl_jit_force_quasi_immutable` abort the same
-                // trace (`exception_reraise_tb_depth_hot`).  A cell
-                // load in a delete-free body still pins — otherwise
-                // `unwrap_cell`'s recording concrete becomes a
-                // `GUARD_VALUE` that deopts on the next in-place
-                // rebind and never retraces (`global_reassign`).
-                let pin_version = !specialize::code_has_any_delete_name_from_ptr(w_code_ptr);
+                // RPython's `ConstPtr.value` is a GC-visible field. Pyre keeps
+                // the same value in the active trace, resume pools and backend
+                // GC table, whose registered walkers forward it in place.
+                // Movability therefore does not change whether this elidable
+                // cell lookup can fold; the namespace version guard below
+                // still revokes the constant when the slot is rebound.
                 return emit_namespace_cell_fold(
                     ctx,
                     op_pc,
@@ -10999,11 +10993,10 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
         return Ok(false);
     }
-    // In-place `write_cell` / `unwrap_cell` do not call `mutated()`.
-    // The live getfield is the cell, so a later in-place store is
-    // visible without a dict `version?` pin.  Pinning `version?` here
-    // made `DELETE_NAME` of a *different* name (`except as`) invalidate
-    // the inner while (`opimpl_jit_force_quasi_immutable`).
+    // `celldict.py getdictvalue_no_unwrapping` is `@elidable_promote` on
+    // `version?` for every lookup: present cell, raw value, and miss.
+    // `setitem_str` does the same lookup before `write_cell`.  A later
+    // insert or `delitem` (`mutated()`) fails GUARD_NOT_INVALIDATED.
     if pin_version {
         if !walker_pin_namespace_version(ctx, op_pc, ns)? {
             return Ok(false);

@@ -9646,11 +9646,9 @@ pub(crate) fn try_walker_orthodox_unwrap_cell<Sym: WalkSym>(
 /// A pointer store runs the cell's write barrier inside
 /// `celldict::write_cell`; an int store does not.
 ///
-/// In-place `write_cell` does not `mutated()`.  The baked cell pointer
-/// is the slot; a replacing store declines below (`write_cell` returns
-/// `Some`) and stays residual.  Do not pin dict `version?` — that
-/// watcher is whole-dict and `DELETE_NAME` of another name would
-/// invalidate this write.
+/// Pin `version?` and re-read the slot before baking `stored`: a later
+/// delete or replacing store mutates the dict and must revoke this
+/// compiled write, which otherwise mutates the detached old cell.
 pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9666,6 +9664,9 @@ pub(crate) fn try_walker_orthodox_write_cell<Sym: WalkSym>(
     let Some(jc) = crate::jitcode_runtime::write_cell_jitcode() else {
         return Ok(false);
     };
+    if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
     if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
         return Ok(false);
     }
@@ -25297,13 +25298,7 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
             None => return Ok(false),
         }
     };
-    if code_deletes_name_from_ptr(w_code_ptr, &name) {
-        return Ok(false);
-    }
-    // Present-cell load: live getfield, no dict `version?`.  `write_cell`
-    // in-place does not `mutated()`; pinning the dict made `DELETE_NAME`
-    // of a different name retrace the inner while.
-    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name, w_code_ptr)? {
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, &name, true)? {
         return Ok(true);
     }
 
@@ -25610,12 +25605,15 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     // Guard (a): the name must stay ABSENT from the module dict so the lookup
-    // keeps falling through to builtins.  A `version?` pin on the *module*
-    // dict is too coarse: `except as` `DELETE_NAME` always `mutated()` and
-    // would invalidate every loop that loaded `None` / `KeyError`.  The
-    // globals-identity guard still binds the fold to this dict; an insert
-    // of this name is a new cell and does not reuse the baked builtin.
+    // keeps falling through to builtins.  Pinning the module dict's `version?`
+    // is what proves that: the new-key insert that would shadow the builtin
+    // runs `mutated()`, which fails GUARD_NOT_INVALIDATED.  It is the same
+    // field a present-name fold on this namespace pins, so the two share one
+    // marker.
     if !guard_current_frame_globals_identity(ctx, op_pc, w_globals)? {
+        return Ok(false);
+    }
+    if !walker_pin_namespace_version(ctx, op_pc, w_globals)? {
         return Ok(false);
     }
     // Guard (b): the builtins value for `name` must be unchanged.  The
@@ -25639,74 +25637,6 @@ fn emit_builtins_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     Ok(true)
-}
-
-/// `except as` compiles to `STORE_NAME` + `DELETE_NAME` of that name
-/// (`pyopcode.py DELETE_NAME`).  Baking its cell would read the detached
-/// object after the delete and the next store allocated a replacement.
-fn code_deletes_name(code: &pyre_interpreter::CodeObject, name: &str) -> bool {
-    for pc in 0..code.instructions.len() {
-        let Some((ins, arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
-            continue;
-        };
-        let namei = match ins {
-            pyre_interpreter::Instruction::DeleteName { namei }
-            | pyre_interpreter::Instruction::DeleteGlobal { namei } => namei,
-            _ => continue,
-        };
-        let idx = namei.get(arg) as usize;
-        if pyre_interpreter::pyframe::load_name_from_code(code, idx) == Some(name) {
-            return true;
-        }
-    }
-    false
-}
-
-fn code_deletes_name_from_ptr(w_code_ptr: usize, name: &str) -> bool {
-    if w_code_ptr == 0 {
-        return false;
-    }
-    let code_ptr =
-        unsafe { pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef) };
-    if code_ptr.is_null() {
-        return false;
-    }
-    code_deletes_name(
-        unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) },
-        name,
-    )
-}
-
-/// True when this `CodeObject` contains any `DELETE_NAME` / `DELETE_GLOBAL`.
-/// A raw-slot `version?` pin on such a body aborts the same trace at the
-/// delete (`opimpl_jit_force_quasi_immutable`).
-pub(crate) fn code_has_any_delete_name_from_ptr(w_code_ptr: usize) -> bool {
-    if w_code_ptr == 0 {
-        return false;
-    }
-    let code_ptr =
-        unsafe { pyre_interpreter::w_code_get_ptr(w_code_ptr as pyre_object::PyObjectRef) };
-    if code_ptr.is_null() {
-        return false;
-    }
-    let code = unsafe { &*(code_ptr as *const pyre_interpreter::CodeObject) };
-    for pc in 0..code.instructions.len() {
-        let Some((ins, _)) = pyre_interpreter::decode_instruction_at(code, pc) else {
-            continue;
-        };
-        if matches!(
-            ins,
-            pyre_interpreter::Instruction::DeleteName { .. }
-                | pyre_interpreter::Instruction::DeleteGlobal { .. }
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
-fn frame_code_deletes_name(frame: &pyre_interpreter::pyframe::PyFrame, name: &str) -> bool {
-    code_deletes_name_from_ptr(frame.pycode as usize, name)
 }
 
 /// LoadName cell fold — module-scope LOAD_NAME mirror of
@@ -25755,18 +25685,7 @@ pub(crate) fn try_walker_load_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    if frame_code_deletes_name(frame, name) {
-        return Ok(false);
-    }
-    if emit_module_dict_cell_fold(
-        ctx,
-        op_pc,
-        dst,
-        dst_bank,
-        w_globals,
-        name,
-        frame.pycode as usize,
-    )? {
+    if emit_module_dict_cell_fold(ctx, op_pc, dst, dst_bank, w_globals, name, true)? {
         return Ok(true);
     }
     emit_builtins_cell_fold(
@@ -25811,9 +25730,6 @@ pub(crate) fn try_walker_store_name_cell_fold<Sym: WalkSym>(
     let name = unsafe {
         pyre_object::unicodeobject::w_str_get_value(w_name_ptr as pyre_object::PyObjectRef)
     };
-    if frame_code_deletes_name(frame, name) {
-        return Ok(false);
-    }
     let Some(slot) = crate::state::module_dict_cell_slot_direct(w_globals, name) else {
         return Ok(false);
     };
