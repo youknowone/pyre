@@ -6877,21 +6877,20 @@ impl<S: JitState> JitDriver<S> {
                     // The state fields as the walk found them: the identity
                     // slots of each bank, which for the int bank is the scalars
                     // and every array element both.
-                    let bh_sf = state.state_field_layout();
                     let sf_i = bank_span(
                         bh.registers_i.len(),
-                        bh_sf.int_scalar_base,
-                        bh_sf.total_slots(),
+                        sf_layout.int_scalar_base,
+                        sf_layout.total_slots(),
                     );
                     let sf_r = bank_span(
                         bh.registers_r.len(),
-                        bh_sf.ref_scalar_base,
-                        bh_sf.num_ref_scalars,
+                        sf_layout.ref_scalar_base,
+                        sf_layout.num_ref_scalars,
                     );
                     let sf_f = bank_span(
                         bh.registers_f.len(),
-                        bh_sf.float_scalar_base,
-                        bh_sf.num_float_scalars,
+                        sf_layout.float_scalar_base,
+                        sf_layout.num_float_scalars,
                     );
                     // Three register-bank copies, and their only purpose is
                     // `guard_may_bridge` below, whose only reader takes them
