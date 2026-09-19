@@ -15,9 +15,16 @@
 //! pinned empty for the same run.
 
 use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use majit_metainterp::JitDriver;
 use majit_metainterp::virt_array::VirtArray;
+
+/// The mainloop hands back one value, so the decoded ones come out through
+/// statics -- which the tests in this binary would race on, because they run
+/// on their own threads. `run` holds this for the call AND for reading the
+/// statics back, so a run and its readout are one unit.
+static RUN_LOCK: Mutex<()> = Mutex::new(());
 
 static LOOPS_COMPILED: AtomicUsize = AtomicUsize::new(0);
 static DECODED_I16: AtomicI64 = AtomicI64::new(0);
@@ -132,27 +139,37 @@ fn program() -> Vec<u8> {
     ]
 }
 
-/// What the three decoders answer, from one run at the given threshold.
-fn run(threshold: u32) -> (i64, i64, i64) {
+/// What one run at the given threshold decoded, and how many loops it compiled.
+struct Run {
+    decoded: (i64, i64, i64),
+    loops_compiled: usize,
+}
+
+fn run(threshold: u32) -> Run {
+    let _serialized = RUN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let answer = dispatch_endian(&program(), threshold);
     assert_eq!(answer, 0, "the loop must have run to completion");
-    (
-        DECODED_I16.load(Ordering::Relaxed),
-        DECODED_I32.load(Ordering::Relaxed),
-        DECODED_U16.load(Ordering::Relaxed),
-    )
+    Run {
+        decoded: (
+            DECODED_I16.load(Ordering::Relaxed),
+            DECODED_I32.load(Ordering::Relaxed),
+            DECODED_U16.load(Ordering::Relaxed),
+        ),
+        loops_compiled: LOOPS_COMPILED.load(Ordering::Relaxed),
+    }
 }
 
 #[test]
 fn the_compiled_tier_decodes_what_rust_decodes() {
     let untraced = run(u32::MAX);
     assert_eq!(
-        LOOPS_COMPILED.load(Ordering::Relaxed),
-        0,
+        untraced.loops_compiled, 0,
         "nothing compiles at an unreachable threshold"
     );
     assert_eq!(
-        untraced,
+        untraced.decoded,
         (
             i16::from_le_bytes([0xff, 0xff]) as i64,
             i32::from_be_bytes([0xff, 0xff, 0xff, 0xfe]) as i64,
@@ -163,13 +180,13 @@ fn the_compiled_tier_decodes_what_rust_decodes() {
 
     let compiled = run(3);
     assert!(
-        LOOPS_COMPILED.load(Ordering::Relaxed) > 0,
+        compiled.loops_compiled > 0,
         "nothing compiled, so this says nothing about the lowering"
     );
     assert_eq!(
-        compiled, untraced,
-        "the compiled tier decoded (i16, i32, u16) = {compiled:?} where Rust \
-         decodes {untraced:?}"
+        compiled.decoded, untraced.decoded,
+        "the compiled tier decoded (i16, i32, u16) = {:?} where Rust decodes {:?}",
+        compiled.decoded, untraced.decoded,
     );
 }
 
