@@ -17180,14 +17180,7 @@ fn builtin_locals(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// walker declines the CALL with `no jitcode for address` — measured on
 /// `locals_proxy_extra_key_hot`, where `locals` was one of three such names.
 ///
-/// Unlike `__majit_wrap_builtin_len` this adds no JIT-shaped body, and that is
-/// a measured limit rather than a simplification.  The descent resolves its
-/// heap-cache item key with `wrapper_args_item_descr_index`, which reads the
-/// first `getarrayitem_gc_r` after the first `arraylen_gc` in the wrapper's own
-/// body; a no-argument wrapper has neither, so the descent declines with
-/// `wrapper args item descriptor unresolved` even though the key it wants would
-/// seed an empty item list.  Under `PYRE_FBW_DESCENT_SCAN_STATIC=1` that
-/// decline comes second, behind the un-lowered-helper scan's own.
+/// Unlike `__majit_wrap_builtin_len` this adds no JIT-shaped body.
 ///
 /// So what this buys is reach, not a descent: the chain below is codewritten,
 /// which is what lets `rewrite_op_jit_force_virtualizable` delete the force in

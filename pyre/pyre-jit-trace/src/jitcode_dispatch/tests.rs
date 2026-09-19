@@ -1141,34 +1141,24 @@ fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
 }
 
 #[test]
-fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
+fn builtin_wrapper_args_slice_names_the_object_gcarray_descr() {
+    // `cpu.arraydescrof(ARRAY)` is one descr per ARRAY: the wrapper's length
+    // and item reads of its `&[PyObjectRef]` argument name the descr the
+    // walker builds that array with, so its heap-cache seeds are hits.
     let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");
+    let expected = crate::state::pyobject_gcarray_descr().index();
     let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .next()
         .expect("wrapper first op");
     assert_eq!(first.key, "arraylen_gc/rd>i");
-    let len_pool_index =
-        wrapper.code[first.pc + 2] as usize | ((wrapper.code[first.pc + 3] as usize) << 8);
-    let len_descr_index = crate::jitcode_runtime::all_descr_refs()[len_pool_index].index();
-
-    let item_descr_index =
-        wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
-    assert_ne!(
-        item_descr_index, len_descr_index,
-        "Charon slice length and element descriptors are distinct cache keys"
-    );
+    assert_eq!(item_pool_descr_index(&wrapper.code, first.pc + 2), expected);
 
     let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| {
             op.key == "getarrayitem_gc_r/rid>r" && wrapper.code.get(op.pc + 1).copied() == Some(0)
         })
         .expect("wrapper getarrayitem(r0)");
-    let item_pool_index =
-        wrapper.code[getitem.pc + 3] as usize | ((wrapper.code[getitem.pc + 4] as usize) << 8);
-    assert_eq!(
-        item_descr_index,
-        crate::jitcode_runtime::all_descr_refs()[item_pool_index].index()
-    );
+    assert_eq!(item_pool_descr_index(&wrapper.code, getitem.pc + 3), expected);
 }
 
 #[test]
@@ -1230,15 +1220,11 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
         "the receiver tests run before the argument preamble"
     );
 
-    let item_descr_index =
-        wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
-    // Select by descr identity rather than by position: the length read names
-    // the array itself and the item read names its elements, so the two carry
-    // distinct heap-cache descriptors even though both index the same slice.
+    let args_descr_index = crate::state::pyobject_gcarray_descr().index();
     let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| {
             op.key == "getarrayitem_gc_r/rid>r"
-                && item_pool_descr_index(&wrapper.code, op.pc + 3) == item_descr_index
+                && item_pool_descr_index(&wrapper.code, op.pc + 3) == args_descr_index
         })
         .expect("wrapper argument-slice item read");
     let slice_reg = wrapper.code[getitem.pc + 1];
@@ -1252,8 +1238,7 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     // splitter inlines far enough to read `args.len()` off the wrapper input
     // before the split: that read can share the slice's register once the
     // wrapper input is dead, and the first `arraylen_gc` in the code would
-    // then name it rather than the slice's.  `wrapper_args_item_descr_index`
-    // anchors on that first read for the same reason.
+    // then name it rather than the slice's.
     crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .filter(|op| {
             op.key == "arraylen_gc/rd>i"

@@ -4460,28 +4460,6 @@ mod portal_frame_chain_tests {
     }
 }
 
-/// Resolve the generated builtin-wrapper argument slice's array-item
-/// descriptor. The first instruction's arraylen descriptor is deliberately
-/// not interchangeable with the later getarrayitem descriptor.
-pub(super) fn wrapper_args_item_descr_index(code: &[u8]) -> Option<u32> {
-    // Generated gateways perform their argument extraction before entering the
-    // typed body, reading the slice length before any element.  The first Ref
-    // item read after the first slice-length read is therefore the
-    // wrapper-argument descriptor, independent of which register colouring
-    // assigns to the slice.
-    let arraylen_pc = crate::jitcode_runtime::decoded_ops(code)
-        .find(|decoded| decoded.key == "arraylen_gc/rd>i")
-        .map(|decoded| decoded.pc)?;
-    crate::jitcode_runtime::decoded_ops(code)
-        .find(|decoded| decoded.pc > arraylen_pc && decoded.key == "getarrayitem_gc_r/rid>r")
-        .and_then(|decoded| {
-            let lo = *code.get(decoded.pc + 3)? as usize;
-            let hi = *code.get(decoded.pc + 4)? as usize;
-            let pool_index = lo | (hi << 8);
-            crate::jitcode_runtime::descr_ref_at(pool_index).map(|descr| descr.index())
-        })
-}
-
 /// `BuiltinCode.func` is an RPython PBC: the codewriter turns its finite
 /// target family into an indirect call whose address is resolved back to the
 /// generated target JitCode by `MetaInterpStaticData.bytecode_for_address`
@@ -4801,29 +4779,6 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         )
     };
 
-    // The generated builtin-wrapper ABI takes its `&[PyObjectRef]` argument
-    // in r0 and begins by checking its length.  Resolve that instruction's
-    // descriptor operand now, before switching the sub-walk to the global
-    // descriptor pool below. The wrapper starts with arraylen(r0), but Charon
-    // emits a distinct descriptor for slice length (header metadata) and
-    // slice item access (element metadata). Heapcache array-item keys use the
-    // latter, exactly like RPython `_do_getarrayitem_gc_any(arraydescr)`;
-    // seeding under the arraylen descriptor makes the later getitem miss and
-    // manufactures a Box without its recording-time `.value`.
-    //
-    // A zero-argument gateway reads no element out of the slice, so its body
-    // holds no `getarrayitem_gc_r` to name the item descriptor and the seeding
-    // loop below has nothing to seed.  Require the descriptor only when an
-    // element is actually published.
-    let wrapper_args_descr_index = match wrapper_args_item_descr_index(body.code) {
-        Some(index) => Some(index),
-        None if wrapper_item_count == 0 => None,
-        None => {
-            builtin_inline_decline!("wrapper args item descriptor unresolved", fnaddr);
-            return Ok(None);
-        }
-    };
-
     let mut callable_guard_op = r_args[0];
     let mut receiver_op = method_form.then_some(r_args[1]);
     if let Some((w_class, version_tag)) = instance_call_class {
@@ -4921,10 +4876,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
             &[args_array, index, item],
             array_descr.clone(),
         );
-        if let Some(wrapper_args_descr_index) = wrapper_args_descr_index {
-            ctx.trace_ctx
-                .heapcache_setarrayitem(args_array, index, wrapper_args_descr_index, item);
-        }
+        // The wrapper reads its `&[PyObjectRef]` argument through this same
+        // ArrayDescr, so its getarrayitem returns the live CALL operand.
+        ctx.trace_ctx
+            .heapcache_setarrayitem(args_array, index, array_descr.index(), item);
     }
 
     if !nested_helper && sym.owns_virtualizable_shadow() {
