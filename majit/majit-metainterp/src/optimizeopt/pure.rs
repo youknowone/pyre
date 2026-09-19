@@ -459,24 +459,6 @@ pub struct OptPure {
     /// RPython keys are lists of constant boxes (value-based equality).
     /// Keys are the constant Values that _can_optimize_call_pure builds.
     call_pure_results: crate::optimizeopt::util::ArgsDict,
-    /// shortpreamble.py: PureOp.produce_op stores PreambleOp in
-    /// optpure's cache. In majit, PreambleOp entries stored here are
-    /// searched with forwarding-aware matching (force_preamble_op pattern).
-    /// Body CSE uses `RecentPureOpTable` (the `cache` field above) — a
-    /// per-opcode bucket array, not a hashmap.
-    preamble_pure_ops: Vec<PreamblePureEntry>,
-}
-
-/// shortpreamble.py: PreambleOp stored in OptPure for always-pure ops.
-/// Searched with forwarding-aware matching during body optimization.
-#[derive(Clone, Debug)]
-struct PreamblePureEntry {
-    opcode: OpCode,
-    args: Vec<OpRef>,
-    descr_identity: Option<usize>,
-    pop: PreambleOp,
-    /// Forced flag: after first match, replaced with Direct result.
-    forced_result: Option<OpRef>,
 }
 
 impl OptPure {
@@ -491,7 +473,6 @@ impl OptPure {
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
             call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
-            preamble_pure_ops: Vec::new(),
         }
     }
 
@@ -722,51 +703,6 @@ impl OptPure {
             .unwrap_or(true)
     }
 
-    /// pure.py: RecentPureOps.force_preamble_op
-    /// Searches preamble entries with forwarding-aware arg matching.
-    /// On match, forces PreambleOp (in-place replacement) and returns result.
-    fn force_preamble_op(&mut self, op: &Op, ctx: &mut OptContext) -> Option<OpRef> {
-        let descr_identity = op.getdescr().as_ref().map(majit_ir::descr::descr_identity);
-        for entry in &mut self.preamble_pure_ops {
-            if entry.opcode != op.opcode {
-                continue;
-            }
-            if entry.descr_identity != descr_identity {
-                continue;
-            }
-            if entry.args.len() != op.num_args() {
-                continue;
-            }
-            // pure.py lookup1: `box0.same_box(get_box_replacement(op.getarg(0)))`.
-            // Both stored and query are walked through the forwarding chain
-            // via `OptContext::same_box` (pure.py:62, :72-73 +
-            // history.py Const.same_box → same_constant).
-            let args_match = op.with_arglist(|args| {
-                entry
-                    .args
-                    .iter()
-                    .zip(args)
-                    .all(|(&stored, query)| ctx.same_box(stored, query.to_opref()))
-            });
-            if args_match {
-                // pure.py: force_preamble_op — isinstance check → force → replace
-                if let Some(result) = entry.forced_result {
-                    if Self::matches_result_type(op, result, ctx) {
-                        return Some(result);
-                    }
-                    continue;
-                }
-                let forced = ctx.force_op_from_preamble_op(&entry.pop);
-                if !Self::matches_result_type(op, forced, ctx) {
-                    continue;
-                }
-                entry.forced_result = Some(forced);
-                return Some(forced);
-            }
-        }
-        None
-    }
-
     /// Store PreambleOp in OptPure for always-pure ops.
     /// RPython shortpreamble.py: opt.pure(op.getopnum(), PreambleOp(...))
     pub fn pure_preamble(
@@ -785,14 +721,7 @@ impl OptPure {
                 .collect(),
             descr_identity,
         };
-        self.cache.insert_preamble(key, pop.clone());
-        self.preamble_pure_ops.push(PreamblePureEntry {
-            opcode,
-            args,
-            descr_identity,
-            pop,
-            forced_result: None,
-        });
+        self.cache.insert_preamble(key, pop);
     }
 
     /// Store PreambleOp in extra_call_pure for CALL_PURE preamble imports.
@@ -1049,16 +978,6 @@ impl Optimization for OptPure {
                     return OptimizationResult::Remove; // guard also removed
                 }
 
-                // pure.py: force_preamble_op replaces the OVF op
-                // with the preamble's cached result.
-                if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
-                    let b_old = postponed_box.clone();
-                    let b_cached = ctx.get_box_replacement_operand(cached_ref);
-                    ctx.make_equal_to(&b_old, &b_cached);
-                    self.last_emitted_was_removed = true;
-                    return OptimizationResult::Remove; // guard also removed
-                }
-
                 // pure.py + 162-171 _can_reuse_oldop:
                 // The lookup may surface a non-OVF op of the same shape
                 // (e.g. INT_ADD vs INT_ADD_OVF). _can_reuse_oldop accepts
@@ -1173,14 +1092,6 @@ impl Optimization for OptPure {
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove;
                 }
-            }
-
-            if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                let b_old = Operand::from_bound_op(op_rc);
-                let b_cached = ctx.get_box_replacement_operand(cached_ref);
-                ctx.make_equal_to(&b_old, &b_cached);
-                self.last_emitted_was_removed = true;
-                return OptimizationResult::Remove;
             }
 
             // CSE: exact same operation already computed?
@@ -1343,13 +1254,11 @@ impl Optimization for OptPure {
         self.known_result_call_pure.clear();
         // Note: extra_call_pure is NOT cleared on setup — it persists
         // across optimization runs (set by set_extra_call_pure before opt).
-        // preamble_pure_ops also NOT cleared — populated during import.
     }
 
     fn reset_between_compiles(&mut self) {
         self.setup();
         self.extra_call_pure.clear();
-        self.preamble_pure_ops.clear();
     }
 
     fn set_call_pure_results(&mut self, results: &crate::optimizeopt::util::ArgsDict) {
@@ -2111,7 +2020,6 @@ mod tests {
             known_result_call_pure: Vec::new(),
             extra_call_pure: Vec::new(),
             call_pure_results: crate::optimizeopt::util::ArgsDict::default(),
-            preamble_pure_ops: Vec::new(),
         }));
         let result = opt
             .optimize_with_constants_and_inputs_oprc(
@@ -3004,7 +2912,7 @@ mod tests {
         let query = Op::new(OpCode::IntAdd, &[arg0, const_box]);
         assert!(
             pass.recent_ops_has_preamble(&query, &ctx),
-            "imported IntAdd must land in RecentPureOps, not only preamble_pure_ops"
+            "imported IntAdd must land in RecentPureOps"
         );
     }
 
