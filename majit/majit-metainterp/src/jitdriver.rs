@@ -6224,6 +6224,11 @@ impl<S: JitState> JitDriver<S> {
                     std::hint::black_box(&mut *state);
                 }
             }
+            let saved_vable_ptr = self
+                .meta
+                .tracing
+                .as_ref()
+                .and_then(|ctx| ctx.virtualizable_heap_ptr());
             if !self.sync_before(state, &compiled_meta, vable) {
                 return None;
             }
@@ -6467,7 +6472,7 @@ impl<S: JitState> JitDriver<S> {
                     if !result.is_finish && !result.typed_values.is_empty() {
                         state.restore_values(&compiled_meta, &result.typed_values);
                     }
-                    self.sync_after(state, &compiled_meta, vable);
+                    self.sync_after(state, &compiled_meta, vable, saved_vable_ptr);
                     std::hint::black_box(&mut *state);
                 }
             }
@@ -6516,7 +6521,7 @@ impl<S: JitState> JitDriver<S> {
                 // `descriptor_cache`), so a second consultation could only
                 // return the same object at the cost of one more refcount pair
                 // per compiled entry.
-                self.sync_after(state, run_meta, vable);
+                self.sync_after(state, run_meta, vable, saved_vable_ptr);
                 // Kept for callers that cannot consume the latch (a portal whose
                 // return type the expansion cannot build from a `Value`). Those
                 // callers see today's behaviour unchanged; a caller that drains
@@ -6534,7 +6539,7 @@ impl<S: JitState> JitDriver<S> {
                 // Carried from the entry decision above, not re-resolved; see
                 // the FINISH arm for why one resolution serves both ends of a
                 // compiled entry.
-                self.sync_after(state, run_meta, vable);
+                self.sync_after(state, run_meta, vable, saved_vable_ptr);
                 return Some(target_pc);
             }
 
@@ -7811,6 +7816,11 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
+                // The entry names the frame this run executes; `sync_after`
+                // puts the caller's frame back.
+                if let Some(ctx) = self.meta.tracing.as_mut() {
+                    ctx.set_virtualizable_heap_ptr(ptr.cast_const());
+                }
             }
             // Fallback cache for layouts that cannot expose array length on
             // the heap object alone (header-less embedded arrays). Unused in
@@ -7826,8 +7836,20 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Counterpart of [`Self::sync_before`]; takes the same pre-resolved
-    /// virtualizable red, and for the same reason.
-    fn sync_after(&self, state: &mut S, meta: &S::Meta, virtualizable: Option<&JitDriverVar>) {
+    /// virtualizable red, and for the same reason. Restores the recording
+    /// context's virtualizable pointer saved before that `sync_before`.
+    fn sync_after(
+        &mut self,
+        state: &mut S,
+        meta: &S::Meta,
+        virtualizable: Option<&JitDriverVar>,
+        saved_vable_ptr: Option<*const u8>,
+    ) {
+        if let Some(ptr) = saved_vable_ptr {
+            if let Some(ctx) = self.meta.tracing.as_mut() {
+                ctx.set_virtualizable_heap_ptr(ptr);
+            }
+        }
         let Some(virtualizable) = virtualizable else {
             return;
         };
@@ -8079,6 +8101,11 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
+        let saved_vable_ptr = self
+            .meta
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_heap_ptr());
         if !state.is_compatible(&meta) || !self.sync_before(state, &meta, vable) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -8180,7 +8207,7 @@ impl<S: JitState> JitDriver<S> {
             std::mem::take(&mut result.typed_values)
         };
         state.restore_values(&exit_meta, &typed_values);
-        self.sync_after(state, &exit_meta, vable);
+        self.sync_after(state, &exit_meta, vable, saved_vable_ptr);
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
             continue_running_normally_values: None,
@@ -8240,6 +8267,11 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
+        let saved_vable_ptr = self
+            .meta
+            .tracing
+            .as_ref()
+            .and_then(|ctx| ctx.virtualizable_heap_ptr());
         if !self.sync_before(state, &meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -8356,7 +8388,7 @@ impl<S: JitState> JitDriver<S> {
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
             state.restore_values(&exit_meta, &result.typed_values);
-            self.sync_after(state, &exit_meta, vable);
+            self.sync_after(state, &exit_meta, vable, saved_vable_ptr);
             drop(result);
             return DetailedDriverRunOutcome::Jump {
                 via_blackhole: false,
