@@ -164,6 +164,12 @@ pub struct TypeDecl {
     /// schema-drift policy above). `None` when Charon emitted no layout.
     #[serde(default)]
     pub layout: Option<Box<RawValue>>,
+    /// Origin Charon recorded for this declaration. A compiler-generated
+    /// closure environment is the object `{"Closure": …}`; every other ADT
+    /// in the extracted corpus is the string `"TopLevel"`. Kept raw so an
+    /// unmodelled origin cannot fail the load.
+    #[serde(default)]
+    pub src: Option<Value>,
 }
 
 /// One `{key, value}` entry of [`TypeDecl::layout`].

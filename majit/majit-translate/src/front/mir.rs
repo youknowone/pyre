@@ -1729,7 +1729,10 @@ fn derive_program_metadata(
                     .enumerate()
                     .map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        (fname, tyref_to_attr_value_type(&f.ty, llbc))
+                        (
+                            fname,
+                            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
+                        )
                     })
                     .collect();
                 struct_field_attrs.insert(canonical_name.clone(), attr_rows);
@@ -3510,28 +3513,18 @@ fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
 /// construct-on-stack spelling; after those passes, a remaining struct
 /// constructor is the allocation and becomes [`OpKind::New`].
 ///
-/// Aggregates passed to `lltype::malloc[_typed*]` stay constructors: they
-/// are the boxing cluster's stack value, not the heap object.
+/// Aggregates that still participate in a boxing cluster stay constructors:
+/// the malloc argument, any phi that carries it, and nested named structs
+/// stored into those (the header object fusion reads `ob_type` off).  They
+/// are the cluster's stack value, not the heap object; rewriting them to
+/// `New` would allocate the header separately and leave fusion looking at
+/// a `New` instead of a `SyntheticTransparentCtor`.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
 )]
 fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
-    use crate::flowspace::model::Variable;
-    use std::collections::HashSet;
-
-    let mut malloc_args: HashSet<Variable> = HashSet::new();
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let OpKind::Call { target, args, .. } = &op.kind else {
-                continue;
-            };
-            if !call_target_is_gc_malloc(target) {
-                continue;
-            }
-            malloc_args.extend(args.iter().filter_map(LinkArg::as_variable).cloned());
-        }
-    }
+    let malloc_args = boxing_cluster_ctor_results(graph);
 
     let mut rewritten = 0usize;
     for block in &mut graph.blocks {
@@ -3568,6 +3561,67 @@ fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
         }
     }
     rewritten
+}
+
+/// Variables that still belong to an unfused boxing cluster: each
+/// `lltype::malloc[_typed*]` argument, the phis that carry it, and every
+/// nested named-struct stored into those aggregates.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
+)]
+fn boxing_cluster_ctor_results(graph: &FunctionGraph) -> std::collections::HashSet<Variable> {
+    use std::collections::HashSet;
+
+    let mut cluster: HashSet<Variable> = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            if !call_target_is_gc_malloc(target) {
+                continue;
+            }
+            cluster.extend(args.iter().filter_map(LinkArg::as_variable).cloned());
+        }
+    }
+    let mut growing = true;
+    while growing {
+        growing = false;
+        for block in &graph.blocks {
+            for (slot, arg) in block.inputargs.iter().enumerate() {
+                if !cluster.contains(arg) {
+                    continue;
+                }
+                for pred in &graph.blocks {
+                    for link in &pred.exits {
+                        if link.target != block.id {
+                            continue;
+                        }
+                        if let Some(v) = link.args.get(slot).and_then(LinkArg::as_variable)
+                            && cluster.insert(v.clone())
+                        {
+                            growing = true;
+                        }
+                    }
+                }
+            }
+            for op in &block.operations {
+                let OpKind::FieldWrite { base, value, .. } = &op.kind else {
+                    continue;
+                };
+                if !cluster.contains(base) {
+                    continue;
+                }
+                if let Some(v) = value.as_variable()
+                    && cluster.insert(v.clone())
+                {
+                    growing = true;
+                }
+            }
+        }
+    }
+    cluster
 }
 
 /// Order in which [`Lowering::lower`] walks the MIR basic blocks.
@@ -7242,6 +7296,10 @@ impl<'a> Lowering<'a> {
                     // consumes `inner`.  It selects the payload projection
                     // below.
                     let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
+                    // A closure env is identified from the type decl's
+                    // `src: Closure` origin, not from the `closure` name
+                    // leaf.  Needed before `resolve_place` consumes `inner`.
+                    let owner_is_closure_env = tyref_is_closure_env(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let base = if let Some(root) = narrow_root {
@@ -7269,16 +7327,17 @@ impl<'a> Lowering<'a> {
                     // A shell variant's payload takes the shell projection:
                     // the `&P` a slice accessor hands back through
                     // `Option`/`Result`/`ControlFlow` is the primitive, not
-                    // a pointer the program stores.  A struct field whose
-                    // declared type is a shared borrow of a primitive is
-                    // the same integer: `Rvalue::Ref` aliases the referent
-                    // and `Ptr(Signed)` does not exist, so a captured
-                    // `&usize` is the `usize`.  A stored `&T` to a
-                    // container keeps the Ref bank.
+                    // a pointer the program stores.  A closure-env field
+                    // whose declared type is a shared borrow of a primitive
+                    // is the same integer: the body reads the capture
+                    // through that borrow as a scalar (`Rvalue::Ref`
+                    // aliases the referent).  An ordinary struct's `&P`
+                    // field is a pointer the program stores and compares.
                     let ty = adt_field_read_value_type(
                         &place_ty,
                         &field_ty,
                         container_is_enum,
+                        owner_is_closure_env,
                         self.llbc,
                     );
                     let res = self
@@ -23641,16 +23700,19 @@ fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
 ///
 /// Prefers the place's post-projection type (generic substitution is
 /// already applied there).  A shell variant peels a shared borrow of a
-/// primitive the way [`tyref_enum_payload_value_type`] does.  A struct
-/// field whose declared type is that same borrow is the integer too:
-/// `Rvalue::Ref` aliases the referent, `resolve_place` collapses `Deref`,
-/// and `Ptr(Signed)` does not exist, so a captured `&usize` is the
-/// `usize`.  Without the peel the field stays `Ref` and a later `int_add`
-/// assembles as `int_add/ri>i`.
+/// primitive the way [`tyref_enum_payload_value_type`] does.  A closure-env
+/// field whose declared type is that same borrow is the integer too: the
+/// body reads the capture through the borrow as a scalar (`Rvalue::Ref`
+/// aliases the referent, `resolve_place` collapses `Deref`, and
+/// `Ptr(Signed)` does not exist), so a captured `&usize` is the `usize`.
+/// Without the peel the field stays `Ref` and a later `int_add` assembles
+/// as `int_add/ri>i`.  An ordinary struct's `&P` field is a pointer the
+/// program stores and compares, so it keeps the Ref bank.
 fn adt_field_read_value_type(
     place_ty: &TyRef,
     field_ty: &TyRef,
     container_is_enum: bool,
+    owner_is_closure_env: bool,
     llbc: &Llbc,
 ) -> ValueType {
     let declared = if container_is_enum {
@@ -23660,8 +23722,9 @@ fn adt_field_read_value_type(
     };
     match declared {
         ValueType::Ref(None) => {
-            if let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
-                .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
+            if owner_is_closure_env
+                && let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
+                    .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
             {
                 return peeled;
             }
@@ -23669,6 +23732,27 @@ fn adt_field_read_value_type(
         }
         resolved => resolved,
     }
+}
+
+/// Whether `td` is a compiler-generated closure environment.
+///
+/// Charon stamps those with `src: { Closure: … }`; ordinary ADTs are
+/// `"TopLevel"`.  Identified from that origin, never from the `closure` /
+/// `closure#N` name leaf.
+fn type_decl_is_closure_env(td: &TypeDecl) -> bool {
+    td.src
+        .as_ref()
+        .is_some_and(|src| src.get("Closure").is_some())
+}
+
+/// Whether `ty` resolves to a closure-env ADT, after peeling reference
+/// wrappers so a `&self` receiver answers the same as a by-value one.
+fn tyref_is_closure_env(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .is_some_and(type_decl_is_closure_env)
 }
 
 fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
@@ -24261,13 +24345,6 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    // A stored shared borrow of a primitive is the integer
-    // (`adt_field_read_value_type`): seed the attr as that scalar so a
-    // captured `&usize` does not FORCE a Ref class field against an
-    // Int-banked getfield.
-    if let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc) {
-        return peeled;
-    }
     // A `str`/`String`/`Wtf8` field seeds a `SomeString` attr shell (via
     // valuetype_to_someshell) instead of the classdef-less `Ref(None)`
     // SomeInstance the fallback yields; the latter walls when the first
@@ -24281,6 +24358,24 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
         return ValueType::Str;
     }
     ValueType::Ref(None)
+}
+
+/// Register-class of a struct field, matching [`tyref_to_attr_value_type`]
+/// except for a closure-env capture whose declared type is a shared borrow
+/// of a primitive: seed that attr as the scalar so FORCE does not install
+/// a Ref class field against an Int-banked getfield.  Ordinary struct
+/// fields of reference type stay `Ref`.
+fn tyref_to_attr_value_type_for_struct_field(
+    ty: &TyRef,
+    owner: &TypeDecl,
+    llbc: &Llbc,
+) -> ValueType {
+    if type_decl_is_closure_env(owner)
+        && let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc)
+    {
+        return peeled;
+    }
+    tyref_to_attr_value_type(ty, llbc)
 }
 
 /// The bare leaf name of `ty`'s named-ADT root, after stripping
@@ -30977,8 +31072,9 @@ mod tests {
         is_core_result_map_err_path, json_ty_is_thin_pointer_element,
         json_ty_scalar_element_spelling, lower_struct_aggregate_ctors_to_new,
         primitive_float_const, push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
-        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
-        tyref_positional_aggregate_root, tyref_to_attr_value_type, tyref_to_value_type,
+        simplify_lowered_graph, type_decl_is_closure_env, tyref_array_suffix, tyref_is_closure_env,
+        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_attr_value_type,
+        tyref_to_attr_value_type_for_struct_field, tyref_to_value_type,
     };
     use crate::model::{
         CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -31226,6 +31322,119 @@ mod tests {
         let mut graph = struct_ctor_graph(true);
         assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    fn boxing_cluster_with_nested_header() -> FunctionGraph {
+        let mut graph = FunctionGraph::new("w_new_int");
+        let entry = graph.startblock;
+        let header_owner = "ObjectHeader";
+        let outer_owner = "W_IntObject";
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), header_owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(header_owner.to_string())),
+                },
+                true,
+            )
+            .expect("header ctor");
+        let class_static = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["charon_corpus", "INT_CLASS"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("class static");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor::new("ob_type", Some(header_owner.to_string())),
+                value: LinkArg::Value(class_static),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let outer = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), outer_owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(outer_owner.to_string())),
+                },
+                true,
+            )
+            .expect("outer ctor");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: outer.clone(),
+                field: FieldDescriptor::new("ob_header", Some(outer_owner.to_string())),
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let boxed = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::function_path(["runtime_object", "lltype", "malloc_typed"]),
+                    args: crate::model::call_args(vec![outer.clone()]),
+                    result_ty: ValueType::Ref(Some(outer_owner.to_string())),
+                },
+                true,
+            )
+            .expect("malloc_typed");
+        graph.set_return(entry, Some(boxed));
+        graph
+    }
+
+    fn boxing_cluster_ctor_new_counts(graph: &FunctionGraph) -> (usize, usize) {
+        let mut ctors = 0usize;
+        let mut news = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::SyntheticTransparentCtor {
+                            is_struct: true, ..
+                        },
+                    ..
+                } => ctors += 1,
+                OpKind::New { .. } => news += 1,
+                _ => {}
+            }
+        }
+        (ctors, news)
+    }
+
+    /// The nested header stored into a `malloc_typed` aggregate is still
+    /// part of the boxing cluster. Rewriting it to `New` would allocate the
+    /// header separately and leave fusion looking at a `New` instead of a
+    /// constructor.
+    #[test]
+    fn malloc_typed_nested_header_ctor_is_left_for_boxing_fusion() {
+        let mut graph = boxing_cluster_with_nested_header();
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
+    }
+
+    /// Final simplify must not steal the cluster either: fusion still has
+    /// to see the construct-on-stack spelling after class addresses land.
+    #[test]
+    fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
+        let mut graph = boxing_cluster_with_nested_header();
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
     /// Every row of the fn-pointer family decision, including the two the
@@ -36084,28 +36293,127 @@ mod tests {
         }))
     }
 
+    fn shared_borrow_of_u8() -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Ref": [
+                {"Erased": null},
+                {"Literal": {"UInt": "U8"}},
+                "Shared"
+            ]
+        }))
+    }
+
+    fn adt_ty(def_id: u64) -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Adt": {"id": {"Adt": def_id}, "generics": {"types": []}}
+        }))
+    }
+
+    fn type_decl_meta(path: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": {"data": {
+                "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+            }},
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    }
+
+    fn llbc_with_ordinary_and_closure_env() -> Llbc {
+        // def_id 0: ordinary struct named `closure` with src TopLevel — the
+        // name leaf must not decide env-ness.
+        // def_id 1: compiler-generated closure env named `Env` with src Closure.
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [
+                    {
+                        "def_id": 0,
+                        "item_meta": type_decl_meta(&["fixture", "BorrowedByte", "closure"]),
+                        "kind": {"Struct": [{
+                            "name": "byte",
+                            "ty": {"Ref": [{"Erased": null}, {"Literal": {"UInt": "U8"}}, "Shared"]},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                        }]},
+                        "src": "TopLevel"
+                    },
+                    {
+                        "def_id": 1,
+                        "item_meta": type_decl_meta(&["fixture", "try_dispatch_binary_special", "Env"]),
+                        "kind": {"Struct": [{
+                            "name": null,
+                            "ty": {"Ref": [{"Erased": null}, {"Literal": {"UInt": "Usize"}}, "Shared"]},
+                            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                        }]},
+                        "src": {"Closure": {"info": {"kind": "FnOnce"}}}
+                    }
+                ],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
+    }
+
+    #[test]
+    fn type_decl_is_closure_env_reads_src_not_the_name() {
+        let llbc = llbc_with_ordinary_and_closure_env();
+        let named_closure = llbc.type_by_id(0).expect("ordinary struct");
+        let env = llbc.type_by_id(1).expect("closure env");
+        assert!(
+            !type_decl_is_closure_env(named_closure),
+            "a struct whose leaf is `closure` but whose src is TopLevel is not an env"
+        );
+        assert!(
+            type_decl_is_closure_env(env),
+            "src Closure identifies the env even when the leaf is not `closure`"
+        );
+        assert!(!tyref_is_closure_env(&adt_ty(0), &llbc));
+        assert!(tyref_is_closure_env(&adt_ty(1), &llbc));
+    }
+
     #[test]
     fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
         // `try_dispatch_binary_special::closure::call` captures `operands:
         // usize` by shared borrow.  `Rvalue::Ref` aliases that integer, so
         // the field read must be Unsigned; leaving it Ref assembles
         // `int_add/ri>i` at pc 10 of jitcode `call`.
-        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let llbc = llbc_with_ordinary_and_closure_env();
         let ref_usize = shared_borrow_of_usize();
+        let ref_u8 = shared_borrow_of_u8();
         assert_eq!(
             tyref_to_value_type(&ref_usize, &llbc),
             ValueType::Ref(None),
             "the global projection stays non-peeling for &usize"
         );
         assert_eq!(
-            adt_field_read_value_type(&ref_usize, &ref_usize, false, &llbc),
-            ValueType::Unsigned,
-            "a stored &usize capture is the usize"
+            adt_field_read_value_type(&ref_u8, &ref_u8, false, false, &llbc),
+            ValueType::Ref(None),
+            "an ordinary struct's &u8 field is a stored pointer"
         );
         assert_eq!(
-            tyref_to_attr_value_type(&ref_usize, &llbc),
+            adt_field_read_value_type(&ref_usize, &ref_usize, false, true, &llbc),
             ValueType::Unsigned,
-            "FORCE-attr rows must match the Int-banked getfield"
+            "a closure-env &usize capture is the usize"
+        );
+        let ordinary = llbc.type_by_id(0).expect("ordinary struct");
+        let env = llbc.type_by_id(1).expect("closure env");
+        assert_eq!(
+            tyref_to_attr_value_type(&ref_u8, &llbc),
+            ValueType::Ref(None),
+            "the generic attr projection does not peel a stored &u8"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&ref_u8, ordinary, &llbc),
+            ValueType::Ref(None),
+            "FORCE-attr rows for an ordinary struct stay Ref"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type_for_struct_field(&ref_usize, env, &llbc),
+            ValueType::Unsigned,
+            "FORCE-attr rows for a closure-env capture match the Int-banked getfield"
         );
     }
 
