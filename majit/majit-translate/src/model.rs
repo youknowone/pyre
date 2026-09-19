@@ -4180,7 +4180,7 @@ pub fn fuse_boxing_alloc_with_pytypes(
     fn is_pyre_class_ctor(target: &CallTarget) -> bool {
         matches!(
             target,
-            CallTarget::FunctionPath { segments }
+            CallTarget::FunctionPath { segments, .. }
                 if matches!(
                     segments.last().map(String::as_str),
                     Some("allocate") | Some("allocate_stable")
@@ -12167,13 +12167,7 @@ mod tests {
         let field = |base: &crate::flowspace::model::Variable, name: &str, value, ty| {
             OpKind::FieldWrite {
                 base: base.clone(),
-                field: FieldDescriptor {
-                    name: name.into(),
-                    owner_root: Some("W_CData".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                },
+                field: FieldDescriptor::new(name, Some("W_CData".into())),
                 value,
                 ty,
             }
@@ -12234,7 +12228,7 @@ mod tests {
         assert!(
             !ops.iter().any(|op| matches!(
                 &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
                     if segments.last().map(String::as_str) == Some("allocate_stable")
             )),
             "allocate_stable must not survive the fusion"

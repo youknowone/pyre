@@ -3874,11 +3874,9 @@ fn simplify_lowered_graph(
     // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
     // which then reclaims the orphaned construct-on-stack ctor and header
     // field writes.
-    dirty |= crate::model::fuse_boxing_alloc_with_pytypes(
-        graph,
-        struct_field_attrs,
-        pytypes_by_struct,
-    ) > 0;
+    dirty |=
+        crate::model::fuse_boxing_alloc_with_pytypes(graph, struct_field_attrs, pytypes_by_struct)
+            > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -13859,12 +13857,10 @@ impl<'a> Lowering<'a> {
                     // `rtype_ptr_null` arm can fold it without also
                     // folding `Vec::default` (`Ref(None)`).
                     let call_result_ty = if args.is_empty()
-                        && crate::codewriter::jtransform::is_generic_default_path(
-                            match &target {
-                                CallTarget::FunctionPath { segments } => segments.as_slice(),
-                                _ => &[],
-                            },
-                        )
+                        && crate::codewriter::jtransform::is_generic_default_path(match &target {
+                            CallTarget::FunctionPath { segments, .. } => segments.as_slice(),
+                            _ => &[],
+                        })
                         && tyref_is_raw_ptr(&call.dest.ty, self.llbc)
                     {
                         ValueType::Ref(Some(
@@ -34502,8 +34498,9 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 /// on `0x81..=0xBF` (neither a literal length nor a placeholder), on an
 /// indirect width/precision bit, on a truncated field, on a missing `0x00`
 /// terminator, and on non-UTF-8 literal bytes.  A placeholder that carries
-/// flags/width/precision is decoded rather than refused; refusing it is the
-/// job of `FmtPlaceholder::is_default()`, which every collapse consults.
+/// flags/width/precision is decoded rather than refused; each collapse
+/// consults `is_default()`, `is_lower_hex_alternate()`, or
+/// `is_lower_hex_byte_02()` for the shape it rewrites.
 fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<FmtPlaceholder>)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -34651,6 +34648,23 @@ impl FmtPlaceholder {
             && self.precision.is_none()
             && !self.width_indirect
             && !self.precision_indirect
+    }
+
+    /// Rust `{:#x}` — alternate lower hex, no width/precision.
+    /// `hex(i)` / `ll_int2hex(i, True)`. Fill/align defaults may ride
+    /// in the flag word with the alternate bit.
+    fn is_lower_hex_alternate(self) -> bool {
+        const ALTERNATE: u32 = 1 << 23;
+        const FILL_SPACE: u32 = b' ' as u32;
+        const ALIGN_UNKNOWN: u32 = 3 << 29;
+        const ALLOWED: u32 = ALTERNATE | FILL_SPACE | ALIGN_UNKNOWN;
+        self.width.is_none()
+            && self.precision.is_none()
+            && !self.width_indirect
+            && !self.precision_indirect
+            && self
+                .flags
+                .is_some_and(|f| f & ALTERNATE != 0 && (f & !ALLOWED) == 0)
     }
 }
 
@@ -36746,6 +36760,7 @@ fn emit_fmt_expansion_ops(
     pieces: &[String],
     value: &Variable,
     result: Variable,
+    render_op: &str,
 ) -> Vec<SpaceOperation> {
     use crate::model::{CallTarget, OpKind, ValueType};
     let str_const = |graph: &mut FunctionGraph, ops: &mut Vec<SpaceOperation>, text: &str| {
@@ -36768,12 +36783,12 @@ fn emit_fmt_expansion_ops(
     if !pieces[0].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[0]));
     }
-    // `str(value)` — render the single Display placeholder.
+    // `str(value)` / `hex(value)` — render the single placeholder.
     let rendered = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     ops.push(SpaceOperation {
         result: Some(rendered.clone()),
         kind: OpKind::UnaryOp {
-            op: "str".to_string(),
+            op: render_op.to_string(),
             operand: value.clone(),
             result_ty: ValueType::Ref(None),
         },
@@ -37028,6 +37043,8 @@ struct FmtCollapse {
     format_block: BlockId,
     format_result: u64,
     pieces: Vec<String>,
+    /// `str` for Display `{}`; `hex` for alternate lower-hex `{:#x}`.
+    render_op: &'static str,
     /// `(block, exit_index, arg_pos, replacement)` — replace the chain
     /// value the link forwarded with the threaded rendered value.
     link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
@@ -37212,15 +37229,19 @@ fn navigate_single_arg_fmt_chain(
 /// leaves the graph untouched.
 fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if nav.kind != FmtArgKind::Display || !nav.placeholder.is_default() {
-        // `str(value)` renders Display; `{:?}` Debug has no native rstr
-        // counterpart, so leave a Debug chain to `collapse_debug_enum_fmt_chains`.
-        return None;
-    }
+    let render_op = match nav.kind {
+        FmtArgKind::Display if nav.placeholder.is_default() => "str",
+        // `hex(i)` / `ll_int2hex(i, True)` — `format!("{:#x}", n)`.
+        FmtArgKind::LowerHex if nav.placeholder.is_lower_hex_alternate() => "hex",
+        // `{:?}` Debug has no native rstr counterpart, so leave a Debug
+        // chain to `collapse_debug_enum_fmt_chains`.
+        _ => return None,
+    };
     Some(FmtCollapse {
         format_block: bf,
         format_result: nav.format_result.id(),
         pieces: nav.pieces,
+        render_op,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -37316,7 +37337,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
         else {
             continue;
         };
-        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result);
+        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result, site.render_op);
         graph
             .block_mut(site.format_block)
             .operations
@@ -39768,9 +39789,9 @@ mod tests {
     #[test]
     fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
         let mut graph = struct_ctor_graph(false);
-        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), false);
+        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), &[], false);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
-        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), true);
+        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), &[], true);
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
         assert_eq!(same_as_count(&graph), 1);
     }
@@ -40058,7 +40079,7 @@ mod tests {
     #[test]
     fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
         let mut graph = boxing_cluster_with_nested_header();
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), &[], true);
         assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
@@ -40842,6 +40863,17 @@ mod tests {
         assert_eq!(pieces, ["\\x".to_string(), String::new()]);
         assert_eq!(placeholders.len(), 1);
         assert!(placeholders[0].is_lower_hex_byte_02());
+
+        // `format!("{:#x}", n)` / `format!("{n:#x}")`.  0xC1 selects flags
+        // only; 0x60800020 is space fill, alternate (`#`), unknown alignment
+        // (`core::fmt` flag word). No width/precision field.
+        let (pieces, placeholders) =
+            decode_packed_format_pieces(&[0xC1, 0x20, 0, 0x80, 0x60, 0]).unwrap();
+        assert_eq!(pieces, [String::new(), String::new()]);
+        assert_eq!(placeholders.len(), 1);
+        assert!(placeholders[0].is_lower_hex_alternate());
+        assert!(!placeholders[0].is_lower_hex_byte_02());
+        assert!(!placeholders[0].is_default());
 
         // A literal length that overruns the buffer bails.
         assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);

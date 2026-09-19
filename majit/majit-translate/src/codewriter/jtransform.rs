@@ -171,6 +171,10 @@ pub struct GraphTransformConfig {
     /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
     #[serde(default = "default_int_str_helper")]
     pub int_str_helper: String,
+    /// The host's `hex(i)` helper (`ll_int2hex(i, True)`). Same contract
+    /// as [`Self::int_str_helper`].
+    #[serde(default = "default_int_hex_helper")]
+    pub int_hex_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -195,6 +199,10 @@ fn default_int_str_helper() -> String {
     "jit_int_str".to_string()
 }
 
+fn default_int_hex_helper() -> String {
+    "jit_int_hex".to_string()
+}
+
 impl Default for GraphTransformConfig {
     fn default() -> Self {
         Self {
@@ -207,6 +215,7 @@ impl Default for GraphTransformConfig {
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
+            int_hex_helper: default_int_hex_helper(),
         }
     }
 }
@@ -856,9 +865,7 @@ pub(crate) fn is_generic_default_path(segments: &[String]) -> bool {
         return false;
     }
     let joined = rest.join("::");
-    joined == "Default"
-        || joined.starts_with("core::default")
-        || joined.starts_with("std::default")
+    joined == "Default" || joined.starts_with("core::default") || joined.starts_with("std::default")
 }
 
 /// Supply the value of a `CTypeFlags` associated constant.
@@ -2597,6 +2604,13 @@ impl<'a> Transformer<'a> {
             } if unop_name == "str" && self.get_value_kind_var(operand) == 'i' => {
                 Some(self.config.int_str_helper.as_str())
             }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "hex" && self.get_value_kind_var(operand) == 'i' => {
+                Some(self.config.int_hex_helper.as_str())
+            }
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -2937,6 +2951,44 @@ impl<'a> Transformer<'a> {
             // allocation.  `jit_int_str` performs both, and sharing that
             // allocation between two renders of one operand is visible to
             // `is_w`, which gives a `str` of `_len() > 1` storage identity.
+            // `hex` over an unboxed integer. `rint.py rtype_hex` /
+            // `ll_str.py ll_int2hex(i, True)` lower `hex(int)` to a
+            // `direct_call` during rtyping. Same wrapping as `str` /
+            // `jit_int_str`: `ll_int2hex` is elidable but the unicode
+            // box is a fresh allocation, so the residual is `CanRaise`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "hex"
+                && self.get_value_kind_var(operand) == 'i'
+                && !self.config.int_hex_helper.is_empty() =>
+            {
+                let target = CallTarget::function_path([self.config.int_hex_helper.as_str()]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Int],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::CanRaise, OopSpecIndex::None),
+                        ),
+                        args_i: vec![operand.clone()],
+                        args_r: vec![],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -4939,7 +4991,10 @@ impl<'a> Transformer<'a> {
         {
             self.notes.push(GraphTransformNote {
                 function: graph_name.to_string(),
-                detail: format!("rewrite: setfield({}) on stack header → dropped", field.name),
+                detail: format!(
+                    "rewrite: setfield({}) on stack header → dropped",
+                    field.name
+                ),
             });
             return RewriteResult::Replace(Vec::new());
         }
@@ -6093,7 +6148,7 @@ impl<'a> Transformer<'a> {
         // raw-pointer Ref). `Vec::default` and a GC-struct Default stay
         // residual — their result is `Ref(None)` or a named owner that
         // is not a pointer.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
             && is_generic_default_path(segments)
             && let Some(kind) = default_zero_rewrite(result_ty)
@@ -6109,7 +6164,7 @@ impl<'a> Transformer<'a> {
         // pointer already grows `COND_CALL_GC_WB`. The explicit hook is
         // only for the interpreter's raw store; a residual helper here
         // is the descent wall after a fused allocation.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && args.len() == 1
             && is_gc_write_barrier_path(segments)
         {
@@ -6126,7 +6181,7 @@ impl<'a> Transformer<'a> {
         // `CTypeFlags::SIGNED_WCHAR` (and the other flag consts) is a
         // compile-time mask. Charon leaves the bitflags impl Opaque, so
         // a leftover 0-arg Call still has to become ConstInt here.
-        if let CallTarget::FunctionPath { segments } = target
+        if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
             && let Some(kind) = ctype_flags_const(segments)
         {
@@ -6312,18 +6367,13 @@ impl<'a> Transformer<'a> {
                     // `declares_cannot_raise` and a
                     // `#[dont_look_inside_cannot_raise]` residual emits
                     // GUARD_NO_EXCEPTION.
-                    let extraeffect = libc_raw
-                        .as_ref()
-                        .map(|(_, extra)| *extra)
-                        .or_else(|| {
-                            classified
-                                .as_ref()
-                                .filter(|(_, _, is_override)| *is_override)
-                                .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect)
-                        });
-                    let oopspecindex = libc_raw
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(OopSpecIndex::None);
+                    let extraeffect = libc_raw.as_ref().map(|(_, extra)| *extra).or_else(|| {
+                        classified
+                            .as_ref()
+                            .filter(|(_, _, is_override)| *is_override)
+                            .map(|(descriptor, _, _)| descriptor.extra_info.extraeffect)
+                    });
+                    let oopspecindex = libc_raw.map(|(idx, _)| idx).unwrap_or(OopSpecIndex::None);
                     let mut descriptor = cc_ref.getcalldescr(
                         op,
                         non_void_args,
@@ -6552,36 +6602,35 @@ impl<'a> Transformer<'a> {
             // The jitcode_lower proc-macro intercepts the macros directly and
             // emits BC_COND_CALL_* / BC_RECORD_KNOWN_RESULT_* bytecodes.
         }
-        let (oopspecindex, extraeffect_override) =
-            if let Some((idx, extra)) = libc_raw_alloc_oopspec(target) {
-                // `jtransform.py _rewrite_raw_malloc`: a char varsize raw
-                // malloc is `OS_RAW_MALLOC_VARSIZE_CHAR`. The frontend may
-                // already have inlined `raw_malloc_varsize_char` to
-                // `libc::malloc`, dropping the user oopspec; recover it
-                // before `describe_call` classifies the C leaf as a
-                // generic residual with `oopspecindex = None`.
-                (idx, Some(extra))
-            } else if let Some((descriptor, _, _)) =
-                classify_call(target, &self.config.call_effects)
-            {
-                (
-                    descriptor.extra_info.oopspecindex,
-                    Some(descriptor.extra_info.extraeffect),
-                )
-            } else if let Some(descriptor) = crate::call::describe_call(target) {
-                (
-                    descriptor.extra_info.oopspecindex,
-                    Some(descriptor.extra_info.extraeffect),
-                )
-            } else if let Some(spec) = user_oopspec.as_deref() {
-                // rlib/jit.py — map user oopspec string to OopSpecIndex.
-                // jtransform.py:1731-1755 — jit.* oopspecs.
-                let idx = map_user_oopspec_to_index(spec);
-                (idx, None)
-            } else {
-                // Unknown builtin — keep as unclassified Call.
-                return RewriteResult::Keep;
-            };
+        let (oopspecindex, extraeffect_override) = if let Some((idx, extra)) =
+            libc_raw_alloc_oopspec(target)
+        {
+            // `jtransform.py _rewrite_raw_malloc`: a char varsize raw
+            // malloc is `OS_RAW_MALLOC_VARSIZE_CHAR`. The frontend may
+            // already have inlined `raw_malloc_varsize_char` to
+            // `libc::malloc`, dropping the user oopspec; recover it
+            // before `describe_call` classifies the C leaf as a
+            // generic residual with `oopspecindex = None`.
+            (idx, Some(extra))
+        } else if let Some((descriptor, _, _)) = classify_call(target, &self.config.call_effects) {
+            (
+                descriptor.extra_info.oopspecindex,
+                Some(descriptor.extra_info.extraeffect),
+            )
+        } else if let Some(descriptor) = crate::call::describe_call(target) {
+            (
+                descriptor.extra_info.oopspecindex,
+                Some(descriptor.extra_info.extraeffect),
+            )
+        } else if let Some(spec) = user_oopspec.as_deref() {
+            // rlib/jit.py — map user oopspec string to OopSpecIndex.
+            // jtransform.py:1731-1755 — jit.* oopspecs.
+            let idx = map_user_oopspec_to_index(spec);
+            (idx, None)
+        } else {
+            // Unknown builtin — keep as unclassified Call.
+            return RewriteResult::Keep;
+        };
 
         // RPython jtransform.py:1990-2002:
         //   calldescr = self.callcontrol.getcalldescr(op, oopspecindex, extraeffect)
@@ -11014,7 +11063,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
 fn libc_raw_alloc_oopspec(
     target: &CallTarget,
 ) -> Option<(majit_ir::descr::OopSpecIndex, majit_ir::descr::ExtraEffect)> {
-    let CallTarget::FunctionPath { segments } = target else {
+    let CallTarget::FunctionPath { segments, .. } = target else {
         return None;
     };
     if !segments.iter().any(|s| s == "libc") {
@@ -13059,13 +13108,126 @@ mod tests {
         (graph, n_var)
     }
 
+    #[test]
+    fn transform_graph_lowers_int_hex_to_jit_int_hex_residual_call() {
+        let (graph, n_var) = int_hex_graph();
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_int_hex"]));
+        assert!(matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected_fnaddr));
+        match &ops[2].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+                assert_eq!(args_i, &vec![n_var.clone()]);
+                assert!(args_r.is_empty());
+                assert!(args_f.is_empty());
+                assert_eq!(*result_kind, 'r');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    /// `hex(int)` over an Int operand, as one graph, for the tests below.
+    fn int_hex_graph() -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("int_hex");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "hex".into(),
+                    operand: n_var.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        (graph, n_var)
+    }
+
     /// The callee is the host's, not this layer's: a pipeline that names its
     /// own render helper gets a call to that one.
     ///
     /// Upstream needs no such setting because rtyping happens inside the
-    /// interpreter's own translation, so `rstr.py ll_int2dec` is already the
+    /// interpreter's own translation, so `rstr.py ll_int2hex` is already the
     /// host's function. A Rust front end reads MIR that has no such helper in
     /// it, so the name has to come from the embedding pipeline.
+    #[test]
+    fn a_named_int_hex_helper_is_the_call_target() {
+        let (graph, _n_var) = int_hex_graph();
+        let config = GraphTransformConfig {
+            int_hex_helper: "grain_render_hex".to_string(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let expected = crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+            "grain_render_hex",
+        ]));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected),
+            "the fnptr names the configured hex helper",
+        );
+    }
+
+    #[test]
+    fn an_unnamed_int_hex_helper_aborts_before_the_original_op() {
+        let (graph, _n_var) = int_hex_graph();
+        let config = GraphTransformConfig {
+            int_hex_helper: String::new(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "no helper is named, so nothing is called: {ops:?}",
+        );
+        assert!(
+            matches!(
+                &ops[1].kind,
+                OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::HostHelperRefused,
+                    },
+                }
+            ),
+            "the host refusal must be explicit: {ops:?}",
+        );
+        assert!(
+            matches!(&ops[2].kind, OpKind::UnaryOp { op: name, .. } if name == "hex"),
+            "the original op stays residual after the abort: {ops:?}",
+        );
+    }
+
     #[test]
     fn a_named_int_str_helper_is_the_call_target() {
         let (graph, _n_var) = int_str_graph();
@@ -18707,11 +18869,8 @@ mod tests {
         let mut transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("wb_drop");
         let obj = graph.alloc_value_var_with_type(ConcreteType::GcRef);
-        let target = CallTarget::function_path([
-            "pyre_object",
-            "gc_hook",
-            "try_gc_write_barrier_managed",
-        ]);
+        let target =
+            CallTarget::function_path(["pyre_object", "gc_hook", "try_gc_write_barrier_managed"]);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::Call {
@@ -18813,15 +18972,17 @@ mod tests {
 
     #[test]
     fn ctype_flags_unknown_leaf_stays_residual() {
-        assert!(super::ctype_flags_const(&[
-            "module".into(),
-            "_cffi_backend".into(),
-            "ctypeobj".into(),
-            "_".into(),
-            "<Impl>".into(),
-            "NOT_A_FLAG".into(),
-        ])
-        .is_none());
+        assert!(
+            super::ctype_flags_const(&[
+                "module".into(),
+                "_cffi_backend".into(),
+                "ctypeobj".into(),
+                "_".into(),
+                "<Impl>".into(),
+                "NOT_A_FLAG".into(),
+            ])
+            .is_none()
+        );
     }
 
     /// `rtuple.py TupleRepr.newtuple`: a non-empty tuple lowers to
@@ -19617,8 +19778,7 @@ mod tests {
     #[test]
     fn pyobject_function_path_is_not_a_header_ctor() {
         assert!(!super::is_object_header_ctor(&CallTarget::function_path([
-            "mymod",
-            "PyObject",
+            "mymod", "PyObject",
         ])));
         assert!(super::is_object_header_ctor(
             &CallTarget::synthetic_transparent_ctor("PyObject")
@@ -19727,10 +19887,7 @@ mod tests {
             descriptor.extra_info.oopspecindex,
             OopSpecIndex::RawMallocVarsizeChar
         );
-        assert_eq!(
-            descriptor.extra_info.extraeffect,
-            ExtraEffect::CanRaise
-        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     /// `jtransform.py rewrite_op_cast_ptr_to_int` keeps a GC cast as the
