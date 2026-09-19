@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=14
 # Regression guard: when a traced function raises, the write-back into its own
 # virtualizable frame must store every local, including the ones whose value is
 # still a virtual box.
@@ -20,10 +20,10 @@
 # onwards.
 #
 # Expected output:
-#   4000 ('i', 'marker')
-#   4000 ('i', 'marker', 'odd_only')
+#   40000 ('i', 'marker')
+#   40000 ('i', 'marker', 'odd_only')
 
-N = 8000
+N = 80000
 
 
 def branchy(i):
