@@ -784,6 +784,123 @@ fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::Toke
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelperFnAddrSkip {
+    Generic,
+    FatPointerArg,
+    ResultReturn,
+    MethodReceiver,
+    Other,
+}
+
+impl HelperFnAddrSkip {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::FatPointerArg => "fat-pointer arg",
+            Self::ResultReturn => "Result return",
+            Self::MethodReceiver => "method receiver",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn is_fat_pointer_arg(ty: &Type) -> bool {
+    matches!(ty, Type::Reference(reference) if is_wide_pointee(&reference.elem))
+}
+
+fn is_result_type(ty: &Type) -> bool {
+    path_type_last_ident(ty).is_some_and(|id| id == "Result")
+}
+
+fn trampoline_skip_reason(func: &ItemFn) -> Option<HelperFnAddrSkip> {
+    if !func.sig.generics.params.is_empty() {
+        return Some(HelperFnAddrSkip::Generic);
+    }
+    for arg in &func.sig.inputs {
+        if let FnArg::Typed(pat_type) = arg
+            && is_fat_pointer_arg(&pat_type.ty)
+        {
+            return Some(HelperFnAddrSkip::FatPointerArg);
+        }
+    }
+    if let ReturnType::Type(_, ty) = &func.sig.output
+        && is_result_type(ty)
+    {
+        return Some(HelperFnAddrSkip::ResultReturn);
+    }
+    if func.sig.receiver().is_some() {
+        return Some(HelperFnAddrSkip::MethodReceiver);
+    }
+    for arg in &func.sig.inputs {
+        let FnArg::Typed(pat_type) = arg else {
+            return Some(HelperFnAddrSkip::Other);
+        };
+        if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none() {
+            return Some(HelperFnAddrSkip::Other);
+        }
+    }
+    match helper_call_kind_for_return(&func.sig.output) {
+        HelperCallKind::Unsupported => Some(HelperFnAddrSkip::Other),
+        HelperCallKind::Void => None,
+        HelperCallKind::Int | HelperCallKind::Ref | HelperCallKind::Float => {
+            let ReturnType::Type(_, ty) = &func.sig.output else {
+                return Some(HelperFnAddrSkip::Other);
+            };
+            if helper_return_to_i64(quote! { __probe }, ty).is_none() {
+                Some(HelperFnAddrSkip::Other)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn report_helper_fnaddr_skip(name: &Ident, reason: HelperFnAddrSkip) {
+    if std::env::var("MAJIT_HELPER_FNADDR_SKIP").is_ok() {
+        eprintln!("[MAJIT_HELPER_FNADDR_SKIP] {}: {name}", reason.as_str());
+    }
+}
+
+fn emit_helper_fnaddr_registration(
+    helper_name: &Ident,
+    trampoline_ident: &Ident,
+    arity: u8,
+) -> proc_macro2::TokenStream {
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            #[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+            #[allow(non_upper_case_globals, unused)]
+            static __MAJIT_HELPER_FNADDR: ::majit_ir::helper_fnaddr::HelperFnAddr =
+                ::majit_ir::helper_fnaddr::HelperFnAddr::new(
+                    ::core::concat!(::core::module_path!(), "::", stringify!(#helper_name)),
+                    #trampoline_ident as *const (),
+                    #arity,
+                );
+        }
+    }
+}
+
+fn emit_helper_fnaddr_ctor(
+    helper_name: &Ident,
+    trampoline_ident: &Ident,
+    arity: u8,
+) -> proc_macro2::TokenStream {
+    let ctor_name = format_ident!("__majit_register_helper_fnaddr_{helper_name}");
+    quote! {
+        #[cfg(target_arch = "wasm32")]
+        #[::ctor::ctor(unsafe)]
+        fn #ctor_name() {
+            ::majit_ir::helper_fnaddr::register(
+                ::core::concat!(::core::module_path!(), "::", stringify!(#helper_name)),
+                #trampoline_ident as *const (),
+                #arity,
+            );
+        }
+    }
+}
+
 fn helper_return_to_i64(
     value: proc_macro2::TokenStream,
     ty: &Type,
@@ -808,8 +925,13 @@ fn helper_return_to_i64(
 
 fn emit_helper_call_target_fn(
     func: &ItemFn,
+    register_fnaddr: bool,
+    register_as: Option<&Ident>,
 ) -> syn::Result<Option<(Ident, Ident, proc_macro2::TokenStream)>> {
-    if !func.sig.generics.params.is_empty() {
+    if let Some(reason) = trampoline_skip_reason(func) {
+        if register_fnaddr {
+            report_helper_fnaddr_skip(&func.sig.ident, reason);
+        }
         return Ok(None);
     }
 
@@ -817,6 +939,9 @@ fn emit_helper_call_target_fn(
     let concrete_target_name = format_ident!("{}_concrete", trace_target_name);
     let mut wrapper_params = Vec::new();
     let mut converted_args = Vec::new();
+    let mut fnaddr_params = Vec::new();
+    let mut fnaddr_args = Vec::new();
+    let mut has_float_arg = false;
     for (index, arg) in func.sig.inputs.iter().enumerate() {
         let syn::FnArg::Typed(pat_type) = arg else {
             return Ok(None);
@@ -826,7 +951,15 @@ fn emit_helper_call_target_fn(
         let Some(converted) = helper_arg_from_i64(&arg_ident, &pat_type.ty) else {
             return Ok(None);
         };
-        converted_args.push(converted);
+        converted_args.push(converted.clone());
+        if helper_call_kind_for_type(&pat_type.ty) == HelperCallKind::Float {
+            has_float_arg = true;
+            fnaddr_params.push(quote! { #arg_ident: f64 });
+            fnaddr_args.push(quote! { #arg_ident });
+        } else {
+            fnaddr_params.push(quote! { #arg_ident: i64 });
+            fnaddr_args.push(converted);
+        }
     }
 
     // Wrapper visibility follows the user fn so external integration
@@ -836,6 +969,7 @@ fn emit_helper_call_target_fn(
     // naming keeps it off the user-facing surface.
     let vis = &func.vis;
     let helper_name = &func.sig.ident;
+    let fnaddr_path_name = register_as.unwrap_or(helper_name);
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
     // `unsafe` wrapper there would be an unused-unsafe warning).
@@ -844,11 +978,24 @@ fn emit_helper_call_target_fn(
     } else {
         quote! { #helper_name(#(#converted_args),*) }
     };
-    let wrapper = match helper_call_kind_for_return(&func.sig.output) {
+    let fnaddr_call_expr = if func.sig.unsafety.is_some() {
+        quote! { unsafe { #helper_name(#(#fnaddr_args),*) } }
+    } else {
+        quote! { #helper_name(#(#fnaddr_args),*) }
+    };
+    let arity = func.sig.inputs.len() as u8;
+    let shim_registration = if register_fnaddr && !has_float_arg {
+        emit_helper_fnaddr_registration(fnaddr_path_name, &trace_target_name, arity)
+    } else {
+        quote! {}
+    };
+    let return_kind = helper_call_kind_for_return(&func.sig.output);
+    let wrapper = match return_kind {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
             #[allow(non_snake_case)]
             #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) {
+                #shim_registration
                 #call_expr;
             }
         },
@@ -863,6 +1010,7 @@ fn emit_helper_call_target_fn(
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> i64 {
+                    #shim_registration
                     #converted_return
                 }
             }
@@ -875,6 +1023,7 @@ fn emit_helper_call_target_fn(
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
                 #vis extern "C" fn #trace_target_name(#(#wrapper_params),*) -> f64 {
+                    #shim_registration
                     #call_expr
                 }
             };
@@ -896,10 +1045,61 @@ fn emit_helper_call_target_fn(
         HelperCallKind::Unsupported => return Ok(None),
     };
 
-    let concrete_name = if matches!(
-        helper_call_kind_for_return(&func.sig.output),
-        HelperCallKind::Float
-    ) {
+    let registered = if register_fnaddr && has_float_arg {
+        let fnaddr_name = format_ident!("__majit_fnaddr_target_{helper_name}");
+        let registration = emit_helper_fnaddr_registration(fnaddr_path_name, &fnaddr_name, arity);
+        let ctor = emit_helper_fnaddr_ctor(fnaddr_path_name, &fnaddr_name, arity);
+        let float_abi = match return_kind {
+            HelperCallKind::Void => quote! {
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) {
+                    #registration
+                    #fnaddr_call_expr;
+                }
+            },
+            HelperCallKind::Float => quote! {
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) -> f64 {
+                    #registration
+                    #fnaddr_call_expr
+                }
+            },
+            HelperCallKind::Int | HelperCallKind::Ref => {
+                let ReturnType::Type(_, ty) = &func.sig.output else {
+                    return Ok(None);
+                };
+                let Some(converted_return) = helper_return_to_i64(fnaddr_call_expr, ty) else {
+                    return Ok(None);
+                };
+                quote! {
+                    #[doc(hidden)]
+                    #[allow(non_snake_case)]
+                    #vis extern "C" fn #fnaddr_name(#(#fnaddr_params),*) -> i64 {
+                        #registration
+                        #converted_return
+                    }
+                }
+            }
+            HelperCallKind::Unsupported => return Ok(None),
+        };
+        quote! {
+            #float_abi
+            #ctor
+        }
+    } else if register_fnaddr {
+        emit_helper_fnaddr_ctor(fnaddr_path_name, &trace_target_name, arity)
+    } else {
+        quote! {}
+    };
+
+    let wrapper = quote! {
+        #wrapper
+        #registered
+    };
+
+    let concrete_name = if matches!(return_kind, HelperCallKind::Float) {
         concrete_target_name
     } else {
         trace_target_name.clone()
@@ -1442,7 +1642,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func) {
+        match emit_helper_call_target_fn(&func, true, None) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -1564,7 +1764,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func) {
+        match emit_helper_call_target_fn(&func, true, None) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -1674,7 +1874,7 @@ fn expand_call_surface_attr(
     let marker = format_ident!("{marker_name}");
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func) {
+        match emit_helper_call_target_fn(&func, false, None) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2442,7 +2642,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         ..func.clone()
     };
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&orig_func) {
+        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name)) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2646,7 +2846,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // same word-ABI entry `#[dont_look_inside]` emits. The public name is
     // the dispatch wrapper; the adapter calls that, matching
     // `getfunctionptr` of the decorated function.
-    let call_target_fn = match emit_helper_call_target_fn(&func) {
+    let call_target_fn = match emit_helper_call_target_fn(&func, false, None) {
         Ok(Some((_, _, tokens))) => Some(tokens),
         Ok(None) => None,
         Err(err) => return err.to_compile_error().into(),
@@ -2819,7 +3019,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // A helper it declines — a generic, or a parameter type the trampoline
     // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
     // path this expansion had before.
-    let native_entry = match emit_helper_call_target_fn(&func) {
+    let native_entry = match emit_helper_call_target_fn(&func, false, None) {
         Ok(Some((trace_target, _concrete, wrapper))) => {
             let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
                 Ok(classes) => classes,
@@ -3692,7 +3892,45 @@ pub fn derive_virtualizable_state(input: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    // Proc macro crates cannot have unit tests that invoke the macros directly.
-    // Integration tests and compile-time tests are used instead.
-    // The parse logic is validated via the proc macro invocations in dependent crates.
+    use super::*;
+
+    fn parse_fn(src: &str) -> ItemFn {
+        syn::parse_str(src).expect("function parses")
+    }
+
+    #[test]
+    fn trampoline_skip_reason_classifies_each_listed_cause() {
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f<T>(x: T) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::Generic)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(s: &str) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(xs: &[u8]) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(x: i64) -> Result<i64, ()> { Ok(x) }")),
+            Some(HelperFnAddrSkip::ResultReturn)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(&self, x: i64) -> i64 { x }")),
+            Some(HelperFnAddrSkip::MethodReceiver)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(x: String) -> i64 { 0 }")),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(x: i64) -> i64 { x }")),
+            None
+        );
+        assert_eq!(
+            trampoline_skip_reason(&parse_fn("fn f(a: f64, b: f64) -> f64 { a }")),
+            None
+        );
+    }
 }

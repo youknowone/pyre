@@ -2027,6 +2027,7 @@ name = "majit-ir"
 version = "0.0.2"
 dependencies = [
  "indexmap",
+ "linkme",
  "parking_lot",
  "rustc-hash",
  "serde",
@@ -2038,6 +2039,7 @@ dependencies = [
 name = "majit-macros"
 version = "0.0.2"
 dependencies = [
+ "linkme",
  "majit-ir",
  "majit-metainterp",
  "majit-translate",
@@ -2053,7 +2055,9 @@ dependencies = [
  "bincode",
  "bit-set",
  "bitflags 2.13.0",
+ "ctor",
  "indexmap",
+ "linkme",
  "majit-backend",
  "majit-backend-cranelift",
  "majit-backend-dynasm",
@@ -2073,7 +2077,9 @@ dependencies = [
 name = "majit-rlib"
 version = "0.0.2"
 dependencies = [
+ "ctor",
  "indexmap",
+ "linkme",
  "majit-gc",
  "majit-ir",
  "majit-macros",
@@ -2780,7 +2786,9 @@ name = "pyre-jit"
 version = "0.0.2"
 dependencies = [
  "bit-set",
+ "ctor",
  "indexmap",
+ "linkme",
  "majit-backend",
  "majit-backend-cranelift",
  "majit-backend-dynasm",
@@ -2809,8 +2817,10 @@ version = "0.0.2"
 dependencies = [
  "bincode",
  "bitflags 2.13.0",
+ "ctor",
  "indexmap",
  "insta",
+ "linkme",
  "majit-backend",
  "majit-backend-cranelift",
  "majit-backend-dynasm",
@@ -3885,6 +3895,7 @@ dependencies = [
 name = "spcount"
 version = "0.0.2"
 dependencies = [
+ "linkme",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
@@ -4168,6 +4179,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "tl"
 version = "0.0.2"
 dependencies = [
+ "linkme",
  "majit-ir",
  "majit-macros",
  "majit-metainterp",

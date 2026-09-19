@@ -6,6 +6,7 @@ pub mod effectinfo;
 pub mod eval_breaker_word;
 pub mod field_entry;
 pub mod forwarding;
+pub mod helper_fnaddr;
 pub mod indexmap_ext;
 pub mod intbound;
 pub mod jit;

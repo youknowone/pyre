@@ -49,6 +49,7 @@ pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 pyre-module = { workspace = true }
 num-traits = { workspace = true }
+linkme = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }
 majit-metainterp = { workspace = true }
@@ -65,6 +66,7 @@ bit-set = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+ctor = { workspace = true }
 # Specified directly (not via workspace inheritance) so default-features
 # can be turned off — the host binding (web vs host-import) is chosen
 # explicitly through pyre-jit's `wasm-web` / `wasm-host` features.
