@@ -789,10 +789,20 @@ pub unsafe fn wsa_ioctl(
 /// Nothing reads it back: WinSock exposes no query for the current setting.
 #[cfg(windows)]
 pub unsafe fn set_ack_frequency(s: Socket, flag: libc::c_int) -> libc::c_int {
+    let code = {
+        #[cfg(feature = "host_env")]
+        {
+            rustpython_host_env::socket::SIO_TCP_SET_ACK_FREQUENCY as u32
+        }
+        #[cfg(not(feature = "host_env"))]
+        {
+            ws::SIO_TCP_SET_ACK_FREQUENCY
+        }
+    };
     let sent = unsafe {
         wsa_ioctl(
             s,
-            ws::SIO_TCP_SET_ACK_FREQUENCY,
+            code,
             (&raw const flag).cast(),
             core::mem::size_of::<libc::c_int>() as u32,
         )

@@ -15,10 +15,9 @@
 use parking_lot::Mutex;
 use pyre_object::{PY_NULL, PyObject, PyObjectRef};
 use rustpython_host_env::overlapped as host_overlapped;
+use rustpython_host_env::overlapped::{Handle as HANDLE, OverlappedIo as OVERLAPPED};
 use rustpython_host_env::winapi as host_winapi;
 use std::sync::OnceLock;
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use super::win32_err;
 

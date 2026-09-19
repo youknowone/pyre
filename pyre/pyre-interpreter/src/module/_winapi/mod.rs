@@ -4,7 +4,8 @@
 //! module under `os.name == "nt"`, so both the stdlib's `os.name == "nt"` and
 //! its `sys.platform == "win32"` branches are live.  The latter reach for
 //! `_winapi`, and without the module `import shutil` — hence `tempfile`, and
-//! everything downstream — fails outright.
+//! everything downstream — fails outright.  The module is the host Win32
+//! surface, so it is compiled only with `host_env`.
 //!
 //! `lib_pypy/_winapi.py` predates the stdlib revision pyre ships and stops
 //! well short of it, so the shapes here follow `PC/_winapi.c` and the Win32
@@ -26,10 +27,12 @@
 //! `ConnectNamedPipe`, `ReadFile` and `WriteFile` that produces one, which is
 //! what `multiprocessing.connection`'s `PipeConnection` is written against.
 
-use windows_sys::Win32::Foundation::HANDLE;
-
-#[cfg(feature = "host_env")]
 use rustpython_host_env::winapi as host_winapi;
+use rustpython_host_env::winapi::Handle as HANDLE;
+
+fn invalid_handle_value() -> HANDLE {
+    rustpython_host_env::overlapped::INVALID_HANDLE_VALUE_ISIZE as HANDLE
+}
 
 use crate::PyError;
 
@@ -111,25 +114,21 @@ fn w_handle(handle: HANDLE) -> pyre_object::PyObjectRef {
     }
 }
 
-#[cfg(feature = "host_env")]
 mod host;
 // The asynchronous half reaches the host's overlapped I/O directly, so a
 // sandbox build leaves it out along with `_overlapped`.
-#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+#[cfg(not(feature = "sandbox"))]
 pub mod overlapped;
 
 /// The process-launch half of the module, which `subprocess.Popen` walks in
 /// order: `CreatePipe` for each redirected stream, `DuplicateHandle` to make
 /// the child's end of it inheritable, `CreateProcess`, then
 /// `WaitForSingleObject` / `GetExitCodeProcess` / `TerminateProcess` on what
-/// comes back.  Backed by `rustpython_host_env::winapi`, so it is compiled
-/// only where that is — which is also the only build that has `msvcrt`, the
-/// module `subprocess` picks its Windows implementation from.
-#[cfg(feature = "host_env")]
+/// comes back.
 mod process {
     use pyre_object::{PyObjectRef, w_int_new, w_none, w_tuple_new};
     use rustpython_host_env::winapi as host_winapi;
-    use rustpython_host_env::winapi::{CSTR_EQUAL, HANDLE, LCMAP_UPPERCASE};
+    use rustpython_host_env::winapi::{CSTR_EQUAL, Handle as HANDLE, LCMAP_UPPERCASE};
     use rustpython_wtf8::Wtf8Buf;
     use widestring::WideCString;
 
@@ -707,39 +706,19 @@ crate::py_module! {
                 return Err(crate::PyError::value_error("embedded null character"));
             }
             exe_name_w.push(0);
-            #[cfg(not(feature = "host_env"))]
-            {
-                let _ = exe_name_w;
-                return Err(crate::PyError::not_implemented(
-                    "_winapi.NeedCurrentDirectoryForExePath requires host_env",
-                ));
-            }
-            #[cfg(feature = "host_env")]
-            {
-                let exe_name = widestring::WideCStr::from_slice(&exe_name_w)
-                    .expect("validated NUL-terminated executable name");
-                return Ok(host_winapi::need_current_directory_for_exe_path_w(exe_name));
-            }
+            let exe_name = widestring::WideCStr::from_slice(&exe_name_w)
+                .expect("validated NUL-terminated executable name");
+            Ok(host_winapi::need_current_directory_for_exe_path_w(exe_name))
         }
         // `subprocess.Handle.Close` captures `_winapi.CloseHandle` as a default
         // argument at class-definition time, so the attribute must exist for
         // `import subprocess` to succeed.
         fn CloseHandle(handle: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
             let handle = handle_w(handle, IntArg::Only("CloseHandle"))?;
-            #[cfg(not(feature = "host_env"))]
-            {
-                let _ = handle;
-                return Err(crate::PyError::not_implemented(
-                    "_winapi.CloseHandle requires host_env",
-                ));
-            }
-            #[cfg(feature = "host_env")]
             let ok = host_winapi::close_handle(handle);
-            #[cfg(feature = "host_env")]
             if ok == 0 {
                 return Err(last_os_error());
             }
-            #[cfg(feature = "host_env")]
             Ok(())
         }
         // `subprocess.Popen._wait`/`poll` also capture these as default
@@ -761,14 +740,6 @@ crate::py_module! {
             // what `save_err=rffi.RFFI_SAVE_LASTERROR` does — reacquiring goes
             // through `mutex2_lock_timeout`, whose timed wait leaves
             // `ERROR_TIMEOUT` behind on a poll that expired.
-            #[cfg(not(feature = "host_env"))]
-            {
-                let _ = (handle, milliseconds);
-                return Err(crate::PyError::not_implemented(
-                    "_winapi.WaitForSingleObject requires host_env",
-                ));
-            }
-            #[cfg(feature = "host_env")]
             let (result, error) = {
                 let _blocked = crate::module::thread::before_external_block();
                 let result = host_winapi::wait_for_single_object(handle, milliseconds);
@@ -787,14 +758,6 @@ crate::py_module! {
         }
         fn GetExitCodeProcess(handle: pyre_object::PyObjectRef) -> Result<i64, crate::PyError> {
             let handle = handle_w(handle, IntArg::Only("GetExitCodeProcess"))?;
-            #[cfg(not(feature = "host_env"))]
-            {
-                let _ = handle;
-                return Err(crate::PyError::not_implemented(
-                    "_winapi.GetExitCodeProcess requires host_env",
-                ));
-            }
-            #[cfg(feature = "host_env")]
             host_winapi::get_exit_code_process(handle)
                 .map(i64::from)
                 .map_err(win32_err)
@@ -806,15 +769,10 @@ crate::py_module! {
         crate::module_ns_store(
             ns,
             "INVALID_HANDLE_VALUE",
-            w_handle(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE),
+            w_handle(invalid_handle_value()),
         );
-        // The launch half, registered by hand: the module is built without
-        // `host_env` too, and there it stops at the constants and the calls
-        // above.
-        #[cfg(feature = "host_env")]
-        {
-            host::install(ns);
-            for (name, arity, function) in [
+        host::install(ns);
+        for (name, arity, function) in [
                 ("GetStdHandle", 1, process::get_std_handle as crate::BuiltinCodeFn),
                 ("GetCurrentProcess", 0, process::get_current_process),
                 ("GetFileType", 1, process::get_file_type),
@@ -864,6 +822,5 @@ crate::py_module! {
                     ),
                 ),
             );
-        }
     },
 }

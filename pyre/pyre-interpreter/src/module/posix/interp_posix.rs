@@ -7200,7 +7200,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             "pread: negative length",
                         ));
                     }
-                    let n = length as usize;
+                    // unwrap_spec(length=int): space.int_w is a machine
+                    // word. A value that does not fit usize is OverflowError,
+                    // not a wrapped allocation size.
+                    let n = usize::try_from(length).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "Python int too large to convert to C ssize_t",
+                        )
+                    })?;
                     let mut buf = Vec::new();
                     buf.try_reserve_exact(n)
                         .map_err(|_| crate::PyError::memory_error(""))?;
@@ -8323,6 +8330,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 crate::PyError::runtime_error("resource module is not initialized")
             })?;
             let cls = crate::baseobjspace::getattr_str(resource, "struct_rusage")?;
+            // Field boxing and the argument tuple can collect, so the type is
+            // pinned before the first allocation and re-read for the call.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(cls);
             let tv_to_f = |tv: libc::timeval| tv.tv_sec as f64 + (tv.tv_usec as f64) * 1e-6;
             let mut fields = pyre_object::gc_roots::RootedItems::new();
             fields.push(pyre_object::floatobject::w_float_new(tv_to_f(ru.ru_utime)));
@@ -8341,7 +8353,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             fields.push(pyre_object::w_int_new(ru.ru_nsignals));
             fields.push(pyre_object::w_int_new(ru.ru_nvcsw));
             fields.push(pyre_object::w_int_new(ru.ru_nivcsw));
-            Ok(crate::_structseq::new_instance(cls, fields.take()))
+            // `_make_struct_rusage` calls `struct_rusage((...))`, so a
+            // rebound type's constructor is observable.
+            let tuple = pyre_object::w_tuple_new(fields.take());
+            crate::call::call_function_impl_result(
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                &[tuple],
+            )
         }
 
         fn wait_with_rusage<F>(wait: F) -> Result<PyObjectRef, crate::PyError>
@@ -11397,10 +11415,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
 
         /// The descriptor's handle, or `None` when it names none.
-        fn fd_handle(fd: i32) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+        fn fd_handle(fd: i32) -> Option<host_nt::Handle> {
             let handle = host_nt::handle_from_fd(fd);
-            (!handle.is_null() && handle != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE)
-                .then_some(handle)
+            (!host_nt::is_invalid_handle(handle)).then_some(handle)
         }
 
         // os.dup(fd) -> new_fd.  `_Py_dup` makes the copy non-inheritable, so

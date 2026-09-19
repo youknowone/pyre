@@ -1935,13 +1935,13 @@ mod ssl_socket_methods {
                 "EOF occurred in violation of protocol".to_string(),
             ),
             PumpExit::Failed { write, code } => {
-                #[cfg(windows)]
+                #[cfg(all(windows, feature = "host_env"))]
                 if !write
                     && !unsafe { pyre_native::ssl::connection_is_handshaking(backend) }
                     && matches!(
                         code,
-                        windows_sys::Win32::Networking::WinSock::WSAECONNABORTED
-                            | windows_sys::Win32::Networking::WinSock::WSAECONNRESET
+                        rustpython_host_env::socket::WSAECONNABORTED
+                            | rustpython_host_env::socket::WSAECONNRESET
                     )
                 {
                     // [3.14-spec] `ThreadedTests.test_wrong_cert_tls13`

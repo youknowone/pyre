@@ -103,10 +103,7 @@ fn set_user_signal_file(signum: libc::c_int, w_file: pyre_object::PyObjectRef) {
 /// `handler.py` `self.user_w_files.pop(signum, None)`.
 #[cfg(all(unix, feature = "host_env"))]
 fn clear_user_signal_file(signum: libc::c_int) {
-    HANDLER
-        .user_w_files
-        .lock()
-        .retain(|&(s, _)| s != signum);
+    HANDLER.user_w_files.lock().retain(|&(s, _)| s != signum);
 }
 
 /// Root walker for the two file-owner tables, registered alongside the other
@@ -241,13 +238,12 @@ unsafe fn faulthandler_dump_current_traceback(fd: i32) {
 unsafe extern "system" fn faulthandler_exc_handler(
     exc_info: *mut rustpython_host_env::faulthandler::ExceptionPointers,
 ) -> i32 {
-    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
     let code = unsafe { rustpython_host_env::faulthandler::exception_code(exc_info) };
     // `faulthandler.c:283-286`: a non-error status, and the C++ / CLR throws a
     // running program uses for control flow, are none of this handler's
     // business — and every Rust panic under MSVC is one of them.
     if rustpython_host_env::faulthandler::ignore_exception(code) {
-        return EXCEPTION_CONTINUE_SEARCH;
+        return rustpython_host_env::faulthandler::EXCEPTION_CONTINUE_SEARCH;
     }
     // Assembled on the stack for the same reason as the signal handler's.
     const PREFIX: &[u8] = b"Windows fatal exception: ";
@@ -282,29 +278,36 @@ unsafe extern "system" fn faulthandler_exc_handler(
     if rustpython_host_env::faulthandler::is_access_violation(code) {
         rustpython_host_env::faulthandler::disable_fatal_signal(libc::SIGSEGV);
     }
-    EXCEPTION_CONTINUE_SEARCH
+    rustpython_host_env::faulthandler::EXCEPTION_CONTINUE_SEARCH
 }
 
 /// The exception statuses `faulthandler` publishes on Windows, spelled the way
 /// `PyModule_AddIntConstant` hands the NTSTATUS values over: as signed 32-bit
 /// ints, so `_EXCEPTION_ACCESS_VIOLATION` reads -0x3ffffffb rather than
 /// 0xc0000005.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 const WINDOWS_EXCEPTIONS: [(&str, i32); 5] = [
-    ("_EXCEPTION_ACCESS_VIOLATION", EXCEPTION_ACCESS_VIOLATION),
+    (
+        "_EXCEPTION_ACCESS_VIOLATION",
+        rustpython_host_env::faulthandler::EXCEPTION_ACCESS_VIOLATION as i32,
+    ),
     (
         "_EXCEPTION_INT_DIVIDE_BY_ZERO",
-        EXCEPTION_INT_DIVIDE_BY_ZERO,
+        rustpython_host_env::faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO as i32,
     ),
-    ("_EXCEPTION_NONCONTINUABLE", 0x1),
-    ("_EXCEPTION_NONCONTINUABLE_EXCEPTION", 0xc000_0025u32 as i32),
-    ("_EXCEPTION_STACK_OVERFLOW", 0xc000_00fdu32 as i32),
+    (
+        "_EXCEPTION_NONCONTINUABLE",
+        rustpython_host_env::faulthandler::EXCEPTION_NONCONTINUABLE as i32,
+    ),
+    (
+        "_EXCEPTION_NONCONTINUABLE_EXCEPTION",
+        rustpython_host_env::faulthandler::EXCEPTION_NONCONTINUABLE_EXCEPTION as i32,
+    ),
+    (
+        "_EXCEPTION_STACK_OVERFLOW",
+        rustpython_host_env::faulthandler::EXCEPTION_STACK_OVERFLOW as i32,
+    ),
 ];
-
-#[cfg(windows)]
-const EXCEPTION_ACCESS_VIOLATION: i32 = 0xc000_0005u32 as i32;
-#[cfg(windows)]
-const EXCEPTION_INT_DIVIDE_BY_ZERO: i32 = 0xc000_0094u32 as i32;
 
 /// `faulthandler.c:1043 faulthandler_suppress_crash_report` — the crash helpers
 /// below take the process down on purpose, so the OS must not stop to offer a
@@ -370,7 +373,9 @@ fn faulthandler_get_fileno_and_file(
             .ok_or_else(|| pyre_interpreter::PyError::runtime_error("sys.stderr is None"))?;
         let w_stderr = pyre_interpreter::baseobjspace::getattr_str(sys, "stderr")?;
         if w_stderr.is_null() || unsafe { pyre_object::is_none(w_stderr) } {
-            return Err(pyre_interpreter::PyError::runtime_error("sys.stderr is None"));
+            return Err(pyre_interpreter::PyError::runtime_error(
+                "sys.stderr is None",
+            ));
         }
         w_stderr
     } else if unsafe { pyre_object::is_int(w_file) } {
@@ -394,7 +399,9 @@ fn faulthandler_get_fileno_and_file(
     let method = pyre_interpreter::baseobjspace::getattr_str(resolved, "fileno")?;
     let res = pyre_interpreter::call::call_function_impl_result(method, &[])?;
     if !unsafe { pyre_object::is_int(res) } {
-        return Err(pyre_interpreter::PyError::type_error("fileno() returned non-integer"));
+        return Err(pyre_interpreter::PyError::type_error(
+            "fileno() returned non-integer",
+        ));
     }
     let fd = unsafe { pyre_object::w_int_get_value(res) } as i32;
     if fd < 0 {
@@ -458,8 +465,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     // when the install fails, or a failed re-enable would
                     // redirect the handlers already installed.
                     let _state = lock_faulthandler_state();
-                    let previous_fd =
-                        HANDLER.fd.swap(fd, std::sync::atomic::Ordering::Relaxed);
+                    let previous_fd = HANDLER.fd.swap(fd, std::sync::atomic::Ordering::Relaxed);
                     #[cfg(unix)]
                     let flags = libc::SA_NODEFER | libc::SA_ONSTACK;
                     #[cfg(windows)]
@@ -474,7 +480,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         // `enable()` must not stack another one, and the
                         // installed handle is what `disable` needs.
                         #[cfg(windows)]
-                        if HANDLER.exc_handler.load(std::sync::atomic::Ordering::Relaxed) == 0
+                        if HANDLER
+                            .exc_handler
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            == 0
                         {
                             HANDLER.exc_handler.store(
                                 rustpython_host_env::faulthandler::add_vectored_exception_handler(
@@ -483,7 +492,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         }
-                        HANDLER.enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+                        HANDLER
+                            .enabled
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         // `handler.py` `self.fatal_error_w_file = w_file`.
                         set_fatal_error_file(file_slot.map_or(
                             pyre_object::PY_NULL,
@@ -491,7 +502,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         ));
                         return Ok(pyre_object::w_none());
                     }
-                    HANDLER.fd.store(previous_fd, std::sync::atomic::Ordering::Relaxed);
+                    HANDLER
+                        .fd
+                        .store(previous_fd, std::sync::atomic::Ordering::Relaxed);
                     Err(pyre_interpreter::PyError::runtime_error(
                         "faulthandler.enable: sigaction failed",
                     ))
@@ -506,7 +519,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             },
             // `enable(file=sys.stderr, all_threads=True, c_stack=True)` —
             // `c_stack` (3.14) selects C-stack dumping; accept and ignore it.
-            pyre_interpreter::Signature::new(vec!["file", "all_threads", "c_stack"], None, None, 0, 0),
+            pyre_interpreter::Signature::new(
+                vec!["file", "all_threads", "c_stack"],
+                None,
+                None,
+                0,
+                0,
+            ),
         ),
     );
     pyre_interpreter::module_ns_store(
@@ -521,9 +540,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     rustpython_host_env::faulthandler::disable_fatal_handlers();
                     #[cfg(windows)]
                     rustpython_host_env::faulthandler::remove_vectored_exception_handler(
-                        HANDLER.exc_handler.swap(0, std::sync::atomic::Ordering::Relaxed),
+                        HANDLER
+                            .exc_handler
+                            .swap(0, std::sync::atomic::Ordering::Relaxed),
                     );
-                    HANDLER.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                    HANDLER
+                        .enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
                     // `handler.py:150` `self.fatal_error_w_file = None`.
                     set_fatal_error_file(pyre_object::PY_NULL);
                 }
@@ -568,7 +591,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     pyre_interpreter::module_ns_store(
         ns,
         "dump_traceback_later",
-        pyre_interpreter::make_builtin_function("dump_traceback_later", |_| Ok(pyre_object::w_none())),
+        pyre_interpreter::make_builtin_function("dump_traceback_later", |_| {
+            Ok(pyre_object::w_none())
+        }),
     );
     pyre_interpreter::module_ns_store(
         ns,
@@ -599,7 +624,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             |args| {
                 let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 if w_signum.is_null() {
-                    return Err(pyre_interpreter::PyError::type_error("register() missing signal"));
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "register() missing signal",
+                    ));
                 }
                 let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
                 // handler.py:174 `@unwrap_spec(all_threads=int, chain=int)`
@@ -694,7 +721,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 #[cfg(all(unix, feature = "host_env"))]
                 {
                     if args.is_empty() {
-                        return Err(pyre_interpreter::PyError::type_error("unregister() missing signal"));
+                        return Err(pyre_interpreter::PyError::type_error(
+                            "unregister() missing signal",
+                        ));
                     }
                     let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
                     let _state = lock_faulthandler_state();
@@ -777,7 +806,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 // status the hardware would have raised.
                 #[cfg(all(windows, feature = "host_env"))]
                 rustpython_host_env::faulthandler::raise_exception(
-                    EXCEPTION_INT_DIVIDE_BY_ZERO as u32,
+                    rustpython_host_env::faulthandler::EXCEPTION_INT_DIVIDE_BY_ZERO,
                     0,
                 );
                 #[cfg(unix)]
@@ -810,8 +839,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // only where structured exceptions exist.
     #[cfg(windows)]
     {
-        for (name, code) in WINDOWS_EXCEPTIONS {
-            pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(code)));
+        #[cfg(feature = "host_env")]
+        {
+            for (name, code) in WINDOWS_EXCEPTIONS {
+                pyre_interpreter::module_ns_store(
+                    ns,
+                    name,
+                    pyre_object::w_int_new(i64::from(code)),
+                );
+            }
         }
         pyre_interpreter::module_ns_store(
             ns,

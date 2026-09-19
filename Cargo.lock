@@ -2866,7 +2866,6 @@ dependencies = [
  "rustpython-host_env",
  "rustpython-wtf8",
  "widestring",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3318,7 +3317,7 @@ dependencies = [
 [[package]]
 name = "rustpython-codegen"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "bitflags 2.13.0",
  "indexmap",
@@ -3341,7 +3340,7 @@ dependencies = [
 [[package]]
 name = "rustpython-common"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "ascii",
  "base64 0.23.1",
@@ -3381,7 +3380,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "rustpython-codegen",
  "rustpython-compiler-core",
@@ -3395,7 +3394,7 @@ dependencies = [
 [[package]]
 name = "rustpython-compiler-core"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "bitflags 2.13.0",
  "bitflagset",
@@ -3411,7 +3410,7 @@ dependencies = [
 [[package]]
 name = "rustpython-host_env"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "bitflags 2.13.0",
  "cc",
@@ -3453,7 +3452,7 @@ dependencies = [
 [[package]]
 name = "rustpython-literal"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "hexf-parse",
  "is-macro",
@@ -3543,7 +3542,7 @@ dependencies = [
 [[package]]
 name = "rustpython-sre_engine"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "bitflags 2.13.0",
  "num_enum",
@@ -3555,7 +3554,7 @@ dependencies = [
 [[package]]
 name = "rustpython-unicode"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "icu_casemap",
  "icu_locale",
@@ -3569,7 +3568,7 @@ dependencies = [
 [[package]]
 name = "rustpython-wtf8"
 version = "0.6.0"
-source = "git+https://github.com/youknowone/RustPython.git?rev=b01f472c6102d0b9b48a6a9722f925e0447afd46#b01f472c6102d0b9b48a6a9722f925e0447afd46"
+source = "git+https://github.com/RustPython/RustPython.git?rev=013333e5f99dc9ffe780881b9dd9bbfdd308a823#013333e5f99dc9ffe780881b9dd9bbfdd308a823"
 dependencies = [
  "ascii",
  "bstr",
