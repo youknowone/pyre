@@ -2176,15 +2176,15 @@ impl VirtualState {
             // `get_index()` is the parent-local field slot index, not
             // the global Descr.index(); pyre's `info.fields` and
             // `element_fields[i]` are populated via `field_slot_index`
-            // (`heap.rs`) / `descr_index` (`virtualize.rs`), both
-            // of which read `FieldDescr.index_in_parent()` when a
-            // parent SizeDescr is bound (matching descr.py). Fall
-            // back to `Descr::index()` for descrs without a parent, the
-            // same fallback heap.rs picks up.
+            // (`heap.rs`) / `parent_list_slot` (`virtualize.rs`). The
+            // mint on `index_in_parent` can predate a later sibling
+            // (`args_w` 1 → 2), so look the field up on the completed
+            // parent list. Fall back to `Descr::index()` for descrs
+            // without a parent.
             let descr_idx = expected_field_descrs[i]
                 .as_field_descr()
                 .filter(|fd| fd.get_parent_descr().is_some())
-                .map(|fd| fd.index_in_parent() as u32)
+                .map(crate::optimizeopt::virtualize::parent_list_slot)
                 .unwrap_or_else(|| expected_field_descrs[i].index());
             let expected_child = expected_fields
                 .iter()

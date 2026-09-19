@@ -8684,7 +8684,7 @@ impl OptContext {
         // only meaningful when a parent SizeDescr is bound (descr.rs index_in_parent).
         let slot = fd
             .get_parent_descr()
-            .map(|_| fd.index_in_parent() as u32)
+            .map(|_| crate::optimizeopt::virtualize::parent_list_slot(fd))
             .unwrap_or_else(|| descr.index());
         // virtualstate.py:149-151 `opinfo = getptrinfo(box); assert
         // opinfo.is_virtual()`. Read the field box only off a virtual struct
@@ -8726,7 +8726,7 @@ impl OptContext {
         // fallback to the global index when no parent SizeDescr is bound.
         let slot = fd
             .get_parent_descr()
-            .map(|_| fd.index_in_parent() as u32)
+            .map(|_| crate::optimizeopt::virtualize::parent_list_slot(fd))
             .unwrap_or_else(|| descr.index());
         let op = self.get_box_replacement_operand_opt(runtime_box)?;
         let info = self.getptrinfo(&op)?;
@@ -9691,7 +9691,10 @@ impl OptContext {
                 // optimizer.py:484: opinfo.init_fields(parent_descr, descr.get_index())
                 // info.py init_fields(parent_descr, index) sets self.descr
                 // and pre-allocates _fields by parent slot count.
-                new_info.init_fields(parent_descr, field_descr.index_in_parent());
+                new_info.init_fields(
+                    parent_descr,
+                    crate::optimizeopt::virtualize::parent_list_slot(field_descr) as usize,
+                );
                 new_info
             }
         } else if op.opcode.is_getarrayitem()
