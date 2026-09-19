@@ -125,3 +125,25 @@ fn reflective_call_uses_declared_width_and_zero_extends_result() {
         assert_eq!(result, [0; 8]);
     });
 }
+
+#[test]
+fn func_sig_codec_golden() {
+    let known = 1_i64 << 63;
+    assert_eq!(encode_func_sig(&[], None), known);
+    assert_eq!(
+        encode_func_sig(&[FuncSigVal::I64, FuncSigVal::I64], Some(FuncSigVal::I64)),
+        known | 2 | (2 << 5) | (1 << 8) | (1 << 10)
+    );
+    assert_eq!(
+        encode_func_sig(&[FuncSigVal::I32, FuncSigVal::I32], Some(FuncSigVal::I32)),
+        known | 2 | (1 << 5)
+    );
+    assert_eq!(decode_func_sig(0), None);
+    assert_eq!(
+        decode_func_sig(known | 1 | (2 << 5) | (1 << 8)),
+        Some(WasmSig {
+            params: vec![FuncSigVal::I64],
+            result: Some(FuncSigVal::I64),
+        })
+    );
+}

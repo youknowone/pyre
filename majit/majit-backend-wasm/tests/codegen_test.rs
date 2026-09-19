@@ -3,6 +3,28 @@
 /// Most tests use wasmparser to validate emitted bytes. The terminal-decline
 /// regression additionally executes the full wasm host and compares its Python
 /// output with dynasm, because the old failure was a runtime pointer miscast.
+///
+/// `ResidualCallAbi` is process-global; oracle tests flip it to Vouched.
+/// One test thread keeps that from racing Word-mode CALL tests.
+#[cfg(not(target_arch = "wasm32"))]
+mod serial_cpu_tests {
+    extern "C" fn set_one_test_thread() {
+        // SAFETY: constructor runs before `main`, single-threaded.
+        unsafe { std::env::set_var("RUST_TEST_THREADS", "1") };
+    }
+
+    #[used]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "ios"),
+        unsafe(link_section = "__DATA,__mod_init_func")
+    )]
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "android", target_os = "freebsd"),
+        unsafe(link_section = ".init_array")
+    )]
+    static SET_ONE_TEST_THREAD: extern "C" fn() = set_one_test_thread;
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -4358,7 +4380,6 @@ fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
     );
     assert_eq!(drops, 0, "a genuine void call has no result to drop");
 }
-
 
 #[test]
 fn an_allocation_is_followed_by_a_memory_error_check() {
@@ -10267,11 +10288,15 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
     let (owner_mallocs, _) = count_rewritten_malloc_nursery(&owner_ops);
     let (region_mallocs, _) = count_rewritten_malloc_nursery(&region_ops);
     assert_eq!(owner_mallocs, 1, "owner rewritten on its own");
-    assert_eq!(region_mallocs, 1, "region rewritten on its own, not batched with owner");
+    assert_eq!(
+        region_mallocs, 1,
+        "region rewritten on its own, not batched with owner"
+    );
 
-    let mut inputs = nursery_new_inputs(vec![
-        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
-    ]);
+    let mut inputs = nursery_new_inputs(vec![Op::new(
+        OpCode::Finish,
+        &[rb(OpRef::input_arg_int(0))],
+    )]);
     inputs.inputargs = owner_ia;
     inputs.ops = owner_ops;
     inputs.constants = owner_consts;
@@ -10314,7 +10339,10 @@ fn collecting_op_between_news_keeps_separate_nursery_bumps() {
     let frontend = vec![plain_new(1, 53), call, plain_new(2, 53), finish_int_arg0()];
     let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
     let (mallocs, _) = count_rewritten_malloc_nursery(&rewritten);
-    assert_eq!(mallocs, 2, "a collecting op flushes the pending nursery batch");
+    assert_eq!(
+        mallocs, 2,
+        "a collecting op flushes the pending nursery batch"
+    );
     let inputs = nursery_new_inputs(frontend);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
@@ -10379,9 +10407,7 @@ fn newstr_without_a_descr_injects_the_builtin_layout() {
     assert!(
         rewritten.iter().any(|op| matches!(
             op.opcode,
-            OpCode::CallMallocNursery
-                | OpCode::CallMallocNurseryVarsize
-                | OpCode::CallR
+            OpCode::CallMallocNursery | OpCode::CallMallocNurseryVarsize | OpCode::CallR
         )),
         "injected Newstr must become a malloc: {:?}",
         rewritten.iter().map(|op| op.opcode).collect::<Vec<_>>()
@@ -10469,9 +10495,7 @@ fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
         &[OpRef::ref_op(1), OpRef::const_int(32)],
         OpRef::ref_op(2),
     );
-    let inputs = nursery_new_inputs(
-        vec![call_malloc_nursery(1, 72), incr, finish_int_arg0()],
-    );
+    let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 72), incr, finish_int_arg0()]);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -10643,7 +10667,6 @@ fn inline_nursery_new_elides_the_barrier_like_gen_malloc_nursery() {
         "gen_malloc_fixedsize remembers a young fixed-size malloc"
     );
 }
-
 /// `emit_force_arm` publishes a guard's fail arguments while the bracketed
 /// call is still on the stack. A constant among them has no home and no
 /// local; it is published as its literal, like `emit_guard_fail_args_spill`
@@ -10779,3 +10802,236 @@ fn cond_call_gc_wb_array_emits_the_array_barrier() {
     );
 }
 
+fn count_ops(bytes: &[u8], pred: impl Fn(&wasmparser::Operator<'_>) -> bool) -> usize {
+    let mut n = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while !operators.eof() {
+                let op = operators.read().unwrap();
+                if pred(&op) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+fn call_i_two_ints() -> (Vec<InputArgRc>, Vec<Op>) {
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Int, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let call = {
+        let op = Op::new(
+            OpCode::CallI,
+            &[
+                rb(OpRef::const_int(42)),
+                rb(OpRef::input_arg_int(0)),
+                rb(OpRef::input_arg_int(1)),
+            ],
+        );
+        op.pos().set(OpRef::int_op(2));
+        op.setdescr(majit_ir::descr::make_call_descr(
+            vec![Type::Int, Type::Int],
+            Type::Int,
+            EffectInfo::default(),
+        ));
+        op
+    };
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
+    (inputargs, ops)
+}
+
+fn with_vouched_oracle(addr: i64, encoded: Option<i64>, body: impl FnOnce()) {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            majit_backend_wasm::clear_test_residual_target_sigs();
+            majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
+            majit_backend_wasm::codegen::set_residual_call_abi(
+                majit_backend_wasm::codegen::ResidualCallAbi::Word,
+            );
+        }
+    }
+    let _restore = Restore;
+    majit_backend_wasm::codegen::set_residual_call_abi(
+        majit_backend_wasm::codegen::ResidualCallAbi::Vouched,
+    );
+    majit_backend_wasm::set_faithful_residual_call_addrs(&[]);
+    majit_backend_wasm::clear_test_residual_target_sigs();
+    if let Some(encoded) = encoded {
+        majit_backend_wasm::set_test_residual_target_sig(addr, encoded);
+    }
+    body();
+}
+
+#[test]
+fn test_oracle_i64_call_lowers_in_module_without_vouch() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[
+            majit_backend_wasm::FuncSigVal::I64,
+            majit_backend_wasm::FuncSigVal::I64,
+        ],
+        Some(majit_backend_wasm::FuncSigVal::I64),
+    );
+    with_vouched_oracle(42, Some(encoded), || {
+        let (inputargs, ops) = call_i_two_ints();
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+    });
+}
+
+#[test]
+fn test_oracle_i32_call_lowers_with_wrap_and_zero_extend() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[
+            majit_backend_wasm::FuncSigVal::I32,
+            majit_backend_wasm::FuncSigVal::I32,
+        ],
+        Some(majit_backend_wasm::FuncSigVal::I32),
+    );
+    with_vouched_oracle(42, Some(encoded), || {
+        let (inputargs, ops) = call_i_two_ints();
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (
+                vec![wasmparser::ValType::I32, wasmparser::ValType::I32],
+                vec![wasmparser::ValType::I32]
+            )
+        );
+        // Two argument wraps. The const table-index wrap folds to `i32.const`.
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(op, wasmparser::Operator::I32WrapI64)),
+            2
+        );
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::I64ExtendI32U
+            )),
+            1
+        );
+    });
+}
+
+#[test]
+fn test_oracle_f32_mismatch_keeps_trampoline_even_if_vouched() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[majit_backend_wasm::FuncSigVal::F32],
+        Some(majit_backend_wasm::FuncSigVal::I64),
+    );
+    with_vouched_oracle(42, Some(encoded), || {
+        majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let call = {
+            let op = Op::new(
+                OpCode::CallI,
+                &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
+            );
+            op.pos().set(OpRef::int_op(1));
+            op.setdescr(majit_ir::descr::make_call_descr(
+                vec![Type::Int],
+                Type::Int,
+                EffectInfo::default(),
+            ));
+            op
+        };
+        let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert!(indirect_calls.is_empty());
+    });
+}
+
+#[test]
+fn test_oracle_unknown_follows_vouch_list() {
+    with_vouched_oracle(42, None, || {
+        let (inputargs, ops) = call_i_two_ints();
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+    });
+    with_vouched_oracle(42, None, || {
+        majit_backend_wasm::set_faithful_residual_call_addrs(&[42]);
+        let (inputargs, ops) = call_i_two_ints();
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+    });
+}
+
+#[test]
+fn test_oracle_picks_calln_void_true_vs_void_word() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let call_n =
+        |result_size: usize| void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], result_size);
+    let finish = || Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+
+    let true_void =
+        majit_backend_wasm::encode_func_sig(&[majit_backend_wasm::FuncSigVal::I64], None);
+    with_vouched_oracle(42, Some(true_void), || {
+        let ops = vec![call_n(8), finish()];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (vec![wasmparser::ValType::I64], vec![])
+        );
+        assert_eq!(drops, 0);
+    });
+
+    let void_word = majit_backend_wasm::encode_func_sig(
+        &[majit_backend_wasm::FuncSigVal::I64],
+        Some(majit_backend_wasm::FuncSigVal::I64),
+    );
+    with_vouched_oracle(42, Some(void_word), || {
+        let ops = vec![call_n(0), finish()];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+        let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
+        assert_eq!(indirect_calls.len(), 1);
+        assert_eq!(
+            function_type(&bytes, indirect_calls[0].0 as usize),
+            (
+                vec![wasmparser::ValType::I64],
+                vec![wasmparser::ValType::I64]
+            )
+        );
+        assert_eq!(drops, 1);
+    });
+}
+
+#[test]
+fn test_func_sig_codec_golden() {
+    let known = 1_i64 << 63;
+    assert_eq!(majit_backend_wasm::encode_func_sig(&[], None), known);
+    assert_eq!(
+        majit_backend_wasm::encode_func_sig(
+            &[
+                majit_backend_wasm::FuncSigVal::I64,
+                majit_backend_wasm::FuncSigVal::I64
+            ],
+            Some(majit_backend_wasm::FuncSigVal::I64)
+        ),
+        known | 2 | (2 << 5) | (1 << 8) | (1 << 10)
+    );
+    assert_eq!(majit_backend_wasm::decode_func_sig(0), None);
+}

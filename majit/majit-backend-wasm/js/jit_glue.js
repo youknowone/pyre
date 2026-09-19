@@ -54,6 +54,10 @@ function jitCallTrampoline(framePtr, callAreaOfs = CALL_RESULT_OFS) {
   view.setInt32(framePtr + callAreaOfs + 4, 0, true);
 }
 
+// JS cannot reflect a table entry's type portably.
+export function jit_func_sig(_slot) { return 0n; }
+function jitFuncSig(_slot) { return 0n; }
+
 export function jit_compile_wasm(bytesPtr, bytesLen) {
   const entries = instantiateTrace(bytesPtr, bytesLen);
   return registerTrace(entries);
@@ -72,7 +76,7 @@ function instantiateTrace(bytesPtr, bytesLen) {
     // chaining; the module imports it only when it has CALL ops. Extra
     // entries in the import object are ignored when not declared.
     const instance = new WebAssembly.Instance(module, {
-      env: { memory: mainMemory, jit_call: jitCallTrampoline, jit_call_compact: jitCallTrampoline, __indirect_function_table: mainTable }
+      env: { memory: mainMemory, jit_call: jitCallTrampoline, jit_call_compact: jitCallTrampoline, jit_func_sig: jitFuncSig, __indirect_function_table: mainTable }
     });
     return traceEntries(instance);
   } catch (e) {

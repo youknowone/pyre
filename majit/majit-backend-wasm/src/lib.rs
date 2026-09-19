@@ -15,6 +15,9 @@
 /// the native arm.
 pub mod codegen;
 pub mod failguard;
+mod func_sig;
+
+pub use func_sig::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 
 /// The wasm host compiles and resumes on the thread that ran the
 /// compiled frame (`eval.rs` post-`run_compiled`). cargo's default
@@ -3142,6 +3145,96 @@ pub fn vouch_residual_call_addr(addr: i64) {
 /// [`vouch_residual_call_addr`].
 pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
     FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
+}
+
+thread_local! {
+    /// Per thread for the same reason [`FAITHFUL_RESIDUAL_CALL_ADDRS`] is.
+    /// Residual targets are guest-static table entries present from
+    /// instantiation (`fn as usize` on wasm32 is that table index), so both
+    /// a known encoding and a `0` unknown answer are stable for the life of
+    /// the instance and are cached.
+    static RESIDUAL_TARGET_SIG_CACHE: RefCell<HashMap<i64, i64>> =
+        RefCell::new(HashMap::new());
+}
+
+#[cfg(any(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static TEST_RESIDUAL_TARGET_SIGS: RefCell<HashMap<i64, i64>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Install a `jit_func_sig` encoding for host-side tests and native compiles.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub fn set_test_residual_target_sig(addr: i64, encoded: i64) {
+    TEST_RESIDUAL_TARGET_SIGS.with(|map| {
+        map.borrow_mut().insert(addr, encoded);
+    });
+    RESIDUAL_TARGET_SIG_CACHE.with(|cache| {
+        cache.borrow_mut().remove(&addr);
+    });
+}
+
+/// Drop every injected encoding and the guest-side cache.
+#[cfg(any(test, not(target_arch = "wasm32")))]
+pub fn clear_test_residual_target_sigs() {
+    TEST_RESIDUAL_TARGET_SIGS.with(|map| map.borrow_mut().clear());
+    RESIDUAL_TARGET_SIG_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
+/// The callee's real wasm signature, if the host oracle knows it.
+///
+/// Residual targets are guest-static function-table slots, so a miss is
+/// cached as well as a hit: the slot cannot be filled later with a different
+/// type.
+pub fn residual_target_sig(addr: i64) -> Option<WasmSig> {
+    let cached = RESIDUAL_TARGET_SIG_CACHE.with(|cache| cache.borrow().get(&addr).copied());
+    let encoded = cached.unwrap_or_else(|| {
+        let encoded = query_residual_target_sig(addr);
+        RESIDUAL_TARGET_SIG_CACHE.with(|cache| {
+            cache.borrow_mut().insert(addr, encoded);
+        });
+        encoded
+    });
+    decode_func_sig(encoded)
+}
+
+fn query_residual_target_sig(addr: i64) -> i64 {
+    #[cfg(any(test, not(target_arch = "wasm32")))]
+    {
+        if let Some(encoded) =
+            TEST_RESIDUAL_TARGET_SIGS.with(|map| map.borrow().get(&addr).copied())
+        {
+            return encoded;
+        }
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+    {
+        return unsafe { jit_func_sig(addr as i32) };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    {
+        return unsafe { jit_func_sig_web::jit_func_sig(addr as i32) };
+    }
+    #[cfg(not(all(target_arch = "wasm32", any(feature = "host-import", feature = "web"))))]
+    {
+        0
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "host-import"))]
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    fn jit_func_sig(slot: i32) -> i64;
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+mod jit_func_sig_web {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(raw_module = "./jit_glue.js")]
+    unsafe extern "C" {
+        pub fn jit_func_sig(slot: i32) -> i64;
+    }
 }
 
 /// [`vouch_residual_call_addr`] for a target whose *result* is a word too, so

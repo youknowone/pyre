@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 pub use majit_backend_wasm::codegen::{
     CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS,
 };
+pub use majit_backend_wasm::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 use wasmtime::error::Context;
 use wasmtime::{
     Caller, Error, Extern, Func, Instance, Memory, Module, Ref, Result, Table, Val, ValType,
@@ -82,6 +83,10 @@ pub fn instantiate<T: HostState + 'static>(
             }
         },
     );
+    let jit_func_sig = Func::wrap(
+        &mut *caller,
+        |mut caller: Caller<'_, T>, slot: i32| -> i64 { jit_func_sig_of_slot(&mut caller, slot) },
+    );
     let mut imports = Vec::new();
     for import in module.imports() {
         imports.push(match (import.module(), import.name()) {
@@ -89,6 +94,7 @@ pub fn instantiate<T: HostState + 'static>(
             ("env", "__indirect_function_table") => Extern::Table(table),
             ("env", "jit_call") => Extern::Func(jit_call),
             ("env", "jit_call_compact") => Extern::Func(jit_call_compact),
+            ("env", "jit_func_sig") => Extern::Func(jit_func_sig),
             (m, n) => return Err(Error::msg(format!("unexpected trace import {m}.{n}"))),
         });
     }
@@ -264,4 +270,44 @@ pub fn residual_call<T: HostState>(
     };
     memory.write(&mut *caller, area, &result.to_le_bytes())?;
     Ok(())
+}
+
+/// `env.jit_func_sig(slot) -> i64` — the callee's packed wasm type, or 0.
+pub fn jit_func_sig_of_slot<T: HostState>(caller: &mut Caller<'_, T>, slot: i32) -> i64 {
+    if slot == 0 {
+        return 0;
+    }
+    let Ok(table) = table(caller) else {
+        return 0;
+    };
+    let func = match table.get(&mut *caller, slot as u64) {
+        Some(Ref::Func(Some(func))) => func,
+        _ => return 0,
+    };
+    encode_functype(&func.ty(&*caller))
+}
+
+fn encode_functype(ty: &wasmtime::FuncType) -> i64 {
+    if ty.params().len() > MAX_CALL_ARGS || ty.results().len() > 1 {
+        return 0;
+    }
+    let mut params = Vec::with_capacity(ty.params().len());
+    for param in ty.params() {
+        params.push(match param {
+            ValType::I32 => FuncSigVal::I32,
+            ValType::I64 => FuncSigVal::I64,
+            ValType::F32 => FuncSigVal::F32,
+            ValType::F64 => FuncSigVal::F64,
+            _ => return 0,
+        });
+    }
+    let result = match ty.results().next() {
+        None => None,
+        Some(ValType::I32) => Some(FuncSigVal::I32),
+        Some(ValType::I64) => Some(FuncSigVal::I64),
+        Some(ValType::F32) => Some(FuncSigVal::F32),
+        Some(ValType::F64) => Some(FuncSigVal::F64),
+        _ => return 0,
+    };
+    encode_func_sig(&params, result)
 }

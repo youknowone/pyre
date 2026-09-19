@@ -1968,6 +1968,14 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
         },
     )?;
 
+    linker.func_wrap(
+        "env",
+        "jit_func_sig",
+        |mut caller: Caller<'_, Host>, slot: i32| -> i64 {
+            majit_backend_wasm_host::jit_func_sig_of_slot(&mut caller, slot)
+        },
+    )?;
+
     // Host-filesystem imports for the wasm-host build's module loader. The wasm32
     // module has no filesystem of its own; these serve module source from the
     // host's real stdlib (`$PYRE_STDLIB`). See `pyre-wasm`'s `host_fs_provider`.

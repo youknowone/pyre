@@ -3211,28 +3211,194 @@ fn residual_call_abi() -> ResidualCallAbi {
 
 /// Whether `op`'s callee may be called with the wasm type its descr's word
 /// types imply, rather than through the reflecting trampoline.
-fn residual_callee_abi_is_word_at(
+fn func_sig_val_to_valtype(val: crate::FuncSigVal) -> ValType {
+    match val {
+        crate::FuncSigVal::I32 => ValType::I32,
+        crate::FuncSigVal::I64 => ValType::I64,
+        crate::FuncSigVal::F32 => ValType::F32,
+        crate::FuncSigVal::F64 => ValType::F64,
+    }
+}
+
+fn wasm_sig_to_typed(sig: &crate::WasmSig) -> TypedResidualSig {
+    (
+        sig.params
+            .iter()
+            .copied()
+            .map(func_sig_val_to_valtype)
+            .collect(),
+        sig.result.map(func_sig_val_to_valtype),
+    )
+}
+
+/// Descr-derived wasm type the direct arm would use for this op.
+///
+/// CallN's void-word vs true-void result follows the oracle's real result
+/// when one is known; otherwise it follows `result_size`. Shared by the
+/// direct-vs-trampoline predicate and the emitter's type-index choice.
+fn expected_direct_wasm_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
+    expected_direct_wasm_sig_at(op, constants, residual_func_ofs(op.opcode))
+}
+
+fn expected_direct_wasm_sig_at(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
     func_arg: usize,
-) -> bool {
-    match residual_call_abi() {
-        ResidualCallAbi::Word => true,
-        ResidualCallAbi::Vouched => {
-            // Only a compile-time callee can be checked against the list; a
-            // register-form func pointer is a different target on every
-            // execution.
-            let Some(func_ptr) = op.getarglist().get(func_arg).map(|arg| arg.to_opref()) else {
-                return false;
-            };
-            func_ptr.is_constant()
-                && crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr))
+) -> Option<TypedResidualSig> {
+    let descr = op.getdescr()?;
+    let cd = descr.as_call_descr()?;
+    let arg_types = cd.arg_types();
+    let mut params = Vec::with_capacity(arg_types.len());
+    for ty in arg_types {
+        params.push(match ty {
+            Type::Float => ValType::F64,
+            Type::Int | Type::Ref => ValType::I64,
+            Type::Void => return None,
+        });
+    }
+    let nargs = op.num_args().saturating_sub(func_arg + 1);
+    if params.len() != nargs {
+        return None;
+    }
+    let is_void_op = matches!(
+        op.opcode,
+        OpCode::CallN
+            | OpCode::CallPureN
+            | OpCode::CallLoopinvariantN
+            | OpCode::CallMayForceN
+            | OpCode::CallReleaseGilN
+            | OpCode::CondCallN
+    );
+    let mut result = if is_void_op {
+        if cd.result_type() != Type::Void {
+            return None;
+        }
+        match cd.result_size() {
+            0 => None,
+            8 => Some(ValType::I64),
+            _ => return None,
+        }
+    } else {
+        if op.result_type() != cd.result_type() {
+            return None;
+        }
+        match cd.result_type() {
+            Type::Float => Some(ValType::F64),
+            Type::Int | Type::Ref => Some(ValType::I64),
+            Type::Void => return None,
+        }
+    };
+    if is_void_op
+        && let Some(addr) = const_funcptr_addr(op, constants, func_arg)
+        && let Some(real) = crate::residual_target_sig(addr)
+    {
+        match real.result {
+            None => result = None,
+            Some(crate::FuncSigVal::I64) | Some(crate::FuncSigVal::I32) => {
+                result = Some(ValType::I64)
+            }
+            Some(crate::FuncSigVal::F32) | Some(crate::FuncSigVal::F64) => {}
+        }
+    }
+    Some((params, result))
+}
+
+fn const_funcptr_addr(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+    func_arg: usize,
+) -> Option<i64> {
+    let func_ptr = op.getarglist().get(func_arg).map(|arg| arg.to_opref())?;
+    func_ptr
+        .is_constant()
+        .then(|| resolve_const_bits(constants, func_ptr))
+}
+
+/// True when `real` differs from `expected` only by i32 where the descr-derived
+/// type has i64 (Int/Ref on the JIT side). f32 anywhere is not this case.
+fn i32_abi_variance(expected: &TypedResidualSig, real: &TypedResidualSig) -> bool {
+    if expected.0.len() != real.0.len() {
+        return false;
+    }
+    if expected.1.is_some() != real.1.is_some() {
+        return false;
+    }
+    if real.0.contains(&ValType::F32) || real.1 == Some(ValType::F32) {
+        return false;
+    }
+    for (want, got) in expected.0.iter().zip(&real.0) {
+        match (*want, *got) {
+            (a, b) if a == b => {}
+            (ValType::I64, ValType::I32) => {}
+            _ => return false,
+        }
+    }
+    match (expected.1, real.1) {
+        (a, b) if a == b => true,
+        (Some(ValType::I64), Some(ValType::I32)) => true,
+        _ => false,
+    }
+}
+
+/// Emit signature for a direct call, or `None` to keep the trampoline.
+fn residual_callee_direct_emit_sig_at(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+    func_arg: usize,
+    expected: &TypedResidualSig,
+) -> Option<TypedResidualSig> {
+    let Some(func_ptr) = op.getarglist().get(func_arg).map(|arg| arg.to_opref()) else {
+        return None;
+    };
+    if !func_ptr.is_constant() {
+        return match residual_call_abi() {
+            ResidualCallAbi::Word if word_descr_shape(expected) => Some(expected.clone()),
+            _ => None,
+        };
+    }
+    let addr = resolve_const_bits(constants, func_ptr);
+    match crate::residual_target_sig(addr) {
+        Some(real) => {
+            if real.has_f32() {
+                return None;
+            }
+            let real_typed = wasm_sig_to_typed(&real);
+            if real_typed == *expected {
+                Some(expected.clone())
+            } else if i32_abi_variance(expected, &real_typed) {
+                Some(real_typed)
+            } else {
+                None
+            }
+        }
+        None => {
+            let all_float =
+                expected.1 == Some(ValType::F64) && expected.0.iter().all(|t| *t == ValType::F64);
+            if all_float
+                || (residual_call_abi() == ResidualCallAbi::Word && word_descr_shape(expected))
+                || crate::residual_call_descr_is_faithful(addr)
+            {
+                Some(expected.clone())
+            } else {
+                None
+            }
         }
     }
 }
 
-fn residual_callee_abi_is_word(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> bool {
-    residual_callee_abi_is_word_at(op, constants, residual_func_ofs(op.opcode))
+fn word_descr_shape(expected: &TypedResidualSig) -> bool {
+    expected.0.iter().all(|t| *t == ValType::I64) && matches!(expected.1, Some(ValType::I64) | None)
+}
+
+fn residual_direct_emit_sig(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<TypedResidualSig> {
+    let expected = expected_direct_wasm_sig(op, constants)?;
+    residual_callee_direct_emit_sig_at(op, constants, residual_func_ofs(op.opcode), &expected)
 }
 
 /// Direct uniform-word shapes for COND_CALL. Conditional calls place the
@@ -3269,10 +3435,19 @@ fn conditional_call_word_shape(
         return None;
     }
     let nargs = op.getarglist().len().saturating_sub(2);
-    if cd.arg_types().len() != nargs || !residual_callee_abi_is_word_at(op, constants, 1) {
+    if cd.arg_types().len() != nargs {
         return None;
     }
-    Some((nargs, returns_word || cd.result_size() == 8))
+    let expected = expected_direct_wasm_sig_at(op, constants, 1)?;
+    let emit = residual_callee_direct_emit_sig_at(op, constants, 1, &expected)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) {
+        return None;
+    }
+    let emit_word = emit.1 == Some(ValType::I64);
+    if returns_word != emit_word && returns_word {
+        return None;
+    }
+    Some((emit.0.len(), emit_word))
 }
 
 fn conditional_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> Option<usize> {
@@ -3346,7 +3521,8 @@ fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) ->
     if arg_types.len() != nargs {
         return None;
     }
-    if !residual_callee_abi_is_word(op, constants) {
+    let emit = residual_direct_emit_sig(op, constants)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) || emit.1 != Some(ValType::I64) {
         return None;
     }
     Some(nargs)
@@ -3401,62 +3577,7 @@ fn residual_call_typed_sig(
     {
         return None;
     }
-    let descr = op.getdescr()?;
-    let cd = descr.as_call_descr()?;
-    if op.result_type() != cd.result_type() {
-        return None;
-    }
-    let result = match cd.result_type() {
-        Type::Float => Some(ValType::F64),
-        Type::Int | Type::Ref => Some(ValType::I64),
-        // A callee that returns nothing still needs its own type when a float
-        // parameter puts it outside `residual_call_void_true_arity`'s uniform
-        // word family.  `all_float` below is false for it, so it reaches the
-        // allow-list check like every other mixed shape.
-        //
-        // Only a descr that records `()` names such a callee.  A void-recorded
-        // descr carrying `result_size == 8` (the `make_call_descr_void_word_abi`
-        // shape) names one that really returns a machine word, and an empty
-        // result list is a different type from the one the callee has.  The i64
-        // family `residual_call_void_word_arity` selects is where that ABI is
-        // spelled; where that family declines -- a float parameter it cannot
-        // carry -- the reflecting trampoline is the arm that stays correct.
-        Type::Void if cd.result_size() != 0 => return None,
-        Type::Void => None,
-    };
-    let arg_types = cd.arg_types();
-    // Every argument `f64` and an `f64` result is the shipped shape and needs
-    // no vouching: a float-only descr has no word parameter to be an `i32`
-    // pointer in disguise. Anything else -- a word beside a float, or a word
-    // result over float arguments -- is only as good as the descr, so the
-    // callee has to be named by `set_faithful_residual_call_addrs`.
-    let all_float = result == Some(ValType::F64) && arg_types.iter().all(|t| *t == Type::Float);
-    let func_ofs = residual_func_ofs(op.opcode);
-    if !all_float {
-        // Only a compile-time callee can be checked against the allow-list; a
-        // register-form func pointer is a different target on every execution.
-        let func_ptr = op.arg(func_ofs).to_opref();
-        if !func_ptr.is_constant() {
-            return None;
-        }
-        if !crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr)) {
-            return None;
-        }
-    }
-    let mut params = Vec::with_capacity(arg_types.len());
-    for ty in arg_types {
-        params.push(match ty {
-            Type::Float => ValType::F64,
-            Type::Int | Type::Ref => ValType::I64,
-            Type::Void => return None,
-        });
-    }
-    // Ordinary CALL: func at arg 0. CALL_RELEASE_GIL: func at arg 1.
-    let nargs = op.num_args().saturating_sub(func_ofs + 1);
-    if params.len() != nargs {
-        return None;
-    }
-    Some((params, result))
+    residual_direct_emit_sig(op, constants)
 }
 
 /// Void-recorded counterpart of [`residual_call_i64_arity`]: an eligible
@@ -3483,7 +3604,7 @@ fn residual_call_void_word_arity(
     }
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
-    if cd.result_type() != Type::Void || cd.result_size() != 8 {
+    if cd.result_type() != Type::Void {
         return None;
     }
     let arg_types = cd.arg_types();
@@ -3498,7 +3619,8 @@ fn residual_call_void_word_arity(
     if arg_types.len() != nargs {
         return None;
     }
-    if !residual_callee_abi_is_word(op, constants) {
+    let emit = residual_direct_emit_sig(op, constants)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) || emit.1 != Some(ValType::I64) {
         return None;
     }
     Some(nargs)
@@ -3523,7 +3645,7 @@ fn residual_call_void_true_arity(
     }
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
-    if cd.result_type() != Type::Void || cd.result_size() != 0 {
+    if cd.result_type() != Type::Void {
         return None;
     }
     let arg_types = cd.arg_types();
@@ -3538,7 +3660,8 @@ fn residual_call_void_true_arity(
     if arg_types.len() != nargs {
         return None;
     }
-    if !residual_callee_abi_is_word(op, constants) {
+    let emit = residual_direct_emit_sig(op, constants)?;
+    if emit.0.iter().any(|t| *t != ValType::I64) || emit.1.is_some() {
         return None;
     }
     Some(nargs)
@@ -9104,31 +9227,56 @@ fn build_function(
                             .map(|type_idx| (sig, type_idx))
                     })
                 {
-                    // Direct in-module typed residual call with the
-                    // descr-derived mixed `(i64/f64...) -> i64/f64` signature.
-                    let (params, _) = &sig;
+                    // Direct in-module typed residual call: descr-derived
+                    // mixed `(i64/f64…) -> i64/f64`, or the oracle's i32-ABI
+                    // twin (`i32.wrap_i64` / `i64.extend_i32_u`).
+                    let (params, result_ty) = &sig;
                     let call_args = &op.getarglist()[func_ofs + 1..];
                     debug_assert_eq!(call_args.len(), params.len());
                     for (arg, ty) in call_args.iter().zip(params) {
-                        if *ty == ValType::F64 {
-                            emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
-                        } else {
-                            emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                        match *ty {
+                            ValType::F64 => {
+                                emit_resolve_f64(&mut sink, constants, value_types, arg.to_opref());
+                            }
+                            ValType::I32 => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                                sink.i32_wrap_i64();
+                            }
+                            _ => {
+                                emit_resolve(&mut sink, constants, value_types, arg.to_opref());
+                            }
                         }
                     }
                     // func_ptr (arg 0) is the table slot — wrap to i32 index.
                     emit_resolve(&mut sink, constants, value_types, func_ptr_ref);
                     sink.i32_wrap_i64();
                     sink.call_indirect(0, type_idx);
+                    let is_void_op = matches!(
+                        op.opcode,
+                        OpCode::CallN
+                            | OpCode::CallPureN
+                            | OpCode::CallMayForceN
+                            | OpCode::CallAssemblerN
+                            | OpCode::CallReleaseGilN
+                            | OpCode::CallLoopinvariantN
+                    );
                     // A void callee leaves nothing on the stack, so there is
                     // neither a local to home it in nor a value to drop.
-                    let homed = if sig.1.is_none() {
+                    // i32 results zero-extend, matching the host trampoline's
+                    // `(*v as u32) as i64`.
+                    let homed = if result_ty.is_none() {
+                        None
+                    } else if is_void_op {
+                        sink.drop();
                         None
                     } else if !OpRef::raw_is_constant(vi) {
+                        if *result_ty == Some(ValType::I32) {
+                            sink.i64_extend_i32_u();
+                        }
                         sink.local_set(value_types.local(vi));
                         Some(vi)
                     } else {
-                        sink.drop(); // value-producing call whose result is unused
+                        sink.drop();
                         None
                     };
                     if can_collect {

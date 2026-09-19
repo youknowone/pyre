@@ -288,6 +288,16 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
         )
         .map_err(estr)?;
 
+    linker
+        .func_wrap(
+            "env",
+            "jit_func_sig",
+            |mut caller: Caller<'_, Host>, slot: i32| -> i64 {
+                jit_func_sig_of_slot(&mut caller, slot)
+            },
+        )
+        .map_err(estr)?;
+
     // Host-filesystem imports serving the wasm-host build's module loader from
     // `$PYRE_STDLIB`. The wasm32 module has no filesystem of its own.
     linker
@@ -654,6 +664,13 @@ fn jit_compile_trace(
     linker
         .define("env", "jit_call_compact", Extern::Func(jit_call_compact))
         .map_err(estr)?;
+    let jit_func_sig = Func::wrap(
+        &mut *caller,
+        |mut inner: Caller<'_, Host>, slot: i32| -> i64 { jit_func_sig_of_slot(&mut inner, slot) },
+    );
+    linker
+        .define("env", "jit_func_sig", Extern::Func(jit_func_sig))
+        .map_err(estr)?;
     let instance = linker
         .instantiate_and_start(&mut *caller, &module)
         .map_err(|e| format!("instantiate trace module: {e}"))?;
@@ -794,6 +811,45 @@ fn jit_call_trampoline(
     };
     write_i64(&memory, &mut *caller, call_area, result)?;
     Ok(())
+}
+
+fn jit_func_sig_of_slot(caller: &mut Caller<'_, Host>, slot: i32) -> i64 {
+    if slot == 0 {
+        return 0;
+    }
+    let Some(table) = caller.data().table else {
+        return 0;
+    };
+    let func = match table.get(&*caller, slot as u64) {
+        Some(Val::FuncRef(fr)) => match func_of(&fr) {
+            Some(f) => f,
+            None => return 0,
+        },
+        _ => return 0,
+    };
+    let ty = func.ty(&*caller);
+    if ty.params().len() > majit_backend_wasm_host::MAX_CALL_ARGS || ty.results().len() > 1 {
+        return 0;
+    }
+    let mut params = Vec::with_capacity(ty.params().len());
+    for param in ty.params() {
+        params.push(match *param {
+            ValType::I32 => majit_backend_wasm_host::FuncSigVal::I32,
+            ValType::I64 => majit_backend_wasm_host::FuncSigVal::I64,
+            ValType::F32 => majit_backend_wasm_host::FuncSigVal::F32,
+            ValType::F64 => majit_backend_wasm_host::FuncSigVal::F64,
+            _ => return 0,
+        });
+    }
+    let result = match ty.results().first() {
+        None => None,
+        Some(ValType::I32) => Some(majit_backend_wasm_host::FuncSigVal::I32),
+        Some(ValType::I64) => Some(majit_backend_wasm_host::FuncSigVal::I64),
+        Some(ValType::F32) => Some(majit_backend_wasm_host::FuncSigVal::F32),
+        Some(ValType::F64) => Some(majit_backend_wasm_host::FuncSigVal::F64),
+        _ => return 0,
+    };
+    majit_backend_wasm_host::encode_func_sig(&params, result)
 }
 
 /// Resolve a funcref to its `Func`, copying the lightweight handle out.
