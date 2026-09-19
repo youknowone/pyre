@@ -27,6 +27,55 @@ pub enum FindOrCountResult {
 /// `w_list_find_or_count_fast`; when that signals `NeedsGeneric`, runs
 /// the generic `ListStrategy.find_or_count` loop
 /// (`listobject.py:941-957`) using `space.eq_w`.
+/// `x in xs` under the list mutation lock.  `IntegerListStrategy.find_or_count`
+/// scans the unboxed pool when the needle is still a plain int; otherwise
+/// this falls back to the generic `eq_w` loop.  The lock acquire is a GC
+/// safepoint, so the list and needle are rooted and reloaded.  Not
+/// elidable: the list is mutable.
+///
+/// The lock stays in this residual so the `contains_list` dispatcher
+/// remains walkable (`w_list_append` documents the same split).
+#[majit_macros::dont_look_inside]
+pub fn contains_int_list_locked(obj: PyObjectRef, w_item: PyObjectRef) -> Result<bool, PyError> {
+    unsafe {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        pyre_object::gc_roots::publish_roots(&[obj, w_item]);
+        pyre_object::gc_roots::normalize_roots(root_base, 2);
+        let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let lock = pyre_object::listobject::w_list_lock_acquire(obj);
+        let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let w_item = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let integer_plain = pyre_object::listobject::w_list_strategy(obj)
+            == pyre_object::listobject::ListStrategy::Integer
+            && pyre_object::listobject::is_plain_int1(w_item)
+            && pyre_object::is_int(w_item);
+        if integer_plain {
+            let found = matches!(
+                pyre_object::listobject::w_list_find_or_count_fast(obj, w_item, 0, i64::MAX, false),
+                ListFindFast::Found(_)
+            );
+            pyre_object::listobject::w_list_lock_release(lock);
+            return Ok(found);
+        }
+        pyre_object::listobject::w_list_lock_release(lock);
+        let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
+        let w_item = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        w_list_find_or_count(obj, w_item, 0, i64::MAX, false)
+            .map(|result| matches!(result, FindOrCountResult::Index(_)))
+    }
+}
+
+/// Residual entry for [`contains_int_list_locked`].  A stored object's
+/// `__eq__` on the generic fallback can run Python.
+#[majit_macros::jit_may_force]
+pub extern "C" fn jit_list_contains_int(haystack: i64, needle: i64) -> i64 {
+    match contains_int_list_locked(haystack as PyObjectRef, needle as PyObjectRef) {
+        Ok(found) => i64::from(found),
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
 pub fn w_list_find_or_count(
     obj: PyObjectRef,
     w_item: PyObjectRef,

@@ -10974,9 +10974,10 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
 /// (`descroperation.rs compare`), and the `bool`-vs-`int` subtype ordering
 /// it keeps is decided on the promoted classes.
 ///
-/// Tags 0..=5 are the six rich comparisons.  `in` / `not in` (6, 7) take
-/// `contains`, `is` / `is_not` (8, 9) have their own fold, and
-/// CHECK_EXC_MATCH (10) its own; none of them is this body's comparison.
+/// Tags 0..=5 are the six rich comparisons.  `in` / `not in` (6, 7)
+/// descend the same [`COMPARE_OP_DESCENT`] helper — `compare_value_from_tag`
+/// routes those tags to `baseobjspace::contains`.  `is` / `is_not` (8, 9)
+/// have their own fold, and CHECK_EXC_MATCH (10) its own.
 pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10986,11 +10987,31 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || r_args.len() != 2
-        || dst_bank != 'r'
-        || !(0..=5).contains(&op_tag)
-    {
+    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
+        return Ok(None);
+    }
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_contains(op_tag) {
+        let (Some(needle_obj), Some(haystack_obj)) = (
+            walker_concrete_ref_object(ctx, r_args[0]),
+            walker_concrete_ref_object(ctx, r_args[1]),
+        ) else {
+            return Ok(None);
+        };
+        if !walker_contains_descent_callback_free(needle_obj, haystack_obj) {
+            return Ok(None);
+        }
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[(tag, op_tag)],
+            &[(r_args[0], needle_obj), (r_args[1], haystack_obj)],
+            &[],
+            dst,
+            dst_bank,
+            &COMPARE_OP_DESCENT,
+        );
+    }
+    if !(0..=5).contains(&op_tag) {
         return Ok(None);
     }
     let mut operands = [(OpRef::NONE, std::ptr::null_mut()); 2];
@@ -22752,6 +22773,50 @@ fn walker_str_pair_operands<Sym: WalkSym>(
         return None;
     }
     Some((lhs, rhs, lhs_obj, rhs_obj))
+}
+
+/// Admission for `COMPARE_OP_DESCENT` on tags 6/7.  Same job as the
+/// exact-numeric gate on tags 0..=5: do not start a sub-walk whose body
+/// can run Python (`__hash__` / `__eq__` / a subclass `__contains__`).
+/// A declining residual would re-run those side effects.  This is not
+/// a type-specialization fold: it is the callback-free gate the other
+/// compare-op descent already uses.  Removing it would re-run a stored
+/// `__eq__` when the sub-walk then declines.
+///
+/// Exact `str`/`bytes` plus a needle whose membership is an elidable
+/// find (another exact `str`/`bytes`, or a byte in `range(256)`), and
+/// an exact `IntegerListStrategy` list plus a plain `int`, are
+/// callback-free.  `dict`/`set` stay on the residual: a stored
+/// element's `__eq__` can still run on a hash collision.
+fn walker_contains_descent_callback_free(
+    needle: pyre_object::PyObjectRef,
+    haystack: pyre_object::PyObjectRef,
+) -> bool {
+    let exact = |obj: pyre_object::PyObjectRef, tp: &pyre_object::pyobject::PyType| unsafe {
+        pyre_object::is_exact_type(obj, tp)
+            && std::ptr::eq((*obj).w_class, pyre_object::get_instantiate(tp))
+    };
+    if exact(haystack, &pyre_object::pyobject::STR_TYPE) {
+        return exact(needle, &pyre_object::pyobject::STR_TYPE)
+            && unsafe { pyre_object::w_str_get_value_opt(needle).is_some() };
+    }
+    if exact(haystack, &pyre_object::bytesobject::BYTES_TYPE) {
+        if exact(needle, &pyre_object::bytesobject::BYTES_TYPE) {
+            return true;
+        }
+        return unsafe {
+            pyre_object::listobject::is_plain_int1(needle) && pyre_object::is_int(needle)
+        } && (0..=255).contains(&unsafe { pyre_object::w_int_get_value(needle) });
+    }
+    if exact(haystack, &pyre_object::pyobject::LIST_TYPE) {
+        return unsafe {
+            pyre_object::listobject::w_list_strategy(haystack)
+                == pyre_object::listobject::ListStrategy::Integer
+                && pyre_object::listobject::is_plain_int1(needle)
+                && pyre_object::is_int(needle)
+        };
+    }
+    false
 }
 
 /// `guard_class(&STR_TYPE)` + the exact canonical `w_class` guard, the pair

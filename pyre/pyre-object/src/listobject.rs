@@ -4801,6 +4801,11 @@ pub unsafe fn w_list_find_or_count_fast(
     }
 }
 
+/// Current list strategy.  `obj` must be a live `W_ListObject`.
+pub unsafe fn w_list_strategy(obj: PyObjectRef) -> ListStrategy {
+    (*(obj as *const W_ListObject)).strategy
+}
+
 /// listobject.py setslice — strategy-preserving.
 ///
 /// When replacement is a list with the same strategy, operates on typed
@@ -5897,6 +5902,22 @@ mod tests {
             assert_eq!(w_list_len(list), 3);
             let value = w_list_getitem(list, 2).unwrap();
             assert!(crate::pyobject::is_float(value));
+        }
+    }
+
+    #[test]
+    fn test_integer_strategy_find_or_count_fast_matches_scan() {
+        let list = w_list_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        unsafe {
+            assert!(w_list_uses_int_storage(list));
+            assert!(matches!(
+                w_list_find_or_count_fast(list, w_int_new(2), 0, i64::MAX, false),
+                ListFindFast::Found(1)
+            ));
+            assert!(matches!(
+                w_list_find_or_count_fast(list, w_int_new(9), 0, i64::MAX, false),
+                ListFindFast::NotFound
+            ));
         }
     }
 

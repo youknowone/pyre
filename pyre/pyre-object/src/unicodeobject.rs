@@ -1453,6 +1453,21 @@ pub extern "C" fn jit_str_endswith(s: i64, suffix: i64) -> i64 {
     }
 }
 
+/// `s.__contains__(sub)` / `sub in s` on two exact `str`s.
+/// `unicodeobject.py descr_contains` is `value.find(sub) >= 0`.
+/// WTF-8 is self-synchronizing, so a byte find is the code-point find.
+#[majit_macros::elidable]
+pub extern "C" fn jit_str_contains(haystack: i64, needle: i64) -> i64 {
+    unsafe {
+        let hay = w_str_get_wtf8(haystack as PyObjectRef).as_bytes();
+        let needle = w_str_get_wtf8(needle as PyObjectRef).as_bytes();
+        if needle.is_empty() {
+            return 1;
+        }
+        i64::from(hay.windows(needle.len()).any(|window| window == needle))
+    }
+}
+
 /// `str(i)` over an unboxed integer: render `i` to its decimal
 /// `W_UnicodeObject`.  The argument is a raw machine integer (the `'i'`
 /// argcode operand), not a boxed object pointer.
@@ -1727,6 +1742,23 @@ mod tests {
             assert_eq!(jit_str_is_true(a as i64), 1);
             assert_eq!(jit_str_is_true(w_str_new("") as i64), 0);
         }
+    }
+
+    #[test]
+    fn test_jit_str_contains_matches_descr_contains() {
+        let hay = w_str_new("alpha");
+        let empty = w_str_new("");
+        assert_eq!(jit_str_contains(hay as i64, w_str_new("a") as i64), 1);
+        assert_eq!(jit_str_contains(hay as i64, w_str_new("z") as i64), 0);
+        assert_eq!(jit_str_contains(hay as i64, w_str_new("ph") as i64), 1);
+        assert_eq!(jit_str_contains(hay as i64, empty as i64), 1);
+        assert_eq!(jit_str_contains(empty as i64, empty as i64), 1);
+        assert_eq!(jit_str_contains(empty as i64, w_str_new("a") as i64), 0);
+        let uni = w_str_new("éèx");
+        assert_eq!(jit_str_contains(uni as i64, w_str_new("è") as i64), 1);
+        assert_eq!(jit_str_contains(uni as i64, w_str_new("x") as i64), 1);
+        assert_eq!(jit_str_contains(uni as i64, w_str_new("éè") as i64), 1);
+        assert_eq!(jit_str_contains(uni as i64, w_str_new("èé") as i64), 0);
     }
 
     #[test]
