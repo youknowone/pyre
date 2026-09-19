@@ -2602,40 +2602,18 @@ const NAME_MAXLEN: usize = if cfg!(windows) {
 
 #[cfg(windows)]
 fn current_thread_name() -> Result<PyObjectRef, crate::PyError> {
-    use windows_sys::Win32::{
-        Foundation::LocalFree,
-        System::Threading::{GetCurrentThread, GetThreadDescription},
-    };
-
-    let mut raw = std::ptr::null_mut();
-    let status = unsafe { GetThreadDescription(GetCurrentThread(), &mut raw) };
-    if status < 0 {
-        // An unnamed thread is reported as absent by older Windows builds;
-        // That state is reported as the empty string.
-        return Ok(w_str_new(""));
-    }
-    if raw.is_null() {
-        return Ok(w_str_new(""));
-    }
-    let mut len = 0usize;
-    unsafe {
-        while *raw.add(len) != 0 {
-            len += 1;
-        }
-    }
-    let name = pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(unsafe {
-        std::slice::from_raw_parts(raw, len)
-    }));
-    unsafe { LocalFree(raw.cast()) };
-    Ok(name)
+    // An unnamed thread is reported as absent by older Windows builds;
+    // that state is reported as the empty string.
+    let units = rustpython_host_env::thread::current_thread_name_wide().unwrap_or_default();
+    Ok(pyre_object::w_str_from_wtf8_managed(
+        rustpython_wtf8::Wtf8Buf::from_wide(&units),
+    ))
 }
 
 #[cfg(windows)]
 fn set_current_thread_name(w_name: PyObjectRef) -> Result<(), crate::PyError> {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
-
-    // `PyThread_set_name`: Windows counts UTF-16 code units, stops at
-    // the first NUL, and truncates without splitting a surrogate pair.
+    // Windows counts UTF-16 code units, stops at the first NUL, and
+    // truncates without splitting a surrogate pair.
     let all: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_name) }
         .encode_wide()
         .collect();
@@ -2649,14 +2627,12 @@ fn set_current_thread_name(w_name: PyObjectRef) -> Result<(), crate::PyError> {
         end -= 1;
     }
     let wide: Vec<u16> = all[..end].iter().copied().chain([0]).collect();
-    let status = unsafe { SetThreadDescription(GetCurrentThread(), wide.as_ptr()) };
-    if status < 0 {
-        return Err(crate::PyError::os_error(format!(
+    rustpython_host_env::thread::set_current_thread_name_wide(&wide).map_err(|error| {
+        crate::PyError::os_error(format!(
             "SetThreadDescription failed with HRESULT 0x{:08x}",
-            status as u32
-        )));
-    }
-    Ok(())
+            error.raw_os_error().unwrap_or(0) as u32
+        ))
+    })
 }
 
 #[cfg(target_os = "linux")]

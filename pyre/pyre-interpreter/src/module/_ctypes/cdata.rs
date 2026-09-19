@@ -1720,7 +1720,7 @@ pub(super) fn bstr_to_pyobject(bytes: &[u8]) -> PyObjectRef {
     let units = unsafe {
         std::slice::from_raw_parts(
             addr as *const u16,
-            windows_sys::Win32::Foundation::SysStringLen(addr as *const u16) as usize,
+            host_ctypes::sys_string_len(addr as *const u16),
         )
     };
     pyre_object::w_str_from_wtf8_managed(rustpython_wtf8::Wtf8Buf::from_wide(units))
@@ -1778,7 +1778,7 @@ pub(super) fn release_bstr_slot(tc: &str, addr: usize) {
     }
     let previous = unsafe { (addr as *const usize).read_unaligned() };
     if previous != 0 {
-        unsafe { windows_sys::Win32::Foundation::SysFreeString(previous as *const u16) };
+        host_ctypes::sys_free_string(previous as *const u16);
     }
 }
 
@@ -1930,15 +1930,12 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
                 let units: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(obj) }
                     .encode_wide()
                     .collect();
-                let Ok(len) = u32::try_from(units.len()) else {
+                if u32::try_from(units.len()).is_err() {
                     return Err(crate::PyError::value_error("String too long for BSTR"));
-                };
-                let bstr = unsafe {
-                    windows_sys::Win32::Foundation::SysAllocStringLen(units.as_ptr(), len)
-                };
-                if bstr.is_null() {
-                    return Err(crate::PyError::memory_error(""));
                 }
+                let Some(bstr) = host_ctypes::sys_alloc_string_len(&units) else {
+                    return Err(crate::PyError::memory_error(""));
+                };
                 bstr as usize
             } else {
                 return Err(crate::PyError::type_error(format!(

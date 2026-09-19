@@ -3469,42 +3469,25 @@ fn parse_hyperv_guid(
     field: &str,
     w_text: pyre_object::PyObjectRef,
 ) -> Result<windows_sys::core::GUID, crate::PyError> {
-    let mut wide: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_text) }
+    let units: Vec<u16> = unsafe { pyre_object::w_str_get_wtf8(w_text) }
         .encode_wide()
         .collect();
-    wide.push(0);
-    let mut guid = windows_sys::core::GUID {
-        data1: 0,
-        data2: 0,
-        data3: 0,
-        data4: [0; 8],
-    };
-    let status =
-        unsafe { windows_sys::Win32::System::Rpc::UuidFromStringW(wide.as_ptr(), &mut guid) };
-    if status != windows_sys::Win32::System::Rpc::RPC_S_OK {
-        return Err(crate::PyError::value_error(format!(
+    let wide = widestring::WideCString::from_vec(units).map_err(|_| {
+        crate::PyError::value_error(format!(
             "{caller}(): AF_HYPERV address {field} is not a valid UUID string"
-        )));
-    }
-    Ok(guid)
+        ))
+    })?;
+    rustpython_host_env::socket::uuid_from_string_w(&wide).map_err(|_| {
+        crate::PyError::value_error(format!(
+            "{caller}(): AF_HYPERV address {field} is not a valid UUID string"
+        ))
+    })
 }
 
 /// The spelling `UuidToStringW` gives a GUID: lower case, unbraced.
 #[cfg(windows)]
 fn hyperv_guid_string(guid: &windows_sys::core::GUID) -> String {
-    use windows_sys::Win32::System::Rpc::{RPC_S_OK, RpcStringFreeW, UuidToStringW};
-
-    let mut text: *mut u16 = std::ptr::null_mut();
-    if unsafe { UuidToStringW(guid, &mut text) } != RPC_S_OK {
-        return String::new();
-    }
-    let mut end = 0usize;
-    while unsafe { *text.add(end) } != 0 {
-        end += 1;
-    }
-    let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, end) });
-    unsafe { RpcStringFreeW(&mut text) };
-    out
+    rustpython_host_env::socket::uuid_to_string_w(guid).unwrap_or_default()
 }
 
 /// The `AF_HYPERV` case of `getsockaddrarg` (`socketmodule.c:2643-2712`).

@@ -7,13 +7,16 @@
 //! here.
 
 use pyre_object::{PY_NULL, PyObjectRef};
-use rustpython_wtf8::{Wtf8, Wtf8Buf};
-use windows_sys::Win32::Foundation::{
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FLAGS, ERROR_NO_UNICODE_TRANSLATION,
-};
-use windows_sys::Win32::Globalization::{
+use rustpython_host_env::windows::{
     CP_ACP, CP_UTF7, CP_UTF8, MB_ERR_INVALID_CHARS, WC_ERR_INVALID_CHARS, WC_NO_BEST_FIT_CHARS,
 };
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
+
+const ERROR_INSUFFICIENT_BUFFER: u32 =
+    rustpython_host_env::windows::ERROR_INSUFFICIENT_BUFFER_I32 as u32;
+const ERROR_INVALID_FLAGS: u32 = rustpython_host_env::windows::ERROR_INVALID_FLAGS_I32 as u32;
+const ERROR_NO_UNICODE_TRANSLATION: u32 =
+    rustpython_host_env::windows::ERROR_NO_UNICODE_TRANSLATION_I32 as u32;
 
 /// The Windows 2000 English message the decoder reports, which
 /// `decode_code_page_errors` hardcodes rather than asking `FormatMessage` for.

@@ -2186,8 +2186,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         ),
                     ) as usize
                 }) as PyObjectRef;
-                let (major, minor, build) =
-                    version_ex_triple().unwrap_or((info.major, info.minor, info.build));
+                let (major, minor, build) = rustpython_host_env::winapi::version_ex_triple()
+                    .unwrap_or((info.major, info.minor, info.build));
                 let _roots = pyre_object::gc_roots::push_roots();
                 let mut extra_slots: Vec<(&str, usize)> = Vec::new();
                 let mut put_extra = |name: &'static str, value: PyObjectRef| {
@@ -4205,26 +4205,6 @@ pub fn init_stream_codecs() -> Result<(), crate::PyError> {
         }
     }
     Ok(())
-}
-
-/// The version `GetVersionEx` reports, which the manifest the executable
-/// carries makes the running one rather than the one an unmanifested process is
-/// shimmed to.  `None` where the call fails, leaving the caller its own answer.
-///
-/// `windows::get_windows_version()` is not this triple: it overwrites
-/// major/minor/build with kernel32's file version, which this function's
-/// caller already publishes as `platform_version`.
-#[cfg(windows)]
-fn version_ex_triple() -> Option<(u32, u32, u32)> {
-    use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
-
-    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
-    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
-    (unsafe { GetVersionExW(&mut info) } != 0).then_some((
-        info.dwMajorVersion,
-        info.dwMinorVersion,
-        info.dwBuildNumber,
-    ))
 }
 
 /// `textio.c CHECK_CLOSED`, the sentence a `TextIOWrapper` method states.
