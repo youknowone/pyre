@@ -2264,6 +2264,12 @@ pub fn rewrite_ops_for_gc_with(
     Option<Arc<majit_gc::GcTable>>,
 ) {
     use majit_gc::GcRewriter;
+    // rewrite.py `gen_malloc_str` parity: inject str_descr/unicode_descr for
+    // NEWSTR/NEWUNICODE. The STRLEN/STRGETITEM/STRHASH arms read the length
+    // and hash offsets off that descr, so the stream has to carry it before
+    // the rewrite, not after — dynasm `assemble_loop` and cranelift
+    // `rewrite_ops` inject at the same point.
+    codegen::inject_builtin_string_descrs(&ops);
     let boxed: Vec<majit_ir::OpRc> = ops.into_iter().map(majit_ir::OpRc::new).collect();
     let mut const_map = majit_ir::ConstMap::default();
     for (&k, &v) in constants {

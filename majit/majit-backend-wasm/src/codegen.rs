@@ -4204,7 +4204,11 @@ pub(crate) fn builtin_string_hash_field_descr(opcode: OpCode) -> Option<majit_ir
 
 /// Cranelift/dynasm `inject_builtin_string_descrs`: vstring mints
 /// `NEWSTR/1/r` with no descr, and rewrite.py fills it from `str_descr`.
-fn inject_builtin_string_descrs(ops: &mut [Op]) {
+///
+/// `setdescr` is interior-mutable, so this takes a shared slice: the GC
+/// rewrite runs it on the incoming stream before it boxes the ops, and
+/// codegen runs it again on a stream that never went through the rewrite.
+pub(crate) fn inject_builtin_string_descrs(ops: &[Op]) {
     for op in ops {
         if op.has_descr() {
             continue;
@@ -4631,8 +4635,8 @@ pub fn build_wasm_module(
     } = inputs;
     let ops_with_string_descrs;
     let ops: &[Op] = if ops.iter().any(needs_builtin_string_descr) {
-        let mut cloned = ops.to_vec();
-        inject_builtin_string_descrs(&mut cloned);
+        let cloned = ops.to_vec();
+        inject_builtin_string_descrs(&cloned);
         ops_with_string_descrs = cloned;
         &ops_with_string_descrs
     } else {
@@ -4689,7 +4693,7 @@ pub fn build_wasm_module(
             merged_ops.extend(bridge.ops.iter().cloned());
             rebased_bridges.push(bridge);
         }
-        inject_builtin_string_descrs(&mut merged_ops);
+        inject_builtin_string_descrs(&merged_ops);
         (&merged_inputargs, &merged_ops)
     };
     // Guard-entry moves and region emission must name the rebased ids, not the
