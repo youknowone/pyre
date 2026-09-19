@@ -229,15 +229,9 @@ pub fn compare_value(
     b: PyObjectRef,
     op: ComparisonOperator,
 ) -> Result<PyObjectRef, PyError> {
-    let cmp_op = match op {
-        ComparisonOperator::Less => CompareOp::Lt,
-        ComparisonOperator::LessOrEqual => CompareOp::Le,
-        ComparisonOperator::Greater => CompareOp::Gt,
-        ComparisonOperator::GreaterOrEqual => CompareOp::Ge,
-        ComparisonOperator::Equal => CompareOp::Eq,
-        ComparisonOperator::NotEqual => CompareOp::Ne,
-    };
-    compare(a, b, cmp_op)
+    // Same helper flatten's COMPARE_OP descends, so a jitted `COMPARE_OP`
+    // and a 2-arg HLOp share one minted graph (`compare_value_from_tag`).
+    compare_value_from_tag(a, b, crate::runtime_ops::compare_op_tag(op))
 }
 
 /// Body of [`compare_value_from_tag`].  See [`binary_value_from_tag_inner`].
@@ -1168,6 +1162,22 @@ pub extern "C" fn jit_descroperation_pos(value: i64) -> i64 {
 pub extern "C" fn jit_baseobjspace_not_(value: i64) -> i64 {
     match unary_not_value(value as PyObjectRef) {
         Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_len(value: i64) -> i64 {
+    match crate::baseobjspace::len(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+    }
+}
+
+#[inline(never)]
+pub extern "C" fn jit_baseobjspace_delitem(obj: i64, key: i64) -> i64 {
+    match crate::baseobjspace::delitem(obj as PyObjectRef, key as PyObjectRef) {
+        Ok(()) => 0,
         Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
     }
 }

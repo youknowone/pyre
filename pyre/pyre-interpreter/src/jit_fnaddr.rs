@@ -1607,6 +1607,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::compare_value_from_tag",
         crate::opcode_ops::jit_compare_value_from_tag,
     );
+    cp1(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::len",
+        crate::opcode_ops::jit_baseobjspace_len,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::delitem",
+        crate::opcode_ops::jit_baseobjspace_delitem,
+    );
     cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",

@@ -4078,6 +4078,7 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
         "not_contains" => pyre_interpreter::runtime_ops::COMPARE_OP_NOT_CONTAINS,
         "is" => pyre_interpreter::runtime_ops::COMPARE_OP_IS,
         "is_not" => pyre_interpreter::runtime_ops::COMPARE_OP_IS_NOT,
+        "check_exc_match" => pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
         _ => return None,
     })
 }
@@ -6504,7 +6505,10 @@ where
 mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
-    /// COMPARE_OP `is` / `is_not` only — `lower_compare_op_hlop_to_insn`.
+    /// GET_LEN — `lower_get_len_hlop_to_insn`.
+    pub const LEN: &str = "pyre_interpreter::baseobjspace::len";
+    /// DELETE_SUBSCR — `lower_delsubscr_hlop_to_insn`.
+    pub const DELITEM: &str = "pyre_interpreter::baseobjspace::delitem";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
@@ -6576,14 +6580,40 @@ fn build_orthodox_inline_call_r_r(
     value: Operand,
     dst_reg: Register,
 ) -> Option<Insn> {
+    build_orthodox_inline_call_r_r_n(canonical_path, vec![value], dst_reg)
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref, …) → Ref` body:
+/// `inline_call_r_r(JitCode, ListR(refs)) → reg`.
+fn build_orthodox_inline_call_r_r_n(
+    canonical_path: &'static str,
+    refs: Vec<Operand>,
+    dst_reg: Register,
+) -> Option<Insn> {
     let jitcode = fully_bound_callee_body(canonical_path)?;
     Some(Insn::op_with_result(
         "inline_call_r_r",
         vec![
             Operand::descr(DescrOperand::JitCode(jitcode)),
-            Operand::ListOfKind(ListOfKind::new(Kind::Ref, vec![value])),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
         ],
         dst_reg,
+    ))
+}
+
+/// `jtransform.py handle_regular_call` for a `(Ref, …) → void` body:
+/// `inline_call_r_v(JitCode, ListR(refs))`.
+fn build_orthodox_inline_call_r_v(
+    canonical_path: &'static str,
+    refs: Vec<Operand>,
+) -> Option<Insn> {
+    let jitcode = fully_bound_callee_body(canonical_path)?;
+    Some(Insn::op(
+        "inline_call_r_v",
+        vec![
+            Operand::descr(DescrOperand::JitCode(jitcode)),
+            Operand::ListOfKind(ListOfKind::new(Kind::Ref, refs)),
+        ],
     ))
 }
 
@@ -6798,6 +6828,12 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
+    if opname == "get_len"
+        && let Some(insn) =
+            build_orthodox_inline_call_r_r(inline_call_targets::LEN, subject.clone(), dst_reg)
+    {
+        return Some(insn);
+    }
     Some(build_residual_call_r_r_insn_from_operands(
         fn_idx,
         vec![subject],
@@ -7384,6 +7420,13 @@ where
     }
     let obj_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let key_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
+    // pyopcode.py DELETE_SUBSCR → `space.delitem`.
+    if let Some(insn) = build_orthodox_inline_call_r_v(
+        inline_call_targets::DELITEM,
+        vec![obj_operand.clone(), key_operand.clone()],
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.delete_subscr_fn_idx,
         vec![obj_operand, key_operand],
@@ -9937,6 +9980,7 @@ mod tests {
             ("not_contains", 7),
             ("is", 8),
             ("is_not", 9),
+            ("check_exc_match", 10),
         ] {
             assert_eq!(
                 compare_op_tag_for_opname(opname),
@@ -14764,6 +14808,14 @@ mod tests {
             super::lower_delsubscr_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .expect("2-arg delete_subscr lowering must succeed");
         match insn {
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } if opname == "inline_call_r_v" => {
+                let _ = args;
+                assert!(result.is_none());
+            }
             Insn::Op {
                 opname,
                 args,

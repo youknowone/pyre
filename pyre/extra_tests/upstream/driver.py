@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import sys
+import tempfile
 import traceback
 import types
 from pathlib import Path
@@ -99,6 +101,85 @@ class _Mark:
         return decorate
 
 
+def _importorskip(name, minversion=None):
+    try:
+        return __import__(name)
+    except ImportError as exc:
+        _skip("could not import %r: %s" % (name, exc))
+
+
+def _fixture(fn=None, **_kwargs):
+    """`@pytest.fixture` / `@pytest.fixture()` — mark a factory for injection."""
+
+    def decorate(func):
+        func._pytest_fixture = True
+        return func
+
+    if callable(fn):
+        return decorate(fn)
+    return decorate
+
+
+class _MonkeyPatch:
+    """The `syspath_prepend` / `delitem` slice `test_abi3_tags.py` uses."""
+
+    def __init__(self):
+        self._undos = []
+
+    def syspath_prepend(self, path):
+        path = str(path)
+        sys.path.insert(0, path)
+
+        def undo():
+            try:
+                sys.path.remove(path)
+            except ValueError:
+                pass
+
+        self._undos.append(undo)
+
+    def delitem(self, mapping, key, raising=True):
+        if key not in mapping:
+            if raising:
+                raise KeyError(key)
+            return
+        old = mapping[key]
+        del mapping[key]
+        self._undos.append(lambda m=mapping, k=key, v=old: m.__setitem__(k, v))
+
+    def undo(self):
+        while self._undos:
+            self._undos.pop()()
+
+
+def _params(fn):
+    code = fn.__code__
+    return code.co_varnames[: code.co_argcount]
+
+
+def _resolve(name, fixtures, cache, undos):
+    if name in cache:
+        return cache[name]
+    if name == "tmp_path":
+        tmp = Path(tempfile.mkdtemp(prefix="pyre-upstream-"))
+        undos.append(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        cache[name] = tmp
+        return tmp
+    if name == "monkeypatch":
+        patch = _MonkeyPatch()
+        undos.append(patch.undo)
+        cache[name] = patch
+        return patch
+    if name not in fixtures:
+        raise TypeError("unknown fixture %r" % (name,))
+    kwargs = {
+        param: _resolve(param, fixtures, cache, undos) for param in _params(fixtures[name])
+    }
+    value = fixtures[name](**kwargs)
+    cache[name] = value
+    return value
+
+
 def _install_pytest_shim() -> None:
     shim = types.ModuleType("pytest")
     shim.raises = _raises
@@ -106,6 +187,8 @@ def _install_pytest_shim() -> None:
     shim.fail = lambda msg="": (_ for _ in ()).throw(AssertionError(msg))
     shim.Skipped = Skipped
     shim.mark = _Mark()
+    shim.importorskip = _importorskip
+    shim.fixture = _fixture
     sys.modules["pytest"] = shim
 
 
@@ -130,13 +213,24 @@ def main(argv: list[str]) -> int:
     path = Path(argv[1]).resolve()
 
     _install_pytest_shim()
-    module = _load(path)
+    try:
+        module = _load(path)
+    except Skipped as exc:
+        print(f"SKIP {path.name} ({exc})")
+        return 0
 
+    fixtures = {
+        name: obj
+        for name, obj in vars(module).items()
+        if callable(obj) and getattr(obj, "_pytest_fixture", False)
+    }
     # `vars()` preserves definition order, which is the order pytest collects in.
     tests = [
         (name, obj)
         for name, obj in vars(module).items()
-        if name.startswith("test") and callable(obj)
+        if name.startswith("test")
+        and callable(obj)
+        and not getattr(obj, "_pytest_fixture", False)
     ]
     if not tests:
         print(f"{path.name}: no tests collected", file=sys.stderr)
@@ -144,8 +238,13 @@ def main(argv: list[str]) -> int:
 
     passed = skipped = failed = 0
     for name, func in tests:
+        cache = {}
+        undos = []
         try:
-            func()
+            kwargs = {
+                param: _resolve(param, fixtures, cache, undos) for param in _params(func)
+            }
+            func(**kwargs)
         except Skipped as exc:
             skipped += 1
             print(f"SKIP {name} ({exc})")
@@ -156,6 +255,9 @@ def main(argv: list[str]) -> int:
         else:
             passed += 1
             print(f"PASS {name}")
+        finally:
+            for undo in reversed(undos):
+                undo()
 
     print(f"{path.name}: {passed} passed, {skipped} skipped, {failed} failed")
     return 1 if failed else 0

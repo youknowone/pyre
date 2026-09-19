@@ -896,6 +896,8 @@ impl Trace {
         // Reuse the walk's reminted Rc. A second from_type_rc splits box
         // identity. Stamp FrontendOp value onto those same boxes
         // (`inputarg_from_tp` is type-only; the value lives on the source).
+        // `opencoder.py` `inputarg_from_tp` runs once; compile_bridge must
+        // see the same boxes as fail_args.
         for (src, ia) in live_inputargs.iter().zip(iter.inputargs.iter()) {
             if let Some(value) = src.as_ref().get_value() {
                 ia.set_value(value);

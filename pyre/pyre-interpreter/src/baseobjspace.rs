@@ -168,7 +168,7 @@ pub fn wrap_dict_key_hash_error(key: PyObjectRef, err: PyError) -> PyError {
         return err;
     }
     if !err.exc_object.is_null() {
-        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
             return err;
@@ -192,7 +192,7 @@ pub fn wrap_set_element_hash_error(item: PyObjectRef, err: PyError) -> PyError {
         return err;
     }
     if !err.exc_object.is_null() {
-        let exact_type_error = crate::builtins::lookup_exc_class("TypeError");
+        let exact_type_error = cached_type_error();
         let raised_type = crate::typedef::r#type(err.exc_object).map_or(PY_NULL, |p| p.as_ptr());
         if exact_type_error.is_none_or(|expected| !std::ptr::eq(raised_type, expected)) {
             return err;
@@ -891,7 +891,7 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
     if !is_type_like_w(w_obj) {
         return false;
     }
-    let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
+    let Some(base_exc) = cached_base_exception() else {
         return false;
     };
     issubtype_w(w_obj, base_exc)
@@ -909,15 +909,32 @@ pub unsafe fn exception_is_valid_obj_as_class_w(w_obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn exception_is_valid_class_w(w_cls: PyObjectRef) -> bool {
-    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if let Some(&base_exc) = BASE_EXC.get() {
-        return issubtype_w(w_cls, base_exc as PyObjectRef);
-    }
-    let Some(base_exc) = crate::builtins::lookup_exc_class("BaseException") else {
+    let Some(base_exc) = cached_base_exception() else {
         return false;
     };
-    let _ = BASE_EXC.set(base_exc as usize);
     issubtype_w(w_cls, base_exc)
+}
+
+/// Canonical `BaseException` from `EXC_CLASS_REGISTRY`, cached after the
+/// first successful lookup.  The registry is populated once at
+/// `make_exc_type` and the class object is immortal, so the pointer is
+/// stable for the process lifetime.
+fn cached_base_exception() -> Option<PyObjectRef> {
+    static BASE_EXC: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&base_exc) = BASE_EXC.get() {
+        return Some(base_exc as PyObjectRef);
+    }
+    let base_exc = crate::builtins::lookup_exc_class("BaseException")?;
+    Some(*BASE_EXC.get_or_init(|| base_exc as usize) as PyObjectRef)
+}
+
+fn cached_type_error() -> Option<PyObjectRef> {
+    static TYPE_ERROR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&cls) = TYPE_ERROR.get() {
+        return Some(cls as PyObjectRef);
+    }
+    let cls = crate::builtins::lookup_exc_class("TypeError")?;
+    Some(*TYPE_ERROR.get_or_init(|| cls as usize) as PyObjectRef)
 }
 
 /// pypy/interpreter/baseobjspace.py `exception_getclass`.
@@ -5401,6 +5418,12 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
+    // baseobjspace.py `exception_match`: identity before the tuple walk
+    // and before `exception_issubclass_w`.
+    if is_w(exc_type, check_class) {
+        return true;
+    }
+
     let is_tuple_check = unsafe { is_tuple(check_class) };
     if is_tuple_check {
         let len = unsafe { w_tuple_len(check_class) };
@@ -5415,22 +5438,8 @@ pub fn exception_match(exc_type: PyObjectRef, check_class: PyObjectRef) -> bool 
         return false;
     }
 
-    // Python 3: except clause only accepts tuple, not list.
-    if !unsafe { is_type(check_class) } {
-        return false;
-    }
-
-    if is_w(exc_type, check_class) {
-        return true;
-    }
-
-    let mro_ptr = unsafe { w_type_get_mro(exc_type) };
-    if mro_ptr.is_null() {
-        return false;
-    }
-
-    let mro = unsafe { (*mro_ptr).as_slice() };
-    mro.iter().any(|&klass| is_w(klass, check_class))
+    // baseobjspace.py `return self.exception_issubclass_w(...)`.
+    unsafe { exception_issubclass_w(exc_type, check_class) }
 }
 
 /// `pypy/objspace/descroperation.py _len` — invoke the concrete
@@ -5454,6 +5463,9 @@ fn _len(obj: PyObjectRef) -> PyResult {
 /// `pypy/objspace/descroperation.py len` — preserve the wrapped
 /// integer returned by `space.index`, but validate negativity and overflow
 /// before exposing it to app-level `len()`.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `LEN` (`space.len`).
+#[inline(never)]
 pub fn len(obj: PyObjectRef) -> PyResult {
     let w_res = _len(obj)?;
     let w_index = space_index(w_res)?;
@@ -21788,6 +21800,9 @@ pub fn side_effects_ok() -> bool {
 /// Delete item: `del obj[index]`
 ///
 /// PyPy: descroperation.py delitem → dispatches to type-specific __delitem__.
+/// `inline(never)` so the codewriter mints the graph named by
+/// `flatten.rs` `DELITEM` (`space.delitem`).
+#[inline(never)]
 pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
     use pyre_object::*;
     unsafe {

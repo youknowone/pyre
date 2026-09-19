@@ -190,6 +190,8 @@ mod residual_host {
             [] => pyre_jit::call_jit::bh_get_current_exception,
             [value] => pyre_jit::call_jit::bh_box_int_fn,
             [value] => pyre_jit::call_jit::bh_truth_fn,
+            [value] => pyre_interpreter::opcode_ops::jit_baseobjspace_len,
+            [obj, key] => pyre_interpreter::opcode_ops::jit_baseobjspace_delitem,
             [array] => pyre_jit::call_jit::bh_newtuple_from_array,
             [array] => pyre_jit::call_jit::bh_newlist_from_array,
             [subcls, cls] => pyre_object::pyobject::__majit_call_target_ll_issubclass,

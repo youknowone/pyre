@@ -203,6 +203,12 @@ def stage(assets_root: Path, targets: list[str]) -> None:
     # would expose CPython-only test shims such as `_testcapi` and suppress
     # intended fallbacks for modules pyre owns natively.
     shutil.copytree(ROOT / "lib-python" / "3", destination, ignore=ignored)
+    # PyPy 5578: `_pypy_abi3_tags` lives in lib_pypy.  Overlay just that
+    # file so site.py can import it without putting the rest of lib_pypy
+    # on sys.path.
+    abi3_tags = ROOT / "lib_pypy" / "_pypy_abi3_tags.py"
+    if abi3_tags.is_file():
+        shutil.copy2(abi3_tags, destination / "_pypy_abi3_tags.py")
     if not build_sqlite3_cffi(destination, targets):
         # `sqlite3/dbapi2.py` opens with `from _sqlite3 import *`, so without an
         # owner the package raises from inside itself on every import.  Ship

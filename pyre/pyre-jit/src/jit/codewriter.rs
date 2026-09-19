@@ -3007,6 +3007,23 @@ fn compare_opname(op: pyre_interpreter::bytecode::ComparisonOperator) -> &'stati
     }
 }
 
+fn emit_frontend_check_exc_match(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    exc: super::flow::FlowValue,
+    match_type: super::flow::FlowValue,
+    offset: i64,
+) -> super::flow::Variable {
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "check_exc_match",
+        vec![exc.into(), match_type.into()],
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn emit_frontend_compare(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -10449,23 +10466,15 @@ impl CodeWriter {
                             // already records the same `compare_fn(...,
                             // ISINSTANCE_OP:Int) → Ref` `residual_call_ir_r`
                             // shape (recorded in this arm).
-                            // Walker-orthodoxy: compare_fn(exc,
-                            // match_type, ISINSTANCE_OP:Int) → Ref shape
-                            // residual_call_ir_r.  No frame_var threading.
-                            let cmp_result = residual_call!(
-                                compare_fn_idx,
-                                CallFlavor::MayForce,
-                                majit_ir::RuntimeHelperKind::CompareOp,
-                                vec![
-                                    super::flow::Constant::signed(
-                                        pyre_interpreter::runtime_ops::ISINSTANCE_OP_TAG,
-                                    )
-                                    .into(),
-                                ],
-                                vec![exc_value, match_type_value],
-                                vec![],
-                                vec![Kind::Ref, Kind::Ref, Kind::Int],
-                                ResKind::Ref,
+                            // pyopcode.py `cmp_exc_match` →
+                            // `exception_match(type(exc), T)`.  Flatten
+                            // lowers `check_exc_match` to the compare
+                            // residual with `ISINSTANCE_OP_TAG`.
+                            let cmp_result = emit_frontend_check_exc_match(
+                                &mut graph,
+                                &current_block.block(),
+                                exc_value,
+                                match_type_value,
                                 py_pc as i64,
                             );
                             // Push the compare result itself, not a fresh
@@ -10481,10 +10490,7 @@ impl CodeWriter {
                             // PopJumpIfFalse's pop re-pins the same value to the
                             // same slot and `truth_fn` reads the compare's own
                             // register.
-                            let result_value: super::flow::FlowValue = match cmp_result {
-                                Some(v) => v.into(),
-                                None => fresh_ref_value(&mut graph).into(),
-                            };
+                            let result_value: super::flow::FlowValue = cmp_result.into();
                             current_state.stack.push(result_value.clone());
                             emit_pushvalue_ref!(current_depth, current_depth, result_value, py_pc);
                         }

@@ -717,6 +717,30 @@ def main():
     sethelper()
     if not sys.flags.isolated:
         enablerlcompleter()
+    if sys.implementation.name in ('pypy', 'pyre'):
+        # pypy/module/sys/initpath.py puts lib_pypy on sys.path; pyre
+        # does not (importing.rs), so a source checkout loads the one
+        # module from the sibling lib_pypy directory.  A packaged tree
+        # already has the file next to site.py (stage-stdlib.py).
+        try:
+            import _pypy_abi3_tags
+        except ImportError:
+            import os
+            here = os.path.dirname(os.path.abspath(__file__))
+            lib_pypy = os.path.normpath(os.path.join(here, os.pardir, os.pardir, 'lib_pypy'))
+            candidate = os.path.join(lib_pypy, '_pypy_abi3_tags.py')
+            if os.path.isfile(candidate):
+                sys.path.insert(0, lib_pypy)
+                try:
+                    import _pypy_abi3_tags
+                except Exception:
+                    pass
+                try:
+                    sys.path.remove(lib_pypy)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
     execsitecustomize()
     if ENABLE_USER_SITE:
         execusercustomize()

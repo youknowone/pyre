@@ -145,15 +145,41 @@ static PyObject *m_carrier_fields(PyObject *self, PyObject *args)
         return NULL;
     }
     PyCFunctionObject *block = (PyCFunctionObject *)carrier;
+    PyObject *got_self = PyCFunction_GetSelf(carrier);
+    int flags = PyCFunction_GetFlags(carrier);
     PyObject *result = Py_BuildValue(
-        "(OOOOO)",
+        "(OOOOOOi)",
         PyCFunction_Check(carrier) ? Py_True : Py_False,
         block->m_ml == &carried_def ? Py_True : Py_False,
         block->m_self == receiver ? Py_True : Py_False,
         block->m_module == module ? Py_True : Py_False,
-        PyCFunction_GetFunction(carrier) == carried_def.ml_meth ? Py_True : Py_False);
+        PyCFunction_GetFunction(carrier) == carried_def.ml_meth ? Py_True : Py_False,
+        got_self == receiver ? Py_True : Py_False,
+        flags);
     Py_DECREF(carrier);
     return result;
+}
+
+/* methodobject.py test_func_attributes: GetSelf / GetFlags on a live
+   PyCFunction, and SystemError on a non-carrier. */
+static PyObject *m_get_self(PyObject *self, PyObject *args)
+{
+    (void)self;
+    PyObject *m_self = PyCFunction_GetSelf(args);
+    if (m_self == NULL) {
+        return NULL;
+    }
+    return Py_NewRef(m_self);
+}
+
+static PyObject *m_get_flags(PyObject *self, PyObject *args)
+{
+    (void)self;
+    int flags = PyCFunction_GetFlags(args);
+    if (flags == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    return PyLong_FromLong(flags);
 }
 
 /* An unpack whose bounds differ, which reports the bound the call missed. */
@@ -1709,6 +1735,8 @@ static PyMethodDef methods[] = {
     {"apply", (PyCFunction)m_apply, METH_VARARGS, NULL},
     {"at_most_two", (PyCFunction)m_at_most_two, METH_VARARGS, NULL},
     {"carrier_fields", (PyCFunction)m_carrier_fields, METH_VARARGS, NULL},
+    {"get_self", m_get_self, METH_O, NULL},
+    {"get_flags", m_get_flags, METH_O, NULL},
     {"inspect", (PyCFunction)m_inspect, METH_VARARGS, NULL},
     {"build", (PyCFunction)m_build, METH_NOARGS, NULL},
     {"roundtrip", (PyCFunction)m_roundtrip, METH_VARARGS, NULL},
