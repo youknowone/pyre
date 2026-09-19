@@ -5201,6 +5201,141 @@ mod tests {
         );
     }
 
+    /// `Code` in `lookup_fmt` is a mixed enum: ten fieldless variants plus
+    /// one payload variant (`Int { signed }`).  `front/mir.rs` dual-publishes
+    /// the discriminant-only base and registers a payload-less variant with
+    /// empty rows (a lone `__discriminant` row is the `is_enum_base`
+    /// sentinel).  The session prologue first-mints every registry key
+    /// through `intern_class_by_qualname`; if that walk skips an empty-row
+    /// `{enum}::{variant}` key, the fieldless variant is frozen base-less,
+    /// unioning it with `Code::Int` finds no common base, and the
+    /// `__discriminant` getattr on `code` lands on the root instance.
+    #[test]
+    fn payload_less_enum_variant_subclasses_base_and_unions_to_discriminant_root() {
+        use crate::annotator::model::{SomeInstance, SomeValue};
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        // Dual-publish like `front/mir.rs` TypeDeclKind::Enum.
+        for base in ["Code", "module::struct::Code"] {
+            reg.fields.insert(
+                base.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+        }
+        for variant_key in [
+            "Code::Int",
+            "module::struct::Code::Int",
+            "Code::FloatComplex",
+            "module::struct::Code::FloatComplex",
+            "Code::DoubleComplex",
+            "module::struct::Code::DoubleComplex",
+        ] {
+            let rows = if variant_key.ends_with("::Int") {
+                vec![("signed".to_string(), "bool".to_string())]
+            } else {
+                // Payload-less: empty rows, not a `__discriminant` sentinel.
+                vec![]
+            };
+            reg.fields.insert(variant_key.to_string(), rows);
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        let mut by_discr: HashMap<i64, String> = HashMap::new();
+        by_discr.insert(0, "FloatComplex".to_string());
+        by_discr.insert(1, "DoubleComplex".to_string());
+        by_discr.insert(2, "Int".to_string());
+        let mut map: HashMap<String, HashMap<i64, String>> = HashMap::new();
+        map.insert("module::struct::Code".to_string(), by_discr.clone());
+        map.insert("Code".to_string(), by_discr);
+        bk.set_enum_variant_by_discriminant(Rc::new(map));
+
+        // Prologue order: every registry key, then the enum-variant pre-mint.
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+        bk.pre_register_enum_variant_classes();
+
+        let base = bk
+            .getuniqueclassdef_for_struct_root("Code")
+            .expect("Code base registers");
+        assert!(
+            base.borrow().attrs.contains_key("__discriminant"),
+            "enum base must carry the synthetic __discriminant row"
+        );
+        assert!(
+            base.borrow().basedef.is_none(),
+            "enum base is the discriminant-only root, not a further subclass"
+        );
+
+        let int_v = bk
+            .getuniqueclassdef_for_enum_variant("Code", "Int")
+            .expect("Code::Int registers");
+        let float_v = bk
+            .getuniqueclassdef_for_enum_variant("Code", "FloatComplex")
+            .expect("Code::FloatComplex registers");
+        let double_v = bk
+            .getuniqueclassdef_for_enum_variant("Code", "DoubleComplex")
+            .expect("Code::DoubleComplex registers");
+
+        let interned_float = bk.intern_class_by_qualname("Code::FloatComplex");
+        let interned_float_cd = bk
+            .getuniqueclassdef(&interned_float)
+            .expect("interned FloatComplex classdef");
+        assert!(
+            Rc::ptr_eq(&interned_float_cd, &float_v),
+            "intern_class_by_qualname of the empty-row key must be the variant classdef"
+        );
+
+        assert!(
+            int_v.borrow().issubclass(&base),
+            "payload variant Code::Int must subclass Code"
+        );
+        assert!(
+            float_v.borrow().issubclass(&base),
+            "payload-less variant Code::FloatComplex must subclass Code \
+             (empty rows are not a reason to mint it base-less)"
+        );
+        assert!(
+            double_v.borrow().issubclass(&base),
+            "payload-less variant Code::DoubleComplex must subclass Code"
+        );
+
+        let s_int = SomeValue::Instance(SomeInstance::new(
+            Some(int_v),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_float = SomeValue::Instance(SomeInstance::new(
+            Some(float_v),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let s_double = SomeValue::Instance(SomeInstance::new(
+            Some(double_v),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let u = union(&s_float, &s_int).unwrap_or_else(|err| {
+            panic!("union(FloatComplex, Int) must share the Code base, got {err}")
+        });
+        let u = union(&u, &s_double).unwrap_or_else(|err| {
+            panic!("union(Code, DoubleComplex) must stay on the Code base, got {err}")
+        });
+        let SomeValue::Instance(inst) = u else {
+            panic!("union of Code variants must stay an instance, got {u:?}");
+        };
+        assert!(
+            inst.classdef.as_ref().is_some_and(|c| Rc::ptr_eq(c, &base)),
+            "union of payload-less and payload Code variants must land on the \
+             Code enum base (classdef={:?}), not the root instance",
+            inst.classdef.as_ref().map(|c| c.borrow().name.clone())
+        );
+        assert!(!inst.can_be_none, "Code is a non-nullable sum type");
+    }
+
     #[test]
     fn enum_variant_ctor_helper_and_narrowing_resolve_one_classdef_with_payload_attr() {
         // The variant CONSTRUCTOR path (`flowspace_adapter`, via

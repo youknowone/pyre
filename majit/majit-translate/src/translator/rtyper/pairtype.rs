@@ -2097,4 +2097,145 @@ mod tests {
         assert_eq!(converted, Some(v_in));
         assert!(llops.ops.is_empty());
     }
+
+    #[test]
+    fn convert_from_to_instance_string_is_not_implemented() {
+        // rstr.py registers convert_from_to only for Char↔String and
+        // UniChar↔Unicode. rmodel.py pairtype(Repr, Repr).convert_from_to
+        // returns NotImplemented. There is no (InstanceRepr, StringRepr)
+        // pair: PyPy never produces one, because W_UnicodeObject.utf8_w
+        // returns the `_utf8` str field (SomeString → StringRepr).
+        //
+        // A PyObject-shaped InstanceRepr has no `value`/`_utf8` field at
+        // the rtyper's view (GcStruct { super, inst_ob_type, inst_w_class }),
+        // so a conversion cannot emit getfield either. Inventing the pair
+        // would compare a PyObject pointer against an rpy_string pointer.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::classdesc::ClassDef;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let r_from =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("PyObject InstanceRepr");
+        Repr::setup(r_from.as_ref()).expect("setup InstanceRepr");
+        let r_to = string_repr();
+        let dummy_v = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            r_from.lowleveltype().clone(),
+        ));
+
+        let converted = pair_convert_from_to(r_from.as_ref(), r_to.as_ref(), &dummy_v, &mut llops)
+            .expect("pair_convert_from_to should not error");
+        assert!(
+            converted.is_none(),
+            "no (InstanceRepr, StringRepr) convert_from_to — MRO exhausts to NotImplemented"
+        );
+        assert!(llops.ops.is_empty());
+
+        let value_field = r_from.getfieldrepr("value");
+        assert!(
+            value_field.is_err(),
+            "PyObject InstanceRepr has no `value` field to convert from: {value_field:?}"
+        );
+        let utf8_field = r_from.getfieldrepr("_utf8");
+        assert!(
+            utf8_field.is_err(),
+            "PyObject InstanceRepr has no `_utf8` field to convert from: {utf8_field:?}"
+        );
+    }
+
+    #[test]
+    fn pair_rtype_eq_instance_string_is_missing_not_a_pointer_compare() {
+        // translate_op_eq dispatches on hop.args_r before hop.inputargs
+        // consults convert_from_to (rtyper.py). (InstanceRepr, StringRepr)
+        // therefore cannot reach pairtype(StringRepr, StringRepr).rtype_eq
+        // even if a conversion existed. The missing-pair error is the
+        // honest wall; an rtype_eq arm that ptr_eq's the two pointers is
+        // not a missing pairtype.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeString, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, SpaceOperation, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let r_inst =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("PyObject InstanceRepr");
+        Repr::setup(r_inst.as_ref()).expect("setup InstanceRepr");
+        let r_str = string_repr();
+        let r_inst_dyn: Arc<dyn Repr> = r_inst.clone();
+        let r_str_dyn: Arc<dyn Repr> = r_str.clone();
+
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "eq".to_string(),
+                vec![
+                    Hlvalue::Constant(Constant::with_concretetype(
+                        ConstValue::None,
+                        r_inst.lowleveltype().clone(),
+                    )),
+                    Hlvalue::Constant(Constant::with_concretetype(
+                        ConstValue::ByteStr(b"NFC".to_vec()),
+                        r_str.lowleveltype().clone(),
+                    )),
+                ],
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+            SomeValue::String(SomeString::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_inst_dyn), Some(r_str_dyn.clone())]);
+        *hop.s_result.borrow_mut() =
+            Some(SomeValue::Bool(crate::annotator::model::SomeBool::new()));
+        *hop.r_result.borrow_mut() =
+            Some(crate::translator::rtyper::rbool::bool_repr() as Arc<dyn Repr>);
+
+        let err = pair_rtype_eq(r_inst.as_ref(), r_str.as_ref(), &hop)
+            .expect_err("InstanceRepr == StringRepr must not invent a pair");
+        assert!(
+            err.is_missing_rtype_operation(),
+            "expected MissingRTypeOperation, got {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("pair(rtype_eq) not implemented for (InstanceRepr, StringRepr)"),
+            "unexpected missing-op text: {text}"
+        );
+        assert!(
+            llops.borrow().ops.is_empty(),
+            "must not emit ptr_eq / ll_streq for (InstanceRepr, StringRepr)"
+        );
+    }
 }
