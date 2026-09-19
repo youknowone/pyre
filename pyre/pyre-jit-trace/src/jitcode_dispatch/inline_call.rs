@@ -12219,11 +12219,11 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     lhs: OpRef,
-    concrete_lhs: pyre_object::PyObjectRef,
-    w_class_l: pyre_object::PyObjectRef,
+    mut concrete_lhs: pyre_object::PyObjectRef,
+    mut w_class_l: pyre_object::PyObjectRef,
     rhs: OpRef,
-    concrete_rhs: pyre_object::PyObjectRef,
-    w_typ_r: pyre_object::PyObjectRef,
+    mut concrete_rhs: pyre_object::PyObjectRef,
+    mut w_typ_r: pyre_object::PyObjectRef,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     macro_rules! decline {
         ($why:expr) => {{
@@ -12254,12 +12254,14 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
             pyre_object::typeobject::w_type_get_name(w_typ_r)
         }));
     };
-    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+    let Some((mut w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) })
+    else {
         decline!(format_args!(
             "{}.{dunder} is not inlinable Python code",
             unsafe { pyre_object::typeobject::w_type_get_name(w_typ_r) }
         ));
     };
+    let mut method = method;
     // `_invoke_binop` (`descroperation.py` `_call_binop_impl`) treats a
     // missing impl as no result.  A builtin slot is invoked at record
     // time: NotImplemented is no result, anything else (a value or a
@@ -12274,14 +12276,41 @@ fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     if let Some(fwd) = forward_method {
         let effects_before = fbw_executed_effect_count();
         let unjournaled_before = fbw_has_unjournaled_effect();
-        match unsafe {
+        // The slot runs arbitrary builtin code, so it can allocate and a minor
+        // collection then moves every operand the route still needs after it.
+        // Pin them for the invocation and read them back from the shadow
+        // stack, as the `for_iter` and resolved-call descents do.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let lhs_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(concrete_lhs);
+        let lhs_class_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_class_l);
+        let rhs_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(concrete_rhs);
+        let rhs_type_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_typ_r);
+        let method_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(method);
+        let code_root = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+
+        let forward_result = unsafe {
             pyre_interpreter::baseobjspace::get_and_call_function(
                 fwd,
                 concrete_lhs,
                 w_class_l,
                 &[concrete_rhs],
             )
-        } {
+        };
+
+        concrete_lhs = pyre_object::gc_roots::shadow_stack_get(lhs_root);
+        w_class_l = pyre_object::gc_roots::shadow_stack_get(lhs_class_root);
+        concrete_rhs = pyre_object::gc_roots::shadow_stack_get(rhs_root);
+        w_typ_r = pyre_object::gc_roots::shadow_stack_get(rhs_type_root);
+        method = pyre_object::gc_roots::shadow_stack_get(method_root);
+        w_code = pyre_object::gc_roots::shadow_stack_get(code_root) as *const ();
+
+        match forward_result {
             Ok(result)
                 if pyre_interpreter::baseobjspace::is_w(
                     result,
