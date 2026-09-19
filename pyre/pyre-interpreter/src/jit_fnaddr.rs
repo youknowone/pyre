@@ -2061,6 +2061,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::w_int_gc_alloc",
         w_int_gc_alloc,
     );
+    // `w_float_gc_alloc` is the float sibling, reached from `w_float_new`
+    // inside `_CDataBase.convert_to_object`. The macro trampoline
+    // bitcasts the `f64` argument to `i64`; bind the float-bank word
+    // wrapper so a `residual_call_fr_r` descr matches.
+    let w_float_gc_alloc: extern "C" fn(f64) -> i64 =
+        pyre_object::floatobject::w_float_gc_alloc_word;
+    cpa1(
+        &mut entries,
+        "pyre_object::floatobject::w_float_gc_alloc",
+        "pyre_object::w_float_gc_alloc",
+        w_float_gc_alloc,
+    );
     // `w_type_set_abstract` stores the runtime-mutable `flag_abstract` atomic — a
     // side effect on per-type state, not a build-time constant, so it carries
     // `#[dont_look_inside]` and binds its `()`-returning `fn` directly by
@@ -6559,6 +6571,27 @@ mod tests {
             expected
         );
         assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
+    }
+
+    /// `w_float_gc_alloc` is `dont_look_inside`; a typo in either spelling
+    /// silently residualizes to a symbolic hash and declines the
+    /// `_CDataBase` descent. Pin both aliases to the float-bank word
+    /// trampoline, not the raw `*mut PyObject` item.
+    #[test]
+    fn jit_trace_fnaddrs_covers_w_float_gc_alloc_word_abi() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected: extern "C" fn(f64) -> i64 = pyre_object::floatobject::w_float_gc_alloc_word;
+        let expected = expected as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::floatobject::w_float_gc_alloc"],
+            expected
+        );
+        assert_eq!(bindings["pyre_object::w_float_gc_alloc"], expected);
+        let raw = pyre_object::floatobject::w_float_gc_alloc as *const () as usize as i64;
+        assert_ne!(
+            expected, raw,
+            "must not publish the raw pointer-returning item"
+        );
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
