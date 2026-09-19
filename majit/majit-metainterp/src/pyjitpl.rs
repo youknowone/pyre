@@ -4628,13 +4628,17 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_vable_ptr = ptr;
     }
 
-    /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`.
+    /// `vinfo.unwrap_virtualizable_box(self.virtualizable_boxes[-1])`
+    /// (`pyjitpl.py vable_and_vrefs_before_residual_call` /
+    /// `vable_after_residual_call`). Residual-call and escape paths unwrap
+    /// the identity box, not the host heap pointer: `virtualizable_heap_ptr`
+    /// can name a `snapshot_for_tracing` copy and is not the unwrap source.
     ///
-    /// Residual-call and escape paths in `pyjitpl.py` unwrap the identity
-    /// box, not the host heap pointer. Fall back to
-    /// [`Self::unwrap_standard_virtualizable`] when the box has no concrete
-    /// ref yet.
-    fn unwrap_virtualizable_boxes_last(&self) -> *const u8 {
+    /// Prefers the identity box's own concrete, then the
+    /// `virtualizable_values` shadow via `TraceCtx::standard_virtualizable_ptr`,
+    /// then `self.pending_vable_ptr` — the host seed `set_vable_ptr` writes
+    /// for off-trace / pre-`TraceCtx` readers.
+    pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
         self.tracing
             .as_ref()
             .and_then(|ctx| {
@@ -4644,29 +4648,14 @@ impl<M: Clone> MetaInterp<M> {
                 ));
                 (!ptr.is_null()).then_some(ptr as *const u8)
             })
-            .unwrap_or_else(|| self.unwrap_standard_virtualizable())
-    }
-
-    /// `vinfo.unwrap_virtualizable_box(virtualizable_boxes[-1])`.
-    ///
-    /// `pending_vable_ptr` is only the host seed until `TraceCtx` exists
-    /// (`set_vable_ptr` / `sync_before`). Once the boxes are installed the
-    /// identity is the last virtualizable box, matching
-    /// `virtualizable.py unwrap_virtualizable_box`. The sync target
-    /// (`virtualizable_heap_ptr`) can name a `snapshot_for_tracing` copy
-    /// and is not the unwrap source.
-    pub fn unwrap_standard_virtualizable(&self) -> *const u8 {
-        if let Some(ctx) = self.tracing.as_ref()
-            && let Some(ptr) = ctx.standard_virtualizable_ptr()
-        {
-            return ptr as *const u8;
-        }
-        self.pending_vable_ptr
-    }
-
-    /// `pyjitpl.py` unwrap of the standard virtualizable identity.
-    pub fn standard_virtualizable_heap_ptr(&self) -> *const u8 {
-        self.unwrap_standard_virtualizable()
+            .unwrap_or_else(|| {
+                if let Some(ctx) = self.tracing.as_ref()
+                    && let Some(ptr) = ctx.standard_virtualizable_ptr()
+                {
+                    return ptr as *const u8;
+                }
+                self.pending_vable_ptr
+            })
     }
 
     /// Cache fallback virtualizable array lengths for trace-entry box setup.
@@ -19062,7 +19051,7 @@ impl<M: Clone> MetaInterp<M> {
                     .tracing_before_residual_call(vref_ptr as *mut u8);
             }
         }
-        // pyjitpl.py:3326-3334 — vinfo path (FORCE_TOKEN + SETFIELD_GC).
+        // pyjitpl.py vable_and_vrefs_before_residual_call: vinfo path.
         let vinfo = match self.virtualizable_info().cloned() {
             Some(info) => info,
             None => return,
@@ -19076,15 +19065,12 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py: `virtualizable = vinfo.unwrap_virtualizable_box(
         //     self.virtualizable_boxes[-1])`.
-        let vable_ptr = self.unwrap_virtualizable_boxes_last();
-        let ctx = match self.tracing.as_mut() {
-            Some(ctx) => ctx,
-            None => return,
-        };
-        let vbox = match ctx.standard_virtualizable_box() {
-            Some(b) => b,
-            None => return,
-        };
+        let vable_ptr = self.unwrap_standard_virtualizable();
+        // `vinfo.tracing_before_residual_call(virtualizable)` runs under the
+        // same condition as `pyjitpl.py vable_after_residual_call`: vinfo
+        // present, token-bearing machine, non-null virtualizable. Recording
+        // (`force_token` / `vable_setfield_descr`) stays below, because it
+        // needs the identity box to name.
         if !vable_ptr.is_null() {
             // SAFETY: the host stamps `vable_ptr` to the live virtualizable
             // pointer for the duration of the trace; flipping the token
@@ -19093,6 +19079,14 @@ impl<M: Clone> MetaInterp<M> {
                 vinfo.tracing_before_residual_call(vable_ptr as *mut u8);
             }
         }
+        let ctx = match self.tracing.as_mut() {
+            Some(ctx) => ctx,
+            None => return,
+        };
+        let vbox = match ctx.standard_virtualizable_box() {
+            Some(b) => b,
+            None => return,
+        };
         let force_token = ctx.force_token();
         ctx.vable_setfield_descr(vbox, force_token, vinfo.token_field_descr());
     }
