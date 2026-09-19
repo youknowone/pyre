@@ -3802,7 +3802,24 @@ pub fn walk<Sym: WalkSym>(
             // replay would resume the caller without delivering the return or
             // raise that this step produced.
             let snapshot_safe = trace_too_long_blackhole_snapshot_safe(&outcome);
-            let blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
+            // Reconcile the operand-stack mirror to the post-step resume
+            // coordinate before latching.  A block-head merge point is
+            // otherwise left on the completed opcode's on-entry stack
+            // (`reconcile_vstack_to_resume_pc`).
+            if snapshot_safe {
+                reconcile_vstack_to_resume_pc(ctx, pc);
+            }
+            let mut blackhole_latched = snapshot_safe && latch_abort_blackhole(ctx, pc, "mod2786");
+            // Root-walk too-long publishes the walker mirror (`_copy_data_from_miframe`
+            // equivalent).  Ask the height check here, while a refusal can still
+            // unstage: a preflighted adopt treats a later decline as an assert.
+            if blackhole_latched
+                && !ctx.fbw_mode.inline_subwalk
+                && !latched_single_frame_mirror_publishable()
+            {
+                reset_single_frame_blackhole();
+                blackhole_latched = false;
+            }
             if trace_too_long_abort_safe(&outcome, blackhole_latched, fbw_executed_effect_count()) {
                 let ops = ctx.trace_ctx.num_recorded_ops();
                 crate::state::note_root_trace_too_long(
@@ -5686,21 +5703,6 @@ fn funcptr_concrete_int<Sym: WalkSym>(
         Some(majit_ir::Value::Int(v)) => Some(v),
         _ => None,
     }
-}
-
-fn walk_body_has_exception_handler<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    code: &[u8],
-) -> bool {
-    let jitcode_index = if ctx.is_top_level {
-        ctx.session.borrow().recording_jitcode_index
-    } else {
-        ctx.inline_callee_consts
-            .map_or(-1, |consts| consts.jitcode_index)
-    };
-    crate::state::jitcode_source_has_exception_handler(jitcode_index).unwrap_or_else(|| {
-        crate::jitcode_runtime::decoded_ops(code).any(|op| op.opname == "catch_exception")
-    })
 }
 
 /// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port for residual calls
@@ -10991,11 +10993,10 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     if guard_frame_globals && !guard_current_frame_globals_identity(ctx, op_pc, ns)? {
         return Ok(false);
     }
-    // In-place `write_cell` / `unwrap_cell` do not call `mutated()`.
-    // Pinning the dict `version?` on those loads made every `except as`
-    // (`DELETE_NAME` → `delitem` always `mutated()`) kill the module
-    // while-loop — 116 qmut aborts on jitstress.  LoadGlobal of a
-    // rebindable name still pins.
+    // `celldict.py getdictvalue_no_unwrapping` is `@elidable_promote` on
+    // `version?` for every lookup: present cell, raw value, and miss.
+    // `setitem_str` does the same lookup before `write_cell`.  A later
+    // insert or `delitem` (`mutated()`) fails GUARD_NOT_INVALIDATED.
     if pin_version {
         if !walker_pin_namespace_version(ctx, op_pc, ns)? {
             return Ok(false);

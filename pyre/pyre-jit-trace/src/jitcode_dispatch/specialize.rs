@@ -1964,11 +1964,11 @@ enum TracebackWalkField {
     TbFrame,
     /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
     FCode,
-    /// `tb.tb_lineno` — the line the node froze at.  The getter resolves the
-    /// sentinel out of `w_code` and `lasti`; `record_application_traceback`
-    /// stamps the real line instead, so a recorded node reads as the slot and
-    /// only a hand-constructed one has to resolve.  The fold covers the stamped
-    /// case and declines the other.
+    /// `tb.tb_lineno` — the getter resolves `LINENO_NOT_COMPUTED` from
+    /// `w_code` and `lasti` (`pytraceback.py get_lineno`). A recorded node
+    /// carries the sentinel (`PyTraceback.__init__`); the fold covers a
+    /// constructor-stamped real line and declines the sentinel so it does
+    /// not pin a value the getter would still resolve.
     ///
     /// `tb_lasti` is deliberately absent: it is the one traceback slot the
     /// walker has no reason to reach, since nothing on the walk consumes it.
