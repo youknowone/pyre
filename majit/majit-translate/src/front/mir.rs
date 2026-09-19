@@ -360,7 +360,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
         Some(push_named_const_folds(folds))
     } else {
         for llbc in llbcs {
-            merge_named_const_folds(harvest_named_const_folds(llbc));
+            merge_named_const_folds(llbc.crate_name(), harvest_named_const_folds(llbc));
         }
         None
     };
@@ -27115,17 +27115,28 @@ thread_local! {
     static NAMED_CONST_FOLDS: std::cell::RefCell<
         std::collections::HashMap<String, OpKind>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Crates whose folds the table already holds, so a repeat can be
+    /// told from the next crate of the same invocation.
+    static NAMED_CONST_CRATES: std::cell::RefCell<
+        std::collections::HashSet<String>,
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 struct NamedConstFoldsGuard {
     previous: std::collections::HashMap<String, OpKind>,
+    previous_crates: std::collections::HashSet<String>,
 }
 
 impl NamedConstFoldsGuard {
     fn push(folds: std::collections::HashMap<String, OpKind>) -> Self {
         let previous =
             NAMED_CONST_FOLDS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), folds));
-        Self { previous }
+        let previous_crates =
+            NAMED_CONST_CRATES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        Self {
+            previous,
+            previous_crates,
+        }
     }
 }
 
@@ -27133,6 +27144,9 @@ impl Drop for NamedConstFoldsGuard {
     fn drop(&mut self) {
         NAMED_CONST_FOLDS.with(|slot| {
             *slot.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+        NAMED_CONST_CRATES.with(|slot| {
+            *slot.borrow_mut() = std::mem::take(&mut self.previous_crates);
         });
     }
 }
@@ -27156,8 +27170,31 @@ fn named_const_fold_for_path(path: &str) -> Option<OpKind> {
     NAMED_CONST_FOLDS.with(|slot| slot.borrow().get(path).cloned())
 }
 
-fn merge_named_const_folds(folds: std::collections::HashMap<String, OpKind>) {
-    NAMED_CONST_FOLDS.with(|slot| slot.borrow_mut().extend(folds));
+/// Add one crate's folds to the table, restarting it when `crate_name`
+/// repeats.
+///
+/// One frontend invocation loads each artefact once, so a crate that is
+/// harvested a second time means a new invocation began.  Without the
+/// restart the table would keep the previous invocation's entries, and a
+/// later partial build could fold an Opaque foreign declaration with a
+/// value harvested from unrelated input.
+fn merge_named_const_folds(crate_name: &str, folds: std::collections::HashMap<String, OpKind>) {
+    let restart = NAMED_CONST_CRATES.with(|slot| {
+        let mut seen = slot.borrow_mut();
+        if seen.insert(crate_name.to_string()) {
+            return false;
+        }
+        seen.clear();
+        seen.insert(crate_name.to_string());
+        true
+    });
+    NAMED_CONST_FOLDS.with(|slot| {
+        let mut table = slot.borrow_mut();
+        if restart {
+            table.clear();
+        }
+        table.extend(folds);
+    });
 }
 
 /// Fold every local `NamedConst` whose initializer this LLBC actually
@@ -31056,6 +31093,27 @@ mod tests {
             super::named_const_fold_for_path("pyre_object::intobject::W_INT_USER_GC_TYPE_ID")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn named_const_merge_restarts_when_a_crate_repeats() {
+        use super::OpKind;
+        let one = |path: &str, v: u64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(path.to_string(), OpKind::ConstUInt(v));
+            m
+        };
+        // A fresh table for this test, restored when the guard drops.
+        let _guard = super::push_named_const_folds(std::collections::HashMap::new());
+        super::merge_named_const_folds("pyre_object", one("pyre_object::A", 1));
+        super::merge_named_const_folds("pyre_interpreter", one("pyre_interpreter::B", 2));
+        assert!(super::named_const_fold_for_path("pyre_object::A").is_some());
+        assert!(super::named_const_fold_for_path("pyre_interpreter::B").is_some());
+        // `pyre_object` again means a second invocation started: the
+        // earlier invocation's entries must not survive into it.
+        super::merge_named_const_folds("pyre_object", one("pyre_object::A", 1));
+        assert!(super::named_const_fold_for_path("pyre_object::A").is_some());
+        assert!(super::named_const_fold_for_path("pyre_interpreter::B").is_none());
     }
 
     #[test]
