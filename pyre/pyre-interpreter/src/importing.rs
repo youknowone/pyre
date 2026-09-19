@@ -3052,7 +3052,15 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // registry has none to drop.
     let dict = sys_modules_dict();
     if !dict.is_null() {
-        return sys_modules_dict_entry(dict, name).filter(|m| !unsafe { pyre_object::is_none(*m) });
+        // No `Option::filter`: the closure is an un-lowered synthetic ctor
+        // and is the descent-scan blocker on `__import__`.
+        let Some(m) = sys_modules_dict_entry(dict, name) else {
+            return None;
+        };
+        if unsafe { pyre_object::is_none(m) } {
+            return None;
+        }
+        return Some(m);
     }
     sys_modules_registry_get(name)
 }
@@ -3074,7 +3082,119 @@ pub(crate) fn sys_modules_entry(name: &str) -> Option<PyObjectRef> {
 /// The `sys.modules` dict read both readers above share: a missing key and a
 /// null are the same absence.
 fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    unsafe { pyre_object::w_dict_getitem_str(dict, name) }.filter(|m| !m.is_null())
+    // `interp_import.py _gcd_import` uses `space.finditem_str`.  Spell that
+    // here so the jitted arm of `finditem_str_named` (no DictOperationGuard)
+    // is the one the `__import__` walk records.  No `Option::filter`: the
+    // closure is an un-lowered synthetic ctor the descent scan declines on.
+    // The `Result` match on `finditem_str` residualises as
+    // `from_exc_object` (`__majit_stringbuilder_new`).  Keep the
+    // probe itself look-inside-adjacent: this wrapper is the one
+    // residual, so the exception conversion is not on the
+    // `__import__` look-inside graph.
+    sys_modules_finditem_str(dict, name)
+}
+
+/// `finditem_str` plus the miss/`Err` swallow.  Hidden so
+/// `from_exc_object` stays off the look-inside `__import__` body.
+#[majit_macros::dont_look_inside]
+pub(crate) fn sys_modules_finditem_str(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    match crate::baseobjspace::finditem_str(dict, name) {
+        Ok(Some(m)) if !m.is_null() => Some(m),
+        _ => None,
+    }
+}
+
+/// Sentinel a 1-word lookup residual returns after
+/// [`crate::runtime_ops::jit_publish_residual_error`].  A static byte
+/// whose address is a real pointer (not the integer 1), compared with
+/// `ptr::eq` so the look-inside graph never `cast_ptr_to_int`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(crate) fn import_lookup_err_ptr() -> PyObjectRef {
+    static SENTINEL: u8 = 0;
+    std::ptr::from_ref(&SENTINEL) as *const u8 as PyObjectRef
+}
+
+fn import_lookup_is_err(p: PyObjectRef) -> bool {
+    std::ptr::eq(p, import_lookup_err_ptr())
+}
+
+/// Object-keyed `finditem`.  Hidden so `from_exc_object` stays off the
+/// look-inside `__import__` body.  Two object arguments and a nullable
+/// object result: the walker can execute this residual.  A raise is
+/// published and returned as [`import_lookup_err_ptr`], not swallowed.
+#[majit_macros::dont_look_inside]
+pub(crate) fn sys_modules_finditem_w(dict: PyObjectRef, w_name: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::finditem(dict, w_name) {
+        Ok(Some(m)) if !m.is_null() => m,
+        Ok(_) => pyre_object::PY_NULL,
+        Err(e) => {
+            crate::runtime_ops::jit_publish_residual_error(e);
+            import_lookup_err_ptr()
+        }
+    }
+}
+
+/// Exact-str `sys.modules` probe: precomputed-hash `getitem_str`, no
+/// `DictOperationGuard`.  Cannot raise on an interned str key, so the
+/// residual is `CallR` rather than `CallMayForceR`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(crate) fn sys_modules_finditem_str_exact(
+    dict: PyObjectRef,
+    w_name: PyObjectRef,
+) -> PyObjectRef {
+    let Some(key) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
+        return pyre_object::PY_NULL;
+    };
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
+    if !strategy.is_null() {
+        return unsafe { (*strategy).getitem_str(dict, key) }.unwrap_or(pyre_object::PY_NULL);
+    }
+    let hash = unsafe { pyre_object::w_str_hash_memoized(w_name) };
+    if majit_metainterp::jit::we_are_jitted() {
+        return unsafe {
+            pyre_object::dictmultiobject::w_dict_get_strategy(dict)
+                .getitem_str_hashed(dict, key, hash)
+        }
+        .unwrap_or(pyre_object::PY_NULL);
+    }
+    match unsafe {
+        pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(dict, key, hash)
+    } {
+        Ok(Some(m)) if !m.is_null() => m,
+        Ok(_) => pyre_object::PY_NULL,
+        Err(_) => {
+            crate::runtime_ops::jit_publish_residual_error(
+                crate::baseobjspace::take_pending_dict_key_error(w_name),
+            );
+            import_lookup_err_ptr()
+        }
+    }
+}
+
+/// `check_sys_modules` for a caller that already holds the name object.
+///
+/// An exact str uses [`sys_modules_finditem_str_exact`]; any other key
+/// keeps the generic [`sys_modules_finditem_w`] residual.
+fn check_sys_modules_import(w_name: PyObjectRef) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let dict = sys_modules_dict();
+    if !dict.is_null() {
+        let m = if unsafe { pyre_object::is_str(w_name) } {
+            sys_modules_finditem_str_exact(dict, w_name)
+        } else {
+            sys_modules_finditem_w(dict, w_name)
+        };
+        if import_lookup_is_err(m) {
+            return Err(take_published_residual_error());
+        }
+        if m.is_null() || unsafe { pyre_object::is_none(m) } {
+            return Ok(None);
+        }
+        return Ok(Some(m));
+    }
+    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
+        return Ok(None);
+    };
+    Ok(sys_modules_registry_get(name))
 }
 
 /// Look `name` up in `SYS_MODULES`, the process-owned name→module registry.
@@ -3107,12 +3227,16 @@ pub(crate) fn check_sys_modules_w(w_name: PyObjectRef) -> Option<PyObjectRef> {
         .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) })
 }
 
+/// Bootstrap name→module map.  PyPy has no such registry on the
+/// `check_sys_modules` look-inside path; the Python-visible dict is the
+/// cache.  Residualise the `HashMap` so a red `sys_modules_dict()` null
+/// check does not drag lock/hash helpers into `__import__`.
+#[majit_macros::dont_look_inside]
 pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
-    SYS_MODULES
-        .lock()
-        .get(name)
-        .copied()
-        .map(|module| module as PyObjectRef)
+    match SYS_MODULES.lock().get(name).copied() {
+        Some(module) => Some(module as PyObjectRef),
+        None => None,
+    }
 }
 
 /// Whether `sys.modules[name]` is bound to `None`, the sentinel that marks
@@ -5217,35 +5341,62 @@ enum GcdCache {
 }
 
 fn gcd_import_cache_probe(name: &str) -> Result<GcdCache, crate::PyError> {
-    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
-
-    // A `None` sentinel blocks the name; `check_sys_modules` skips it and
-    // would fall back to the interpreter cache, resurrecting a builtin the
-    // sentinel is meant to block.  Give up so the slow path raises
-    // `import of {name} halted; None in sys.modules`.
-    if sys_modules_blocks(name) {
-        return Ok(GcdCache::Miss);
-    }
+    // `interp_import.py _gcd_import` — `space.sys.get('modules')` then
+    // `finditem_str`.  No shadow-stack pin: the probe must stay free of
+    // effects so a look-inside of `__import__` can record the dict read
+    // and the two getattrs.  A Python `None` sentinel is FastPathGiveUp
+    // (`getattr(None, "__spec__")` is AttributeError) and the slow path
+    // raises `import of {name} halted; None in sys.modules`.
     let Some(w_module) = check_sys_modules(name) else {
         return Ok(GcdCache::Miss);
     };
-    let _roots = push_roots();
-    let mod_slot = shadow_stack_len();
-    let _ = pin_root(w_module);
-    let Some(w_spec) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__spec__")?
-    else {
+    gcd_import_cache_probe_after(w_module)
+}
+
+/// Object-keyed cache probe for the look-inside `__import__` body.
+///
+/// The wrapper already holds the name object; looking it up with
+/// [`check_sys_modules_import`] keeps `&str` off the executed residual.
+fn gcd_import_cache_probe_w(w_name: PyObjectRef) -> Result<GcdCache, crate::PyError> {
+    let Some(w_module) = check_sys_modules_import(w_name)? else {
         return Ok(GcdCache::Miss);
     };
-    let spec_slot = shadow_stack_len();
-    let _ = pin_root(w_spec);
-    if let Some(w_initializing) =
-        crate::baseobjspace::findattr_result(shadow_stack_get(spec_slot), "_initializing")?
-        && crate::baseobjspace::is_true(w_initializing)?
-    {
-        return Ok(GcdCache::Initializing(shadow_stack_get(mod_slot)));
+    gcd_import_cache_probe_after(w_module)
+}
+
+fn gcd_import_cache_probe_after(w_module: PyObjectRef) -> Result<GcdCache, crate::PyError> {
+    // Exact module only — the same cut `sys_module_if_initialized` already
+    // applies.  A non-module is FastPathGiveUp: `findattr` would enter
+    // `getattr_str_impl` (`force` + `pin_root` + `w_str_new_managed`), and
+    // after the red `sys.modules` pointer the descent scan cannot prove
+    // `is_module`, so that arm would residualise the whole `__import__`.
+    if !unsafe { pyre_object::is_module(w_module) } {
+        return Ok(GcdCache::Miss);
     }
-    Ok(GcdCache::Ready(shadow_stack_get(mod_slot)))
+    let dict = unsafe { pyre_object::w_module_get_w_dict(w_module) };
+    if dict.is_null() {
+        return Ok(GcdCache::Miss);
+    }
+    let w_spec = module_dict_get_spec(dict);
+    if import_lookup_is_err(w_spec) {
+        return Err(take_published_residual_error());
+    }
+    if w_spec.is_null() {
+        return Ok(GcdCache::Miss);
+    }
+    if unsafe { pyre_object::is_none(w_spec) } {
+        return Ok(GcdCache::Ready(w_module));
+    }
+    // `space.getattr(w_spec, "_initializing")` — mapdict `getdictvalue`
+    // (mapdict.py `MapdictDictSupport.getdictvalue`).  AttributeError is
+    // "initialized" (a builtin module).  The `"_initializing"` literal
+    // is built at the call site; keep it inside the residual so
+    // stringbuilder stays off the look-inside graph.
+    let w_initializing = module_spec_get_initializing(w_spec);
+    if !w_initializing.is_null() && is_true_import(w_initializing)? {
+        return Ok(GcdCache::Initializing(w_module));
+    }
+    Ok(GcdCache::Ready(w_module))
 }
 
 /// `_gcd_import` fast path: the already-imported module for `name`, after
@@ -5273,6 +5424,19 @@ fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
             // can see only the initialized-module arm (`guard_not_invalidated`).
             wait_initializing_module(name, w_module)
         }
+    }
+}
+
+/// Look-inside `_gcd_import` fast path: same as [`gcd_import_fast`] but
+/// the `sys.modules` probe is keyed by the name object.
+fn gcd_import_fast_w(
+    name: &str,
+    w_name: PyObjectRef,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    match gcd_import_cache_probe_w(w_name)? {
+        GcdCache::Miss => Ok(None),
+        GcdCache::Ready(w_module) => Ok(Some(w_module)),
+        GcdCache::Initializing(w_module) => wait_initializing_module(name, w_module),
     }
 }
 
@@ -5433,7 +5597,7 @@ fn sys_modules_blocks_no_callback(name: &str) -> Option<bool> {
 /// is true.  The 3.14 `import_ensure_initialized` wait lives here instead, as
 /// a residual, so the initialized arm stays a small look-inside body.
 #[majit_macros::dont_look_inside]
-fn wait_initializing_module(
+pub(crate) fn wait_initializing_module(
     name: &str,
     w_module: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -5510,11 +5674,18 @@ fn rpython_str_find_char(value: &str, needle: char, start: i64) -> i64 {
     let Ok(start) = usize::try_from(start) else {
         return -1;
     };
-    value
-        .get(start..)
-        .and_then(|tail| tail.find(needle))
-        .and_then(|offset| i64::try_from(start + offset).ok())
-        .unwrap_or(-1)
+    // No `.and_then` closures: each is an un-lowered synthetic ctor the
+    // descent scan declines on after `sys_modules_dict`.
+    let Some(tail) = value.get(start..) else {
+        return -1;
+    };
+    let Some(offset) = tail.find(needle) else {
+        return -1;
+    };
+    match i64::try_from(start + offset) {
+        Ok(index) => index,
+        Err(_) => -1,
+    }
 }
 
 /// Native counterpart of RPython `s[:stop]`.
@@ -5524,7 +5695,14 @@ fn rpython_str_find_char(value: &str, needle: char, start: i64) -> i64 {
 /// `rpython_str_find_char`, so translation replaces this exact helper with the
 /// existing post-annotation `getslice(s, 0, stop)` marker.
 fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
-    &value[..usize::try_from(stop).expect("find returned a non-negative index")]
+    // No `expect`: the panic formatter is `__majit_stringbuilder_new`.
+    let Ok(stop) = usize::try_from(stop) else {
+        return value;
+    };
+    match value.get(..stop) {
+        Some(prefix) => prefix,
+        None => value,
+    }
 }
 
 /// `interp_import.py:85-90` — hand a cached package's fromlist to importlib.
@@ -5540,7 +5718,7 @@ fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
 /// its own.  Answers `None` while the bootstrap is not installed, which leaves
 /// the caller on the slow path.
 #[majit_macros::dont_look_inside]
-fn handle_fromlist_fast(
+pub(crate) fn handle_fromlist_fast(
     w_mod: PyObjectRef,
     w_fromlist: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
@@ -5599,31 +5777,54 @@ pub fn dunder_import(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+    dunder_import_inner(
+        name,
+        pyre_object::PY_NULL,
+        w_globals,
+        w_locals,
+        w_fromlist,
+        level,
+        execution_context,
+    )
+}
 
+/// Look-inside `__import__` after the wrapper has the name object.
+///
+/// Same body as [`dunder_import`], but the cache probe is keyed by
+/// `w_name` so the executed residual is [`sys_modules_finditem_w`].
+pub(crate) fn dunder_import_w(
+    name: &str,
+    w_name: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    dunder_import_inner(
+        name,
+        w_name,
+        w_globals,
+        w_locals,
+        w_fromlist,
+        level,
+        execution_context,
+    )
+}
+
+fn dunder_import_inner(
+    name: &str,
+    w_name: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
     // Captured before any Python can run below (`is_true` may call a
-    // `__bool__`); the raw argument pointers are stale after that.
+    // `__bool__`).  The fast path below does not pin: `interp___import__`
+    // has no shadow stack, and a pin is an effect in front of `_gcd_import`.
     let fromlist_missing = w_fromlist.is_null() || unsafe { is_none(w_fromlist) };
-
-    let _roots = push_roots();
-    let globals_slot = shadow_stack_len();
-    let _ = pin_root(if w_globals.is_null() {
-        pyre_object::w_none()
-    } else {
-        w_globals
-    });
-    let locals_slot = shadow_stack_len();
-    let _ = pin_root(if w_locals.is_null() {
-        pyre_object::w_none()
-    } else {
-        w_locals
-    });
-    let fromlist_slot = shadow_stack_len();
-    let _ = pin_root(if w_fromlist.is_null() {
-        pyre_object::w_none()
-    } else {
-        w_fromlist
-    });
 
     if level == 0 {
         // `interp_import.py:66-92` — the fast path is only for absolute
@@ -5632,74 +5833,68 @@ pub fn dunder_import(
         // imports whatever the list adds.  No import lock is taken here:
         // `interp_import.py:19` records that CPython's fast path does not
         // take one either.
-        if let Some(w_mod) = gcd_import_fast(name)? {
-            let mod_slot = shadow_stack_len();
-            let _ = pin_root(w_mod);
+        let w_mod = if w_name.is_null() {
+            gcd_import_fast(name)?
+        } else {
+            gcd_import_fast_w(name, w_name)?
+        };
+        if let Some(w_mod) = w_mod {
             // `interp_import.py interp___import__` — the list is tested once
             // the cache hit is in hand, and a dotted name's head is resolved
             // only inside the empty-list arm.  Resolving it ahead of the test
             // would run `gcd_import_fast` on the head, whose `__spec__` and
             // `_initializing` reads can run a module's own Python; neither
             // importer runs that for a non-empty list.
-            let have_fromlist =
-                !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
+            let have_fromlist = !fromlist_missing && is_true_import(w_fromlist)?;
             if !have_fromlist {
-                // `import a.b` answers `a`.
-                let dotindex = rpython_str_find_char(name, '.', 0);
-                if dotindex < 0 {
-                    return Ok(shadow_stack_get(mod_slot));
-                }
-                let head = rpython_str_slice_prefix(name, dotindex);
-                if let Some(w_head) = gcd_import_fast(head)? {
-                    return Ok(w_head);
-                }
-                // An uncached head is what `_bootstrap.__import__`'s own
-                // `if not fromlist:` arm imports — `return _gcd_import(
-                // name.partition('.')[0])`.  Re-entering under the head name
-                // with no list reaches that same import while leaving the
-                // caller's list alone: the one truth test `__import__` owes a
-                // stateful `__bool__` has already been made here.
-                return dunder_import(
-                    head,
-                    shadow_stack_get(globals_slot),
-                    shadow_stack_get(locals_slot),
-                    pyre_object::w_none(),
-                    0,
+                // `name.find(".")` / `name[:dotindex]` residualise as
+                // `find` / `__getslice_rangeto`.  Keep that arm off the
+                // look-inside graph so a cached `from math import pi`
+                // (this branch is not taken) is not declined for helpers
+                // only the empty-fromlist dotted name needs.
+                return dunder_import_absolute_head(
+                    name,
+                    w_mod,
+                    w_globals,
+                    w_locals,
                     execution_context,
                 );
             }
             // `assert have_fromlist` — the package test and its two return
-            // arms.
-            if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?
-                .is_none()
-            {
-                return Ok(shadow_stack_get(mod_slot));
-            } else if let Some(w_handled) =
-                handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
-            {
-                return Ok(w_handled);
-            } else if get_sys_module("importlib._bootstrap").is_none() {
-                // `interp_import.py interp___import__` returns from both arms
-                // of the package test; the `_handle_fromlist` it calls is
-                // always installed upstream.  While the bootstrap is not
-                // installed at all, the native one stands in here.  Falling
-                // through to the slow path instead would resolve the same
-                // cached module a second time and test the list a second time,
-                // and `__import__` owes a stateful `__bool__` exactly one test.
-                handle_fromlist(
-                    shadow_stack_get(mod_slot),
-                    shadow_stack_get(fromlist_slot),
-                    false,
+            // arms.  Exact-module `__path__` is the module-dict hit, not
+            // `findattr` (`getattr_str_impl` starts with `force` + `pin_root`
+            // and is the `__majit_stringbuilder_new` descent wall).  A
+            // non-module with a fromlist is FastPathGiveUp, same cut as
+            // `gcd_import_cache_probe`.
+            if unsafe { pyre_object::is_module(w_mod) } {
+                let dict = unsafe { pyre_object::w_module_get_w_dict(w_mod) };
+                let w_path = if dict.is_null() {
+                    pyre_object::PY_NULL
+                } else {
+                    module_dict_get_path(dict)
+                };
+                if import_lookup_is_err(w_path) {
+                    return Err(take_published_residual_error());
+                }
+                if dict.is_null() || w_path.is_null() {
+                    return Ok(w_mod);
+                }
+                // Pin + `_handle_fromlist` allocate and call Python.
+                // After the red `sys.modules` pointer the scan cannot
+                // prove `__path__` is absent, so keep this arm off the
+                // look-inside graph (`push_roots` / `pin_root` would
+                // otherwise decline a cached `from math import pi`).
+                return dunder_import_package_fromlist(
+                    name,
+                    w_mod,
+                    w_globals,
+                    w_locals,
+                    w_fromlist,
+                    fromlist_missing,
+                    level,
                     execution_context,
-                )?;
-                return Ok(shadow_stack_get(mod_slot));
+                );
             }
-            // An installed bootstrap that cannot serve `_handle_fromlist` is a
-            // broken bootstrap, not an absent one.  `_bootstrap.__import__`
-            // reaches the handler as a module global and raises when it is
-            // gone, so fall through to the slow path and let that error be the
-            // one `__import__` reports rather than answering from the native
-            // handler.
         }
     }
 
@@ -5718,6 +5913,250 @@ pub fn dunder_import(
     )
 }
 
+/// `space.getattr(w_spec, "_initializing")` dict hit.  The key literal
+/// residualises as `__majit_stringbuilder_new` / `_build` at the call
+/// site, so the whole probe stays off the look-inside graph.
+///
+/// Nullable object result so the walk can execute this residual.
+#[majit_macros::dont_look_inside]
+pub(crate) fn module_spec_get_initializing(w_spec: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::getdictvalue_native(w_spec, "_initializing") {
+        Some(v) if !v.is_null() => v,
+        _ => pyre_object::PY_NULL,
+    }
+}
+
+/// Exact-module `__spec__`: celldict `getdictvalue_no_unwrapping` then
+/// `unwrap_cell`.  The literal stays inside the cannot-raise residual;
+/// unwrap is look-inside so the trace records the cell field read.
+fn module_dict_get_spec(dict: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) }.is_null() {
+        return module_dict_finditem_spec(dict);
+    }
+    let raw = module_dict_cell_get_spec(dict);
+    if raw.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let v = unsafe { pyre_object::celldict::unwrap_cell(raw) };
+    if v.is_null() { pyre_object::PY_NULL } else { v }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(crate) fn module_dict_cell_get_spec(dict: PyObjectRef) -> PyObjectRef {
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
+    if strategy.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { (*strategy).getdictvalue_no_unwrapping(dict, "__spec__") }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn module_dict_finditem_spec(dict: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::finditem_str(dict, "__spec__") {
+        Ok(Some(s)) if !s.is_null() => s,
+        Ok(_) => pyre_object::PY_NULL,
+        Err(e) => {
+            crate::runtime_ops::jit_publish_residual_error(e);
+            import_lookup_err_ptr()
+        }
+    }
+}
+
+/// Exact-module `__path__`, same split as [`module_dict_get_spec`].
+fn module_dict_get_path(dict: PyObjectRef) -> PyObjectRef {
+    if unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) }.is_null() {
+        return module_dict_finditem_path(dict);
+    }
+    let raw = module_dict_cell_get_path(dict);
+    if raw.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    let v = unsafe { pyre_object::celldict::unwrap_cell(raw) };
+    if v.is_null() { pyre_object::PY_NULL } else { v }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(crate) fn module_dict_cell_get_path(dict: PyObjectRef) -> PyObjectRef {
+    let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
+    if strategy.is_null() {
+        return pyre_object::PY_NULL;
+    }
+    unsafe { (*strategy).getdictvalue_no_unwrapping(dict, "__path__") }
+        .unwrap_or(pyre_object::PY_NULL)
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn module_dict_finditem_path(dict: PyObjectRef) -> PyObjectRef {
+    match crate::baseobjspace::finditem_str(dict, "__path__") {
+        Ok(Some(s)) if !s.is_null() => s,
+        Ok(_) => pyre_object::PY_NULL,
+        Err(e) => {
+            crate::runtime_ops::jit_publish_residual_error(e);
+            import_lookup_err_ptr()
+        }
+    }
+}
+
+/// Look-inside `space.is_true` for `__import__`: exact tuple / bool /
+/// None are answered here so a constant fromlist and an exact-bool
+/// `_initializing` never call the hidden residual.  The generic arm
+/// is [`is_true_after_modules`].
+fn is_true_import(obj: PyObjectRef) -> Result<bool, crate::PyError> {
+    unsafe {
+        if pyre_object::is_tuple(obj) {
+            return Ok(pyre_object::w_tuple_len(obj) != 0);
+        }
+        if pyre_object::is_bool(obj) {
+            return Ok(std::ptr::eq(obj, pyre_object::w_bool_from(true)));
+        }
+        if pyre_object::is_none(obj) {
+            return Ok(false);
+        }
+    }
+    let flag = is_true_after_modules(obj);
+    if flag < 0 {
+        return Err(take_published_residual_error());
+    }
+    Ok(flag != 0)
+}
+
+/// Generic `space.is_true` after the red `sys.modules` read.  Hidden so
+/// a red receiver does not drag `is_true_slot`'s layout predicates
+/// into the look-inside body.  `1` / `0` / `-1` (raise published).
+#[majit_macros::dont_look_inside]
+pub(crate) fn is_true_after_modules(obj: PyObjectRef) -> i64 {
+    match crate::baseobjspace::is_true(obj) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            crate::runtime_ops::jit_publish_residual_error(e);
+            -1
+        }
+    }
+}
+
+/// Recover the exception a 1-word residual published through
+/// [`crate::runtime_ops::jit_publish_residual_error`].  Does not
+/// re-run the helper.  Hidden; the cached-import walk does not take
+/// this arm.
+#[majit_macros::dont_look_inside]
+pub(crate) fn take_published_residual_error() -> crate::PyError {
+    let obj = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| {
+        let v = cell.get();
+        cell.set(0);
+        v
+    });
+    if obj == 0 {
+        crate::PyError::type_error("residual published no exception")
+    } else {
+        unsafe { crate::PyError::from_exc_object(obj as PyObjectRef) }
+    }
+}
+
+/// `interp___import__` empty-fromlist arm: answer `name.partition('.')[0]`.
+///
+/// The `find` / slice helpers are un-lowered, so the whole arm — including
+/// the undotted `import math` return — stays off the look-inside graph.
+#[majit_macros::dont_look_inside]
+pub(crate) fn dunder_import_absolute_head(
+    name: &str,
+    w_mod: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `import a.b` answers `a`.
+    let dotindex = rpython_str_find_char(name, '.', 0);
+    if dotindex < 0 {
+        return Ok(w_mod);
+    }
+    let head = rpython_str_slice_prefix(name, dotindex);
+    if let Some(w_head) = gcd_import_fast(head)? {
+        return Ok(w_head);
+    }
+    // An uncached head is what `_bootstrap.__import__`'s own
+    // `if not fromlist:` arm imports — `return _gcd_import(
+    // name.partition('.')[0])`.  Re-entering under the head name
+    // with no list reaches that same import while leaving the
+    // caller's list alone: the one truth test `__import__` owes a
+    // stateful `__bool__` has already been made here.
+    dunder_import(
+        head,
+        w_globals,
+        w_locals,
+        pyre_object::w_none(),
+        0,
+        execution_context,
+    )
+}
+
+/// Cached-package fromlist arm of `interp___import__`: pin, then
+/// `_handle_fromlist` (bootstrap) or the native stand-in.  Hidden so
+/// `push_roots` / `pin_root` stay off the look-inside graph.
+///
+/// A broken installed bootstrap falls through to [`dunder_import_slow`]
+/// with the same arguments the look-inside caller used to pass.
+#[majit_macros::dont_look_inside]
+pub(crate) fn dunder_import_package_fromlist(
+    name: &str,
+    w_mod: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    fromlist_missing: bool,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    let fromlist_slot = shadow_stack_len();
+    let _ = pin_root(if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    });
+    if let Some(w_handled) =
+        handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
+    {
+        return Ok(w_handled);
+    } else if get_sys_module("importlib._bootstrap").is_none() {
+        // `interp_import.py interp___import__` returns from both
+        // arms of the package test; the `_handle_fromlist` it
+        // calls is always installed upstream.  While the
+        // bootstrap is not installed at all, the native one
+        // stands in here.  Falling through to the slow path
+        // instead would resolve the same cached module a second
+        // time and test the list a second time, and `__import__`
+        // owes a stateful `__bool__` exactly one test.
+        handle_fromlist(
+            shadow_stack_get(mod_slot),
+            shadow_stack_get(fromlist_slot),
+            false,
+            execution_context,
+        )?;
+        return Ok(shadow_stack_get(mod_slot));
+    }
+    // An installed bootstrap that cannot serve `_handle_fromlist`
+    // is a broken bootstrap, not an absent one.
+    // `_bootstrap.__import__` reaches the handler as a module
+    // global and raises when it is gone, so fall through to the
+    // slow path and let that error be the one `__import__`
+    // reports rather than answering from the native handler.
+    dunder_import_slow(
+        name,
+        w_globals,
+        w_locals,
+        w_fromlist,
+        fromlist_missing,
+        level,
+        execution_context,
+    )
+}
+
 /// Miss / relative / bootstrap half of `interp___import__`.
 ///
 /// PyPy's `space.call_function(FrozenCache.w_frozen_import, ...)` is one
@@ -5725,7 +6164,7 @@ pub fn dunder_import(
 /// `try_walker_inline_builtin_call` to descend: a look-inside of this body
 /// is 300+ un-lowered helpers and the descent scan refuses the whole builtin.
 #[majit_macros::dont_look_inside]
-fn dunder_import_slow(
+pub(crate) fn dunder_import_slow(
     name: &str,
     w_globals: PyObjectRef,
     w_locals: PyObjectRef,
@@ -6003,6 +6442,9 @@ fn call_bootstrap_import(
 /// and the path search — is `&str`-keyed and can hold no such name, so the
 /// app-level `_bootstrap.__import__` runs it with the name object as given,
 /// which keeps the dotted-name, `level` and `fromlist` handling intact.
+/// Residual: a red `w_str_get_value_opt` must not drag this bootstrap
+/// graph into the look-inside `__import__` body.
+#[majit_macros::dont_look_inside]
 pub fn dunder_import_name_obj(
     w_name: PyObjectRef,
     w_globals: PyObjectRef,
@@ -6335,7 +6777,13 @@ fn import_head(
 ///
 /// Returns unit rather than the module: the caller holds the pinned leaf, and
 /// the imports below can move whatever this were to hand back.
-fn handle_fromlist(
+///
+/// Hidden: the native stand-in iterates, formats TypeErrors, and imports
+/// children.  After the red `sys.modules` read the descent scan cannot
+/// prove the bootstrap is installed, so inlining this body is the
+/// `__majit_stringbuilder_new` / warning / compare wall on `__import__`.
+#[majit_macros::dont_look_inside]
+pub(crate) fn handle_fromlist(
     w_mod: PyObjectRef,
     w_fromlist: PyObjectRef,
     recursive: bool,
