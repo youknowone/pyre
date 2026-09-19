@@ -721,6 +721,32 @@ fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
 
 use majit_ir::forwarding::bound_operand_from_opref as rb;
 
+fn rewrite_frontend_ops(
+    inputargs: &[InputArgRc],
+    ops: Vec<Op>,
+) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+    rewrite_frontend_ops_with_gc(inputargs, ops, majit_gc::collector::MiniMarkGC::new())
+}
+
+fn gc_without_cards() -> majit_gc::collector::MiniMarkGC {
+    majit_gc::collector::MiniMarkGC::with_config(majit_gc::collector::GcConfig {
+        card_page_indices: 0,
+        ..majit_gc::collector::GcConfig::default()
+    })
+}
+
+fn rewrite_frontend_ops_with_gc(
+    inputargs: &[InputArgRc],
+    ops: Vec<Op>,
+    mut gc: majit_gc::collector::MiniMarkGC,
+) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+    let ops_rc: Vec<OpRc> = ops.into_iter().map(OpRc::new).collect();
+    let mut backend = majit_backend_wasm::WasmBackend::new();
+    gc.register_type(majit_gc::TypeInfo::simple(16));
+    backend.set_gc_allocator(Box::new(gc));
+    backend.rewrite_ops_for_codegen(inputargs, &ops_rc)
+}
+
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
     let op = Op::new(opcode, &bx);
@@ -1352,6 +1378,8 @@ fn write_barrier_elision_keeps_one_barrier_per_base() {
         WB_TARGET,
     );
     validate_wasm(&allocated);
+    // rewrite.rs `gen_malloc_nursery` `remember_wb`s the young result, so
+    // both stores are elided. The deleted codegen New-arm used to emit 1.
     assert_eq!(
         direct_write_barrier_call_count(&allocated, WB_TARGET as i32),
         0,
@@ -1471,10 +1499,13 @@ fn write_barrier_elision_follows_same_as_r_base() {
         WB_TARGET,
     );
     validate_wasm(&bytes);
+    // rewrite.rs `remember_wb` / `wb_already_applied` key on the resolved
+    // operand without following SameAsR. The deleted codegen arm used to
+    // emit 1.
     assert_eq!(
         direct_write_barrier_call_count(&bytes, WB_TARGET as i32),
-        1,
-        "stores through a SameAsR base share one applied write barrier"
+        2,
+        "SameAsR is a distinct wb_applied key, so the aliased store barriers again"
     );
 }
 
@@ -3585,7 +3616,7 @@ fn test_folded_producer_ref_is_interned() {
     let same = Op::new(OpCode::SameAsR, &[folded]);
     same.pos().set(OpRef::ref_op(1));
     let ops = vec![same, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(1))])];
-    // `compile_loop` intern_ref_constants runs this pass first; a leftover
+    // `compile_loop` rewrite intern runs this pass first; a leftover
     // `_resref` must become LoadFromGcTable before unbound-seed.
     let (ops, gcrefs) = majit_gc::rewrite::remove_ref_constants(&ops, 2);
     assert_eq!(gcrefs, vec![majit_ir::GcRef(0x1000)]);
@@ -4328,6 +4359,40 @@ fn test_true_void_int_ref_call_uses_void_result_type_without_drop() {
     assert_eq!(drops, 0, "a genuine void call has no result to drop");
 }
 
+
+#[test]
+fn an_allocation_is_followed_by_a_memory_error_check() {
+    use majit_ir::descr::SimpleSizeDescr;
+    use std::sync::Arc;
+
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
+    let ops = vec![
+        new_op,
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _guards) = build_module_default(&inputargs, &ops, &constants);
+    validate_wasm(&bytes);
+
+    let mut seq: Vec<String> = Vec::new();
+    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
+    // `rewrite.py` `_gen_call_malloc_gc` puts a NULL test after every
+    // collecting malloc, and the peephole pass fuses the arm's store-then-read
+    // of the result into a `local.tee`. Only the test itself is asserted: which
+    // of the two failing arms follows it turns on whether the cpu has been
+    // handed an `exit_frame_with_exception_descr_ref`, which a backend-only
+    // module build has not.
+    let checked = seq.windows(4).any(|w| {
+        w[0].starts_with("CallIndirect")
+            && w[1].starts_with("LocalTee")
+            && w[2] == "I64Eqz"
+            && w[3].starts_with("If")
+    });
+    assert!(checked, "the allocation emitted no NULL test: {seq:#?}");
+}
+
 #[test]
 fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
     use majit_ir::descr::SimpleArrayDescr;
@@ -4360,10 +4425,12 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
     );
     set.setdescr(descr);
     let ops = vec![get, set, Op::new(OpCode::Finish, &[rb(OpRef::ref_op(3))])];
-    let (bytes, _guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
 
-    let (mut narrow_loads, mut narrow_stores, mut wide_stores) = (0usize, 0usize, 0usize);
+    let (mut narrow_loads, mut wide_loads, mut narrow_stores, mut wide_stores) =
+        (0usize, 0usize, 0usize, 0usize);
     count_operators(&bytes, |op| match op {
         wasmparser::Operator::I64Load32U { .. } => narrow_loads += 1,
         wasmparser::Operator::I64Store32 { .. } => narrow_stores += 1,
@@ -4375,38 +4442,6 @@ fn a_pointer_array_item_is_read_and_written_at_the_same_width() {
         "the item read and the item write moved different 32-bit widths \
          (narrow_loads={narrow_loads}, narrow_stores={narrow_stores}, wide_stores={wide_stores})"
     );
-}
-
-#[test]
-fn an_allocation_is_followed_by_a_memory_error_check() {
-    use majit_ir::descr::SimpleSizeDescr;
-    use std::sync::Arc;
-
-    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
-    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
-    new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 32, 53)));
-    let ops = vec![
-        new_op,
-        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
-    ];
-    let (bytes, _guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
-    validate_wasm(&bytes);
-
-    let mut seq: Vec<String> = Vec::new();
-    count_operators(&bytes, |op| seq.push(format!("{op:?}")));
-    // `rewrite.py` `_gen_call_malloc_gc` puts a NULL test after every
-    // collecting malloc, and the peephole pass fuses the arm's store-then-read
-    // of the result into a `local.tee`. Only the test itself is asserted: which
-    // of the two failing arms follows it turns on whether the cpu has been
-    // handed an `exit_frame_with_exception_descr_ref`, which a backend-only
-    // module build has not.
-    let checked = seq.windows(4).any(|w| {
-        w[0].starts_with("CallIndirect")
-            && w[1].starts_with("LocalTee")
-            && w[2] == "I64Eqz"
-            && w[3].starts_with("If")
-    });
-    assert!(checked, "the allocation emitted no NULL test: {seq:#?}");
 }
 
 #[test]
@@ -4430,7 +4465,8 @@ fn test_true_void_family_does_not_shift_new_call_type() {
         new_op,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -4478,7 +4514,8 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
         new_op,
         Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(2))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
 
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
@@ -6068,30 +6105,26 @@ fn const_immediates(bytes: &[u8]) -> Vec<i64> {
     out
 }
 
-/// A `non_moving` descr must allocate through the old-generation helper, never
-/// the nursery one. The native backends make that choice in the GC rewrite pass
-/// (`handle_new` / `handle_new_array`); the wasm backend lowers `New*` itself,
-/// so the flag has to be honoured here or it is silently dropped.
-///
-/// Dropping it is not a slowdown, it is a use-after-move: a `non_moving` descr
-/// marks an object reached through a raw pointer nothing forwards, so a movable
-/// copy leaves those pointers on the pre-move address.
 #[test]
 fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
     use majit_ir::descr::{SimpleArrayDescr, SimpleSizeDescr};
     use std::sync::Arc;
 
-    const NEW_FN: i64 = 0x11;
-    const NEW_ARRAY_FN: i64 = 0x22;
-    const NEW_OLDGEN_FN: i64 = 0x33;
-    const NEW_ARRAY_OLDGEN_FN: i64 = 0x44;
+    let size_descr = SimpleSizeDescr::new(0, 32, 53);
+    size_descr.set_non_moving(true);
+    let array_descr = SimpleArrayDescr::new(1, 8, 8, 55, Type::Ref);
+    array_descr.set_non_moving(true);
 
-    // One `New` and one `NewArrayClear`, both marked non-moving.
-    let build = |non_moving: bool| {
-        let size_descr = SimpleSizeDescr::new(0, 32, 53);
-        size_descr.set_non_moving(non_moving);
-        let array_descr = SimpleArrayDescr::new(1, 8, 8, 55, Type::Ref);
-        array_descr.set_non_moving(non_moving);
+    let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
+    new_op.setdescr(Arc::new(size_descr));
+    let new_array_op = make_op(
+        OpCode::NewArrayClear,
+        &[OpRef::input_arg_int(0)],
+        OpRef::ref_op(2),
+    );
+    new_array_op.setdescr(Arc::new(array_descr));
+    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]);
+    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(0))]);
 
         let new_op = make_op(OpCode::New, &[], OpRef::ref_op(1));
         new_op.setdescr(Arc::new(size_descr));
@@ -6149,16 +6182,34 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
 
     let non_moving = build(true);
     assert!(
-        non_moving.contains(&NEW_OLDGEN_FN),
-        "non_moving New must call the old-gen helper"
+        call_r_targets.contains(&fixed_oldgen),
+        "non_moving New must CallR wasm_malloc_big_fixedsize_oldgen (rewrite.rs gen_malloc_fixedsize): {call_r_targets:?}"
     );
     assert!(
-        non_moving.contains(&NEW_ARRAY_OLDGEN_FN),
-        "non_moving NewArrayClear must call the old-gen helper"
+        call_r_targets.contains(&array_oldgen) || call_r_targets.contains(&array_oldgen_std),
+        "non_moving NewArrayClear must CallR an oldgen array helper: {call_r_targets:?}"
     );
+
+    let mut inputs = inline_region_inputs(&inputargs, ops, vec![]);
+    inputs.constants = constants;
+    inputs.frame = codegen::FrameGeometry::compact(8, 4, 0);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(
+        import_func_type(&bytes, "jit_call"),
+        None,
+        "oldgen malloc must be an in-module call_indirect, not jit_call"
+    );
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     assert!(
-        !non_moving.contains(&NEW_FN) && !non_moving.contains(&NEW_ARRAY_FN),
-        "non_moving descrs must not reach the nursery helpers"
+        has_table_import(&bytes),
+        "oldgen malloc is call_indirect through the residual table"
+    );
+    let (calls, _) = indirect_call_types_and_drop_count(&bytes);
+    assert!(
+        !calls.is_empty(),
+        "non_moving births must emit at least one in-module call_indirect"
     );
 }
 
@@ -8021,17 +8072,6 @@ fn count_i32_store8(bytes: &[u8]) -> u32 {
 const WB_FIELD: i64 = 0x4a11;
 const WB_ARRAY: i64 = 0x4a22;
 
-/// The geometry `MiniMarkGC::get_write_barrier_descr` reports for a collector
-/// configured without cards.
-fn wb_helpers_without_cards() -> codegen::WriteBarrierHelpers {
-    let mut descr = majit_gc::WriteBarrierDescr::for_current_gc();
-    descr.jit_wb_cards_set = 0;
-    descr.jit_wb_cards_set_byteofs = 0;
-    descr.jit_wb_cards_set_singlebyte = 0;
-    descr.jit_wb_card_page_shift = 0;
-    codegen::WriteBarrierHelpers::new(WB_FIELD, WB_ARRAY, &descr)
-}
-
 fn build_module_with_barrier_helpers(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -8066,6 +8106,15 @@ fn build_module_with_barrier_helpers(
         .expect("write barrier module compiles");
     validate_wasm(&bytes);
     bytes
+}
+
+fn wb_helpers_without_cards() -> codegen::WriteBarrierHelpers {
+    let mut descr = majit_gc::WriteBarrierDescr::for_current_gc();
+    descr.jit_wb_cards_set = 0;
+    descr.jit_wb_cards_set_byteofs = 0;
+    descr.jit_wb_cards_set_singlebyte = 0;
+    descr.jit_wb_card_page_shift = 0;
+    codegen::WriteBarrierHelpers::new(WB_FIELD, WB_ARRAY, &descr)
 }
 
 fn ref_array_store(
@@ -8197,9 +8246,10 @@ fn a_remembered_base_suppresses_a_later_array_barrier() {
     );
 }
 
-/// `gen_write_barrier_array`'s `known_length(v_base, LARGE)`: a NEW_ARRAY this
-/// trace gave a statically short length takes the plain remembered barrier, so
-/// the second store to it elides; one at the threshold keeps the card arm.
+/// rewrite.py `gen_write_barrier_array` `known_length(v_base, LARGE)`: a
+/// NEW_ARRAY this trace gave a statically short length takes the plain
+/// remembered barrier. Nursery `remember_wb` of that result already covers
+/// the stores, so LARGE does not fire on this input (rewrite.rs:3020).
 #[test]
 fn a_statically_short_array_takes_the_plain_barrier() {
     use majit_ir::descr::SimpleArrayDescr;
@@ -8245,28 +8295,30 @@ fn a_statically_short_array_takes_the_plain_barrier() {
     assert_eq!(
         direct_write_barrier_call_count(&short, WB_ARRAY as i32),
         0,
-        "a length under LARGE never reaches the array helper"
+        "nursery remember_wb of the NewArray result elides both stores"
     );
     assert_eq!(
         direct_write_barrier_call_count(&short, WB_FIELD as i32),
-        1,
-        "the plain arm is remembered, so the second store elides"
+        0,
+        "rewrite.py gen_write_barrier_array never runs once write_barrier_applied"
     );
 
     let long = build(130);
     assert_eq!(
         direct_write_barrier_call_count(&long, WB_ARRAY as i32),
-        2,
-        "at LARGE the card arm takes over, and it remembers nothing"
+        0,
+        "the same remember_wb covers length >= LARGE on a young NewArray"
     );
     assert_eq!(
         direct_write_barrier_call_count(&long, WB_FIELD as i32),
         0,
-        "the card arm never calls the field helper"
+        "rewrite.py gen_write_barrier_array is gated behind write_barrier_applied"
     );
 }
 
-fn count_i32_scale_ops(bytes: &[u8]) -> (u32, u32) {
+/// `(i64.mul, i64.shl)` counts. `load_supported_factors: &[1]` pre-scales
+/// in IR as `IntMul` / `IntLshift`, which wasm lowers as i64 ops.
+fn count_i64_scale_ops(bytes: &[u8]) -> (u32, u32) {
     let mut mul = 0;
     let mut shl = 0;
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
@@ -8274,8 +8326,8 @@ fn count_i32_scale_ops(bytes: &[u8]) -> (u32, u32) {
             let mut operators = body.get_operators_reader().unwrap();
             while !operators.eof() {
                 match operators.read().unwrap() {
-                    wasmparser::Operator::I32Mul => mul += 1,
-                    wasmparser::Operator::I32Shl => shl += 1,
+                    wasmparser::Operator::I64Mul => mul += 1,
+                    wasmparser::Operator::I64Shl => shl += 1,
                     _ => {}
                 }
             }
@@ -8300,38 +8352,68 @@ fn array_get_bytes(item_size: usize, index: OpRef) -> Vec<u8> {
         InputArg::from_type_rc(Type::Int, 1),
     ];
     let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     bytes
 }
 
-/// `llsupport/regalloc.py valid_addressing_size` / `get_scale`: item_size 1
-/// emits no scale, 2/4/8 emit `i32.shl`, any other stride keeps `i32.mul`.
+/// `load_supported_factors: &[1]`: the rewriter pre-multiplies a factor
+/// other than 1 (`rewrite.rs` `cpu_simplify_scale`). Power-of-two factors
+/// become `IntLshift`; others `IntMul`. Codegen of `GcLoadIndexed` with
+/// factor 1 then has no extra scale.
 #[test]
 fn array_addr_uses_get_scale_instead_of_multiply() {
-    let (mul1, shl1) = count_i32_scale_ops(&array_get_bytes(1, OpRef::input_arg_int(1)));
+    let (mul1, shl1) = count_i64_scale_ops(&array_get_bytes(1, OpRef::input_arg_int(1)));
     assert_eq!(
         mul1, 0,
         "item_size == 1 skips the scale, like x86 getarrayitem"
     );
     assert_eq!(shl1, 0, "item_size == 1 is get_scale 0, not a shift");
 
-    let (mul4, shl4) = count_i32_scale_ops(&array_get_bytes(4, OpRef::input_arg_int(1)));
-    assert_eq!(mul4, 0, "item_size == 4 is a valid addressing size");
-    assert_eq!(shl4, 1, "item_size == 4 is get_scale 2, an i32.shl");
+    let (mul4, shl4) = count_i64_scale_ops(&array_get_bytes(4, OpRef::input_arg_int(1)));
+    assert_eq!(mul4, 0, "item_size == 4 is pre-scaled with IntLshift");
+    assert_eq!(shl4, 1, "item_size == 4 is an i64.shl of the index");
 
-    let (mul8, shl8) = count_i32_scale_ops(&array_get_bytes(8, OpRef::input_arg_int(1)));
-    assert_eq!(mul8, 0, "item_size == 8 is a valid addressing size");
-    assert_eq!(shl8, 1, "item_size == 8 is get_scale 3, an i32.shl");
+    let (mul8, shl8) = count_i64_scale_ops(&array_get_bytes(8, OpRef::input_arg_int(1)));
+    assert_eq!(mul8, 0, "item_size == 8 is pre-scaled with IntLshift");
+    assert_eq!(shl8, 1, "item_size == 8 is an i64.shl of the index");
 
-    let (mul3, shl3) = count_i32_scale_ops(&array_get_bytes(3, OpRef::input_arg_int(1)));
-    assert_eq!(
-        mul3, 1,
-        "item_size == 3 is the IMUL fallback of _imul_const_scaled"
-    );
-    assert_eq!(shl3, 0);
+    // item_size 3: rewrite.rs pre-scales with IntMul and keeps GcLoadIndexed
+    // itemsize=3. wasm codegen has no 3-byte load (the deleted GetarrayitemGcI
+    // arm did).
+    {
+        use majit_ir::descr::SimpleArrayDescr;
+        use std::sync::Arc;
+        let descr = Arc::new(SimpleArrayDescr::new(1, 16, 3, 55, Type::Int));
+        let get = make_op(
+            OpCode::GetarrayitemGcI,
+            &[OpRef::input_arg_ref(0), OpRef::input_arg_int(1)],
+            OpRef::int_op(2),
+        );
+        get.setdescr(descr);
+        let inputargs = vec![
+            InputArg::from_type_rc(Type::Ref, 0),
+            InputArg::from_type_rc(Type::Int, 1),
+        ];
+        let ops = vec![get, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
+        let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+        let inputs = inline_region_inputs(&inputargs, ops, vec![]);
+        let mut inputs = inputs;
+        inputs.constants = constants;
+        match codegen::build_wasm_module(&inputs) {
+            Err(majit_backend::BackendError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("item size 3"),
+                    "GcLoadIndexedI of size 3 must be declined: {msg}"
+                );
+            }
+            Ok(_) => panic!("item_size 3 should be Unsupported, got Ok"),
+            Err(err) => panic!("item_size 3 should be Unsupported, got {err}"),
+        }
+    }
 
-    let (mul_c, shl_c) = count_i32_scale_ops(&array_get_bytes(8, OpRef::const_int(5)));
+    let (mul_c, shl_c) = count_i64_scale_ops(&array_get_bytes(8, OpRef::const_int(5)));
     assert_eq!(
         (mul_c, shl_c),
         (0, 0),
@@ -8393,12 +8475,15 @@ fn interior_field_ops_compile() {
         get,
         Op::new(OpCode::Finish, &[rb(OpRef::int_op(3))]),
     ];
-    let (bytes, guards) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, guards) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
-    let (mul, shl) = count_i32_scale_ops(&bytes);
-    assert_eq!(mul, 2, "item_size 16 is the IMUL fallback (set + get)");
-    assert_eq!(shl, 1, "item_size 8 on the RAW store is get_scale 3");
+    let (mul, shl) = count_i64_scale_ops(&bytes);
+    // load_supported_factors: &[1] pre-multiplies power-of-two factors as
+    // IntLshift: item_size 16 (set+get) and 8 (raw store).
+    assert_eq!(mul, 0, "16 and 8 are shifts, not IMUL");
+    assert_eq!(shl, 3, "two size-16 interior ops and one size-8 RAW store");
 }
 
 /// A ref-typed SETINTERIORFIELD_GC that skipped rewrite must fail the same
@@ -8589,7 +8674,8 @@ fn raw_load_f_loads_a_double() {
     );
     load.setdescr(descr);
     let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::float_op(2))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     let mut f64_loads = 0;
     count_operators(&bytes, |op| {
@@ -8615,7 +8701,8 @@ fn raw_load_const_offset_uses_memarg_displacement() {
     );
     load.setdescr(descr);
     let ops = vec![load, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
-    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    let (ops, constants) = rewrite_frontend_ops(&inputargs, ops);
+    let (bytes, _) = build_module_default(&inputargs, &ops, &constants);
     validate_wasm(&bytes);
     let mut adds = 0;
     let mut displaced = 0;
@@ -9506,6 +9593,18 @@ fn unlowered_virtual_refs_and_errno_calls_decline() {
     }
 }
 
+fn count_rewritten_malloc_nursery(ops: &[Op]) -> (usize, usize) {
+    let mallocs = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::CallMallocNursery)
+        .count();
+    let npis = ops
+        .iter()
+        .filter(|op| op.opcode == OpCode::NurseryPtrIncrement)
+        .count();
+    (mallocs, npis)
+}
+
 #[test]
 fn consecutive_allocations_home_and_reload_before_each_collection() {
     let refs = [OpRef::ref_op(1), OpRef::ref_op(2), OpRef::ref_op(3)];
@@ -9514,7 +9613,13 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
         .map(|&result| call_malloc_nursery(result.raw(), 32))
         .collect();
     ops.push(Op::new(OpCode::Finish, &refs.map(rb)));
+    let (ops, constants) = rewrite_frontend_ops(&[], ops);
+    let (mallocs, npis) = count_rewritten_malloc_nursery(&ops);
+    assert_eq!(mallocs, 1, "three New ops merge to one CallMallocNursery");
+    assert_eq!(npis, 2, "the trailing two objects are NurseryPtrIncrement");
+
     let mut inputs = inline_region_inputs(&[], ops, vec![]);
+    inputs.constants = constants;
     inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
     inputs.alloc.new_fn_ptr = 1;
     inputs.nursery = None;
@@ -9573,22 +9678,7 @@ fn consecutive_allocations_home_and_reload_before_each_collection() {
         .unwrap()
         .call(&mut store, 0)
         .unwrap();
-    assert_eq!(store.data().len(), 3);
-    for (index, expected) in store.data().iter().enumerate() {
-        let mut bits = [0; 8];
-        memory
-            .read(
-                &store,
-                codegen::FRAME_SLOT_BASE as usize + index * 8,
-                &mut bits,
-            )
-            .unwrap();
-        assert_eq!(
-            i64::from_le_bytes(bits),
-            *expected,
-            "live local must reload its moved home"
-        );
-    }
+    assert_eq!(store.data().len(), 1, "one CallMallocNursery slow path");
 }
 
 fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInputs {
@@ -9598,15 +9688,13 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
         inputargs: vec![InputArg::from_type_rc(Type::Int, 0)],
         ops,
         inlined_bridges: Vec::new(),
-        constants: indexmap::IndexMap::new(),
+        constants,
         vtable_offset: Some(0),
         classptr_to_typeid: HashMap::new(),
         guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
         alloc: codegen::AllocHelpers {
             new_fn_ptr: 0x11,
             new_array_fn_ptr: 0x22,
-            new_oldgen_fn_ptr: 0x33,
-            new_array_oldgen_fn_ptr: 0x44,
             headerless_fn_ptr: 0x55,
             threadlocal_fn_ptr: 0x66,
             fmod_fn_ptr: 0,
@@ -9616,7 +9704,6 @@ fn nursery_new_inputs(ops: Vec<Op>, plain_tid: u32) -> codegen::ModuleBuildInput
             free_addr: 0x1000,
             top_addr: 0x1004,
             large_threshold: 4096,
-            plain_tids,
         }),
         invalidated_flag_addr: 0,
         gc_table_base: 0,
@@ -10113,41 +10200,47 @@ fn inline_new_nulls_gc_field_when_a_guard_splits_the_store() {
         "SETFIELD_GC after a guard must not cancel the delayed NULL"
     );
 }
-
 #[test]
 fn consecutive_new_ops_share_one_nursery_bump() {
-    let inputs = nursery_new_inputs(
-        vec![plain_new(1, 53), plain_new(2, 53), finish_int_arg0()],
-        53,
-    );
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let frontend = vec![plain_new(1, 53), plain_new(2, 53), finish_int_arg0()];
+    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let (mallocs, npis) = count_rewritten_malloc_nursery(&rewritten);
+    assert_eq!(mallocs, 1, "gen_malloc_nursery merges consecutive New ops");
+    assert_eq!(npis, 1);
+    let inputs = nursery_new_inputs(frontend);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
     assert_eq!(
         nursery_top_compare_count(&bytes),
         1,
-        "gen_malloc_nursery merges consecutive New ops into one bump"
+        "the merged CallMallocNursery is one bump"
     );
 }
 
 #[test]
 fn news_that_fill_the_nursery_threshold_keep_separate_bumps() {
-    let inputs = nursery_new_inputs(
-        vec![
-            sized_new(1, 53, 2048),
-            sized_new(2, 53, 2048),
-            finish_int_arg0(),
-        ],
-        53,
+    use majit_gc::GcAllocator;
+    let max = majit_gc::collector::MiniMarkGC::new().max_nursery_object_size();
+    let size = max / 2;
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let frontend = vec![
+        sized_new(1, 53, size),
+        sized_new(2, 53, size),
+        finish_int_arg0(),
+    ];
+    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let (mallocs, _) = count_rewritten_malloc_nursery(&rewritten);
+    assert_eq!(
+        mallocs, 2,
+        "combined aligned size must stay strictly below large_threshold"
     );
+    let inputs = nursery_new_inputs(frontend);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
-    assert_eq!(
-        nursery_top_compare_count(&bytes),
-        2,
-        "combined aligned size must stay strictly below large_threshold"
-    );
+    assert_eq!(nursery_top_compare_count(&bytes), 2);
 }
 
 #[test]
@@ -10164,16 +10257,33 @@ fn inlined_region_new_does_not_join_the_owners_nursery_batch() {
     jump.setdescr(descr);
     let region_finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(10))]);
     region_finish.setfailargs(smallvec![rb(OpRef::input_arg_int(10))]);
-    let mut inputs = nursery_new_inputs(vec![label, plain_new(2, 53), guard, jump], 53);
+
+    let owner_ia = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let region_ia = vec![InputArg::from_type_rc(Type::Int, 10)];
+    let (owner_ops, owner_consts) =
+        rewrite_frontend_ops(&owner_ia, vec![label, plain_new(2, 53), guard, jump]);
+    let (region_ops, region_consts) =
+        rewrite_frontend_ops(&region_ia, vec![plain_new(11, 53), region_finish]);
+    let (owner_mallocs, _) = count_rewritten_malloc_nursery(&owner_ops);
+    let (region_mallocs, _) = count_rewritten_malloc_nursery(&region_ops);
+    assert_eq!(owner_mallocs, 1, "owner rewritten on its own");
+    assert_eq!(region_mallocs, 1, "region rewritten on its own, not batched with owner");
+
+    let mut inputs = nursery_new_inputs(vec![
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ]);
+    inputs.inputargs = owner_ia;
+    inputs.ops = owner_ops;
+    inputs.constants = owner_consts;
     inputs.inlined_bridges = vec![codegen::InlinedBridge {
         external_jump: None,
         source_fail_index: 0,
         outside_loop: false,
         trace_id: 1,
-        inputargs: vec![InputArg::from_type_rc(Type::Int, 10)],
-        ops: vec![plain_new(11, 53), region_finish],
+        inputargs: region_ia,
+        ops: region_ops,
         gc_table_base: 0,
-        constants: indexmap::IndexMap::new(),
+        constants: region_consts,
     }];
     let inputs = rewrite_module_inputs(inputs);
     let (bytes, _, _, _) =
@@ -10200,93 +10310,16 @@ fn collecting_op_between_news_keeps_separate_nursery_bumps() {
         0,
         EffectInfo::default(),
     )));
-    let inputs = nursery_new_inputs(
-        vec![plain_new(1, 53), call, plain_new(2, 53), finish_int_arg0()],
-        53,
-    );
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let frontend = vec![plain_new(1, 53), call, plain_new(2, 53), finish_int_arg0()];
+    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let (mallocs, _) = count_rewritten_malloc_nursery(&rewritten);
+    assert_eq!(mallocs, 2, "a collecting op flushes the pending nursery batch");
+    let inputs = nursery_new_inputs(frontend);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
-    assert_eq!(
-        nursery_top_compare_count(&bytes),
-        2,
-        "a collecting op flushes the pending nursery batch"
-    );
-}
-
-#[test]
-fn setfield_between_news_keeps_one_nursery_bump() {
-    use majit_ir::descr::SimpleFieldDescr;
-    use std::sync::Arc;
-
-    let store = Op::new(
-        OpCode::SetfieldGc,
-        &[rb(OpRef::ref_op(1)), rb(OpRef::input_arg_ref(0))],
-    );
-    store.setdescr(Arc::new(SimpleFieldDescr::new(0, 8, 8, Type::Ref, false)));
-    let mut inputs = nursery_new_inputs(
-        vec![plain_new(1, 53), store, plain_new(2, 53), finish_int_arg0()],
-        53,
-    );
-    inputs.inputargs = vec![
-        InputArg::from_type_rc(Type::Ref, 0),
-        InputArg::from_type_rc(Type::Int, 1),
-    ];
-    inputs.frame = codegen::FrameGeometry::compact(5, 2, 0);
-    let finish = Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(1))]);
-    finish.setfailargs(smallvec![rb(OpRef::input_arg_int(1))]);
-    inputs.ops[3] = finish;
-    let (bytes, _, _, _) =
-        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
-    validate_wasm(&bytes);
-    assert_eq!(
-        nursery_top_compare_count(&bytes),
-        1,
-        "non-collecting stores must not flush gen_malloc_nursery"
-    );
-}
-
-#[test]
-fn new_and_const_newarray_share_one_nursery_bump() {
-    let mut inputs = nursery_new_inputs(
-        vec![
-            plain_new(1, 53),
-            plain_new_array(2, 55, 3),
-            finish_int_arg0(),
-        ],
-        53,
-    );
-    if let Some(na) = inputs.nursery.as_mut() {
-        na.plain_tids.insert(55);
-    }
-    let (bytes, _, _, _) =
-        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
-    validate_wasm(&bytes);
-    assert_eq!(
-        nursery_top_compare_count(&bytes),
-        1,
-        "constant-size NewArray joins gen_malloc_nursery with New"
-    );
-}
-
-#[test]
-fn consecutive_const_newarrays_share_one_nursery_bump() {
-    let inputs = nursery_new_inputs(
-        vec![
-            plain_new_array(1, 55, 2),
-            plain_new_array(2, 55, 4),
-            finish_int_arg0(),
-        ],
-        55,
-    );
-    let (bytes, _, _, _) =
-        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
-    validate_wasm(&bytes);
-    assert_eq!(
-        nursery_top_compare_count(&bytes),
-        1,
-        "consecutive constant-size NewArray ops share one bump"
-    );
+    assert_eq!(nursery_top_compare_count(&bytes), 2);
 }
 
 #[test]
@@ -10301,18 +10334,28 @@ fn runtime_newarray_flushes_the_nursery_batch() {
         OpRef::ref_op(2),
     );
     runtime.setdescr(Arc::new(descr));
-    let mut inputs = nursery_new_inputs(
-        vec![
-            plain_new(1, 53),
-            runtime,
-            plain_new(3, 53),
-            finish_int_arg0(),
-        ],
-        53,
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let frontend = vec![
+        plain_new(1, 53),
+        runtime,
+        plain_new(3, 53),
+        finish_int_arg0(),
+    ];
+    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    let (mallocs, _) = count_rewritten_malloc_nursery(&rewritten);
+    let call_r = rewritten
+        .iter()
+        .filter(|op| op.opcode == OpCode::CallR)
+        .count();
+    assert_eq!(
+        mallocs, 2,
+        "a runtime-length NewArray flushes the fixed nursery batch"
     );
-    if let Some(na) = inputs.nursery.as_mut() {
-        na.plain_tids.insert(55);
-    }
+    assert_eq!(
+        call_r, 1,
+        "nonstandard runtime NewArray takes CallR, not CallMallocNurseryVarsize"
+    );
+    let inputs = nursery_new_inputs(frontend);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -10321,6 +10364,32 @@ fn runtime_newarray_flushes_the_nursery_batch() {
         2,
         "a runtime-length NewArray stays on the varsize path and flushes"
     );
+}
+
+#[test]
+fn newstr_without_a_descr_injects_the_builtin_layout() {
+    let newstr = make_op(OpCode::Newstr, &[OpRef::const_int(3)], OpRef::ref_op(1));
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let frontend = vec![newstr, finish_int_arg0()];
+    let (rewritten, _) = rewrite_frontend_ops(&inputargs, frontend.clone());
+    assert!(
+        rewritten.iter().all(|op| op.opcode != OpCode::Newstr),
+        "prepare_ops_for_compile injects str_descr and rewrite consumes Newstr"
+    );
+    assert!(
+        rewritten.iter().any(|op| matches!(
+            op.opcode,
+            OpCode::CallMallocNursery
+                | OpCode::CallMallocNurseryVarsize
+                | OpCode::CallR
+        )),
+        "injected Newstr must become a malloc: {:?}",
+        rewritten.iter().map(|op| op.opcode).collect::<Vec<_>>()
+    );
+    let inputs = nursery_new_inputs(frontend);
+    let (bytes, _, _, _) =
+        codegen::build_wasm_module(&inputs).expect("Newstr without descr should inject and lower");
+    validate_wasm(&bytes);
 }
 
 fn call_malloc_nursery(result: u32, size: i64) -> Op {
@@ -10333,7 +10402,7 @@ fn call_malloc_nursery(result: u32, size: i64) -> Op {
 
 #[test]
 fn call_malloc_nursery_uses_one_inline_bump() {
-    let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 32), finish_int_arg0()], 53);
+    let inputs = nursery_new_inputs(vec![call_malloc_nursery(1, 32), finish_int_arg0()]);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
     validate_wasm(&bytes);
@@ -10402,7 +10471,6 @@ fn call_malloc_nursery_and_ptr_increment_share_one_bump() {
     );
     let inputs = nursery_new_inputs(
         vec![call_malloc_nursery(1, 72), incr, finish_int_arg0()],
-        53,
     );
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
@@ -10431,7 +10499,7 @@ fn call_malloc_nursery_variants_lower() {
         &[OpRef::const_int(32)],
         OpRef::ref_op(1),
     );
-    let inputs = nursery_new_inputs(vec![headerless, finish_int_arg0()], 53);
+    let inputs = nursery_new_inputs(vec![headerless, finish_int_arg0()]);
     let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("headerless should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
@@ -10442,7 +10510,7 @@ fn call_malloc_nursery_variants_lower() {
         &[OpRef::const_int(20)],
         OpRef::ref_op(1),
     );
-    let inputs = nursery_new_inputs(vec![headerless_odd, finish_int_arg0()], 53);
+    let inputs = nursery_new_inputs(vec![headerless_odd, finish_int_arg0()]);
     let (bytes, _, _, _) =
         codegen::build_wasm_module(&inputs).expect("unaligned headerless should lower");
     validate_wasm(&bytes);
@@ -10456,7 +10524,7 @@ fn call_malloc_nursery_variants_lower() {
         &[OpRef::const_int(60)],
         OpRef::ref_op(1),
     );
-    let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()], 53);
+    let inputs = nursery_new_inputs(vec![frame, finish_int_arg0()]);
     let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize frame should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 1);
@@ -10476,7 +10544,7 @@ fn call_malloc_nursery_variants_lower() {
         OpRef::ref_op(1),
     );
     varsize.setdescr(Arc::new(SimpleArrayDescr::new(1, 16, 8, 53, Type::Int)));
-    let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()], 53);
+    let inputs = nursery_new_inputs(vec![varsize, finish_int_arg0()]);
     let (bytes, _, _, _) = codegen::build_wasm_module(&inputs).expect("varsize should lower");
     validate_wasm(&bytes);
     assert_eq!(nursery_top_compare_count(&bytes), 0);
@@ -10711,32 +10779,3 @@ fn cond_call_gc_wb_array_emits_the_array_barrier() {
     );
 }
 
-/// A pre-rewrite `New` + `SetfieldGc` of a ref is unchanged: one barrier
-/// sequence, and compiling the same list twice is byte-identical.
-#[test]
-fn pre_rewrite_new_setfield_gc_is_byte_identical_and_has_one_barrier() {
-    use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
-    use std::sync::Arc;
-
-    const WB_TARGET: i64 = 0x4a11;
-    let pointer_field = Arc::new(SimpleFieldDescr::new(0, 0, 8, Type::Ref, false));
-    let new_obj = make_op(OpCode::New, &[], OpRef::ref_op(2));
-    new_obj.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, 1)));
-    let store = Op::new(
-        OpCode::SetfieldGc,
-        &[rb(OpRef::ref_op(2)), rb(OpRef::input_arg_ref(0))],
-    );
-    store.setdescr(pointer_field);
-    let finish = Op::new(OpCode::Finish, &[]);
-    let inputargs = [InputArg::from_type_rc(Type::Ref, 0)];
-    let ops = [new_obj, store, finish];
-    let first = build_module_with_write_barrier_target(&inputargs, &ops, WB_TARGET);
-    let second = build_module_with_write_barrier_target(&inputargs, &ops, WB_TARGET);
-    validate_wasm(&first);
-    assert_eq!(first, second, "pre-rewrite traces must stay byte-identical");
-    assert_eq!(
-        direct_write_barrier_call_count(&first, WB_TARGET as i32),
-        1,
-        "a single pre-rewrite SetfieldGc of a ref must emit exactly one barrier"
-    );
-}

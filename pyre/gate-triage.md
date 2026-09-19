@@ -207,7 +207,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 **OFF**. Three diagnostics (`PYRE_DESCR_SPELLING_GATE`, `PYRE_GC_DIAG`,
 `PYRE_MC_DIAG`) read as ON under the unqualified rule and are OFF in fact.
 
-### §6a — Live default-ON (7): the removal targets
+### §6a — Live default-ON (6): the removal targets
 
 | gate | what is ON by default | retire when |
 |---|---|---|
@@ -215,7 +215,6 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WALKABORT_OFF | the non-carrier walk-abort leg (`trace.rs walk_abort_leg_enabled`) | kept deliberately: the leg commits irrevocably once the blackhole runs, so it is the one-binary A/B for the bug class it sits in |
 | PYRE_WASM_BRIDGE_PARAMS | a wasm guard passing its fail args to the bridge as call parameters (`lib.rs bridge_params_enabled`); `=0`/`false`/`off` restores the jitframe spill crossing | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
 | PYRE_WASM_INLINE_BRIDGE | merging a loop-closing bridge's ops into the module of the loop it guards into, so `guard → bridge → loop` becomes a `br` (`lib.rs inline_bridge_enabled`); `=0`/`false`/`off` restores the separate bridge module | the wasm trace-crossing epic closes; until then it is the one-binary A/B for the crossing shape |
-| PYRE_WASM_GC_REWRITE | running `rewrite.py` (`GcRewriter::rewrite_for_gc_with_constants`) on every wasm `compile_loop` / `compile_bridge` (`lib.rs prepare_ops_for_compile`); `=0`/`false`/`off` restores the intern-only pre-rewrite path | when the pre-rewrite New / NewArray arms are deleted |
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 | PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a residual wrote to the frame, whether or not it forced, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the walk reads a local through a channel a residual cannot leave stale; until then this is the one-binary control that keeps the defect demonstrable, and the parity fixture's two arms (a forcing call, and an inlined callee whose store forces nothing) are only separable with it |
 

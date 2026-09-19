@@ -173,10 +173,9 @@ pub fn bind_failarg_const_table(gcrefs: &[majit_ir::GcRef], gc_table_base: u32) 
 
 /// Merge one interned GC table into the force-arm ConstPtr map.
 ///
-/// `intern_ref_constants` of a later compile (an inline bridge) clears the
-/// TLS map. Re-emission must restore every retained region's table, each
-/// under its own `base_addr`, or a non-null owner ConstPtr falls through
-/// to a raw address.
+/// A later compile (an inline bridge) rebuilds the TLS map. Re-emission
+/// must restore every retained region's table, each under its own
+/// `base_addr`, or a non-null owner ConstPtr falls through to a raw address.
 pub fn extend_failarg_const_table_from_gc_table(table: &majit_gc::GcTable) {
     FAILARG_CONST_TABLE.with(|cell| {
         let mut map = cell.borrow_mut();
@@ -1134,64 +1133,6 @@ fn emit_sized_int_store(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize) {
     };
 }
 
-/// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
-/// a FieldDescr; a missing one is an invariant violation, so panic rather than
-/// emit a silently-wrong width.
-fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
-    let descr = op.getdescr();
-    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
-        return (fd.field_size(), fd.is_field_signed());
-    }
-    missing_layout_descr("field descr (size/sign)", op)
-}
-
-/// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
-/// is stored at machine-word width regardless of the descr's recorded size: a
-/// pointer is 4 bytes on wasm32, so a fixed 8-byte store would clobber the
-/// adjacent field. There is no `SetfieldGcR` opcode, so the field type is the
-/// only signal — mirroring the `GetfieldGcR` read, which always loads pointers
-/// at i32 width. Non-pointer fields use the descr's true field width.
-fn setfield_store_size_from_descr(op: &Op) -> usize {
-    let descr = op.getdescr();
-    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
-        if fd.is_pointer_field() {
-            return std::mem::size_of::<usize>();
-        }
-        return fd.field_size();
-    }
-    missing_layout_descr("field descr (store size)", op)
-}
-
-fn field_is_float_from_descr(op: &Op) -> bool {
-    let descr = op.getdescr();
-    match descr.as_ref().and_then(|d| d.as_field_descr()) {
-        Some(fd) => fd.is_float_field(),
-        None => missing_layout_descr("field descr (is_float)", op),
-    }
-}
-
-fn emit_float_load(
-    sink: &mut PeepSink<'_, '_>,
-    offset: u64,
-    size: usize,
-) -> Result<(), BackendError> {
-    match size {
-        4 => {
-            sink.f32_load(mem32(offset));
-            sink.f64_promote_f32();
-        }
-        8 => {
-            sink.f64_load(mem64(offset));
-        }
-        other => {
-            return Err(BackendError::Unsupported(format!(
-                "wasm codegen: float load has size {other}"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn value_is_f64(value_types: &ValueLocals, val: OpRef) -> bool {
     if val.is_constant() {
         return val.ty() == Some(Type::Float);
@@ -1219,31 +1160,6 @@ fn emit_float_store(
         }
     }
     Ok(())
-}
-
-/// `(item_size, is_signed)` from an op's ArrayDescr. An array op always carries
-/// an ArrayDescr; a missing one is an invariant violation, so panic.
-fn array_item_size_sign_from_descr(op: &Op) -> (usize, bool) {
-    op.with_array_descr(|ad| (ad.item_size(), ad.is_item_signed()))
-        .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
-}
-
-/// `raw_load` / `raw_store` address `arg(0) + arg(1)` and nothing else: a raw
-/// buffer has no GC array header, so the descr's base size is not part of the
-/// address the way it is for the `GETARRAYITEM` family.
-fn emit_raw_addr(
-    sink: &mut PeepSink<'_, '_>,
-    constants: &indexmap::IndexMap<u32, i64>,
-    value_types: &ValueLocals,
-    op: &Op,
-) -> u64 {
-    emit_gc_offset_addr(
-        sink,
-        constants,
-        value_types,
-        op.arg(0).to_opref(),
-        op.arg(1).to_opref(),
-    )
 }
 
 /// Address the GC rewrite's descriptor-free `base + offset` memory form.
@@ -1337,11 +1253,6 @@ fn gc_rewrite_access_size(
         )));
     }
     Ok((size, encoded < 0))
-}
-
-fn array_item_is_float_from_descr(op: &Op) -> bool {
-    op.with_array_descr(|ad| ad.item_type() == Type::Float)
-        .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
 }
 
 /// Dense census of every non-constant Ref-typed value (input arg / op result),
@@ -1982,27 +1893,6 @@ pub fn frame_value_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
     normal_frame_value_slots(inputargs, ops) + LabelResumeData::collect(inputargs, ops).scalar_slots
 }
 
-/// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
-/// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
-/// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
-/// / `SETARRAYITEM_GC` / `SETINTERIORFIELD_GC` through the barrier).
-fn ref_store_value_arg(op: &Op) -> Option<usize> {
-    match op.opcode {
-        OpCode::SetfieldGc => Some(1),
-        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc => Some(2),
-        _ => None,
-    }
-}
-
-/// If `op` stores a (non-constant) reference into a GC object, return the base
-/// object operand that must be passed through the write barrier; otherwise
-/// `None`. [`RefValues`] records every non-constant Ref-typed input/result;
-/// [`RefHomes`] deliberately records only values that must survive a collecting
-/// position or be published for force/resume. This mirrors the native
-/// `handle_write_barrier_setfield` gate `v.type == 'r' and not ConstPtr`: a
-/// constant reference is an immortal/old object whose store never makes the base
-/// point to young, so it needs no barrier (rewrite.py:930-931).
-///
 /// `CondCallGcWb` / `CondCallGcWbArray` are the rewriter's already-decided
 /// barrier ops (`rewrite.py gen_write_barrier` / `gen_write_barrier_array`);
 /// the stored value is no longer on the op, so the base is `arg(0)`.
@@ -2014,7 +1904,6 @@ fn write_barrier_base(op: &Op, ref_values: &RefValues) -> Option<OpRef> {
     // `contains` returns false for constants, matching the gate's `not ConstPtr`.
     ref_values.contains(val).then(|| op.arg(0).to_opref())
 }
-
 /// `llsupport/gc.py WriteBarrierDescr` as the emitted barrier reads it, paired
 /// with the addresses of the two helpers its arms call.
 ///
@@ -2178,9 +2067,8 @@ fn emit_wb_helper_call(
     sink.drop();
 }
 
-/// Emit a write-barrier check on `base_ref` before a ref-storing field/array
-/// store, standing in for the `COND_CALL_GC_WB` the native GC rewrite pass
-/// inserts.
+/// Emit a write-barrier check on `base_ref` for a rewriter `CondCallGcWb` /
+/// `CondCallGcWbArray`.
 ///
 /// With the residual type family declared (`residual_type_base`), this is
 /// `_write_barrier_fastpath`: one test of the flag byte, and only a flagged
@@ -2494,8 +2382,8 @@ fn call_can_collect(op: &Op) -> bool {
 }
 
 /// Static collecting-call positions whose gcmap-visible homes may be forwarded.
-/// Every `is_malloc` op (the whole `New..=Newunicode` range, string allocations
-/// included) routes through a collecting allocator. A residual call earns a
+/// Every `is_malloc` op (post-rewrite `CallMallocNursery*` included) routes
+/// through a collecting allocator. A residual call earns a
 /// position only where [`call_can_collect`] admits it, which is the predicate
 /// the reload side already applies: a home exists so a collection can forward
 /// the value, so a call that cannot collect would buy a home that nothing ever
@@ -3657,10 +3545,10 @@ fn residual_call_void_true_arity(
 }
 
 /// Arity of `op`'s in-module `(i64×n) -> i64` lowering, if it has one: an
-/// eligible residual CALL (word-result or word-ABI void), a `New*`
-/// allocation (the `wasm_jit_alloc*` helper targets are plain
-/// `extern "C" fn(i64×n) -> i64` table entries), or a ref-storing store
-/// (its `wasm_jit_write_barrier` helper takes 1 arg). All of these share
+/// eligible residual CALL (word-result or word-ABI void), a
+/// `CallMallocNursery*` slow path (the `wasm_jit_alloc*` helper targets are
+/// plain `extern "C" fn(i64×n) -> i64` table entries), or a
+/// `CondCallGcWb*` (`wasm_jit_write_barrier` takes 1 arg). All of these share
 /// the i64-result residual-call type family, so one max covers them. True-void
 /// residuals use a separate result family and arity census.
 fn direct_helper_i64_arity(
@@ -3679,7 +3567,7 @@ fn direct_helper_i64_arity(
     }
     match op.opcode {
         // wasm_jit_alloc(type_id, size)
-        OpCode::New | OpCode::NewWithVtable | OpCode::CallMallocNursery => Some(2),
+        OpCode::CallMallocNursery => Some(2),
         OpCode::CallMallocNurseryHeaderless | OpCode::ThreadlocalrefGet => Some(1),
         OpCode::CallMallocNurseryVarsizeFrame => Some(2),
         // wasm_jit_alloc_array(type_id, base_size, item_size, length, len_offset)
@@ -3700,10 +3588,10 @@ fn direct_helper_i64_arity(
 /// invocation and therefore needs the corresponding function import.
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
-/// i64, typed float, and true-void residual families, `New*`, and write
-/// barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each one be;
-/// non-uniform CALLs, an unvouched callee, and string allocation retain the
-/// trampoline.
+/// i64, typed float, and true-void residual families, `CallMallocNursery*`,
+/// and write barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each
+/// one be; non-uniform CALLs, an unvouched callee, and string allocation
+/// retain the trampoline.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -3720,7 +3608,6 @@ fn has_trampoline_calls(
         // but neither emission arm calls anything: CheckMemoryError is an
         // inline null/exit test and RecordKnownResult is optimizer metadata.
         OpCode::CheckMemoryError | OpCode::RecordKnownResult => false,
-        OpCode::Newstr | OpCode::Newunicode => false,
         // Every residual CALL uses the trampoline unless its exact lowering
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
@@ -3729,7 +3616,7 @@ fn has_trampoline_calls(
                 && residual_call_void_true_arity(op, constants).is_none()
                 && conditional_call_true_void_arity(op, constants).is_none()
         }
-        // `New*` and ref-store write barriers are covered by
+        // `CallMallocNursery*` and `CondCallGcWb*` are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
         // the frame call area.
         _ => false,
@@ -4058,12 +3945,12 @@ pub struct CaInlineParams {
     pub large_threshold: usize,
 }
 
-/// Inline nursery-bump fast-path parameters for `New`/`NewWithVtable` and
-/// the post-rewrite `CallMallocNursery*` ops (rewrite.py's malloc fast path
-/// over the gc.py:525-531 `get_nursery_free_addr`/`get_nursery_top_addr`
-/// surface, which the x86 backend lowers as `malloc_cond`: load free, bump,
-/// compare top, call the slow path only on overflow). `None` keeps every
-/// allocation on the `wasm_jit_alloc` helper call.
+/// Inline nursery-bump fast-path parameters for post-rewrite
+/// `CallMallocNursery*` ops (rewrite.py's malloc fast path over the
+/// gc.py:525-531 `get_nursery_free_addr`/`get_nursery_top_addr` surface,
+/// which the x86 backend lowers as `malloc_cond`: load free, bump, compare
+/// top, call the slow path only on overflow). `None` keeps every allocation
+/// on the `wasm_jit_alloc` helper call.
 #[derive(Clone)]
 pub struct NurseryAllocParams {
     /// Linear-memory address of the GC's `nursery_free` bump pointer.
@@ -4077,7 +3964,6 @@ pub struct NurseryAllocParams {
     /// destructor / weakref side-list registration).
     pub plain_tids: std::collections::HashSet<u32>,
 }
-
 /// `Nursery::alloc` 8-aligns the total. The inline VarsizeFrame and
 /// headerless bumps write `nursery_free` themselves, so a wasm32 size that
 /// is only word-aligned has to be raised here or the next object header is
@@ -4233,21 +4119,12 @@ fn needs_builtin_string_descr(op: &Op) -> bool {
         && (builtin_string_array_descr(op.opcode).is_some()
             || builtin_string_hash_field_descr(op.opcode).is_some())
 }
-
 /// `__indirect_function_table` indices of the allocation helpers a compiled
-/// trace calls for `New*` / `NewArray*`.
-///
-/// Two generations, picked per operation from the descr's `non_moving` flag:
-/// the nursery pair is the default, the old-gen pair is for a descr whose
-/// object must not move (see `majit_backend_wasm::wasm_jit_alloc_oldgen`).
-/// The native backends make the same choice inside the GC rewrite pass, which
-/// the wasm backend bypasses in favour of this lowering.
+/// trace calls for `CallMallocNursery*` slow paths.
 #[derive(Clone, Copy, Default)]
 pub struct AllocHelpers {
     pub new_fn_ptr: i64,
     pub new_array_fn_ptr: i64,
-    pub new_oldgen_fn_ptr: i64,
-    pub new_array_oldgen_fn_ptr: i64,
     pub headerless_fn_ptr: i64,
     pub threadlocal_fn_ptr: i64,
     pub fmod_fn_ptr: i64,
@@ -4975,8 +4852,8 @@ pub fn build_wasm_module(
         has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
     // In-module residual calls ([`RESIDUAL_CALL_ABI`]): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
-    // result or word-ABI void) plus the `New*` / write-barrier helper
-    // targets, which share the same uniform-i64 ABI — or `None` if there
+    // result or word-ABI void) plus the `CallMallocNursery*` / write-barrier
+    // helper targets, which share the same uniform-i64 ABI — or `None` if there
     // are none. Each distinct arity `0..=max` gets its own function type
     // (declared below) so those arms can `call_indirect` with a static type.
     let residual_max_arity = {
@@ -5480,8 +5357,8 @@ fn build_function(
     frame: FrameGeometry,
     // Base wasm type index of the `(i64×n)->i64` residual-call types (type
     // `residual_type_base + n` for arity `n`), or `None` when the trace has no
-    // eligible residual call / `New*` / write barrier, so those arms always
-    // use the `jit_call` path.
+    // eligible residual call / `CallMallocNursery*` / write barrier, so those
+    // arms always use the `jit_call` path.
     residual_type_base: Option<u32>,
     // Exact wasm type indices for direct typed residual calls, keyed by their
     // descr-derived parameter sequence and result. Float SSA values are
@@ -7285,29 +7162,34 @@ fn build_function(
             // GC_LOAD_INDEXED first.
             OpCode::GetinteriorfieldGcI
             | OpCode::GetinteriorfieldGcR
-            | OpCode::GetinteriorfieldGcF => {
+            | OpCode::GetinteriorfieldGcF
+            | OpCode::SetinteriorfieldGc
+            | OpCode::SetinteriorfieldRaw
+            | OpCode::Strlen
+            | OpCode::Unicodelen
+            | OpCode::Strgetitem
+            | OpCode::Unicodegetitem
+            | OpCode::Strsetitem
+            | OpCode::Unicodesetitem
+            | OpCode::Strhash
+            | OpCode::Unicodehash
+            | OpCode::Copystrcontent
+            | OpCode::Copyunicodecontent
+            | OpCode::RawLoadI
+            | OpCode::RawLoadF
+            | OpCode::RawStore
+            | OpCode::GuardAlwaysFails => {
+                return Err(BackendError::Unsupported(format!(
+                    "wasm codegen: {:?} reached codegen without the GC rewrite",
+                    op.opcode
+                )));
+            }
+            OpCode::GetarrayitemRawR => {
                 let vi = op.pos().get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    let field = unpack_interior_field(op);
-                    let base = emit_scaled_index_addr(
-                        &mut sink,
-                        constants,
-                        value_types,
-                        op.arg(0).to_opref(),
-                        op.arg(1).to_opref(),
-                        field.item_size,
-                        field.offset,
-                    );
-                    // The opcode, not the descriptor, names the result's
-                    // register class — it is what the value local was declared
-                    // from — so it picks the load the same way the three
-                    // `Getarrayitem` arms do.
-                    if op.opcode == OpCode::GetinteriorfieldGcF {
-                        emit_float_load(&mut sink, base, field.field_size)?;
-                    } else {
-                        let (size, signed) = field.access_size_sign();
-                        emit_sized_int_load(&mut sink, base, size, signed);
-                    }
+                    let base_size = emit_array_addr(&mut sink, constants, value_types, op);
+                    let (item_size, signed) = array_item_access_size_sign(op);
+                    emit_sized_int_load(&mut sink, base_size, item_size, signed);
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -7381,7 +7263,6 @@ fn build_function(
                     sink.local_set(value_types.local(vi));
                 }
             }
-
             // ── GC rewrite memory ops ──
             // These descriptor-free forms carry their complete layout in
             // operands. Supporting them here lets wasm consume the same
@@ -7499,30 +7380,6 @@ fn build_function(
                     emit_resolve(&mut sink, constants, value_types, val);
                     emit_sized_int_store(&mut sink, offset, size);
                 }
-            }
-
-            // ── Raw memory access ──
-            OpCode::RawLoadI | OpCode::RawLoadF => {
-                let vi = op.pos().get().raw();
-                if !OpRef::raw_is_constant(vi) {
-                    let offset = emit_raw_addr(&mut sink, constants, value_types, op);
-                    if op.opcode == OpCode::RawLoadF {
-                        sink.f64_load(mem64(offset));
-                    } else {
-                        let (item_size, signed) = array_item_size_sign_from_descr(op);
-                        emit_sized_int_load(&mut sink, offset, item_size, signed);
-                    }
-                    sink.local_set(value_types.local(vi));
-                }
-            }
-            OpCode::RawStore => {
-                let offset = emit_raw_addr(&mut sink, constants, value_types, op);
-                // `emit_resolve` hands back a Float operand as the `i64` its
-                // bits spell, so the width-sized integer store writes the same
-                // eight bytes an `f64.store` would.
-                emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref());
-                let (item_size, _signed) = array_item_size_sign_from_descr(op);
-                emit_sized_int_store(&mut sink, offset, item_size);
             }
 
             // ── Exception handling ──
@@ -8029,32 +7886,6 @@ fn build_function(
                 );
                 guard_idx += 1;
             }
-            OpCode::GuardAlwaysFails => {
-                // This guard always exits, and what it exits INTO is the
-                // interpreter: it is the cut a segmented trace ends with
-                // (`rewrite.py:419-426` lowers it to `GUARD_VALUE(SAME_AS_I(0),
-                // 1)` for the backends that run the GC rewrite, so those reach
-                // the ordinary GUARD_VALUE path). This backend does not run
-                // that rewrite, so the raw opcode arrives here and has to
-                // publish its own fail args — the resume rebuilds the frame
-                // from them, and an exit that writes none leaves the
-                // interpreter reading whatever the slots last held.
-                emit_guard_exit(
-                    &mut sink,
-                    constants,
-                    value_types,
-                    guard_idx,
-                    op,
-                    block_exit_depth,
-                    guard_dispatch,
-                    // Emitted at statement level: this guard has no passing
-                    // outcome, so no `if` stands between it and the region
-                    // blocks. A loop-closing bridge merges into exactly this
-                    // exit when the owner is a segmented trace's cut.
-                    0,
-                );
-                guard_idx += 1;
-            }
             // `reached_loop_header` mints this op only to donate its
             // `rd_resume_position` to the guards `jump_to_existing_trace` and
             // `inline_short_preamble` stamp; both `optimize_GUARD_FUTURE_CONDITION`
@@ -8233,7 +8064,6 @@ fn build_function(
                 emit_scale_index(&mut sink, item_size);
                 sink.memory_copy(0, 0);
             }
-
             // ── Misc ops ──
             OpCode::NurseryPtrIncrement => {
                 let vi = op.pos().get().raw();
@@ -8366,8 +8196,8 @@ fn build_function(
                         frame,
                     );
                 }
-                // Same spill as `New*`: `wasm_jit_alloc` can return old-gen
-                // when the nursery cannot hold the request.
+                // `wasm_jit_alloc` can return old-gen when the nursery cannot
+                // hold the request.
             }
             OpCode::CallMallocNurseryHeaderless => {
                 let vi = op.pos().get().raw();
@@ -8650,10 +8480,8 @@ fn build_function(
                 // hold the frame.
             }
             // `GcRewriterImpl::_gen_call_malloc_gc` emits this after a residual
-            // malloc. Use the same propagate-exception exit as the wasm
-            // backend's inline `New*` lowering. This is especially important
-            // on wasm: address zero is valid linear memory, so merely omitting
-            // the check would turn OOM into silent heap corruption.
+            // malloc. Address zero is valid linear memory, so omitting the
+            // check would turn OOM into silent heap corruption.
             OpCode::CheckMemoryError => {
                 emit_memory_error_check(
                     &mut sink,
@@ -9425,7 +9253,6 @@ fn build_function(
                     op.opcode
                 );
             }
-
             // ── Misc ──
             OpCode::ForceToken => {
                 let vi = op.pos().get().raw();
@@ -10389,34 +10216,6 @@ fn const_operand_value(constants: &indexmap::IndexMap<u32, i64>, opref: OpRef) -
         .then(|| resolve_const_bits(constants, opref))
 }
 
-/// Extract field offset from op's descr (FieldDescr).
-fn field_offset_from_descr(op: &Op) -> u64 {
-    let __descr_arc_descr = op.getdescr();
-    if let Some(descr) = __descr_arc_descr.as_ref()
-        && let Some(fd) = descr.as_field_descr()
-    {
-        return fd.offset() as u64;
-    }
-    missing_layout_descr("field descr (offset)", op)
-}
-
-/// `(length-field offset, length-field size)` from an op's ArrayDescr length
-/// descriptor, mirroring `bh_arraylen_gc`, which reads the length at
-/// `len_descr().offset()` at machine-word width. The offset is taken from the
-/// registered descr (not hardcoded) so it tracks the real per-target layout,
-/// and the size lets the caller load at the field's true width — a word-sized
-/// length is 4 bytes on wasm32, so a fixed 8-byte read would pull the adjacent
-/// field into the high half. Falls back to the conventional offset / word
-/// width when no length descr is registered.
-fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
-    op.with_array_descr(|ad| {
-        ad.len_descr()
-            .map(|ld| (ld.offset() as u64, ld.field_size()))
-    })
-    .flatten()
-    .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
-}
-
 /// `llsupport/regalloc.py valid_addressing_size`: the scales x86 SIB (and a
 /// wasm `i32.shl`) can form without a multiply.
 fn valid_addressing_size(size: u64) -> bool {
@@ -10523,8 +10322,7 @@ fn emit_array_addr(
 const GUEST_PTR_SIZE: usize = 4;
 
 /// The width an access to one array item moves, and how a read of it extends.
-/// The array twin of [`InteriorFieldLayout::access_size`]; every
-/// `GETARRAYITEM` / `SETARRAYITEM` arm reads it from here.
+/// Every remaining `GETARRAYITEM_RAW_R` arm reads it from here.
 ///
 /// The address stride still comes from the descriptor's own `item_size`
 /// (`emit_array_addr`), which is what the allocation laid the array out with.
@@ -10537,53 +10335,6 @@ fn array_item_access_size_sign(op: &Op) -> (usize, bool) {
         }
     })
     .unwrap_or_else(|| missing_layout_descr("array descr (item size/sign)", op))
-}
-
-/// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
-/// plus the element stride and the field's own width / signedness / kind.
-struct InteriorFieldLayout {
-    /// `basesize + field.offset`, the displacement past the scaled index.
-    offset: u64,
-    /// The array's element stride.
-    item_size: u64,
-    /// The field's own width, and how a read of it extends.
-    field_size: usize,
-    signed: bool,
-    is_float: bool,
-    is_ptr: bool,
-}
-
-impl InteriorFieldLayout {
-    /// The width an access to this field moves, and how a read of it extends.
-    /// A pointer is guest-pointer-wide and never extends as signed, whatever
-    /// the descriptor says; every reading and writing arm takes both from here
-    /// so the two cannot drift apart.
-    fn access_size_sign(&self) -> (usize, bool) {
-        if self.is_ptr {
-            (GUEST_PTR_SIZE, false)
-        } else {
-            (self.field_size, self.signed)
-        }
-    }
-}
-
-fn unpack_interior_field(op: &Op) -> InteriorFieldLayout {
-    let descr = op
-        .getdescr()
-        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
-    let ifd = descr
-        .as_interior_field_descr()
-        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
-    let ad = ifd.array_descr();
-    let fd = ifd.field_descr();
-    InteriorFieldLayout {
-        offset: (ad.base_size() + fd.offset()) as u64,
-        item_size: ad.item_size() as u64,
-        field_size: fd.field_size(),
-        signed: fd.is_field_signed(),
-        is_float: fd.is_float_field(),
-        is_ptr: fd.is_pointer_field(),
-    }
 }
 
 // ── Guard emission helpers ──
@@ -11313,10 +11064,8 @@ fn exit_fail_args(op: &Op) -> Vec<OpRef> {
 
 /// x86/assembler.py `genop_discard_check_memory_error`: the NULL test
 /// `rewrite.py` `_gen_call_malloc_gc` attaches to every collecting malloc.
-/// wasm lowers `New` / `NewArray` itself in place of the GC rewrite, so it owes
-/// itself the same check — address 0 is ordinary linear memory here, so the
-/// vtable, class-word and item stores that follow an allocation would corrupt
-/// it silently rather than fault.
+/// Address 0 is ordinary linear memory here, so stores that follow an
+/// allocation would corrupt it silently rather than fault.
 ///
 /// The failing arm is `_build_propagate_exception_path` in this backend's exit
 /// spelling. `_store_and_reset_exception` moves the `MemoryError` the

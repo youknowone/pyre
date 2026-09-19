@@ -390,9 +390,7 @@ fn classify_inline_install_error(error: &BackendError) {
 }
 
 static REEMIT_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Default ON: compile_loop/compile_bridge run `rewrite.py` then intern.
-/// Host opt-out through [`gc_rewrite_disable`] (`PYRE_WASM_GC_REWRITE=0`).
-static GC_REWRITE_ENABLED: AtomicBool = AtomicBool::new(true);
+
 static INLINE_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 /// On: non-header regions are placed outside the header `loop`, so they
 /// do not tax the fall-through path. See `inline_nonheader_enable`.
@@ -515,25 +513,6 @@ pub fn trace_entry_census_summary() -> String {
 /// Arm loop-module replacement from the host before guest execution starts.
 pub fn reemit_enable() {
     REEMIT_ENABLED.store(true, Ordering::Relaxed);
-}
-
-/// Disable the GC rewrite pass from the host before guest execution
-/// starts. On by default: every compile_loop/compile_bridge runs
-/// `rewrite.py`. `PYRE_WASM_GC_REWRITE=0|false|off` restores the
-/// intern-only pre-rewrite path.
-pub fn gc_rewrite_disable() {
-    GC_REWRITE_ENABLED.store(false, Ordering::Relaxed);
-}
-
-fn gc_rewrite_enabled() -> bool {
-    GC_REWRITE_ENABLED.load(Ordering::Relaxed)
-}
-
-/// Test-only setter so host unit tests can pin the rewrite pass
-/// without a guest export.
-#[cfg(test)]
-pub fn gc_rewrite_enable_for_test(on: bool) {
-    GC_REWRITE_ENABLED.store(on, Ordering::Relaxed);
 }
 
 fn reemit_enabled() -> bool {
@@ -1508,13 +1487,12 @@ pub fn active_gc_collection_counts() -> (usize, usize) {
     with_wasm_active_gc(|gc| gc.collection_counts()).unwrap_or((0, 0))
 }
 
-/// Assemble the inline nursery-bump parameters for this trace's `New` /
-/// `NewWithVtable` / `CallMallocNursery*` ops (rewrite.py malloc-fast-path
-/// eligibility over the gc.py:525-531 nursery address surface), or `None`
-/// when no GC is active, the `gc_stress` feature is compiled in (the fast
-/// path would bypass its per-allocation stress collections), or no
-/// allocation op qualifies. Post-rewrite `CallMallocNursery*` ops carry size
-/// in operands and do not need the per-tid set that `New*` uses.
+/// Assemble the inline nursery-bump parameters for this trace's
+/// `CallMallocNursery*` ops (rewrite.py malloc-fast-path eligibility over
+/// the gc.py:525-531 nursery address surface), or `None` when no GC is
+/// active, the `gc_stress` feature is compiled in (the fast path would
+/// bypass its per-allocation stress collections), or no allocation op
+/// qualifies.
 fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
     if majit_gc::gc_stress_enabled() {
         return None;
@@ -1561,13 +1539,12 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
             free_addr: free_addr as u32,
             top_addr: top_addr as u32,
             large_threshold: gc.max_nursery_object_size(),
-            plain_tids,
         })
     })?
 }
 
 /// Assemble the direct CA arm's fixed-size nursery/frame parameters. This is
-/// deliberately separate from ordinary `New*` eligibility: a CA frame needs
+/// deliberately separate from ordinary `CallMallocNursery*` eligibility: a CA frame needs
 /// both the nursery words and the JitFrame shadow-stack top/limit cells.
 /// Missing active GC (or gc_stress) leaves the pre-existing helper path intact.
 fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
@@ -2367,21 +2344,17 @@ fn alloc_helpers() -> codegen::AllocHelpers {
     codegen::AllocHelpers {
         new_fn_ptr: wasm_jit_alloc as *const () as usize as i64,
         new_array_fn_ptr: wasm_jit_alloc_array as *const () as usize as i64,
-        new_oldgen_fn_ptr: wasm_jit_alloc_oldgen as *const () as usize as i64,
-        new_array_oldgen_fn_ptr: wasm_jit_alloc_array_oldgen as *const () as usize as i64,
         headerless_fn_ptr: wasm_jit_alloc_headerless as *const () as usize as i64,
         threadlocal_fn_ptr: wasm_jit_threadlocalref_get as *const () as usize as i64,
         fmod_fn_ptr: wasm_jit_fmod as *const () as usize as i64,
     }
 }
 
-/// JIT-trace write-barrier trampoline target for ref-storing `SetfieldGc` /
-/// `SetarrayitemGc` / `SetinteriorfieldGc`. Routes through the host `jit_call`
-/// trampoline; invokes the active GC's `write_barrier`, which adds an old
-/// object that may now hold a young reference to the remembered set (and clears
-/// TRACK_YOUNG_PTRS). A young base (no flag) or a null base is a no-op. wasm
-/// skips the native GC rewrite pass, so the trace emits this barrier directly
-/// instead of `COND_CALL_GC_WB`. Returns 0 — the store codegen ignores it.
+/// JIT-trace write-barrier trampoline for `CondCallGcWb`. Invokes the
+/// active GC's `write_barrier`, which adds an old object that may now
+/// hold a young reference to the remembered set (and clears
+/// TRACK_YOUNG_PTRS). A young base (no flag) or a null base is a no-op.
+/// Returns 0 — the store codegen ignores it.
 pub extern "C" fn wasm_jit_write_barrier(obj: i64) -> i64 {
     with_wasm_active_gc_mut(|gc| gc.write_barrier(GcRef(obj as usize)));
     0
@@ -3490,16 +3463,10 @@ impl WasmBackend {
     #[allow(dead_code)] // constptr-only subset; production uses `rewrite_ops_for_gc`
     fn intern_ref_constants(
         inputargs: &[InputArgRc],
-        ops: Vec<Op>,
-    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
-        let next_pos = codegen::next_value_pos(inputargs, &ops);
-        let input_indices: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
-        let (ops, gcrefs) =
-            majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
-        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
-        let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
-        codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
-        (ops, table)
+        ops: &[OpRc],
+    ) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
+        let (ops, _) = self.prepare_ops_for_compile(inputargs, ops, true);
+        (ops, self.constants.clone())
     }
 
     /// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
@@ -4072,9 +4039,9 @@ impl WasmBackend {
         // Key-0 still clears the full used-label range.
         inputs.ca.home_gcmap_min_ordinary = compiled.num_ref_homes.get();
         inputs.ca.home_gcmap_min_labels = compiled.used_label_homes.get();
-        // `intern_ref_constants` of the just-compiled bridge cleared the
-        // TLS ConstPtr map. Restore every table pinned on this token so
-        // owner/region force-arm ConstPtrs rematerialize after collection.
+        // The just-compiled bridge rebuilt the TLS ConstPtr map. Restore
+        // every table pinned on this token so owner/region force-arm
+        // ConstPtrs rematerialize after collection.
         Self::rebind_failarg_const_tables(token);
         let (wasm_bytes, guard_exits, merged_ref_homes, merged_labels) =
             codegen::build_wasm_module(&inputs)?;
@@ -4338,36 +4305,6 @@ impl WasmBackend {
 // The TLS box is not in this struct; its destructor forgets the MiniMark
 // so a thread hop cannot free the nursery on TLS teardown.
 unsafe impl Send for WasmBackend {}
-
-/// Stamp a position onto every non-Void-result op left unpositioned by the
-/// optimizer, so no operand resolves to `OpRef::NONE` during codegen.
-///
-/// The optimizer's force path emits materialized allocation/store ops (e.g. a
-/// virtualized list's `NewArray` backing block and its `SetfieldGc` /
-/// `SetarrayitemGc` stores) with `Op::new`, and only assigns a position to ops
-/// whose `result_type() != Void` — a Void-result store keeps `pos == NONE`.
-/// A later op that consumes such a producer's result reads its `pos` through
-/// `Operand::Op`, and an unpositioned producer yields `OpRef::NONE`
-/// (`raw() == u32::MAX`), which `emit_resolve` would use to index `value_types`
-/// out of bounds. The native backends normalize positions before codegen
-/// (dynasm `prepare_ops_for_compile`, cranelift `normalize_ops_for_codegen_simple`);
-/// the wasm backend does the same here.
-fn normalize_ops_for_codegen(inputargs: &[InputArgRc], ops: &[OpRc]) -> Vec<Op> {
-    let num_inputs = inputargs.len() as u32;
-    ops.iter()
-        .enumerate()
-        .map(|(op_idx, op)| {
-            let normalized = (**op).clone();
-            let rt = normalized.result_type();
-            if rt != majit_ir::Type::Void && normalized.pos().get().is_none() {
-                normalized
-                    .pos()
-                    .set(majit_ir::OpRef::op_typed(num_inputs + op_idx as u32, rt));
-            }
-            normalized
-        })
-        .collect()
-}
 
 /// Report why a trace cannot be compiled by the wasm backend, or `None` if it
 /// can. Declined traces fall back to the interpreter (correct, unaccelerated)
@@ -7762,18 +7699,13 @@ mod tests {
         assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xA11C_E701);
     }
 
-    /// Post-rewrite `CallMallocNursery*` traces must get the same nursery
-    /// free/top addresses a `New` trace would; empty `plain_tids` must not
-    /// block them. `nursery_alloc_params` is the private gatherer that feeds
+    /// Post-rewrite `CallMallocNursery*` traces must get nursery free/top
+    /// addresses. `nursery_alloc_params` is the private gatherer that feeds
     /// `compile_loop`.
     #[test]
     fn nursery_alloc_params_accepts_call_malloc_nursery() {
-        use majit_ir::descr::SimpleSizeDescr;
-        use std::sync::Arc;
-
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        let mut gc = MiniMarkGC::new();
-        let type_id = gc.register_type(TypeInfo::simple(16));
+        let gc = MiniMarkGC::new();
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
 
@@ -7798,13 +7730,6 @@ mod tests {
         incr.pos().set(majit_ir::OpRef::ref_op(2));
         let malloc_params = nursery_alloc_params(&[malloc, incr])
             .expect("CallMallocNursery must qualify for the inline bump");
-
-        let new_op = majit_ir::Op::new(majit_ir::OpCode::New, &[]);
-        new_op.setdescr(Arc::new(SimpleSizeDescr::new(0, 16, type_id)));
-        new_op.pos().set(majit_ir::OpRef::ref_op(1));
-        let new_params = nursery_alloc_params(&[new_op]).expect("plain New must still qualify");
-        assert_eq!(malloc_params.free_addr, new_params.free_addr);
-        assert_eq!(malloc_params.top_addr, new_params.top_addr);
         assert_ne!(malloc_params.free_addr, 0);
         assert_ne!(malloc_params.top_addr, 0);
 
@@ -7833,23 +7758,6 @@ mod tests {
             "CallMallocNurseryVarsize must qualify for the inline bump"
         );
         let _ = backend;
-    }
-
-    struct GcRewriteFlagGuard;
-    impl Drop for GcRewriteFlagGuard {
-        fn drop(&mut self) {
-            gc_rewrite_enable_for_test(true);
-        }
-    }
-
-    fn arm_gc_rewrite() -> GcRewriteFlagGuard {
-        gc_rewrite_enable_for_test(true);
-        GcRewriteFlagGuard
-    }
-
-    fn pin_gc_rewrite_off() -> GcRewriteFlagGuard {
-        gc_rewrite_enable_for_test(false);
-        GcRewriteFlagGuard
     }
 
     fn u1_new_setfield_ops(type_id: u32) -> (Vec<InputArgRc>, Vec<OpRc>) {
@@ -7939,12 +7847,10 @@ mod tests {
         names
     }
 
-    /// Switch ON: adjacent `New`s merge into `CallMallocNursery` +
-    /// `NurseryPtrIncrement`.
+    /// Adjacent `New`s merge into `CallMallocNursery` + `NurseryPtrIncrement`.
     #[test]
     fn gc_rewrite_on_merges_adjacent_news() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        let _flag = arm_gc_rewrite();
         let mut gc = MiniMarkGC::new();
         let type_id = gc.register_type(TypeInfo::simple(16));
         let mut backend = WasmBackend::new();
@@ -7970,12 +7876,11 @@ mod tests {
         );
     }
 
-    /// Switch ON: a ConstPtr used as an operand and as a failarg shares one
-    /// gc table, and the failarg is bound.
+    /// A ConstPtr used as an operand and as a failarg shares one gc table,
+    /// and the failarg is bound.
     #[test]
     fn gc_rewrite_on_one_table_for_operand_and_failarg_constptr() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        let _flag = arm_gc_rewrite();
         let mut gc = MiniMarkGC::with_config(majit_gc::collector::GcConfig {
             nursery_size: 65536,
             large_object_threshold: 1024,
@@ -8014,49 +7919,11 @@ mod tests {
         );
     }
 
-    /// Switch OFF: U1 input is intern-only and byte-identical to calling
-    /// intern_ref_constants directly.
-    #[test]
-    fn gc_rewrite_off_matches_intern_ref_constants() {
-        let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        // Pin OFF: this asserts the intern-only pre-rewrite path.
-        let _flag = pin_gc_rewrite_off();
-        let (inputargs, ops) = u1_new_setfield_ops(1);
-        let mut backend = WasmBackend::new();
-        let (prepared_a, _) = backend.prepare_ops_for_compile(&inputargs, &ops, true);
-        let (prepared_b, _) = backend.prepare_ops_for_compile(&inputargs, &ops, true);
-        let interned = {
-            let mut ops_owned = normalize_ops_for_codegen(&inputargs, &ops);
-            codegen::materialize_unbound_label_args(&inputargs, &mut ops_owned);
-            WasmBackend::intern_ref_constants(&inputargs, ops_owned).0
-        };
-        let bytes_a =
-            codegen::build_wasm_module(&test_module_inputs(inputargs.clone(), prepared_a.clone()))
-                .expect("off-path module")
-                .0;
-        let bytes_b =
-            codegen::build_wasm_module(&test_module_inputs(inputargs.clone(), prepared_b))
-                .expect("off-path module again")
-                .0;
-        let bytes_intern = codegen::build_wasm_module(&test_module_inputs(inputargs, interned))
-            .expect("intern_ref_constants module")
-            .0;
-        assert_eq!(bytes_a, bytes_b);
-        assert_eq!(bytes_a, bytes_intern);
-        assert!(
-            prepared_a
-                .iter()
-                .any(|op| op.opcode == majit_ir::OpCode::New),
-            "switch OFF must keep pre-rewrite New"
-        );
-    }
-
     /// Rewritten NewArray slow path (CallR malloc helper) must not import
     /// jit_call.
     #[test]
     fn gc_rewrite_newarray_slow_path_has_no_jit_call() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        let _flag = arm_gc_rewrite();
         use majit_ir::descr::SimpleArrayDescr;
         use std::sync::Arc;
         let mut backend = WasmBackend::new();
@@ -8100,7 +7967,6 @@ mod tests {
     #[test]
     fn gc_rewrite_new_ref_field_zero_store_uses_usize_width() {
         let _compile_guard = failguard::FAIL_DESCR_TEST_LOCK.lock();
-        let _flag = arm_gc_rewrite();
         use majit_ir::descr::{SimpleFieldDescr, SimpleSizeDescr};
         use std::sync::Arc;
         let mut gc = MiniMarkGC::new();

@@ -652,16 +652,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     {
         arm.call(&mut store, ())?;
     }
-    // GC rewrite is the default. The guest has no environment, so an
-    // explicit host-side opt-out must travel through this export before
-    // tracing begins.
-    if std::env::var_os("PYRE_WASM_GC_REWRITE")
-        .is_some_and(|value| matches!(value.to_str().map(str::trim), Some("0" | "false" | "off")))
-        && let Ok(arm) =
-            instance.get_typed_func::<(), ()>(&mut store, "pyre_jit_gc_rewrite_disable")
-    {
-        arm.call(&mut store, ())?;
-    }
     // Loop-closing bridge inlining is the default. The guest has no
     // environment, so an explicit host-side opt-out must travel through this
     // export before tracing begins.
