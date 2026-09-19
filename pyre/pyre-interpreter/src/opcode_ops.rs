@@ -97,7 +97,9 @@ pub fn binary_value(
         BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
             Some(desc::BinopDunder::FloorDiv)
         }
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => Some(desc::BinopDunder::Mod),
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            Some(desc::BinopDunder::Mod)
+        }
         BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
             Some(desc::BinopDunder::TrueDiv)
         }

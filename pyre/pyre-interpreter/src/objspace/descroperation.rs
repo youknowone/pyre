@@ -4393,42 +4393,26 @@ pub(crate) fn try_binop_shortcut(
             return Ok(None);
         }
         let w_name = match op {
-            BinopDunder::Add => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__"))
-            }
-            BinopDunder::Sub => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__sub__"))
-            }
-            BinopDunder::Mul => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__"))
-            }
+            BinopDunder::Add => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__add__")),
+            BinopDunder::Sub => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__sub__")),
+            BinopDunder::Mul => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mul__")),
             BinopDunder::FloorDiv => {
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__floordiv__"))
             }
-            BinopDunder::Mod => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mod__"))
-            }
+            BinopDunder::Mod => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__mod__")),
             BinopDunder::LShift => {
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__lshift__"))
             }
             BinopDunder::RShift => {
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__rshift__"))
             }
-            BinopDunder::And => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__and__"))
-            }
-            BinopDunder::Or => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__or__"))
-            }
-            BinopDunder::Xor => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__xor__"))
-            }
+            BinopDunder::And => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__and__")),
+            BinopDunder::Or => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__or__")),
+            BinopDunder::Xor => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__xor__")),
             BinopDunder::TrueDiv => {
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__truediv__"))
             }
-            BinopDunder::Pow => {
-                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__"))
-            }
+            BinopDunder::Pow => pyre_object::unicodeobject::box_str_constant(Wtf8::new("__pow__")),
             BinopDunder::DivMod => {
                 pyre_object::unicodeobject::box_str_constant(Wtf8::new("__divmod__"))
             }
@@ -4445,11 +4429,7 @@ pub(crate) fn try_binop_shortcut(
 /// Signature is `(w_obj1, w_obj2, op)` — three words.  Upstream's
 /// generated `binop_mod_impl(space, w_obj1, w_obj2)` closes over the
 /// TypeError symbol; a `&str` argument is two words and shifts `op`.
-pub(crate) fn binop_with_shortcut(
-    a: PyObjectRef,
-    b: PyObjectRef,
-    op: BinopDunder,
-) -> PyResult {
+pub(crate) fn binop_with_shortcut(a: PyObjectRef, b: PyObjectRef, op: BinopDunder) -> PyResult {
     if let Some(w_res) = try_binop_shortcut(a, b, op)? {
         return Ok(w_res);
     }
@@ -4488,8 +4468,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // `__radd__` before refusing.
         if numeric_override
             && !sequence_numeric_slot_is_null(a, BinopDunder::Add)
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
         {
             return Ok(result);
         }
@@ -4512,8 +4491,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // subclass overriding `__add__`/`__radd__` must reach the
             // reflected dispatch; otherwise concat directly.
             if needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::Str, BinopDunder::Add)
-                && let Some(result) =
-                    try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
+                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
             {
                 return Ok(result);
             }
@@ -4536,8 +4514,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         }
         if is_list(a) && is_list(b) {
             if needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::List, BinopDunder::Add)
-                && let Some(result) =
-                    try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
+                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
             {
                 return Ok(result);
             }
@@ -4565,8 +4542,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         }
         if is_tuple(a) && is_tuple(b) {
             if needs_seq_binop_dispatch_unless_exact(a, b, SeqBase::Tuple, BinopDunder::Add)
-                && let Some(result) =
-                    try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
+                && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
             {
                 return Ok(result);
             }
@@ -4600,9 +4576,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
                 }
                 return bytes_concat(a, b_src);
             }
-            if let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
-            {
+            if let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)? {
                 return Ok(result);
             }
             // [3.14-spec] `bytes_concat` reaches its own refusal when
@@ -4616,8 +4590,7 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // already implements the reflected-first reordering rule for
         // subclass operands.
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Add)?
         {
             return Ok(result);
         }
@@ -4632,9 +4605,7 @@ pub fn matmul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 /// `@` and `@=` — one body, see [`binop_type_error`].
 pub(crate) fn matmul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> PyResult {
     unsafe {
-        if let Some(result) =
-            try_dispatch_binary_special(&mut a, &mut b, BinopDunder::MatMul)?
-        {
+        if let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::MatMul)? {
             return Ok(result);
         }
         Err(binop_type_error(symbol, a, b))
@@ -4650,15 +4621,13 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Sub)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Sub)?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Sub);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Sub)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Sub)?
         {
             return Ok(result);
         }
@@ -4686,8 +4655,7 @@ pub(crate) fn sub_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return crate::typedef::set_method_difference(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Sub)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Sub)?
         {
             return Ok(result);
         }
@@ -4707,8 +4675,7 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // `nb_multiply`, so only the other operand's runs here.
         if numeric_override
             && !sequence_numeric_slot_is_null(a, BinopDunder::Mul)
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mul)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mul)?
         {
             return Ok(result);
         }
@@ -4732,8 +4699,7 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         // list repetition — the same gate the concat branches of `add` apply.
         if (seq_repeat_override(a, RepeatDunder::MulPair)
             || seq_repeat_override(b, RepeatDunder::MulPair))
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mul)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mul)?
         {
             return Ok(result);
         }
@@ -4898,8 +4864,7 @@ pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Mod);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mod)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mod)?
         {
             return Ok(result);
         }
@@ -4954,8 +4919,7 @@ pub(crate) fn mod_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             };
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mod)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Mod)?
         {
             return Ok(result);
         }
@@ -4981,8 +4945,7 @@ pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str)
         let numeric_override =
             needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::TrueDiv);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::TrueDiv)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::TrueDiv)?
         {
             return Ok(result);
         }
@@ -5005,8 +4968,7 @@ pub(crate) fn truediv_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str)
             return complex_truediv(a, b);
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::TrueDiv)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::TrueDiv)?
         {
             return Ok(result);
         }
@@ -5339,12 +5301,7 @@ pub(crate) unsafe fn call_descr_obj_arg(
     let Some(w_type) = crate::typedef::r#type(w_obj1) else {
         return w_not_implemented();
     };
-    match crate::baseobjspace::get_and_call_function(
-        w_impl,
-        w_obj1,
-        w_type.as_ptr(),
-        &[w_obj2],
-    ) {
+    match crate::baseobjspace::get_and_call_function(w_impl, w_obj1, w_type.as_ptr(), &[w_obj2]) {
         Ok(w_res) => w_res,
         Err(e) => {
             crate::call::set_call_error(e);
@@ -5841,8 +5798,7 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::DivMod);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::DivMod)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::DivMod)?
         {
             return Ok(result);
         }
@@ -5869,8 +5825,7 @@ pub fn divmod(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         }
     }
     if !numeric_override
-        && let Some(result) =
-            try_dispatch_binary_special(&mut a, &mut b, BinopDunder::DivMod)?
+        && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::DivMod)?
     {
         return Ok(result);
     }
@@ -6051,8 +6006,7 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::LShift);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::LShift)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::LShift)?
         {
             return Ok(result);
         }
@@ -6065,8 +6019,7 @@ pub(crate) fn lshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
             }
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::LShift)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::LShift)?
         {
             return Ok(result);
         }
@@ -6085,8 +6038,7 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::RShift);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::RShift)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::RShift)?
         {
             return Ok(result);
         }
@@ -6099,8 +6051,7 @@ pub(crate) fn rshift_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) 
             }
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::RShift)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::RShift)?
         {
             return Ok(result);
         }
@@ -6119,15 +6070,13 @@ pub(crate) fn and_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::And)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::And)?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::And);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::And)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::And)?
         {
             return Ok(result);
         }
@@ -6155,8 +6104,7 @@ pub(crate) fn and_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return crate::typedef::set_method_intersection(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::And)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::And)?
         {
             return Ok(result);
         }
@@ -6295,15 +6243,13 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     unsafe {
         let set_override = needs_set_binop_dispatch_unless_exact(a, b);
         if set_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Xor)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Xor)?
         {
             return Ok(result);
         }
         let numeric_override = needs_numeric_binop_dispatch_unless_exact(a, b, BinopDunder::Xor);
         if numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Xor)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Xor)?
         {
             return Ok(result);
         }
@@ -6330,8 +6276,7 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             return crate::typedef::set_method_symmetric_difference(&[a, b]);
         }
         if !numeric_override
-            && let Some(result) =
-                try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Xor)?
+            && let Some(result) = try_dispatch_binary_special(&mut a, &mut b, BinopDunder::Xor)?
         {
             return Ok(result);
         }
@@ -8454,8 +8399,7 @@ mod tests {
     #[test]
     fn inplace_add_fallthrough_takes_same_type_int_shortcut() {
         init_interned_binop_names();
-        let result = binop_with_shortcut(w_int_new(1189), w_int_new(1), BinopDunder::Add)
-            .unwrap();
+        let result = binop_with_shortcut(w_int_new(1189), w_int_new(1), BinopDunder::Add).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 1190) };
     }
 
