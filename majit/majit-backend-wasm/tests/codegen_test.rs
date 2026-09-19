@@ -8883,6 +8883,49 @@ fn gc_rewrite_bare_load_store_execute_with_dynamic_offset() {
 }
 
 #[test]
+fn gc_store_halfword_at_negative_offset_uses_store16() {
+    // wasm32 NPI flags clear: GcStore offset -6, width 2. Negative
+    // offsets cannot use MemArg, so the address is folded; width 2 is
+    // i64.store16 (same path as gen_initialize_tid's HALFWORD tid).
+    let inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    let ops = vec![
+        make_op(
+            OpCode::GcStore,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::const_int(-6),
+                OpRef::input_arg_int(1),
+                OpRef::const_int(2),
+            ],
+            OpRef::NONE,
+        ),
+        make_op(
+            OpCode::GcLoadI,
+            &[
+                OpRef::input_arg_ref(0),
+                OpRef::const_int(-6),
+                OpRef::const_int(-2),
+            ],
+            OpRef::int_op(2),
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))]),
+    ];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    let mut store16 = 0;
+    count_operators(&bytes, |op| {
+        if matches!(op, wasmparser::Operator::I64Store16 { .. }) {
+            store16 += 1;
+        }
+    });
+    assert_eq!(store16, 1, "width-2 GcStore must emit i64.store16");
+    assert_eq!(execute_simple_trace(&bytes, &[4096, 0x7BCD]), 0x7BCD);
+}
+
+#[test]
 fn gc_rewrite_indexed_load_store_execute() {
     let inputargs = vec![
         InputArg::from_type_rc(Type::Ref, 0),
@@ -9600,6 +9643,29 @@ fn nursery_top_compare_count(bytes: &[u8]) -> usize {
         }
     });
     nursery_top_compares
+}
+
+fn count_memory_fills(bytes: &[u8]) -> usize {
+    let mut fills = 0;
+    count_operators(bytes, |op| {
+        if matches!(op, wasmparser::Operator::MemoryFill { .. }) {
+            fills += 1;
+        }
+    });
+    fills
+}
+
+fn tid_gc_store(obj: u32, tid: i64) -> Op {
+    make_op(
+        OpCode::GcStore,
+        &[
+            OpRef::ref_op(obj),
+            OpRef::const_int(-(std::mem::size_of::<usize>() as i64)),
+            OpRef::const_int(tid),
+            OpRef::const_int((std::mem::size_of::<usize>() / 2) as i64),
+        ],
+        OpRef::NONE,
+    )
 }
 
 fn finish_int_arg0() -> Op {

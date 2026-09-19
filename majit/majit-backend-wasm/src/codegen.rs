@@ -8307,7 +8307,9 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
-                    // Fast path clears the header word; rewrite then stores tid.
+                    // Header word only: `genop_call_malloc_nursery`
+                    // `mov QWORD [rcx], 0`. Payload stays dirty; rewrite
+                    // owns tid / field init (`malloc_zero_filled = False`).
                     sink.local_get(alloc_scratch_local);
                     sink.i64_const(0);
                     sink.i64_store(MemArg {
@@ -8586,6 +8588,8 @@ fn build_function(
                         align: 2,
                         memory_index: 0,
                     });
+                    // Header word only: `CallMallocNurseryVarsizeFrame`
+                    // `mov QWORD [rcx], 0`. Payload stays dirty.
                     sink.local_get(alloc_scratch_local);
                     sink.i64_const(0);
                     sink.i64_store(MemArg {
