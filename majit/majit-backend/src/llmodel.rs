@@ -49,19 +49,8 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
     }
 }
 
-/// llmodel.py — `_decode_pos(deadframe, index)`.
-///
-/// Translate one `rd_locs[index]` entry into the jitframe slot
-/// `get_int_value_direct(jf, slot)` consumes.  Returns `None` for
-/// 0xFFFF (unmapped — the resume system handles those through the
-/// `rd_numb` TAGCONST/TAGVIRTUAL encoding) or for out-of-range indices.
-///
-/// Upstream `_decode_pos` is a method on `AbstractLLCPU` and fetches the
-/// descr itself through `get_latest_descr(deadframe)`; here the descr is
-/// passed in, because the deadframe types that hold one are the callers.
 #[inline]
-pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
-    let locs = descr.rd_locs();
+fn decode_rd_loc_slot_from_locs(locs: &[u16], index: usize) -> Option<usize> {
     // Synthetic descrs never receive `write_failure_recovery_description`,
     // so the table stays empty and the fail-arg index *is* the slot
     // (`runner.rs` identity fallback). A stamped table uses `0xFFFF`
@@ -74,6 +63,21 @@ pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> 
         None | Some(0xFFFF) => None,
         Some(pos) => Some(pos as usize),
     }
+}
+
+/// llmodel.py — `_decode_pos(deadframe, index)`.
+///
+/// Translate one `rd_locs[index]` entry into the jitframe slot
+/// `get_int_value_direct(jf, slot)` consumes.  Returns `None` for
+/// 0xFFFF (unmapped — the resume system handles those through the
+/// `rd_numb` TAGCONST/TAGVIRTUAL encoding) or for out-of-range indices.
+///
+/// Upstream `_decode_pos` is a method on `AbstractLLCPU` and fetches the
+/// descr itself through `get_latest_descr(deadframe)`; here the descr is
+/// passed in, because the deadframe types that hold one are the callers.
+#[inline]
+pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
+    decode_rd_loc_slot_from_locs(descr.rd_locs(), index)
 }
 
 /// llmodel.py — `get_int_value_direct(deadframe, pos)`.
@@ -132,6 +136,7 @@ pub enum FailArgSource<'a> {
     JitFrame {
         root: OwnerRootGuard,
         descr: &'a dyn FailDescr,
+        rd_locs: &'a [u16],
         n: usize,
     },
 }
@@ -142,6 +147,7 @@ impl<'a> FailArgSource<'a> {
         Self::JitFrame {
             root: OwnerRootGuard::new(GcRef(ptr as usize)),
             descr,
+            rd_locs: descr.rd_locs(),
             n,
         }
     }
@@ -163,10 +169,18 @@ impl<'a> FailArgSource<'a> {
     pub fn get(&self, index: usize) -> i64 {
         match self {
             Self::Slice(s) => s.get(index).copied().unwrap_or(0),
-            Self::JitFrame { root, descr, n } => {
+            Self::JitFrame {
+                root, rd_locs, n, ..
+            } => {
                 debug_assert!(index < *n);
                 let ptr = root.get().0 as *const JitFrame;
-                unsafe { get_int_value(ptr, *descr, index) }
+                match decode_rd_loc_slot_from_locs(rd_locs, index) {
+                    Some(slot) => {
+                        let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
+                        unsafe { get_int_value_direct(ptr, slot) as i64 }
+                    }
+                    None => 0,
+                }
             }
         }
     }
@@ -181,9 +195,15 @@ impl Clone for FailArgSource<'_> {
     fn clone(&self) -> Self {
         match self {
             Self::Slice(s) => Self::Slice(s),
-            Self::JitFrame { root, descr, n } => Self::JitFrame {
+            Self::JitFrame {
+                root,
+                descr,
+                rd_locs,
+                n,
+            } => Self::JitFrame {
                 root: OwnerRootGuard::new(root.get()),
                 descr: *descr,
+                rd_locs: *rd_locs,
                 n: *n,
             },
         }
