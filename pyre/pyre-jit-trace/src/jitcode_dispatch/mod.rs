@@ -197,6 +197,7 @@
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
 use crate::state::{ConcreteValue, MIFrame, WalkSym};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
+use rustpython_wtf8::Wtf8;
 
 /// Descriptor accessor carried by an active MIFrame walk.
 ///
@@ -9159,7 +9160,12 @@ unsafe fn lookup_instance_dunder_call(
     if version_tag == 0 {
         return None;
     }
-    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
+    let method = unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__call__")),
+        )
+    }?;
     Some((method, w_class, version_tag))
 }
 

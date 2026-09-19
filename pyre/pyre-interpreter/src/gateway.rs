@@ -5,6 +5,7 @@
 //! a Python builtin like `print`, `len`, etc.
 
 use pyre_object::pyobject::*;
+use rustpython_wtf8::Wtf8;
 
 /// pypy/interpreter/gateway.py `class SignatureBuilder`.
 ///
@@ -2556,9 +2557,12 @@ fn path_or_fd_w(
             // without losing that observable descriptor value.
             (Vec::new(), obj_slot, fd, true)
         } else {
-            let Some(fspath_descr) = crate::typedef::r#type(obj)
-                .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
-            else {
+            let Some(fspath_descr) = crate::typedef::r#type(obj).and_then(|pt| {
+                crate::baseobjspace::lookup_in_type(
+                    pt.as_ptr(),
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__fspath__")),
+                )
+            }) else {
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();

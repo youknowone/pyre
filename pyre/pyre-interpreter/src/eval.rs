@@ -15,6 +15,7 @@ use crate::{
 };
 use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
+use rustpython_wtf8::Wtf8;
 
 use crate::call::call_callable;
 use std::cell::Cell;
@@ -3969,7 +3970,11 @@ impl IterOpcodeHandler for PyFrame {
             // this only sees non-iterator containers.
             if pyre_object::is_instance(iter)
                 || crate::typedef::r#type(iter).is_some_and(|t| {
-                    crate::baseobjspace::lookup_in_type_where(t.as_ptr(), "__iter__").is_some()
+                    crate::baseobjspace::lookup_in_type_where(
+                        t.as_ptr(),
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+                    )
+                    .is_some()
                 })
             {
                 let result = crate::baseobjspace::iter(iter)?;
@@ -3991,7 +3996,10 @@ impl IterOpcodeHandler for PyFrame {
                     }
                 };
                 if let Some(metaclass) = mc
-                    && let Some(method) = crate::baseobjspace::lookup_in_type(metaclass, "__iter__")
+                    && let Some(method) = crate::baseobjspace::lookup_in_type(
+                        metaclass,
+                        pyre_object::unicodeobject::box_str_constant(Wtf8::new("__iter__")),
+                    )
                 {
                     let result = crate::call_function(method, &[iter]);
                     let tos = self.valuestackdepth - 1;
@@ -4314,7 +4322,10 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             if !crate::baseobjspace::has_object_getattribute(w_type) {
                 return PY_NULL;
             }
-            let raw = crate::baseobjspace::lookup_in_type(w_type, name);
+            let raw = crate::baseobjspace::lookup_in_type(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+            );
             match raw {
                 _ if shadowed => PY_NULL,
                 // staticmethod / classmethod wrappers: getattr already
@@ -4357,7 +4368,10 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             if !metatype_is_type {
                 return PY_NULL;
             }
-            let raw = crate::baseobjspace::lookup_in_type(obj, name);
+            let raw = crate::baseobjspace::lookup_in_type(
+                obj,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+            );
             match raw {
                 // Exact for the reason given on the instance arm above.
                 Some(d) if pyre_object::is_exact_classmethod(d) => obj,
@@ -4366,9 +4380,12 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
                     // Not in the type's own MRO → resolved via the
                     // metaclass MRO; bind the type for a method-descriptor
                     // function getattr surfaced unchanged.
-                    match crate::typedef::r#type(obj)
-                        .and_then(|meta| crate::baseobjspace::lookup_in_type(meta.as_ptr(), name))
-                    {
+                    match crate::typedef::r#type(obj).and_then(|meta| {
+                        crate::baseobjspace::lookup_in_type(
+                            meta.as_ptr(),
+                            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+                        )
+                    }) {
                         Some(d) => method_descriptor_bound(d, attr, obj),
                         None => PY_NULL,
                     }
@@ -4394,7 +4411,10 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             if !crate::baseobjspace::has_object_getattribute(w_type.as_ptr()) {
                 return PY_NULL;
             }
-            match crate::baseobjspace::lookup_in_type(w_type.as_ptr(), name) {
+            match crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+            ) {
                 Some(d) if pyre_object::is_staticmethod(d) => PY_NULL,
                 // Exact for the reason given on the instance arm above.
                 Some(d) if pyre_object::is_exact_classmethod(d) => w_type.as_ptr(),
@@ -6022,7 +6042,26 @@ impl OpcodeStepExecutor for PyFrame {
         // the annotator off the bare-`!` hazard. The cache path's helpers are
         // `dont_look_inside`, so the JIT never traces into them.
         if majit_metainterp::jit::we_are_jitted() {
-            return OpcodeStepExecutor::load_attr(self, name);
+            // pyopcode.py LOAD_ATTR: `w_attributename = self.getname_w(nameindex)`;
+            // `space.getattr(w_obj, w_attributename)`.
+            let obj = self.pop_value()?;
+            let roots = pyre_object::gc_roots::push_roots();
+            let obj_slot = roots.base();
+            let obj = roots.pin_root(obj);
+            let w_name = unsafe {
+                crate::pycode::w_code_getname_w_or_new(self.pycode as PyObjectRef, nameindex, name)
+            };
+            return crate::baseobjspace::getattr(obj, w_name)
+                .map(|attr| {
+                    let live = unsafe { &mut *FrameAnchor::new(self).live() };
+                    live.push(attr);
+                })
+                .map_err(|error| {
+                    if finalize_failed_attr_receiver_now(roots.get(obj_slot)) {
+                        self.defer_failed_attr_until_pop_except();
+                    }
+                    error
+                });
         }
         // Graceful underflow (`shared_opcode.rs`'s `opcode_load_attr` →
         // `pop_value()?`): a corrupted concrete-execution stack during

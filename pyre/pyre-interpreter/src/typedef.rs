@@ -4733,7 +4733,10 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // W_ObjectObject and int/float subclass instances.
     unsafe {
         if let Some(w_type) = crate::typedef::r#type(w_obj) {
-            if let Some(method) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__bool__") {
+            if let Some(method) = crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__bool__")),
+            ) {
                 if pyre_object::is_none(method) {
                     return Err(crate::PyError::type_error(
                         "object of this type has no bool()",
@@ -4756,7 +4759,10 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 }
                 return Ok(result);
             }
-            if let Some(len_m) = crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__len__") {
+            if let Some(len_m) = crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__len__")),
+            ) {
                 if pyre_object::is_none(len_m) {
                     return Err(crate::PyError::type_error(
                         "object of this type has no len()",
@@ -5019,8 +5025,14 @@ fn list_init_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let instance_type = crate::typedef::r#type(list).map_or(list_type, |p| p.as_ptr());
     let inherits_list_new = unsafe {
         match (
-            crate::baseobjspace::lookup_in_type(instance_type, "__new__"),
-            crate::baseobjspace::lookup_in_type(list_type, "__new__"),
+            crate::baseobjspace::lookup_in_type(
+                instance_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            ),
+            crate::baseobjspace::lookup_in_type(
+                list_type,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            ),
         ) {
             (Some(instance_new), Some(list_new)) => std::ptr::eq(instance_new, list_new),
             _ => true,
@@ -5234,8 +5246,14 @@ fn filter_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let init_matches = std::ptr::eq(cls, filter_type)
         || unsafe {
             match (
-                crate::baseobjspace::lookup_in_type(cls, "__init__"),
-                crate::baseobjspace::lookup_in_type(filter_type, "__init__"),
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
+                crate::baseobjspace::lookup_in_type(
+                    filter_type,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
             ) {
                 (Some(sub), Some(base)) => std::ptr::eq(sub, base),
                 (None, None) => true,
@@ -6070,8 +6088,14 @@ fn builtinclass_new_args_check(
         || std::ptr::eq(w_basetyp, w_subtyp)
         || unsafe {
             match (
-                crate::baseobjspace::lookup_in_type(w_basetyp, "__init__"),
-                crate::baseobjspace::lookup_in_type(w_subtyp, "__init__"),
+                crate::baseobjspace::lookup_in_type(
+                    w_basetyp,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
+                crate::baseobjspace::lookup_in_type(
+                    w_subtyp,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
             ) {
                 (Some(b), Some(s)) => std::ptr::eq(b, s),
                 (None, None) => true,
@@ -10093,7 +10117,13 @@ pub(crate) fn mappingproxy_from_mapping(
 ) -> Result<PyObjectRef, crate::PyError> {
     let has_getitem = r#type(w_mapping)
         .map(|t| {
-            unsafe { crate::baseobjspace::lookup_in_type(t.as_ptr(), "__getitem__") }.is_some()
+            unsafe {
+                crate::baseobjspace::lookup_in_type(
+                    t.as_ptr(),
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__getitem__")),
+                )
+            }
+            .is_some()
         })
         .unwrap_or(false);
     let is_seq = unsafe { pyre_object::is_list(w_mapping) || pyre_object::is_tuple(w_mapping) };
@@ -22084,15 +22114,35 @@ pub(crate) fn object_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
     // none.  A type that overrides __new__ but forwards excess args to
     // object.__new__ hits the first error.
     if positional.len() > 1 || crate::builtins::has_real_kwargs(kwargs) {
-        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(cls, "__new__") };
-        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        let tp_new = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                cls,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        };
+        let obj_new = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_object,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        };
         if !same_inherited_slot(tp_new, obj_new) {
             return Err(crate::PyError::type_error(
                 "object.__new__() takes exactly one argument (the type to instantiate)",
             ));
         }
-        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(cls, "__init__") };
-        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        let tp_init = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                cls,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        };
+        let obj_init = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_object,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        };
         if same_inherited_slot(tp_init, obj_init) {
             let name = unsafe { pyre_object::w_type_get_name(cls) };
             return Err(crate::PyError::type_error(format!(
@@ -22140,15 +22190,35 @@ fn object_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         return Ok(w_none());
     };
     if let Some(w_type) = crate::typedef::r#type(w_obj) {
-        let tp_init = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__init__") };
-        let obj_init = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__init__") };
+        let tp_init = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        };
+        let obj_init = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_object,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+            )
+        };
         if !same_inherited_slot(tp_init, obj_init) {
             return Err(crate::PyError::type_error(
                 "object.__init__() takes exactly one argument (the instance to initialize)",
             ));
         }
-        let tp_new = unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__new__") };
-        let obj_new = unsafe { crate::baseobjspace::lookup_in_type(w_object, "__new__") };
+        let tp_new = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_type.as_ptr(),
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        };
+        let obj_new = unsafe {
+            crate::baseobjspace::lookup_in_type(
+                w_object,
+                pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__")),
+            )
+        };
         if same_inherited_slot(tp_new, obj_new) {
             let name = unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) };
             return Err(crate::PyError::type_error(format!(
@@ -32021,8 +32091,14 @@ fn itertools_twoarg_new(
     let init_matches = std::ptr::eq(cls, exact_type)
         || unsafe {
             match (
-                crate::baseobjspace::lookup_in_type(cls, "__init__"),
-                crate::baseobjspace::lookup_in_type(exact_type, "__init__"),
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
+                crate::baseobjspace::lookup_in_type(
+                    exact_type,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
             ) {
                 (Some(sub), Some(base)) => std::ptr::eq(sub, base),
                 (None, None) => true,
@@ -32352,8 +32428,14 @@ fn islice_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let init_matches = std::ptr::eq(cls, exact)
         || unsafe {
             match (
-                crate::baseobjspace::lookup_in_type(cls, "__init__"),
-                crate::baseobjspace::lookup_in_type(exact, "__init__"),
+                crate::baseobjspace::lookup_in_type(
+                    cls,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
+                crate::baseobjspace::lookup_in_type(
+                    exact,
+                    pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__")),
+                ),
             ) {
                 (Some(sub), Some(base)) => std::ptr::eq(sub, base),
                 (None, None) => true,
