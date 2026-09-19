@@ -11175,6 +11175,9 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             "cast_ptr_to_int/r>i",
             majit_jitcode::insns::BC_CAST_PTR_TO_INT,
         ),
+        // `rbuiltin.py rtype_cast_int_to_ptr` → `cast_int_to_ptr/i>r`.
+        // Sibling of `cast_ptr_to_int/r>i`; `wire_bhimpl_handlers` already
+        // has `handler_cast_int_to_ptr` (`blackhole.py bhimpl_cast_int_to_ptr`).
         (
             "cast_int_to_ptr/i>r",
             majit_jitcode::insns::BC_CAST_INT_TO_PTR,
