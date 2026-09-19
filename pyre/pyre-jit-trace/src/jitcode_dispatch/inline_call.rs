@@ -6327,9 +6327,22 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // callee's OWN resume coordinate rather than collapsing to the
                 // caller's CALL boundary — and `strict_seed` seeds one too.
                 // The two routes are an either/or, not a ladder.
-                let seeded_callee_resume = callable_guard_op.is_constant()
-                    && inline_depth < 2
-                    && (try_multiframe || strict_seed);
+                //
+                // Neither carries a depth term of its own here, because each
+                // already declares the depth its resume machinery is proven to:
+                // `strict_seed` stops at `fbw_max_multiframe_depth`, and
+                // `try_multiframe` at `fbw_effective_multiframe_depth`, which
+                // reads the raising-chain and recursion cases separately.  The
+                // `inline_depth < 2` that stood here was `framestack.len() < 2`
+                // from the bare-reraise predicate this grew out of, where "one
+                // paused caller" bounded the re-raise chain specifically; it
+                // outlived that predicate the way `has_exception_table` did.
+                // Two is far under what both routes admit, so it was the whole
+                // bound in practice: a third Python frame residualized however
+                // straight-line it was, which is a two-deep helper called from
+                // any dunder at all.
+                let seeded_callee_resume =
+                    callable_guard_op.is_constant() && (try_multiframe || strict_seed);
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
                 let foriter_dirty_bound = entry_is_call_boundary
                     && (bound_method.is_some() || seeded_callee_resume)
@@ -10721,7 +10734,7 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
     code: &[u8],
-    funcptr: OpRef,
+    funcptr: Option<OpRef>,
     r_args: &[OpRef],
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
@@ -10778,7 +10791,9 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         ctx,
         op,
         code,
-        funcptr,
+        // A helper-descent entry carries no funcptr operand of its own; the
+        // method constant stands for the call the way the binop route's does.
+        funcptr.unwrap_or(getitem_const),
         r_args,
         call_descr,
         dst_bank,
@@ -10799,10 +10814,17 @@ pub(crate) fn try_walker_inline_subscr_getitem<Sym: WalkSym>(
         has_closure,
         Some((obj, concrete_obj, w_type, version_tag)),
         None,
-        // `obj[key]` enters from BINARY_OP, which the abort rewind cannot
-        // name.  This is the entry the retired `arg_class_guard.is_none()`
-        // proxy admitted by mistake.
-        false,
+        // `entry_is_call_boundary`, for the reason the forward-dunder route
+        // gives: what decides it is whether the abort rewind can name this
+        // entry, not whether the entry is spelled CALL, and
+        // `latch_abort_call_resume` names a BINARY_OP one by sourcing the
+        // operand image from the frame's own resume sources.  Saying `false`
+        // here cost the whole route inside a `for`, where
+        // `foriter_dirty_bound` has it as a term and refused every subscript
+        // the loop walked.  There is no rewind arm to guard: `__getitem__`
+        // has no reflected half, so no body reached here can answer
+        // `NotImplemented` and demand its descent be taken back.
+        binop_rewind_enabled(),
         false,
         None,
     )
@@ -14289,14 +14311,34 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, boxed);
             write_ref_reg(ctx, op.pc, dst, boxed, concrete_for_shadow)
         };
-        if matches!(
+        let is_subscr = matches!(
             pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
             Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
-        ) && let Some(DispatchOutcome::SubReturn {
-            result: Some(boxed),
-        }) = spec_gate(SpecFold::Subscr, || {
-            super::specialize::try_emit_list_int_getitem(ctx, op.pc, &args, dst, dst_bank)
-        })? {
+        );
+        // A receiver whose own type owns `__getitem__` resolves to a Python
+        // body.  Residual BINARY_OP admitted it here; flatten now lowers
+        // BINARY to an `inline_call` of the helper, so the residual gate no
+        // longer sees the subscript at all -- the same move the forward-dunder
+        // admission below had to be re-run for, and the storage folds around
+        // it are for builtin containers this declines.
+        if is_subscr
+            && let Ok(setup) = inline_fnaddr_call_setup(ctx, op.pc, descr_index, &[], &args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
+                try_walker_inline_subscr_getitem(
+                    ctx, op, code, None, &args, call_descr, dst, dst_bank,
+                )
+            })?
+        {
+            return Ok(inlined);
+        }
+        if is_subscr
+            && let Some(DispatchOutcome::SubReturn {
+                result: Some(boxed),
+            }) = spec_gate(SpecFold::Subscr, || {
+                super::specialize::try_emit_list_int_getitem(ctx, op.pc, &args, dst, dst_bank)
+            })?
+        {
             write_boxed(ctx, boxed)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
@@ -14558,6 +14600,22 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         )
     {
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        // A receiver whose own type owns `__getitem__` resolves to a Python
+        // body.  Residual BINARY_OP admitted it; this lowering replaced that
+        // gate, so the route has to be re-run here the way the forward-dunder
+        // admission below is.  The storage folds after it are for builtin
+        // containers, which this declines.
+        if let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
+                try_walker_inline_subscr_getitem(
+                    ctx, op, code, None, &ref_args, call_descr, dst, dst_bank,
+                )
+            })?
+        {
+            return Ok(inlined);
+        }
         // Residual BINARY_OP runs the full tuple/str/list/dict fold.
         // Flatten must not keep only list-int: `t[i]` / `s[i]` would
         // residualize (`pure_tupleload`, `str_subscr_hot`).  Identify
