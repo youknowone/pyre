@@ -7366,7 +7366,6 @@ mod tests {
 
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
-        let _gc = ActiveGcGuard;
 
         let resolved = backend.get_typeid_from_classptr_if_gcremovetypeptr(int_vtable);
         assert_eq!(resolved, Some(int_tid));
@@ -7391,7 +7390,6 @@ mod tests {
         unsafe { *(root.0 as *mut u64) = 0xA11C_E701 };
         let mut backend = WasmBackend::new();
         backend.set_gc_allocator(Box::new(gc));
-        let _gc = ActiveGcGuard;
 
         let constant = majit_ir::Op::new(
             majit_ir::OpCode::SameAsR,
