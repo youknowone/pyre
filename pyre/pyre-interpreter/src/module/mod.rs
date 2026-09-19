@@ -7,8 +7,6 @@ pub mod __builtin__;
 #[allow(non_snake_case)]
 pub mod __pypy__;
 #[allow(non_snake_case)]
-pub mod _abc;
-#[allow(non_snake_case)]
 pub mod _ast;
 #[allow(non_snake_case)]
 #[cfg(all(
@@ -34,18 +32,10 @@ pub mod _locale;
 #[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
-pub mod _pypy_generic_alias;
-#[allow(non_snake_case)]
 pub mod _random;
 pub mod _sre;
 #[allow(non_snake_case)]
-pub mod _stat;
-#[allow(non_snake_case)]
-pub mod _symtable;
-#[allow(non_snake_case)]
 pub mod _types;
-#[allow(non_snake_case)]
-pub mod _typing;
 pub mod _warnings;
 pub mod _weakref;
 #[allow(non_snake_case)]
@@ -54,8 +44,6 @@ pub mod _winapi;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod _wmi;
 pub mod array;
-pub mod atexit;
-pub mod errno;
 pub mod gc;
 #[allow(non_snake_case)]
 pub mod imp;

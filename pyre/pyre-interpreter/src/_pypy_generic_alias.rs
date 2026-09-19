@@ -996,7 +996,7 @@ fn normalize_none(x: PyObjectRef) -> PyObjectRef {
 
 /// `_create_union(x, y)` (`_pypy_generic_alias.py:328`) — both operands
 /// must be unionable, else `NotImplemented`; identical operands collapse.
-pub(crate) fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
+pub fn create_union(x: PyObjectRef, y: PyObjectRef) -> crate::PyResult {
     use crate::objspace::descroperation::unionable;
     if !unionable(x) || !unionable(y) {
         return Ok(w_not_implemented());

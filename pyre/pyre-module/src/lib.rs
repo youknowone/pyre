@@ -23,6 +23,7 @@ pub mod module;
 /// The interpreter does not depend on this crate. The final binary calls
 /// [`register`] before `install_builtin_modules`.
 pub fn install_optional_modules() {
+    pyre_interpreter::importing::register_builtin_module("_abc", module::_abc::init);
     pyre_interpreter::importing::register_builtin_module("_bisect", module::_bisect::init);
     pyre_interpreter::importing::register_builtin_module("_blake2", module::_blake2::init);
     pyre_interpreter::importing::register_builtin_module("_bz2", module::_bz2::init);
@@ -64,31 +65,46 @@ pub fn install_optional_modules() {
         "_posixsubprocess",
         module::_posixsubprocess::init,
     );
+    pyre_interpreter::importing::register_builtin_module(
+        "_pypy_generic_alias",
+        module::_pypy_generic_alias::init,
+    );
     pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
     #[cfg(not(feature = "sandbox"))]
     pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
+    // Frozen importlib imports `_stat` while bootstrapping a sandbox that
+    // mounts no stdlib files, so this stays an unconditional builtin.
+    pyre_interpreter::importing::register_builtin_module("_stat", module::_stat::init);
     pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
     pyre_interpreter::importing::register_builtin_module(
         "_suggestions",
         module::_suggestions::init,
     );
+    pyre_interpreter::importing::register_builtin_module("_symtable", module::_symtable::init);
     pyre_interpreter::importing::register_builtin_module("_template", module::_template::init);
     pyre_interpreter::importing::register_builtin_module("_tokenize", module::_tokenize::init);
+    pyre_interpreter::importing::register_builtin_module("_typing", module::_typing::init);
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("_uuid", module::_uuid::init);
     #[cfg(target_os = "macos")]
     pyre_interpreter::importing::register_builtin_module("_scproxy", module::_scproxy::init);
+    pyre_interpreter::importing::register_builtin_module("atexit", module::atexit::init);
     pyre_interpreter::importing::register_builtin_module("binascii", module::binascii::init);
     pyre_interpreter::importing::register_builtin_module("cmath", module::cmath::init);
+    pyre_interpreter::importing::register_builtin_module("errno", module::errno::init);
     #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module(
         "faulthandler",
         module::faulthandler::init,
     );
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     pyre_interpreter::importing::register_builtin_module("mmap", module::mmap::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
@@ -338,7 +354,11 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         "pymath::math::misc::ulp",
         pymath::math::ulp as *const (),
     );
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     {
         let mmap_type: fn() -> pyre_object::PyObjectRef = module::mmap::interp_mmap::mmap_type;
         let addr = mmap_type as *const () as usize as i64;
@@ -422,8 +442,12 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
         ));
     }
     // `mmap.mmap` follows the optional SSL tail on ordinary Unix/Windows
-    // builds. A sandbox build has no `mmap` module at all.
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    // builds. A sandbox or host_env-off build has no `mmap` module at all.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     aliases.push(subclass_range_alias(195, typed::<module::mmap::W_MMap>()));
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(
@@ -472,7 +496,11 @@ mod tests {
         );
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     #[test]
     fn jit_trace_fnaddrs_covers_moved_mmap_type() {
         let bindings: HashMap<&'static str, i64> =

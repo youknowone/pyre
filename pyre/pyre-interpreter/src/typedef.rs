@@ -25805,7 +25805,7 @@ pub(crate) fn fs_errors() -> &'static str {
 /// `surrogateescape` rescues every byte, so this only ever fails under
 /// `surrogatepass`, where a byte that begins no UTF-8 sequence has no spelling
 /// at all and the name is reported rather than invented.
-pub(crate) fn fsdecode_wtf8(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
+pub fn fsdecode_wtf8(data: &[u8]) -> Result<Wtf8Buf, crate::PyError> {
     decode_utf8_with_errors(data, FS_ERRORS)
 }
 

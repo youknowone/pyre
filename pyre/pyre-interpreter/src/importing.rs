@@ -717,13 +717,7 @@ pub fn install_builtin_modules() {
     // other host-access modules a sandbox build leaves out.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     pyre_install_module!(winsound);
-    pyre_install_module!(_abc);
-
-    // Frozen importlib imports `_stat` while bootstrapping a sandbox that
-    // deliberately mounts no stdlib files, so it must stay a builtin.
-    pyre_install_module!(_stat);
     pyre_install_module!(_functools);
-    pyre_install_module!(_symtable);
     pyre_install_module!("_thread"(thread));
     pyre_install_module!(itertools);
     pyre_install_module!(_contextvars);
@@ -743,7 +737,6 @@ pub fn install_builtin_modules() {
     pyre_install_module!(posix);
     #[cfg(windows)]
     pyre_install_module!("nt"(posix));
-    pyre_install_module!(errno);
     pyre_install_module!(_collections);
     pyre_install_module!(_ast);
     pyre_install_module!("_imp"(imp));
@@ -764,14 +757,13 @@ pub fn install_builtin_modules() {
     // pypyjit — runtime JIT-parameter control (`set_param`).
     pyre_install_module!("pypyjit" => crate::module::pypyjit::init);
 
-    pyre_install_module!(atexit);
-
     // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
-    // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp` and the other
-    // optional host modules live in `pyre-module`.  None belong to the
-    // mediated ll_os/ll_time surface, so the sandbox interpreter omits
-    // them entirely: `import _ctypes` then raises ModuleNotFoundError,
-    // as in a build whose syscall code is absent.
+    // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp`, `errno`, `_stat`,
+    // `_abc`, `_typing`, `_symtable`, `_pypy_generic_alias`, `atexit` and
+    // the other optional modules live in `pyre-module`.  None of the host
+    // ones belong to the mediated ll_os/ll_time surface, so the sandbox
+    // interpreter omits them entirely: `import _ctypes` then raises
+    // ModuleNotFoundError, as in a build whose syscall code is absent.
     #[cfg(not(feature = "sandbox"))]
     {
         // `_signal` is a bootstrap module upstream: it is built on every
@@ -790,11 +782,9 @@ pub fn install_builtin_modules() {
     }
     pyre_install_module!(_locale);
     pyre_install_module!(_random);
-    pyre_install_module!(_pypy_generic_alias);
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
-    pyre_install_module!(_typing);
     pyre_install_module!(gc);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
