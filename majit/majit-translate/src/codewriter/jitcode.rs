@@ -1485,6 +1485,29 @@ impl BhCallDescr {
         }
     }
 
+    /// Copy of this descr with a different residual-call signature and an
+    /// unresolved stub.
+    ///
+    /// `descr.py CallDescr.create_call_stub` derives the stub from the descr's
+    /// own ARGS and RESULT at the moment the descr is made. A clone that then
+    /// rewrites `arg_classes` / `result_type` would keep a stub built for the
+    /// original signature. [`Clone`] itself may keep a resolved stub when the
+    /// signature is unchanged.
+    pub fn with_signature(&self, arg_classes: String, result_type: char) -> Self {
+        debug_assert_dispatchable(&arg_classes);
+        Self {
+            arg_classes,
+            result_type,
+            result_signed: self.result_signed,
+            result_size: self.result_size,
+            result_erased: self.result_erased,
+            void_word_abi: self.void_word_abi,
+            extra_info: self.extra_info.clone(),
+            translated_effect_info_id: self.translated_effect_info_id,
+            call_stub: OnceLock::new(),
+        }
+    }
+
     pub fn with_void_word_abi(mut self) -> Self {
         assert_eq!(
             self.result_type, 'v',
