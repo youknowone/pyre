@@ -1,4 +1,4 @@
-use majit_backend::ExitValueSourceLayout;
+use majit_backend::{Backend, ExitValueSourceLayout};
 
 thread_local! {
     /// Set while a full-body-walk trace executes a residual may-force call
@@ -6522,13 +6522,11 @@ impl<S: JitState> JitDriver<S> {
             // compile.py handle_fail
             let fail_index = result.fail_index;
             let trace_id = result.trace_id;
-            // `warmstate.py execute_assembler` reads fail values from the
-            // deadframe in place. Pyre projects its typed exit buffer back to
-            // machine words for the resume helpers; reuse the entry scratch's
-            // raw buffer instead of spilling a fresh `ExitRawValues` whenever
-            // this guard has more than its inline width.
-            let mut raw_values = self.take_exit_raw_scratch();
-            raw_values.extend(result.typed_values.iter().map(Value::as_raw_i64));
+            // `compile.py ResumeGuardDescr.handle_fail` / `resume.py
+            // blackhole_from_resumedata` read fail values from the deadframe
+            // in place (`resume.py ResumeDataDirectReader.decode_int` via
+            // `self.cpu.get_int_value(self.deadframe, num)`). No dense list
+            // is built unless `must_compile` starts a bridge.
             let descr_arc = result
                 .descr_arc
                 .take()
@@ -6567,10 +6565,13 @@ impl<S: JitState> JitDriver<S> {
                     fail_index,
                     trace_id,
                     descr_addr,
-                    raw_values.len()
+                    fd.fail_arg_types().len()
                 );
             }
             if failvals_enabled() {
+                let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                    self.meta.raw_exit_slots_from_deadframe(frame, fd)
+                });
                 eprintln!(
                     "@@@FAILVALS fail_index={} resume_pc={} raw_values={:?}",
                     fail_index,
@@ -6581,6 +6582,9 @@ impl<S: JitState> JitDriver<S> {
                 );
             }
             if crate::callee_rca_enabled() {
+                let raw_values = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                    self.meta.raw_exit_slots_from_deadframe(frame, fd)
+                });
                 eprintln!(
                     "[callee-rca][guard-fail] fail_index={} trace_id={} raw_values={:?} exit_types={:?}",
                     fail_index,
@@ -6598,9 +6602,13 @@ impl<S: JitState> JitDriver<S> {
             // the `must_compile` call. A descr with no owner stamped is the
             // loop that was entered.
             let owning_key = descr_owning_key.unwrap_or(green_key);
+            // `guard_value_operand` was read off the deadframe while it was
+            // live (`compile.py must_compile` `cpu.get_value_direct`). The
+            // fail-values slice is only the fallback for backends that
+            // resolve the GUARD_VALUE index from the dense vector.
             let (must_compile, owning_key) = self.meta.must_compile_with_owning_key(
                 &descr_arc,
-                &raw_values,
+                &[],
                 guard_value_operand,
                 owning_key,
             );
@@ -6630,23 +6638,32 @@ impl<S: JitState> JitDriver<S> {
             // file from, or a bridge setup that gave up; the blackhole arm
             // below is then the answer, exactly as when the guard does not
             // `must_compile` at all.
-            if should_bridge
-                && let Some(pc) = self.bridge_from_guard_resume_position(
+            // Decode a dense list only when this failure will start a
+            // bridge (`compile.py ResumeGuardDescr.handle_fail` when
+            // `must_compile` fires — about once per 200 failures).
+            let mut raw_values_for_bridge: Option<Vec<i64>> = None;
+            if should_bridge {
+                let mut raw_values = self.take_exit_raw_scratch();
+                if let Some(frame) = result.deadframe.as_ref() {
+                    raw_values.extend(self.meta.raw_exit_slots_from_deadframe(frame, fd));
+                }
+                if let Some(pc) = self.bridge_from_guard_resume_position(
                     &descr_arc,
                     state,
                     env,
                     &raw_values,
                     target_pc,
-                )
-            {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
-                        green_key, trace_id, fail_index, pc,
-                    );
+                ) {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
+                            green_key, trace_id, fail_index, pc,
+                        );
+                    }
+                    self.exit_raw_scratch_out(raw_values);
+                    return Some(pc);
                 }
-                self.exit_raw_scratch_out(raw_values);
-                return Some(pc);
+                raw_values_for_bridge = Some(raw_values);
             }
 
             // compile.py:711 resume_in_blackhole
@@ -6752,13 +6769,33 @@ impl<S: JitState> JitDriver<S> {
                         .blackhole_virtualizable_identity(&compiled_meta, &info.name, info)
                         .map(|ptr| ptr as i64)
                 });
+                // `resume.py ResumeDataDirectReader.decode_int` —
+                // `self.cpu.get_int_value(self.deadframe, num)`. Keep
+                // `result` (and its deadframe) alive across this call so
+                // `jf_savedata` stays rooted; `FailArgSource::JitFrame`
+                // also holds an `OwnerRootGuard`.
+                let n_fail_args = fd.fail_arg_types().len();
+                let fallback_raw;
+                let fail_args = match result
+                    .deadframe
+                    .as_ref()
+                    .and_then(|frame| frame.jitframe_ptr())
+                {
+                    Some(ptr) => majit_backend::FailArgSource::from_jitframe(ptr, fd, n_fail_args),
+                    None => {
+                        fallback_raw = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                            self.meta.raw_exit_slots_from_deadframe(frame, fd)
+                        });
+                        majit_backend::FailArgSource::Slice(&fallback_raw)
+                    }
+                };
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
                     rd_consts_slice,
                     all_liveness,
-                    majit_backend::FailArgSource::Slice(&raw_values),
+                    fail_args,
                     Some(fd.fail_arg_types()),
                     rd_virtuals_slice,
                     Some(fd.rd_pendingfields().unwrap_or(&[])), // rd_guard_pendingfields
@@ -6840,21 +6877,20 @@ impl<S: JitState> JitDriver<S> {
                     // The state fields as the walk found them: the identity
                     // slots of each bank, which for the int bank is the scalars
                     // and every array element both.
-                    let bh_sf = state.state_field_layout();
                     let sf_i = bank_span(
                         bh.registers_i.len(),
-                        bh_sf.int_scalar_base,
-                        bh_sf.total_slots(),
+                        sf_layout.int_scalar_base,
+                        sf_layout.total_slots(),
                     );
                     let sf_r = bank_span(
                         bh.registers_r.len(),
-                        bh_sf.ref_scalar_base,
-                        bh_sf.num_ref_scalars,
+                        sf_layout.ref_scalar_base,
+                        sf_layout.num_ref_scalars,
                     );
                     let sf_f = bank_span(
                         bh.registers_f.len(),
-                        bh_sf.float_scalar_base,
-                        bh_sf.num_float_scalars,
+                        sf_layout.float_scalar_base,
+                        sf_layout.num_float_scalars,
                     );
                     // Three register-bank copies, and their only purpose is
                     // `guard_may_bridge` below, whose only reader takes them
@@ -7138,12 +7174,13 @@ impl<S: JitState> JitDriver<S> {
                             && !portal_crn_handled
                             && pc != usize::MAX
                         {
+                            let raw_values = raw_values_for_bridge.get_or_insert_with(|| {
+                                result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                                    self.meta.raw_exit_slots_from_deadframe(frame, fd)
+                                })
+                            });
                             let bridge_ok = self.start_bridge_tracing(
-                                &descr_arc,
-                                state,
-                                env,
-                                &raw_values,
-                                pc,
+                                &descr_arc, state, env, raw_values, pc,
                                 // The blackhole above already applied this
                                 // guard's writes; recording is the whole
                                 // job here.
@@ -7156,7 +7193,9 @@ impl<S: JitState> JitDriver<S> {
                                 );
                             }
                         }
-                        self.exit_raw_scratch_out(raw_values);
+                        if let Some(raw_values) = raw_values_for_bridge {
+                            self.exit_raw_scratch_out(raw_values);
+                        }
                         return Some(pc);
                     }
                 }
@@ -7199,7 +7238,9 @@ impl<S: JitState> JitDriver<S> {
             self.meta.invalidate_loop(green_key);
             self.meta.remove_compiled_loop(green_key);
             self.meta.warm_state_mut().abort_tracing(green_key, true);
-            self.exit_raw_scratch_out(raw_values);
+            if let Some(raw_values) = raw_values_for_bridge {
+                self.exit_raw_scratch_out(raw_values);
+            }
             return Some(guard_resume_pc);
         }
 
@@ -8103,7 +8144,23 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let exit_meta = result.meta.take().expect("a detailed run carries its meta");
-        state.restore_values(&exit_meta, &result.typed_values);
+        // JUMP already decoded on its own arm. A guard-failure through this
+        // runner still `restore_values`; re-derive the list from the deadframe.
+        let typed_values = if result.fail_index == u32::MAX {
+            std::mem::take(&mut result.typed_values)
+        } else if let (Some(frame), Some(fd)) = (
+            result.deadframe.as_ref(),
+            result.descr_arc.as_ref().and_then(|a| a.as_fail_descr()),
+        ) {
+            crate::pyjitpl::MetaInterp::<S::Meta>::decode_exit_slots(
+                self.meta.backend(),
+                frame,
+                fd.fail_arg_types(),
+            )
+        } else {
+            std::mem::take(&mut result.typed_values)
+        };
+        state.restore_values(&exit_meta, &typed_values);
         self.sync_after(state, &exit_meta, vable);
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
@@ -8248,11 +8305,6 @@ impl<S: JitState> JitDriver<S> {
         // The pointer travels; the layout behind it is opened past the finish
         // arm below, which is the one that carries none.
         let exit_layout = result.exit_layout.take();
-        // Projected first: the take below is what leaves `typed_values` empty.
-        let raw_values = crate::compile::raw_exit_values(&result.typed_values).into_vec();
-        // Taken, not copied: every field this arm needs is read out here and
-        // `result` is dropped just below, so the buffer has no reader left.
-        let typed_values = std::mem::take(&mut result.typed_values).into_vec();
         let guard_value_operand = result.guard_value_operand;
         // See the sibling run loop.
         let descr_owning_key = result.rd_loop_token;
@@ -8266,12 +8318,13 @@ impl<S: JitState> JitDriver<S> {
         // until `AllVirtuals.show` so `jf_savedata` stays rooted.
         let savedata = result.savedata;
         let deadframe = result.deadframe.take();
-        drop(result);
 
         // memmgr.py: keep_loop_alive(loop_token)
         self.meta.keep_loop_alive(green_key);
 
         if is_finish {
+            let typed_values = std::mem::take(&mut result.typed_values).into_vec();
+            drop(result);
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
                 via_blackhole: false,
@@ -8283,8 +8336,9 @@ impl<S: JitState> JitDriver<S> {
         let descr_arc = descr_arc.expect("a guard exit carries its descr");
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
-            state.restore_values(&exit_meta, &typed_values);
+            state.restore_values(&exit_meta, &result.typed_values);
             self.sync_after(state, &exit_meta, vable);
+            drop(result);
             return DetailedDriverRunOutcome::Jump {
                 via_blackhole: false,
                 continue_running_normally_values: None,
@@ -8293,6 +8347,16 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py handle_fail / must_compile: single tick+check.
+        // Guard-failure: decode from the deadframe after the split, for
+        // callers that still take `GuardFailure.raw_values` (eval.rs).
+        let fd: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("a guard exit carries a FailDescr");
+        let raw_values = deadframe
+            .as_ref()
+            .map(|frame| self.meta.raw_exit_slots_from_deadframe(frame, fd))
+            .unwrap_or_default();
+        drop(result);
         let exit_layout = *exit_layout.expect("a guard exit carries its exit layout");
         let fallback_green_key = if exit_layout.rd_loop_token != 0 {
             exit_layout.rd_loop_token
@@ -9073,9 +9137,18 @@ impl<S: JitState> JitDriver<S> {
         let Some(fd) = source_descr.as_fail_descr() else {
             return false;
         };
-        let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
-        self.meta
-            .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
+        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
+        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
+        // `bridge_attached` returns `Some(false)` while the guard still
+        // owns its recovery stub; `None` falls back to the token map.
+        match self.meta.backend.bridge_attached(fd) {
+            Some(attached) => attached,
+            None => {
+                let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
+                self.meta
+                    .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
+            }
+        }
     }
 
     /// Start bridge tracing from a guard failure point.
@@ -9129,10 +9202,17 @@ impl<S: JitState> JitDriver<S> {
         // path once a bridge is attached. A later `must_compile` FIRED
         // here is a pyre re-entry; walking again can abort setup and
         // terminally decline the working source.
-        if self
-            .meta
-            .bridge_was_compiled(green_key, trace_id, fail_index)
-        {
+        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
+        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
+        // `bridge_attached` returns `Some(false)` while the guard still
+        // owns its recovery stub; `None` falls back to the token map.
+        let already_compiled = match self.meta.backend.bridge_attached(descr_fd) {
+            Some(attached) => attached,
+            None => self
+                .meta
+                .bridge_was_compiled(green_key, trace_id, fail_index),
+        };
+        if already_compiled {
             return false;
         }
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {

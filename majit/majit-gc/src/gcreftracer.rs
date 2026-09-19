@@ -240,11 +240,17 @@ impl GcTable {
     }
 }
 
-/// Append a live table to the registry, sweeping out tables whose loop
-/// tokens have already been freed.
+/// Append a live table to the registry.
+///
+/// `assembler.py setup` / `gcreftracer.make_gcref_tracer` appends one
+/// tracer per compiled piece. Sweep dead `Weak`s only when the vec is
+/// about to reallocate — walking every live table on each register is
+/// extra work the append does not do.
 fn register_table(table: &Arc<GcTable>) {
     let mut guard = LIVE_GC_TABLES.write();
-    guard.retain(|w| w.strong_count() > 0);
+    if guard.len() == guard.capacity() {
+        guard.retain(|w| w.strong_count() > 0);
+    }
     guard.push(Arc::downgrade(table));
 }
 

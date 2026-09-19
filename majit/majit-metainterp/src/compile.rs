@@ -248,11 +248,11 @@ impl CompiledExitLayout {
 pub struct CompileResult<M> {
     /// The exit slots this run left through.
     ///
-    /// The machine-word list that used to sit beside this one is gone: every
-    /// reader of it is on the guard-failure or detailed-run path, so a steady
-    /// finish exit built one per entry and dropped it unread, moving eighty
-    /// bytes through each by-value return of this struct on the way. Those
-    /// readers call [`raw_exit_values`] on this list instead.
+    /// Populated on a FINISH and on a back-edge JUMP (`fail_index ==
+    /// u32::MAX`). A guard-failure leaves this empty: `compile.py
+    /// ResumeGuardDescr.handle_fail` does not copy the deadframe out, and
+    /// `resume.py ResumeDataDirectReader.decode_int` reads named slots via
+    /// `self.cpu.get_int_value(self.deadframe, num)`.
     pub typed_values: ExitValues,
     /// Snapshot of the compiled entry's metadata taken *before*
     /// `execute_token`, mirroring `warmstate.py` `execute_assembler`'s hold on

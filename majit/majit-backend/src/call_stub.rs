@@ -14,6 +14,7 @@
 //! AAPCS.
 
 use majit_translate::codewriter::insns::MAX_HOST_CALL_ARITY;
+use majit_translate::jitcode::{BhCallDescr, BhCallStub};
 
 /// `descr.py TYPE()` collapsed to the two C-ABI register classes the
 /// dispatch table can express: `'i'`, `'r'` and `'L'` (`lltype.Signed`,
@@ -26,10 +27,12 @@ pub enum ArgClass {
 }
 
 /// Class-sequence table shared by `bh_call_i_dispatch`, `bh_call_f_dispatch`,
-/// and `bh_call_v_dispatch`. `$ret` plugs into both the function-pointer
-/// signature and the dispatch function's return type.
+/// and `bh_call_v_dispatch`. Each row is one monomorphic stub module; the
+/// same list is the match in `lookup_stub_*` and the arms `dispatch_classes_body!`
+/// used to inline. `$ret` plugs into both the function-pointer signature
+/// and the dispatch function's return type.
 ///
-/// `descr.py` / `descr.py create_call_stub` parity: the signature
+/// `descr.py` / `descr.py CallDescr.create_call_stub` parity: the signature
 /// is built in `arg_classes` declaration order, so `fn(f64, i64)` is dispatched
 /// as `extern "C" fn(f64, i64)` rather than a class-blind
 /// `extern "C" fn(i64, f64)`. That preserves SysV/AAPCS register-file order
@@ -42,1045 +45,380 @@ pub enum ArgClass {
 /// deopt that first runs it; widening the arms here means raising it there in
 /// the same change (`majit-translate` cannot call into `majit-backend`, so the
 /// bound is stated on both sides rather than shared).
-macro_rules! dispatch_classes_body {
-    ($func:ident, $classes:ident, $args:ident, $ret:ty) => {{
-        type I = i64;
-        type F = f64;
-        assert_eq!(
-            $classes.len(),
-            $args.len(),
-            "bh_call dispatch: class sequence and positional arg list length differ"
-        );
-        match $classes {
-            [] => {
-                let f: unsafe extern "C" fn() -> $ret = std::mem::transmute($func);
-                f()
-            }
-            [ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I) -> $ret = std::mem::transmute($func);
-                f($args[0])
-            }
-            [ArgClass::Float] => {
-                let f: unsafe extern "C" fn(F) -> $ret = std::mem::transmute($func);
-                f(f64::from_bits($args[0] as u64))
-            }
-            [ArgClass::Int, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I, I) -> $ret = std::mem::transmute($func);
-                f($args[0], $args[1])
-            }
-            [ArgClass::Int, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(I, F) -> $ret = std::mem::transmute($func);
-                f($args[0], f64::from_bits($args[1] as u64))
-            }
-            [ArgClass::Float, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(F, I) -> $ret = std::mem::transmute($func);
-                f(f64::from_bits($args[0] as u64), $args[1])
-            }
-            [ArgClass::Float, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                )
-            }
-            [ArgClass::Int, ArgClass::Int, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I, I, I) -> $ret = std::mem::transmute($func);
-                f($args[0], $args[1], $args[2])
-            }
-            [ArgClass::Int, ArgClass::Int, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(I, I, F) -> $ret = std::mem::transmute($func);
-                f($args[0], $args[1], f64::from_bits($args[2] as u64))
-            }
-            [ArgClass::Int, ArgClass::Float, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I, F, I) -> $ret = std::mem::transmute($func);
-                f($args[0], f64::from_bits($args[1] as u64), $args[2])
-            }
-            [ArgClass::Int, ArgClass::Float, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                )
-            }
-            [ArgClass::Float, ArgClass::Int, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(F, I, I) -> $ret = std::mem::transmute($func);
-                f(f64::from_bits($args[0] as u64), $args[1], $args[2])
-            }
-            [ArgClass::Float, ArgClass::Int, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                )
-            }
-            [ArgClass::Float, ArgClass::Float, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                )
-            }
-            [ArgClass::Float, ArgClass::Float, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                )
-            }
-            [ArgClass::Int, ArgClass::Int, ArgClass::Int, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I, I, I, I) -> $ret = std::mem::transmute($func);
-                f($args[0], $args[1], $args[2], $args[3])
-            }
-            [ArgClass::Int, ArgClass::Int, ArgClass::Int, ArgClass::Float] => {
-                let f: unsafe extern "C" fn(I, I, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [ArgClass::Int, ArgClass::Int, ArgClass::Float, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I, I, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [ArgClass::Int, ArgClass::Float, ArgClass::Int, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(I, F, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [ArgClass::Float, ArgClass::Int, ArgClass::Int, ArgClass::Int] => {
-                let f: unsafe extern "C" fn(F, I, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    $args[2],
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I) -> $ret = std::mem::transmute($func);
-                f($args[0], $args[1], $args[2], $args[3], $args[4])
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    $args[2],
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, F, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, I, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, I, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, I, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, F, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(I, F, F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0],
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, I, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    $args[2],
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, I, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    $args[2],
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, I, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, F, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, I, F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    $args[1],
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, I, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, I, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, I, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, I, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    $args[2],
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, F, I, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, F, I, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    $args[3],
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, F, F, I) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    $args[4],
-                )
-            }
-            [
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-                ArgClass::Float,
-            ] => {
-                let f: unsafe extern "C" fn(F, F, F, F, F) -> $ret = std::mem::transmute($func);
-                f(
-                    f64::from_bits($args[0] as u64),
-                    f64::from_bits($args[1] as u64),
-                    f64::from_bits($args[2] as u64),
-                    f64::from_bits($args[3] as u64),
-                    f64::from_bits($args[4] as u64),
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I) -> $ret = std::mem::transmute($func);
-                f($args[0], $args[1], $args[2], $args[3], $args[4], $args[5])
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9], $args[10],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9], $args[10], $args[11],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9], $args[10], $args[11], $args[12],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9], $args[10], $args[11], $args[12], $args[13],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(I, I, I, I, I, I, I, I, I, I, I, I, I, I, I) -> $ret =
-                    std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14],
-                )
-            }
-            [
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-                ArgClass::Int,
-            ] => {
-                let f: unsafe extern "C" fn(
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                    I,
-                ) -> $ret = std::mem::transmute($func);
-                f(
-                    $args[0], $args[1], $args[2], $args[3], $args[4], $args[5], $args[6], $args[7],
-                    $args[8], $args[9], $args[10], $args[11], $args[12], $args[13], $args[14],
-                    $args[15],
-                )
-            }
-            classes => {
-                // TODO: upstream
-                // `rpython/jit/backend/llsupport/descr.py:574` /
-                // `descr.py create_call_stub` generates a
-                // per-calldescr stub at translation time, so every class
-                // sequence has a matching extern "C" signature. Rust has no
-                // translation-time codegen equivalent here, so the dispatch
-                // is a hand-rolled class-sequence table. Convergence path:
-                // wire libffi (or an ABI adapter) so any sequence is
-                // dispatchable; until then, callees outside the table panic
-                // instead of silently corrupting registers.
-                panic!(
-                    "bh_call dispatch: unsupported arg class sequence {classes:?}; \
-                     needs libffi for general dispatch"
-                );
-            }
-        }
+macro_rules! invoke_ty {
+    (Int) => {
+        i64
+    };
+    (Float) => {
+        f64
+    };
+}
+
+macro_rules! invoke_arg {
+    (Int, $a:ident, $i:tt) => {
+        $a[$i]
+    };
+    (Float, $a:ident, $i:tt) => {
+        f64::from_bits($a[$i] as u64)
+    };
+}
+
+macro_rules! invoke_with_idx {
+    ($f:ident, $a:ident) => {{
+        let _ = $a;
+        $f()
+    }};
+    ($f:ident, $a:ident, $c0:ident) => {
+        $f(invoke_arg!($c0, $a, 0))
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident) => {
+        $f(invoke_arg!($c0, $a, 0), invoke_arg!($c1, $a, 1))
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident, $c10:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+            invoke_arg!($c10, $a, 10),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident, $c10:ident, $c11:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+            invoke_arg!($c10, $a, 10),
+            invoke_arg!($c11, $a, 11),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident, $c10:ident, $c11:ident, $c12:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+            invoke_arg!($c10, $a, 10),
+            invoke_arg!($c11, $a, 11),
+            invoke_arg!($c12, $a, 12),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident, $c10:ident, $c11:ident, $c12:ident, $c13:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+            invoke_arg!($c10, $a, 10),
+            invoke_arg!($c11, $a, 11),
+            invoke_arg!($c12, $a, 12),
+            invoke_arg!($c13, $a, 13),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident, $c10:ident, $c11:ident, $c12:ident, $c13:ident, $c14:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+            invoke_arg!($c10, $a, 10),
+            invoke_arg!($c11, $a, 11),
+            invoke_arg!($c12, $a, 12),
+            invoke_arg!($c13, $a, 13),
+            invoke_arg!($c14, $a, 14),
+        )
+    };
+    ($f:ident, $a:ident, $c0:ident, $c1:ident, $c2:ident, $c3:ident, $c4:ident, $c5:ident, $c6:ident, $c7:ident, $c8:ident, $c9:ident, $c10:ident, $c11:ident, $c12:ident, $c13:ident, $c14:ident, $c15:ident) => {
+        $f(
+            invoke_arg!($c0, $a, 0),
+            invoke_arg!($c1, $a, 1),
+            invoke_arg!($c2, $a, 2),
+            invoke_arg!($c3, $a, 3),
+            invoke_arg!($c4, $a, 4),
+            invoke_arg!($c5, $a, 5),
+            invoke_arg!($c6, $a, 6),
+            invoke_arg!($c7, $a, 7),
+            invoke_arg!($c8, $a, 8),
+            invoke_arg!($c9, $a, 9),
+            invoke_arg!($c10, $a, 10),
+            invoke_arg!($c11, $a, 11),
+            invoke_arg!($c12, $a, 12),
+            invoke_arg!($c13, $a, 13),
+            invoke_arg!($c14, $a, 14),
+            invoke_arg!($c15, $a, 15),
+        )
+    };
+}
+
+macro_rules! invoke_stub {
+    ($func:ident, $args:ident, $ret:ty $(, $class:ident)*) => {{
+        let f: unsafe extern "C" fn($(invoke_ty!($class)),*) -> $ret =
+            std::mem::transmute($func);
+        invoke_with_idx!(f, $args $(, $class)*)
     }};
 }
+
+/// One module per ABI sequence: `call_i` / `call_f` / `call_v` are the
+/// monomorphic stubs `descr.py CallDescr.create_call_stub` would emit.
+/// `dispatch_classes_body!` is this table (via `lookup_stub_*`).
+macro_rules! call_sig_table {
+    ($apply:ident) => {
+        $apply! {
+        Z {  }
+        I { Int }
+        F { Float }
+        II { Int, Int }
+        IF { Int, Float }
+        FI { Float, Int }
+        FF { Float, Float }
+        III { Int, Int, Int }
+        IIF { Int, Int, Float }
+        IFI { Int, Float, Int }
+        IFF { Int, Float, Float }
+        FII { Float, Int, Int }
+        FIF { Float, Int, Float }
+        FFI { Float, Float, Int }
+        FFF { Float, Float, Float }
+        IIII { Int, Int, Int, Int }
+        IIIF { Int, Int, Int, Float }
+        IIFI { Int, Int, Float, Int }
+        IIFF { Int, Int, Float, Float }
+        IFII { Int, Float, Int, Int }
+        IFIF { Int, Float, Int, Float }
+        IFFI { Int, Float, Float, Int }
+        IFFF { Int, Float, Float, Float }
+        FIII { Float, Int, Int, Int }
+        FIIF { Float, Int, Int, Float }
+        FIFI { Float, Int, Float, Int }
+        FIFF { Float, Int, Float, Float }
+        FFII { Float, Float, Int, Int }
+        FFIF { Float, Float, Int, Float }
+        FFFI { Float, Float, Float, Int }
+        FFFF { Float, Float, Float, Float }
+        IIIII { Int, Int, Int, Int, Int }
+        IIIIF { Int, Int, Int, Int, Float }
+        IIIFI { Int, Int, Int, Float, Int }
+        IIIFF { Int, Int, Int, Float, Float }
+        IIFII { Int, Int, Float, Int, Int }
+        IIFIF { Int, Int, Float, Int, Float }
+        IIFFI { Int, Int, Float, Float, Int }
+        IIFFF { Int, Int, Float, Float, Float }
+        IFIII { Int, Float, Int, Int, Int }
+        IFIIF { Int, Float, Int, Int, Float }
+        IFIFI { Int, Float, Int, Float, Int }
+        IFIFF { Int, Float, Int, Float, Float }
+        IFFII { Int, Float, Float, Int, Int }
+        IFFIF { Int, Float, Float, Int, Float }
+        IFFFI { Int, Float, Float, Float, Int }
+        IFFFF { Int, Float, Float, Float, Float }
+        FIIII { Float, Int, Int, Int, Int }
+        FIIIF { Float, Int, Int, Int, Float }
+        FIIFI { Float, Int, Int, Float, Int }
+        FIIFF { Float, Int, Int, Float, Float }
+        FIFII { Float, Int, Float, Int, Int }
+        FIFIF { Float, Int, Float, Int, Float }
+        FIFFI { Float, Int, Float, Float, Int }
+        FIFFF { Float, Int, Float, Float, Float }
+        FFIII { Float, Float, Int, Int, Int }
+        FFIIF { Float, Float, Int, Int, Float }
+        FFIFI { Float, Float, Int, Float, Int }
+        FFIFF { Float, Float, Int, Float, Float }
+        FFFII { Float, Float, Float, Int, Int }
+        FFFIF { Float, Float, Float, Int, Float }
+        FFFFI { Float, Float, Float, Float, Int }
+        FFFFF { Float, Float, Float, Float, Float }
+        I6 { Int, Int, Int, Int, Int, Int }
+        I7 { Int, Int, Int, Int, Int, Int, Int }
+        I8 { Int, Int, Int, Int, Int, Int, Int, Int }
+        I9 { Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I10 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I11 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I12 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I13 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I14 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I15 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        I16 { Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int }
+        }
+    };
+}
+
+macro_rules! define_call_sig_stubs {
+    ($($name:ident { $($class:ident),* })*) => {
+        fn lookup_stub_i(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) -> i64 {
+            match classes {
+                $(
+                    [$(ArgClass::$class),*] => {
+                        unsafe fn stub(func: usize, args: &[i64]) -> i64 {
+                            unsafe { invoke_stub!(func, args, i64 $(, $class)*) }
+                        }
+                        stub
+                    }
+                )*
+                classes => unsupported_call_sig(classes),
+            }
+        }
+
+        fn lookup_stub_f(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) -> f64 {
+            match classes {
+                $(
+                    [$(ArgClass::$class),*] => {
+                        unsafe fn stub(func: usize, args: &[i64]) -> f64 {
+                            unsafe { invoke_stub!(func, args, f64 $(, $class)*) }
+                        }
+                        stub
+                    }
+                )*
+                classes => unsupported_call_sig(classes),
+            }
+        }
+
+        fn lookup_stub_v(classes: &[ArgClass]) -> unsafe fn(usize, &[i64]) {
+            match classes {
+                $(
+                    [$(ArgClass::$class),*] => {
+                        unsafe fn stub(func: usize, args: &[i64]) {
+                            unsafe { invoke_stub!(func, args, () $(, $class)*) }
+                        }
+                        stub
+                    }
+                )*
+                classes => unsupported_call_sig(classes),
+            }
+        }
+    };
+}
+
+fn unsupported_call_sig(classes: &[ArgClass]) -> ! {
+    // `descr.py CallDescr.create_call_stub` generates a
+    // per-calldescr stub at translation time, so every class
+    // sequence has a matching extern "C" signature. Rust has no
+    // translation-time codegen equivalent here, so the dispatch
+    // is a hand-rolled class-sequence table. Convergence path:
+    // wire libffi (or an ABI adapter) so any sequence is
+    // dispatchable; until then, callees outside the table panic
+    // instead of silently corrupting registers.
+    panic!(
+        "bh_call dispatch: unsupported arg class sequence {classes:?}; \
+         needs libffi for general dispatch"
+    );
+}
+
+call_sig_table!(define_call_sig_stubs);
 
 /// llmodel.py:816 call_stub_i: ABI-correct dispatch in calldescr declaration
 /// order.
@@ -1099,7 +437,12 @@ macro_rules! dispatch_classes_body {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    unsafe { dispatch_classes_body!(func, classes, args, i64) }
+    assert_eq!(
+        classes.len(),
+        args.len(),
+        "bh_call dispatch: class sequence and positional arg list length differ"
+    );
+    unsafe { (lookup_stub_i(classes))(func, args) }
 }
 
 /// llmodel.py bh_call_v: void-typed parallel of `bh_call_i_dispatch`.
@@ -1113,7 +456,12 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) {
-    unsafe { dispatch_classes_body!(func, classes, args, ()) }
+    assert_eq!(
+        classes.len(),
+        args.len(),
+        "bh_call dispatch: class sequence and positional arg list length differ"
+    );
+    unsafe { (lookup_stub_v(classes))(func, args) }
 }
 
 /// llmodel.py bh_call_f: f64-typed parallel of `bh_call_i_dispatch`.
@@ -1127,7 +475,12 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> f64 {
-    unsafe { dispatch_classes_body!(func, classes, args, f64) }
+    assert_eq!(
+        classes.len(),
+        args.len(),
+        "bh_call dispatch: class sequence and positional arg list length differ"
+    );
+    unsafe { (lookup_stub_f(classes))(func, args) }
 }
 
 /// The ordered class sequence and matching positional argument list that
@@ -1201,6 +554,156 @@ pub fn verify_result_type(result_type: char, accepted: &str) {
         "BhCallDescr.verify_types: result_type {result_type:?} is not one of {accepted:?}; \
          the emitted residual_call opcode and the calldescr disagree about the return register"
     );
+}
+
+/// `descr.py CallDescr.create_call_stub`: walk `arg_classes` once, pick the
+/// monomorphic ABI stub, and record the bank mapping. `verify_result_type`
+/// and the `verify_types` count of each class run here, not per call.
+pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
+    let accepted = match result_type {
+        'i' | 'S' => "iS",
+        'r' => "r",
+        'f' | 'L' => "fL",
+        'v' => "v",
+        _ => "",
+    };
+    verify_result_type(result_type, accepted);
+
+    let mut slots = [0u8; MAX_HOST_CALL_ARITY];
+    let mut classes_buf = [ArgClass::Int; MAX_HOST_CALL_ARITY];
+    let mut arity = 0u8;
+    let mut expect_i = 0u8;
+    let mut expect_r = 0u8;
+    let mut expect_f = 0u8;
+    let mut ii = 0u8;
+    let mut ri = 0u8;
+    let mut fi = 0u8;
+
+    for c in arg_classes.chars() {
+        if arity as usize >= MAX_HOST_CALL_ARITY {
+            panic!(
+                "bh_call dispatch: {} arguments exceeds MAX_HOST_CALL_ARITY \
+                 ({MAX_HOST_CALL_ARITY}); the dispatch table has no arm this wide",
+                arity as usize + 1
+            );
+        }
+        let (bank, class) = match c {
+            'i' => (BhCallStub::BANK_I, ArgClass::Int),
+            'r' => (BhCallStub::BANK_R, ArgClass::Int),
+            'f' => (BhCallStub::BANK_F, ArgClass::Float),
+            'L' => (BhCallStub::BANK_F, ArgClass::Int),
+            'S' => {
+                panic!(
+                    "BhCallDescr.collect_call_args: 'S' (SingleFloat) ABI \
+                     requires f32-aware dispatch; pyre's dispatch table \
+                     only supports f64. arg_classes={arg_classes:?}"
+                );
+            }
+            other => panic!(
+                "BhCallDescr.collect_call_args: unsupported arg class {other:?} \
+                 in arg_classes={arg_classes:?}"
+            ),
+        };
+        let idx = match bank {
+            BhCallStub::BANK_I => {
+                let i = ii;
+                ii += 1;
+                expect_i += 1;
+                i
+            }
+            BhCallStub::BANK_R => {
+                let i = ri;
+                ri += 1;
+                expect_r += 1;
+                i
+            }
+            _ => {
+                let i = fi;
+                fi += 1;
+                expect_f += 1;
+                i
+            }
+        };
+        slots[arity as usize] = (bank << 6) | idx;
+        classes_buf[arity as usize] = class;
+        arity += 1;
+    }
+
+    let classes = &classes_buf[..arity as usize];
+    BhCallStub::new(
+        slots,
+        arity,
+        expect_i,
+        expect_r,
+        expect_f,
+        lookup_stub_i(classes),
+        lookup_stub_f(classes),
+        lookup_stub_v(classes),
+    )
+}
+
+fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
+    calldescr
+        .call_stub
+        .get_or_init(|| create_call_stub(&calldescr.arg_classes, calldescr.result_type))
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_i`: read the per-descr stub and call.
+/// The wasm trampoline path (`residual_host_call`) stays on
+/// [`bh_call_i_by_classes`].
+///
+/// # Safety
+/// `func` must match the ABI [`create_call_stub`] derives from `arg_classes`.
+pub unsafe fn bh_call_i_with_descr(
+    func: usize,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+    calldescr: &BhCallDescr,
+) -> i64 {
+    if residual_host_call().is_some() {
+        return unsafe {
+            bh_call_i_by_classes(func, &calldescr.arg_classes, args_i, args_r, args_f)
+        };
+    }
+    unsafe { call_stub_for(calldescr).call_i(func, args_i, args_r, args_f) }
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_f` parallel of [`bh_call_i_with_descr`].
+///
+/// # Safety
+/// See [`bh_call_i_with_descr`].
+pub unsafe fn bh_call_f_with_descr(
+    func: usize,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+    calldescr: &BhCallDescr,
+) -> f64 {
+    if residual_host_call().is_some() {
+        return unsafe {
+            bh_call_f_by_classes(func, &calldescr.arg_classes, args_i, args_r, args_f)
+        };
+    }
+    unsafe { call_stub_for(calldescr).call_f(func, args_i, args_r, args_f) }
+}
+
+/// `llmodel.py AbstractLLCPU.bh_call_v` parallel of [`bh_call_i_with_descr`].
+///
+/// # Safety
+/// See [`bh_call_i_with_descr`].
+pub unsafe fn bh_call_v_with_descr(
+    func: usize,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+    calldescr: &BhCallDescr,
+) {
+    if residual_host_call().is_some() {
+        unsafe { bh_call_v_by_classes(func, &calldescr.arg_classes, args_i, args_r, args_f) };
+        return;
+    }
+    unsafe { call_stub_for(calldescr).call_v(func, args_i, args_r, args_f) }
 }
 
 /// Build the C-ABI class sequence and positional argument list from
@@ -1628,5 +1131,62 @@ mod tests {
     #[should_panic(expected = "is not one of \"r\"")]
     fn verify_result_type_rejects_the_default_descr_s_null_result_type() {
         verify_result_type('\0', "r");
+    }
+
+    /// `descr.py CallDescr.create_call_stub` + `llmodel.py AbstractLLCPU.bh_call_f`
+    /// for the interleaved float/ref case of `test_call_stubs_2`.
+    #[test]
+    fn create_call_stub_f_interleaved_float_ref_preserves_declaration_order() {
+        let b = [1_i64];
+        let descr = BhCallDescr::from_arg_classes(
+            "fr".to_string(),
+            'f',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let result = unsafe {
+            bh_call_f_with_descr(
+                f2 as *const () as usize,
+                None,
+                Some(&[b.as_ptr() as i64]),
+                Some(&[3.5_f64.to_bits() as i64]),
+                &descr,
+            )
+        };
+        assert_eq!(result, 4.5);
+    }
+
+    /// `shift` (`arg_classes = "rii"`) is the regex residual that the stub
+    /// must serve without walking the class string on the second call.
+    #[test]
+    fn create_call_stub_i_rii_places_ref_then_two_ints() {
+        extern "C" fn rii(a: i64, b: i64, c: i64) -> i64 {
+            a + b * 10 + c * 100
+        }
+        let descr = BhCallDescr::from_arg_classes(
+            "rii".to_string(),
+            'i',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
+        let result = unsafe {
+            bh_call_i_with_descr(
+                rii as *const () as usize,
+                Some(&[2, 3]),
+                Some(&[1]),
+                None,
+                &descr,
+            )
+        };
+        assert_eq!(result, 321);
+        let again = unsafe {
+            bh_call_i_with_descr(
+                rii as *const () as usize,
+                Some(&[2, 3]),
+                Some(&[1]),
+                None,
+                &descr,
+            )
+        };
+        assert_eq!(again, 321);
+        assert!(descr.call_stub.get().is_some());
     }
 }

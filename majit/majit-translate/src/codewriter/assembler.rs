@@ -7141,6 +7141,7 @@ mod tests {
             void_word_abi: false,
             extra_info: effect.clone(),
             translated_effect_info_id: None,
+            call_stub: std::sync::OnceLock::new(),
         };
         let raw_address = crate::jitcode::BhCallDescr {
             arg_classes: "i".to_string(),
@@ -7151,6 +7152,7 @@ mod tests {
             void_word_abi: false,
             extra_info: effect,
             translated_effect_info_id: None,
+            call_stub: std::sync::OnceLock::new(),
         };
 
         assert_eq!(single_float.result_type, 'S');

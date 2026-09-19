@@ -1164,7 +1164,150 @@ impl CallResultErasedKey {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `descr.py CallDescr.create_call_stub` product: one monomorphic
+/// residual-call stub plus the bank mapping that places `args_i` /
+/// `args_r` / `args_f` into the callee's declaration order.
+///
+/// Resolved once per descr (lazily, on the first blackhole call) and
+/// stored on [`BhCallDescr::call_stub`]. The per-call path is: read this
+/// stub, place the three banks into a stack buffer, invoke the fn pointer.
+/// The fn pointers are the arms of `majit-backend` `dispatch_classes_body!`.
+#[derive(Clone, Copy, Debug)]
+pub struct BhCallStub {
+    /// Per-position: high 2 bits = bank (0 = `args_i`, 1 = `args_r`,
+    /// 2 = `args_f`), low 6 bits = index in that bank.
+    slots: [u8; super::insns::MAX_HOST_CALL_ARITY],
+    arity: u8,
+    expect_i: u8,
+    expect_r: u8,
+    expect_f: u8,
+    /// `llmodel.py AbstractLLCPU.bh_call_i` / `bh_call_r` — i64 result word.
+    pub call_stub_i: unsafe fn(usize, &[i64]) -> i64,
+    /// `llmodel.py AbstractLLCPU.bh_call_f` — f64 result.
+    pub call_stub_f: unsafe fn(usize, &[i64]) -> f64,
+    /// `llmodel.py AbstractLLCPU.bh_call_v` — void result.
+    pub call_stub_v: unsafe fn(usize, &[i64]),
+}
+
+impl BhCallStub {
+    pub const BANK_I: u8 = 0;
+    pub const BANK_R: u8 = 1;
+    pub const BANK_F: u8 = 2;
+
+    pub fn new(
+        slots: [u8; super::insns::MAX_HOST_CALL_ARITY],
+        arity: u8,
+        expect_i: u8,
+        expect_r: u8,
+        expect_f: u8,
+        call_stub_i: unsafe fn(usize, &[i64]) -> i64,
+        call_stub_f: unsafe fn(usize, &[i64]) -> f64,
+        call_stub_v: unsafe fn(usize, &[i64]),
+    ) -> Self {
+        Self {
+            slots,
+            arity,
+            expect_i,
+            expect_r,
+            expect_f,
+            call_stub_i,
+            call_stub_f,
+            call_stub_v,
+        }
+    }
+
+    fn place<'a>(
+        &self,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+        buf: &'a mut [i64; super::insns::MAX_HOST_CALL_ARITY],
+    ) -> &'a [i64] {
+        debug_assert_eq!(
+            args_i.map_or(0, <[i64]>::len),
+            self.expect_i as usize,
+            "BhCallDescr.verify_types: arg_classes has {} int slots, args_i has {}",
+            self.expect_i,
+            args_i.map_or(0, <[i64]>::len),
+        );
+        debug_assert_eq!(
+            args_r.map_or(0, <[i64]>::len),
+            self.expect_r as usize,
+            "BhCallDescr.verify_types: arg_classes has {} ref slots, args_r has {}",
+            self.expect_r,
+            args_r.map_or(0, <[i64]>::len),
+        );
+        debug_assert_eq!(
+            args_f.map_or(0, <[i64]>::len),
+            self.expect_f as usize,
+            "BhCallDescr.verify_types: arg_classes has {} float slots, args_f has {}",
+            self.expect_f,
+            args_f.map_or(0, <[i64]>::len),
+        );
+        let n = self.arity as usize;
+        for i in 0..n {
+            let slot = self.slots[i];
+            let bank = slot >> 6;
+            let idx = (slot & 0x3f) as usize;
+            buf[i] = match bank {
+                Self::BANK_I => args_i.expect("BhCallDescr.collect_call_args: args_i missing")[idx],
+                Self::BANK_R => args_r.expect("BhCallDescr.collect_call_args: args_r missing")[idx],
+                _ => args_f.expect("BhCallDescr.collect_call_args: args_f missing")[idx],
+            };
+        }
+        &buf[..n]
+    }
+
+    /// Place banks and invoke `call_stub_i`.
+    ///
+    /// # Safety
+    /// `func` must match the ABI this stub was selected for.
+    pub unsafe fn call_i(
+        &self,
+        func: usize,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+    ) -> i64 {
+        let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
+        let args = self.place(args_i, args_r, args_f, &mut buf);
+        unsafe { (self.call_stub_i)(func, args) }
+    }
+
+    /// Place banks and invoke `call_stub_f`.
+    ///
+    /// # Safety
+    /// `func` must match the ABI this stub was selected for.
+    pub unsafe fn call_f(
+        &self,
+        func: usize,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+    ) -> f64 {
+        let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
+        let args = self.place(args_i, args_r, args_f, &mut buf);
+        unsafe { (self.call_stub_f)(func, args) }
+    }
+
+    /// Place banks and invoke `call_stub_v`.
+    ///
+    /// # Safety
+    /// `func` must match the ABI this stub was selected for.
+    pub unsafe fn call_v(
+        &self,
+        func: usize,
+        args_i: Option<&[i64]>,
+        args_r: Option<&[i64]>,
+        args_f: Option<&[i64]>,
+    ) {
+        let mut buf = [0i64; super::insns::MAX_HOST_CALL_ARITY];
+        let args = self.place(args_i, args_r, args_f, &mut buf);
+        unsafe { (self.call_stub_v)(func, args) }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BhCallDescr {
     /// RPython `CallDescr.arg_classes`: one char per non-void FUNC argument.
     /// This is not the assembler `I/R/F` list-marker suffix.
@@ -1189,6 +1332,31 @@ pub struct BhCallDescr {
     /// carries the dense id across its analyzer/runtime process boundary.
     #[serde(default)]
     pub translated_effect_info_id: Option<u32>,
+    /// `descr.py CallDescr.create_call_stub` — one monomorphic stub
+    /// selected from `arg_classes` + `result_type`. Skipped by serde:
+    /// a deserialized descr resolves the stub on the first residual call.
+    #[serde(skip)]
+    pub call_stub: OnceLock<BhCallStub>,
+}
+
+impl Clone for BhCallDescr {
+    fn clone(&self) -> Self {
+        let out = Self {
+            arg_classes: self.arg_classes.clone(),
+            result_type: self.result_type,
+            result_signed: self.result_signed,
+            result_size: self.result_size,
+            result_erased: self.result_erased,
+            void_word_abi: self.void_word_abi,
+            extra_info: self.extra_info.clone(),
+            translated_effect_info_id: self.translated_effect_info_id,
+            call_stub: OnceLock::new(),
+        };
+        if let Some(&stub) = self.call_stub.get() {
+            let _ = out.call_stub.set(stub);
+        }
+        out
+    }
 }
 
 /// Widest `arg_classes` the blackhole's residual-call dispatch table can build
@@ -1264,6 +1432,7 @@ impl BhCallDescr {
             void_word_abi: result_class == 'v' && result_size == 8,
             extra_info: cd.get_extra_info().clone(),
             translated_effect_info_id: None,
+            call_stub: OnceLock::new(),
         }
     }
 
@@ -1283,6 +1452,7 @@ impl BhCallDescr {
             void_word_abi: false,
             extra_info,
             translated_effect_info_id: None,
+            call_stub: OnceLock::new(),
         }
     }
 
@@ -1311,6 +1481,7 @@ impl BhCallDescr {
             void_word_abi: false,
             extra_info,
             translated_effect_info_id: None,
+            call_stub: OnceLock::new(),
         }
     }
 

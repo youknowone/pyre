@@ -942,6 +942,12 @@ pub struct CompiledLoopToken {
     /// the owning Arc is built first, then `set_loop_token_wref` patches
     /// the weak ref through `&CompiledLoopToken`.
     pub loop_token_wref: parking_lot::Mutex<std::sync::Weak<JitCellToken>>,
+    /// Lock-free stamp of the owning `JitCellToken`'s green key, written
+    /// in [`Self::set_loop_token_wref`] once the owning Arc is the stable
+    /// identity. `0` is a legal green key, so `owning_green_key_set` is
+    /// the "is set" flag rather than a sentinel.
+    owning_green_key: AtomicU64,
+    owning_green_key_set: AtomicBool,
     /// `model.py` `self.bridges_count = 0`.
     pub bridges_count: parking_lot::Mutex<usize>,
     /// `model.py` `self.looptokens_redirected_to = []` — weak
@@ -958,6 +964,16 @@ pub struct CompiledLoopToken {
     /// `get_asmmemmgr_blocks`). pyre eagerly initializes to an empty Vec;
     /// the `None` sentinel is a Python idiom not needed on Rust.
     pub asmmemmgr_blocks: parking_lot::Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    /// Append-only `(source_trace_id, source_fail_index) → entry address`
+    /// for compiled bridges stored in `asmmemmgr_blocks`. The most recently
+    /// compiled bridge for a key wins (insert overwrites). `0` / absent
+    /// means none. Written at the single site a `CompiledCode` bridge is
+    /// pushed; read by the dynasm `lookup_bridge_addr` path so a guard
+    /// failure does not walk every block. `assembler.py
+    /// patch_jump_for_descr` is what actually redirects the guard; this
+    /// map answers the query-style "is there a bridge" question RPython
+    /// never asks.
+    pub compiled_bridge_addrs: parking_lot::Mutex<std::collections::HashMap<(u64, u32), usize>>,
     /// `model.py` `asmmemmgr_gcreftracers = None`; parity shape
     /// reserved for the GC ref-tracer lifecycle (llsupport/assembler.py:190).
     /// Eagerly empty (same rationale as `asmmemmgr_blocks`).
@@ -1030,9 +1046,12 @@ impl CompiledLoopToken {
         CompiledLoopToken {
             number,
             loop_token_wref: parking_lot::Mutex::new(std::sync::Weak::new()),
+            owning_green_key: AtomicU64::new(0),
+            owning_green_key_set: AtomicBool::new(false),
             bridges_count: parking_lot::Mutex::new(0),
             looptokens_redirected_to: parking_lot::Mutex::new(Vec::new()),
             asmmemmgr_blocks: parking_lot::Mutex::new(Vec::new()),
+            compiled_bridge_addrs: parking_lot::Mutex::new(std::collections::HashMap::new()),
             asmmemmgr_gcreftracers: parking_lot::Mutex::new(Vec::new()),
             frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
             _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
@@ -1045,8 +1064,15 @@ impl CompiledLoopToken {
     /// stable identity (i.e., once `make_jitcell_token` has stamped its
     /// generation and the token is the soon-to-be `compiled_loops[gk]`
     /// entry's `.token` field). The weak ref ages out automatically when
-    /// memmgr drops the owning Arc.
+    /// memmgr drops the owning Arc. Also stamps `owning_green_key` from
+    /// the upgraded token so [`descr_owning_green_key`] can read it
+    /// without locking.
     pub fn set_loop_token_wref(&self, wref: std::sync::Weak<JitCellToken>) {
+        if let Some(jct) = wref.upgrade() {
+            self.owning_green_key
+                .store(jct.green_key(), Ordering::Relaxed);
+            self.owning_green_key_set.store(true, Ordering::Release);
+        }
         *self.loop_token_wref.lock() = wref;
     }
 
@@ -1163,6 +1189,27 @@ pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>
 /// consume the metainterp `AbstractFailDescr` Arc directly.
 pub fn descr_owning_jct(descr: &dyn FailDescr) -> Option<Arc<JitCellToken>> {
     descr_owning_clt(descr)?.upgrade_loop_token()
+}
+
+/// Lock-free reader of the owning loop's green key.
+///
+/// Reaches the owning [`CompiledLoopToken`] the same way [`descr_owning_jct`]
+/// does (via [`descr_owning_clt`]) and returns the green key stamped at
+/// [`CompiledLoopToken::set_loop_token_wref`]. Returns `None` when `descr`
+/// carries no owning clt or the stamp was never written. Does not lock the
+/// weak-reference mutex and does not upgrade the weak reference.
+///
+/// Unlike [`descr_owning_jct`], this keeps answering after the owning
+/// `JitCellToken` has been dropped by the memory manager. That matches
+/// `compile.py AbstractResumeGuardDescr.must_compile` reading
+/// `self.rd_loop_token` and `pyjitpl.py` reading `resumedescr.rd_loop_token`:
+/// `rd_loop_token` is a strong attribute and never becomes unreadable.
+pub fn descr_owning_green_key(descr: &dyn FailDescr) -> Option<u64> {
+    let clt = descr_owning_clt(descr)?;
+    if !clt.owning_green_key_set.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(clt.owning_green_key.load(Ordering::Relaxed))
 }
 
 /// Token identifying a compiled loop. Bridges are attached to this.
@@ -1970,6 +2017,21 @@ impl DeadFrame {
             DeadFrame::JitFrame(jf) => Some(jf),
             DeadFrame::LibcJitFrame(_) | DeadFrame::Boxed(_) => None,
         }
+    }
+
+    /// Pointer for `FailArgSource::from_jitframe`.
+    ///
+    /// Only the GC-owned variant: `from_jitframe` takes an
+    /// `OwnerRootGuard` on the address, matching
+    /// `compile.py ResumeGuardDescr.handle_fail` handing the deadframe to
+    /// `resume.py blackhole_from_resumedata` so
+    /// `resume.py ResumeDataDirectReader.decode_int` can call
+    /// `self.cpu.get_int_value(self.deadframe, num)`. An off-GC
+    /// (`LibcJitFrame`) address must not be registered as a GCREF.
+    #[inline]
+    pub fn jitframe_ptr(&self) -> Option<*const crate::jitframe::JitFrame> {
+        self.as_jitframe()
+            .map(|jf| jf.jf_gcref().0 as *const crate::jitframe::JitFrame)
     }
 
     /// Mutable counterpart of [`DeadFrame::as_jitframe`].
@@ -3796,18 +3858,12 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
-        // llmodel.py:818 `calldescr.verify_types(..., history.INT + 'S')`.
+        // llmodel.py AbstractLLCPU.bh_call_i `calldescr.verify_types(..., history.INT + 'S')`.
         crate::call_stub::verify_result_type(calldescr.result_type, "iS");
         // SAFETY: `func` is a valid funcptr matching the ABI recovered from
         // `calldescr.arg_classes`.
         unsafe {
-            crate::call_stub::bh_call_i_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_i_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
     /// model.py bh_call_r(func, args_i, args_r, args_f, calldescr).
@@ -3822,17 +3878,11 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
-        // llmodel.py:824 `calldescr.verify_types(..., history.REF)`.
+        // llmodel.py AbstractLLCPU.bh_call_r `calldescr.verify_types(..., history.REF)`.
         crate::call_stub::verify_result_type(calldescr.result_type, "r");
         // SAFETY: see `bh_call_i`.
         let raw = unsafe {
-            crate::call_stub::bh_call_i_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_i_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         };
         GcRef(raw as usize)
     }
@@ -3848,17 +3898,11 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
-        // llmodel.py:830 `calldescr.verify_types(..., history.FLOAT + 'L')`.
+        // llmodel.py AbstractLLCPU.bh_call_f `calldescr.verify_types(..., history.FLOAT + 'L')`.
         crate::call_stub::verify_result_type(calldescr.result_type, "fL");
         // SAFETY: see `bh_call_i`.
         unsafe {
-            crate::call_stub::bh_call_f_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_f_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
     /// model.py bh_call_v(func, args_i, args_r, args_f, calldescr).
@@ -3873,17 +3917,11 @@ pub trait Backend: Send {
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
         assert_ne!(func, 0, "bh_call_v: null function pointer");
-        // llmodel.py:837 `calldescr.verify_types(..., history.VOID)`.
+        // llmodel.py AbstractLLCPU.bh_call_v `calldescr.verify_types(..., history.VOID)`.
         crate::call_stub::verify_result_type(calldescr.result_type, "v");
         // SAFETY: see `bh_call_i`.
         unsafe {
-            crate::call_stub::bh_call_v_by_classes(
-                func as usize,
-                &calldescr.arg_classes,
-                args_i,
-                args_r,
-                args_f,
-            )
+            crate::call_stub::bh_call_v_with_descr(func as usize, args_i, args_r, args_f, calldescr)
         }
     }
 

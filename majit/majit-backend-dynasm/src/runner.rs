@@ -1746,31 +1746,28 @@ impl DynasmBackend {
     }
 
     /// Bridge entry-pointer lookup by source guard `(trace_id, fail_index_per_trace)`.
-    /// Scans `token.asmmemmgr_blocks` for a `CompiledCode` whose `source_guard`
-    /// matches; returns `0` if none — `assembler.py` treats `adr_jump_offset == 0`
+    /// Reads `CompiledLoopToken.compiled_bridge_addrs`, written when the
+    /// matching `CompiledCode` is pushed onto `asmmemmgr_blocks`. Returns
+    /// `0` if none — `assembler.py` treats `adr_jump_offset == 0`
     /// uniformly as "patched / no entry".
     ///
-    /// `asmmemmgr_blocks` is append-only, so retracing the same guard
-    /// leaves multiple matching bridges in place.  Walk in reverse to
-    /// return the most recently compiled bridge — that is the one
-    /// `bridge_was_compiled` / `compiled_bridge_fail_descr_layouts` ask
-    /// about and the one subsequent guard failures should dispatch into.
+    /// The map is append-only and insert-overwrites, so retracing the same
+    /// guard resolves to the most recently compiled bridge — that is the
+    /// one `bridge_was_compiled` / `compiled_bridge_fail_descr_layouts`
+    /// ask about and the one subsequent guard failures should dispatch into.
     pub fn lookup_bridge_addr(
         &self,
         token: &JitCellToken,
         source_trace_id: u64,
         source_fail_index: u32,
     ) -> usize {
-        let blocks_clt = token.compiled_loop_token_expect();
-        let blocks = blocks_clt.asmmemmgr_blocks.lock();
-        for block in blocks.iter().rev() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
-                && bridge.source_guard == Some((source_trace_id, source_fail_index))
-            {
-                return bridge.entry_ptr() as usize;
-            }
-        }
-        0
+        token
+            .compiled_loop_token_expect()
+            .compiled_bridge_addrs
+            .lock()
+            .get(&(source_trace_id, source_fail_index))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
@@ -2919,11 +2916,12 @@ impl Backend for DynasmBackend {
             }
         }
 
-        original_token
-            .compiled_loop_token_expect()
-            .asmmemmgr_blocks
-            .lock()
-            .push(Box::new(compiled));
+        let source_guard = compiled.source_guard;
+        let clt = original_token.compiled_loop_token_expect();
+        clt.asmmemmgr_blocks.lock().push(Box::new(compiled));
+        if let Some(key) = source_guard {
+            clt.compiled_bridge_addrs.lock().insert(key, bridge_addr);
+        }
 
         Ok(AsmInfo {
             code_addr: bridge_addr,
@@ -3470,7 +3468,7 @@ impl Backend for DynasmBackend {
     /// recovery stub address into `adr_jump_offset`, and `patch_jump_for_descr`
     /// zeroes it once the guard's jump has been redirected into a bridge. A
     /// non-zero offset therefore still names the guard's own stub: no bridge.
-    /// Zero is left to the block scan, since a guard that never received a
+    /// Zero is left to the token map, since a guard that never received a
     /// stub reads the same way as a patched one.
     fn bridge_attached(&self, descr: &dyn majit_ir::FailDescr) -> Option<bool> {
         (descr.adr_jump_offset() != 0).then_some(false)
@@ -3576,17 +3574,13 @@ impl Backend for DynasmBackend {
     ) -> i64 {
         assert_ne!(func, 0, "bh_call_i: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(
+            majit_backend::call_stub::bh_call_i_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             )
         }
     }
@@ -3605,17 +3599,13 @@ impl Backend for DynasmBackend {
     ) -> majit_ir::GcRef {
         assert_ne!(func, 0, "bh_call_r: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         let raw = unsafe {
-            majit_backend::call_stub::bh_call_i_dispatch(
+            majit_backend::call_stub::bh_call_i_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             )
         };
         majit_ir::GcRef(raw as usize)
@@ -3635,17 +3625,13 @@ impl Backend for DynasmBackend {
     ) -> f64 {
         assert_ne!(func, 0, "bh_call_f: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         unsafe {
-            majit_backend::call_stub::bh_call_f_dispatch(
+            majit_backend::call_stub::bh_call_f_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             )
         }
     }
@@ -3666,17 +3652,13 @@ impl Backend for DynasmBackend {
     ) {
         assert_ne!(func, 0, "bh_call_v: null function pointer");
         majit_backend::call_stub::verify_result_type(calldescr.result_type, "v");
-        let collected = majit_backend::call_stub::collect_call_args(
-            &calldescr.arg_classes,
-            args_i,
-            args_r,
-            args_f,
-        );
         unsafe {
-            majit_backend::call_stub::bh_call_v_dispatch(
+            majit_backend::call_stub::bh_call_v_with_descr(
                 func as usize,
-                collected.classes(),
-                collected.args(),
+                args_i,
+                args_r,
+                args_f,
+                calldescr,
             );
         }
     }

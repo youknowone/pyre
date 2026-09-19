@@ -3650,7 +3650,7 @@ impl<M: Clone> MetaInterp<M> {
         let is_finish = descr.is_finish();
         let is_exit_frame_with_exception = descr.is_exit_frame_with_exception();
         let exit_types = ExitTypes::from_slice(descr.fail_arg_types());
-        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
+        let rd_loop_token = majit_backend::descr_owning_green_key(descr);
 
         let default_layout = || CompiledExitLayout {
             rd_loop_token: green_key,
@@ -12361,17 +12361,12 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
-        // compile.py `descr.rd_loop_token` — owning loop's clt,
-        // stamped at compile time.  Walk the chain
-        // `descr.rd_loop_token_clt() → clt.upgrade_loop_token()` to
-        // recover the owning `Arc<JitCellToken>` (pyjitpl.py:2897
-        // `resumedescr.rd_loop_token.loop_token_wref()`) for guard
-        // exits that belong to a loop other than the one currently
-        // executing (bridge-into-B while running A).  Derive
-        // `green_key` from `jct.green_key` so identity is preserved
-        // through the lookup. O(1) replacement for the legacy O(N)
-        // scan over `compiled_loops`.
-        let rd_loop_token = majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key());
+        // compile.py `descr.rd_loop_token` — owning loop's green key,
+        // stamped onto the clt at `set_loop_token_wref`. Guard exits
+        // that belong to a loop other than the one currently executing
+        // (bridge-into-B while running A) read that stamp lock-free.
+        // `pyjitpl.py` reads `resumedescr.rd_loop_token` the same way.
+        let rd_loop_token = majit_backend::descr_owning_green_key(descr);
         Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
@@ -12603,12 +12598,13 @@ impl<M: Clone> MetaInterp<M> {
         exit_layout
     }
 
-    /// `compile.py _DoneWithThisFrameDescr.get_result` and
-    /// `handle_fail`'s exit read: decode a returned frame's exit slots into the
-    /// typed list every consumer of a compiled run reads.
+    /// `compile.py _DoneWithThisFrameDescr.get_result` and the JUMP arm's
+    /// `restore_values` read: decode a returned frame's exit slots into the
+    /// typed list those two arms consume.
     ///
-    /// The slot types come from the descr the run ended on, so this is the one
-    /// step both outcomes of a compiled entry share.
+    /// A guard-failure does not call this. `compile.py ResumeGuardDescr.handle_fail`
+    /// leaves the values in the deadframe; `resume.py ResumeDataDirectReader.decode_int`
+    /// reads only the slots the resume stream names.
     ///
     /// Only the typed list is built. The machine-word list beside it used to be
     /// built here too and travelled out on the result, but its four readers are
@@ -12616,7 +12612,7 @@ impl<M: Clone> MetaInterp<M> {
     /// built and dropped one per entry; they call [`raw_exit_values`] on the
     /// typed list instead, which is [`Value::as_raw_i64`] per slot and loses
     /// nothing.
-    fn decode_exit_slots(
+    pub(crate) fn decode_exit_slots(
         backend: &BackendImpl,
         frame: &majit_backend::DeadFrame,
         exit_types: &[Type],
@@ -12631,6 +12627,27 @@ impl<M: Clone> MetaInterp<M> {
             });
         }
         typed_values
+    }
+
+    /// Materialize every fail-arg word from the deadframe.
+    ///
+    /// Used only when `compile.py ResumeGuardDescr.handle_fail` takes the
+    /// `must_compile` arm (`start_bridge_tracing`) or a runner still needs a
+    /// dense list. The common blackhole path uses
+    /// `FailArgSource::from_jitframe` instead.
+    pub(crate) fn raw_exit_slots_from_deadframe(
+        &self,
+        frame: &majit_backend::DeadFrame,
+        descr: &dyn majit_ir::FailDescr,
+    ) -> Vec<i64> {
+        let types = descr.fail_arg_types();
+        if let Some(ptr) = frame.jitframe_ptr() {
+            let src = majit_backend::FailArgSource::from_jitframe(ptr, descr, types.len());
+            (0..src.len()).map(|i| src.get(i)).collect()
+        } else {
+            crate::compile::raw_exit_values(&Self::decode_exit_slots(&self.backend, frame, types))
+                .into_vec()
+        }
     }
 
     /// `warmstate.py execute_assembler(loop_token, *args)`: the run
@@ -12714,14 +12731,9 @@ impl<M: Clone> MetaInterp<M> {
         // the descr straight off the deadframe, and for a DoneWithThisFrame it
         // goes to `fail_descr.get_result(cpu, deadframe)` without building any
         // per-exit description; only the general `handle_fail` case needs one.
-        // Every reader below either only reads this list or says explicitly
-        // that it takes ownership, and this is the steady entry path, so the
-        // copy was paid on every call for the benefit of the guard-failure arm
-        // alone.
-        let exit_types: &[Type] = descr.fail_arg_types();
-        // The exit slots are read for both outcomes, so they are decoded before
-        // the split rather than once in each arm.
-        let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
+        // Finish and JUMP decode on their own arms. A guard-failure leaves
+        // the slots in the deadframe: `compile.py ResumeGuardDescr.handle_fail`
+        // does not copy them out.
         // The deadframe decode, amplified. It READS the frame the run returned
         // and builds a fresh list; it does not touch the frame, so it repeats.
         // Each pass drops what it built, which is the same drop the shipping
@@ -12759,6 +12771,8 @@ impl<M: Clone> MetaInterp<M> {
         // and never reaches the general case at all.
         if is_finish {
             Self::finish_compiled_run_io();
+            let typed_values =
+                Self::decode_exit_slots(&self.backend, &frame, descr.fail_arg_types());
             // No layout. A final descr resumes nothing, so every field of one
             // built here is a default: the two guard-only slot lists are empty
             // because they exist for the blackhole resume and the bridge, and
@@ -12804,14 +12818,22 @@ impl<M: Clone> MetaInterp<M> {
         // the JUMP has already re-entered the loop's own LABEL, and what comes
         // back out is the loop-carried state, not a failure to recover from.
         let is_jump_exit = Self::is_jump_exit(is_finish, fail_index);
+        // JUMP still hands typed values to `state.restore_values`. A
+        // guard-failure does not: `resume.py ResumeDataDirectReader.decode_int`
+        // reads named slots off the deadframe.
+        let typed_values = if is_jump_exit {
+            Self::decode_exit_slots(&self.backend, &frame, exit_types)
+        } else {
+            ExitValues::new()
+        };
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
         // Only the layout fallback and the `must_compile` identity read it, and
-        // a JUMP exit reaches neither, so the weakref upgrade the resolution
-        // costs is not paid on the back edge.
+        // a JUMP exit reaches neither, so the owning-key resolution is not
+        // paid on the back edge.
         let rd_loop_token = if is_jump_exit {
             None
         } else {
-            majit_backend::descr_owning_jct(descr).map(|jct| jct.green_key())
+            majit_backend::descr_owning_green_key(descr)
         };
         Self::finish_compiled_run_io();
 
@@ -13901,12 +13923,14 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Green key of the loop a failing guard belongs to.
     ///
-    /// `compile.py _trace_and_compile_from_bridge` walks
-    /// `resumedescr.rd_loop_token.loop_token_wref()` for the owning JCT.  When
-    /// the weakref is dead (memmgr eviction — `compile.py compile.giveup()`
-    /// parity), no other identity is recoverable, so the caller's own outer
-    /// entry key stands in.  RPython has no such fallback because its identity
-    /// is descr-pointer-based, never indirected through a numeric `green_key`.
+    /// `compile.py AbstractResumeGuardDescr.must_compile` reads
+    /// `self.rd_loop_token`; `pyjitpl.py` reads `resumedescr.rd_loop_token`.
+    /// That attribute is strong, so this path uses the green key stamped
+    /// onto the owning clt rather than upgrading the weakref.  When the
+    /// descr carries no owning clt (or the stamp was never written), the
+    /// caller's own outer entry key stands in.  RPython has no such
+    /// fallback because its identity is descr-pointer-based, never
+    /// indirected through a numeric `green_key`.
     ///
     /// A JitCellToken invalidated by `QuasiImmut.invalidate()` (quasiimmut.py)
     /// still resolves here, and the `must_compile` tick that follows still
@@ -13922,8 +13946,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> u64 {
         descr_arc
             .as_fail_descr()
-            .and_then(majit_backend::descr_owning_jct)
-            .map(|jct| jct.green_key())
+            .and_then(majit_backend::descr_owning_green_key)
             .unwrap_or(fallback_green_key)
     }
 
@@ -13941,7 +13964,7 @@ impl<M: Clone> MetaInterp<M> {
     /// loop_token_wref()`, `trace_id` mirrors `assembler.py:227
     /// self.faildescr.trace_id`, and `fail_index_per_trace` mirrors
     /// `self.faildescr.index = i`.  The `fallback_green_key` only fires
-    /// when the owning-JCT walk returns `None`; see
+    /// when the stamped owning green key is unset; see
     /// [`Self::owning_key_for_descr`].
     ///
     /// Returns (should_compile, owning_green_key).
@@ -16290,9 +16313,8 @@ impl<M: Clone> MetaInterp<M> {
             let descr = descr_arc
                 .as_fail_descr()
                 .expect("forced virtualizable must have a fail descriptor");
-            let green_key = majit_backend::descr_owning_jct(descr)
-                .expect("forced virtualizable must belong to a compiled loop")
-                .green_key();
+            let green_key = majit_backend::descr_owning_green_key(descr)
+                .expect("forced virtualizable must belong to a compiled loop");
             let trace_id = descr.trace_id();
             let fail_index = descr.fail_index();
             // compile.py `force_from_resumedata(..., deadframe)`: TAGBOX
