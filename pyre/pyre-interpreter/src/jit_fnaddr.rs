@@ -546,15 +546,18 @@ fn cpa7<
 /// checked publishers above, and if a helper does not fit, change the helper.
 ///
 /// What "cannot express" costs differs by which half of the signature is
-/// unrepresentable. An unrepresentable result reads one register: a function
-/// returning `Option<*mut T>` answers `1` for `Some(p)` and `0` for `None` —
-/// never `p`, a wrong pointer that passes a null check rather than a crash.
-/// An unrepresentable parameter is worse. The executor writes one word per
-/// `arg_types()` entry, so the second half of a fat pointer is whatever the
-/// caller happened to leave in that register, and a callee that reads it as a
-/// length dereferences an address nothing chose. Publish those through
-/// [`push_abi_unsound_argument_fnaddr`] instead, which names them for
-/// [`is_abi_unsound_argument_residual`].
+/// unrepresentable. An unrepresentable result that still fits in two
+/// registers (16 bytes, e.g. `Option<*mut T>`) reads one register: the
+/// function answers `1` for `Some(p)` and `0` for `None` — never `p`, a
+/// wrong pointer that passes a null check rather than a crash. A result
+/// larger than 16 bytes returns through `sret`: the callee writes through a
+/// hidden pointer the residual stub never passed, so the store lands on
+/// whatever is in `x8` / `rdi`. An unrepresentable parameter is worse. The
+/// executor writes one word per `arg_types()` entry, so the second half of a
+/// fat pointer is whatever the caller happened to leave in that register,
+/// and a callee that reads it as a length dereferences an address nothing
+/// chose. Publish those through [`push_abi_unsound_argument_fnaddr`] instead,
+/// which names them for [`is_abi_unsound_argument_residual`].
 fn push_abi_unsound_fnaddr(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
@@ -2369,8 +2372,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `#[dont_look_inside]` so the descent scan must not enter the body;
     // without a published address the call stays a symbolic hash and the
     // scan declines the whole wrapper after `sys_modules_dict`.
-    // ABI-UNSOUND: `Result<PyObjectRef, PyError>` is not one residual word;
-    // several also take `&str`.
+    // Word-ABI bridges cover the sret returns; the remaining `&str`
+    // parameters still use the argument hatch.
     push_abi_unsound_argument_alias_pair(
         &mut entries,
         &mut abi_unsound_arguments,
@@ -2378,17 +2381,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::dunder_import_slow",
         crate::importing::dunder_import_slow as *const (),
     );
-    push_abi_unsound_alias_pair(
+    cpa5(
         &mut entries,
         "pyre_interpreter::importing::dunder_import_name_obj",
         "pyre_interpreter::dunder_import_name_obj",
-        crate::importing::dunder_import_name_obj as *const (),
+        crate::importing::dunder_import_name_obj_jit_abi,
     );
-    push_abi_unsound_alias_pair(
+    cpa2(
         &mut entries,
         "pyre_interpreter::importing::handle_fromlist_fast",
         "pyre_interpreter::handle_fromlist_fast",
-        crate::importing::handle_fromlist_fast as *const (),
+        crate::importing::handle_fromlist_fast_jit_abi,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -2397,23 +2400,27 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::wait_initializing_module",
         crate::importing::wait_initializing_module as *const (),
     );
-    push_abi_unsound_alias_pair(
+    // ABI-UNSOUND: the result is one residual word (`_jit_abi`), but
+    // `args: &[PyObjectRef]` is one MIR slot and two machine words. Record
+    // the address so `is_abi_unsound_argument_residual` refuses the call.
+    push_abi_unsound_argument_alias_pair(
         &mut entries,
+        &mut abi_unsound_arguments,
         "pyre_interpreter::builtins::builtin_dunder_import_keyword",
         "pyre_interpreter::builtin_dunder_import_keyword",
-        crate::builtins::builtin_dunder_import_keyword as *const (),
+        crate::builtins::builtin_dunder_import_keyword_jit_abi as *const (),
     );
-    push_abi_unsound_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_interpreter::builtins::module_name_must_be_string",
         "pyre_interpreter::module_name_must_be_string",
-        crate::builtins::module_name_must_be_string as *const (),
+        crate::builtins::module_name_must_be_string_jit_abi,
     );
-    push_abi_unsound_alias_pair(
+    cpa5(
         &mut entries,
         "pyre_interpreter::builtins::import_bound_objects_index_level",
         "pyre_interpreter::import_bound_objects_index_level",
-        crate::builtins::import_bound_objects_index_level as *const (),
+        crate::builtins::import_bound_objects_index_level_jit_abi,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -2429,11 +2436,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::dunder_import_package_fromlist",
         crate::importing::dunder_import_package_fromlist as *const (),
     );
-    push_abi_unsound_alias_pair(
+    cpa4(
         &mut entries,
         "pyre_interpreter::importing::handle_fromlist",
         "pyre_interpreter::handle_fromlist",
-        crate::importing::handle_fromlist as *const (),
+        crate::importing::handle_fromlist_jit_abi,
     );
     // `__import__` look-inside still residualises these: `finditem_str_named`
     // has no jitcode (the `&str` + strategy dispatch is a symbolic hash),
@@ -2460,17 +2467,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::finditem_str_generic",
         crate::baseobjspace::finditem_str_generic as *const (),
     );
-    push_abi_unsound_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::baseobjspace::bool_must_return_bool",
         "pyre_interpreter::bool_must_return_bool",
-        crate::baseobjspace::bool_must_return_bool as *const (),
+        crate::baseobjspace::bool_must_return_bool_jit_abi,
     );
-    push_abi_unsound_alias_pair(
+    cpa1(
         &mut entries,
         "pyre_interpreter::baseobjspace::is_true_lookup",
         "pyre_interpreter::is_true_lookup",
-        crate::baseobjspace::is_true_lookup as *const (),
+        crate::baseobjspace::is_true_lookup_jit_abi,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,
@@ -2492,11 +2499,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::is_true_after_modules",
         crate::importing::is_true_after_modules,
     );
-    push_abi_unsound_alias_pair(
+    cpa0(
         &mut entries,
         "pyre_interpreter::importing::take_published_residual_error",
         "pyre_interpreter::take_published_residual_error",
-        crate::importing::take_published_residual_error as *const (),
+        crate::importing::take_published_residual_error_jit_abi,
     );
     push_abi_unsound_argument_alias_pair(
         &mut entries,

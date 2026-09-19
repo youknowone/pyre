@@ -5763,6 +5763,22 @@ pub(crate) fn handle_fromlist_fast(
     }
 }
 
+/// One-word residual-call ABI for [`handle_fromlist_fast`].
+///
+/// Three outcomes share the result register: `Ok(Some(p))` is `p`,
+/// `Ok(None)` is null, and an error is published then answered as
+/// [`import_lookup_err_ptr`].
+pub extern "C" fn handle_fromlist_fast_jit_abi(w_mod: i64, w_fromlist: i64) -> i64 {
+    match handle_fromlist_fast(w_mod as PyObjectRef, w_fromlist as PyObjectRef) {
+        Ok(Some(result)) => result as i64,
+        Ok(None) => 0,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            import_lookup_err_ptr() as i64
+        }
+    }
+}
+
 /// `builtins.__import__` — `interp___import__`: a fast path answering
 /// absolute imports from initialised `sys.modules` entries, the app-level
 /// `_bootstrap.__import__` (the full `sys.meta_path` / `sys.path_hooks`
@@ -6052,6 +6068,16 @@ pub(crate) fn take_published_residual_error() -> crate::PyError {
     } else {
         unsafe { crate::PyError::from_exc_object(obj as PyObjectRef) }
     }
+}
+
+/// One-word residual-call ABI for [`take_published_residual_error`].
+///
+/// The helper consumes an already-published exception and rebuilds a
+/// `PyError` for `return Err(...)`. A residual cannot hand that struct
+/// back, so the bridge re-publishes it and returns 0; `GUARD_NO_EXCEPTION`
+/// takes the error arm.
+pub extern "C" fn take_published_residual_error_jit_abi() -> i64 {
+    crate::runtime_ops::jit_publish_residual_error(take_published_residual_error())
 }
 
 /// `interp___import__` empty-fromlist arm: answer `name.partition('.')[0]`.
@@ -6505,6 +6531,26 @@ pub fn dunder_import_name_obj(
     )
 }
 
+/// One-word residual-call ABI for [`dunder_import_name_obj`].
+pub extern "C" fn dunder_import_name_obj_jit_abi(
+    w_name: i64,
+    w_globals: i64,
+    w_locals: i64,
+    w_fromlist: i64,
+    level: i64,
+) -> i64 {
+    match dunder_import_name_obj(
+        w_name as PyObjectRef,
+        w_globals as PyObjectRef,
+        w_locals as PyObjectRef,
+        w_fromlist as PyObjectRef,
+        level,
+    ) {
+        Ok(result) => result as i64,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
 /// `PyImport_ImportModuleLevelObject`, the `level > 0` / empty-fromlist tail:
 /// import `name` relative to `globals`, then return the head package named by
 /// the absolute name the resolution produced.
@@ -6914,6 +6960,26 @@ pub(crate) fn handle_fromlist(
         }
     }
     Ok(())
+}
+
+/// One-word residual-call ABI for [`handle_fromlist`].
+///
+/// `Ok(())` is 1; an error is published and answered as 0.
+pub extern "C" fn handle_fromlist_jit_abi(
+    w_mod: i64,
+    w_fromlist: i64,
+    recursive: i64,
+    execution_context: i64,
+) -> i64 {
+    match handle_fromlist(
+        w_mod as PyObjectRef,
+        w_fromlist as PyObjectRef,
+        recursive != 0,
+        execution_context as *const PyExecutionContext,
+    ) {
+        Ok(()) => 1,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
 }
 
 /// Whether a ModuleNotFoundError's `name` is exactly `module_name` -- the

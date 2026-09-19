@@ -23588,6 +23588,23 @@ pub(crate) fn builtin_dunder_import_keyword(
     import_bound_objects(scope[0], scope[1], scope[2], scope[3], scope[4])
 }
 
+/// One-word residual-call ABI for [`builtin_dunder_import_keyword`].
+///
+/// The result is one word; `args: &[PyObjectRef]` is still a fat pointer
+/// and is not a residual slot. The address is published through the
+/// argument hatch so the walker refuses the call.
+pub extern "C" fn builtin_dunder_import_keyword_jit_abi(args_ptr: i64, args_len: i64) -> i64 {
+    let args = if args_ptr == 0 || args_len <= 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(args_ptr as *const PyObjectRef, args_len as usize) }
+    };
+    match builtin_dunder_import_keyword(args) {
+        Ok(result) => result as i64,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
+}
+
 /// `__import__` after the five named slots are bound.
 ///
 /// Shared by the keyword gateway and the five-positional wrapper so both
@@ -23635,6 +23652,14 @@ fn import_bound_objects(
 #[majit_macros::dont_look_inside]
 pub(crate) fn module_name_must_be_string() -> crate::PyError {
     crate::PyError::type_error("module name must be a string")
+}
+
+/// One-word residual-call ABI for [`module_name_must_be_string`].
+///
+/// The helper only constructs an error; the bridge publishes it and
+/// returns 0.
+pub extern "C" fn module_name_must_be_string_jit_abi() -> i64 {
+    crate::runtime_ops::jit_publish_residual_error(module_name_must_be_string())
 }
 
 /// `@unwrap_spec(level=int)` miss: run `__index__` and pin across it.
@@ -23706,6 +23731,26 @@ pub(crate) fn import_bound_objects_index_level(
         );
     };
     crate::importing::dunder_import_w(name, name_obj, globals, locals, fromlist, level, exec_ctx)
+}
+
+/// One-word residual-call ABI for [`import_bound_objects_index_level`].
+pub extern "C" fn import_bound_objects_index_level_jit_abi(
+    name_obj: i64,
+    w_globals: i64,
+    w_locals: i64,
+    w_fromlist: i64,
+    level_obj: i64,
+) -> i64 {
+    match import_bound_objects_index_level(
+        name_obj as PyObjectRef,
+        w_globals as PyObjectRef,
+        w_locals as PyObjectRef,
+        w_fromlist as PyObjectRef,
+        level_obj as PyObjectRef,
+    ) {
+        Ok(result) => result as i64,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error(error),
+    }
 }
 
 /// Gateway target for `builtins.__import__`.
