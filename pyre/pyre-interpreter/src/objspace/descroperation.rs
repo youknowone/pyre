@@ -3518,10 +3518,7 @@ fn reverse_dunder(dunder: &str) -> Option<&'static str> {
 /// `__neg__` with `bad operand type for unary -`, because a class object is
 /// not an instance: `lookup` reads the dunder off `type(C)`, which is the
 /// metaclass, and that is the resolution `-C` owes.
-unsafe fn try_lookup_unaryop(
-    a: PyObjectRef,
-    dunder: &str,
-) -> Result<Option<PyObjectRef>, PyError> {
+unsafe fn try_lookup_unaryop(a: PyObjectRef, dunder: &str) -> Result<Option<PyObjectRef>, PyError> {
     let Some(method) = lookup(a, dunder) else {
         return Ok(None);
     };

@@ -1196,11 +1196,7 @@ fn utf8_decode_impl(
 /// those into one error span.  A mapping that raises anything other than
 /// `LookupError` / `KeyError` propagates, so a `__getitem__` of its own is not
 /// mistaken for "undefined".
-fn charmap_output(
-    mapping_slot: usize,
-    cp: u32,
-    out: &mut Vec<u8>,
-) -> Result<bool, crate::PyError> {
+fn charmap_output(mapping_slot: usize, cp: u32, out: &mut Vec<u8>) -> Result<bool, crate::PyError> {
     let w_mapping = pyre_object::gc_roots::shadow_stack_get(mapping_slot);
     if unsafe { is_str(w_mapping) } && cp as usize >= unsafe { w_str_len(w_mapping) } {
         return Ok(false);

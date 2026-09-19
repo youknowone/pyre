@@ -9759,20 +9759,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         // the subscript an opaque residual.  The storage folds
                         // below are for builtin containers, which this
                         // declines.
-                        if let Some(inlined) =
-                            spec_gate(SpecFold::SubscrUserGetitem, || {
-                                try_walker_inline_subscr_getitem(
-                                    ctx,
-                                    op,
-                                    code,
-                                    Some(funcptr),
-                                    &r_args,
-                                    call_descr,
-                                    dst,
-                                    dst_bank,
-                                )
-                            })?
-                        {
+                        if let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
+                            try_walker_inline_subscr_getitem(
+                                ctx,
+                                op,
+                                code,
+                                Some(funcptr),
+                                &r_args,
+                                call_descr,
+                                dst,
+                                dst_bank,
+                            )
+                        })? {
                             return Ok(inlined);
                         }
                         // Int-strategy miss: `dict.lookup` on dstorage +
