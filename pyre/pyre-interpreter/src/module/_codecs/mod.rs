@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pyre_object::*;
+use rustpython_unicode::character_name;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
 /// `_PyArg_BadArgument` — how a clinic-converted argument is reported.  A
@@ -333,9 +334,7 @@ fn namereplace_errors(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     }
     let mut replacement = String::new();
     for code in error_codepoints(&exc)? {
-        if let Some(name) =
-            char::from_u32(code).and_then(crate::module::unicodedata::character_name)
-        {
+        if let Some(name) = char::from_u32(code).and_then(character_name) {
             replacement.push_str("\\N{");
             replacement.push_str(&name);
             replacement.push('}');

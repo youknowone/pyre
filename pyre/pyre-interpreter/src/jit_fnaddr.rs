@@ -2472,26 +2472,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::set_in_flight_exception",
         set_in_flight_exception,
     );
-    // `mmap_type` is `#[cfg(unix)]` inside `interp_mmap`, and the `mmap`
-    // module itself is gated at `module/mod.rs`'s `pub mod mmap`; the row has to carry
-    // both or a sandbox build on Linux satisfies `unix` with the module
-    // configured out.
-    #[cfg(all(
-        any(unix, windows),
-        not(target_arch = "wasm32"),
-        not(feature = "sandbox")
-    ))]
-    {
-        let mmap_type: fn() -> pyre_object::PyObjectRef =
-            crate::module::mmap::interp_mmap::mmap_type;
-        pa0(
-            &mut entries,
-            "pyre_interpreter::module::mmap::interp_mmap::mmap_type",
-            "pyre_interpreter::mmap_type",
-            mmap_type,
-        );
-    }
-    // `cdata_bytes_object` carries the `_ctypes` module's own gate
+    // `mmap_type` residual lives on the optional-module hook after the
+    // module moved. `cdata_bytes_object` carries the `_ctypes` module's own gate
     // (`module/mod.rs`), so the row repeats it rather than resolving a path
     // configured out of the build.
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]

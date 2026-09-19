@@ -14,7 +14,7 @@ use std::time::Instant;
 /// `cProfile.Profile` subclasses the type.
 // CPython 3.14 Modules/_lsprof.c:_lsprof_exec uses
 // PyType_FromModuleAndSpec with IMMUTABLETYPE.
-#[crate::pyre_class("_lsprof.Profiler", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_lsprof.Profiler", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_Profiler {
     pub map: usize,
@@ -47,7 +47,7 @@ const _: () = assert!(
 /// two references below are ordinary inline `gc_ptr_offsets` edges.
 // CPython 3.14 Modules/_lsprof.c creates this with PyStructSequence_NewType;
 // the resulting struct-sequence type is a mutable heap type.
-#[crate::pyre_class("_lsprof.profiler_entry", cpython_mutable)]
+#[pyre_interpreter::pyre_class("_lsprof.profiler_entry", cpython_mutable)]
 pub struct W_StatsEntry {
     frame: PyObjectRef,
     callcount: i64,
@@ -60,7 +60,7 @@ pub struct W_StatsEntry {
 /// `interp_lsprof.py W_StatsSubEntry`, likewise not instantiable and
 /// therefore prefix-free.
 // Same PyStructSequence_NewType mutable heap owner as profiler_entry.
-#[crate::pyre_class("_lsprof.profiler_subentry", cpython_mutable)]
+#[pyre_interpreter::pyre_class("_lsprof.profiler_subentry", cpython_mutable)]
 pub struct W_StatsSubEntry {
     frame: PyObjectRef,
     callcount: i64,
@@ -265,9 +265,9 @@ fn stats_repr_open(
     reccallcount: i64,
     tt: &str,
     it: &str,
-) -> Result<Wtf8Buf, crate::PyError> {
-    let frame_repr = unsafe { crate::display::py_repr_wtf8(w_frame)? };
-    Ok(crate::display::wtf8_format!(
+) -> Result<Wtf8Buf, pyre_interpreter::PyError> {
+    let frame_repr = unsafe { pyre_interpreter::display::py_repr_wtf8(w_frame)? };
+    Ok(pyre_interpreter::wtf8_format!(
         "(\"",
         frame_repr,
         "\", ",
@@ -284,7 +284,7 @@ fn stats_repr_open(
 mod stats_entry_methods {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_StatsEntry {
         #[getter]
         fn code(&self) -> PyObjectRef {
@@ -316,7 +316,7 @@ mod stats_entry_methods {
             self.w_calls
         }
 
-        fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn __repr__(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let open = stats_repr_open(
                 self.frame,
                 self.callcount,
@@ -327,10 +327,10 @@ mod stats_entry_methods {
             let calls_repr = if unsafe { pyre_object::is_none(self.w_calls) } {
                 Wtf8Buf::from_string("None".to_string())
             } else {
-                unsafe { crate::display::py_repr_wtf8(self.w_calls)? }
+                unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_calls)? }
             };
             Ok(pyre_object::w_str_from_wtf8_managed(
-                crate::display::wtf8_format!(open, ", ", calls_repr, ")"),
+                pyre_interpreter::wtf8_format!(open, ", ", calls_repr, ")"),
             ))
         }
     }
@@ -339,7 +339,7 @@ mod stats_entry_methods {
 mod stats_subentry_methods {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_StatsSubEntry {
         #[getter]
         fn code(&self) -> PyObjectRef {
@@ -366,7 +366,7 @@ mod stats_subentry_methods {
             self.tt
         }
 
-        fn __repr__(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn __repr__(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let open = stats_repr_open(
                 self.frame,
                 self.callcount,
@@ -375,7 +375,7 @@ mod stats_subentry_methods {
                 &format!("{:.6}", self.it),
             )?;
             Ok(pyre_object::w_str_from_wtf8_managed(
-                crate::display::wtf8_format!(open, ")"),
+                pyre_interpreter::wtf8_format!(open, ")"),
             ))
         }
     }
@@ -392,17 +392,19 @@ fn module_name_wtf8(w_module: PyObjectRef) -> Option<Wtf8Buf> {
 }
 
 fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObjectRef {
-    let name = if !w_function.is_null() && unsafe { crate::function::is_function(w_function) } {
-        unsafe { crate::function::function_get_name(w_function) }
+    let name = if !w_function.is_null()
+        && unsafe { pyre_interpreter::function::is_function(w_function) }
+    {
+        unsafe { pyre_interpreter::function::function_get_name(w_function) }
     } else {
         "?"
     };
     let class_name = if !w_function.is_null()
-        && unsafe { crate::function::is_function(w_function) }
+        && unsafe { pyre_interpreter::function::is_function(w_function) }
         && !w_type.is_null()
         && unsafe { pyre_object::is_type(w_type) }
     {
-        unsafe { crate::baseobjspace::lookup_where_pair(w_type, name) }
+        unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_type, name) }
             .map(|(w_realclass, _)| unsafe { pyre_object::w_type_get_name(w_realclass) })
             .unwrap_or_else(|| unsafe { pyre_object::w_type_get_name(w_type) })
     } else if !w_type.is_null() && unsafe { pyre_object::is_type(w_type) } {
@@ -414,18 +416,18 @@ fn create_spec_for_method(w_function: PyObjectRef, w_type: PyObjectRef) -> PyObj
 }
 
 fn create_spec_for_function(w_func: PyObjectRef) -> PyObjectRef {
-    let name = unsafe { crate::function::function_get_name(w_func) };
-    let w_module = unsafe { (*(w_func as *const crate::function::Function)).w_module };
-    let text = if unsafe { crate::function::function_has_builtin_code(w_func) } {
+    let name = unsafe { pyre_interpreter::function::function_get_name(w_func) };
+    let w_module = unsafe { (*(w_func as *const pyre_interpreter::function::Function)).w_module };
+    let text = if unsafe { pyre_interpreter::function::function_has_builtin_code(w_func) } {
         if let Some(module) = module_name_wtf8(w_module) {
-            crate::display::wtf8_format!("<built-in method ", module, ".", name, ">")
+            pyre_interpreter::wtf8_format!("<built-in method ", module, ".", name, ">")
         } else {
-            crate::display::wtf8_format!("<built-in function ", name, ">")
+            pyre_interpreter::wtf8_format!("<built-in function ", name, ">")
         }
     } else if let Some(module) = module_name_wtf8(w_module) {
-        crate::display::wtf8_format!("<", module, ".", name, ">")
+        pyre_interpreter::wtf8_format!("<", module, ".", name, ">")
     } else {
-        crate::display::wtf8_format!("<", name, ">")
+        pyre_interpreter::wtf8_format!("<", name, ">")
     };
     pyre_object::w_str_from_wtf8_managed(text)
 }
@@ -443,14 +445,16 @@ fn prepare_spec(w_arg: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
     if !w_arg.is_null() && unsafe { pyre_object::function::is_method(w_arg) } {
         let w_func = unsafe { pyre_object::function::w_method_get_func(w_arg) };
         let w_self = unsafe { pyre_object::function::w_method_get_self(w_arg) };
-        let w_type = crate::typedef::r#type(w_self).map_or(pyre_object::PY_NULL, |ty| ty.as_ptr());
+        let w_type = pyre_interpreter::typedef::r#type(w_self)
+            .map_or(pyre_object::PY_NULL, |ty| ty.as_ptr());
         let w_frame = create_spec_for_method(w_func, w_type);
         (w_func, w_type, w_frame)
-    } else if !w_arg.is_null() && unsafe { crate::function::is_function(w_arg) } {
+    } else if !w_arg.is_null() && unsafe { pyre_interpreter::function::is_function(w_arg) } {
         let w_frame = create_spec_for_function(w_arg);
         (w_arg, pyre_object::PY_NULL, w_frame)
     } else {
-        let w_type = crate::typedef::r#type(w_arg).map_or(pyre_object::PY_NULL, |ty| ty.as_ptr());
+        let w_type =
+            pyre_interpreter::typedef::r#type(w_arg).map_or(pyre_object::PY_NULL, |ty| ty.as_ptr());
         let w_frame = create_spec_for_object(w_type);
         (pyre_object::PY_NULL, w_type, w_frame)
     }
@@ -459,10 +463,10 @@ fn prepare_spec(w_arg: PyObjectRef) -> (PyObjectRef, PyObjectRef, PyObjectRef) {
 fn lsprof_call(
     _space: PyObjectRef,
     w_self: PyObjectRef,
-    frame: *mut crate::pyframe::PyFrame,
+    frame: *mut pyre_interpreter::pyframe::PyFrame,
     event: &str,
     w_arg: PyObjectRef,
-) -> Result<(), crate::PyError> {
+) -> Result<(), pyre_interpreter::PyError> {
     let Some(profiler) = W_Profiler::from_obj(w_self) else {
         return Ok(());
     };
@@ -497,16 +501,16 @@ impl W_Profiler {
         if self.w_callable.is_null() {
             return read_timestamp();
         }
-        match crate::call::call_function_impl_result(self.w_callable, &[])
-            .and_then(crate::baseobjspace::int_w)
+        match pyre_interpreter::call::call_function_impl_result(self.w_callable, &[])
+            .and_then(pyre_interpreter::baseobjspace::int_w)
         {
             Ok(value) => value,
             Err(mut err) => {
-                let repr = unsafe { crate::display::py_repr_wtf8(self.w_callable) }
+                let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) }
                     .unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
                 err.write_unraisable(
                     w_none(),
-                    &crate::display::wtf8_format!(
+                    &pyre_interpreter::wtf8_format!(
                         "Exception ignored while calling _lsprof timer ",
                         repr
                     ),
@@ -696,7 +700,7 @@ impl W_Profiler {
 mod profiler_methods {
     use super::*;
 
-    #[crate::pyre_methods]
+    #[pyre_interpreter::pyre_methods]
     impl W_Profiler {
         #[staticmethod]
         fn __new__(
@@ -705,8 +709,8 @@ mod profiler_methods {
             #[default(0.0f64)] time_unit: f64,
             #[default(1i32)] subcalls: i32,
             #[default(1i32)] builtins: i32,
-        ) -> Result<PyObjectRef, crate::PyError> {
-            crate::typedef::check_user_subclass(type_object(), cls)?;
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
             let callable = if unsafe { pyre_object::is_none(w_callable) } {
                 pyre_object::PY_NULL
             } else {
@@ -731,7 +735,7 @@ mod profiler_methods {
             &mut self,
             #[default(w_none())] w_subcalls: PyObjectRef,
             #[default(w_none())] w_builtins: PyObjectRef,
-        ) -> Result<(), crate::PyError> {
+        ) -> Result<(), pyre_interpreter::PyError> {
             if self.is_enabled {
                 return Ok(());
             }
@@ -741,11 +745,11 @@ mod profiler_methods {
             // the claim instead would leave the tool id held when `__bool__`
             // raises, and nothing could release it: `disable` returns early
             // while `is_enabled` is still false.
-            let flag = |w: PyObjectRef| -> Result<Option<bool>, crate::PyError> {
+            let flag = |w: PyObjectRef| -> Result<Option<bool>, pyre_interpreter::PyError> {
                 if unsafe { pyre_object::is_none(w) } {
                     Ok(None)
                 } else {
-                    Ok(Some(crate::baseobjspace::is_true(w)?))
+                    Ok(Some(pyre_interpreter::baseobjspace::is_true(w)?))
                 }
             };
             let subcalls = flag(w_subcalls)?;
@@ -753,8 +757,8 @@ mod profiler_methods {
             // The tool id is claimed before any of the profiler's own state is
             // touched, so a second profiler's `enable` reports the conflict and
             // leaves the first one installed.
-            crate::module::sys::vm::monitoring_use_tool_id(
-                crate::module::sys::vm::MONITORING_PROFILER_ID,
+            pyre_interpreter::module::sys::vm::monitoring_use_tool_id(
+                pyre_interpreter::module::sys::vm::MONITORING_PROFILER_ID,
                 w_str_new_managed("cProfile"),
             )?;
             if let Some(value) = subcalls {
@@ -766,24 +770,26 @@ mod profiler_methods {
             self.is_enabled = true;
             self.total_real_time -= read_real_time();
             self.total_timestamp -= read_timestamp();
-            let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+            let ec = pyre_interpreter::call::getexecutioncontext()
+                as *mut pyre_interpreter::PyExecutionContext;
             unsafe {
                 (*ec).setllprofile(Some(lsprof_call), self as *mut Self as PyObjectRef)?;
             }
             Ok(())
         }
 
-        fn disable(&mut self) -> Result<(), crate::PyError> {
+        fn disable(&mut self) -> Result<(), pyre_interpreter::PyError> {
             if !self.is_enabled {
                 return Ok(());
             }
-            crate::module::sys::vm::monitoring_free_tool_id(
-                crate::module::sys::vm::MONITORING_PROFILER_ID,
+            pyre_interpreter::module::sys::vm::monitoring_free_tool_id(
+                pyre_interpreter::module::sys::vm::MONITORING_PROFILER_ID,
             );
             self.is_enabled = false;
             self.total_timestamp += read_timestamp();
             self.total_real_time += read_real_time();
-            let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
+            let ec = pyre_interpreter::call::getexecutioncontext()
+                as *mut pyre_interpreter::PyExecutionContext;
             unsafe {
                 (*ec).setllprofile(None, pyre_object::PY_NULL)?;
             }
@@ -801,10 +807,10 @@ mod profiler_methods {
             self.builtin_entries.clear();
         }
 
-        fn getstats(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn getstats(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             let factor = if self.w_callable.is_null() {
                 if self.is_enabled {
-                    return Err(crate::PyError::runtime_error(
+                    return Err(pyre_interpreter::PyError::runtime_error(
                         "Profiler instance must be disabled before getting the stats",
                     ));
                 }
@@ -840,7 +846,7 @@ pub unsafe fn w_profiler_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     profiler.walk_owned_refs(f);
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_lsprof",
     interpleveldefs: {
         "Profiler" => profiler_methods::type_object(),

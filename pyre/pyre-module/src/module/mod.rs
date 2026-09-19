@@ -21,11 +21,17 @@ pub mod _codecs_tw;
 #[allow(non_snake_case)]
 pub mod _csv;
 #[allow(non_snake_case)]
+pub mod _hashlib;
+#[allow(non_snake_case)]
 pub mod _heapq;
 #[allow(non_snake_case)]
 pub mod _immutables_map;
 #[allow(non_snake_case)]
 pub mod _json;
+#[allow(non_snake_case)]
+pub mod _lsprof;
+#[allow(non_snake_case)]
+pub mod _lzma;
 #[allow(non_snake_case)]
 pub mod _multibytecodec;
 #[allow(non_snake_case)]
@@ -43,8 +49,16 @@ pub mod _posixshmem;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod _posixsubprocess;
 #[allow(non_snake_case)]
+pub mod _queue;
+#[allow(non_snake_case)]
 #[cfg(target_os = "macos")]
 pub mod _scproxy;
+#[allow(non_snake_case)]
+#[cfg(not(feature = "sandbox"))]
+pub mod _socket;
+#[allow(non_snake_case)]
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+pub mod _ssl;
 #[allow(non_snake_case)]
 pub mod _statistics;
 #[allow(non_snake_case)]
@@ -65,10 +79,18 @@ pub mod fcntl;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod grp;
 pub mod math;
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+pub mod mmap;
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+pub mod pwd;
 pub mod pyexpat;
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub mod resource;
+#[cfg(not(feature = "sandbox"))]
+pub mod select;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod syslog;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod termios;
+pub mod unicodedata;
+pub mod zlib;

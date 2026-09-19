@@ -2,9 +2,9 @@
 //!
 //! Provides the lowest-level socket API exposed to Python.  The
 //! interp_socket submodule carries the W_Socket class implementation
-//! plus address conversion / IDNA / error mapping helpers, and
-//! rsocket_rffi carries the host socket layer both platforms reach it
-//! through.  A target with no such layer still carries the module: what it
+//! plus address conversion / IDNA / error mapping helpers.  The host
+//! socket layer is `pyre_interpreter::rsocket_rffi` (`rpython/rlib/_rsocket_rffi.py`).
+//! A target with no such layer still carries the module: what it
 //! lacks it lacks entry point by entry point, the way a build whose C library
 //! has the headers but not the calls lacks them, and `interp_socket_wasm`
 //! publishes the part that is left -- the type `socket.py` subclasses and the
@@ -16,7 +16,5 @@
 use rustpython_common::inet;
 #[cfg(not(any(unix, windows)))]
 mod interp_socket_wasm;
-#[cfg(any(unix, windows))]
-pub(crate) mod rsocket_rffi;
 
-crate::pyre_module_init!(interp_socket);
+pyre_interpreter::pyre_module_init!(interp_socket);

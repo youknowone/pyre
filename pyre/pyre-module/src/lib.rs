@@ -36,8 +36,11 @@ pub fn install_optional_modules() {
     pyre_interpreter::importing::register_builtin_module("_codecs_jp", module::_codecs_jp::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_kr", module::_codecs_kr::init);
     pyre_interpreter::importing::register_builtin_module("_codecs_tw", module::_codecs_tw::init);
+    pyre_interpreter::importing::register_builtin_module("_hashlib", module::_hashlib::init);
     pyre_interpreter::importing::register_builtin_module("_heapq", module::_heapq::init);
     pyre_interpreter::importing::register_builtin_module("_json", module::_json::init);
+    pyre_interpreter::importing::register_builtin_module("_lsprof", module::_lsprof::init);
+    pyre_interpreter::importing::register_builtin_module("_lzma", module::_lzma::init);
     pyre_interpreter::importing::register_builtin_module(
         "_immutables_map",
         module::_immutables_map::init,
@@ -61,6 +64,11 @@ pub fn install_optional_modules() {
         "_posixsubprocess",
         module::_posixsubprocess::init,
     );
+    pyre_interpreter::importing::register_builtin_module("_queue", module::_queue::init);
+    #[cfg(not(feature = "sandbox"))]
+    pyre_interpreter::importing::register_builtin_module("_socket", module::_socket::init);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("_ssl", module::_ssl::init);
     pyre_interpreter::importing::register_builtin_module("_statistics", module::_statistics::init);
     pyre_interpreter::importing::register_builtin_module(
         "_suggestions",
@@ -80,17 +88,44 @@ pub fn install_optional_modules() {
         module::faulthandler::init,
     );
     pyre_interpreter::importing::register_builtin_module("math", module::math::init);
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("mmap", module::mmap::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("fcntl", module::fcntl::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("grp", module::grp::init);
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+    pyre_interpreter::importing::register_builtin_module("pwd", module::pwd::init);
     pyre_interpreter::importing::register_builtin_module("pyexpat", module::pyexpat::init);
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("resource", module::resource::init);
+    #[cfg(not(feature = "sandbox"))]
+    pyre_interpreter::importing::register_builtin_module("select", module::select::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("syslog", module::syslog::init);
     #[cfg(all(unix, not(feature = "sandbox")))]
     pyre_interpreter::importing::register_builtin_module("termios", module::termios::init);
+    pyre_interpreter::importing::register_builtin_module("unicodedata", module::unicodedata::init);
+    pyre_interpreter::importing::register_builtin_module("zlib", module::zlib::init);
+}
+
+/// Immortal `#[pyre_class]` types allocated through `allocate`.  The
+/// collector never walks them, so `build_gc` only registers their
+/// `w_class` offset.  `select` is compiled out of a sandbox build
+/// (`module/mod.rs`'s `pub mod select`), so its descriptors carry that
+/// gate too.
+pub fn all_immortal_w_class_only_descriptors()
+-> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
+    #[allow(unused_imports)]
+    use pyre_object::lltype::PyreClassPyTypeOf;
+    vec![
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+        <module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        <module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
+        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
+        <module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
+    ]
 }
 
 /// Install [`install_optional_modules`] as the interpreter's optional-module hook.
@@ -303,6 +338,19 @@ fn publish_optional_fnaddrs(entries: &mut Vec<(&'static str, i64)>) {
         "pymath::math::misc::ulp",
         pymath::math::ulp as *const (),
     );
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    {
+        let mmap_type: fn() -> pyre_object::PyObjectRef = module::mmap::interp_mmap::mmap_type;
+        let addr = mmap_type as *const () as usize as i64;
+        if addr != 0 {
+            entries.push((
+                "pyre_interpreter::module::mmap::interp_mmap::mmap_type",
+                addr,
+            ));
+            entries.push(("pyre_interpreter::mmap_type", addr));
+            entries.push(("pyre_module::module::mmap::interp_mmap::mmap_type", addr));
+        }
+    }
 }
 
 fn walk_optional_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
@@ -321,11 +369,62 @@ fn optional_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRange
 
     let mut aliases = vec![
         subclass_range_alias(129, typed::<module::_tokenize::W_TokenizerIter>()),
+        // `unicodedata.UCD` sits at AUTO-ID 157, before `__pypy__.Bufferable`.
+        subclass_range_alias(157, typed::<module::unicodedata::W_UCD>()),
         subclass_range_alias(162, typed::<module::_json::W_Scanner>()),
         subclass_range_alias(163, typed::<module::_json::W_Encoder>()),
+        // `_hashlib`'s per-object digest/HMAC contexts follow their Python
+        // owners and have sweep-time native-state destructors in build_gc.
+        subclass_range_alias(164, typed::<module::_hashlib::W_HashState>()),
+        subclass_range_alias(165, typed::<module::_hashlib::W_Hmac>()),
         subclass_range_alias(172, typed::<module::_bz2::W_BZ2Compressor>()),
         subclass_range_alias(173, typed::<module::_bz2::W_BZ2Decompressor>()),
+        // `_lzma`'s two stream objects own their liblzma coder, unconditional
+        // so their ids agree on wasm/native.
+        subclass_range_alias(174, typed::<module::_lzma::W_LZMACompressor>()),
+        subclass_range_alias(175, typed::<module::_lzma::W_LZMADecompressor>()),
+        // PyPy zlib stream wrappers own their native stream and lock directly.
+        // Keep these unconditional entries ahead of target-gated native types.
+        subclass_range_alias(169, typed::<module::zlib::W_Compress>()),
+        subclass_range_alias(170, typed::<module::zlib::W_Decompress>()),
+        subclass_range_alias(171, typed::<module::zlib::W_ZlibDecompressor>()),
+        // `_lsprof`'s profiler and stats result owners are unconditional.
+        subclass_range_alias(176, typed::<module::_lsprof::W_Profiler>()),
+        subclass_range_alias(177, typed::<module::_lsprof::W_StatsEntry>()),
+        subclass_range_alias(178, typed::<module::_lsprof::W_StatsSubEntry>()),
+        // `_queue.SimpleQueue` is unconditional and carries a native FIFO, so
+        // it closes the ungated aliases ahead of the target-gated ones.
+        subclass_range_alias(179, typed::<module::_queue::W_SimpleQueue>()),
     ];
+    // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
+    // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    {
+        aliases.push(subclass_range_alias(
+            190,
+            typed::<module::_ssl::W_SSLContext>(),
+        ));
+        aliases.push(subclass_range_alias(
+            191,
+            typed::<module::_ssl::W_MemoryBIO>(),
+        ));
+        aliases.push(subclass_range_alias(
+            192,
+            typed::<module::_ssl::W_SSLSession>(),
+        ));
+        aliases.push(subclass_range_alias(
+            193,
+            typed::<module::_ssl::W_SSLSocket>(),
+        ));
+        aliases.push(subclass_range_alias(
+            194,
+            typed::<module::_ssl::W_Certificate>(),
+        ));
+    }
+    // `mmap.mmap` follows the optional SSL tail on ordinary Unix/Windows
+    // builds. A sandbox build has no `mmap` module at all.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    aliases.push(subclass_range_alias(195, typed::<module::mmap::W_MMap>()));
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     aliases.push(subclass_range_alias(
         196,
@@ -362,6 +461,63 @@ mod tests {
     /// from a host copy of this crate; a missing row here is the same
     /// defect as a build script that forgot to link `pyre-module`.
     #[test]
+    fn jit_trace_fnaddrs_covers_moved_hashlib_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_hashlib::hash_state_class::__majit_wrap___new__"
+            ),
+            "moved _hashlib #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_mmap_type() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_module::module::mmap::interp_mmap::mmap_type"),
+            "moved mmap_type must publish a residual fnaddr",
+        );
+    }
+
+    #[cfg(all(unix, not(feature = "sandbox")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_select_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings
+                .contains_key("pyre_module::module::select::interp_select::__majit_wrap_register"),
+            "moved select #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_lzma_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_lzma::compressor_methods::__majit_wrap___new__"
+            ),
+            "moved _lzma #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_unicodedata_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key("pyre_module::module::unicodedata::__majit_wrap_category"),
+            "moved unicodedata #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
     fn jit_trace_fnaddrs_covers_moved_bz2_wrapper() {
         let bindings: HashMap<&'static str, i64> =
             pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
@@ -370,6 +526,30 @@ mod tests {
                 "pyre_module::module::_bz2::compressor_methods::__majit_wrap___new__"
             ),
             "moved _bz2 #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_ssl_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_ssl::ssl_session_methods::__majit_wrap___new__"
+            ),
+            "moved _ssl #[pyre_methods] wrappers must publish residual fnaddrs",
+        );
+    }
+
+    #[test]
+    fn jit_trace_fnaddrs_covers_moved_lsprof_wrapper() {
+        let bindings: HashMap<&'static str, i64> =
+            pyre_interpreter::jit_trace_fnaddrs().into_iter().collect();
+        assert!(
+            bindings.contains_key(
+                "pyre_module::module::_lsprof::profiler_methods::__majit_wrap___new__"
+            ),
+            "moved _lsprof #[pyre_methods] wrappers must publish residual fnaddrs",
         );
     }
 

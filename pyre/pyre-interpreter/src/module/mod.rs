@@ -28,30 +28,16 @@ pub mod _contextvars;
 pub mod _ctypes;
 #[allow(non_snake_case)]
 pub mod _functools;
-#[allow(non_snake_case)]
-pub mod _hashlib;
 pub mod _io;
 #[allow(non_snake_case)]
 pub mod _locale;
-#[allow(non_snake_case)]
-pub mod _lsprof;
-#[allow(non_snake_case)]
-pub mod _lzma;
 #[allow(non_snake_case)]
 pub mod _pickle;
 #[allow(non_snake_case)]
 pub mod _pypy_generic_alias;
 #[allow(non_snake_case)]
-pub mod _queue;
-#[allow(non_snake_case)]
 pub mod _random;
-#[allow(non_snake_case)]
-#[cfg(not(feature = "sandbox"))]
-pub mod _socket;
 pub mod _sre;
-#[allow(non_snake_case)]
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-pub mod _ssl;
 #[allow(non_snake_case)]
 pub mod _stat;
 #[allow(non_snake_case)]
@@ -76,17 +62,11 @@ pub mod imp;
 pub mod importlib;
 pub mod itertools;
 pub mod marshal;
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-pub mod mmap;
 #[cfg(all(windows, feature = "host_env"))]
 pub mod msvcrt;
 pub mod operator;
 pub mod posix;
-#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-pub mod pwd;
 pub mod pypyjit;
-#[cfg(not(feature = "sandbox"))]
-pub mod select;
 #[allow(non_snake_case)]
 pub mod signal;
 #[allow(non_snake_case)]
@@ -95,10 +75,8 @@ pub mod sys;
 #[allow(non_snake_case)]
 pub mod thread;
 pub mod time;
-pub mod unicodedata;
 #[cfg(windows)]
 pub mod winreg;
 #[allow(non_snake_case)]
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub mod winsound;
-pub mod zlib;

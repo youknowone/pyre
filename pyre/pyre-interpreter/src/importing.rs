@@ -38,7 +38,7 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 /// disabled the same names fall back to `std::*` shims so call sites
 /// stay uniform.
 #[cfg(feature = "host_env")]
-pub(crate) mod host {
+pub mod host {
     #[cfg(not(target_arch = "wasm32"))]
     pub use rustpython_host_env::fs;
     pub mod os {
@@ -54,7 +54,7 @@ pub(crate) mod host {
     }
 }
 #[cfg(not(feature = "host_env"))]
-pub(crate) mod host {
+pub mod host {
     pub mod fs {
         pub use std::fs::{metadata, read, read_dir, read_to_string, symlink_metadata};
     }
@@ -766,14 +766,12 @@ pub fn install_builtin_modules() {
 
     pyre_install_module!(atexit);
 
-    // Host-access modules — network (`_socket`), arbitrary FFI (`_ctypes`),
-    // subprocess/`fork`+`exec` (`_posixsubprocess`), shared memory
-    // (`_multiprocessing`/`_posixshmem`), system log, fd/tty control
-    // (`fcntl`/`termios`/`select`/`resource`), real signals, and the host
-    // user/group databases (`pwd`/`grp`).  None belong to the mediated
-    // ll_os/ll_time surface, so the sandbox interpreter omits them entirely:
-    // `import _socket` then raises ModuleNotFoundError, as in a build whose
-    // syscall code is absent.
+    // Host-access modules — arbitrary FFI (`_ctypes`), real signals.
+    // `select`, `mmap`, `_socket`/`_ssl`, `pwd`/`grp` and the other
+    // optional host modules live in `pyre-module`.  None belong to the
+    // mediated ll_os/ll_time surface, so the sandbox interpreter omits
+    // them entirely: `import _ctypes` then raises ModuleNotFoundError,
+    // as in a build whose syscall code is absent.
     #[cfg(not(feature = "sandbox"))]
     {
         // `_signal` is a bootstrap module upstream: it is built on every
@@ -782,24 +780,6 @@ pub fn install_builtin_modules() {
         // handler table and `raise_signal`, and leaves out the itimers, the
         // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
-        // Only a POSIX host has the user/group databases these read; the
-        // platforms without them have no `pwd`/`grp` module at all, and the
-        // callers depend on that: `posixpath.expanduser`, `pathlib` and
-        // `tarfile` all reach for the module inside `try/except ImportError`
-        // and take a fallback when it is missing.
-        #[cfg(all(unix, feature = "host_env"))]
-        pyre_install_module!(pwd);
-
-        pyre_install_module!(select);
-        // `socket.py`'s module body subclasses `_socket.socket`, so the type
-        // has to be there even where nothing can be connected: a target with
-        // no host layer publishes it and the numbers, and leaves out the
-        // entry points that would need a descriptor.
-        pyre_install_module!(_socket);
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        pyre_install_module!(_ssl);
-        #[cfg(not(target_arch = "wasm32"))]
-        pyre_install_module!(mmap);
         pyre_install_module!(_ctypes);
         #[cfg(all(
             feature = "host_env",
@@ -814,13 +794,8 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_pickle);
     register_collectible_builtin_module("_struct", crate::module::r#struct::init);
     pyre_install_module!(marshal);
-    pyre_install_module!(zlib);
-    pyre_install_module!(_lsprof);
-    pyre_install_module!(_lzma);
     pyre_install_module!(_typing);
-    pyre_install_module!(_hashlib);
     pyre_install_module!(gc);
-    pyre_install_module!(unicodedata);
 
     // Modules whose stdlib wrapper does `import X` + attribute access or
     // `from X import *` are deliberately NOT stubbed here: an empty stub
@@ -834,7 +809,6 @@ pub fn install_builtin_modules() {
         crate::module::array::init_array_module,
         crate::module::array::startup_array_module,
     );
-    register_builtin_module("_queue", crate::module::_queue::init);
     register_builtin_module("_types", crate::module::_types::init);
     register_builtin_module("_string", init_string_module);
     register_builtin_module("_tracemalloc", init_tracemalloc);

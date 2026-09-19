@@ -21,8 +21,8 @@ use pyre_object::PyObjectRef;
 fn socket_type() -> PyObjectRef {
     static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SOCKET_TYPE_OBJ.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
-        crate::typedef::mark_cpython_heap_type(tp, false);
+        let tp = pyre_interpreter::typedef::make_builtin_type("socket", init_socket_type);
+        pyre_interpreter::typedef::mark_cpython_heap_type(tp, false);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         tp as usize
     }) as PyObjectRef
@@ -36,7 +36,7 @@ fn init_socket_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            crate::typedef::make_new_descr(|args| {
+            pyre_interpreter::typedef::make_new_descr(|args| {
                 let cls = args
                     .first()
                     .copied()
@@ -53,9 +53,9 @@ fn init_socket_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            crate::make_builtin_function("__init__", |_args| {
-                Err(crate::PyError::os_error_syscall(
-                    crate::builtins::wasm_errno::ENOTSUP,
+            pyre_interpreter::make_builtin_function("__init__", |_args| {
+                Err(pyre_interpreter::PyError::os_error_syscall(
+                    pyre_interpreter::builtins::wasm_errno::ENOTSUP,
                     pyre_object::w_none(),
                 ))
             }),
@@ -99,7 +99,9 @@ pub(super) fn pton(family: i32, text: &std::ffi::CStr) -> Result<Vec<u8>, PtonEr
         AF_INET => super::inet::pton_v4(bytes).map(|a| a.to_vec()),
         AF_INET6 => super::inet::pton_v6(bytes).map(|a| a.to_vec()),
         _ => {
-            return Err(PtonError::Family(crate::builtins::wasm_errno::EAFNOSUPPORT));
+            return Err(PtonError::Family(
+                pyre_interpreter::builtins::wasm_errno::EAFNOSUPPORT,
+            ));
         }
     };
     packed.ok_or(PtonError::Address)
@@ -218,17 +220,17 @@ const CONSTANTS: &[(&str, i64)] = &[
 /// build the rest out of.
 pub(super) fn register_names(ns: PyObjectRef) {
     for (name, value) in CONSTANTS {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
     let socket_tp = socket_type();
-    crate::module_ns_store(ns, "socket", socket_tp);
-    crate::module_ns_store(ns, "SocketType", socket_tp);
+    pyre_interpreter::module_ns_store(ns, "socket", socket_tp);
+    pyre_interpreter::module_ns_store(ns, "SocketType", socket_tp);
     // `gethostname` needs no socket layer -- wasi answers it out of `uname` --
     // and `platform._node` calls it, so `platform.uname()` depends on it.
-    crate::module_ns_store(
+    pyre_interpreter::module_ns_store(
         ns,
         "gethostname",
-        crate::make_builtin_function_with_arity(
+        pyre_interpreter::make_builtin_function_with_arity(
             "gethostname",
             |_args| Ok(pyre_object::w_str_new_managed(NODE_NAME)),
             0,

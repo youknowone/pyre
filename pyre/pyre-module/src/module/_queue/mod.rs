@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 // CPython 3.14 Modules/_queuemodule.c:_queue_exec uses
 // PyType_FromModuleAndSpec with IMMUTABLETYPE.
-#[crate::pyre_class("_queue.SimpleQueue", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_queue.SimpleQueue", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_SimpleQueue {
     pub map: *const u8,
@@ -51,7 +51,7 @@ fn queue_lock<'a>(
     if let Some(guard) = mutex.try_lock() {
         return guard;
     }
-    let blocked = crate::module::thread::before_external_block();
+    let blocked = pyre_interpreter::module::thread::before_external_block();
     let guard = mutex.lock();
     drop(blocked);
     guard
@@ -89,16 +89,19 @@ fn queue_len(mutex: &Mutex<VecDeque<PyObjectRef>>) -> usize {
 /// wait: an infinity would otherwise block forever and a NaN would poll once.
 /// The conversion is the one `_thread.lock.acquire` already performs
 /// (`module/thread/mod.rs parse_acquire_args`).
-fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate::PyError> {
+fn parse_timeout(
+    block: bool,
+    timeout: PyObjectRef,
+) -> Result<Option<f64>, pyre_interpreter::PyError> {
     if !block {
         return Ok(None);
     }
     if timeout.is_null() || unsafe { pyre_object::is_none(timeout) } {
         return Ok(None);
     }
-    let seconds = crate::baseobjspace::float_w(timeout)?;
+    let seconds = pyre_interpreter::baseobjspace::float_w(timeout)?;
     if seconds.is_nan() {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "Invalid value NaN (not a number)",
         ));
     }
@@ -106,12 +109,12 @@ fn parse_timeout(block: bool, timeout: PyObjectRef) -> Result<Option<f64>, crate
     const NS_MIN: f64 = -9223372036854776832.0;
     const NS_MAX: f64 = 9223372036854775296.0;
     if !(NS_MIN..NS_MAX).contains(&(seconds * 1e9).ceil()) {
-        return Err(crate::PyError::overflow_error(
+        return Err(pyre_interpreter::PyError::overflow_error(
             "timestamp out of range for platform time_t",
         ));
     }
     if seconds < 0.0 {
-        return Err(crate::PyError::value_error(
+        return Err(pyre_interpreter::PyError::value_error(
             "'timeout' must be a non-negative number",
         ));
     }
@@ -124,10 +127,10 @@ fn deadline_from_timeout(timeout: Option<f64>) -> Option<Instant> {
     timeout.map(|seconds| Instant::now() + Duration::from_secs_f64(seconds))
 }
 
-fn empty_error() -> crate::PyError {
-    let mut err = crate::PyError::runtime_error("");
-    if let Some(cls) = crate::builtins::lookup_exc_class("_queue.Empty")
-        && let Ok(exc) = crate::builtins::exc_exception_new(&[cls])
+fn empty_error() -> pyre_interpreter::PyError {
+    let mut err = pyre_interpreter::PyError::runtime_error("");
+    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_queue.Empty")
+        && let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[cls])
     {
         err.exc_object = exc;
     }
@@ -160,14 +163,14 @@ fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
 fn simplequeue_wait_for_item(
     queue: &W_SimpleQueue,
     timeout: Option<f64>,
-) -> Result<MutexGuard<'_, VecDeque<PyObjectRef>>, crate::PyError> {
+) -> Result<MutexGuard<'_, VecDeque<PyObjectRef>>, pyre_interpreter::PyError> {
     let mut guard = queue_lock(&queue.queue);
     let deadline = deadline_from_timeout(timeout);
     loop {
         if !guard.is_empty() {
             return Ok(guard);
         }
-        let blocked = crate::module::thread::before_external_block();
+        let blocked = pyre_interpreter::module::thread::before_external_block();
         if let Some(deadline) = deadline {
             let now = Instant::now();
             if now >= deadline {
@@ -190,7 +193,7 @@ fn simplequeue_get(
     queue: &W_SimpleQueue,
     block: bool,
     timeout: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let timeout = parse_timeout(block, timeout)?;
     if block {
         return simplequeue_wait_and_pop(queue, timeout);
@@ -203,7 +206,7 @@ fn simplequeue_get(
 fn simplequeue_wait_and_pop(
     queue: &W_SimpleQueue,
     timeout: Option<f64>,
-) -> Result<PyObjectRef, crate::PyError> {
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let mut guard = simplequeue_wait_for_item(queue, timeout)?;
     guard.pop_front().ok_or_else(empty_error)
 }
@@ -211,16 +214,19 @@ fn simplequeue_wait_and_pop(
 mod simplequeue_methods {
     use super::*;
 
-    #[crate::pyre_methods(weakrefable, unhashable)]
+    #[pyre_interpreter::pyre_methods(weakrefable, unhashable)]
     impl W_SimpleQueue {
         #[staticmethod]
-        fn __new__(cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        fn __new__(
+            cls: PyObjectRef,
+            args: &[PyObjectRef],
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             if args.len() > 1 {
-                return Err(crate::PyError::type_error(
+                return Err(pyre_interpreter::PyError::type_error(
                     "_queue.SimpleQueue() takes no arguments",
                 ));
             }
-            crate::typedef::check_user_subclass(type_object(), cls)?;
+            pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
             let obj = Self::allocate_stable(Self::default());
             unsafe { (*obj).w_class = cls };
             Ok(obj)
@@ -249,11 +255,11 @@ mod simplequeue_methods {
             &self,
             #[default(true)] block: bool,
             #[default(w_none())] timeout: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             simplequeue_get(self, block, timeout)
         }
 
-        fn get_nowait(&self) -> Result<PyObjectRef, crate::PyError> {
+        fn get_nowait(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             simplequeue_get(self, false, w_none())
         }
 
@@ -269,8 +275,8 @@ mod simplequeue_methods {
         fn __class_getitem__(
             cls: PyObjectRef,
             item: PyObjectRef,
-        ) -> Result<PyObjectRef, crate::PyError> {
-            crate::_pypy_generic_alias::generic_alias_class_getitem(&[cls, item])
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem(&[cls, item])
         }
     }
 }
@@ -301,13 +307,13 @@ pub unsafe fn w_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "_queue",
     interpleveldefs: {
         "SimpleQueue" => simplequeue_methods::type_object(),
     },
     exceptions: {
-        "Empty" => crate::builtins::lookup_exc_class("Exception")
+        "Empty" => pyre_interpreter::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _queue init"),
     },
 }

@@ -86,6 +86,17 @@ pub struct TypeDef {
     /// uses `applevel_subclasses_base.typedef` as `overridetypedef` so the
     /// derived declaration reuses that base's Layout.
     pub applevel_subclasses_base: *const TypeDef,
+    /// TypeDef.__init__ `__buffer`.  `None` takes the first base that
+    /// declared one.  cpyext `make_bf_getbuffer` reads only presence;
+    /// the `'read'` / `'read-write'` vocabulary is never consulted.
+    pub buffer: Option<TypeDefBuffer>,
+}
+
+/// TypeDef.__init__ `__buffer` — `'read'` or `'read-write'`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeDefBuffer {
+    Read,
+    ReadWrite,
 }
 
 impl TypeDef {
@@ -110,6 +121,7 @@ impl TypeDef {
             flag_sequence_bug_compat: false,
             heaptype: false,
             applevel_subclasses_base: std::ptr::null(),
+            buffer: None,
         }
     }
 
@@ -163,6 +175,9 @@ impl TypeDef {
             unsafe {
                 definition.hasdict |= (*base).hasdict;
                 definition.weakrefable |= (*base).weakrefable;
+                if definition.buffer.is_none() {
+                    definition.buffer = (*base).buffer;
+                }
             }
         }
         definition.bases = bases;

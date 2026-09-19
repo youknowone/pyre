@@ -51,12 +51,73 @@ pub enum Buffer {
 /// the callback at start-up; until then, and for owners that keep no count
 /// (`ctypes.memoryview_at`, whose `w_obj` is `None`), releasing is a no-op.
 static EXTERNAL_RELEASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static EXTERNAL_ACQUIRE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static EXTERNAL_VIEW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static EXTERNAL_LAYOUT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `W_MMap.readbuf_w` / `writebuf_w`: address, length, readonly.
+/// `None` is "not this exporter"; `Err` is a closed mapping.
+pub type ExternalBufferViewFn =
+    fn(PyObjectRef) -> Option<Result<(usize, usize, bool), &'static str>>;
 
 /// # Safety
 /// `f` must stay valid for the process lifetime and accept any `w_obj` that
 /// was stored in an `External` buffer.
 pub unsafe fn set_external_release_hook(f: unsafe fn(PyObjectRef)) {
     EXTERNAL_RELEASE.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Install the counted-external exporter (`mmap`) beside the release hook.
+///
+/// # Safety
+/// Each function must stay valid for the process lifetime.
+pub unsafe fn set_external_buffer_exporter(
+    view: ExternalBufferViewFn,
+    acquire: fn(PyObjectRef),
+    release: unsafe fn(PyObjectRef),
+    has_layout: fn(PyObjectRef) -> bool,
+) {
+    EXTERNAL_VIEW.store(view as usize, core::sync::atomic::Ordering::Release);
+    EXTERNAL_ACQUIRE.store(acquire as usize, core::sync::atomic::Ordering::Release);
+    EXTERNAL_RELEASE.store(release as usize, core::sync::atomic::Ordering::Release);
+    EXTERNAL_LAYOUT.store(has_layout as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// The live mapping window, or `None` when `obj` is not the counted
+/// external exporter.
+pub fn external_buffer_view(
+    obj: PyObjectRef,
+) -> Option<Result<(usize, usize, bool), &'static str>> {
+    let f = EXTERNAL_VIEW.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 {
+        return None;
+    }
+    unsafe { core::mem::transmute::<usize, ExternalBufferViewFn>(f)(obj) }
+}
+
+/// # Safety
+/// `obj` must be the exporter paired with a successful view.
+pub unsafe fn external_buffer_acquire(obj: PyObjectRef) {
+    let f = EXTERNAL_ACQUIRE.load(core::sync::atomic::Ordering::Acquire);
+    if f != 0 && !obj.is_null() {
+        unsafe { core::mem::transmute::<usize, fn(PyObjectRef)>(f)(obj) }
+    }
+}
+
+/// Whether `obj` has the counted-external exporter layout, including a
+/// Python subclass.
+pub fn has_external_buffer_layout(obj: PyObjectRef) -> bool {
+    let f = EXTERNAL_LAYOUT.load(core::sync::atomic::Ordering::Acquire);
+    if f == 0 {
+        return false;
+    }
+    unsafe { core::mem::transmute::<usize, fn(PyObjectRef) -> bool>(f)(obj) }
+}
+
+/// # Safety
+/// `w_obj` must be the exporter paired with a successful acquisition.
+pub unsafe fn external_buffer_release(w_obj: PyObjectRef) {
+    unsafe { external_release(w_obj) };
 }
 
 unsafe fn external_release(w_obj: PyObjectRef) {

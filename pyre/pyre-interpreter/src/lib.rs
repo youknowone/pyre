@@ -160,6 +160,10 @@ pub mod pycode;
 pub mod pyopcode;
 pub mod pytraceback;
 pub mod reduce_protocol;
+/// Host socket layer — `rpython/rlib/_rsocket_rffi.py`.
+/// Signal uses this rlib API, not `pypy.module._socket`.
+#[cfg(any(unix, windows))]
+pub mod rsocket_rffi;
 pub mod runtime_ops;
 pub mod shared_opcode;
 pub mod sliceobject;
@@ -1107,19 +1111,9 @@ pub fn all_w_class_only_descriptors() -> Vec<&'static pyre_object::lltype::PyreC
 /// gate this crate spells exactly.
 pub fn all_immortal_w_class_only_descriptors()
 -> Vec<&'static pyre_object::lltype::PyreClassDescriptor> {
-    #[allow(unused_imports)]
-    use pyre_object::lltype::PyreClassPyTypeOf;
-    vec![
-        // `select` is compiled out of a sandbox build (`module/mod.rs`'s
-        // `pub mod select`), so
-        // its descriptors carry that gate too.
-        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_select::Poll as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_kqueue::W_Kqueue as PyreClassPyTypeOf>::DESCRIPTOR,
-        #[cfg(all(target_os = "macos", feature = "host_env", not(feature = "sandbox")))]
-        <crate::module::select::interp_kevent::W_Kevent as PyreClassPyTypeOf>::DESCRIPTOR,
-    ]
+    // `select.poll` / `kqueue` / `kevent` live on the optional-module
+    // crate; `pyre_module::all_immortal_w_class_only_descriptors` lists them.
+    vec![]
 }
 
 /// Interpreter-owned PyType aliases in the shared GC inheritance census.
@@ -1188,9 +1182,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // `functools.KeyWrapper` follows them at the append-only AUTO-ID
         // registration tail.
         subclass_range_alias(156, typed::<crate::module::_functools::W_KeyWrapper>()),
-        // `unicodedata.UCD` and `__pypy__.Bufferable` close that tail in the
-        // order `build_gc` registers them.
-        subclass_range_alias(157, typed::<crate::module::unicodedata::W_UCD>()),
+        // `unicodedata.UCD` alias 157 lives on the optional-module hook.
+        // `__pypy__.Bufferable` closes that tail in the order `build_gc`
+        // registers them.
         subclass_range_alias(
             158,
             typed::<crate::module::__pypy__::interp_buffer::bufferable_impl::W_Bufferable>(),
@@ -1199,10 +1193,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         // 159 as a bare `with_gc_ptrs` id and carries no vtable of its own.
         subclass_range_alias(160, typed::<crate::module::_io::W_BytesIO>()),
         subclass_range_alias(161, typed::<crate::module::_io::W_StringIO>()),
-        // `_hashlib`'s per-object digest/HMAC contexts follow their Python
-        // owners and have sweep-time native-state destructors in build_gc.
-        subclass_range_alias(164, typed::<crate::module::_hashlib::W_HashState>()),
-        subclass_range_alias(165, typed::<crate::module::_hashlib::W_Hmac>()),
+        // `_hashlib` aliases 164-165 live on the optional-module hook.
         // `gc.GcRef` keeps its raw referent as a traced wrapper field.
         // referent field is traced on the wrapper itself, as in
         // `pypy/module/gc/referents.py`.
@@ -1212,22 +1203,9 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(167, typed::<crate::module::gc::hook::W_AppLevelHooks>()),
         // `gc._get_stats()` returns referents.py's native W_GcStats owner.
         subclass_range_alias(168, typed::<crate::module::gc::stats::W_GcStats>()),
-        // PyPy zlib stream wrappers own their native stream and lock directly.
-        // Keep these unconditional entries ahead of target-gated native types.
-        subclass_range_alias(169, typed::<crate::module::zlib::W_Compress>()),
-        subclass_range_alias(170, typed::<crate::module::zlib::W_Decompress>()),
-        subclass_range_alias(171, typed::<crate::module::zlib::W_ZlibDecompressor>()),
-        // `_lzma`'s two stream objects own their liblzma coder, unconditional
-        // for the same reason.
-        subclass_range_alias(174, typed::<crate::module::_lzma::W_LZMACompressor>()),
-        subclass_range_alias(175, typed::<crate::module::_lzma::W_LZMADecompressor>()),
-        // `_lsprof`'s profiler and stats result owners are unconditional.
-        subclass_range_alias(176, typed::<crate::module::_lsprof::W_Profiler>()),
-        subclass_range_alias(177, typed::<crate::module::_lsprof::W_StatsEntry>()),
-        subclass_range_alias(178, typed::<crate::module::_lsprof::W_StatsSubEntry>()),
-        // `_queue.SimpleQueue` is unconditional and carries a native FIFO, so
-        // it closes the ungated aliases ahead of the target-gated ones.
-        subclass_range_alias(179, typed::<crate::module::_queue::W_SimpleQueue>()),
+        // zlib / `_lsprof` / `_queue` aliases live on the optional-module
+        // hook (ids 169-171, 176-179). `_lzma` aliases 174-175 live on
+        // the same hook.
         // `_PyLineIterator` / `_PyPositionsIterator` / `_PyBranchesIterator` —
         // each retains the code object its suspended walk reads.  All three
         // are unconditional, so they close the ungated block ahead of the
@@ -1242,23 +1220,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(188, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
-        // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
-        // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(190, typed::<crate::module::_ssl::W_SSLContext>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(191, typed::<crate::module::_ssl::W_MemoryBIO>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(192, typed::<crate::module::_ssl::W_SSLSession>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(193, typed::<crate::module::_ssl::W_SSLSocket>()),
-        #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(194, typed::<crate::module::_ssl::W_Certificate>()),
-        // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
-        // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
-        // contributes no alias rather than sliding into the vacated SSL slot.
-        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
+        // rustls-backed `_ssl` aliases 190-194 live on the optional-module
+        // hook. `mmap.mmap` alias 195 lives on the same hook.
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.

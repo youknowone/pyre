@@ -23,11 +23,7 @@ use pyre_object::*;
 use rustpython_unicode::{self as ucd_core, NormalizeForm};
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
-use crate::{PyError, PyErrorKind};
-
-pub(crate) fn character_name(ch: char) -> Option<String> {
-    ucd_core::character_name(ch)
-}
+use pyre_interpreter::{PyError, PyErrorKind};
 
 type PyResult = Result<PyObjectRef, PyError>;
 
@@ -53,7 +49,7 @@ fn extract_char(func: &str, argno: Option<u32>, obj: PyObjectRef) -> Result<Code
         None => "argument".to_string(),
     };
     if !unsafe { is_str(obj) } {
-        let ty = crate::baseobjspace::object_functionstr_type_name(obj);
+        let ty = pyre_interpreter::baseobjspace::object_functionstr_type_name(obj);
         return Err(PyError::type_error(format!(
             "{func}() {argword} must be a unicode character, not {ty}"
         )));
@@ -73,8 +69,8 @@ fn extract_char(func: &str, argno: Option<u32>, obj: PyObjectRef) -> Result<Code
 
 /// Single required character argument (`category`, `bidirectional`, …).
 fn one_char(func: &str, args: &[PyObjectRef]) -> Result<CodePoint, PyError> {
-    let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    if crate::builtins::has_real_kwargs(kwargs) {
+    let (args, kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
+    if pyre_interpreter::builtins::has_real_kwargs(kwargs) {
         return Err(PyError::type_error(format!(
             "unicodedata.{func}() takes no keyword arguments"
         )));
@@ -226,7 +222,7 @@ fn lookup_impl(db: &ucd_core::Ucd, args: &[PyObjectRef]) -> PyResult {
     }
     let obj = args[0];
     if !unsafe { is_str(obj) } {
-        let ty = crate::baseobjspace::object_functionstr_type_name(obj);
+        let ty = pyre_interpreter::baseobjspace::object_functionstr_type_name(obj);
         return Err(PyError::type_error(format!(
             "lookup() argument must be str, not {ty}"
         )));
@@ -258,7 +254,7 @@ fn lookup(args: &[PyObjectRef]) -> PyResult {
 /// Parse the normalization-form argument (`NFC`/`NFKC`/`NFD`/`NFKD`).
 fn normalize_form(func: &str, obj: PyObjectRef) -> Result<NormalizeForm, PyError> {
     if !unsafe { is_str(obj) } {
-        let ty = crate::baseobjspace::object_functionstr_type_name(obj);
+        let ty = pyre_interpreter::baseobjspace::object_functionstr_type_name(obj);
         return Err(PyError::type_error(format!(
             "{func}() argument 1 must be str, not {ty}"
         )));
@@ -285,7 +281,7 @@ fn normalize_form(func: &str, obj: PyObjectRef) -> Result<NormalizeForm, PyError
 /// Borrow the string argument to be normalized (`unistr`).
 fn normalize_text(func: &str, obj: PyObjectRef) -> Result<&'static Wtf8, PyError> {
     if !unsafe { is_str(obj) } {
-        let ty = crate::baseobjspace::object_functionstr_type_name(obj);
+        let ty = pyre_interpreter::baseobjspace::object_functionstr_type_name(obj);
         return Err(PyError::type_error(format!(
             "{func}() argument 2 must be str, not {ty}"
         )));
@@ -331,7 +327,7 @@ fn is_normalized(args: &[PyObjectRef]) -> PyResult {
 /// descriptors on the type, rather than entries in an instance dictionary.
 // CPython 3.14 Modules/unicodedata.c:PyInit_unicodedata uses PyType_FromSpec;
 // ucd_type_spec carries IMMUTABLETYPE.
-#[crate::pyre_class("unicodedata.UCD", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("unicodedata.UCD", cpython_heaptype)]
 pub struct W_UCD {
     legacy: bool,
 }
@@ -341,7 +337,7 @@ fn ucd_method_args(args: &[PyObjectRef]) -> &[PyObjectRef] {
     args.get(1..).unwrap_or(&[])
 }
 
-#[crate::pyre_methods(doc = "Unicode character database.")]
+#[pyre_interpreter::pyre_methods(doc = "Unicode character database.")]
 impl W_UCD {
     fn category(&self, args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         category_impl(ucd(self.legacy), ucd_method_args(args))
@@ -393,7 +389,7 @@ impl W_UCD {
     }
 }
 
-crate::py_module! {
+pyre_interpreter::py_module! {
     "unicodedata",
     interpleveldefs: {
         "unidata_version" => w_str_new(&ucd_core::unicode_version()),
@@ -441,7 +437,7 @@ crate::py_module! {
         let ucd = pyre_object::gc_roots::shadow_stack_get(
             pyre_object::gc_roots::shadow_stack_len() - 1,
         );
-        crate::module_ns_store(ns, "ucd_3_2_0", ucd);
+        pyre_interpreter::module_ns_store(ns, "ucd_3_2_0", ucd);
     },
 }
 
@@ -451,7 +447,8 @@ mod tests {
 
     #[test]
     fn ucd_legacy_instance_uses_typed_descriptors() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::test_hooks::install_hash_hook();
+        pyre_interpreter::typedef::init_typeobjects();
         let _ = type_object();
         let obj = W_UCD::allocate_stable(W_UCD {
             ob: PyObject {
@@ -473,7 +470,8 @@ mod tests {
 
     #[test]
     fn ucd_legacy_name_rejects_later_assignments() {
-        crate::typedef::init_typeobjects();
+        pyre_interpreter::test_hooks::install_hash_hook();
+        pyre_interpreter::typedef::init_typeobjects();
         let _ = type_object();
         let obj = W_UCD::allocate_stable(W_UCD {
             ob: PyObject {
