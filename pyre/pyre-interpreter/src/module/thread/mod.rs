@@ -376,7 +376,9 @@ pub(crate) fn unregister_execution_context() {
 /// first-install `signals_enabled` write.  Used when the fallback context is
 /// replaced by the thread's real one.
 pub(crate) fn replace_execution_context(ec: *const crate::PyExecutionContext) {
-    EXECUTION_CONTEXTS.lock().insert(current_ident(), ec as usize);
+    EXECUTION_CONTEXTS
+        .lock()
+        .insert(current_ident(), ec as usize);
 }
 
 pub(crate) fn take_async_exception(ec: *mut crate::PyExecutionContext) -> PyObjectRef {

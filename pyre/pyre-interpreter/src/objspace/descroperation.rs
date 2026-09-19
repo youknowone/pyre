@@ -6323,13 +6323,12 @@ fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult 
         {
             let da = pyre_object::bytesobject::bytes_like_data(a);
             let db = pyre_object::bytesobject::bytes_like_data(b);
-            let diff = if pyre_object::bytesobject::is_bytes(a)
-                && pyre_object::bytesobject::is_bytes(b)
-            {
-                ll_bytes_strcmp(da, db)
-            } else {
-                ll_bytes_strcmp_mutable(da, db)
-            };
+            let diff =
+                if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
+                    ll_bytes_strcmp(da, db)
+                } else {
+                    ll_bytes_strcmp_mutable(da, db)
+                };
             return Ok(w_bool_from(match op {
                 CompareOp::Lt => diff < 0,
                 CompareOp::Le => diff <= 0,
