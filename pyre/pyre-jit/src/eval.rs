@@ -11840,24 +11840,16 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
     if dump_bytecode_enabled() {
-        if code.obj_name.as_str() == "fannkuch" && frame_root.frame().next_instr() == 0 {
+        if frame_root.frame().next_instr() == 0 {
             use std::sync::OnceLock;
             static DUMPED: OnceLock<()> = OnceLock::new();
             if DUMPED.get().is_none() {
                 let _ = DUMPED.set(());
                 let mut state = pyre_interpreter::OpArgState::default();
-                eprintln!("-- fannkuch bytecode dump --");
+                eprintln!("-- {} bytecode dump --", code.obj_name.as_str());
                 for (pc, unit) in code.instructions.iter().copied().enumerate() {
                     let (instr, oparg) = state.get(unit);
                     eprintln!("{pc:03}: {instr:?} oparg={oparg:?}");
-                }
-                for pc in [
-                    72usize, 99, 129, 131, 141, 155, 168, 179, 234, 245, 447, 449,
-                ] {
-                    eprintln!(
-                        "decode[{pc}] = {:?}",
-                        pyre_interpreter::decode_instruction_at(code, pc)
-                    );
                 }
             }
         }
