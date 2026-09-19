@@ -64,9 +64,13 @@ pub enum CanRaise {
 
 /// Charon spells the receiver type of every closure `closure`, so a
 /// `Method { receiver_root: Some("closure") }` names a *kind*, not a type:
-/// it cannot say which closure is being invoked.  Test against
-/// [`is_closure_receiver`], never against this literal — Charon appends a
-/// `#N` disambiguator to all but one of them.
+/// it cannot say which closure is being invoked by that string alone.
+/// Test against [`is_closure_receiver`], never against this literal —
+/// Charon appends a `#N` disambiguator to all but one of them. Each
+/// `closure#N` FunDecl is still a registered graph (a nested function);
+/// [`CallControl::unique_path_ending_with`] / caller-prefix resolution
+/// bind the call to that graph rather than to an unrelated same-named
+/// `call`.
 const CLOSURE_RECEIVER_ROOT: &str = "closure";
 
 /// Whether `receiver` names the closure *kind* rather than a type.
@@ -74,11 +78,10 @@ const CLOSURE_RECEIVER_ROOT: &str = "closure";
 /// Charon appends a `#N` disambiguator when one scope defines several
 /// closures, so the production spelling is `closure`, `closure#1`,
 /// `closure#12`, … — the bare form is the exception, not the rule. A
-/// pyre-jit-trace codegen over the three pyre artefacts reaches the
-/// receiver-agnostic fallback with 11 closure receivers, of which exactly
-/// **one** is spelled bare; matching the literal alone therefore let ten of
-/// them through to bind `Fn::call` to whichever graph happens to be the
-/// table's only `call`.
+/// method-name fallback would bind every such receiver to whichever
+/// unrelated graph happens to be the table's only `call`. The kind test
+/// therefore gates a FunDecl lookup (`[receiver, method]` against the
+/// registered graphs) instead of a name-only bind.
 ///
 /// `#` cannot occur in a Rust path segment, so the disambiguator is
 /// unambiguous to strip and this cannot widen onto a real type name.
@@ -91,6 +94,29 @@ fn is_closure_receiver(receiver: &str) -> bool {
         }
         None => receiver == CLOSURE_RECEIVER_ROOT,
     }
+}
+
+/// Drop a leading `crate` / local-crate segment.  Registration stores the
+/// crate-stripped spelling; Charon call sites keep the crate root.
+fn strip_crate_prefix_segments(segments: &[String]) -> Option<&[String]> {
+    if segments.len() > 1 {
+        let root = segments[0].as_str();
+        if root == "crate" || crate::local_crates::is_local_crate_root(root) {
+            return Some(&segments[1..]);
+        }
+    }
+    None
+}
+
+/// Two path spellings name one funcobj when they differ only by a crate
+/// alias prefix, or one is a nested suffix of the other.
+fn path_segments_alias_equal(a: &[String], b: &[String]) -> bool {
+    if a == b {
+        return true;
+    }
+    let a = strip_crate_prefix_segments(a).unwrap_or(a);
+    let b = strip_crate_prefix_segments(b).unwrap_or(b);
+    a == b || a.ends_with(b) || b.ends_with(a)
 }
 
 /// Which analyzer a witness callstack is being recovered for.
@@ -4429,8 +4455,8 @@ impl CallControl {
             // RPython call.py:77-90: scan all Call ops in the graph.
             // For each call, check guess_call_kind (with BFS-aware
             // is_candidate that treats "has graph" as candidate).
-            for block in &graph.blocks {
-                for op in &block.operations {
+            for (block_idx, block) in graph.blocks.iter().enumerate() {
+                for (op_idx, op) in block.operations.iter().enumerate() {
                     // `call.py:76-77` — only `direct_call` and
                     // `indirect_call` ops are walked; everything else is
                     // skipped.  The op-shape dispatch produces the callee
@@ -4491,30 +4517,48 @@ impl CallControl {
                         // only; an indirect family is instead validated
                         // as a whole in `getcalldescr`.
                         OpKind::Call { target, .. } => {
-                            let callee_path = match self.target_to_path(target) {
-                                Some(path) => path,
-                                None => {
-                                    // The single widest silent refusal in the
-                                    // pipeline: a call whose target resolves to
-                                    // no registered path at all.  Upstream has
-                                    // no analogue — `funcobj.graph` is an
-                                    // object reference that either exists or is
-                                    // `None` (call.py:127), never a name lookup
-                                    // that can miss — so a miss here means the
-                                    // callee was never lowered into
-                                    // `function_graphs`, not that a gate judged
-                                    // it.  Every gate downstream of this point
-                                    // is therefore never consulted for this
-                                    // callee, which is exactly the reading that
-                                    // a bare `continue` cannot support.
-                                    crate::decline::record(
-                                        BFS_GATE,
-                                        "callee-target-unresolvable",
-                                        format_args!("{target:?} in {path}"),
-                                    );
-                                    continue;
+                            let callee_path =
+                                match self.direct_callee_graph_path(target, Some(&path)) {
+                                    Some(callee) => callee,
+                                    None => {
+                                        // The single widest silent refusal in the
+                                        // pipeline: a call whose target resolves to
+                                        // no registered path at all.  Upstream has
+                                        // no analogue — `funcobj.graph` is an
+                                        // object reference that either exists or is
+                                        // `None` (call.py:127), never a name lookup
+                                        // that can miss — so a miss here means the
+                                        // callee was never lowered into
+                                        // `function_graphs`, not that a gate judged
+                                        // it.  Every gate downstream of this point
+                                        // is therefore never consulted for this
+                                        // callee, which is exactly the reading that
+                                        // a bare `continue` cannot support.
+                                        crate::decline::record(
+                                            BFS_GATE,
+                                            "callee-target-unresolvable",
+                                            format_args!("{target:?} in {path}"),
+                                        );
+                                        continue;
+                                    }
+                                };
+                            // `getfunctionptr(graph)`: remember the nested
+                            // closure identity on the op so emit's
+                            // `graphs_from` uses the same path BFS followed.
+                            if matches!(
+                                target,
+                                CallTarget::Method {
+                                    resolved_path: None,
+                                    ..
                                 }
-                            };
+                            ) {
+                                self.stamp_method_resolved_path(
+                                    &path,
+                                    block_idx,
+                                    op_idx,
+                                    callee_path.clone(),
+                                );
+                            }
                             // `call.py:119-120`
                             // jitdriver_sd_from_portal_runner_ptr → recursive.
                             if self.is_portal_recursive_call(&callee_path) {
@@ -5191,17 +5235,19 @@ impl CallControl {
     /// collapse to `None` when no candidate is reachable — the residual
     /// call path.
     ///
-    /// The `is_candidate` argument from RPython `call.py` is
-    /// omitted here because majit's `find_all_graphs_for_tests` /
-    /// `find_all_graphs` populates `self.candidate_graphs` in bulk
-    /// before any caller invokes `graphs_from`; the RPython
-    /// incremental-discovery shape (where `find_all_graphs` passes its
-    /// own local `is_candidate`) is not needed.
+    /// After `find_all_graphs`, `is_candidate` is membership in
+    /// `self.candidate_graphs`.  During BFS the same registered-graph
+    /// resolution (`direct_callee_graph_path`) is used with the caller
+    /// path so a nested closure FunDecl is the graph `funcobj.graph`
+    /// would have been.
     pub fn graphs_from(&self, op: &SpaceOperation) -> Option<Vec<CallPath>> {
         match &op.kind {
             OpKind::Call { target, .. } => {
-                // call.py:97-101 direct_call branch.
-                let path = self.target_to_path(target)?;
+                // call.py:97-101 direct_call branch: `funcobj.graph` if
+                // `is_candidate(graph)`.  The registered spelling is the
+                // graph identity BFS also follows; an unregistered
+                // `target_to_path` result is residual, not a different key.
+                let path = self.direct_callee_graph_path(target, None)?;
                 if self.candidate_graphs.contains(&path) {
                     Some(vec![path])
                 } else {
@@ -5251,6 +5297,159 @@ impl CallControl {
         }
     }
 
+    fn has_callable_graph(&self, path: &CallPath) -> bool {
+        self.function_graphs.contains_key(path) || self.opname_helper_paths.contains(path)
+    }
+
+    /// The registered graph identity for a direct call — `funcobj.graph`.
+    ///
+    /// `target_to_path` may still return an unregistered 3+-segment
+    /// FunctionPath so `fnaddr_for_target` can look up a host binding.
+    /// Discovery and emit (`graphs_from` / BFS) share this filter so they
+    /// cannot disagree on spelling.
+    fn direct_callee_graph_path(
+        &self,
+        target: &CallTarget,
+        caller: Option<&CallPath>,
+    ) -> Option<CallPath> {
+        if let Some(path) = self.target_to_path(target)
+            && self.has_callable_graph(&path)
+        {
+            return Some(path);
+        }
+        if let CallTarget::FunctionPath { segments } = target
+            && let Some(registered) = self.registered_function_path_alias(segments)
+        {
+            return Some(registered);
+        }
+        if let (
+            Some(caller),
+            CallTarget::Method {
+                name,
+                receiver_root: Some(recv),
+                ..
+            },
+        ) = (caller, target)
+            && is_closure_receiver(recv)
+        {
+            return self.closure_graph_under_caller(caller, recv, name);
+        }
+        None
+    }
+
+    /// Crate-stripped or suffix-matched registered spelling of `segments`.
+    fn registered_function_path_alias(&self, segments: &[String]) -> Option<CallPath> {
+        if let Some(stripped) = strip_crate_prefix_segments(segments) {
+            let stripped_path = CallPath::from_segments(stripped.iter().map(String::as_str));
+            if self.has_callable_graph(&stripped_path) {
+                return Some(stripped_path);
+            }
+            if let Some(path) = self.unique_suffix_registered_path(stripped) {
+                return Some(path);
+            }
+        }
+        self.unique_suffix_registered_path(segments)
+    }
+
+    fn unique_suffix_registered_path(&self, segments: &[String]) -> Option<CallPath> {
+        let leaf = segments.last()?;
+        let mut matches = Vec::new();
+        for index in [&self.free_fn_leaf_index, &self.impl_method_leaf_index] {
+            if let Some(bucket) = index.get(leaf) {
+                matches.extend(bucket.iter().filter(|key| {
+                    let cs = &key.segments;
+                    cs.len() >= segments.len() && cs[cs.len() - segments.len()..] == *segments
+                }));
+            }
+        }
+        self.unique_shared_graph_path(&matches)
+    }
+
+    fn paths_ending_with<'a>(&'a self, owner_leaf: &str, method: &str) -> Vec<&'a CallPath> {
+        let mut matches = Vec::new();
+        for index in [&self.impl_method_leaf_index, &self.free_fn_leaf_index] {
+            if let Some(bucket) = index.get(method) {
+                matches.extend(bucket.iter().filter(|key| {
+                    let segs = &key.segments;
+                    segs.len() >= 2 && segs[segs.len() - 2] == owner_leaf
+                }));
+            }
+        }
+        matches
+    }
+
+    /// Unique registered graph whose last two segments are `[owner, method]`.
+    /// Aliases of one `GraphSlot` count as one graph (object identity).
+    fn unique_path_ending_with(&self, owner_leaf: &str, method: &str) -> Option<CallPath> {
+        let matches = self.paths_ending_with(owner_leaf, method);
+        self.unique_shared_graph_path(&matches)
+    }
+
+    fn unique_shared_graph_path(&self, matches: &[&CallPath]) -> Option<CallPath> {
+        let first_path = *matches.first()?;
+        let first = self.function_graphs.get(first_path)?;
+        if !matches.iter().all(|path| {
+            self.function_graphs
+                .get(path)
+                .is_some_and(|graph| std::ptr::eq(graph, first))
+        }) {
+            return None;
+        }
+        matches
+            .iter()
+            .copied()
+            .min_by(|a, b| a.segments.cmp(&b.segments))
+            .cloned()
+    }
+
+    /// Nested-function analogue: the closure FunDecl lives under the caller.
+    fn closure_graph_under_caller(
+        &self,
+        caller: &CallPath,
+        receiver: &str,
+        method: &str,
+    ) -> Option<CallPath> {
+        let matches: Vec<&CallPath> = self
+            .paths_ending_with(receiver, method)
+            .into_iter()
+            .filter(|key| {
+                key.segments.len() >= 2
+                    && path_segments_alias_equal(
+                        &key.segments[..key.segments.len() - 2],
+                        &caller.segments,
+                    )
+            })
+            .collect();
+        self.unique_shared_graph_path(&matches)
+    }
+
+    fn stamp_method_resolved_path(
+        &mut self,
+        caller: &CallPath,
+        block_idx: usize,
+        op_idx: usize,
+        resolved: CallPath,
+    ) {
+        let Some(graph) = self.function_graphs.get_mut(caller) else {
+            return;
+        };
+        let Some(op) = graph
+            .blocks
+            .get_mut(block_idx)
+            .and_then(|block| block.operations.get_mut(op_idx))
+        else {
+            return;
+        };
+        if let OpKind::Call {
+            target: CallTarget::Method { resolved_path, .. },
+            ..
+        } = &mut op.kind
+            && resolved_path.is_none()
+        {
+            *resolved_path = Some(resolved);
+        }
+    }
+
     /// Look up the registered graph alongside its `CallPath` in a single
     /// step — `call.py:97` `funcobj.graph` direct read.  The returned
     /// `&FunctionGraph` is the same identity registered under the path,
@@ -5285,10 +5484,14 @@ impl CallControl {
                 // A rich-`OpKind` graph resolves via `function_graphs`; an
                 // opname-dispatch helper has no rich twin there, so it is
                 // recognised by its persistent registration instead.
-                if self.function_graphs.contains_key(&path)
-                    || self.opname_helper_paths.contains(&path)
-                {
+                if self.has_callable_graph(&path) {
                     return Some(path);
+                }
+                // `funcobj.graph`: the crate-stripped / suffix-matched
+                // registration, so BFS and `graphs_from` share one spelling
+                // instead of returning a 3+-segment path that is not a key.
+                if let Some(registered) = self.registered_function_path_alias(segments) {
+                    return Some(registered);
                 }
                 // Cross-module reference fallback.  `front::mir` resolves
                 // each callee through Charon to its fully-qualified
@@ -5448,31 +5651,44 @@ impl CallControl {
                     if self.function_graphs.contains_key(&qualified) {
                         return Some(qualified);
                     }
-                    // Suffix-match fallback for in-impl `self.method()` calls.
-                    //
-                    // When the parser walks `impl PyFrame { fn pop(&mut self) {
-                    // self.stack_base() } }`, the inner `self.stack_base()` is
-                    // recorded as `Method { receiver_root: Some("PyFrame") }`
-                    // — the syntactic spelling, not the canonical
-                    // `pyframe::PyFrame`.  `for_impl_method("PyFrame",
-                    // "stack_base")` produces the 2-segment
-                    // `["PyFrame", "stack_base"]`, but `function_graphs`
-                    // registers the impl method under the 3-segment
-                    // module-qualified key `["pyframe", "PyFrame",
-                    // "stack_base"]`.  The literal lookup above misses, and
-                    // without this fallback every in-impl `self.method()`
-                    // call falls through to residual_call — inflating IR
-                    // emission whenever the BFS would have inlined the
-                    // method body otherwise.
-                    //
-                    // Look up `function_graphs` keys whose last 2 segments
-                    // match `[receiver, name]` via `impl_method_leaf_index`.
-                    // Accept the match only if it is unique: an ambiguous
-                    // suffix (e.g. two crates both exposing a `PyFrame::pop`)
-                    // falls through to the trait resolution path, which mirrors
-                    // Rust's name-resolution ambiguity error rather than
-                    // silently picking one.
-                    if let Some(path) = self.suffix_match_impl_method(receiver, name.as_str()) {
+                    // Closure FunDecl: Charon extracts each `closure#N` as
+                    // its own graph.  Resolve to that graph (nested-function
+                    // analogue) rather than declining the receiver as a kind
+                    // or binding an unrelated same-named `call`.  Ambiguous
+                    // same-leaf closures stay unresolved here; BFS disambiguates
+                    // by nesting under the caller.
+                    if is_closure_receiver(receiver) {
+                        if let Some(path) = self.unique_path_ending_with(receiver, name.as_str()) {
+                            return Some(path);
+                        }
+                        // Ambiguous same-leaf closures: BFS nests under the caller.
+                    } else if let Some(path) =
+                        self.suffix_match_impl_method(receiver, name.as_str())
+                    {
+                        // Suffix-match fallback for in-impl `self.method()` calls.
+                        //
+                        // When the parser walks `impl PyFrame { fn pop(&mut self) {
+                        // self.stack_base() } }`, the inner `self.stack_base()` is
+                        // recorded as `Method { receiver_root: Some("PyFrame") }`
+                        // — the syntactic spelling, not the canonical
+                        // `pyframe::PyFrame`.  `for_impl_method("PyFrame",
+                        // "stack_base")` produces the 2-segment
+                        // `["PyFrame", "stack_base"]`, but `function_graphs`
+                        // registers the impl method under the 3-segment
+                        // module-qualified key `["pyframe", "PyFrame",
+                        // "stack_base"]`.  The literal lookup above misses, and
+                        // without this fallback every in-impl `self.method()`
+                        // call falls through to residual_call — inflating IR
+                        // emission whenever the BFS would have inlined the
+                        // method body otherwise.
+                        //
+                        // Look up `function_graphs` keys whose last 2 segments
+                        // match `[receiver, name]` via `impl_method_leaf_index`.
+                        // Accept the match only if it is unique: an ambiguous
+                        // suffix (e.g. two crates both exposing a `PyFrame::pop`)
+                        // falls through to the trait resolution path, which mirrors
+                        // Rust's name-resolution ambiguity error rather than
+                        // silently picking one.
                         return Some(path);
                     }
                 }
@@ -5530,30 +5746,7 @@ impl CallControl {
                 segs.len() >= 2 && segs[segs.len() - 2] == receiver_leaf
             })
             .collect();
-        if matches.is_empty() {
-            return None;
-        }
-        if matches.len() == 1 {
-            return Some(matches[0].clone());
-        }
-        let first_graph_name = self
-            .function_graphs
-            .get(matches[0])
-            .map(|g| g.name.as_str())?;
-        let all_same = matches.iter().all(|p| {
-            self.function_graphs
-                .get(p)
-                .map(|g| g.name == first_graph_name)
-                .unwrap_or(false)
-        });
-        if !all_same {
-            return None;
-        }
-        matches
-            .iter()
-            .copied()
-            .min_by(|a, b| a.segments.cmp(&b.segments))
-            .cloned()
+        self.unique_shared_graph_path(&matches)
     }
 
     /// RPython `call.py` uses `getfunctionptr(graph)` to obtain the
@@ -5828,14 +6021,13 @@ impl CallControl {
             if receiver.contains("::") || canonical != receiver {
                 return None;
             }
-            // A closure receiver names the kind, not a type, so it can
-            // never identify a callee.  Subsumed by the retirement of the
-            // receiver-agnostic fallback below — every receiver now
-            // declines — and kept as an explicit statement of the case,
-            // since resolving these for real needs the closure bodies in
-            // `function_graphs`, which the front end does not lower.
+            // Closure FunDecl: resolve to that nested graph, not an
+            // unrelated same-named `call`.  Ambiguous same-leaf closures
+            // stay unresolved here (BFS nests them under the caller).
             if is_closure_receiver(receiver) {
-                return None;
+                return self
+                    .unique_path_ending_with(receiver, name)
+                    .and_then(|path| self.function_graphs.get(&path));
             }
         }
 
@@ -5903,7 +6095,8 @@ impl CallControl {
             if majit_ir::descr::canonical_struct_name(receiver) != receiver {
                 return None;
             }
-            // Closure receiver: same decline as [`Self::resolve_method`].
+            // Closure receiver: [`Self::target_to_path`] already resolved
+            // the FunDecl; a remaining miss is ambiguous or unregistered.
             if is_closure_receiver(receiver) {
                 return None;
             }
@@ -13373,6 +13566,162 @@ mod tests {
                 "call"
             )),
             "a receiver that names the registration must still resolve"
+        );
+    }
+
+    fn graph_calling(name: &str, target: CallTarget) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(direct_call_op(target));
+        graph
+    }
+
+    /// Charon extracts each `closure#N` FunDecl as its own graph, the way a
+    /// nested function is a plain graph. A `Method { receiver: closure#N }`
+    /// call must resolve to that FunDecl, not decline as an untyped kind
+    /// and not bind an unrelated same-named `call`.
+    #[test]
+    fn closure_receiver_resolves_to_its_own_graph() {
+        let mut cc = CallControl::new();
+        cc.register_trait_method(
+            "call",
+            Some("OpcodeStepExecutor"),
+            "<default methods of OpcodeStepExecutor>",
+            FunctionGraph::new("opcode_step_executor_call"),
+        );
+        // FunDecl registered as a free function: the Impl owner may not have
+        // stamped `owner_root`, so the impl-method leaf index never sees it.
+        let free_path = CallPath::from_segments(["eval", "f", "closure#1", "call"]);
+        cc.register_function_graph(free_path.clone(), FunctionGraph::new("call"));
+        let owned_path = CallPath::for_impl_method("eval::g::closure#12", "call_once");
+        cc.register_function_graph(
+            owned_path.clone(),
+            FunctionGraph::new("call_once").with_owner_root("eval::g::closure#12"),
+        );
+
+        let free_call = CallTarget::Method {
+            name: "call".to_string(),
+            receiver_root: Some("closure#1".to_string()),
+            resolved_path: None,
+        };
+        assert_eq!(
+            cc.target_to_path(&free_call),
+            Some(free_path.clone()),
+            "a closure#N FunDecl must resolve even when registered as a free function"
+        );
+        let owned_call = CallTarget::Method {
+            name: "call_once".to_string(),
+            receiver_root: Some("closure#12".to_string()),
+            resolved_path: None,
+        };
+        assert_eq!(
+            cc.target_to_path(&owned_call),
+            Some(owned_path.clone()),
+            "a closure#N FunDecl registered as an impl method must resolve to itself"
+        );
+        assert_ne!(
+            cc.target_to_path(&free_call),
+            Some(CallPath::for_impl_method(
+                "<default methods of OpcodeStepExecutor>",
+                "call"
+            )),
+            "must not bind Fn::call to an unrelated same-named graph"
+        );
+    }
+
+    /// `graphs_from` and `find_all_graphs` share one resolution: a
+    /// crate-prefixed FunctionPath whose graph is registered under the
+    /// crate-stripped spelling is `funcobj.graph`, not an unregistered
+    /// path that BFS records as `callee-has-no-registered-graph`.
+    #[test]
+    fn graphs_from_and_bfs_agree_on_crate_prefixed_function_path() {
+        let mut cc = CallControl::new();
+        let registered = CallPath::from_segments(["eval", "helper"]);
+        let call_spelling = CallPath::from_segments(["crate", "eval", "helper"]);
+        let portal = CallPath::from_segments(["portal"]);
+        cc.register_function_graph(
+            portal.clone(),
+            graph_calling(
+                "portal",
+                CallTarget::function_path(call_spelling.segments.iter().map(String::as_str)),
+            ),
+        );
+        cc.register_function_graph(registered.clone(), FunctionGraph::new("helper"));
+        cc.mark_portal(portal.clone());
+
+        let spelled = CallTarget::function_path(["crate", "eval", "helper"]);
+        assert_eq!(
+            cc.target_to_path(&spelled),
+            Some(registered.clone()),
+            "the 3+-segment crate-prefixed spelling must resolve to the registered graph"
+        );
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        assert!(
+            cc.is_candidate(&registered),
+            "BFS must follow the registered graph, not skip it as unregistered"
+        );
+
+        let portal_graph = cc
+            .function_graphs
+            .get(&portal)
+            .expect("portal graph")
+            .clone();
+        let op = &portal_graph.block(portal_graph.startblock).operations[0];
+        assert_eq!(
+            cc.graphs_from(op),
+            Some(vec![registered.clone()]),
+            "emit must use the same registered path BFS followed"
+        );
+    }
+
+    /// Two `closure#1` FunDecls in different parents: BFS follows the
+    /// nested one under the caller, and `graphs_from` later agrees.
+    #[test]
+    fn graphs_from_and_bfs_agree_on_nested_closure_callee() {
+        let mut cc = CallControl::new();
+        let nested = CallPath::from_segments(["eval", "f", "closure#1", "call"]);
+        let other = CallPath::from_segments(["other", "g", "closure#1", "call"]);
+        let portal = CallPath::from_segments(["eval", "f"]);
+        cc.register_function_graph(
+            portal.clone(),
+            graph_calling(
+                "f",
+                CallTarget::Method {
+                    name: "call".to_string(),
+                    receiver_root: Some("closure#1".to_string()),
+                    resolved_path: None,
+                },
+            ),
+        );
+        cc.register_function_graph(nested.clone(), FunctionGraph::new("call"));
+        cc.register_function_graph(other.clone(), FunctionGraph::new("call"));
+        cc.mark_portal(portal.clone());
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        assert!(
+            cc.is_candidate(&nested),
+            "BFS must enter the caller's nested closure FunDecl"
+        );
+        assert!(
+            !cc.is_candidate(&other),
+            "BFS must not pull in an unrelated function's same-leaf closure"
+        );
+
+        let portal_graph = cc
+            .function_graphs
+            .get(&portal)
+            .expect("portal graph")
+            .clone();
+        let op = &portal_graph.block(portal_graph.startblock).operations[0];
+        assert_eq!(
+            cc.graphs_from(op),
+            Some(vec![nested.clone()]),
+            "emit must resolve the stamped nested closure, not residualize it"
         );
     }
 }

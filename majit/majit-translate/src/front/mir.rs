@@ -7269,18 +7269,18 @@ impl<'a> Lowering<'a> {
                     // A shell variant's payload takes the shell projection:
                     // the `&P` a slice accessor hands back through
                     // `Option`/`Result`/`ControlFlow` is the primitive, not
-                    // a pointer the program stores.  Every other container's
-                    // `&P` field is a reference the program declared and
-                    // keeps its own bank.
-                    let declared = if container_is_enum {
-                        tyref_enum_payload_value_type(&place_ty, self.llbc)
-                    } else {
-                        tyref_to_value_type(&place_ty, self.llbc)
-                    };
-                    let ty = match declared {
-                        ValueType::Ref(None) => tyref_to_value_type(&field_ty, self.llbc),
-                        resolved => resolved,
-                    };
+                    // a pointer the program stores.  A struct field whose
+                    // declared type is a shared borrow of a primitive is
+                    // the same integer: `Rvalue::Ref` aliases the referent
+                    // and `Ptr(Signed)` does not exist, so a captured
+                    // `&usize` is the `usize`.  A stored `&T` to a
+                    // container keeps the Ref bank.
+                    let ty = adt_field_read_value_type(
+                        &place_ty,
+                        &field_ty,
+                        container_is_enum,
+                        self.llbc,
+                    );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -8095,12 +8095,21 @@ impl<'a> Lowering<'a> {
         // argument, including primitive payloads for which the annotator does
         // not split classdefs.
         let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
-        let owner_root = match head
-            .as_object()
-            .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
-        {
-            Some(suffix) => format!("{owner_leaf}{suffix}"),
-            None => owner_leaf,
+        // Duplicate-leaf hardening drops the shared `closure` /
+        // `closure#N` alias from the field registry.  Field reads of a
+        // capture must key the full crate-stripped path the registry
+        // kept — the same spelling [`tyref_input_class_root`] uses for
+        // the env parameter.
+        let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
+            strip_crate_prefix(&name_path)
+        } else {
+            match head
+                .as_object()
+                .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
+            {
+                Some(suffix) => format!("{owner_leaf}{suffix}"),
+                None => owner_leaf,
+            }
         };
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) => {
@@ -23628,6 +23637,45 @@ fn tyref_deref_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     tyref_to_value_type(&TyRef::Other(node.clone()), llbc)
 }
 
+/// Register-bank kind of an ADT field read.
+///
+/// Prefers the place's post-projection type (generic substitution is
+/// already applied there).  A shell variant peels a shared borrow of a
+/// primitive the way [`tyref_enum_payload_value_type`] does.  A struct
+/// field whose declared type is that same borrow is the integer too:
+/// `Rvalue::Ref` aliases the referent, `resolve_place` collapses `Deref`,
+/// and `Ptr(Signed)` does not exist, so a captured `&usize` is the
+/// `usize`.  Without the peel the field stays `Ref` and a later `int_add`
+/// assembles as `int_add/ri>i`.
+fn adt_field_read_value_type(
+    place_ty: &TyRef,
+    field_ty: &TyRef,
+    container_is_enum: bool,
+    llbc: &Llbc,
+) -> ValueType {
+    let declared = if container_is_enum {
+        tyref_enum_payload_value_type(place_ty, llbc)
+    } else {
+        tyref_to_value_type(place_ty, llbc)
+    };
+    match declared {
+        ValueType::Ref(None) => {
+            if let Some(peeled) = tyref_shared_borrow_primitive_value(field_ty, llbc)
+                .or_else(|| tyref_shared_borrow_primitive_value(place_ty, llbc))
+            {
+                return peeled;
+            }
+            tyref_to_value_type(field_ty, llbc)
+        }
+        resolved => resolved,
+    }
+}
+
+fn tyref_shared_borrow_primitive_value(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let pointee = tyref_shared_borrow_primitive_pointee(ty, llbc)?;
+    Some(tyref_to_value_type(&TyRef::Other(pointee), llbc))
+}
+
 /// Register-bank kind of an enum variant's payload — `Option<T>`,
 /// `Result<T, E>`, `ControlFlow<T, _>`, `Bound<T>`.
 ///
@@ -24212,6 +24260,13 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // no `pair(SomeInteger, SomeInstance).union()` handler and walls.
     if tyref_is_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
+    }
+    // A stored shared borrow of a primitive is the integer
+    // (`adt_field_read_value_type`): seed the attr as that scalar so a
+    // captured `&usize` does not FORCE a Ref class field against an
+    // Int-banked getfield.
+    if let Some(peeled) = tyref_shared_borrow_primitive_value(ty, llbc) {
+        return peeled;
     }
     // A `str`/`String`/`Wtf8` field seeds a `SomeString` attr shell (via
     // valuetype_to_someshell) instead of the classdef-less `Ref(None)`
@@ -30915,14 +30970,15 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
-        cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
-        checked_arith_uint_atom_is_word_sized, decode_literal, fn_ptr_family_for,
-        int_binop_needs_ptr_to_int, is_class_pytype_assoc_const, is_core_result_map_err_path,
-        json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
-        lower_struct_aggregate_ctors_to_new, primitive_float_const, push_cast_ptr_to_int,
-        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr, tyref_positional_aggregate_root, tyref_to_value_type,
+        DecodedConst, FnPtrFamily, adt_field_read_value_type, cast_call_segments,
+        cast_kind_is_raw_ptr, cast_pointer_marker_op, charon_const_generic_to_string,
+        charon_type_value_to_ast_string, checked_arith_uint_atom_is_word_sized, decode_literal,
+        fn_ptr_family_for, int_binop_needs_ptr_to_int, is_class_pytype_assoc_const,
+        is_core_result_map_err_path, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, lower_struct_aggregate_ctors_to_new,
+        primitive_float_const, push_cast_ptr_to_int, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        tyref_positional_aggregate_root, tyref_to_attr_value_type, tyref_to_value_type,
     };
     use crate::model::{
         CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -36009,6 +36065,107 @@ mod tests {
         assert!(!int_binop_needs_ptr_to_int("lt", Some(&int), Some(&int)));
         assert!(!int_binop_needs_ptr_to_int("mod", Some(&int), Some(&int)));
         assert!(!int_binop_needs_ptr_to_int("add", Some(&ptr), Some(&ptr)));
+    }
+
+    fn fixture_ty(v: serde_json::Value) -> TyRef {
+        serde_json::from_value::<TyRef>(serde_json::json!({
+            "HashConsedValue": [0, v]
+        }))
+        .expect("fixture TyRef parses")
+    }
+
+    fn shared_borrow_of_usize() -> TyRef {
+        fixture_ty(serde_json::json!({
+            "Ref": [
+                {"Erased": null},
+                {"Literal": {"UInt": "Usize"}},
+                "Shared"
+            ]
+        }))
+    }
+
+    #[test]
+    fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
+        // `try_dispatch_binary_special::closure::call` captures `operands:
+        // usize` by shared borrow.  `Rvalue::Ref` aliases that integer, so
+        // the field read must be Unsigned; leaving it Ref assembles
+        // `int_add/ri>i` at pc 10 of jitcode `call`.
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let ref_usize = shared_borrow_of_usize();
+        assert_eq!(
+            tyref_to_value_type(&ref_usize, &llbc),
+            ValueType::Ref(None),
+            "the global projection stays non-peeling for &usize"
+        );
+        assert_eq!(
+            adt_field_read_value_type(&ref_usize, &ref_usize, false, &llbc),
+            ValueType::Unsigned,
+            "a stored &usize capture is the usize"
+        );
+        assert_eq!(
+            tyref_to_attr_value_type(&ref_usize, &llbc),
+            ValueType::Unsigned,
+            "FORCE-attr rows must match the Int-banked getfield"
+        );
+    }
+
+    #[test]
+    fn resolve_adt_field_keys_a_closure_capture_by_its_full_path() {
+        use super::Lowering;
+        use majit_charon_reader::ullbc::Unstructured;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["fixture", 0]},
+                            {"Ident": ["try_dispatch_binary_special", 0]},
+                            {"Ident": ["closure", 0]}
+                        ],
+                        "span": span, "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"Literal": {"UInt": "Usize"}},
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false}
+                    }]}
+                }],
+                "fun_decls": [], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).unwrap();
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "locals": {"arg_count": 0, "locals": []}, "body": [], "span": span
+        }))
+        .unwrap();
+        let dont_look_inside = std::collections::HashSet::new();
+        let lowering = Lowering::new(
+            &llbc,
+            "fixture".into(),
+            &body,
+            crate::HostStaticAddrs::default(),
+            &[],
+            None,
+            &dont_look_inside,
+        )
+        .unwrap();
+        let payload = serde_json::json!([{"Adt": [0, null]}, 0]);
+        let (owner_root, field_name, _, _) = lowering
+            .resolve_adt_field(&payload)
+            .expect("closure field projection must resolve");
+        assert_eq!(field_name, "__pos_0");
+        assert_eq!(
+            owner_root, "try_dispatch_binary_special::closure",
+            "the shared leaf `closure` is withdrawn; the field keys the full path"
+        );
     }
 
     #[test]
