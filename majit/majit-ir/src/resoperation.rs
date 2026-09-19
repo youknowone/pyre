@@ -2500,7 +2500,7 @@ const THIN_STAMPED_BIT: u64 = 1u64 << 61;
 const THIN_STAMPED_ID_SHIFT: u32 = 48;
 const THIN_STAMPED_ID_MASK: u64 = 0x1fff;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct ThinStamped {
     vtable: u8,
     stamp: u32,
@@ -2512,7 +2512,18 @@ struct ThinStamped {
     fwd_tag: u8,
 }
 
-static THIN_STAMPED: std::sync::Mutex<Vec<ThinStamped>> = std::sync::Mutex::new(Vec::new());
+struct ThinStampedTable {
+    entries: Vec<ThinStamped>,
+    index: rustc_hash::FxHashMap<ThinStamped, usize>,
+}
+
+static THIN_STAMPED: std::sync::LazyLock<std::sync::Mutex<ThinStampedTable>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(ThinStampedTable {
+            entries: Vec::new(),
+            index: rustc_hash::FxHashMap::default(),
+        })
+    });
 
 static DESCR_VTABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
@@ -2559,7 +2570,7 @@ fn thin_stamped_at(w: u64) -> Option<ThinStamped> {
     }
     let id = ((w >> THIN_STAMPED_ID_SHIFT) & THIN_STAMPED_ID_MASK) as usize;
     let v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
-    v.get(id).copied()
+    v.entries.get(id).copied()
 }
 
 fn thin_stamp(w: u64) -> u32 {
@@ -2603,21 +2614,22 @@ fn thin_with_stamp(thin: u64, stamp: u32) -> Option<u64> {
 
 fn intern_thin_stamped(vtable: u8, stamp: u32, data: usize, fwd_tag: u8) -> Option<u64> {
     let mut v = THIN_STAMPED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = v.iter().position(|e| {
-        e.vtable == vtable && e.stamp == stamp && e.data == data && e.fwd_tag == fwd_tag
-    }) {
-        return Some(i as u64);
-    }
-    if v.len() as u64 >= THIN_STAMPED_ID_MASK + 1 {
-        return None;
-    }
-    v.push(ThinStamped {
+    let key = ThinStamped {
         vtable,
         stamp,
         data,
         fwd_tag,
-    });
-    Some((v.len() - 1) as u64)
+    };
+    if let Some(&i) = v.index.get(&key) {
+        return Some(i as u64);
+    }
+    if v.entries.len() as u64 >= THIN_STAMPED_ID_MASK + 1 {
+        return None;
+    }
+    let i = v.entries.len();
+    v.entries.push(key);
+    v.index.insert(key, i);
+    Some(i as u64)
 }
 
 fn thin_with_forwarded(thin: u64, packed: u64) -> Option<u64> {
@@ -8400,5 +8412,25 @@ mod tests {
             assert!(!opcode.is_pure_with_descr(Some(&immutable)), "{opcode:?}");
         }
         assert!(OpCode::GetarrayitemGcPureI.is_pure_with_descr(None));
+    }
+
+    #[test]
+    fn intern_thin_stamped_reuses_id_and_roundtrips_fields() {
+        let id_a = intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2)
+            .expect("intern first key");
+        let id_a_again = intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_3333, 2)
+            .expect("intern same key");
+        assert_eq!(id_a, id_a_again);
+
+        let id_b = intern_thin_stamped(3, 0xABCDEF01, 0x1111_2222_4444, 2)
+            .expect("intern different key");
+        assert_ne!(id_a, id_b);
+
+        let word = (id_a << THIN_STAMPED_ID_SHIFT) | THIN_STAMPED_BIT;
+        let e = thin_stamped_at(word).expect("reader path");
+        assert_eq!(e.vtable, 3);
+        assert_eq!(e.stamp, 0xABCDEF01);
+        assert_eq!(e.data, 0x1111_2222_3333);
+        assert_eq!(e.fwd_tag, 2);
     }
 }
