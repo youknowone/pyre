@@ -3315,13 +3315,7 @@ mod tests {
         }
         let expr: Expr = syn::parse_str(src).expect("parse bytes expr");
         lowerer.lower_value_expr(&expr)?;
-        Some(
-            lowerer
-                .statements
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-        )
+        Some(lowerer.statements.iter().map(ToString::to_string).collect())
     }
 
     #[test]

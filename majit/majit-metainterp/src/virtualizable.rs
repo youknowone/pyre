@@ -2253,8 +2253,7 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![2]);
 
-        let (static_boxes, array_boxes) =
-            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(static_boxes, vec![42, 99]);
         assert_eq!(array_boxes, vec![vec![10, 20]]);
     }
@@ -2283,8 +2282,7 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
 
-        let (_, array_boxes) =
-            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
+        let (_, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(array_boxes, vec![vec![100, 200, 300]]);
 
         // Verify write roundtrip with custom layout
@@ -2297,8 +2295,7 @@ mod tests {
             );
         }
         // Re-read from the actual array_data (obj_mut still points to array_data)
-        let (_, array_boxes2) =
-            unsafe { info.read_all_boxes(obj_mut.as_ptr(), &lengths) };
+        let (_, array_boxes2) = unsafe { info.read_all_boxes(obj_mut.as_ptr(), &lengths) };
         assert_eq!(array_boxes2, vec![vec![111, 222, 333]]);
     }
 
@@ -2339,8 +2336,7 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
 
-        let (static_boxes, array_boxes) =
-            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(static_boxes, vec![7]);
         assert_eq!(array_boxes, vec![vec![10, 20, 30]]);
 
@@ -2463,8 +2459,7 @@ mod tests {
 
         // sync_before_jit: read from heap
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
-        let (mut statics, mut arrays) =
-            unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
+        let (mut statics, mut arrays) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(statics, vec![11, 22]);
         assert_eq!(arrays, vec![vec![50, 60]]);
 

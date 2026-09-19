@@ -93,8 +93,7 @@ pub static LAST_OPS_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 /// lock-free on the compile path; the probe rebuilds the struct inside the same
 /// lock window it reads the counters in, because this is as process-global as
 /// they are.
-pub static LAST_HAS_JUMP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static LAST_HAS_JUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub static LAST_ALWAYS_FAILS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -132,10 +131,7 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
         LAST_OPS_AFTER.store(ops_after, std::sync::atomic::Ordering::Relaxed);
         let shape = majit_metainterp::LoopBodyShape::of(opcodes);
         LAST_HAS_JUMP.store(shape.has_jump, std::sync::atomic::Ordering::Relaxed);
-        LAST_ALWAYS_FAILS.store(
-            shape.has_always_fails,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        LAST_ALWAYS_FAILS.store(shape.has_always_fails, std::sync::atomic::Ordering::Relaxed);
     });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
@@ -153,11 +149,7 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
     }
 
     while pc < program.len() {
-        // Still the bare observer/replay form. The single-executor
-        // `jit_merge_point!(driver, program, pc; state)` conversion does not
-        // hold for this interpreter yet, and `trip_count_gate` below is the
-        // permanent assertion that says so — see its second doc paragraph.
-        jit_merge_point!();
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         pc += 1;
 
