@@ -12,9 +12,9 @@
 //!
 //! In pyre this is achieved by `alive_loops` storing
 //! `Arc<JitCellToken>`. When an entry is removed, the Arc drops; when
-//! the last strong reference goes, `JitCellToken::drop` (TBD —
-//! `model.py cpu.free_loop_and_bridges` parity) frees the backend
-//! resources.
+//! the last strong reference goes, `JitCellToken::drop` calls
+//! `CompiledLoopToken::free_loop_and_bridges` (`llmodel.py`) and the
+//! CLT `Drop` bumps `total_freed_*` (`model.py` `CompiledLoopToken.__del__`).
 //!
 //! Both long-lived handles on a compiled token are now weak —
 //! `BaseJitCell::loop_token` (`warmstate.py`) and
@@ -198,13 +198,13 @@ impl MemoryManager {
     /// ```
     ///
     /// Returns the evicted token objects, where upstream returns `None`:
-    /// `LoopToken.__del__` (`memmgr.py`) dispatches
-    /// `cpu.free_loop_and_bridges` by itself once the only strong owner
-    /// (`alive_loops`) drops the token, and pyre has no destructor hook at
-    /// that point.  Both other long-lived handles are weak now, so the drop
-    /// here IS the last one; the list lets `pyjitpl::try_to_free_some_loops`
-    /// retire the matching `compiled_loops` entries, whose `Weak` would
-    /// otherwise linger as a dead key.
+    /// `LoopToken.__del__` (`memmgr.py`) lets the CLT run
+    /// `cpu.free_loop_and_bridges` once `alive_loops` drops the token.
+    /// Pyre does the same in `JitCellToken::drop` /
+    /// `CompiledLoopToken::drop`. The list lets
+    /// `pyjitpl::try_to_free_some_loops` retire the matching
+    /// `compiled_loops` entries, whose metadata cannot live on the
+    /// token (crate split).
     ///
     /// The return value is a `Vec<Arc<JitCellToken>>` rather than
     /// `Vec<u64>` (green_keys) so the caller can match by **token-object

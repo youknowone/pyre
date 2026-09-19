@@ -11994,12 +11994,78 @@ pub(super) fn user_binop_forward_dunder(
     }
 }
 
-/// Inline a plain Python forward arithmetic dunder after the exact numeric
-/// BINARY_OP specializations decline. The receiver class and its version tag
-/// pin the descriptor lookup, matching `try_dispatch_binary_special`'s
-/// forward arm. A proper-subclass rhs still declines below so reflected-method
-/// priority is preserved; a traced `NotImplemented` result guards and deopts
-/// to the generic dispatcher.
+/// Reflected dunder selected by `try_dispatch_binary_special` for a
+/// non-inplace BINARY_OP. In-place operators and `Subscr` have no `__r*__`
+/// arm in `_call_binop_impl` (`descroperation.py`) and stay on the generic
+/// path, matching [`user_binop_forward_dunder`].
+pub(super) fn user_binop_reflected_dunder(
+    op: pyre_interpreter::bytecode::BinaryOperator,
+) -> Option<&'static str> {
+    use pyre_interpreter::bytecode::BinaryOperator;
+
+    match op {
+        BinaryOperator::Add => Some("__radd__"),
+        BinaryOperator::And => Some("__rand__"),
+        BinaryOperator::FloorDivide => Some("__rfloordiv__"),
+        BinaryOperator::Lshift => Some("__rlshift__"),
+        BinaryOperator::MatrixMultiply => Some("__rmatmul__"),
+        BinaryOperator::Multiply => Some("__rmul__"),
+        BinaryOperator::Or => Some("__ror__"),
+        BinaryOperator::Power => Some("__rpow__"),
+        BinaryOperator::Remainder => Some("__rmod__"),
+        BinaryOperator::Rshift => Some("__rrshift__"),
+        BinaryOperator::Subtract => Some("__rsub__"),
+        BinaryOperator::TrueDivide => Some("__rtruediv__"),
+        BinaryOperator::Xor => Some("__rxor__"),
+        BinaryOperator::Subscr
+        | BinaryOperator::InplaceAdd
+        | BinaryOperator::InplaceAnd
+        | BinaryOperator::InplaceFloorDivide
+        | BinaryOperator::InplaceLshift
+        | BinaryOperator::InplaceMatrixMultiply
+        | BinaryOperator::InplaceMultiply
+        | BinaryOperator::InplaceOr
+        | BinaryOperator::InplacePower
+        | BinaryOperator::InplaceRemainder
+        | BinaryOperator::InplaceRshift
+        | BinaryOperator::InplaceSubtract
+        | BinaryOperator::InplaceTrueDivide
+        | BinaryOperator::InplaceXor => None,
+    }
+}
+
+/// True when `method` is an app-level `function` — the public type
+/// [`resolve_inlinable_callee`] admits. Builtin slots share `is_function`
+/// but carry a different type object.
+fn binop_impl_is_app_level_function(method: pyre_object::PyObjectRef) -> bool {
+    !method.is_null()
+        && unsafe {
+            (*method).ob_type as *const () as usize
+                == &pyre_interpreter::FUNCTION_TYPE as *const _ as usize
+        }
+}
+
+/// True when `method` is a builtin operator slot (`builtin_function_or_method`,
+/// `method_descriptor`, or `wrapper_descriptor`). Those are the forward impls
+/// `_invoke_binop` (`descroperation.py`) may run without entering user Python.
+fn binop_impl_is_builtin_slot(method: pyre_object::PyObjectRef) -> bool {
+    if method.is_null() {
+        return false;
+    }
+    unsafe {
+        (pyre_interpreter::is_function(method) && !binop_impl_is_app_level_function(method))
+            || pyre_interpreter::is_slot_wrapper(method)
+    }
+}
+
+/// Inline a plain Python arithmetic dunder after the exact numeric BINARY_OP
+/// specializations decline. The forward arm looks the dunder up on the lhs
+/// class, matching `try_dispatch_binary_special`'s first `_invoke_binop`
+/// (`descroperation.py` `_call_binop_impl`). When that impl is absent or a
+/// builtin slot, the reflected arm looks `__r*__` up on the rhs and descends
+/// with the operands swapped. A proper-subclass rhs still declines below so
+/// reflected-method priority is preserved; a traced `NotImplemented` result
+/// guards and deopts to the generic dispatcher.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -12075,18 +12141,230 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         decline!("rhs is a proper subclass; its reflected dunder has priority");
     }
 
-    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) })
+    let forward_method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) };
+    if let Some(method) = forward_method
+        && let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) })
+    {
+        return try_walker_inline_user_binop_dunder(
+            ctx,
+            op,
+            code,
+            r_args,
+            call_descr,
+            dst,
+            dunder,
+            method,
+            w_code,
+            nparams,
+            has_closure,
+            lhs,
+            concrete_lhs,
+            w_class,
+            version_tag,
+            rhs,
+            concrete_rhs,
+            w_typ_r.as_ptr(),
+        );
+    }
+    // Forward lookup found nothing, or found a slot that is not inlinable
+    // Python.  An app-level `function` that `resolve_inlinable_callee`
+    // refused is still user Python — do not invoke it, and do not fall
+    // through to `__r*__`.  A builtin slot (or a missing impl) is the
+    // `_invoke_binop` miss that `_call_binop_impl` (`descroperation.py`)
+    // follows with the reflected arm.
+    if let Some(method) = forward_method {
+        if binop_impl_is_app_level_function(method) {
+            decline!(format_args!(
+                "{}.{dunder} is not inlinable Python code",
+                unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+            ));
+        }
+        if !binop_impl_is_builtin_slot(method) {
+            decline!(format_args!("{}.{dunder} is not a builtin slot", unsafe {
+                pyre_object::typeobject::w_type_get_name(w_class)
+            }));
+        }
+    }
+    return try_walker_inline_user_binop_reflected(
+        ctx,
+        op,
+        code,
+        op_kind,
+        dunder,
+        forward_method,
+        r_args,
+        call_descr,
+        dst,
+        lhs,
+        concrete_lhs,
+        w_class,
+        rhs,
+        concrete_rhs,
+        w_typ_r.as_ptr(),
+    );
+}
+
+/// Reflected arm of [`try_walker_inline_user_binop`]: look `__r*__` up on the
+/// rhs type and descend with the operands swapped. Taken only when the
+/// forward impl cannot run user Python.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    op_kind: pyre_interpreter::bytecode::BinaryOperator,
+    forward_dunder: &'static str,
+    forward_method: Option<pyre_object::PyObjectRef>,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    lhs: OpRef,
+    concrete_lhs: pyre_object::PyObjectRef,
+    w_class_l: pyre_object::PyObjectRef,
+    rhs: OpRef,
+    concrete_rhs: pyre_object::PyObjectRef,
+    w_typ_r: pyre_object::PyObjectRef,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[binop-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    let Some(dunder) = user_binop_reflected_dunder(op_kind) else {
+        decline!(format_args!("no reflected dunder for {op_kind:?}"));
+    };
+    // `_call_binop_impl` (`descroperation.py`) never considers the reflected
+    // impl when the operand types are the same.
+    if std::ptr::eq(w_class_l, w_typ_r) {
+        decline!("same types; reflected dunder is not considered");
+    }
+    let version_tag_r = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_typ_r) };
+    if version_tag_r == 0 {
+        decline!(format_args!("rhs class {} has no version tag", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_typ_r)
+        }));
+    }
+    let Some(method) = (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_typ_r, dunder) })
     else {
         decline!(format_args!("{} has no {dunder}", unsafe {
-            pyre_object::typeobject::w_type_get_name(w_class)
+            pyre_object::typeobject::w_type_get_name(w_typ_r)
         }));
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
         decline!(format_args!(
             "{}.{dunder} is not inlinable Python code",
-            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+            unsafe { pyre_object::typeobject::w_type_get_name(w_typ_r) }
         ));
     };
+    // `_invoke_binop` (`descroperation.py` `_call_binop_impl`) treats a
+    // missing impl as no result.  A builtin slot is invoked at record
+    // time: NotImplemented is no result, anything else (a value or a
+    // raise) is a result we cannot skip.  The compiled body will not
+    // re-run that slot, so the skip has to hold for every pair the
+    // emitted guards admit.  Those guards pin the rhs class/version tag
+    // (the reflected receiver) and the lhs `w_class`; builtin numeric
+    // slots decide NotImplemented from those types.  The odometer
+    // reading around the invocation — not an assumption — is what
+    // establishes that the skipped slot applied nothing.  A Python
+    // forward dunder is never invoked here.
+    if let Some(fwd) = forward_method {
+        let effects_before = fbw_executed_effect_count();
+        let unjournaled_before = fbw_has_unjournaled_effect();
+        match unsafe {
+            pyre_interpreter::baseobjspace::get_and_call_function(
+                fwd,
+                concrete_lhs,
+                w_class_l,
+                &[concrete_rhs],
+            )
+        } {
+            Ok(result)
+                if pyre_interpreter::baseobjspace::is_w(
+                    result,
+                    pyre_object::special::w_not_implemented(),
+                ) => {}
+            Ok(_) => {
+                decline!(format_args!(
+                    "{}.{forward_dunder} produced a value for these operand types",
+                    unsafe { pyre_object::typeobject::w_type_get_name(w_class_l) }
+                ));
+            }
+            Err(_) => {
+                decline!(format_args!(
+                    "{}.{forward_dunder} raised for these operand types",
+                    unsafe { pyre_object::typeobject::w_type_get_name(w_class_l) }
+                ));
+            }
+        }
+        if fbw_executed_effect_count() != effects_before
+            || unjournaled_before
+            || fbw_has_unjournaled_effect()
+        {
+            decline!(format_args!(
+                "{}.{forward_dunder} applied an effect before answering NotImplemented",
+                unsafe { pyre_object::typeobject::w_type_get_name(w_class_l) }
+            ));
+        }
+    }
+    try_walker_inline_user_binop_dunder(
+        ctx,
+        op,
+        code,
+        r_args,
+        call_descr,
+        dst,
+        dunder,
+        method,
+        w_code,
+        nparams,
+        has_closure,
+        rhs,
+        concrete_rhs,
+        w_typ_r,
+        version_tag_r,
+        lhs,
+        concrete_lhs,
+        w_class_l,
+    )
+}
+
+/// Shared descent for a resolved Python binop dunder. `receiver` is `self`;
+/// `other` is the remaining operand. The class/version-tag guard pins the
+/// receiver type; the other-operand guard pins the remaining operand's type.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_user_binop_dunder<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dunder: &'static str,
+    method: pyre_object::PyObjectRef,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    receiver: OpRef,
+    concrete_receiver: pyre_object::PyObjectRef,
+    w_class: pyre_object::PyObjectRef,
+    version_tag: u64,
+    other: OpRef,
+    concrete_other: pyre_object::PyObjectRef,
+    w_typ_other: pyre_object::PyObjectRef,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[binop-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
     // The two operands bind the first two parameters.  A longer signature is
     // not itself unbindable: `Function.funccall_valuestack` fills every
     // parameter the call leaves unbound from `defs_w`, and the
@@ -12143,8 +12421,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     let arg_concretes = vec![
         ConcreteValue::Ref(method),
         ConcreteValue::Null,
-        ConcreteValue::Ref(concrete_lhs),
-        ConcreteValue::Ref(concrete_rhs),
+        ConcreteValue::Ref(concrete_receiver),
+        ConcreteValue::Ref(concrete_other),
     ];
     // Rewind point for the `NotImplemented` arm below.  Nothing above this
     // line records IR or touches the heap cache.
@@ -12176,18 +12454,18 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         method_const,
         method,
         arg_concretes,
-        vec![lhs, rhs],
+        vec![receiver, other],
         vec![
-            ConcreteValue::Ref(concrete_lhs),
-            ConcreteValue::Ref(concrete_rhs),
+            ConcreteValue::Ref(concrete_receiver),
+            ConcreteValue::Ref(concrete_other),
         ],
         true,
         None,
         w_code,
         nparams,
         has_closure,
-        Some((lhs, concrete_lhs, w_class, version_tag)),
-        Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
+        Some((receiver, concrete_receiver, w_class, version_tag)),
+        Some((other, concrete_other, w_typ_other)),
         // `entry_is_call_boundary`.  What decides it is whether the abort
         // rewind can name this entry, not whether the entry is spelled CALL,
         // and it can once `latch_abort_call_resume` sources the operand image

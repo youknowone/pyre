@@ -42,20 +42,19 @@ use crate::x86::cpu_ext::X86CpuExt as ArchCpuExt;
 /// EXISTING-ADAPTATION — serializable descriptors), so a process-wide
 /// `token_number -> DynasmCaTarget` index is required.
 ///
-/// Each entry retains the callee's `Arc<CompiledLoopToken>` so
+/// Each entry retains a `Weak` to the callee's `CompiledLoopToken` so
 /// `handle_call_assembler` (rewrite.py) can sample
-/// `_ll_initial_locs` and `frame_info` for the
-/// `call_assembler_callee_locs` callback. The Arc is the compiled token's own
-/// `JitCellToken.compiled_loop_token`, kept alive here so GC-rewrite metadata
-/// remains available for compiled callers.
+/// `_ll_initial_locs` and `frame_info`. The strong owner is
+/// `JitCellToken.compiled_loop_token` / `alive_loops`; a strong Arc
+/// here would keep the CLT past `CompiledLoopToken.__del__`.
 struct DynasmCaTarget {
     /// `_ll_function_addr` per `x86/assembler.py:599`, retained for
     /// redirect bookkeeping and diagnostics. Dynasm address resolution now
     /// reads the descr-carried token directly.
     code_addr: usize,
-    /// `model.py` `CompiledLoopToken` — Arc-shared with the
-    /// owning `JitCellToken` once the real target registers.
-    compiled_loop_token: Arc<majit_backend::CompiledLoopToken>,
+    /// `model.py` `CompiledLoopToken` — Weak to the owning
+    /// `JitCellToken.compiled_loop_token`.
+    compiled_loop_token: std::sync::Weak<majit_backend::CompiledLoopToken>,
     /// `pyjitpl.py:3629` `outermost_jitdriver_sd.index_of_virtualizable`.
     /// Captured from `JitCellToken.virtualizable_arg_index` when the compiled
     /// target registers.
@@ -77,6 +76,12 @@ thread_local! {
         RefCell::new(IndexMap::new());
 }
 
+fn unregister_dynasm_ca_target(number: u64) {
+    let _ = CALL_ASSEMBLER_TARGETS.try_with(|cell| {
+        cell.borrow_mut().swap_remove(&number);
+    });
+}
+
 /// `rewrite.py` `handle_call_assembler` per-callee metadata
 /// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
 /// Mirrors `majit-backend-cranelift::compiler.rs`.
@@ -86,7 +91,7 @@ pub(crate) fn lookup_call_assembler_callee_locs(
     CALL_ASSEMBLER_TARGETS.with(|cell| {
         let guard = cell.borrow();
         let target = guard.get(&token_number)?;
-        let clt = &target.compiled_loop_token;
+        let clt = target.compiled_loop_token.upgrade()?;
         // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
         // pinned, matching cranelift's `compiler.rs` pattern.
         let frame_info_ptr = {
@@ -2404,18 +2409,20 @@ impl DynasmBackend {
             match guard.get_mut(&token_number) {
                 Some(existing) => {
                     existing.code_addr = code_addr;
-                    // Preserve the registered CLT Arc when this token number
-                    // is re-registered, so metadata pointers already baked
-                    // into callers remain stable.
-                    token.set_compiled_loop_token(Some(Arc::clone(&existing.compiled_loop_token)));
+                    // Re-register keeps the token's own CLT; a Weak
+                    // here must not resurrect a dropped token.
+                    if let Some(clt) = existing.compiled_loop_token.upgrade() {
+                        token.set_compiled_loop_token(Some(clt));
+                    }
                 }
                 None => {
                     let clt = token.compiled_loop_token_expect();
+                    clt.set_ca_unregister(unregister_dynasm_ca_target);
                     guard.insert(
                         token_number,
                         DynasmCaTarget {
                             code_addr,
-                            compiled_loop_token: clt,
+                            compiled_loop_token: Arc::downgrade(&clt),
                             index_of_virtualizable,
                         },
                     );
@@ -3349,9 +3356,7 @@ impl Backend for DynasmBackend {
     /// fail-descr cells it pins — would live for the entire process
     /// lifetime.  Drop the entry so the Arc chain unwinds.
     fn free_loop(&mut self, token: &JitCellToken) {
-        CALL_ASSEMBLER_TARGETS.with(|cell| {
-            cell.borrow_mut().swap_remove(&token.number);
-        });
+        unregister_dynasm_ca_target(token.number);
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {

@@ -647,14 +647,12 @@ struct RegisteredLoopTarget {
     /// has no virtualizable.
     index_of_virtualizable: i32,
     /// `rpython/jit/backend/model.py` `CompiledLoopToken` — the
-    /// per-loop metadata RPython `handle_call_assembler` (rewrite.py-
-    /// 695) reads as `loop_token.compiled_loop_token`. Sources
-    /// `_ll_initial_locs` (`regalloc.py:861-871`) and `frame_info`
-    /// (`jitframe.py:30-40`) for `call_assembler_callee_locs`. Arc
-    /// continuity across pending → real registration is preserved by
-    /// adopting the pending Arc onto `token.compiled_loop_token` in
-    /// `register_call_assembler_target`.
-    compiled_loop_token: Arc<CompiledLoopToken>,
+    /// per-loop metadata RPython `handle_call_assembler` reads as
+    /// `loop_token.compiled_loop_token`. Sources `_ll_initial_locs`
+    /// (`regalloc.py` `_set_initial_bindings`) and `frame_info`
+    /// (`jitframe.py`) for `call_assembler_callee_locs`. Weak so
+    /// this table cannot keep the CLT past `CompiledLoopToken.__del__`.
+    compiled_loop_token: std::sync::Weak<CompiledLoopToken>,
     /// `compile.py setattr(cpu, name, descr)` — heap-stable clone of
     /// the owning `CraneliftBackend`'s per-cpu descr attachments.  Kept
     /// here so `execute_registered_loop_target` (a free fn reached from
@@ -2801,11 +2799,13 @@ fn register_call_assembler_target(
     // stable. `CompiledLoopToken::new` zero-initialises the fields we're about
     // to populate, so reusing the token's current CLT is safe.
     if let Some(existing_clt) = with_call_assembler_registry(|m| {
-        m.get(&token.number).map(|t| t.compiled_loop_token.clone())
+        m.get(&token.number)
+            .and_then(|t| t.compiled_loop_token.upgrade())
     }) {
         token.set_compiled_loop_token(Some(existing_clt));
     }
     let clt = token.compiled_loop_token_expect();
+    clt.set_ca_unregister(unregister_call_assembler_target);
     // `regalloc.py` `_set_initial_bindings`: contiguous layout
     // → `locs[i] = i * SIZEOFSIGNED`.
     *clt._ll_initial_locs.lock() = (0..compiled.num_inputs).map(|i| (i as i32) * 8).collect();
@@ -2832,7 +2832,7 @@ fn register_call_assembler_target(
             .virtualizable_arg_index()
             .map(|i| i as i32)
             .unwrap_or(-1),
-        compiled_loop_token: clt,
+        compiled_loop_token: Arc::downgrade(&clt),
         cpu_attachments: Arc::clone(&compiled.cpu_attachments),
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
@@ -9333,8 +9333,8 @@ impl CraneliftBackend {
             // both sourced directly from the CLT Arc on the target
             // (model.py:292-338).
             call_assembler_callee_locs: Some(Box::new(|token_number| {
-                lookup_call_assembler_target(token_number).map(|t| {
-                    let clt = &t.compiled_loop_token;
+                lookup_call_assembler_target(token_number).and_then(|t| {
+                    let clt = t.compiled_loop_token.upgrade()?;
                     // JitFrameInfo is #[repr(C)] so `&JitFrameInfo as *const _`
                     // points at [jfi_frame_depth, jfi_frame_size] (Signed
                     // words); the generated CALL_ASSEMBLER code loads those
@@ -9347,14 +9347,14 @@ impl CraneliftBackend {
                         &*guard as *const majit_backend::JitFrameInfo as usize
                     };
                     let ll_initial_locs = clt._ll_initial_locs.lock().clone();
-                    majit_gc::rewrite::CallAssemblerCalleeLocs {
+                    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
                         _ll_initial_locs: ll_initial_locs,
                         frame_depth: t.max_output_slots + t.num_ref_roots,
                         frame_info_ptr,
                         // pyjitpl.py:3605 — outermost_jitdriver_sd.index_of_virtualizable,
                         // propagated from JitCellToken at registration time.
                         index_of_virtualizable: t.index_of_virtualizable,
-                    }
+                    })
                 })
             })),
         }
