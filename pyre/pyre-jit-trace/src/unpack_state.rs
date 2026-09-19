@@ -239,12 +239,14 @@ mod tests {
         // below therefore exercises the global fallback in `descr_at`.
         assert!(jitcode.exec.descrs.is_empty());
 
-        // jd1's first inline-call (`inline_call_r_r/dR>r`) names its callee in
-        // the leading 2-byte `d` operand; `descr_at` must map it to a JitCode
-        // through the global pool.
+        // jd1's first inline-call names its callee in the leading 2-byte `d`
+        // operand; `descr_at` must map it to a JitCode through the global
+        // pool. Every `inline_call_*` spelling puts `d` first (`dR>r`,
+        // `dIR`, `dIRF>f`, ...), so the family is what this reads -- the body
+        // currently inlines `drain_append_at` as `inline_call_ir_v/dIR`.
         let inline = crate::jitcode_runtime::decoded_ops(&canonical.code)
-            .find(|op| op.opname == "inline_call_r_r")
-            .expect("jd1 body has an inline_call_r_r");
+            .find(|op| op.opname.starts_with("inline_call_"))
+            .expect("jd1 body has an inline call");
         let callee_idx = canonical.code[inline.pc + 1] as usize
             | ((canonical.code[inline.pc + 2] as usize) << 8);
         assert!(
