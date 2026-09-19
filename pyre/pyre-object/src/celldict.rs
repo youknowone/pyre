@@ -305,10 +305,10 @@ pub unsafe fn write_cell(w_cell: Option<PyObjectRef>, w_value: PyObjectRef) -> O
     debug_assert!(!w_value.is_null(), "write_cell: null value");
     match classify_cell_write(w_cell, w_value) {
         CellWrite::InPlaceObject(cell) => {
-            // An in-place int store writes no `PyObjectRef` and needs no
-            // barrier.
-            (*(cell as *mut ObjectMutableCell)).w_value = w_value;
+            // Barrier before the store, the `remember_young_pointer` order.
+            // An in-place int store writes no `PyObjectRef` and needs none.
             object_mutable_cell_write_barrier(cell as *mut u8);
+            (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
         CellWrite::InPlaceInt(cell, intvalue) => {
