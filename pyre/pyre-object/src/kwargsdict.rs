@@ -48,6 +48,19 @@ use crate::pyobject::PyObjectRef;
 ///   auto-promotes to `UnicodeDictStrategy` to avoid degenerate O(n).
 pub struct KwargsDictStrategy;
 
+/// `ll_getitem_fast` on the parallel `keys_w` / `values_w` lists
+/// (`kwargsdict.py` `keys_w[i]` / `values_w[i]`).
+fn kwargs_at(items: &[PyObjectRef], i: usize) -> PyObjectRef {
+    debug_assert!(i < items.len());
+    unsafe { *items.as_ptr().add(i) }
+}
+
+/// `ll_setitem_fast` on `values_w[i]`.
+fn kwargs_at_mut(items: &mut [PyObjectRef], i: usize) -> &mut PyObjectRef {
+    debug_assert!(i < items.len());
+    unsafe { &mut *items.as_mut_ptr().add(i) }
+}
+
 /// `pypy/objspace/std/kwargsdict.py KwargsDictStrategy`
 /// singleton — matches PyPy's `space.fromcache(KwargsDictStrategy)`.
 pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
@@ -192,8 +205,8 @@ impl DictStrategy for KwargsDictStrategy {
         if Self::is_correct_type(w_key) {
             let (keys_w, values_w) = kwargs_storage(w_dict);
             for i in 0..keys_w.len() {
-                if crate::dictmultiobject::dict_keys_equal(keys_w[i], w_key) {
-                    return Some(values_w[i]);
+                if crate::dictmultiobject::dict_keys_equal(kwargs_at(keys_w, i), w_key) {
+                    return Some(kwargs_at(values_w, i));
                 }
             }
             return None;
@@ -232,8 +245,8 @@ impl DictStrategy for KwargsDictStrategy {
             let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
             let storage = &mut *(dict.dstorage as *mut (Vec<PyObjectRef>, Vec<PyObjectRef>));
             for i in 0..storage.0.len() {
-                if crate::dictmultiobject::dict_keys_equal(storage.0[i], w_key) {
-                    storage.1[i] = w_value;
+                if crate::dictmultiobject::dict_keys_equal(kwargs_at(&storage.0, i), w_key) {
+                    *kwargs_at_mut(&mut storage.1, i) = w_value;
                     crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
                     return;
                 }
@@ -282,7 +295,7 @@ impl DictStrategy for KwargsDictStrategy {
         let (keys_w, values_w) = kwargs_storage(w_dict);
         let mut items = Vec::new();
         for i in 0..keys_w.len() {
-            items.push((keys_w[i], values_w[i]));
+            items.push((kwargs_at(keys_w, i), kwargs_at(values_w, i)));
         }
         items
     }
@@ -297,13 +310,22 @@ impl DictStrategy for KwargsDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         let (keys_w, values_w) = kwargs_storage(w_dict);
-        keys_w.get(index).copied().zip(values_w.get(index).copied())
+        if index < keys_w.len() && index < values_w.len() {
+            Some((kwargs_at(keys_w, index), kwargs_at(values_w, index)))
+        } else {
+            None
+        }
     }
 
     /// Value-iterator twin of [`Self::nth_item`], matching
     /// `kwargsdict.py itervalues`' direct values-list cursor.
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-        kwargs_storage(w_dict).1.get(index).copied()
+        let values_w = &kwargs_storage(w_dict).1;
+        if index < values_w.len() {
+            Some(kwargs_at(values_w, index))
+        } else {
+            None
+        }
     }
 
     /// `kwargsdict.py popitem` — pop from both arrays in lock-step.
@@ -420,7 +442,7 @@ mod tests {
             let (keys_w, values_w) = kwargs_storage(w_dict);
             assert_eq!(items.len(), keys_w.len());
             for i in 0..keys_w.len() {
-                assert_eq!(items[i], (keys_w[i], values_w[i]));
+                assert_eq!(items[i], (kwargs_at(keys_w, i), kwargs_at(values_w, i)));
             }
             items.reverse();
             let fresh = KWARGS_DICT_STRATEGY.items(w_dict);

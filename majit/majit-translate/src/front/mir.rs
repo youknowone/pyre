@@ -344,6 +344,26 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     if link_scalars {
         link_transparent_scalar_types(llbcs);
     }
+    // Defining-crate NamedConst values have to be harvested while that
+    // crate's artefact is loaded: a foreign `const` is `Opaque` in the
+    // caller's LLBC.  The production frontend reloads one crate at a
+    // time (`build_semantic_program_from_prelinked_llbc`), so a
+    // single-artefact call MERGES into the invocation table and later
+    // crates see earlier ones — production load order puts
+    // `pyre-object` before `pyre-interpreter`.  A multi-artefact call
+    // has every tree live and replaces the table for the duration.
+    let _named_const_folds = if llbcs.len() > 1 {
+        let mut folds = std::collections::HashMap::new();
+        for llbc in llbcs {
+            folds.extend(harvest_named_const_folds(llbc));
+        }
+        Some(push_named_const_folds(folds))
+    } else {
+        for llbc in llbcs {
+            merge_named_const_folds(llbc.crate_name(), harvest_named_const_folds(llbc));
+        }
+        None
+    };
     let mut merged: Option<crate::front::semantic::SemanticProgram> = None;
     // Dedup key combines `self_ty_root` (the impl owner, when known),
     // `module_path`, and `name`.  Without `self_ty_root`, two distinct
@@ -8101,76 +8121,24 @@ impl<'a> Lowering<'a> {
     /// `NamedConst`), absent initializers, or any non-trivial init body
     /// (a computed const keeps the accessor path so it is not
     /// mis-evaluated here).
+    ///
+    /// A foreign `const` is recorded `Opaque` in the caller's LLBC, so
+    /// this also resolves the same path from the defining crate's harvest
+    /// (seeded while that crate's artefact is loaded).  Module constants
+    /// are live host values, independent of which crate reads them.
     fn fold_named_const_global(&self, def_id: u64) -> Option<OpKind> {
-        let gd = self.llbc.global_by_id(def_id)?;
-        if gd
-            .rest
-            .get("global_kind")
-            .and_then(serde_json::Value::as_str)
-            != Some("NamedConst")
-        {
-            return None;
-        }
-        let init_id = gd.rest.get("init")?.as_u64()?;
-        let init = self.llbc.fn_by_id(init_id)?;
-        let body = init.unstructured()?;
-        // The initializer must be exactly one literal assignment to the
-        // return local (`_0 = const <lit>`); anything else (arithmetic,
-        // calls, multiple assigns) is a computed const left to the
-        // accessor path.
-        let mut found: Option<&serde_json::Value> = None;
-        for blk in &body.body {
-            for st in &blk.statements {
-                let Some(assign) = st.kind.get("Assign").and_then(|a| a.as_array()) else {
-                    continue;
-                };
-                let is_local0 = assign
-                    .first()
-                    .and_then(|p| p.get("kind"))
-                    .and_then(|k| k.get("Local"))
-                    .and_then(serde_json::Value::as_u64)
-                    == Some(0);
-                let lit = assign
-                    .get(1)
-                    .and_then(|rv| rv.get("Use"))
-                    .and_then(|u| u.get("Const"))
-                    .and_then(|c| c.get("kind"))
-                    .and_then(|k| k.get("Literal"));
-                match lit {
-                    Some(l) if is_local0 => {
-                        if found.is_some() {
-                            return None;
-                        }
-                        found = Some(l);
-                    }
-                    // A non-literal write to _0 (computed const) — bail.
-                    _ if is_local0 => return None,
-                    _ => {}
-                }
+        fold_named_const_on_llbc(self.llbc, def_id).or_else(|| {
+            let gd = self.llbc.global_by_id(def_id)?;
+            if gd
+                .rest
+                .get("global_kind")
+                .and_then(serde_json::Value::as_str)
+                != Some("NamedConst")
+            {
+                return None;
             }
-        }
-        match decode_literal(found?).ok()? {
-            DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
-            DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
-            DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
-            DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
-            DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
-            DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
-            // A `const NAME: &str = "..."` global reads as a named-const
-            // fold, not a static address; without this arm the read falls
-            // through to a residual `FunctionPath` Call on the const path
-            // (`ATTR_W_OBJ_WEAK` etc.) the registry cannot bind.  Emit the
-            // same synthetic `__str_const` the `build_rvalue` const path
-            // uses (result kind `Ref` — a `&str` literal is `Ptr(STR)`).
-            DecodedConst::Str(s) => Some(OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["__str_const".to_string(), s],
-                },
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Ref(None),
-            }),
-            _ => None,
-        }
+            named_const_fold_for_path(&gd.item_meta.name_path())
+        })
     }
 
     /// Fold a `NamedConst` global whose initializer builds a fixed-size
@@ -27143,6 +27111,197 @@ enum ConstLit {
     CheckedUInt(u64, bool),
 }
 
+thread_local! {
+    static NAMED_CONST_FOLDS: std::cell::RefCell<
+        std::collections::HashMap<String, OpKind>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Crates whose folds the table already holds, so a repeat can be
+    /// told from the next crate of the same invocation.
+    static NAMED_CONST_CRATES: std::cell::RefCell<
+        std::collections::HashSet<String>,
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+struct NamedConstFoldsGuard {
+    previous: std::collections::HashMap<String, OpKind>,
+    previous_crates: std::collections::HashSet<String>,
+}
+
+impl NamedConstFoldsGuard {
+    fn push(folds: std::collections::HashMap<String, OpKind>) -> Self {
+        let previous =
+            NAMED_CONST_FOLDS.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), folds));
+        let previous_crates =
+            NAMED_CONST_CRATES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        Self {
+            previous,
+            previous_crates,
+        }
+    }
+}
+
+impl Drop for NamedConstFoldsGuard {
+    fn drop(&mut self) {
+        NAMED_CONST_FOLDS.with(|slot| {
+            *slot.borrow_mut() = std::mem::take(&mut self.previous);
+        });
+        NAMED_CONST_CRATES.with(|slot| {
+            *slot.borrow_mut() = std::mem::take(&mut self.previous_crates);
+        });
+    }
+}
+
+/// Install `folds` as this invocation's defining-crate NamedConst table
+/// until the returned guard drops.
+///
+/// The production frontend parses one crate at a time (holding every
+/// tree with the merged program blew a 12 GB container), so a
+/// cross-crate read sees only the caller's `Opaque` initializer.  This
+/// table is the defining crate's already-folded value, seeded per
+/// pipeline invocation the same way [`crate::local_crates`] is: thread-
+/// local because one translate run stays on one thread.
+pub(crate) fn push_named_const_folds(
+    folds: std::collections::HashMap<String, OpKind>,
+) -> impl Drop {
+    NamedConstFoldsGuard::push(folds)
+}
+
+fn named_const_fold_for_path(path: &str) -> Option<OpKind> {
+    NAMED_CONST_FOLDS.with(|slot| slot.borrow().get(path).cloned())
+}
+
+/// Add one crate's folds to the table, restarting it when `crate_name`
+/// repeats.
+///
+/// One frontend invocation loads each artefact once, so a crate that is
+/// harvested a second time means a new invocation began.  Without the
+/// restart the table would keep the previous invocation's entries, and a
+/// later partial build could fold an Opaque foreign declaration with a
+/// value harvested from unrelated input.
+fn merge_named_const_folds(crate_name: &str, folds: std::collections::HashMap<String, OpKind>) {
+    let restart = NAMED_CONST_CRATES.with(|slot| {
+        let mut seen = slot.borrow_mut();
+        if seen.insert(crate_name.to_string()) {
+            return false;
+        }
+        seen.clear();
+        seen.insert(crate_name.to_string());
+        true
+    });
+    NAMED_CONST_FOLDS.with(|slot| {
+        let mut table = slot.borrow_mut();
+        if restart {
+            table.clear();
+        }
+        table.extend(folds);
+    });
+}
+
+/// Fold every local `NamedConst` whose initializer this LLBC actually
+/// carries (a literal assign, or a computed body [`const_eval_init_body`]
+/// can evaluate).  Foreign decls are skipped: Charon left their init
+/// `Opaque`, and the defining crate's harvest is the one that binds
+/// the path.
+pub(crate) fn harvest_named_const_folds(llbc: &Llbc) -> std::collections::HashMap<String, OpKind> {
+    let mut out = std::collections::HashMap::new();
+    for gd in llbc.iter_global_decls() {
+        if !gd.item_meta.is_local {
+            continue;
+        }
+        if gd
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            continue;
+        }
+        let Some(op) = fold_named_const_on_llbc(llbc, gd.def_id).or_else(|| {
+            let init_id = gd.rest.get("init")?.as_u64()?;
+            const_eval_init_body(llbc, &llbc.fn_by_id(init_id)?.unstructured()?)
+        }) else {
+            continue;
+        };
+        out.insert(gd.item_meta.name_path(), op);
+    }
+    out
+}
+
+/// Fold a `NamedConst` whose initializer is the trivial
+/// `_0 = const <lit>; return` shape in `llbc`.  `None` when the
+/// initializer is missing, `Opaque`, or any non-literal assign.
+fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
+    let gd = llbc.global_by_id(def_id)?;
+    if gd
+        .rest
+        .get("global_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("NamedConst")
+    {
+        return None;
+    }
+    let init_id = gd.rest.get("init")?.as_u64()?;
+    let init = llbc.fn_by_id(init_id)?;
+    let body = init.unstructured()?;
+    // The initializer must be exactly one literal assignment to the
+    // return local (`_0 = const <lit>`); anything else (arithmetic,
+    // calls, multiple assigns) is a computed const left to the
+    // accessor path.
+    let mut found: Option<&serde_json::Value> = None;
+    for blk in &body.body {
+        for st in &blk.statements {
+            let Some(assign) = st.kind.get("Assign").and_then(|a| a.as_array()) else {
+                continue;
+            };
+            let is_local0 = assign
+                .first()
+                .and_then(|p| p.get("kind"))
+                .and_then(|k| k.get("Local"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(0);
+            let lit = assign
+                .get(1)
+                .and_then(|rv| rv.get("Use"))
+                .and_then(|u| u.get("Const"))
+                .and_then(|c| c.get("kind"))
+                .and_then(|k| k.get("Literal"));
+            match lit {
+                Some(l) if is_local0 => {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(l);
+                }
+                // A non-literal write to _0 (computed const) — bail.
+                _ if is_local0 => return None,
+                _ => {}
+            }
+        }
+    }
+    match decode_literal(found?).ok()? {
+        DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+        DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
+        DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
+        DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
+        DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
+        DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+        // A `const NAME: &str = "..."` global reads as a named-const
+        // fold, not a static address; without this arm the read falls
+        // through to a residual `FunctionPath` Call on the const path
+        // (`ATTR_W_OBJ_WEAK` etc.) the registry cannot bind.  Emit the
+        // same synthetic `__str_const` the `build_rvalue` const path
+        // uses (result kind `Ref` — a `&str` literal is `Ptr(STR)`).
+        DecodedConst::Str(s) => Some(OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), s],
+            },
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(None),
+        }),
+        _ => None,
+    }
+}
+
 /// Evaluate a global's single-value init body over literal locals.
 ///
 /// Upstream needs no analog: RPython constants are live host values at
@@ -30913,6 +31072,48 @@ mod tests {
         for p in ["f32", "()", ""] {
             assert!(!type_arg_splits_per_instantiation(p), "{p} must not split");
         }
+    }
+
+    #[test]
+    fn named_const_harvest_scopes_defining_crate_folds() {
+        use super::OpKind;
+        let mut folds = std::collections::HashMap::new();
+        folds.insert(
+            "pyre_object::intobject::W_INT_USER_GC_TYPE_ID".to_string(),
+            OpKind::ConstUInt(185),
+        );
+        let _guard = super::push_named_const_folds(folds);
+        assert!(matches!(
+            super::named_const_fold_for_path("pyre_object::intobject::W_INT_USER_GC_TYPE_ID"),
+            Some(OpKind::ConstUInt(185))
+        ));
+        assert!(super::named_const_fold_for_path("missing::CONST").is_none());
+        drop(_guard);
+        assert!(
+            super::named_const_fold_for_path("pyre_object::intobject::W_INT_USER_GC_TYPE_ID")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn named_const_merge_restarts_when_a_crate_repeats() {
+        use super::OpKind;
+        let one = |path: &str, v: u64| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(path.to_string(), OpKind::ConstUInt(v));
+            m
+        };
+        // A fresh table for this test, restored when the guard drops.
+        let _guard = super::push_named_const_folds(std::collections::HashMap::new());
+        super::merge_named_const_folds("pyre_object", one("pyre_object::A", 1));
+        super::merge_named_const_folds("pyre_interpreter", one("pyre_interpreter::B", 2));
+        assert!(super::named_const_fold_for_path("pyre_object::A").is_some());
+        assert!(super::named_const_fold_for_path("pyre_interpreter::B").is_some());
+        // `pyre_object` again means a second invocation started: the
+        // earlier invocation's entries must not survive into it.
+        super::merge_named_const_folds("pyre_object", one("pyre_object::A", 1));
+        assert!(super::named_const_fold_for_path("pyre_object::A").is_some());
+        assert!(super::named_const_fold_for_path("pyre_interpreter::B").is_none());
     }
 
     #[test]

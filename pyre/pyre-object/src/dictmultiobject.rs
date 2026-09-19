@@ -5102,10 +5102,20 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
         object_dict_storage_gc_type_id(),
     );
     let new_map = &mut *new_storage;
-    for (i, &hash) in hashes.iter().enumerate() {
+    // `ll_getitem_fast` on the hash/pair arrays, not `Enumerate`.
+    let hash_p = hashes.as_ptr();
+    let mut i = 0usize;
+    while i < hashes.len() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(ObjectKey { hash, obj }, value);
+        new_map.insert(
+            ObjectKey {
+                hash: *hash_p.add(i),
+                obj,
+            },
+            value,
+        );
+        i += 1;
     }
     let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
     dict.dstorage = new_storage as *mut u8;
@@ -5288,10 +5298,19 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
         object_dict_storage_gc_type_id(),
     );
     let new_map = &mut *new_storage;
-    for (i, &hash) in hashes.iter().enumerate() {
+    let hash_p = hashes.as_ptr();
+    let mut i = 0usize;
+    while i < hashes.len() {
         let obj = roots.get(pairs_base + 2 * i);
         let value = roots.get(pairs_base + 2 * i + 1);
-        new_map.insert(ObjectKey { hash, obj }, value);
+        new_map.insert(
+            ObjectKey {
+                hash: *hash_p.add(i),
+                obj,
+            },
+            value,
+        );
+        i += 1;
     }
     let dict = &mut *(roots.get(dict_slot) as *mut W_DictObject);
     dict.dstorage = new_storage as *mut u8;
@@ -5486,11 +5505,13 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         for k in strategy.getiterkeys(storage) {
             let _ = roots.pin_root(crate::celldict::_wrapkey(k));
         }
-        strategy
-            .getitervalues(storage)
-            .enumerate()
-            .map(|(i, v)| (roots.get(keys_base + i), v))
-            .collect()
+        let mut items = Vec::new();
+        let mut i = 0usize;
+        for v in strategy.getitervalues(storage) {
+            items.push((roots.get(keys_base + i), v));
+            i += 1;
+        }
+        items
     }
 }
 

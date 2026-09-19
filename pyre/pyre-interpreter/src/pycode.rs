@@ -1601,10 +1601,14 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
     }
     let published = publish_code_slot_store_rooting(obj, &[constants]);
     let constants = published.get(0);
-    for (index, slot) in slots.iter().take(count).enumerate() {
+    // `ll_getitem_fast` on the const-slot table, not `Enumerate`.
+    let slot_p = slots.as_ptr();
+    let mut index = 0usize;
+    while index < count {
         if let Some(value) = unsafe { pyre_object::w_tuple_getitem(constants, index as i64) } {
-            slot.store(value, std::sync::atomic::Ordering::Release);
+            unsafe { &*slot_p.add(index) }.store(value, std::sync::atomic::Ordering::Release);
         }
+        index += 1;
     }
 }
 
@@ -1786,15 +1790,21 @@ fn constants_tuple(obj: PyObjectRef, code: &crate::CodeObject) -> PyObjectRef {
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     let mut constants = pyre_object::gc_roots::RootedItems::new();
-    for (index, constant) in crate::pyframe::code_constants(code).iter().enumerate() {
+    // `range` + `ll_getitem_fast`, not `Enumerate`.  `obj` is pinned:
+    // `w_code_const` / `pyobject_from_constant` may collect.
+    let src = crate::pyframe::code_constants(code);
+    let src_p = src.as_ptr();
+    let mut index = 0usize;
+    while index < src.len() {
         let value =
             unsafe { w_code_const(pyre_object::gc_roots::shadow_stack_get(obj_slot), index) };
         let value = if value.is_null() {
-            crate::pyframe::pyobject_from_constant(constant)
+            crate::pyframe::pyobject_from_constant(unsafe { &*src_p.add(index) })
         } else {
             value
         };
         constants.push(value);
+        index += 1;
     }
     w_tuple_new(constants.take())
 }
@@ -2180,14 +2190,18 @@ pub unsafe fn code_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
             add_obj(&mut result, w_str_new_managed(name))?;
         }
     }
-    for (index, constant) in crate::pyframe::code_constants(code).iter().enumerate() {
+    let src = crate::pyframe::code_constants(code);
+    let src_p = src.as_ptr();
+    let mut index = 0usize;
+    while index < src.len() {
         let w_constant = unsafe { w_code_const(obj, index) };
         let w_constant = if w_constant.is_null() {
-            crate::pyframe::pyobject_from_constant(constant)
+            crate::pyframe::pyobject_from_constant(unsafe { &*src_p.add(index) })
         } else {
             w_constant
         };
         add_obj(&mut result, w_constant)?;
+        index += 1;
     }
     Ok(if result == -1 { -2 } else { result })
 }

@@ -263,13 +263,17 @@ pub mod frame_locals_proxy {
                         )?,
                 )
             };
-            for (index, name) in code.varnames.iter().enumerate() {
+            // `range` + `ll_getitem_fast`, not `Enumerate`.
+            let mut index = 0usize;
+            for name in code.varnames.iter() {
                 if hidden_local(code, index) {
+                    index += 1;
                     continue;
                 }
                 if matches(name.as_ref())? {
                     return Ok(Some(index));
                 }
+                index += 1;
             }
             let mut index = code.varnames.len();
             for name in code.cellvars.iter() {
@@ -2124,8 +2128,12 @@ impl PyFrame {
         let src_vals = locals_w!(src).as_slice().to_vec();
         let dst = locals_w_mut!(self);
         let n = src_vals.len().min(dst.as_slice().len());
+        let dst_p = dst.items_mut_ptr();
         for (i, &v) in src_vals.iter().take(n).enumerate() {
-            dst[i] = v;
+            // `ll_setitem_fast` on the locals array.
+            unsafe {
+                *dst_p.add(i) = v;
+            }
         }
         remember_frame_locals_array(self.locals_cells_stack_w);
     }
@@ -2265,7 +2273,12 @@ pub struct FrameDebugData {
 impl FrameDebugData {
     /// `pyframe.py FrameDebugData.__init__`: initialize the rare-frame
     /// globals override from the code object's first-seen globals.
-    pub fn new(pycode: *const (), init_lineno: isize) -> Self {
+    ///
+    /// Named `init`, not `new`: Charon spells every inherent impl as
+    /// `<Impl>`, so `FrameDebugData::new` and `PyFrame::new` share
+    /// `pyframe::<Impl>::new` when `self_ty_root` is missing. The
+    /// `__init__` leaf cannot collide with `PyFrame::new`.
+    pub fn init(pycode: *const (), init_lineno: isize) -> Self {
         Self {
             w_globals: if pycode.is_null() {
                 pyre_object::PY_NULL
@@ -2288,7 +2301,7 @@ impl FrameDebugData {
 
 impl Default for FrameDebugData {
     fn default() -> Self {
-        Self::new(std::ptr::null(), -1)
+        Self::init(std::ptr::null(), -1)
     }
 }
 
@@ -3638,7 +3651,7 @@ impl PyFrame {
             } else {
                 std::ptr::null_mut()
             };
-            // Build the payload only after that allocation.  `FrameDebugData::new`
+            // Build the payload only after that allocation.  `FrameDebugData::init`
             // copies the code object's first-seen globals into this stack
             // temporary; a collection inside the allocation forwards the
             // anchored frame and the `PyCode` slot the copy came from, but
@@ -3646,7 +3659,7 @@ impl PyFrame {
             // publish a pre-collection address into the new block.  Only an
             // atomic field read separates the allocation from the write below,
             // so the fresh block crosses no safepoint unrooted.
-            let value = FrameDebugData::new(unsafe { (*frame_anchor.live()).pycode }, init_lineno);
+            let value = FrameDebugData::init(unsafe { (*frame_anchor.live()).pycode }, init_lineno);
             let debugdata = if raw.is_null() {
                 pyre_object::lltype::malloc_raw(value)
             } else {
@@ -4792,7 +4805,8 @@ impl PyFrame {
         let mut i = lst.len();
         while i > 0 {
             i -= 1;
-            self.append_block(lst[i]);
+            // `ll_getitem_fast` on the rebuilt block list.
+            self.append_block(unsafe { *lst.as_ptr().add(i) });
         }
     }
 

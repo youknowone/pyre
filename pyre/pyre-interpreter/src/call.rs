@@ -613,6 +613,23 @@ pub fn unpack_merge_point(greenkey: PyObjectRef, w_iterator: PyObjectRef, items:
     }
 }
 
+/// jd `generatorentry_driver` (`generator.py`): greens=`pycode`,
+/// reds=`gen`, `w_arg`. Called from `send_ex` when `we_are_jitted()`
+/// and `should_not_inline(pycode)`.
+type GenEntryMergeFn = fn(w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef);
+static GENENTRY_MERGE_HOOK: OnceLock<GenEntryMergeFn> = OnceLock::new();
+
+pub fn register_genentry_merge_hook(f: GenEntryMergeFn) {
+    let _ = GENENTRY_MERGE_HOOK.set(f);
+}
+
+#[inline]
+pub fn genentry_merge_point(w_gen: PyObjectRef, w_arg: PyObjectRef, pycode: PyObjectRef) {
+    if let Some(f) = GENENTRY_MERGE_HOOK.get() {
+        f(w_gen, w_arg, pycode);
+    }
+}
+
 /// `warmspot.py rewrite_jit_merge_point`: the original portal graph ends in
 /// `return portal_runner(*args)`. pyre-interpreter cannot import pyre-jit, so
 /// the JIT registers the runner at boot. Without a hook the split portal
@@ -650,10 +667,15 @@ thread_local! {
 pub fn set_last_exec_ctx(ctx: *const crate::PyExecutionContext) {
     LAST_EXEC_CTX.with(|c| {
         let previous = c.replace(ctx);
+        if previous == ctx {
+            return;
+        }
         if previous.is_null() && !ctx.is_null() {
             crate::module::thread::register_execution_context(ctx);
         } else if !previous.is_null() && ctx.is_null() {
             crate::module::thread::unregister_execution_context();
+        } else if !previous.is_null() && !ctx.is_null() {
+            crate::module::thread::replace_execution_context(ctx);
         }
     });
 }
@@ -693,6 +715,52 @@ pub(crate) fn capture_last_exec_ctx_cell() -> *const () {
 /// bootstrap and clears it at teardown, matching PyPy's threadlocals owner.
 pub fn getexecutioncontext() -> *const crate::PyExecutionContext {
     take_last_exec_ctx()
+}
+
+/// Owns the on-demand ExecutionContext created when the threadlocals slot is
+/// empty.  Drop is the thread-exit counterpart of `leave_thread`: it clears
+/// that slot before the allocation is freed, so `EXECUTION_CONTEXTS` cannot
+/// keep a pointer into a dropped `Rc`.
+struct FallbackEcGuard {
+    ec: std::rc::Rc<crate::PyExecutionContext>,
+}
+
+impl Drop for FallbackEcGuard {
+    fn drop(&mut self) {
+        let ptr = std::rc::Rc::as_ptr(&self.ec);
+        // `set_last_exec_ctx` uses `.with` and panics if `LAST_EXEC_CTX` has
+        // already been destroyed; `ForcePlainEvalGuard` uses `try_with` for
+        // the same TLS-destructor window.
+        match LAST_EXEC_CTX.try_with(|c| c.get() == ptr) {
+            Ok(true) => set_last_exec_ctx(std::ptr::null()),
+            Ok(false) => {}
+            Err(_) => crate::module::thread::unregister_execution_context(),
+        }
+    }
+}
+
+/// `baseobjspace.py getexecutioncontext` untranslated path: if the
+/// threadlocals slot is empty, `enter_thread` / `createexecutioncontext`
+/// installs one. Used by `repr_enter` so a missing EC is not treated
+/// as "already in repr" and is not a silent first-enter without a set.
+pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
+    let existing = take_last_exec_ctx();
+    if !existing.is_null() {
+        return existing;
+    }
+    thread_local! {
+        static FALLBACK_EC: std::cell::RefCell<Option<FallbackEcGuard>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    FALLBACK_EC.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let fallback = guard.get_or_insert_with(|| FallbackEcGuard {
+            ec: std::rc::Rc::new(crate::PyExecutionContext::default()),
+        });
+        let ptr = std::rc::Rc::as_ptr(&fallback.ec);
+        set_last_exec_ctx(ptr);
+        ptr
+    })
 }
 
 /// Guard that temporarily forces all nested calls to use the plain

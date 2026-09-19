@@ -102,6 +102,7 @@ pub const W_TUPLE_USER_GC_TYPE_ID: u32 = 187;
 pub const W_TUPLE_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_TupleObjectUser>();
 
 impl crate::lltype::GcType for W_TupleObjectUser {
+    #[inline(always)]
     fn type_id() -> u32 {
         W_TUPLE_USER_GC_TYPE_ID
     }
