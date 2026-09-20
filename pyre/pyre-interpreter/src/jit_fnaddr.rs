@@ -6628,6 +6628,20 @@ mod tests {
         );
     }
 
+    /// `rffi.cast(rffi.CCHARPP, data)[0] = value` is the `raw_write_ptr`
+    /// oopspec. Unregistered it residualizes to a symbolic hash.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_raw_write_ptr() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::module::_cffi_backend::cdataobj::raw_write_ptr as *const ()
+            as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::cdataobj::raw_write_ptr"],
+            expected
+        );
+    }
+
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
     /// codewriter bakes for `PyFrame::pop` — the `pop_value` sub-jitcode
     /// residual the full-body walk must not concretely execute against the
