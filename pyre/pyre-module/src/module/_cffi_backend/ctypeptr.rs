@@ -106,13 +106,9 @@ pub unsafe fn array_convert_from_object(
     {
         let item = item_of(ct)?;
         let length = source.array_length()?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.ptr as *const u8,
-                cdata,
-                (item.size * length) as usize,
-            );
-        }
+        // `ctypearray.py convert_from_object` uses `rffi.c_memcpy`; a
+        // non-constant length takes `_raw_memcopy`'s opaque residual.
+        misc::raw_memcopy(source.ptr, cdata as usize, (item.size * length) as usize);
         return Ok(());
     }
     unsafe { convert_array_from_object(ct, cdata, w_ob) }
@@ -167,7 +163,8 @@ pub unsafe fn convert_array_from_object(
             ));
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), cdata, s.len());
+            // `copy_string_to_raw` — residual memcpy of the initializer.
+            misc::raw_memcopy(s.as_ptr() as usize, cdata as usize, s.len());
             if n != ct.length {
                 cdata.offset(n as isize).write(0);
             }
@@ -597,7 +594,10 @@ unsafe fn accept_movable_str(
     }
     let buf = cdataobj::raw_alloc(value.len() as i64 + 1, false)?;
     unsafe {
-        std::ptr::copy_nonoverlapping(value.as_ptr(), buf as *mut u8, value.len());
+        // `misc.py write_string_as_charp` is `@jit.dont_look_inside`;
+        // the copy itself is `_raw_memcopy` because the collector may
+        // move the bytes and there is no non-moving pin.
+        misc::raw_memcopy(value.as_ptr() as usize, buf, value.len());
         (buf as *mut u8).add(value.len()).write(0);
         cdata.cast::<usize>().write_unaligned(buf);
         set_mustfree_flag(cdata, MUSTFREE_FREE);

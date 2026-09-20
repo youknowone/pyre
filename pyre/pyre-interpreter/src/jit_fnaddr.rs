@@ -6594,6 +6594,40 @@ mod tests {
         );
     }
 
+    /// `W_CTypePrimitiveLongDouble._copy_longdouble` is
+    /// `@jit.dont_look_inside`. A missing spelling residualizes to a
+    /// symbolic hash and declines the `_CDataBase` convert descent.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_copy_longdouble() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::module::_cffi_backend::ctypeprim::copy_longdouble as *const ()
+            as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::ctypeprim::copy_longdouble"],
+            expected
+        );
+    }
+
+    /// `misc.py _raw_memcopy_opaque` is `@jit.dont_look_inside`. A missing
+    /// spelling residualizes to a symbolic hash and declines the
+    /// `_CDataBase` call descent on `copy_nonoverlapping`.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    #[test]
+    fn jit_trace_fnaddrs_covers_raw_memcopy_opaque() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::module::_cffi_backend::misc::raw_memcopy_opaque as *const ()
+            as usize as i64;
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::misc::raw_memcopy_opaque"],
+            expected
+        );
+        assert_eq!(
+            bindings["pyre_interpreter::module::_cffi_backend::raw_memcopy_opaque"],
+            expected
+        );
+    }
+
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the
     /// codewriter bakes for `PyFrame::pop` — the `pop_value` sub-jitcode
     /// residual the full-body walk must not concretely execute against the

@@ -306,7 +306,7 @@ unsafe fn copy_from_same(ct: &W_CType, cdata: *mut u8, w_ob: PyObjectRef) -> boo
         && source.ctype == ct.as_object()
         && ct.size >= 0
     {
-        unsafe { std::ptr::copy(source.ptr as *const u8, cdata, ct.size as usize) };
+        misc::raw_memcopy(source.ptr, cdata as usize, ct.size as usize);
         return true;
     }
     false
