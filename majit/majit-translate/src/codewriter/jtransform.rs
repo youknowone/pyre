@@ -5144,6 +5144,34 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // Leftover `i64::checked_add` after `front::checked_arith` missed
+        // the Option diamond. `simplify.py transform_ovfcheck` /
+        // `rewrite_op_int_add_ovf` emit `add_ovf` plus `-live-`.
+        if crate::front::checked_arith::is_checked_arith_target(target)
+            && args.len() == 2
+            && matches!(result_ty, ValueType::Int | ValueType::Unknown)
+            && let CallTarget::FunctionPath { segments } = target
+            && let Some(leaf) = segments.last()
+            && let Some(ovf) = crate::front::checked_arith::checked_arith_ovf_opname(leaf)
+        {
+            let lhs = resolve_alias(&args[0], &self.aliases);
+            let rhs = resolve_alias(&args[1], &self.aliases);
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                },
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::BinOp {
+                        op: ovf.into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ]);
+        }
         // `__getslice_rangefrom(l, start)` — the front's deferred `l[start:]`
         // on a GC array.  The rtyper's `rtype_getslice` (`rlist.py`) turns
         // the lifted graph's `getslice` into a direct call of
@@ -16459,6 +16487,97 @@ mod tests {
             }
             _ => panic!("expected Replace(convert_float_bytes_to_longlong)"),
         }
+    }
+
+    /// A leftover `i64::checked_add` Call becomes `add_ovf` plus `-live-`,
+    /// matching `rewrite_op_int_add_ovf`.
+    #[test]
+    fn checked_add_call_rewrites_to_add_ovf() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("checked_add_call");
+        let lhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let rhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["core", "num", "<Impl>", "checked_add"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[lhs.clone(), rhs.clone()],
+            &result_ty,
+            "checked_add_call",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Replace(ops) => {
+                assert_eq!(ops.len(), 2);
+                assert!(matches!(ops[0].kind, OpKind::Live));
+                match &ops[1].kind {
+                    OpKind::BinOp { op, result_ty, .. } => {
+                        assert_eq!(op, "add_ovf");
+                        assert_eq!(*result_ty, ValueType::Int);
+                    }
+                    other => panic!("expected add_ovf, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Replace(add_ovf)"),
+        }
+    }
+
+    /// Grain packs a `Position` into an i64 as `position_from_bits`. A
+    /// substring `from_bits` match would rewrite that call to
+    /// `convert_longlong_bytes_to_float` and make the caller
+    /// `float_return` a Position. The leaf is the method name itself.
+    #[test]
+    fn position_from_bits_is_not_a_float_bitcast() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("position_from_bits_call");
+        let bits = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let target =
+            CallTarget::function_path(["rhai", "grain", "vm", "jit", "position_from_bits"]);
+        let result_ty = ValueType::Ref(None);
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![bits.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&bits),
+            &result_ty,
+            "position_from_bits_call",
+            &mut graph,
+        );
+        let folded_to_bitcast = match &rewritten {
+            RewriteResult::Replace(ops) => ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. }
+                        if op == "convert_longlong_bytes_to_float"
+                            || op == "convert_float_bytes_to_longlong"
+                )
+            }),
+            _ => false,
+        };
+        assert!(
+            !folded_to_bitcast,
+            "position_from_bits must not fold to a float bitcast"
+        );
     }
 
     /// `Transformer.rewrite_op_direct_call` dispatches real calls through
