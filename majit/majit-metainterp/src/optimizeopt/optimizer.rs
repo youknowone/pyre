@@ -3291,7 +3291,10 @@ impl Optimizer {
                 // instead of OpRef::int_op(k). RPython avoids this with fresh-Box identity
                 // per phase; majit's flat OpRef space needs an explicit SameAs
                 // alias so nia[j] points outside the body inputarg position range.
-                {
+                //
+                // Bridges do not import this export (unroll.py:183-236): the
+                // aliases never rewrite the live JUMP args, so skip them.
+                if !building_bridge {
                     let mut seen: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
                     // RPython parity: positions already holding an emitted op
                     // are phase 1 results, not body inputarg sources. Only
@@ -3411,6 +3414,17 @@ impl Optimizer {
                         .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                         .collect(),
                 );
+                // unroll.py:193-205: `optimize_bridge` runs
+                // `propagate_all_forward` then flush +
+                // `force_box_for_end_of_preamble` on the jump args; it does
+                // not preview virtual state, produce short boxes, or call
+                // `export_state`. That export is only the retrace arm
+                // (unroll.py:231-233), which `optimize_bridge` still runs
+                // after `jump_to_existing_trace`. Heap writebacks from the
+                // flush + force above are already in `ctx.new_operations`.
+                if building_bridge {
+                    break 'export None;
+                }
                 // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
                 // VS is captured AFTER force + flush so its `Virtual` /
                 // `VStruct` entries match the `info.is_virtual()` predicate
