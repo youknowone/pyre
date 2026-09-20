@@ -3839,6 +3839,19 @@ impl Repr for InstanceRepr {
         };
         if attr == "__discriminant" && receiver_is_nullable_instance {
             use crate::translator::rtyper::rtyper::GenopResult;
+            // Result lltype follows `hop.r_result`: a switch on tags
+            // 0..n specialises `SomeInteger` to Ruint/Unsigned; a
+            // discriminant that never gained knowntypedata stays Signed.
+            let disc_lltype = hop
+                .r_result
+                .borrow()
+                .as_ref()
+                .map(|r| r.lowleveltype().clone())
+                .unwrap_or(LowLevelType::Signed);
+            let cast_op = match &disc_lltype {
+                LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => "cast_bool_to_uint",
+                _ => "cast_bool_to_int",
+            };
             let v_nonzero = hop
                 .genop(
                     "ptr_nonzero",
@@ -3850,11 +3863,7 @@ impl Repr for InstanceRepr {
                         "InstanceRepr.rtype_getattr: ptr_nonzero produced no result var",
                     )
                 })?;
-            return Ok(hop.genop(
-                "cast_bool_to_int",
-                vec![v_nonzero],
-                GenopResult::LLType(LowLevelType::Signed),
-            ));
+            return Ok(hop.genop(cast_op, vec![v_nonzero], GenopResult::LLType(disc_lltype)));
         }
 
         // upstream: `else:`

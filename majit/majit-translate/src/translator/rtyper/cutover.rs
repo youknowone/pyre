@@ -4311,6 +4311,57 @@ fn run_phase_b_rtype_isolated(
                         for op in &failed_block.operations {
                             eprintln!("[PREPASS phaseB op] {gname}: {op:?}");
                         }
+                        for (ei, link) in failed_block.exits.iter().enumerate() {
+                            let followed = annotator
+                                .links_followed
+                                .borrow()
+                                .contains_key(&crate::flowspace::model::LinkKey::of(link));
+                            eprintln!(
+                                "[PREPASS phaseB exit] {gname}: i={ei} followed={followed} args={:?} case={:?}",
+                                link.borrow().args,
+                                link.borrow().exitcase
+                            );
+                        }
+                        drop(failed_block);
+                        if let Some(g) = &gopt {
+                            let gb = g.borrow();
+                            let ret = gb.getreturnvar();
+                            eprintln!("[PREPASS phaseB returnvar] {gname}: {ret:?}");
+                            let annotated = annotator.annotated.borrow();
+                            let blocked = annotator.blocked_blocks.borrow();
+                            let all_blocks = annotator.all_blocks.borrow();
+                            let blocks = gb.iterblocks();
+                            let mut n_ann_graph = 0usize;
+                            let mut n_ann_none = 0usize;
+                            let mut n_missing = 0usize;
+                            let mut n_blocked = 0usize;
+                            for b in &blocks {
+                                let key = crate::flowspace::model::BlockKey::of(b);
+                                match annotated.get(&key) {
+                                    Some(Some(_)) => n_ann_graph += 1,
+                                    Some(None) => n_ann_none += 1,
+                                    None => n_missing += 1,
+                                }
+                                if blocked.contains_key(&key) {
+                                    n_blocked += 1;
+                                }
+                                if !all_blocks.contains_key(&key) {
+                                    eprintln!(
+                                        "[PREPASS phaseB block-census] {gname}: reachable block missing from all_blocks"
+                                    );
+                                }
+                            }
+                            eprintln!(
+                                "[PREPASS phaseB block-census] {gname}: reachable={} annotated-graph={} annotated-false={} missing={} blocked={} all_blocks={} annotated_map={}",
+                                blocks.len(),
+                                n_ann_graph,
+                                n_ann_none,
+                                n_missing,
+                                n_blocked,
+                                all_blocks.len(),
+                                annotated.len()
+                            );
+                        }
                         phase_b_reasons.push(reason);
                     }
                     match &gopt {
