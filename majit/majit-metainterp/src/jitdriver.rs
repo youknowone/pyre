@@ -6576,6 +6576,13 @@ impl<S: JitState> JitDriver<S> {
             // Keep `result` (and its deadframe) until this arm returns so
             // `jf_savedata` stays rooted through `AllVirtuals.show`, matching
             // `compile.py handle_fail(self, deadframe, ...)`.
+            // Also park the copied GCREF: `AllVirtuals.show` reads this
+            // word after the reconstruction has already allocated.
+            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                crate::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| savedata.is_some())
+            };
+            let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
             // The reconstruction below allocates through the blackhole allocator,
             // so hold the exception where the frontend's root walker can reach
             // it until `prepare_resume_from_failure` hands it to the blackhole.

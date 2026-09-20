@@ -7998,7 +7998,6 @@ fn drive_unpack_iterable_trace(
                     .expect("a guard exit carrying resume storage carries its layout"),
                 guard_exc,
                 // jd1 is novable: it has no virtualizable to force.
-                std::ptr::null(),
                 true,
                 None,
             );
@@ -11375,26 +11374,6 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
     }
 }
 
-/// `compile.py ResumeGuardForcedDescr.handle_fail` — the frame whose
-/// forced-virtual cache this guard failure may fish, or null.
-///
-/// Only the `GUARD_NOT_FORCED` / `GUARD_NOT_FORCED_2` failure reads the cache
-/// `handle_async_forcing` saved; every other `handle_fail` resumes with
-/// `all_virtuals = None`. `invent_fail_descr_for_op` marks exactly those two
-/// guards (`optimizeopt/mod.rs`'s `store_final_boxes_in_guard`), so
-/// `is_guard_forced()` is the same discriminator upstream gets from the
-/// descr subtype.
-fn forced_guard_cache_owner(
-    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    frame: *const pyre_interpreter::PyFrame,
-) -> *const pyre_interpreter::PyFrame {
-    if descr_arc.is_guard_forced() {
-        frame
-    } else {
-        std::ptr::null()
-    }
-}
-
 /// `compile.py:956-957` — `hidden_all_virtuals =
 /// metainterp_sd.cpu.get_savedata_ref(deadframe)` then `AllVirtuals.show`.
 ///
@@ -11404,7 +11383,6 @@ fn forced_guard_cache_owner(
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
 pub(crate) fn take_forced_virtuals_for_frame(
-    _frame: *const pyre_interpreter::PyFrame,
     savedata: Option<majit_ir::GcRef>,
 ) -> Option<(Vec<i64>, Vec<i64>)> {
     savedata.and_then(majit_metainterp::AllVirtuals::show)
@@ -11432,10 +11410,6 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
     raw_values: &mut [i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
-    // `forced_guard_cache_owner` of the failing guard: the frame whose
-    // forced-virtual cache this resume may fish, null for any guard that is
-    // not a GUARD_NOT_FORCED.
-    forced_cache_owner: *const pyre_interpreter::PyFrame,
     // True when the failing guard belongs to a novable jitdriver (jd1
     // `unpackiterable_driver`): its resume data has no vable section, so the
     // decode must not consume one. jd0 guards pass `false`.
@@ -11491,7 +11465,14 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         // kind out of the self-describing deadframe+descr it was handed.
         // The sibling resume paths already pass this slice directly
         // (`jitdriver.rs`).
-        let all_virtuals = take_forced_virtuals_for_frame(forced_cache_owner, savedata);
+        let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+        let _savedata_root = unsafe {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {
+                savedata.is_some()
+            })
+        };
+        let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
+        let all_virtuals = take_forced_virtuals_for_frame(savedata);
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
@@ -11884,7 +11865,6 @@ fn execute_assembler(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                         savedata,
                     );
@@ -12269,7 +12249,6 @@ fn bound_reached(
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                         savedata,
                     );
@@ -12588,7 +12567,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                         raw_values,
                         exit_layout,
                         guard_exc,
-                        forced_guard_cache_owner(descr_arc, frame_root.frame()),
                         false,
                         savedata,
                     );

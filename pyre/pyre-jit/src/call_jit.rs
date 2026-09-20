@@ -2274,15 +2274,16 @@ fn jit_blackhole_resume_from_guard(
         // instead of resuming the no-exception continuation with a NULL
         // result.
         // compile.py `ResumeGuardForcedDescr.handle_fail` fishes the
-        // cache `handle_async_forcing` saved; no other `handle_fail` does.
-        // `fail_values[0]` IS the callee's `PyFrame*` for the Python portal
-        // (the entry-green-key recovery above relies on the same contract), so
-        // it names the frame a force would have attached its cache to.
-        let all_virtuals = if descr_arc.is_guard_forced() {
-            crate::eval::take_forced_virtuals_for_frame(
-                fail0 as *const pyre_interpreter::pyframe::PyFrame,
-                crate::eval::savedata_from_jitframe(deadframe),
-            )
+        // cache `handle_async_forcing` saved via `cpu.get_savedata_ref(deadframe)`.
+        let savedata = crate::eval::savedata_from_jitframe(deadframe);
+        let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+        let _savedata_root = unsafe {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {
+                savedata.is_some()
+            })
+        };
+        let all_virtuals = if descr_arc.is_guard_forced() && savedata.is_some() {
+            majit_metainterp::AllVirtuals::show(majit_ir::GcRef(savedata_slot[0] as usize))
         } else {
             None
         };
@@ -4908,21 +4909,23 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             {
                 return result;
             }
-            // compile.py `ResumeGuardForcedDescr.handle_fail`: only a
-            // GUARD_NOT_FORCED failure fishes the cache the force saved, keyed
-            // by the callee frame `raw_values[0]` names.
-            let forced_cache_owner = if descr_arc.is_guard_forced() {
-                callee_frame as *const pyre_interpreter::pyframe::PyFrame
-            } else {
-                std::ptr::null()
+            // compile.py ResumeGuardForcedDescr.handle_fail reads
+            // `cpu.get_savedata_ref(deadframe)` after the bridge attempt.
+            // `dead_frame_from_ran_frame` already copied `jf_savedata`;
+            // root that copy across the same window.
+            let mut savedata_slot = [savedata.map_or(0, majit_ir::GcRef::as_usize) as i64];
+            let _savedata_root = unsafe {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&mut savedata_slot, |_| {
+                    savedata.is_some()
+                })
             };
+            let savedata = savedata.map(|_| majit_ir::GcRef(savedata_slot[0] as usize));
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
                 &mut raw_values,
                 &exit_layout,
                 guard_exc,
-                forced_cache_owner,
                 false,
-                savedata,
+                descr_arc.is_guard_forced().then_some(savedata).flatten(),
             );
             handle_blackhole_result(bh, green_key).unwrap_or(0)
         }
