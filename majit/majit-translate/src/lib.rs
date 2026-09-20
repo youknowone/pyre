@@ -958,6 +958,38 @@ fn distinct_struct_identities_by_leaf(
 
 type TraitImplOwners = std::collections::HashMap<String, std::collections::BTreeSet<String>>;
 
+/// The unique concrete override of a trait default, when the analyzed
+/// program has exactly one impl of that trait.
+///
+/// `classdesc.py lookup` walks the receiver's MRO and a concrete method
+/// shadows the base-class (trait-default) body.  A generic
+/// `<E: Trait>` call site lowers to `[<Trait>, <method>]`; with one
+/// impl that walk has a single answer, so the direct path must bind
+/// the override rather than the default.  Several impl types leave the
+/// receiver ambiguous and keep the default (indirect-call family).
+fn unique_trait_default_override<'a>(
+    is_default: bool,
+    trait_leaf: &str,
+    method_name: &str,
+    trait_method_overrides: &'a std::collections::HashMap<
+        (&'a str, &'a str),
+        (&'a str, &'a front::semantic::SemanticFunction),
+    >,
+    trait_concrete_impl_types: &std::collections::HashMap<&str, Vec<&str>>,
+) -> Option<(&'a str, &'a front::semantic::SemanticFunction)> {
+    if !is_default {
+        return None;
+    }
+    trait_method_overrides
+        .get(&(trait_leaf, method_name))
+        .filter(|_| {
+            trait_concrete_impl_types
+                .get(trait_leaf)
+                .is_some_and(|types| types.len() == 1)
+        })
+        .copied()
+}
+
 /// Resolve a trait's sole concrete owner to the struct root used by the
 /// annotator, preserving class identity across the LLBC registry's aliases.
 fn unique_trait_impl_roots(
@@ -1705,62 +1737,19 @@ fn analyze_pipeline_from_module_paths(
         for method in &impl_info.methods {
             // `classdesc.py lookup` MRO: on the generic-dispatch
             // direct path `[<Trait>, <method>]`, the unique concrete
-            // override shadows the trait default body (pre-pass
-            // above).  `None` for concrete-impl entries, defaults
-            // without an override, and traits with several concrete
-            // impl types (the receiver stays ambiguous —
-            // indirect-call family territory keeps the default).
-            //
-            // Staged scope: whole-trait shadowing is blocked on the
-            // classdef-hints-before-BFS annotator work — registering
-            // objspace-heavy overrides (load_attr / call_callable /
-            // binary_op …) pulls their graph closure into the BFS,
-            // where the annotator fails on classdef-less SomeInstance
-            // attr reads and on runtime statics no build-time table
-            // can resolve (`JIT_DRIVER`).  Grown deliberately, one
-            // fail-loud resolution at a time; the motivating members are
-            // the exception-handler pair whose empty defaults broke
-            // generic-dispatch resolution.
-            const DEFAULT_SHADOW_DEVIRT_SCOPE: &[&str] = &[
-                "push_exc_info",
-                "pop_except",
-                // `pyopcode::execute_load_super_attr` is generic over the
-                // executor, but the portal's one concrete executor is
-                // `PyFrame`.  Keeping the trait default here generates the
-                // deliberately-raising "not implemented" body and cuts the
-                // real `PyFrame::load_super_attr_with` call graph out of the
-                // JitCode closure.  PyPy traces the ordinary
-                // `W_Super.getattribute` / `_super_check` bodies, so bind the
-                // concrete override at the same classdef/MRO decision point
-                // as the exception-handler pair above.
-                "load_super_attr_with",
-                // `ControlFlowOpcodeHandler::close_loop`'s default reports
-                // `StepResult::Continue`.  `PyFrame` overrides it to report
-                // `CloseLoop` unconditionally — that report is the back edge,
-                // and the portal turns it into the `loop_header` op
-                // `jtransform.py` rewrites `can_enter_jit` into.  Left on the
-                // default, a walk of the portal reads `Continue` at every back
-                // edge, never reaches `loop_header`, and so leaves
-                // `seen_loop_header_for_jdindex` at -1 for the whole walk:
-                // every `jit_merge_point` is a no-op and no trace can close.
-                // The override is one struct literal over the target pc, so it
-                // carries none of the objspace surface the staging above is
-                // about.
-                "close_loop",
-            ];
+            // override shadows the trait default body.  `None` for
+            // concrete-impl entries, defaults without an override, and
+            // traits with several concrete impl types (the receiver
+            // stays ambiguous — indirect-call family territory keeps
+            // the default).
             let devirt: Option<(&str, &front::semantic::SemanticFunction)> =
-                if is_default && DEFAULT_SHADOW_DEVIRT_SCOPE.contains(&method.name.as_str()) {
-                    trait_method_overrides
-                        .get(&(impl_info.trait_name.as_str(), method.name.as_str()))
-                        .filter(|_| {
-                            trait_concrete_impl_types
-                                .get(impl_info.trait_name.as_str())
-                                .is_some_and(|types| types.len() == 1)
-                        })
-                        .copied()
-                } else {
-                    None
-                };
+                unique_trait_default_override(
+                    is_default,
+                    impl_info.trait_name.as_str(),
+                    method.name.as_str(),
+                    &trait_method_overrides,
+                    &trait_concrete_impl_types,
+                );
             // Hints for the direct path follow the graph registered
             // there (RPython binds hints to graph identity).
             let direct_hints: &Vec<String> = match devirt {
@@ -2997,6 +2986,100 @@ mod portal_driver_tests {
             identities.get("PyFrame").map(Vec::len),
             Some(2),
             "genuinely distinct same-leaf classes remain ambiguous"
+        );
+    }
+
+    #[test]
+    fn unique_trait_default_override_is_method_agnostic() {
+        let store = front::semantic::SemanticFunction {
+            name: "store_attr_cached".into(),
+            graph: FunctionGraph::new("PyFrame::store_attr_cached"),
+            return_type: None,
+            self_ty_root: Some("PyFrame".into()),
+            trait_impl_id: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            trait_root: Some("OpcodeStepExecutor".into()),
+            trait_qualified: Some("pyre_interpreter::pyopcode::OpcodeStepExecutor".into()),
+            returns_objectptr: false,
+        };
+        let to_bool = front::semantic::SemanticFunction {
+            name: "to_bool".into(),
+            graph: FunctionGraph::new("PyFrame::to_bool"),
+            return_type: None,
+            self_ty_root: Some("PyFrame".into()),
+            trait_impl_id: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            trait_root: Some("OpcodeStepExecutor".into()),
+            trait_qualified: Some("pyre_interpreter::pyopcode::OpcodeStepExecutor".into()),
+            returns_objectptr: false,
+        };
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            ("OpcodeStepExecutor", "store_attr_cached"),
+            ("PyFrame", &store),
+        );
+        overrides.insert(("OpcodeStepExecutor", "to_bool"), ("PyFrame", &to_bool));
+        let mut types = std::collections::HashMap::new();
+        types.insert("OpcodeStepExecutor", vec!["PyFrame"]);
+
+        let hit = unique_trait_default_override(
+            true,
+            "OpcodeStepExecutor",
+            "store_attr_cached",
+            &overrides,
+            &types,
+        );
+        assert_eq!(
+            hit.map(|(owner, func)| (owner, func.graph.name.as_str())),
+            Some(("PyFrame", "PyFrame::store_attr_cached"))
+        );
+        let hit = unique_trait_default_override(
+            true,
+            "OpcodeStepExecutor",
+            "to_bool",
+            &overrides,
+            &types,
+        );
+        assert_eq!(
+            hit.map(|(owner, func)| (owner, func.graph.name.as_str())),
+            Some(("PyFrame", "PyFrame::to_bool"))
+        );
+        assert!(
+            unique_trait_default_override(
+                true,
+                "OpcodeStepExecutor",
+                "no_override",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "a method the unique impl does not override keeps the trait default"
+        );
+        assert!(
+            unique_trait_default_override(
+                false,
+                "OpcodeStepExecutor",
+                "store_attr_cached",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "a concrete impl entry is not a default-body shadow"
+        );
+
+        types.insert("OpcodeStepExecutor", vec!["PyFrame", "OtherFrame"]);
+        assert!(
+            unique_trait_default_override(
+                true,
+                "OpcodeStepExecutor",
+                "store_attr_cached",
+                &overrides,
+                &types,
+            )
+            .is_none(),
+            "several concrete impls leave the default on the direct path"
         );
     }
 
