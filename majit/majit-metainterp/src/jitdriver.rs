@@ -6224,15 +6224,12 @@ impl<S: JitState> JitDriver<S> {
                     std::hint::black_box(&mut *state);
                 }
             }
-            let saved_vable_ptr = self
-                .meta
-                .tracing
-                .as_ref()
-                .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
+            // No recording context to move or put back: this function
+            // refuses to run at all while `is_tracing`, so `sync_before`
+            // writes no trace pointer and the exits below have none to
+            // restore. The two `run_compiled_detailed_*` runners carry the
+            // save/restore, because a walk does reach those.
             if !self.sync_before(state, &compiled_meta, vable) {
-                // `sync_before` returns false only from its early
-                // `sync_named_virtualizable_before_jit` failure, which is
-                // before it writes the context pointer.
                 return None;
             }
             // The entry arguments are assembled in buffers the driver keeps
@@ -6306,7 +6303,6 @@ impl<S: JitState> JitDriver<S> {
                     state.state_field_layout().total_live_values(),
                 ) {
                     self.entry_scratch_out(scratch);
-                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 }
 
@@ -6320,7 +6316,6 @@ impl<S: JitState> JitDriver<S> {
                     &mut scratch.vable_arrays,
                 ) {
                     self.entry_scratch_out(scratch);
-                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 }
             }
@@ -6339,7 +6334,6 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     self.entry_scratch_out(scratch);
-                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 };
                 if crate::callee_rca_enabled() {
@@ -6360,7 +6354,6 @@ impl<S: JitState> JitDriver<S> {
                 // types are confirmed here as well.
                 let Some(types) = self.meta.front_target_inputarg_types(green_key) else {
                     self.entry_scratch_out(scratch);
-                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 };
                 if types.len() != scratch.live_values.len()
@@ -6383,7 +6376,6 @@ impl<S: JitState> JitDriver<S> {
                         );
                     }
                     self.entry_scratch_out(scratch);
-                    self.restore_trace_vable_ptr(saved_vable_ptr);
                     return None;
                 }
             }
@@ -6480,7 +6472,7 @@ impl<S: JitState> JitDriver<S> {
                     if !result.is_finish && !result.typed_values.is_empty() {
                         state.restore_values(&compiled_meta, &result.typed_values);
                     }
-                    self.sync_after(state, &compiled_meta, vable, saved_vable_ptr);
+                    self.sync_after(state, &compiled_meta, vable, None);
                     std::hint::black_box(&mut *state);
                 }
             }
@@ -6529,7 +6521,7 @@ impl<S: JitState> JitDriver<S> {
                 // `descriptor_cache`), so a second consultation could only
                 // return the same object at the cost of one more refcount pair
                 // per compiled entry.
-                self.sync_after(state, run_meta, vable, saved_vable_ptr);
+                self.sync_after(state, run_meta, vable, None);
                 // Kept for callers that cannot consume the latch (a portal whose
                 // return type the expansion cannot build from a `Value`). Those
                 // callers see today's behaviour unchanged; a caller that drains
@@ -6547,7 +6539,7 @@ impl<S: JitState> JitDriver<S> {
                 // Carried from the entry decision above, not re-resolved; see
                 // the FINISH arm for why one resolution serves both ends of a
                 // compiled entry.
-                self.sync_after(state, run_meta, vable, saved_vable_ptr);
+                self.sync_after(state, run_meta, vable, None);
                 return Some(target_pc);
             }
 
