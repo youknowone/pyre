@@ -208,6 +208,14 @@ PLATFORM_GATED = {
         lambda p: p not in ("win32", "emscripten", "wasi"),
         "os.openpty() not available",
     ),
+    # `fcntl = import_module('fcntl')`.  The module needs `sys/ioctl.h` and
+    # `fcntl.h`, which win32 has not, and WASI names it in the SDK's
+    # unsupported set next to `mmap` and `termios`.  Emscripten builds it:
+    # the browser block's own `SET_NA` lists only `readline`.
+    "test.test_fcntl": (
+        lambda p: p not in ("win32", "wasi"),
+        "no fcntl module",
+    ),
     # `syslog = import_helper.import_module("syslog")`
     "test.test_syslog": (
         lambda p: p not in ("win32", "emscripten", "wasi"),
