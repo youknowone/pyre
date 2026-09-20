@@ -88,9 +88,8 @@ impl W_BufferedRandom {
         if !super::acquire_buffered_lock(lock) {
             return Err(crate::PyError::runtime_error("reentrant call"));
         }
-        let result = body(self);
-        super::release_buffered_lock(lock);
-        result
+        let _guard = super::BufferedLockGuard(lock);
+        body(self)
     }
 
     fn reader_reset_buf(&mut self) {
@@ -544,13 +543,17 @@ impl W_BufferedRandom {
             return self.with_lock(Self::read_all_unlocked);
         }
         let size = size as usize;
-        if let Some(result) = self.read_fast(size) {
-            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
-        }
-        let result = self.with_lock(|this| this.read_generic_unlocked(size))?;
-        Ok(match result {
-            Some(data) => pyre_object::bytesobject::w_bytes_from_bytes(&data),
-            None => w_none(),
+        // See `Buffered::read_size`: the unlocked `_read_fast` races with a
+        // `with_lock` body once another thread has dropped the GIL in
+        // `raw_read`.
+        self.with_lock(|this| {
+            if let Some(result) = this.read_fast(size) {
+                return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&result));
+            }
+            Ok(match this.read_generic_unlocked(size)? {
+                Some(data) => pyre_object::bytesobject::w_bytes_from_bytes(&data),
+                None => w_none(),
+            })
         })
     }
 
