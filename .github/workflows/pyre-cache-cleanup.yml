@@ -1,0 +1,41 @@
+name: cache cleanup
+
+# A cache entry is scoped to the ref that wrote it, so once a pull request
+# closes nothing can read `refs/pull/<n>/merge` again. The entries still count
+# against the repository's 10 GB budget until eviction reaches them, and
+# eviction is by last access: a merged PR's set outlives caches that live runs
+# are still hitting. Reclaim the space at close instead.
+on:
+  pull_request:
+    types: [ closed ]
+
+permissions:
+  actions: write
+
+jobs:
+  delete-pr-caches:
+    name: delete the closed PR's caches
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Delete every cache written by this PR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        # Workflow runs write to the merge ref; the head ref is swept too so a
+        # cache from a workflow that triggered on the branch itself is not left
+        # behind. Three rounds of 100 bound the work without a loop that a
+        # failing delete could spin in.
+        for ref in "refs/pull/$PR/merge" "refs/pull/$PR/head"; do
+          for _ in 1 2 3; do
+            ids=$(gh cache list --ref "$ref" --limit 100 --json id --jq '.[].id')
+            [ -n "$ids" ] || break
+            for id in $ids; do
+              # An entry evicted between the list and the delete is not an error.
+              gh cache delete "$id" || true
+            done
+          done
+        done

@@ -114,6 +114,11 @@ jobs:
   prepare-charon-llbc-linux:
     name: prepare Charon/LLBC (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    # `actions: write` for `Drop superseded LLBC cache entries`, which deletes
+    # this ref's older entries for the crates it just saved.
+    permissions:
+      contents: read
+      actions: write
     # Every expensive job in this workflow hangs off one of the three prepare
     # jobs, so naming `pre-commit` here is what holds a whole run behind a
     # cheap check. Waiting costs no runner-seconds of its own -- a queued job
@@ -157,9 +162,9 @@ jobs:
         # only on main so per-PR target caches don't multiply across refs past
         # GitHub's 10 GB cache budget and trigger LRU eviction.
         save-if: ${{ github.ref == 'refs/heads/main' }}
-    - name: Cache Charon binary
+    - name: Restore Charon binary
       id: charon-cache
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         # Only the installed charon/charon-driver + .installed-version stamp —
         # all the skip check (charon_bin + stamp) and the main build need.
@@ -177,6 +182,21 @@ jobs:
       if: steps.charon-cache.outputs.cache-hit != 'true'
       shell: bash
       run: scripts/install-charon.py
+    - name: Save Charon binary
+      # Windows builds Charon from source, so a miss there is a full cargo
+      # build and the entry earns its place on a PR ref too. Everywhere else
+      # install-charon.py fetches a published release: on run 35442882015 the
+      # step took 0.57 s from a cold cache, so a PR-ref copy of an entry main
+      # already holds buys under a second and costs the budget an entry.
+      # The key carries no fingerprint, so main's entry is byte-identical to
+      # the one a PR would write and `restore-keys` reaches it.
+      if: >-
+        steps.charon-cache.outputs.cache-hit != 'true' &&
+        (github.ref == 'refs/heads/main' || runner.os == 'Windows')
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: .pyre-build/charon
+        key: charon-bin-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}
     - name: Upload Charon artifact
       # Hand the installed Charon tree to downstream jobs within this run.
       # The cache above is still the cross-run source of truth; this artifact
@@ -406,6 +426,41 @@ jobs:
           build/llbc/pyre-jit.ullbc.fingerprint
           build/llbc/pyre-jit.ullbc.readfiles
         key: llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
+    - name: Drop superseded LLBC cache entries
+      # Every push that rewrites a crate saves a new entry under a new
+      # fingerprint and nothing reclaims the one before it. That entry can no
+      # longer be read: the exact key names a fingerprint the tree no longer
+      # produces, and the `restore-keys` prefix always resolves to the most
+      # recent match. On 2026-09-20 such entries held 760 MB of a 10 GB budget
+      # across 33 crate/platform groups, main's own among them.
+      #
+      # Keep the newest per crate on this ref. The listing is narrowed to this
+      # runner's platform so the three prepare jobs, which run together, each
+      # touch only the keys they write.
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        # `github.ref` is the ref a run's caches are written under:
+        # `refs/pull/<n>/merge` for a pull request, `refs/heads/main` on push.
+        REF: ${{ github.ref }}
+      run: |
+        set -uo pipefail
+        entries="$RUNNER_TEMP/llbc-cache-entries.tsv"
+        gh cache list --ref "$REF" --limit 100 --sort created_at --order desc \
+          --json id,key --jq '.[] | [.id, .key] | @tsv' > "$entries"
+        for crate in majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit; do
+          prefix="llbc3-$crate-$RUNNER_OS-$RUNNER_ARCH-$CHARON_VERSION-"
+          # Newest first, so every match after the first is superseded.
+          awk -v p="$prefix" 'index($2, p) == 1 { n++; if (n > 1) print $1 }' "$entries" |
+            while read -r id; do
+              echo "deleting superseded $prefix entry $id"
+              # A fork's token cannot delete, and eviction may have taken the
+              # entry between the listing and here. Neither is a build failure.
+              gh cache delete "$id" || true
+            done
+        done
     - name: Save Charon cargo target
       # The directory is only populated when extract ran Charon. An exact
       # hit on this key already has the deps; saving again is refused.
@@ -445,6 +500,10 @@ jobs:
   prepare-charon-llbc-macos:
     name: prepare Charon/LLBC (macos-latest)
     runs-on: macos-latest
+    # See prepare-charon-llbc-linux for why this job writes to `actions`.
+    permissions:
+      contents: read
+      actions: write
     # `pre-commit` is the only Linux job the two platforms wait for, and the
     # reason is latency. Job end times on run 32793420243, relative to the
     # first job's start: `cargo fmt --check` +47 s, `cargo test (ubuntu)`
@@ -477,6 +536,10 @@ jobs:
     # On windows-latest install-charon.py builds Charon from source
     # (no Windows release asset is published); see scripts/install-charon.py.
     runs-on: windows-latest
+    # See prepare-charon-llbc-linux for why this job writes to `actions`.
+    permissions:
+      contents: read
+      actions: write
     # See prepare-charon-llbc-macos for why `pre-commit` is the only wait,
     # and for the draft condition.
     needs: pre-commit
