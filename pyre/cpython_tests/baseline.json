@@ -658,7 +658,8 @@
       "reason": "package skips itself on a free-threaded build (Py_GIL_DISABLED)"
     },
     "test.test_io": {
-      "dynasm": "TIMEOUT"
+      "dynasm": "TIMEOUT",
+      "reason": "CBufferedReaderTest.test_threads hangs — concurrent bufio.read() raises TryLock's `reentrant call` although every reader is its own thread, and the remaining readers never join; reproduces under PYRE_NO_JIT=1, so it is not the JIT"
     },
     "test.test_ioctl": {
       "dynasm": "FAIL"
@@ -1054,7 +1055,8 @@
       "dynasm": "FAIL"
     },
     "test.test_signal": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "4 failures — test_pthread_sigmask and test_sigpending want the interpreter on the process's first thread, which darwin gives a spawned one for the stack, so a signal blocked in every thread is parked where sigpending(2) on another thread cannot report it; test__thread_interrupt_main; and test_stress_delivery_dependent, which runs out of SHORT_TIMEOUT because a compiled loop services a pending signal a full wait-bound late"
     },
     "test.test_site": {
       "dynasm": "FAIL",
