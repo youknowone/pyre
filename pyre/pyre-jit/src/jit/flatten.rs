@@ -7184,7 +7184,13 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // pyopcode.py import_from is `space.getattr` then an AttributeError
+    // `sys.modules` fallback.  Tag the residual as LoadAttr so the walker
+    // applies the existing getattr folds (module-dict cell, mapdict slot)
+    // to the getattr half.  A decline falls through to `bh_import_from_fn`,
+    // which still runs the fallback and the ImportError raise.
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
@@ -14347,6 +14353,19 @@ mod tests {
                         index: 102
                     }),
                 );
+                match &args[3] {
+                    Operand::Descr(descr) => match descr.as_ref() {
+                        DescrOperand::CallDescrStub(stub) => {
+                            assert_eq!(
+                                stub.effect_info.runtime_helper,
+                                majit_ir::RuntimeHelperKind::LoadAttr,
+                                "import_from residual is getattr + fallback"
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Descr operand, got {other:?}"),
+                }
             }
             _ => panic!("expected Insn::Op, got {insn:?}"),
         }

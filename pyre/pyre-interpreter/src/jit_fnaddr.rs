@@ -2365,6 +2365,206 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::sys_modules_registry_get",
         sys_modules_registry_get as *const (),
     );
+    // `__import__` look-inside miss / unwrap_spec arms.  Each is
+    // `#[dont_look_inside]` so the descent scan must not enter the body;
+    // without a published address the call stays a symbolic hash and the
+    // scan declines the whole wrapper after `sys_modules_dict`.
+    // ABI-UNSOUND: `Result<PyObjectRef, PyError>` is not one residual word;
+    // several also take `&str`.
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::importing::dunder_import_slow",
+        "pyre_interpreter::dunder_import_slow",
+        crate::importing::dunder_import_slow as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::dunder_import_name_obj",
+        "pyre_interpreter::dunder_import_name_obj",
+        crate::importing::dunder_import_name_obj as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::handle_fromlist_fast",
+        "pyre_interpreter::handle_fromlist_fast",
+        crate::importing::handle_fromlist_fast as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::importing::wait_initializing_module",
+        "pyre_interpreter::wait_initializing_module",
+        crate::importing::wait_initializing_module as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::builtin_dunder_import_keyword",
+        "pyre_interpreter::builtin_dunder_import_keyword",
+        crate::builtins::builtin_dunder_import_keyword as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::module_name_must_be_string",
+        "pyre_interpreter::module_name_must_be_string",
+        crate::builtins::module_name_must_be_string as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::builtins::import_bound_objects_index_level",
+        "pyre_interpreter::import_bound_objects_index_level",
+        crate::builtins::import_bound_objects_index_level as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::importing::dunder_import_absolute_head",
+        "pyre_interpreter::dunder_import_absolute_head",
+        crate::importing::dunder_import_absolute_head as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::importing::dunder_import_package_fromlist",
+        "pyre_interpreter::dunder_import_package_fromlist",
+        crate::importing::dunder_import_package_fromlist as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::handle_fromlist",
+        "pyre_interpreter::handle_fromlist",
+        crate::importing::handle_fromlist as *const (),
+    );
+    // `__import__` look-inside still residualises these: `finditem_str_named`
+    // has no jitcode (the `&str` + strategy dispatch is a symbolic hash),
+    // and the `dont_look_inside` miss / error arms need published addresses
+    // or the scan declines the wrapper after `sys_modules_dict`.
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::baseobjspace::finditem_str_named",
+        "pyre_interpreter::finditem_str_named",
+        crate::baseobjspace::finditem_str_named as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::baseobjspace::finditem_str_shortcut_interp",
+        "pyre_interpreter::finditem_str_shortcut_interp",
+        crate::baseobjspace::finditem_str_shortcut_interp as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::baseobjspace::finditem_str_generic",
+        "pyre_interpreter::finditem_str_generic",
+        crate::baseobjspace::finditem_str_generic as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::bool_must_return_bool",
+        "pyre_interpreter::bool_must_return_bool",
+        crate::baseobjspace::bool_must_return_bool as *const (),
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::is_true_lookup",
+        "pyre_interpreter::is_true_lookup",
+        crate::baseobjspace::is_true_lookup as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::baseobjspace::getdictvalue_via_dict",
+        "pyre_interpreter::getdictvalue_via_dict",
+        crate::baseobjspace::getdictvalue_via_dict as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::baseobjspace::getdictvalue_native",
+        "pyre_interpreter::getdictvalue_native",
+        crate::baseobjspace::getdictvalue_native as *const (),
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::importing::is_true_after_modules",
+        "pyre_interpreter::is_true_after_modules",
+        crate::importing::is_true_after_modules,
+    );
+    push_abi_unsound_alias_pair(
+        &mut entries,
+        "pyre_interpreter::importing::take_published_residual_error",
+        "pyre_interpreter::take_published_residual_error",
+        crate::importing::take_published_residual_error as *const (),
+    );
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::importing::sys_modules_finditem_str",
+        "pyre_interpreter::sys_modules_finditem_str",
+        crate::importing::sys_modules_finditem_str as *const (),
+    );
+    // Object-keyed probe: two `PyObjectRef` arguments and a nullable
+    // object result.  The look-inside `__import__` walk executes this
+    // residual; the `&str` twin above is only the `&str`-keyed readers.
+    pa0(
+        &mut entries,
+        "pyre_interpreter::importing::import_lookup_err_ptr",
+        "pyre_interpreter::import_lookup_err_ptr",
+        crate::importing::import_lookup_err_ptr,
+    );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::importing::sys_modules_finditem_w",
+        "pyre_interpreter::sys_modules_finditem_w",
+        crate::importing::sys_modules_finditem_w,
+    );
+    pa2(
+        &mut entries,
+        "pyre_interpreter::importing::sys_modules_finditem_str_exact",
+        "pyre_interpreter::sys_modules_finditem_str_exact",
+        crate::importing::sys_modules_finditem_str_exact,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::importing::module_spec_get_initializing",
+        "pyre_interpreter::module_spec_get_initializing",
+        crate::importing::module_spec_get_initializing,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::importing::module_dict_cell_get_spec",
+        "pyre_interpreter::module_dict_cell_get_spec",
+        crate::importing::module_dict_cell_get_spec,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::importing::module_dict_finditem_spec",
+        "pyre_interpreter::module_dict_finditem_spec",
+        crate::importing::module_dict_finditem_spec,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::importing::module_dict_cell_get_path",
+        "pyre_interpreter::module_dict_cell_get_path",
+        crate::importing::module_dict_cell_get_path,
+    );
+    pa1(
+        &mut entries,
+        "pyre_interpreter::importing::module_dict_finditem_path",
+        "pyre_interpreter::module_dict_finditem_path",
+        crate::importing::module_dict_finditem_path,
+    );
+    // `getdictvalue` mapdict arm: already `#[dont_look_inside]`, but
+    // unpublished so the `_initializing` read was a symbolic residual.
+    push_abi_unsound_argument_alias_pair(
+        &mut entries,
+        &mut abi_unsound_arguments,
+        "pyre_interpreter::objspace::std::mapdict::instance_node_getdictvalue_checked",
+        "pyre_interpreter::instance_node_getdictvalue_checked",
+        crate::objspace::std::mapdict::instance_node_getdictvalue_checked as *const (),
+    );
     // The same shape over four more runtime-mutable cells:
     // `_io::unsupported_operation_type` reads the `UNSUPPORTED_OPERATION_TYPE`
     // `OnceLock` the `_io` module init stamps with its module-local
