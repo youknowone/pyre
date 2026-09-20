@@ -311,10 +311,12 @@ pub unsafe fn w_pytraceback_get_w_code(obj: PyObjectRef) -> PyObjectRef {
 /// `walker_specialize_traceback_walk_field`, which folds the raw slot against
 /// a guard that it is not the sentinel.
 ///
-/// `record_application_traceback` leaves `lineno=LINENO_NOT_COMPUTED`
-/// (`pytraceback.py PyTraceback.__init__`); the first `tb_lineno` read
-/// resolves it.  A constructor argument that is already a real line
-/// number takes the first branch.
+/// `record_application_traceback` stamps the line eagerly, so a recorded node
+/// reaches the first branch — unless its `tb_lasti` names no line, where the
+/// eager walk answers `-1` and stamps the sentinel, and the resolution below
+/// runs and answers `None`.  That timing is not observable: `tb_lasti` and
+/// `tb_lineno` are read-only, so the only other way to hand a live node a
+/// sentinel is the constructor, which lands in the second branch either way.
 ///
 /// # Safety
 /// `tb` must point to a valid `PyTraceback`.
@@ -438,14 +440,39 @@ pub unsafe fn record_application_traceback(
         // safepoint's major would otherwise sweep the oldgen exception (and
         // the traceback chain it roots) (`tstate->current_exception` parity).
         crate::eval::set_in_flight_exception(w_exc_object);
-        // `pytraceback.py PyTraceback.__init__` defaults
-        // `lineno=LINENO_NOT_COMPUTED`; `get_lineno` walks
-        // `offset2lineno(self.frame.pycode, self.lasti)` on first read.
-        // The `PyCode` wrapper is captured into `w_code` so source-path /
-        // function name readers (`write_traceback_chain` in `error.rs`)
-        // go through that slot rather than the raw `frame` pointer.
+        // `pytraceback.py self.lineno = offset2lineno(self.frame
+        // .pycode, self.lasti)` — pyre resolves the line number eagerly
+        // here rather than leaving the sentinel for the getter.
+        // `_PyTraceBack_FromFrame` records the sentinel instead and
+        // `tb_lineno_get` resolves it, but a node's `tb_lasti` and
+        // `tb_lineno` are both read-only there, so which of the two
+        // moments does the walk is not app-level observable.  An offset
+        // that names no line resolves to `-1`, which IS the sentinel, so
+        // such a node is stamped unresolved and reaches the getter.
+        //
+        // What the eager stamp buys is the JIT fold
+        // `walker_specialize_traceback_walk_field` (pyre-jit-trace): it
+        // reads this slot directly and declines on the sentinel, so a
+        // node that carried the sentinel would decline on every read of
+        // its line.  Frame lifetime is not part of it — the `w_code`
+        // slot below is forwarded unconditionally and is the same
+        // `pycode` upstream reads, which is what makes the getter's
+        // resolution safe at any later point.
+        //
+        // `frame.pycode` is the `PyCode` wrapper; the inner
+        // `CodeObject` is extracted via `pyframe_get_pycode`.
+        //
+        // The `PyCode` PyObjectRef is also captured into the `w_code`
+        // slot so the traceback's source-path / function name metadata
+        // stays GC-rooted in that same case — readers (e.g.
+        // `write_traceback_chain` in `error.rs`) MUST go through
+        // `w_code` rather than dereferencing the `frame` pointer.
         let w_code = (*frame).pycode as PyObjectRef;
-        let lineno = LINENO_NOT_COMPUTED;
+        let lineno = if w_code.is_null() {
+            LINENO_NOT_COMPUTED
+        } else {
+            crate::pyframe::offset2lineno(w_code, last_instruction as isize) as i64
+        };
         // `tb = operror.get_traceback()` — the read that grows the chain
         // marks the previous head's frame, matching `get_traceback`.
         let prev_tb = pyre_object::interp_exceptions::w_exception_get_traceback(w_exc_object);
