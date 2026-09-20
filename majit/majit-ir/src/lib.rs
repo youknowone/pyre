@@ -28,6 +28,11 @@ pub mod resumedata;
 pub mod test_support;
 pub mod value;
 
+// Proc-macro expansions name `::majit_ir::linkme` so consumers do not
+// need a direct `linkme` dependency.
+#[doc(hidden)]
+pub use linkme;
+
 // Re-export key types at crate root for convenience.
 pub use descr::{
     AccumInfo, ArrayDescr, ArrayFlag, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,

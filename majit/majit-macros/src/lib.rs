@@ -984,7 +984,8 @@ fn emit_helper_fnaddr_registration(
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            #[::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+            #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+            #[linkme(crate = ::majit_ir::linkme)]
             #[allow(non_upper_case_globals, unused)]
             static __MAJIT_HELPER_FNADDR: ::majit_ir::helper_fnaddr::HelperFnAddr =
                 ::majit_ir::helper_fnaddr::HelperFnAddr::new(
