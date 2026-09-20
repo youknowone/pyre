@@ -443,15 +443,76 @@ pub(super) fn type_is_unsigned_int(ty: &Type) -> bool {
     }
 }
 
+/// A primitive integer's `from_le_bytes` / `from_be_bytes` associated function.
+///
+/// Only the bare spelling (`u16::from_le_bytes`) and the explicit primitive
+/// paths (`core::primitive::u16::…`, `std::primitive::u16::…`) match. A
+/// namespaced user type whose last segment is a primitive name (`wire::u16::…`)
+/// is declined.
+pub(super) struct PrimitiveFromEndianBytes {
+    pub ty_name: &'static str,
+    pub little_endian: bool,
+    pub unsigned: bool,
+    pub byte_width: usize,
+    pub acc_ty_name: &'static str,
+}
+
+/// Path-match a primitive `from_le_bytes` / `from_be_bytes` associated function.
+pub(super) fn primitive_from_endian_bytes_path(func: &Expr) -> Option<PrimitiveFromEndianBytes> {
+    let segments = canonical_expr_segments(func)?;
+    let n_seg = segments.len();
+    let ty_idx = match n_seg {
+        2 => 0,
+        4 if matches!(
+            (segments[0].as_str(), segments[1].as_str()),
+            ("core", "primitive") | ("std", "primitive")
+        ) =>
+        {
+            2
+        }
+        _ => return None,
+    };
+    let little_endian = match segments[n_seg - 1].as_str() {
+        "from_le_bytes" => true,
+        "from_be_bytes" => false,
+        _ => return None,
+    };
+    let (ty_name, unsigned, byte_width, acc_ty_name) = match segments[ty_idx].as_str() {
+        "i16" => ("i16", false, 2usize, "u16"),
+        "u16" => ("u16", true, 2, "u16"),
+        "i32" => ("i32", false, 4, "u32"),
+        "u32" => ("u32", true, 4, "u32"),
+        "i64" => ("i64", false, 8, "u64"),
+        "u64" => ("u64", true, 8, "u64"),
+        // `isize`/`usize` are deliberately absent: their width belongs to
+        // the TARGET, and this expansion runs on the host, so the host's
+        // `size_of` would be the wrong number to check the element count
+        // against on any cross build.
+        _ => return None,
+    };
+    Some(PrimitiveFromEndianBytes {
+        ty_name,
+        little_endian,
+        unsigned,
+        byte_width,
+        acc_ty_name,
+    })
+}
+
 /// Whether a source expression is already an unsigned integer value.
 /// Covers `x as u64` / `(x as u32)` so `as f64` can pick
 /// `cast_uint_to_float` the way `rewrite_op_force_cast` uses
-/// `rffi.size_and_sign`.
+/// `rffi.size_and_sign`. A primitive unsigned `from_le_bytes` /
+/// `from_be_bytes` call is unsigned too: signedness is read off the
+/// original expression, one level above the desugared `((chain) as u64)`.
 pub(super) fn expr_is_unsigned_int(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(paren) => expr_is_unsigned_int(&paren.expr),
         Expr::Group(group) => expr_is_unsigned_int(&group.expr),
         Expr::Cast(cast) => type_is_unsigned_int(&cast.ty),
+        Expr::Call(call) => {
+            primitive_from_endian_bytes_path(&call.func).is_some_and(|info| info.unsigned)
+        }
         _ => false,
     }
 }
