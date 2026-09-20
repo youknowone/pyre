@@ -674,6 +674,12 @@ impl std::ops::Deref for InputArgRc {
     }
 }
 
+impl PartialEq for InputArgRc {
+    fn eq(&self, other: &Self) -> bool {
+        InputArg::eq(self, other)
+    }
+}
+
 impl AsRef<InputArg> for InputArgRc {
     fn as_ref(&self) -> &InputArg {
         self
