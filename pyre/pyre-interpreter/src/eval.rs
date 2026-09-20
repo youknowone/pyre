@@ -3984,11 +3984,17 @@ pub fn compute_load_method_bound(obj: PyObjectRef, attr: PyObjectRef, name: &str
             // self-binding optimization for a custom `tp_getattro` (pushes
             // NULL), so an override returning the raw descriptor must call as a
             // plain function, not a bound method.  This is the same gate
-            // `load_method_fast_path` applies before its fast path, in the same
-            // computing form: the raw `uses_object_getattribute` flag is only a
-            // memo that `mutated` clears and a jitted lookup never sets, so
-            // reading it here would answer NULL for a descriptor the fast path
-            // just surfaced unbound.
+            // `load_method_fast_path` applies before its fast path.
+            //
+            // The computing form, not the raw `uses_object_getattribute`
+            // memo: that field starts `false`, `mutated()` resets it to
+            // `false` on every type-dict write, and the only writer
+            // (`getattribute_if_not_from_object`) is skipped while jitted.
+            // Reading it raw therefore answers "custom `__getattribute__`"
+            // for a type that inherits the default one, and the method load
+            // drops `self` — while `load_method_fast_path`, which resolves
+            // the same question by lookup, pushed the unbound function that
+            // needs it.
             if !crate::baseobjspace::has_object_getattribute(w_type) {
                 return PY_NULL;
             }
@@ -6096,6 +6102,50 @@ mod tests {
         unsafe {
             assert!(crate::baseobjspace::exception_is_valid_obj_as_class_w(good));
             assert!(!crate::baseobjspace::exception_is_valid_obj_as_class_w(bad));
+        }
+    }
+
+    // `load_method_fast_path` and `compute_load_method_bound` split one
+    // LOAD_METHOD between them — the first picks the attribute, the second the
+    // `null_or_self` pushed beside it — and no Python expression reaches
+    // either alone.  They ask the same question about the receiver's
+    // `__getattribute__`, so they have to answer it the same way: the fast
+    // path pushes the UNBOUND function, and a `PY_NULL` companion calls it
+    // with `self` missing.
+    //
+    // The state pinned here is the one a hot trace sees.  `mutated()` clears
+    // `uses_object_getattribute` on every type-dict write, and the only writer
+    // (`getattribute_if_not_from_object`) is skipped while jitted, so a type
+    // reached only from compiled code keeps the flag `false` however ordinary
+    // its `__getattribute__` is.
+    #[test]
+    fn test_load_method_bound_agrees_with_the_fast_path_on_an_unmemoized_type() {
+        let (_result, frame) =
+            run_exec_frame("class C:\n    def m(self):\n        return 1\nobj = C()");
+        let w_globals = frame.get_w_globals();
+        let obj =
+            unsafe { pyre_object::w_dict_getitem_str(w_globals, "obj") }.expect("missing obj");
+
+        unsafe {
+            let w_type = pyre_object::w_instance_get_type(obj);
+            // Read the descriptor before clearing the flag: `lookup_in_type`
+            // is a plain MRO walk, while anything going through
+            // `has_object_getattribute` would memoize the default back and
+            // hide exactly what this pins.
+            let w_descr = crate::baseobjspace::lookup_in_type(w_type, "m").expect("C.m");
+            pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, false);
+
+            assert!(
+                std::ptr::eq(compute_load_method_bound(obj, w_descr, "m"), obj),
+                "an unmemoized default `__getattribute__` must still bind self",
+            );
+
+            // The companion admits the same receiver, and pushes `w_descr`
+            // unbound — which is what makes the NULL above a dropped `self`
+            // rather than a missed optimisation.  Last, because it memoizes.
+            let (_, _, fast_descr) =
+                crate::baseobjspace::load_method_fast_path(obj, "m").expect("fast path admits C.m");
+            assert!(std::ptr::eq(fast_descr, w_descr));
         }
     }
 
