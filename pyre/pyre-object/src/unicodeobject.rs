@@ -1876,20 +1876,25 @@ pub fn int_str_text(v: i64) -> String {
     v.to_string()
 }
 
-/// `ll_int2hex(r_uint, True)` (`ll_str.py`). `0x` plus lowercase digits
-/// of the magnitude. Only unsigned operands are collapsed onto this
-/// helper; Rust `{:#x}` on `u8`..`u64`/`usize` agrees on every value.
-pub fn int_hex_text(v: u64) -> String {
-    format!("0x{v:x}")
+/// `hex(i)` / `ll_int2hex(i, True)` (`ll_str.py`). Optional minus, then
+/// `0x`, then digits of the magnitude. Rust `{:#x}` on a signed value
+/// prints the two's-complement bit pattern (`-26` → `0xffffffffffffffe6`),
+/// which is not `hex()`.
+pub fn int_hex_text(v: i64) -> String {
+    let (sign, mag) = if v < 0 {
+        ("-", v.wrapping_neg() as u64)
+    } else {
+        ("", v as u64)
+    };
+    format!("{sign}0x{mag:x}")
 }
 
 /// Residual `hex(i)` for an exact machine int. Same wrapping as
 /// [`jit_int_str`]: `ll_int2hex` is elidable but the unicode box is a
 /// fresh allocation, so the call is `CanRaise` rather than elidable.
-/// The `i64` ABI carries the unsigned magnitude's bit pattern.
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_int_hex(v: i64) -> i64 {
-    w_str_new_managed(&int_hex_text(v as u64)) as i64
+    w_str_new_managed(&int_hex_text(v)) as i64
 }
 
 #[cfg(test)]
@@ -2189,15 +2194,10 @@ mod tests {
         unsafe {
             assert_eq!(w_str_get_value(jit_int_hex(0) as PyObjectRef), "0x0");
             assert_eq!(w_str_get_value(jit_int_hex(26) as PyObjectRef), "0x1a");
-            // `extern "C" fn(i64)` ABI: a high-bit unsigned magnitude is
-            // the two's-complement bit pattern, not a signed `hex()`.
-            assert_eq!(
-                w_str_get_value(jit_int_hex(-26) as PyObjectRef),
-                "0xffffffffffffffe6",
-            );
+            assert_eq!(w_str_get_value(jit_int_hex(-26) as PyObjectRef), "-0x1a");
             assert_eq!(
                 w_str_get_value(jit_int_hex(i64::MIN) as PyObjectRef),
-                "0x8000000000000000",
+                "-0x8000000000000000",
             );
         }
     }

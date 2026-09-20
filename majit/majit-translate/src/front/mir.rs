@@ -37157,10 +37157,10 @@ struct SingleArgFmtChainNav {
     /// The argument tuple is exactly Rust `(u8,)`; used by the LowerHex
     /// parity collapse to prove that two hexadecimal digits cannot truncate.
     context_is_u8: bool,
-    /// The argument tuple is a single unsigned integer (`u8`..`u64`/`usize`).
-    /// `format!("{:#x}", n)` matches `ll_int2hex(r_uint, True)` only for
-    /// those types; a signed or unknown operand must not collapse to `hex`.
-    context_is_unsigned: bool,
+    /// The argument tuple is a single machine integer (`i8`..`i64`/`isize`
+    /// or `u8`..`u64`/`usize`). `format!("{:#x}", n)` is `hex(n)` /
+    /// `ll_int2hex(i, True)` (`rint.py rtype_hex`).
+    context_is_int: bool,
     /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
     /// chain value the link forwarded onto a still-live value so no link
     /// references a deleted result var after the chain ops are removed.
@@ -37172,13 +37172,21 @@ struct SingleArgFmtChainNav {
     dead_bases: Vec<u64>,
 }
 
-/// Charon names a one-element unsigned integer tuple `Tuple<u8>` …
-/// `Tuple<usize>`. Rust `{:#x}` on those types agrees with
-/// `ll_int2hex(r_uint, True)` (`ll_str.py`) on every value.
-fn is_unsigned_int_tuple_ctor(name: &str) -> bool {
+/// Charon names a one-element integer tuple `Tuple<i32>` / `Tuple<u32>`
+/// and so on. `rtype_hex` feeds that word to `ll_int2hex(i, True)`.
+fn is_int_tuple_ctor(name: &str) -> bool {
     matches!(
         name,
-        "Tuple<u8>" | "Tuple<u16>" | "Tuple<u32>" | "Tuple<u64>" | "Tuple<usize>"
+        "Tuple<u8>"
+            | "Tuple<u16>"
+            | "Tuple<u32>"
+            | "Tuple<u64>"
+            | "Tuple<usize>"
+            | "Tuple<i8>"
+            | "Tuple<i16>"
+            | "Tuple<i32>"
+            | "Tuple<i64>"
+            | "Tuple<isize>"
     )
 }
 
@@ -37286,10 +37294,10 @@ fn navigate_single_arg_fmt_chain(
         _ => None,
     });
     // Charon names a one-element tuple `Tuple<T>`; the `{:02x}` byte
-    // collapse needs `T == u8`, the `{:#x}` hex collapse needs `T` in
-    // `u8`..`u64`/`usize` (`ll_int2hex` on `r_uint`).
+    // collapse needs `T == u8`, the `{:#x}` hex collapse needs a
+    // machine integer (`ll_int2hex`).
     let context_is_u8 = tuple_ctor_name == Some("Tuple<u8>");
-    let context_is_unsigned = tuple_ctor_name.is_some_and(is_unsigned_int_tuple_ctor);
+    let context_is_int = tuple_ctor_name.is_some_and(is_int_tuple_ctor);
 
     // Thread `context` straight through the slots the chain values used:
     // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
@@ -37317,7 +37325,7 @@ fn navigate_single_arg_fmt_chain(
         format_result,
         context,
         context_is_u8,
-        context_is_unsigned,
+        context_is_int,
         link_rewrites,
         dead_results,
         dead_bases,
@@ -37332,11 +37340,13 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
     let render_op = match nav.kind {
         FmtArgKind::Display if nav.placeholder.is_default() => "str",
-        // `hex(i)` / `ll_int2hex(r_uint, True)` — `format!("{:#x}", n)`
-        // only when `n` is unsigned. Rust `{:#x}` on a signed integer
-        // prints the two's-complement bit pattern, which is not `hex()`.
+        // `hex(i)` / `ll_int2hex(i, True)` — `format!("{:#x}", n)` on a
+        // machine int. `ll_int2hex` takes the sign of a Signed word
+        // (`i < 0` then `-` + magnitude); an Unsigned word is never
+        // negative. Rust `{:#x}` on signed is two's-complement bits,
+        // which is the format! shell this rewrite replaces.
         FmtArgKind::LowerHex
-            if nav.placeholder.is_lower_hex_alternate() && nav.context_is_unsigned =>
+            if nav.placeholder.is_lower_hex_alternate() && nav.context_is_int =>
         {
             "hex"
         }
