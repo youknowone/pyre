@@ -4962,6 +4962,27 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
     Ok(value)
 }
+/// `tupleobject.py W_AbstractTupleObject.descr_new`, exposed through
+/// `interp2app`.  A named gateway wrapper makes it a member of
+/// `BuiltinCode.func`'s PBC family, so a traced `tuple(x)` descends here from
+/// `typeobject.py descr_call` instead of leaving the whole call residual.
+pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    tuple_descr_new(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_tuple_descr_new: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_tuple_descr_new)
+        ),
+        func: __majit_wrap_tuple_descr_new,
+    };
+
 /// `enumerate.__new__(cls, iterable, start=0)` — `functional.py:253-275
 /// W_Enumerate.descr___new__`.  `builtin_enumerate` builds a fresh
 /// `W_Enumerate`; a subclass instance is the same object with `w_class`
@@ -10349,7 +10370,7 @@ fn init_tuple_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(tuple_descr_new),
+            make_new_descr(__majit_wrap_tuple_descr_new),
         )
     };
     unsafe {

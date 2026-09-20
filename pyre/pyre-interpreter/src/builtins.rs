@@ -3341,7 +3341,7 @@ pub fn install_default_builtins(ns: PyObjectRef) {
         crate::typedef::gettypeobject(&pyre_object::functional::REVERSED_TYPE)
     });
     crate::module_ns_get_or_insert_with(ns, "sorted", || {
-        make_module_builtin_function("sorted", builtin_sorted)
+        make_module_builtin_function("sorted", __majit_wrap_builtin_sorted)
     });
     crate::module_ns_get_or_insert_with(ns, "iter", || {
         make_module_builtin_function("iter", builtin_iter)
@@ -19062,6 +19062,26 @@ pub(crate) fn builtin_reversed(args: &[PyObjectRef]) -> Result<PyObjectRef, crat
         crate::baseobjspace::object_functionstr_type_name(obj)
     )))
 }
+
+/// `functional.py sorted`, exposed through `interp2app`.  The named gateway
+/// wrapper makes it a member of `BuiltinCode.func`'s PBC family, so a traced
+/// `sorted(x)` descends into the body instead of staying a generic residual.
+pub fn __majit_wrap_builtin_sorted(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    builtin_sorted(args)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_builtin_sorted: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(__majit_wrap_builtin_sorted)
+        ),
+        func: __majit_wrap_builtin_sorted,
+    };
 
 /// `pypy/module/__builtin__/functional.py:328-340 builtin_sorted`
 /// parity:

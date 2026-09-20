@@ -9041,6 +9041,77 @@ unsafe fn lookup_instance_dunder_call(
     Some((method, w_class, version_tag))
 }
 
+/// `typeobject.py descr_call` for a class whose `__new__` is a builtin gateway
+/// and whose `__init__` is `object`'s: the whole of `type.__call__` is then the
+/// `__new__` call, which `try_walker_inline_builtin_call` enters with the class
+/// as its receiver.
+///
+/// `object.__init__` rejects surplus arguments only when `__new__` is
+/// `object`'s or `__init__` is overridden, and neither holds here, so the
+/// `__init__` half of `descr_call` has no effect to reproduce.  That is true of
+/// the class named at the call; `descr_call` looks `__init__` up on the type of
+/// what `__new__` returned.  A builtin `__new__` handed the exact class returns
+/// another type only through a conversion dunder of an argument (`__int__`,
+/// `__str__`, ...), so every argument is required to be an instance of a
+/// builtin type, which the caller pins.
+///
+/// # Safety
+/// `callable` and every entry of `args` must be valid objects.
+unsafe fn resolve_type_call_builtin_new(
+    callable: pyre_object::PyObjectRef,
+    args: &[ConcreteValue],
+) -> Option<pyre_object::PyObjectRef> {
+    if callable.is_null() || !unsafe { pyre_object::is_type(callable) } {
+        return None;
+    }
+    let w_metatype = pyre_interpreter::typedef::w_type();
+    let w_object = pyre_interpreter::typedef::w_object();
+    if w_object.is_null() || std::ptr::eq(callable, w_metatype) {
+        return None;
+    }
+    // A metaclass may supply its own `__call__`; only `type`'s is this shape.
+    if !std::ptr::eq(unsafe { (*callable).w_class }, w_metatype) {
+        return None;
+    }
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(callable) } == 0 {
+        return None;
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(callable)
+            || pyre_object::w_type_is_abstract(callable)
+            || pyre_object::typeobject::w_type_get_hasuserdel(callable)
+            || pyre_object::typeobject::w_type_has_vectorcall(callable)
+    } {
+        return None;
+    }
+    let tp_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__new__") }?;
+    let obj_new = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__new__") };
+    if Some(tp_new) == obj_new || !unsafe { pyre_interpreter::is_function_carrier(tp_new) } {
+        return None;
+    }
+    let tp_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(callable, "__init__") };
+    let obj_init = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_object, "__init__") };
+    if tp_init != obj_init {
+        return None;
+    }
+    for arg in args {
+        let ConcreteValue::Ref(arg) = arg else {
+            return None;
+        };
+        if arg.is_null() || *arg == pyre_object::PY_NULL {
+            return None;
+        }
+        let w_class = unsafe { (**arg).w_class };
+        if w_class.is_null()
+            || !unsafe { pyre_object::is_type(w_class) }
+            || unsafe { pyre_object::typeobject::w_type_is_heaptype(w_class) }
+        {
+            return None;
+        }
+    }
+    Some(tp_new)
+}
+
 /// [`lookup_instance_dunder_call`] narrowed to an app-level `__call__` the
 /// walker can inline.  A `__call__` that is not a plain inlinable function — a
 /// `classmethod`, another callable object — has no body to walk and declines

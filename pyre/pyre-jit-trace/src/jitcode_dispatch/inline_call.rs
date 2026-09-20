@@ -4539,21 +4539,32 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // class the way `space.lookup` promotes the type.  An app-level `__call__`
     // belongs to `try_walker_inline_call`'s `resolve_instance_dunder_call`.
     let mut instance_call_class = None;
+    // `descr_call` on a class whose `__new__` is a builtin gateway: the class
+    // is the wrapper's receiver.  See `resolve_type_call_builtin_new`.
+    let mut type_call_class = None;
     // A type-dict `__call__` installed from a `BuiltinCode` is a slot wrapper:
     // the same `Function` carrier under `SLOT_WRAPPER_TYPE`, so the carrier
     // test admits it and the `Function.code` read below is the same load.
-    let (callable, receiver) =
-        if method_form || bound_method || unsafe { pyre_interpreter::is_function(callable) } {
-            (callable, receiver)
-        } else {
-            match unsafe { lookup_instance_dunder_call(callable) } {
-                Some((method, w_class, version_tag)) => {
-                    instance_call_class = Some((w_class, version_tag));
-                    (method, Some(callable_operand))
+    let (callable, receiver) = if method_form
+        || bound_method
+        || unsafe { pyre_interpreter::is_function(callable) }
+    {
+        (callable, receiver)
+    } else {
+        match unsafe { lookup_instance_dunder_call(callable) } {
+            Some((method, w_class, version_tag)) => {
+                instance_call_class = Some((w_class, version_tag));
+                (method, Some(callable_operand))
+            }
+            None => match unsafe { resolve_type_call_builtin_new(callable, &arg_concretes[2..]) } {
+                Some(tp_new) => {
+                    type_call_class = Some(callable_operand);
+                    (tp_new, Some(callable_operand))
                 }
                 None => (callable, receiver),
-            }
-        };
+            },
+        }
+    };
     // Every decline below is silent otherwise, and they are not
     // interchangeable: `not is_function` is a class call or another
     // non-Function callable, while `no jitcode for address` names a builtin
@@ -4816,6 +4827,32 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         )?;
         callable_guard_op = ctx.trace_ctx.const_ref(callable as i64);
         receiver_op = Some(r_args[0]);
+    }
+    if let Some(w_type) = type_call_class {
+        // Pin the class and the type-dict version the `__new__` / `__init__`
+        // lookups resolved against, then each argument's class: the wrapper
+        // this call dispatches to is a constant of the pinned class.
+        let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[r_args[0], type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(r_args[0], type_const);
+        walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+        for (&arg, concrete) in r_args[2..].iter().zip(&arg_concretes[2..]) {
+            let ConcreteValue::Ref(concrete) = *concrete else {
+                unreachable!("resolve_type_call_builtin_new admits ref arguments only")
+            };
+            let w_class = unsafe { (*concrete).w_class };
+            let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+            walker_guard_exception_attr_slot(ctx, op.pc, arg, concrete, w_class, version_tag)?;
+        }
+        callable_guard_op = ctx.trace_ctx.const_ref(callable as i64);
+        receiver_op = Some(type_const);
     }
     if bound_method {
         // pypy/interpreter/function.py `_Method._immutable_fields_`:
