@@ -379,6 +379,30 @@ mod tests {
         }
     }
 
+    fn cast_ptr_to_int_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: [
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_ptr_to_int",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        }
+    }
+
+    fn string_len_target() -> CallTarget {
+        CallTarget::FunctionPath {
+            segments: ["pyre_object", "lowlevel_string", "bh_lowlevel_string_len"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
     fn residual_from_raw_parts(g: &FunctionGraph) -> bool {
         g.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(
