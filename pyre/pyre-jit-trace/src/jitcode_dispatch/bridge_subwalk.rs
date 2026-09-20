@@ -169,7 +169,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // references it (use-before-def).  Seed here — the trait's pre-guard
     // cache-once analog — so every guard snapshot reads a real EC OpRef.
     seed_execution_context_for_walk(sym, trace_ctx);
-    seed_standing_exception_for_walk(sym, trace_ctx);
+    seed_standing_exception_for_walk(sym, trace_ctx, jitcode_code, position);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`

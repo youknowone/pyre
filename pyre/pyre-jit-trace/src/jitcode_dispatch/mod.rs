@@ -5185,12 +5185,24 @@ fn dispatch_switch_id<Sym: WalkSym>(
 /// (`full_body_walk_trace`) is the caller, dispatching each JitCode
 /// opcode through this entry as it walks the body.
 ///
-/// Bridge exception seeding follows `pyjitpl.py`: only a
+/// Bridge exception seeding follows `pyjitpl.py`: a
 /// `ResumeGuardExcDescr`/`ResumeGuardCopiedExcDescr` source guard carries
-/// exception state into bridge tracing. Operand-stack values are never scanned
-/// to infer a standing exception.
-fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut TraceCtx) {
-    if trace_ctx.is_bridge_trace && !trace_ctx.bridge_source_is_exception_guard() {
+/// exception state into bridge tracing. A non-exception-guard bridge whose
+/// entry path reads `last_exc_value` before the next `catch_exception/L`
+/// (the `except E as name:` cleanup tail) seeds from the frame's current
+/// exception (`ExecutionContext.sys_exc_value`) instead — the same slot the
+/// original trace already reads. Operand-stack values are never scanned to
+/// infer a standing exception.
+fn seed_standing_exception_for_walk<Sym: WalkSym>(
+    sym: &mut Sym,
+    trace_ctx: &mut TraceCtx,
+    code: &[u8],
+    position: usize,
+) {
+    if trace_ctx.is_bridge_trace
+        && !trace_ctx.bridge_source_is_exception_guard()
+        && !reads_last_exc_before_next_catch(code, position)
+    {
         return;
     }
 
@@ -5248,12 +5260,34 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(sym: &mut Sym, trace_ctx: &mut
 
     let current = pyre_interpreter::eval::get_current_exception();
     if !current.is_null() && unsafe { pyre_object::is_exception(current) } {
-        let exc_box = trace_ctx.const_ref(current as i64);
+        let exc_box = standing_exc_box_from_current(sym, trace_ctx, current);
         sym.set_current_exc_value(current);
         sym.set_current_exc_box(exc_box);
         sym.set_last_exc_value(current);
         sym.set_last_exc_box(exc_box);
         sym.set_class_of_last_exc_is_const(true);
+    }
+}
+
+/// Box for a current-exception seed: a live `GetfieldGcR` of
+/// `ExecutionContext.sys_exc_value` on a bridge that has the portal EC red,
+/// otherwise a const-ref of the recording-time pointer.
+fn standing_exc_box_from_current<Sym: WalkSym>(
+    sym: &Sym,
+    trace_ctx: &mut TraceCtx,
+    current: pyre_object::PyObjectRef,
+) -> OpRef {
+    let ec = sym.execution_context();
+    if trace_ctx.is_bridge_trace && !ec.is_none() {
+        let exc_box = trace_ctx.record_op_with_descr(
+            OpCode::GetfieldGcR,
+            &[ec],
+            crate::descr::ec_sys_exc_value_descr(),
+        );
+        trace_ctx.set_opref_concrete(exc_box, Value::Ref(majit_ir::GcRef(current as usize)));
+        exc_box
+    } else {
+        trace_ctx.const_ref(current as i64)
     }
 }
 
