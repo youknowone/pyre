@@ -182,10 +182,19 @@ impl WasmFrameData {
     pub fn set_savedata(&mut self, data: majit_ir::GcRef) {
         let was_nonzero = self.savedata != 0;
         let now_nonzero = !data.is_null();
-        self.savedata = data.0 as i64;
+        let mut data_slot = data.0 as i64;
         if let Some(jf) = self.origin_jf {
-            unsafe { (*jf).jf_savedata = data.0 };
+            let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut data_slot));
+            }
+            if crate::wasm_gc_owns_object(jf as usize) {
+                crate::wasm_active_gc_write_barrier(majit_ir::GcRef(jf as usize));
+            }
+            majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+            unsafe { (*jf).jf_savedata = data_slot as usize };
         }
+        self.savedata = data_slot;
         if was_nonzero == now_nonzero {
             return;
         }

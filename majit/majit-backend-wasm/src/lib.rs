@@ -2565,7 +2565,7 @@ fn wasm_active_gc_write_barrier_before_move(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.writebarrier_before_move(obj));
 }
 
-fn wasm_active_gc_write_barrier(obj: GcRef) {
+pub(crate) fn wasm_active_gc_write_barrier(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.write_barrier(obj));
 }
 
@@ -2574,7 +2574,7 @@ fn wasm_active_gc_write_barrier(obj: GcRef) {
 /// This query can fire reentrantly from an extra-root walker mid-collection
 /// (the interpreter-safepoint major holds the box's mutable borrow while
 /// asking whether a slot is GC-managed), so both arms are read-only.
-fn wasm_gc_owns_object(addr: usize) -> bool {
+pub(crate) fn wasm_gc_owns_object(addr: usize) -> bool {
     if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.is_managed_heap_object(addr)) {
         return r;
     }

@@ -3149,7 +3149,17 @@ pub fn set_savedata_ref_on_deadframe(
     let jf = frame
         .as_jitframe_mut()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    jf.set_savedata_ref(data);
+    // llmodel.py set_savedata_ref is a GCREF store. Root `data` across
+    // the barrier so a moving collection forwards AllVirtuals before
+    // the field write.
+    let mut data_slot = data.0 as i64;
+    let depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(std::slice::from_mut(&mut data_slot));
+    }
+    majit_gc::gc_write_barrier(jf.jf_gcref());
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(depth);
+    jf.set_savedata_ref(GcRef(data_slot as usize));
     Ok(())
 }
 
