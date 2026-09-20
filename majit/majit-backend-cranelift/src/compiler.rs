@@ -27192,6 +27192,34 @@ mod tests {
     // Caller uses CallAssemblerR and gets the force_token result.
 
     #[test]
+    fn test_guard_not_forced_2_keeps_failargs_after_finish() {
+        // runner_test.py `test_guard_not_forced_2`: force a returned token,
+        // not just a token inside a still-running CALL_MAY_FORCE. FINISH's
+        // result slot must not overwrite the guard's frame locations.
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let guard = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::int_op(2))]);
+        let ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                2,
+            ),
+            mk_op(OpCode::ForceToken, &[], 3),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9017);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let frame = backend.execute_token(&token, &[Value::Int(20), Value::Int(10)]);
+        let force_token = backend.get_ref_value(&frame, 0);
+        assert!(!force_token.is_null());
+        let forced = force_token_to_dead_frame(force_token);
+        assert_eq!(get_int_from_deadframe(&forced, 0).unwrap(), 30);
+    }
+
+    #[test]
     fn test_all_guards_have_recovery_layout() {
         let mut backend = CraneliftBackend::new();
 
