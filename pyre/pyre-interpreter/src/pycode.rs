@@ -3263,10 +3263,11 @@ unsafe fn realize_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef
 /// `pyopcode.py getname_w(index) -> self.getcode().co_names_w[index]`
 /// — the one wrapped name this code object holds at `idx`.
 ///
-/// PyPy fills `co_names_w` in the constructor (`_immutable_fields_
-/// co_names_w[*]`), so this is an array read the trace records. Pyre
-/// realizes a slot on first demand; a filled slot is immortal and the
-/// load is the same read. The intern/CAS miss stays residual.
+/// Look-inside, same shape as [`w_code_const`]: the filled-slot load is
+/// the array read the trace records (`_immutable_fields_ co_names_w[*]`).
+/// First-demand intern is only the empty-slot arm and stays off the
+/// jitted graph (`we_are_jitted` folds true, so [`w_code_realize_name_w`]
+/// is dead).
 ///
 /// Returns `PY_NULL` when the enclosing code or the slot cannot be resolved
 /// (test fixtures and gateway builtins carry no name table); callers fall back
@@ -3275,26 +3276,29 @@ unsafe fn realize_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef
 /// # Safety
 /// `w_code_obj` must point to a valid `PyCode`.
 pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
-    let existing = unsafe { w_code_peek_name_w(w_code_obj, idx) };
-    if !existing.is_null() {
-        return existing;
-    }
-    unsafe { w_code_realize_name_w(w_code_obj, idx) }
-}
-
-unsafe fn w_code_peek_name_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     if w_code_obj.is_null() {
         return pyre_object::pyobject::PY_NULL;
     }
     let w_code = unsafe { &*(w_code_obj as *const PyCode) };
     if w_code.co_names_w.is_null() {
-        return pyre_object::pyobject::PY_NULL;
+        return if majit_rlib::jit::we_are_jitted() {
+            pyre_object::pyobject::PY_NULL
+        } else {
+            unsafe { w_code_realize_name_w(w_code_obj, idx) }
+        };
     }
     let slot_table = unsafe { &*w_code.co_names_w };
-    let Some(slot) = slot_table.get(idx) else {
+    if idx >= slot_table.len() {
         return pyre_object::pyobject::PY_NULL;
-    };
-    slot.load(std::sync::atomic::Ordering::Acquire)
+    }
+    let existing = slot_table[idx].load(std::sync::atomic::Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    if majit_rlib::jit::we_are_jitted() {
+        return pyre_object::pyobject::PY_NULL;
+    }
+    unsafe { w_code_realize_name_w(w_code_obj, idx) }
 }
 
 /// First-demand intern into `co_names_w[idx]`. Residual: intern and the
