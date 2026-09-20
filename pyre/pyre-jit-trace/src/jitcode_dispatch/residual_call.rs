@@ -32,6 +32,46 @@ fn fnaddr_set(pred: impl Fn(&str) -> bool) -> std::collections::HashSet<i64> {
         .collect()
 }
 
+/// Address a walker fold compares a residual's funcbox against.
+///
+/// The JitCode constant is patched from `jit_trace_fnaddrs` (`fnaddr_for_target`
+/// / `direct_funcptr_value`, then `patch_constants_i_fnaddrs`), so the match
+/// must use [`crate::runtime_fnaddr_patch::runtime_fnaddr_by_path`] rather than
+/// a second `fn as usize`: wasm32 table slots are not stable across cast sites.
+///
+/// `None` on every path falls back to `raw` so an unpublished name cannot
+/// silently disable the fold on native, where the two casts agree. An
+/// unpublished path is a unit-test failure, not a production decline.
+fn walker_published_fnaddr(paths: &[&'static str], raw: i64) -> i64 {
+    paths
+        .iter()
+        .copied()
+        .find_map(crate::runtime_fnaddr_patch::runtime_fnaddr_by_path)
+        .unwrap_or(raw)
+}
+
+/// `cpa3` publishes both spellings from one `f as *const ()`; the codewriter
+/// lookup for `exc_info_tuple`'s call is the module-qualified path (Charon
+/// `name_path` keeps the crate root; `target_to_path` returns 3+-segment
+/// `FunctionPath`s verbatim; `register_macro_helper_trace_fnaddr` binds that
+/// unstripped spelling). Accept either published address.
+static JIT_W_TUPLE3_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    walker_published_fnaddr(
+        &[
+            "pyre_object::tupleobject::jit_w_tuple3",
+            "pyre_object::jit_w_tuple3",
+        ],
+        pyre_object::tupleobject::jit_w_tuple3 as *const () as usize as i64,
+    )
+});
+
+static TAKE_LAST_EXEC_CTX_FNADDR: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+    walker_published_fnaddr(
+        &["pyre_interpreter::call::take_last_exec_ctx"],
+        pyre_interpreter::call::take_last_exec_ctx as *const () as usize as i64,
+    )
+});
+
 /// Residuals whose registered path names a `bigint` helper: their Ref slots
 /// carry `*mut BigInt` payloads, not `PyObject`s.
 static BIGINT_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
@@ -6992,9 +7032,7 @@ fn try_walker_lower_getexecutioncontext<Sym: WalkSym>(
     let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr) else {
         return Ok(None);
     };
-    let take_last_exec_ctx =
-        pyre_interpreter::call::take_last_exec_ctx as *const () as usize as i64;
-    if funcaddr != take_last_exec_ctx {
+    if funcaddr != *TAKE_LAST_EXEC_CTX_FNADDR {
         return Ok(None);
     }
 
@@ -7051,8 +7089,7 @@ fn try_walker_lower_jit_w_tuple3<Sym: WalkSym>(
     let Some(majit_ir::Value::Int(funcaddr)) = ctx.trace_ctx.box_value(funcptr) else {
         return Ok(None);
     };
-    let jit_w_tuple3 = pyre_object::tupleobject::jit_w_tuple3 as *const () as usize as i64;
-    if funcaddr != jit_w_tuple3 {
+    if funcaddr != *JIT_W_TUPLE3_FNADDR {
         return Ok(None);
     }
     let a = r_args[0];
@@ -7193,7 +7230,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && matches!(
             ctx.trace_ctx.box_value(funcptr),
             Some(majit_ir::Value::Int(funcaddr))
-                if funcaddr == pyre_object::tupleobject::jit_w_tuple3 as *const () as usize as i64
+                if funcaddr == *JIT_W_TUPLE3_FNADDR
         )
         && spec_gate(SpecFold::JitWTuple3, || {
             try_walker_lower_jit_w_tuple3(ctx, op.pc, funcptr, &r_args, dst_bank, dst)

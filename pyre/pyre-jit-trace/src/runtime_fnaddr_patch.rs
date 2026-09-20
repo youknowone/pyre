@@ -755,4 +755,29 @@ mod tests {
         let cpu = crate::pyre_cpu::PyreCpu::new();
         assert_eq!(cpu.bh_strlen(GcRef(addr as usize)), Some(0));
     }
+
+    /// Walker folds that recognise a residual by callee compare against this
+    /// map. An unpublished path would silently disable the fold on wasm32
+    /// (and, without the raw-cast fallback, on native too).
+    #[test]
+    fn runtime_fnaddr_by_path_resolves_walker_residual_fold_callees() {
+        let module = runtime_fnaddr_by_path("pyre_object::tupleobject::jit_w_tuple3");
+        let alias = runtime_fnaddr_by_path("pyre_object::jit_w_tuple3");
+        assert!(
+            module.is_some(),
+            "pyre_object::tupleobject::jit_w_tuple3 must be published in jit_trace_fnaddrs"
+        );
+        assert!(
+            alias.is_some(),
+            "pyre_object::jit_w_tuple3 must be published in jit_trace_fnaddrs"
+        );
+        assert_eq!(
+            module, alias,
+            "cpa3 publishes both jit_w_tuple3 spellings from one fn item"
+        );
+        assert!(
+            runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
+            "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
+        );
+    }
 }
