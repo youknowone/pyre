@@ -13,12 +13,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use wasmi::{
-    AsContext, AsContextMut, Caller, Config, Engine, Extern, Func, Linker, Memory, Module, Ref,
-    Store, Table, Val, ValType, F32, F64,
+    AsContext, AsContextMut, Caller, Config, Engine, Extern, F32, F64, Func, Linker, Memory,
+    Module, Ref, Store, Table, Val, ValType,
 };
 
-use crate::host_path::{guest_path_to_host, host_path_to_guest};
 use crate::CALL_RESULT_OFS;
+use crate::host_path::{guest_path_to_host, host_path_to_guest};
 
 /// Per-store host state, mirroring the wasmtime path's `Host`. wasmi needs the
 /// engine handle stored too, because trace modules are compiled from inside an
@@ -39,8 +39,7 @@ fn estr(e: impl std::fmt::Display) -> String {
 
 /// Reported when wasmi's translator declines a main-module function. Not a pyre
 /// bug; the program is runnable under wasmtime.
-const WASMI_TRANSLATOR_DECLINE: &str =
-    "wasmi could not translate this module (cmp+branch fusion assertion in wasmi 1.x); \
+const WASMI_TRANSLATOR_DECLINE: &str = "wasmi could not translate this module (cmp+branch fusion assertion in wasmi 1.x); \
      run this program with `--engine wasmtime`";
 
 /// True for panics raised by wasmi's own bytecode translator (e.g. the

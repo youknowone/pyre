@@ -333,7 +333,7 @@ mod host_fs_provider {
         /// writing if it exceeds `cap`), or -1 if `path` is not a readable
         /// directory.
         fn host_list_dir(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32)
-            -> i64;
+        -> i64;
         /// Write the host's working directory into `[buf, buf+cap)`; return
         /// its byte length (without writing if it exceeds `cap`), or -1 if
         /// the host has none.
@@ -1217,7 +1217,7 @@ pub fn run_python(source: &str) -> String {
 #[cfg(feature = "wasm-host")]
 mod host_abi {
     use super::run_python_impl;
-    use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
+    use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 
     // Buffers crossing the boundary are allocated and freed through the
     // global allocator with a `Layout::array::<u8>(len)` derived purely

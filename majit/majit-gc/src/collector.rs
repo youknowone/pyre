@@ -332,10 +332,7 @@ fn env_var(varname: &str) -> Option<String> {
 #[cfg_attr(not(feature = "gc_stress"), allow(dead_code))]
 fn env_is_set(varname: &str) -> bool {
     std::env::var_os(varname).is_some()
-        || SUPPLIED_ENV
-            .read()
-            .iter()
-            .any(|(name, _)| name == varname)
+        || SUPPLIED_ENV.read().iter().any(|(name, _)| name == varname)
 }
 
 /// env.py `_read_float_and_factor_from_env`. Parse `varname` as a float
