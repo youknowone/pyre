@@ -25115,7 +25115,7 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 /// `Bool`) shares the `'int'` bank, `Ref` the `'ref'` bank, `Float` the
 /// `'float'` bank.  Non-value kinds (`Void` / `State` / `Unknown`) get a
 /// distinct discriminant so they never compare equal to a real bank.
-fn value_type_bank(ty: &ValueType) -> u8 {
+pub(crate) fn value_type_bank(ty: &ValueType) -> u8 {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool => 0,
         ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 1,
