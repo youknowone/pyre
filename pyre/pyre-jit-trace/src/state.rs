@@ -15400,10 +15400,16 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 w_globals,
                 execution_context,
                 PY_NULL,
-                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ),
         );
         drop(arg_roots);
+        // A `new_boxed` fallback frame is freed by the `drop(frame)` below;
+        // decline rather than stamp a pointer that is about to dangle, as the
+        // recording-time frame further down does.
+        if !frame.is_gc_owned() {
+            return None;
+        }
         let concrete_frame_ptr = frame.as_mut_ptr();
         ctx.set_opref_concrete(
             frame_vable,
@@ -15473,7 +15479,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
             current_globals,
             execution_context,
             current_closure,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ),
     );
     // The `drop(concrete_frame)` below relinquishes only the host handle for a
