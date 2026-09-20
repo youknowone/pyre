@@ -8779,9 +8779,9 @@ impl DeadFrameRefRoots {
     /// `values` must stay alive and at a fixed address for the scope's whole
     /// lifetime; the collector writes forwarded addresses back through the
     /// registered pointers.
-    pub unsafe fn enter(values: &[i64], is_ref: impl Fn(usize) -> bool) -> Self {
+    pub unsafe fn enter(values: &mut [i64], is_ref: impl Fn(usize) -> bool) -> Self {
         let base_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
-        let base = values.as_ptr() as *mut i64;
+        let base = values.as_mut_ptr();
         for index in 0..values.len() {
             if is_ref(index) {
                 // SAFETY: `index < values.len()`, and the caller pins the

@@ -7941,7 +7941,7 @@ fn drive_unpack_iterable_trace(
                 is_exception_exit,
                 fail_index,
                 has_storage,
-                values,
+                mut values,
                 exit_layout,
                 guard_exc,
             )) = meta
@@ -7992,7 +7992,7 @@ fn drive_unpack_iterable_trace(
             // compile.py:710-716 resume_in_blackhole: complete the in-flight
             // `next()`/`append` and run forward to the next merge point.
             let bh = resume_in_blackhole_from_exit_layout(
-                &values,
+                &mut values,
                 exit_layout
                     .as_deref()
                     .expect("a guard exit carrying resume storage carries its layout"),
@@ -11183,7 +11183,7 @@ fn handle_fail(
     should_bridge: bool,
     _owning_key: u64,
     exit_layout: &CompiledExitLayout,
-    raw_values: &[i64],
+    raw_values: &mut [i64],
     guard_exc: i64,
     _info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> HandleFailOutcome {
@@ -11429,7 +11429,7 @@ pub(crate) fn savedata_from_jitframe(
 // dont_look_inside: post-trace blackhole resume machinery.
 #[majit_macros::dont_look_inside]
 pub(crate) fn resume_in_blackhole_from_exit_layout(
-    raw_values: &[i64],
+    raw_values: &mut [i64],
     exit_layout: &CompiledExitLayout,
     guard_exc: i64,
     // `forced_guard_cache_owner` of the failing guard: the frame whose
@@ -11495,7 +11495,7 @@ pub(crate) fn resume_in_blackhole_from_exit_layout(
         let result = crate::call_jit::blackhole_resume_via_rd_numb(
             &storage.rd_numb,
             storage.rd_consts(),
-            majit_backend::FailArgSource::from(raw_values),
+            majit_backend::FailArgSource::from(&*raw_values),
             Some(&storage.rd_pendingfields),
             Some(&storage.rd_virtuals),
             Some(exit_layout.exit_types.as_slice()),
@@ -11705,7 +11705,7 @@ fn execute_assembler(
     // itself points into the evacuated (and debug-poisoned) frame.  PyPy roots
     // the frame object and lets its type tracer follow the locals-array field;
     // `FrameRoot` plus `pyframe_object_custom_trace` is that same ownership.
-    let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+    let mut outcome = driver.run_compiled_detailed_with_bridge_keyed(
         green_key,
         entry_pc,
         &mut jit_state,
@@ -11855,7 +11855,7 @@ fn execute_assembler(
             ref descr_arc,
             should_bridge,
             owning_key,
-            ref raw_values,
+            ref mut raw_values,
             ref exit_layout,
             guard_exc,
             savedata,
@@ -12218,7 +12218,7 @@ fn bound_reached(
     } else {
         None
     };
-    if let Some(outcome) = outcome {
+    if let Some(mut outcome) = outcome {
         // rstack.stack_check_slowpath → _StackOverflow parity: drain
         // the JIT-overflow flag the backend probe records when it
         // trips. The backend's prologue exits via the dedicated
@@ -12234,7 +12234,7 @@ fn bound_reached(
             ref descr_arc,
             should_bridge,
             owning_key,
-            ref raw_values,
+            ref mut raw_values,
             ref exit_layout,
             guard_exc,
             savedata,
@@ -12508,7 +12508,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // callees and exits through the same guards.
         let _topframeref_guard =
             TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
-        let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+        let mut outcome = driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             frame_root.frame().next_instr(),
             &mut jit_state,
@@ -12550,7 +12550,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             ref descr_arc,
             should_bridge,
             owning_key,
-            ref raw_values,
+            ref mut raw_values,
             ref exit_layout,
             guard_exc,
             savedata,

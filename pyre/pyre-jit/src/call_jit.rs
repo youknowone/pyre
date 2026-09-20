@@ -4565,14 +4565,14 @@ fn jit_ca_handle_guard_failure(
         // hands its stash to the blackhole hook via `CA_WALK_FINISHED_FRAME`
         // (`ResumeBlackhole`). A JUMP attach returns `CompiledContinue`
         // and `handle_fail` re-enters the portal instead of blackholing.
-        let raw_values: Vec<i64> = (0..n_fail_args)
+        let mut raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
         // The copy is not a JITFRAME: `jitframe_trace` cannot update it.
         // Root Ref slots for the same window `handle_fail` already covers
         // (`DeadFrameRefRoots` / `compute_gcmap`).
         let _deadframe_roots = unsafe {
-            majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+            majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
                 // Slot 0 is the virtualizable (PyFrame). It is a GC
                 // object even when `exit_types` has not yet classified
                 // it; a CA bridge walk that forces `f_locals` reads it
@@ -4842,7 +4842,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             descr_arc,
             green_key,
             exit_layout,
-            raw_values,
+            mut raw_values,
             guard_value_operand,
             mut guard_exc,
             savedata,
@@ -4855,7 +4855,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
             let _deadframe_roots = unsafe {
-                majit_metainterp::resume::DeadFrameRefRoots::enter(&raw_values, |index| {
+                majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
                     exit_layout.is_traced_ref_slot(index)
                 })
             };
@@ -4907,7 +4907,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 std::ptr::null()
             };
             let bh = crate::eval::resume_in_blackhole_from_exit_layout(
-                &raw_values,
+                &mut raw_values,
                 &exit_layout,
                 guard_exc,
                 forced_cache_owner,
