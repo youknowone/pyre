@@ -478,13 +478,6 @@ pub const PYFRAME_CALL_EFFECTS: &[CallEffectSpec] = &[
         },
         effect: CallEffectKind::Residual,
     },
-    CallEffectSpec {
-        target: CallTargetSpec::Method {
-            name: "on_iter_exhausted",
-            receiver_root: PYFRAME_CALL_OWNER_ROOT,
-        },
-        effect: CallEffectKind::Residual,
-    },
     // ── opcode_* free functions (FunctionPath targets) ──
     // These are called by OpcodeStepExecutor default methods.
     // Adding them here lets the classifier match at the default method

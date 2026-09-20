@@ -7083,11 +7083,28 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Err(DispatchError::ForceQuasiImmutable { pc: op.pc });
     }
 
+    // BuiltinCode.func is an indirect PBC target exactly like RPython's
+    // gateway wrappers.  Enter its generated JitCode before considering the
+    // user-function-only full-body walk below.
+    if let Some(inlined) = try_walker_inline_builtin_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        1,
+        &r_args,
+        call_descr,
+        foldable_runtime_helper,
+        dst_bank,
+        dst,
+    )? {
+        return Ok(inlined);
+    }
+
     // Cached `import math` / `from math import pi`: `_gcd_import` hit
-    // recorded as a non-forcing residual instead of CallMayForce through
-    // `__import__`.  PyPy's `test_import.test_import_in_function` wants
-    // `guard_not_invalidated` only; look-inside of the wrapper is still
-    // refused (un-lowered helpers), so the walker records the cache read.
+    // recorded as a non-forcing residual when look-inside of `__import__`
+    // is still refused.  Tried after the descent so a walkable wrapper
+    // produces the PyPy field-read shape instead of this CallR.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
@@ -7096,22 +7113,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })?
     {
         return Ok((outcome, op.next_pc));
-    }
-
-    // BuiltinCode.func is an indirect PBC target exactly like RPython's
-    // gateway wrappers.  Enter its generated JitCode before considering the
-    // user-function-only full-body walk below.
-    if let Some(inlined) = try_walker_inline_builtin_call(
-        ctx,
-        op,
-        code,
-        1,
-        &r_args,
-        foldable_runtime_helper,
-        dst_bank,
-        dst,
-    )? {
-        return Ok(inlined);
     }
 
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
@@ -8975,8 +8976,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         ctx,
         op,
         code,
+        funcptr,
         1 + i_width,
         &r_args,
+        call_descr,
         foldable_runtime_helper,
         dst_bank,
         dst,
@@ -9753,9 +9756,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         // the subscript an opaque residual.  The storage folds
                         // below are for builtin containers, which this
                         // declines.
-                        if let Some(inlined) = try_walker_inline_subscr_getitem(
-                            ctx, op, code, funcptr, &r_args, call_descr, dst, dst_bank,
-                        )? {
+                        if let Some(inlined) = spec_gate(SpecFold::SubscrUserGetitem, || {
+                            try_walker_inline_subscr_getitem(
+                                ctx,
+                                op,
+                                code,
+                                Some(funcptr),
+                                &r_args,
+                                call_descr,
+                                dst,
+                                dst_bank,
+                            )
+                        })? {
                             return Ok(inlined);
                         }
                         // Int-strategy miss: `dict.lookup` on dstorage +

@@ -95,11 +95,16 @@ pub mod frame_locals_proxy {
     /// every entry of `extra` as a `(key, value)` pair on top of the caller's
     /// bracket, and report how many.
     ///
-    /// Its own function, and deliberately UNHINTED: this loop is bounded by
-    /// the dict's length, which is red, where the slot scan it follows is
-    /// bounded by the green `locals_plus_names`.  `contains_loop` therefore
-    /// declines this graph and the extras walk stays one residual call.
-    fn pin_extra_locals_entries(extra: PyObjectRef) -> usize {
+    /// Pins into `roots` on purpose — a nested `push_roots` would rewind
+    /// those slots on drop before the caller could read them.  Deliberately
+    /// UNHINTED: this loop is bounded by the dict's length, which is red,
+    /// where the slot scan it follows is bounded by the green
+    /// `locals_plus_names`.  `contains_loop` therefore declines this graph
+    /// and the extras walk stays one residual call.
+    fn pin_extra_locals_entries(
+        roots: &pyre_object::gc_roots::RootScope,
+        extra: PyObjectRef,
+    ) -> usize {
         // `pin_root` itself is a forwarding query, so a sequential pin of
         // the remaining pairs would leave them unrooted across that
         // safepoint. Publish the whole snapshot first.
@@ -109,7 +114,7 @@ pub mod frame_locals_proxy {
             live.push(key);
             live.push(value);
         }
-        let _ = pyre_object::gc_roots::pin_roots(&live);
+        let _ = roots.pin_roots(&live);
         live.len() / 2
     }
 
@@ -438,9 +443,12 @@ pub mod frame_locals_proxy {
         ///
         /// Each pair is pinned as it is produced: a slot's key is a freshly
         /// allocated string, so an earlier pair left in a native `Vec` would
-        /// not survive a later name's allocation.  The caller owns the
-        /// bracket these pins live in and must not have pinned anything else
-        /// above its base, since the slots are addressed relative to it.
+        /// not survive a later name's allocation.  Pins into `roots` on
+        /// purpose — a nested `push_roots` would rewind those slots on
+        /// drop before the caller could read them.  The pairs start at the
+        /// bracket's top as this scan finds it, so a caller that pinned
+        /// something first reads its own entries from there rather than from
+        /// `roots.base()`.
         ///
         /// `@jit.unroll_safe` for the same reason as
         /// [`Self::locals_plus_value`]: the slot scan is bounded by
@@ -449,11 +457,15 @@ pub mod frame_locals_proxy {
         /// dict's length instead, so it lives in its own unhinted function
         /// and stays a residual call.
         #[majit_macros::unroll_safe]
-        fn pin_entries(&self) -> usize {
+        fn pin_entries(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
             let mut count = 0;
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             let code = self.frame().code();
+            // The first slot this scan claims. Reading it from the bracket
+            // rather than from `roots.base()` keeps the pair arithmetic below
+            // correct for a caller that had already pinned something.
+            let mut next_slot = roots.publish(&[]);
             // A plain loop rather than a closure over `self`, for the reason
             // [`PyFrame::frame_locals_proxy_snapshot`] gives.
             for (index, name, cell_slot) in locals_plus_names(code) {
@@ -474,18 +486,16 @@ pub mod frame_locals_proxy {
                 }
                 // The key allocates and the value does not, so claim the key's
                 // slot first, pin the value, and only then build the name.
-                let key_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(pyre_object::PY_NULL);
-                let _ = pyre_object::gc_roots::pin_root(value);
-                pyre_object::gc_roots::shadow_stack_set(
-                    key_slot,
-                    pyre_object::w_str_new_managed(name),
-                );
+                let key_slot = next_slot;
+                next_slot += 2;
+                let _ = roots.pin_root(pyre_object::PY_NULL);
+                let _ = roots.pin_root(value);
+                roots.set(key_slot, pyre_object::w_str_new_managed(name));
                 count += 1;
             }
             let extra = self.frame().get_extra_locals();
             if !extra.is_null() {
-                count += pin_extra_locals_entries(extra);
+                count += pin_extra_locals_entries(roots, extra);
             }
             count
         }
@@ -750,7 +760,7 @@ pub mod frame_locals_proxy {
             // hands that back; it does not build a cursor.
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
-            let count = self.pin_entries();
+            let count = self.pin_entries(&roots);
             let mut keys: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in (0..count).rev() {
                 keys.push(roots.get(base + index * 2));
@@ -759,17 +769,32 @@ pub mod frame_locals_proxy {
         }
 
         fn __contains__(&self, key: PyObjectRef) -> Result<bool, crate::PyError> {
+            // `framelocalsproxy_contains`: the first bound locals-plus slot
+            // whose name hashes and compares equal to `key`, else
+            // `f_extra_locals`.  Materializing the mapping allocated a string
+            // per bound local for a yes/no.
+            //
+            // `locals_plus_value` and the extras lookup both allocate, so
+            // reload the key from its root between them.
             let roots = pyre_object::gc_roots::push_roots();
             let key_slot = roots.base();
             let _ = roots.pin_root(key);
-            let mapping = self.mapping()?;
-            crate::baseobjspace::contains(mapping, roots.get(key_slot))
+            if self.locals_plus_value(roots.get(key_slot))?.is_some() {
+                return Ok(true);
+            }
+            let extra = self.frame().get_extra_locals();
+            if extra.is_null() {
+                return Ok(false);
+            }
+            let extra_slot = key_slot + 1;
+            let _ = roots.pin_root(extra);
+            crate::baseobjspace::contains(roots.get(extra_slot), roots.get(key_slot))
         }
 
         fn keys(&self) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
-            let count = self.pin_entries();
+            let count = self.pin_entries(&roots);
             let mut keys: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in 0..count {
                 keys.push(roots.get(base + index * 2));
@@ -780,7 +805,7 @@ pub mod frame_locals_proxy {
         fn values(&self) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.base();
-            let count = self.pin_entries();
+            let count = self.pin_entries(&roots);
             let mut values: Vec<PyObjectRef> = Vec::with_capacity(count);
             for index in 0..count {
                 values.push(roots.get(base + index * 2 + 1));
@@ -794,8 +819,8 @@ pub mod frame_locals_proxy {
             // the next iteration.  Publish both and read them back.
             let roots = pyre_object::gc_roots::push_roots();
             let pairs_base = roots.base();
-            let count = self.pin_entries();
-            let out_base = pyre_object::gc_roots::shadow_stack_len();
+            let count = self.pin_entries(&roots);
+            let out_base = roots.publish(&[]);
             for index in 0..count {
                 let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
                     roots.get(pairs_base + index * 2),
@@ -818,7 +843,18 @@ pub mod frame_locals_proxy {
             key: PyObjectRef,
             #[default(pyre_object::w_none())] default: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            self.call_mapping_method("get", &[key, default])
+            // `framelocalsproxy_get` is `framelocalsproxy_getitem` with a miss
+            // turned into `default`.  Routing through the snapshot dict paid a
+            // string per bound local for a single lookup.
+            let roots = pyre_object::gc_roots::push_roots();
+            let key_slot = roots.publish(&[key, default]);
+            roots.normalize(key_slot, 2);
+            let default_slot = key_slot + 1;
+            match self.__getitem__(roots.get(key_slot)) {
+                Ok(value) => Ok(value),
+                Err(err) if err.kind == crate::PyErrorKind::KeyError => Ok(roots.get(default_slot)),
+                Err(err) => Err(err),
+            }
         }
 
         fn update(&mut self, other: PyObjectRef) -> Result<(), crate::PyError> {
@@ -1224,10 +1260,12 @@ pub const FRAME_BLOCK_GC_TYPE_ID: u32 = 104;
 pub const GC_HEADER_SIZE: usize = majit_gc::header::GcHeader::SIZE;
 
 /// Ownership selected by the caller that decides a frame's lifetime.
-/// `FrameBox::new` call frames use `OldGenGc`; tracer-private snapshots use
-/// `StdAlloc` so their locals remain valid until deterministic `Drop`.
+/// Normal call frames use `NurseryGc`, matching `PyFrame.__init__`'s fresh
+/// `[None] * size`; frame-owned auxiliary snapshots use `OldGenGc`, and
+/// tracer-private snapshots use `StdAlloc` until deterministic `Drop`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameLocalsArrayAllocation {
+    NurseryGc,
     OldGenGc,
     StdAlloc,
 }
@@ -1289,24 +1327,34 @@ unsafe fn alloc_frame_locals_array(
     fill: pyre_object::PyObjectRef,
     allocation: FrameLocalsArrayAllocation,
 ) -> *mut FixedObjectArray {
-    if allocation == FrameLocalsArrayAllocation::OldGenGc {
-        let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
-            + len * std::mem::size_of::<pyre_object::PyObjectRef>();
-        let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+    let payload = pyre_object::FIXED_ARRAY_ITEMS_OFFSET
+        + len * std::mem::size_of::<pyre_object::PyObjectRef>();
+    let raw = match allocation {
+        FrameLocalsArrayAllocation::NurseryGc => pyre_object::gc_hook::GcAllocOutcome::from_hook(
+            pyre_object::gc_hook::try_gc_alloc(pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID, payload),
+        )
+        .allocated_or_abort(payload)
+        .unwrap_or(std::ptr::null_mut()),
+        FrameLocalsArrayAllocation::OldGenGc => pyre_object::gc_hook::try_gc_alloc_stable_raw(
             pyre_object::PY_OBJECT_ARRAY_GC_TYPE_ID,
             payload,
-        );
-        if !raw.is_null() {
-            let arr = raw as *mut FixedObjectArray;
-            unsafe {
-                (*arr).len = len;
-                let items = (*arr).items_mut_ptr();
-                for i in 0..len {
-                    items.add(i).write(fill);
-                }
+        ),
+        FrameLocalsArrayAllocation::StdAlloc => std::ptr::null_mut(),
+    };
+    if !raw.is_null() {
+        // Nursery memory is not zero-filled. The length and every item are
+        // written before the next collection point, so the array is never
+        // reachable from a root while it still holds allocator garbage; the
+        // caller publishes the completed array.
+        let arr = raw as *mut FixedObjectArray;
+        unsafe {
+            (*arr).len = len;
+            let items = (*arr).items_mut_ptr();
+            for i in 0..len {
+                items.add(i).write(fill);
             }
-            return arr;
         }
+        return arr;
     }
     unsafe { alloc_fixed_array_with_header(len, fill) }
 }
@@ -6167,11 +6215,12 @@ impl PyFrame {
         // slot is the only thing that keeps it off the next sweep. It joins the
         // bracket the call inputs already opened: its lifetime is the rest of
         // this function body, so it needs no owner of its own.
-        let _ = pyre_object::gc_roots::pin_root(locals_cells_stack_w as PyObjectRef);
+        let locals_idx = _roots.publish(&[locals_cells_stack_w as PyObjectRef]);
+        _roots.normalize(locals_idx, 1);
 
         {
             // Populate the freshly-allocated array via its mutable slice.
-            let arr = unsafe { &mut *locals_cells_stack_w };
+            let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
 
             // Bind positional arguments directly -- no intermediate Vec.
             let nargs = args.len().min(num_locals);
@@ -6179,10 +6228,9 @@ impl PyFrame {
                 arr[i] = _roots.get(args_base + i);
             }
 
-            // CPython 3.11+ `co_localsplusnames` unified slot layout:
-            // each cellvar that ALSO appears in varnames shares its
+            // Each cellvar that also appears in varnames shares its
             // varname slot (MAKE_CELL wraps the local). Only cellvars
-            // NOT in varnames take a fresh slot in the cell region.
+            // not in varnames take a fresh slot in the cell region.
             // Allocating cells for the overlap would shift freevar
             // indices and break LOAD_DEREF on `def repeat(n): def
             // wrap(fn): def inner(): return (n, fn)` style closures.
@@ -6192,11 +6240,14 @@ impl PyFrame {
                 let family = unsafe {
                     crate::pycode::w_code_cell_family(_roots.get(root_base), num_locals + i)
                 };
-                arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL, family);
+                let cell = pyre_object::w_cell_new(PY_NULL, family);
+                let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
+                arr[num_locals + i] = cell;
             }
             let closure = _roots.get(root_base + 2);
             if !closure.is_null() {
                 let nfreevars = code_ref.freevars.len();
+                let arr = unsafe { &mut *(_roots.get(locals_idx) as *mut FixedObjectArray) };
                 for i in 0..nfreevars {
                     let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
                     arr[num_locals + npure + i] = cell;
@@ -6205,8 +6256,9 @@ impl PyFrame {
         }
 
         // Stable frame-locals arrays are filled before their owning frame is
-        // published. `w_cell_new` uses the non-collecting old-gen allocator;
-        // remember the completed array before the next allocating operation.
+        // published. Reload after the cell allocations: the pin slot is the
+        // only root until the frame stores the array.
+        let locals_cells_stack_w = _roots.get(locals_idx) as *mut FixedObjectArray;
         remember_frame_locals_array(locals_cells_stack_w);
 
         let frame_stores_global = unsafe {
@@ -6238,15 +6290,22 @@ impl PyFrame {
         let mut frame = majit_metainterp::jit::hint_fresh_virtualizable(
             majit_metainterp::jit::hint_access_directly(frame),
         );
-        if frame_stores_global {
-            frame.set_w_globals(_roots.get(root_base + 1));
+        {
+            // The globals store and the scope binding allocate. A collection
+            // forwards the pin slot, not the field of this unboxed frame, so
+            // register the field's slot for the span, as `createframe_obj` does
+            // around `initialize_frame_scopes`.
+            let _locals_root = FrameLocalsRoot::new(&mut frame);
+            if frame_stores_global {
+                frame.set_w_globals(_roots.get(root_base + 1));
+            }
+            // This constructor bypasses `initialize_frame_scopes`, so apply the
+            // scope binding it would have done.  `FunctionType(co, globals)` over
+            // a module-level code object arrives here, and without the binding its
+            // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
+            frame.bind_unoptimized_locals_scope();
+            frame.init_cells();
         }
-        // This constructor bypasses `initialize_frame_scopes`, so apply the
-        // scope binding it would have done.  `FunctionType(co, globals)` over
-        // a module-level code object arrives here, and without the binding its
-        // `STORE_NAME`s land in a throwaway mapping instead of `globals`.
-        frame.bind_unoptimized_locals_scope();
-        frame.init_cells();
         frame
     }
 
@@ -6554,7 +6613,7 @@ pub fn createframe_obj(
         execution_context,
     ));
     let locals_cells_stack_w =
-        unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc) };
+        unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::NurseryGc) };
     let frame = PyFrame {
         ob_header: frame_ob_header(),
         pycode: _roots.get(root_base) as *const (),
@@ -6627,7 +6686,7 @@ fn finditem_str_object(
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let key_slot = object_slot + 1;
     let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     match crate::baseobjspace::getitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(v) if !v.is_null() => Ok(Some(v)),
@@ -6649,7 +6708,7 @@ fn setitem_str_object(
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
     let _ = roots.pin_root(value);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let key_slot = object_slot + 2;
     let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     crate::baseobjspace::setitem(
         roots.get(object_slot),
@@ -6665,7 +6724,7 @@ fn delitem_str_object(w_obj: PyObjectRef, name: &str) -> Result<(), crate::PyErr
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = roots.base();
     let _ = roots.pin_root(w_obj);
-    let key_slot = pyre_object::gc_roots::shadow_stack_len();
+    let key_slot = object_slot + 1;
     let _ = roots.pin_root(unsafe { pyre_object::w_str_new_managed(name) });
     match crate::baseobjspace::delitem(roots.get(object_slot), roots.get(key_slot)) {
         Ok(_) => Ok(()),
@@ -7115,5 +7174,110 @@ mod tests {
             !mark_compatible_stack(obj, iter),
             "Iterator target rejects Object source"
         );
+    }
+
+    fn nested_function_frame(source: &str) -> super::FrameBox {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let outer = crate::compile_exec(source).expect("compile");
+        let code = super::code_constants(&outer)
+            .iter()
+            .find_map(|constant| match constant {
+                crate::bytecode::ConstantData::Code { code } => Some(code.as_ref()),
+                _ => None,
+            })
+            .expect("nested function code");
+        assert!(
+            code.flags.contains(crate::CodeFlags::OPTIMIZED),
+            "function frames expose FrameLocalsProxy"
+        );
+        let w_code = crate::pycode::box_code_constant(code);
+        let w_globals = pyre_object::w_dict_new();
+        super::createframe_obj(w_code as *const (), w_globals, std::ptr::null(), None)
+            .expect("frame")
+    }
+
+    #[test]
+    fn frame_locals_proxy_contains_len_keys_getitem() {
+        // Bound slots answer membership, length, keys and subscript from the
+        // fast array; unbound slots are skipped; extras follow without
+        // replacing a bound name.
+        let mut frame = nested_function_frame("def f(a):\n    b = 1\n");
+        let bound = pyre_object::w_int_new(7);
+        frame.set_locals_w(0, bound);
+        let proxy = frame.fget_getdictscope().expect("proxy");
+        assert!(
+            super::frame_locals_proxy::viewed_frame(proxy).is_some(),
+            "optimized frame.f_locals is a FrameLocalsProxy"
+        );
+
+        let roots = pyre_object::gc_roots::push_roots();
+        let proxy_slot = roots.base();
+        let _ = roots.pin_root(proxy);
+        let _ = roots.pin_root(bound);
+        let a_slot = proxy_slot + 2;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("a"));
+        let b_slot = a_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("b"));
+        let missing_slot = b_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("missing"));
+
+        assert!(crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(a_slot)).unwrap());
+        assert!(!crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(b_slot)).unwrap());
+        assert!(
+            !crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(missing_slot)).unwrap()
+        );
+
+        let got = crate::baseobjspace::getitem(roots.get(proxy_slot), roots.get(a_slot)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(got) }, 7);
+
+        let len = crate::baseobjspace::len(roots.get(proxy_slot)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(len) }, 1);
+
+        let extra_key_slot = missing_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_str_new_managed("extra"));
+        let extra_val_slot = extra_key_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_int_new(9));
+        crate::baseobjspace::setitem(
+            roots.get(proxy_slot),
+            roots.get(extra_key_slot),
+            roots.get(extra_val_slot),
+        )
+        .unwrap();
+
+        assert!(
+            crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(extra_key_slot))
+                .unwrap()
+        );
+        let len = crate::baseobjspace::len(roots.get(proxy_slot)).unwrap();
+        assert_eq!(unsafe { pyre_object::w_int_get_value(len) }, 2);
+
+        let keys = crate::baseobjspace::call_method(roots.get(proxy_slot), "keys", &[]);
+        assert!(
+            !keys.is_null(),
+            "keys() failed: {:?}",
+            crate::call::take_call_error()
+        );
+        unsafe {
+            assert_eq!(pyre_object::w_list_len(keys), 2);
+            let k0 = pyre_object::w_list_getitem(keys, 0).unwrap();
+            let k1 = pyre_object::w_list_getitem(keys, 1).unwrap();
+            assert_eq!(pyre_object::w_str_get_wtf8(k0).as_bytes(), b"a");
+            assert_eq!(pyre_object::w_str_get_wtf8(k1).as_bytes(), b"extra");
+        }
+    }
+
+    #[test]
+    fn frame_locals_proxy_contains_rejects_unhashable() {
+        let mut frame = nested_function_frame("def f(a):\n    return a\n");
+        let proxy = frame.fget_getdictscope().expect("proxy");
+        let roots = pyre_object::gc_roots::push_roots();
+        let proxy_slot = roots.base();
+        let _ = roots.pin_root(proxy);
+        let key_slot = proxy_slot + 1;
+        let _ = roots.pin_root(pyre_object::w_list_new(Vec::new()));
+        let err = crate::baseobjspace::contains(roots.get(proxy_slot), roots.get(key_slot))
+            .expect_err("unhashable key");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
     }
 }

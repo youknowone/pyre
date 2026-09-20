@@ -5796,6 +5796,8 @@ impl<M: Clone> MetaInterp<M> {
                 // appended `virtualizable_boxes` onto `original_boxes`. Attach
                 // here so `Trace(max_num_inputargs)` sees the full cap.
                 ctx.attach_live_byte_recorder();
+                // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
+                ctx.seed_compile_and_run_once_merge_point();
                 // warmstate.py:439 `force_finish_trace=bool(cell.flags &
                 // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
                 // upstream (no clear in rpython/jit/metainterp/).
@@ -6119,6 +6121,10 @@ impl<M: Clone> MetaInterp<M> {
         // appended `virtualizable_boxes` onto `original_boxes`. Attach
         // here so `Trace(max_num_inputargs)` sees the full cap.
         ctx.attach_live_byte_recorder();
+        // pyjitpl.py `_compile_and_run_once` seeds the start boxes so
+        // the first matching header visit closes. Bridges go through
+        // `start_retrace_from_guard` and stay empty.
+        ctx.seed_compile_and_run_once_merge_point();
 
         // warmstate.py:439 `force_finish_trace=bool(cell.flags &
         // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky upstream.
@@ -8177,7 +8183,7 @@ impl<M: Clone> MetaInterp<M> {
                         // read-only after `setup_descrs`; `bridgeopt.py:155`
                         // indexes it blind.
                         simple_opt.all_descrs = unroll_opt.all_descrs.clone();
-                        // compile.py:272 `compile_simple_loop` — this retry is
+                        // compile.py `compile_simple_loop` — this retry is
                         // that call, so it optimizes as `SimpleCompileData` does.
                         simple_opt.simple_compile = true;
                         // history.py/261/307: `Const.type` /
@@ -9644,19 +9650,41 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
         // the rare missing-token path does not drain the active retrace.
-        let loop_jitcell_token = {
-            let green_key = match self.tracing.as_ref() {
-                Some(ctx) => ctx.green_key,
-                None => return false,
-            };
-            let Some(token) = self
-                .compiled_loops
-                .get(&green_key)
-                .and_then(|compiled| compiled.live_token())
-            else {
+        // pyjitpl.py `compile_retrace` `greenkey = original_boxes[:num_green_args]`
+        // is the MATCHED merge point's key, not the trace root.
+        let (green_key, loop_jitcell_token) = {
+            let Some(ctx) = self.tracing.as_ref() else {
                 return false;
             };
-            token
+            let Some(retrace_pos) = self.retracing_from else {
+                crate::debug::log_one(
+                    "jit-abort",
+                    "compile_retrace: entered with no retracing_from position",
+                );
+                return false;
+            };
+            let Some(mp) = ctx.merge_point_at_start(retrace_pos) else {
+                crate::debug::log_one(
+                    "jit-abort",
+                    "compile_retrace: no merge point at retracing_from start \
+                     — declining rather than assembling an uncut trace",
+                );
+                return false;
+            };
+            let green_key = mp.green_key;
+            // compile.py `compile_retrace` `loop_jitcell_token = metainterp.get_procedure_token(greenkey)`
+            // — the warmstate cell, which rejects an invalidated token.
+            // `compiled.live_token()` upgrades the side-table Weak without
+            // that filter and disagrees exactly when the cell has lost
+            // its token.
+            let token = match mp.green_key_typed.as_ref() {
+                Some(typed) => self.warm_state.get_procedure_token_for_key(typed),
+                None => self.warm_state.get_procedure_token(green_key),
+            };
+            let Some(token) = token else {
+                return false;
+            };
+            (green_key, token)
         };
         let partial = match self.partial_trace.take() {
             Some(p) => p,
@@ -9693,8 +9721,6 @@ impl<M: Clone> MetaInterp<M> {
             call_pure_results,
             phase2_input_ops_seed,
         ) = {
-            let green_key = ctx.green_key;
-            let header_pc = ctx.header_pc;
             let driver_descriptor = ctx.driver_descriptor().cloned();
             // `compile.py:341-347` takes `start` as a parameter; there is no
             // upstream `compile_retrace` without one. Requiring it here rather
@@ -9708,9 +9734,9 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 return false;
             };
-            let retrace_merge_point = ctx.get_merge_point_at(green_key, header_pc).filter(|mp| {
-                mp.position == retrace_pos && mp.position.has_prefix_ops(ctx.num_inputargs())
-            });
+            let retrace_merge_point = ctx
+                .merge_point_at_start(retrace_pos)
+                .filter(|mp| mp.position.has_prefix_ops(ctx.num_inputargs()));
             // compile.py:347 `trace = metainterp.history.trace.cut_trace_from(
             // start, inputargs)` is UNCONDITIONAL. `start` is read once, at the
             // caller's single merge-point selection (pyjitpl.py:3019), and
@@ -9733,7 +9759,7 @@ impl<M: Clone> MetaInterp<M> {
             if retrace_merge_point.is_none() {
                 crate::debug::log_one(
                     "jit-abort",
-                    "compile_retrace: no merge point at header_pc for retracing_from \
+                    "compile_retrace: no merge point at retracing_from start \
                      — declining rather than assembling an uncut trace",
                 );
                 return false;
@@ -9764,11 +9790,10 @@ impl<M: Clone> MetaInterp<M> {
             let trace = if let Some((ref original_boxes, start)) = retrace_cut {
                 if crate::majit_log_enabled() {
                     eprintln!(
-                        "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={} header_pc={}",
+                        "[jit] cut_retrace_from: start.op_index={} original_boxes={} trace_ops={}",
                         start.op_index,
                         original_boxes.len(),
                         trace.ops.len(),
-                        header_pc,
                     );
                 }
                 // As in `compile_loop_body`: a declined cut cannot fall back to
@@ -9903,12 +9928,7 @@ impl<M: Clone> MetaInterp<M> {
             .and_then(|bridge| bridge.source_descr.as_fail_descr())
             .and_then(majit_backend::descr_owning_jct)
             .map(|source_jct| source_jct.number);
-        unroll_opt.retraced_count = self
-            .compiled_loops
-            .get(&green_key)
-            .and_then(|compiled| compiled.live_token())
-            .map(|token| token.get_retraced_count())
-            .unwrap_or(0);
+        unroll_opt.retraced_count = loop_jitcell_token.get_retraced_count();
         unroll_opt.retrace_limit = self.warm_state.retrace_limit();
         unroll_opt.max_retrace_guards = self.warm_state.max_retrace_guards();
         unroll_opt.callinfocollection = self.callinfocollection.clone();
@@ -13246,38 +13266,10 @@ impl<M: Clone> MetaInterp<M> {
     pub fn try_to_free_some_loops(&mut self) {
         let evicted = self.warm_state.memory_manager.next_generation();
         for token in evicted {
-            // model.py `cpu.free_loop_and_bridges` parity for the
-            // counter side: PyPy's `LoopToken.__del__` runs that
-            // routine, which on its way out bumps
-            // `cpu.tracker.total_freed_loops += 1` plus
-            // `total_freed_bridges += loop.bridges_count`.  Pyre routes
-            // both bumps through the backend's `CpuTotalTracker` Arc
-            // via `JitProfiler::inc_freed_loop` / `add_freed_bridges`
-            // (the profiler is rebound onto that Arc in
-            // `MetaInterp::new`).
-            //
-            // **TIMING DIVERGENCE.**  RPython fires `__del__` exactly
-            // when the GC collects the LoopToken — Rust's `Arc`
-            // cannot match that timing because the last strong ref
-            // may be held by a guard-failure path that hasn't dropped
-            // yet.  Pyre instead bumps the counters at memmgr
-            // eviction (memmgr.py `_kill_old_loops_now`), which is
-            // strictly upstream of `__del__` in PyPy: every evicted
-            // token will eventually `__del__`, but the counter is
-            // bumped at observe-time, not at the (later, unpredictable)
-            // Arc-drop time.  The observable difference is a small
-            // lead in the counter relative to actual memory release.
-            // `compiled_loop_token` is None before backend compile
-            // completes — never reachable on an evicted token, but
-            // guarded for safety.
-            let bridges = token
-                .compiled_loop_token()
-                .map(|clt| *clt.bridges_count.lock())
-                .unwrap_or(0);
-            self.staticdata.profiler.inc_freed_loop();
-            if bridges > 0 {
-                self.staticdata.profiler.add_freed_bridges(bridges);
-            }
+            // Counters move in `CompiledLoopToken::drop`
+            // (`model.py` `CompiledLoopToken.__del__`). This loop only
+            // retires the green-key side table whose metadata cannot
+            // live on the token (crate split).
             let gk = token.green_key();
             let Some(entry) = self.compiled_loops.get_mut(&gk) else {
                 continue;
@@ -16035,6 +16027,12 @@ impl<M: Clone> MetaInterp<M> {
                 return None;
             }
         };
+        // pyjitpl.py `handle_guard_failure` keeps tracing while
+        // `resumedescr.rd_loop_token.loop_token_wref()` is live.
+        // `get_procedure_token` is `compile.py compile_retrace` only —
+        // applying it here would refuse an ordinary bridge when the
+        // warm-state cell was cleared but the source descr still names
+        // a live token.
 
         let norm_tid = trace_id;
         let fail_descr = descr_arc

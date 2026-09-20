@@ -1877,8 +1877,11 @@ impl TraceCtx {
         green_key: u64,
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
-        let initial_position = recorder.get_position();
-        let green_boxes = GreenBox::from_recorder_inputargs(&recorder);
+        // pyjitpl.py `self.current_merge_points = []` at MetaInterp
+        // init and again in `handle_guard_failure`. The first header
+        // visit appends; a seed entry here made every scan look like a
+        // prior visit and forced a length filter in
+        // `same_greenkey`.
         TraceCtx {
             recorder,
             metainterp_sd,
@@ -1900,16 +1903,7 @@ impl TraceCtx {
             cut_inner_green_key: None,
             inline_loop_abort_pending: false,
             recursive_call_assembler_pending: None,
-            current_merge_points: vec![MergePoint {
-                green_key,
-                // This constructor is handed a bare `green_key` number and no
-                // greens, so there is no key to carry.
-                green_key_typed: None,
-                position: initial_position,
-                green_boxes,
-                header_pc: 0,
-                vable_ptr: 0,
-            }],
+            current_merge_points: Vec::new(),
             header_greens: None,
             close_greens: None,
             close_green_pc: None,
@@ -1964,13 +1958,6 @@ impl TraceCtx {
         green_key_values: GreenKey,
         metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
     ) -> Self {
-        let initial_position = recorder.get_position();
-        // Taken before `green_key_values` is moved into the struct literal
-        // below; the seeded merge point needs the same key.
-        let header_green_key = green_key_values.clone();
-        // RPython pyjitpl.py:2878: initial merge point types come from
-        // live_arg_boxes which carry actual types (INT/REF/FLOAT).
-        let green_boxes = GreenBox::from_recorder_inputargs(&recorder);
         TraceCtx {
             recorder,
             metainterp_sd,
@@ -1992,17 +1979,7 @@ impl TraceCtx {
             cut_inner_green_key: None,
             inline_loop_abort_pending: false,
             recursive_call_assembler_pending: None,
-            current_merge_points: vec![MergePoint {
-                green_key,
-                // The structured key this constructor is named for: the header
-                // it seeds is the trace's own, so the entry carries the same
-                // greens `green_key` was hashed from.
-                green_key_typed: Some(header_green_key),
-                position: initial_position,
-                green_boxes,
-                header_pc: 0,
-                vable_ptr: 0,
-            }],
+            current_merge_points: Vec::new(),
             header_greens: None,
             close_greens: None,
             close_green_pc: None,
@@ -6612,17 +6589,19 @@ mod tests {
 
     #[test]
     fn new_seeds_green_boxes_from_inputargs_without_a_type_vec() {
-        // GreenBox folds the parallel type list. Rebuilding
-        // `inputarg_types().to_vec()` + `Vec<OpRef>` in `TraceCtx::new`
-        // was two 128 B allocs on every `start_bridge_tracing`.
+        // `TraceCtx::new` does not seed (`pyjitpl.py` starts empty;
+        // bridges stay empty). Primary traces seed via
+        // `seed_compile_and_run_once_merge_point` (`pyjitpl.py` `_compile_and_run_once`).
         let mut recorder = Trace::new();
         let _i = recorder.record_input_arg(Type::Int);
         let _r = recorder.record_input_arg(Type::Ref);
-        let ctx = TraceCtx::new(
+        let mut ctx = TraceCtx::new(
             recorder,
             0,
             std::sync::Arc::new(crate::MetaInterpStaticData::new()),
         );
+        assert!(ctx.current_merge_points.is_empty());
+        ctx.seed_compile_and_run_once_merge_point();
         let boxes = &ctx.current_merge_points[0].green_boxes;
         assert_eq!(boxes.len(), 2);
         assert_eq!(boxes[0].ty, Type::Int);

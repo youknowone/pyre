@@ -1610,20 +1610,29 @@ pub fn is_true(obj: PyObjectRef) -> Result<bool, PyError> {
 /// (and by `is_true_slot` for an exact builtin that matched no by-layout fast
 /// path).  An inherited builtin `__bool__` is found here and takes priority
 /// over an overridden `__len__`.
-fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
+///
+/// Hidden: after a red `sys.modules` pointer the descent scan cannot
+/// prove `is_exact_builtin_instance`, and inlining this path reaches
+/// `get_and_call_function`, `space_index` closures, and the warning
+/// formatter (`__majit_stringbuilder_new`).
+#[majit_macros::dont_look_inside]
+pub(crate) fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
     if let Some(w_type) = crate::typedef::r#type(obj) {
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__bool__") } {
             let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
-            // The only instances of bool are `w_False` / `w_True`, so a
-            // non-bool result is a TypeError reporting the receiver's type
-            // (upstream's `%T` on `w_obj`).
+            // The only instances of bool are `w_False` / `w_True`, so any
+            // other box is the TypeError, and what it names is the type of
+            // what `__bool__` RETURNED.  The docstring above transcribes
+            // `%T` on `w_obj`, which is upstream's own slip -- it computes
+            // `w_restype` on the line before and then does not use it.
             if unsafe { is_bool(w_res) } {
                 return Ok(unsafe { w_bool_get_value(w_res) });
             }
-            return Err(PyError::type_error(format!(
-                "__bool__ should return bool, returned {}",
-                object_functionstr_type_name(obj),
-            )));
+            // Keep that `format!` off the look-inside graph:
+            // `__majit_stringbuilder_new` is an un-lowered helper, and a red
+            // `__bool__` result would otherwise decline every descent that has
+            // already executed an effect (the `__import__` `sys.modules` read).
+            return Err(bool_must_return_bool(w_res));
         }
         if let Some(w_descr) = unsafe { lookup_in_type(w_type.as_ptr(), "__len__") } {
             let w_res = unsafe { get_and_call_function(w_descr, obj, w_type.as_ptr(), &[]) }?;
@@ -1632,6 +1641,17 @@ fn is_true_lookup(obj: PyObjectRef) -> Result<bool, PyError> {
         }
     }
     Ok(true)
+}
+
+/// `descroperation.py` TypeError for a `__bool__` that did not return a bool,
+/// naming the type of the returned object.  The message allocates, so it stays
+/// off the look-inside graph.
+#[majit_macros::dont_look_inside]
+pub(crate) fn bool_must_return_bool(w_res: PyObjectRef) -> PyError {
+    PyError::type_error(format!(
+        "__bool__ should return bool, returned {}",
+        object_functionstr_type_name(w_res),
+    ))
 }
 
 /// Direct truthiness body for `is_true`: the by-layout fast paths for exact
@@ -5142,16 +5162,61 @@ pub fn finditem_str_named(
     nameindex: usize,
 ) -> Result<Option<PyObjectRef>, PyError> {
     if is_shortcut_dict(obj) {
-        let hash = named_key_hash(key, pycode, nameindex);
-        return unsafe {
-            pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash)
+        // `celldict.py ModuleDictStrategy.getitem_str`:
+        // `getdictvalue_no_unwrapping` + `unwrap_cell`.  No user `__eq__`,
+        // so the DictOperationGuard lock in `w_dict_getitem_str` is not
+        // load-bearing and would be an effect in front of the elidable
+        // `_getdictvalue_no_unwrapping_pure` walk.
+        let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(obj) };
+        if !strategy.is_null() {
+            return Ok(unsafe { (*strategy).getitem_str(obj, key) });
         }
-        .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)));
+        // `objspace.py StdObjSpace.finditem_str` — `w_obj.getitem_str(key)`
+        // with no DictOperationGuard.  The lock lives on the user-facing
+        // `w_dict_getitem_str` wrapper; taking it here is an effect in front
+        // of the strategy probe and residualises `_gcd_import`'s
+        // `sys.modules` read.  Under the JIT the compiled loop has already
+        // pinned the dict identity; the interpreter keeps the locked wrapper.
+        if majit_metainterp::jit::we_are_jitted() {
+            return Ok(unsafe {
+                pyre_object::dictmultiobject::w_dict_get_strategy(obj).getitem_str(obj, key)
+            });
+        }
+        return finditem_str_shortcut_interp(obj, key, pycode, nameindex);
     }
     // `wrapped_key` realizes the code object's name slot, or interns a fresh
-    // `w_str` for a caller that named none; either allocates.  Arguments
-    // evaluate left to right, so `obj` is read before that allocation and would
-    // reach `finditem` at its pre-collection address.
+    // `w_str` for a caller that named none; either allocates.  Keep this arm
+    // off the look-inside graph: after a red `sys.modules` pointer the
+    // descent scan cannot prove `is_shortcut_dict`, and inlining the wrap
+    // reaches `w_str_new_managed`'s un-lowered `__majit_stringbuilder_new`.
+    finditem_str_generic(obj, key, pycode, nameindex)
+}
+
+/// Interpreter-only shortcut-dict arm of [`finditem_str_named`]: hashed
+/// getitem plus the wrap-key hash-error recovery.  The wrap allocates, so
+/// the descent scan must not enter it after an effect.
+#[majit_macros::dont_look_inside]
+pub(crate) fn finditem_str_shortcut_interp(
+    obj: PyObjectRef,
+    key: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let hash = named_key_hash(key, pycode, nameindex);
+    unsafe { pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(obj, key, hash) }
+        .map_err(|_| take_pending_dict_key_error(wrapped_key(key, pycode, nameindex)))
+}
+
+/// `objspace.py StdObjSpace.finditem_str` generic arm: wrap the key and
+/// defer to `finditem`.  Hidden for the same reason as
+/// [`finditem_str_shortcut_interp`].
+#[majit_macros::dont_look_inside]
+pub(crate) fn finditem_str_generic(
+    obj: PyObjectRef,
+    key: &str,
+    pycode: PyObjectRef,
+    nameindex: usize,
+) -> Result<Option<PyObjectRef>, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(obj);
@@ -5451,6 +5516,50 @@ fn _len(obj: PyObjectRef) -> PyResult {
     len_slot(obj)
 }
 
+/// Resolve the `__len__` call [`_len`] dispatches without executing it.  The
+/// trace-side admission counterpart of [`getitem_fast_path`]: the caller pins
+/// the receiver's type and version tag, which is what makes the returned
+/// descriptor the one [`_len`] would have found.
+///
+/// [`subclass_special_override`] is the whole gate, so the receivers whose
+/// length is a layout read rather than a call — an exact builtin, and a
+/// subclass that only inherits its builtin `__len__` — return `None` and keep
+/// the [`len_slot`] path.
+///
+/// Everything [`len_w`] does with the result is [`len_result_tail`], which the
+/// caller owes in full.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn len_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    unsafe {
+        if w_obj.is_null() {
+            return None;
+        }
+        let (method, w_type) = subclass_special_override(w_obj, "__len__")?;
+        let version_tag = w_type_version_tag(w_type);
+        if version_tag == 0 {
+            return None;
+        }
+        Some((w_type, version_tag, method))
+    }
+}
+
+/// The tail of [`len_w`] after the `__len__` call: `space.index` over what it
+/// returned, then [`_check_len_result`] over that.
+///
+/// Split out of [`len_w`] so a caller that obtained the [`_len`] result by
+/// another route applies the same two checks to it.  `pyre-jit-trace`'s
+/// `operator_continuation` is that caller: a guard failure inside an inlined
+/// app-level `__len__` resumes into a level whose whole body is this
+/// function, which is the only way the operator's own checks survive the
+/// deopt.  `builtins.rs builtin_len` boxes the machine length it answers, so
+/// app-level `len()` is an exact `int` whatever `__len__` returned.
+pub fn len_result_tail(w_res: PyObjectRef) -> Result<i64, crate::PyError> {
+    let w_index = space_index(w_res)?;
+    _check_len_result(w_index)
+}
+
 /// `pypy/objspace/descroperation.py len` — preserve the wrapped
 /// integer returned by `space.index`, but validate negativity and overflow
 /// before exposing it to app-level `len()`.
@@ -5534,14 +5643,16 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
         // `r#type` so a true user instance, a W_Root type (e.g. `deque`), and
         // a class whose metaclass defines `__len__` (e.g. `EnumMeta.__len__`)
         // all dispatch correctly.
+        //
+        // `lookup` is the whole resolution: a special method is read off the
+        // type, never off the object.  A `getattr_str` fallback here answered
+        // `len(SomeClass)` with the class's OWN unbound `__len__` bound to the
+        // class — `len` of a class is a TypeError unless its METAclass defines
+        // the slot, which the lookup above already covers.
         if let Some(w_type) = crate::typedef::r#type(obj)
             && let Some(method) = lookup_in_type_where(w_type.as_ptr(), "__len__")
         {
             return get_and_call_function(method, obj, w_type.as_ptr(), &[]);
-        }
-        // Per-instance __len__ via the unified getattr path (live dict).
-        if let Ok(method) = getattr_str(obj, "__len__") {
-            return crate::builtins::call_and_check(method, &[obj]);
         }
         Err(PyError::type_error(format!(
             "object of type '{}' has no len()",
@@ -6085,6 +6196,11 @@ pub fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectRef) -> 
 /// reserved keys, and neither that type nor a Python subclass of it gives an
 /// instance a reachable `__dict__`, so nothing but those `str` keys is ever
 /// stored and the `unwrap_or` here reports no attribute rather than hiding one.
+/// Residual: `unwrap_or` and the mapdict `type_id` / `Wtf8` ctor sit
+/// behind a red `has_mapdict_storage` after `sys.modules`, which is the
+/// remaining `__import__` descent wall (`__majit_stringbuilder_new`,
+/// `W_*_USER_GC_TYPE_ID`, `Result.unwrap_or`).
+#[majit_macros::dont_look_inside]
 pub(crate) fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     getdictvalue(obj, name).unwrap_or(None)
 }
@@ -6124,6 +6240,19 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
             )
         };
     }
+    // `getdict` can run `_thread._local` Python and allocate.  After a
+    // red `has_mapdict_storage` the descent scan cannot prove the
+    // mapdict arm, so keep this fallback off the look-inside graph.
+    getdictvalue_via_dict(obj, name)
+}
+
+/// Non-mapdict arm of [`getdictvalue`]: materialise the instance dict
+/// and probe it.  Hidden for the same reason as [`is_true_lookup`].
+#[majit_macros::dont_look_inside]
+pub(crate) fn getdictvalue_via_dict(
+    obj: PyObjectRef,
+    name: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
     let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
         return Ok(None);
@@ -15924,9 +16053,7 @@ fn _check_len_result(w_int: PyObjectRef) -> Result<i64, crate::PyError> {
 /// before `_check_len_result` so `__index__` is consulted but `__int__`
 /// is NOT — matching PyPy's stricter contract.
 pub fn len_w(w_obj: PyObjectRef) -> Result<i64, crate::PyError> {
-    let w_res = _len(w_obj)?;
-    let w_index = space_index(w_res)?;
-    _check_len_result(w_index)
+    len_result_tail(_len(w_obj)?)
 }
 
 /// pypy/objspace/descroperation.py `_index` + line 622-627 `index`.

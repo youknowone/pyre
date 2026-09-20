@@ -17,7 +17,7 @@
 //! fn stack_effect(args: &[pyre_object::PyObjectRef])
 //!     -> Result<pyre_object::PyObjectRef, ::pyre_interpreter::PyError>
 //! {
-//!     let opcode: i64 = unsafe { pyre_object::w_int_get_value(args[0]) };
+//!     let opcode: i64 = pyre_interpreter::baseobjspace::gateway_int_w(args[0])?;
 //!     Ok(pyre_object::w_int_new(__stack_effect_user(opcode)))
 //! }
 //!
@@ -25,9 +25,9 @@
 //! ```
 //!
 //! Supported parameter types (per-position):
-//! * `i64` / `i32` / `u32` / `usize` — `w_int_get_value` + cast.
-//! * `f64` — `w_float_get_value`.
-//! * `bool` — `w_bool_get_value`.
+//! * `i64` / `i32` / `u32` / `usize` — `gateway_int_w` + cast.
+//! * `f64` — `float_w`.
+//! * `bool` — `is_true`.
 //! * `&str` — `str_utf8_w` (a lone surrogate raises `UnicodeEncodeError`).
 //! * `pyre_object::PyObjectRef` — passthrough (`args[i]`).
 //! * `&[pyre_object::PyObjectRef]` — passthrough of the whole slice (varargs).
@@ -740,9 +740,19 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
         }
         if let Some(seg) = p.path.segments.last() {
             let name = seg.ident.to_string();
+            // The scalar unwraps are the `@unwrap_spec` conversions, not raw
+            // payload reads: `int` is `space.gateway_int_w`, `float` is
+            // `space.float_w`, `bool` is `space.is_true`.  Reading the payload
+            // by layout instead would take an arbitrary object's first words
+            // as the value — `msvcrt.SetErrorMode("x")` handed a str's
+            // interior to the Win32 call and answered with it — where every
+            // one of these owes a `TypeError` for an argument that is not the
+            // type it declared.
             match name.as_str() {
                 "i64" => {
-                    return Ok(quote! { unsafe { ::pyre_object::w_int_get_value(args[#idx]) } });
+                    return Ok(quote! {
+                        ::pyre_interpreter::baseobjspace::gateway_int_w(args[#idx])?
+                    });
                 }
                 "i32" | "u32" | "usize" | "isize" | "u16" | "i16" | "u8" | "i8" => {
                     // Parenthesised so the cast composes inside `if/else`
@@ -750,15 +760,24 @@ fn unwrap_expr(ty: &Type, idx: usize) -> syn::Result<proc_macro2::TokenStream> {
                     // around the unwrap.  Without the parens,
                     // `if ... { unsafe{} as u32 } else { ... }` fails to
                     // parse because `as` doesn't accept a block-form LHS.
+                    //
+                    // The cast is the truncation `@unwrap_spec(x=int)` leaves
+                    // to the body; a parameter that owes the narrower type's
+                    // own `OverflowError` names `PyCInt` / `PyCNonNegInt`
+                    // instead.
                     return Ok(quote! {
-                        (unsafe { ::pyre_object::w_int_get_value(args[#idx]) } as #ty)
+                        (::pyre_interpreter::baseobjspace::gateway_int_w(args[#idx])? as #ty)
                     });
                 }
                 "f64" => {
-                    return Ok(quote! { unsafe { ::pyre_object::w_float_get_value(args[#idx]) } });
+                    return Ok(quote! {
+                        ::pyre_interpreter::baseobjspace::float_w(args[#idx])?
+                    });
                 }
                 "bool" => {
-                    return Ok(quote! { unsafe { ::pyre_object::w_bool_get_value(args[#idx]) } });
+                    return Ok(quote! {
+                        ::pyre_interpreter::baseobjspace::is_true(args[#idx])?
+                    });
                 }
                 _ => {}
             }

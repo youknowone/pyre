@@ -17,6 +17,55 @@
 use super::*;
 use majit_gc::GcAllocOutcome;
 
+/// GC-transformed residual body for `rbigint.add` on movable payloads.
+///
+/// The JIT stack map keeps the payload objects alive, while this generated
+/// boundary supplies the two live payload objects to the collecting list
+/// malloc inside `_x_add`/`_x_sub`; ordinary payload tracing updates their
+/// `_digits` edges.
+/// That is the `push_roots(livevars)` bracket which RPython inserts around the
+/// allocation after translating `rbigint.py:add`.
+#[inline]
+pub unsafe fn add_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
+    let mut roots = [majit_ir::GcRef::NULL; 2];
+    unsafe { (&*a).add_with_gc_roots(&*b, Some(&mut roots)) }
+}
+
+/// GC-transformed residual body for `rbigint.sub` on movable payloads.
+#[inline]
+pub unsafe fn sub_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
+    let mut roots = [majit_ir::GcRef::NULL; 2];
+    unsafe { (&*a).sub_with_gc_roots(&*b, Some(&mut roots)) }
+}
+
+/// GC-transformed residual body for `rbigint.mul` on movable payloads.
+#[inline]
+pub unsafe fn mul_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
+    let mut roots = [majit_ir::GcRef::NULL; 2];
+    unsafe { (&*a).mul_with_gc_roots(&*b, Some(&mut roots)) }
+}
+
+/// GC-transformed residual body for `rbigint.and_` on movable payloads.
+#[inline]
+pub unsafe fn and_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
+    let mut roots = [majit_ir::GcRef::NULL; 2];
+    unsafe { (&*a).and_with_gc_roots(&*b, Some(&mut roots)) }
+}
+
+/// GC-transformed residual body for `rbigint.or_` on movable payloads.
+#[inline]
+pub unsafe fn or_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
+    let mut roots = [majit_ir::GcRef::NULL; 2];
+    unsafe { (&*a).or_with_gc_roots(&*b, Some(&mut roots)) }
+}
+
+/// GC-transformed residual body for `rbigint.xor` on movable payloads.
+#[inline]
+pub unsafe fn xor_payloads_collecting(a: *const RBigInt, b: *const RBigInt) -> RBigInt {
+    let mut roots = [majit_ir::GcRef::NULL; 2];
+    unsafe { (&*a).xor_with_gc_roots(&*b, Some(&mut roots)) }
+}
+
 // ---- RBigIntGcRoot ----
 /// Address-stable GC root for a host-side, by-value `RBigInt`.
 ///

@@ -567,8 +567,8 @@ impl JitProfiler {
             .unwrap_or(0) as u64
     }
 
-    /// `cpu.tracker.total_freed_loops += 1` parity.  Fired from the
-    /// memory manager when an evicted token represents a root loop.
+    /// `cpu.tracker.total_freed_loops += 1` parity.  Production bumps
+    /// live in `CompiledLoopToken::drop`; this method remains for tests.
     /// Hits `self.cpu_tracker` so the paired backend (rebound via
     /// [`Self::set_cpu_tracker`]) and profiler share the same per-CPU
     /// instance.

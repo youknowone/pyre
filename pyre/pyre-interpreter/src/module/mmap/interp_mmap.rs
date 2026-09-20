@@ -1455,7 +1455,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                 }
                 mmap_check_exports(obj, "mmap can't resize with extant buffers exported.")?;
                 let (p, old_len) = mmap_ptr(obj)?;
-                let newsize = unsafe { pyre_object::w_int_get_value(args[1]) };
+                let newsize = crate::baseobjspace::gateway_int_w(args[1])?;
                 if newsize < 0 {
                     return Err(crate::PyError::value_error("new_size must be positive"));
                 }

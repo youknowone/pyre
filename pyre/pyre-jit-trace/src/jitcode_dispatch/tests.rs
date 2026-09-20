@@ -1141,33 +1141,26 @@ fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
 }
 
 #[test]
-fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
+fn builtin_wrapper_args_slice_names_the_object_gcarray_descr() {
+    // `cpu.arraydescrof(ARRAY)` is one descr per ARRAY: the wrapper's length
+    // and item reads of its `&[PyObjectRef]` argument name the descr the
+    // walker builds that array with, so its heap-cache seeds are hits.
     let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");
+    let expected = crate::state::pyobject_gcarray_descr().index();
     let first = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .next()
         .expect("wrapper first op");
     assert_eq!(first.key, "arraylen_gc/rd>i");
-    let len_pool_index =
-        wrapper.code[first.pc + 2] as usize | ((wrapper.code[first.pc + 3] as usize) << 8);
-    let len_descr_index = crate::jitcode_runtime::all_descr_refs()[len_pool_index].index();
-
-    let item_descr_index =
-        wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
-    assert_ne!(
-        item_descr_index, len_descr_index,
-        "Charon slice length and element descriptors are distinct cache keys"
-    );
+    assert_eq!(item_pool_descr_index(&wrapper.code, first.pc + 2), expected);
 
     let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| {
             op.key == "getarrayitem_gc_r/rid>r" && wrapper.code.get(op.pc + 1).copied() == Some(0)
         })
         .expect("wrapper getarrayitem(r0)");
-    let item_pool_index =
-        wrapper.code[getitem.pc + 3] as usize | ((wrapper.code[getitem.pc + 4] as usize) << 8);
     assert_eq!(
-        item_descr_index,
-        crate::jitcode_runtime::all_descr_refs()[item_pool_index].index()
+        item_pool_descr_index(&wrapper.code, getitem.pc + 3),
+        expected
     );
 }
 
@@ -1230,15 +1223,11 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
         "the receiver tests run before the argument preamble"
     );
 
-    let item_descr_index =
-        wrapper_args_item_descr_index(&wrapper.code).expect("wrapper item descriptor");
-    // Select by descr identity rather than by position: the length read names
-    // the array itself and the item read names its elements, so the two carry
-    // distinct heap-cache descriptors even though both index the same slice.
+    let args_descr_index = crate::state::pyobject_gcarray_descr().index();
     let getitem = crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .find(|op| {
             op.key == "getarrayitem_gc_r/rid>r"
-                && item_pool_descr_index(&wrapper.code, op.pc + 3) == item_descr_index
+                && item_pool_descr_index(&wrapper.code, op.pc + 3) == args_descr_index
         })
         .expect("wrapper argument-slice item read");
     let slice_reg = wrapper.code[getitem.pc + 1];
@@ -1252,8 +1241,7 @@ fn signature_bound_wrapper_reads_argument_slice_with_distinct_item_descr() {
     // splitter inlines far enough to read `args.len()` off the wrapper input
     // before the split: that read can share the slice's register once the
     // wrapper input is dead, and the first `arraylen_gc` in the code would
-    // then name it rather than the slice's.  `wrapper_args_item_descr_index`
-    // anchors on that first read for the same reason.
+    // then name it rather than the slice's.
     crate::jitcode_runtime::decoded_ops(&wrapper.code)
         .filter(|op| {
             op.key == "arraylen_gc/rd>i"
@@ -1358,6 +1346,33 @@ fn user_binop_forward_dunder_covers_fraction_arithmetic_without_inplace_shortcut
         user_binop_forward_dunder(BinaryOperator::InplaceTrueDivide),
         None
     );
+}
+
+#[test]
+fn user_binop_reflected_dunder_covers_fraction_arithmetic_without_inplace_shortcuts() {
+    use pyre_interpreter::bytecode::BinaryOperator;
+
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::Add),
+        Some("__radd__")
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::Subtract),
+        Some("__rsub__")
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::TrueDivide),
+        Some("__rtruediv__")
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::InplaceSubtract),
+        None
+    );
+    assert_eq!(
+        user_binop_reflected_dunder(BinaryOperator::InplaceTrueDivide),
+        None
+    );
+    assert_eq!(user_binop_reflected_dunder(BinaryOperator::Subscr), None);
 }
 
 #[test]
@@ -15293,13 +15308,16 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         0x02, 0x01, 0x02, // rr: len=2, [r1, r2]
         0x00, // rf: len=0
     ];
-    // Model the trace as having STARTED at this loop header, so the second
-    // arrival closes on the merge point the first arrival registered.  The
-    // arriving key is `make_green_key` at `(pycode, next_instr)` from the green
-    // concretes below.
-    let mut tc = TraceCtx::for_test_types_with_green_key(
-        &[Type::Ref],
-        crate::driver::make_green_key(0x1_0000 as *const (), 42, false),
+    // Production `_compile_and_run_once` seeds
+    // `current_merge_points = [(original_boxes, start)]`
+    // (`pyjitpl.py` `_compile_and_run_once`); the first matching header visit closes.
+    // Recorder inputargs are the two reds the header live-args carry.
+    let green_key = crate::driver::make_green_key(0x1_0000 as *const (), 42, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[Type::Ref, Type::Ref], green_key);
+    tc.seed_compile_and_run_once_merge_point();
+    assert!(
+        tc.has_merge_point_with_shape_assert(green_key, 2),
+        "seed must match header live-arg length so the first visit closes"
     );
     let next_instr = tc.const_int(42); // gi[0] = Python pc
     let pycode = tc.const_ref(0x1_0000); // gr[0] = PyCode ptr
@@ -15351,31 +15369,23 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         live_after_jit_pc: usize::MAX,
     };
 
-    // Arrival without a preceding `loop_header` stamp and with no
-    // recorded ops is a plain pass-through (pyjitpl.py):
-    // nothing registers, nothing closes.
+    // Arrival without a preceding `loop_header` stamp is a plain
+    // pass-through (pyjitpl.py): nothing closes.
     let (gated, gated_next) = step(&code, 0, &mut wc).expect("gated jit_merge_point must dispatch");
     assert_eq!(gated, DispatchOutcome::Continue);
     assert_eq!(gated_next, code.len());
 
-    // First crossing via a backward jump: `loop_header` stamped the
-    // per-trace flag (pyjitpl.py) — registers
-    // (key, [red0, red1]) and continues.
+    // First stamped crossing: the production seed already holds this
+    // key + red shape, so the visit closes (`pyjitpl.py` `_compile_and_run_once` /
+    // `:3018-3022`). The reds here are constants, so
+    // `remove_consts_and_duplicates` (pyjitpl.py) replaces each with a
+    // freshly recorded `same_as` op before the close — the jump args
+    // are runtime OpRefs wrapping the original const reds, not the consts.
     wc.trace_ctx.seen_loop_header_for_jdindex = 0;
     let (first, first_next) = step(&code, 0, &mut wc).expect("first jit_merge_point must dispatch");
-    assert_eq!(first, DispatchOutcome::Continue);
     assert_eq!(first_next, code.len());
-    // The stamp is consumed (pyjitpl.py).
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
-
-    // Second stamped crossing (same key + red shape): closes the loop.
-    // The reds here are constants, so `remove_consts_and_duplicates`
-    // (pyjitpl.py) replaces each with a freshly recorded
-    // `same_as` op before the close — the jump args are runtime
-    // OpRefs wrapping the original const reds, not the consts.
-    wc.trace_ctx.seen_loop_header_for_jdindex = 0;
-    let (second, _) = step(&code, 0, &mut wc).expect("second jit_merge_point must dispatch");
-    match second {
+    match first {
         DispatchOutcome::CloseLoop {
             jump_args,
             loop_header_pc,
@@ -15388,7 +15398,7 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
                 assert_eq!(wc.trace_ctx.get_opref_type(*arg), Some(majit_ir::Type::Ref));
             }
         }
-        other => panic!("expected CloseLoop, got {other:?}"),
+        other => panic!("expected CloseLoop from production seed, got {other:?}"),
     }
 }
 
@@ -15470,9 +15480,15 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         0x00, // rf
     ];
     let pycode_ptr = 0x1_0000usize;
-    let mut tc = TraceCtx::for_test_types_with_green_key(
-        &[Type::Ref],
-        crate::driver::make_green_key(pycode_ptr as *const (), 42, false),
+    let green_key = crate::driver::make_green_key(pycode_ptr as *const (), 42, false);
+    // Header live args are the reds only (none on this form). Seed the
+    // same empty shape production `_compile_and_run_once` seeds
+    // (`pyjitpl.py` `_compile_and_run_once`).
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
+    tc.seed_compile_and_run_once_merge_point();
+    assert!(
+        tc.has_merge_point_with_shape_assert(green_key, 0),
+        "seed must match header live-arg length so the first visit closes"
     );
     let next_instr = tc.const_int(42);
     let unused = tc.const_int(99);
@@ -15524,9 +15540,21 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     };
     wc.trace_ctx.seen_loop_header_for_jdindex = 0;
     let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int-form merge point must dispatch");
-    assert_eq!(outcome, DispatchOutcome::Continue);
     assert_eq!(next_pc, code.len());
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    match outcome {
+        DispatchOutcome::CloseLoop {
+            jump_args,
+            loop_header_pc,
+            ..
+        } => {
+            assert_eq!(loop_header_pc, 42);
+            assert_eq!(jump_args.len(), 0);
+        }
+        other => {
+            panic!("expected CloseLoop after resolving jdindex from the int bank, got {other:?}")
+        }
+    }
 }
 
 /// A green list with no concrete leading element cannot form the

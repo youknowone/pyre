@@ -10,6 +10,9 @@ const INTERPRETER_LLBC: &str = concat!(
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
 
+/// `dunder_import_absolute_head` is the empty-fromlist arm that holds
+/// `name.find('.')` and `name[:dotindex]`; `dunder_import` itself delegates
+/// to it and carries neither call.
 #[test]
 fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
     let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
@@ -17,14 +20,14 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
         &[llbc],
         HostStaticAddrs::default(),
         &["importing"],
-        &["dunder_import"],
+        &["dunder_import_absolute_head"],
     )
-    .expect("lower importing::dunder_import");
+    .expect("lower importing::dunder_import_absolute_head");
     let function = program
         .functions
         .iter()
-        .find(|f| f.name == "dunder_import")
-        .expect("dunder_import graph");
+        .find(|f| f.name == "dunder_import_absolute_head")
+        .expect("dunder_import_absolute_head graph");
 
     assert_eq!(
         program

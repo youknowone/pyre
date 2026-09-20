@@ -3864,6 +3864,19 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
     descr
 }
 
+/// The runtime's own descr for a list backing block named by its ARRAY
+/// identity.  The build-time descr pool consults this before minting, so
+/// the GC tid stamped here reaches the shared `_cache_array` slot first.
+pub(crate) fn runtime_gcarray_descr(array_type_id: &str) -> Option<DescrRef> {
+    use majit_translate::codewriter::jtransform as jt;
+    match array_type_id {
+        jt::LIST_INT_ITEMS_ARRAY => Some(int_gcarray_descr()),
+        jt::LIST_FLOAT_ITEMS_ARRAY => Some(float_gcarray_descr()),
+        jt::LIST_OBJ_ITEMS_ARRAY => Some(pyobject_gcarray_descr()),
+        _ => None,
+    }
+}
+
 /// `Ptr(GcArray(Signed))` — the `IntegerListStrategy` backing block
 /// (`erase([int])`). Length-prefixed `[capacity][i64...]`: `base_size` skips
 /// the capacity header so `GetarrayitemGcI(block, i)` lands on items[i], and
@@ -3871,13 +3884,14 @@ pub fn pyobject_gcarray_descr() -> DescrRef {
 /// the raw `int_array_descr`.
 pub(crate) fn int_gcarray_descr() -> DescrRef {
     let token = &pyre_object::TYPED_ITEMS_BLOCK_INT_TOKEN;
-    crate::descr::make_array_descr_with_type(
+    crate::descr::make_array_descr_with_full_id(
         token.base_size,
         token.item_size,
         pyre_object::gc_int_array_gc_type_id(),
         Some(token.len_offset),
         Type::Int,
         true,
+        Some(majit_translate::codewriter::jtransform::LIST_INT_ITEMS_ARRAY.to_string()),
     )
 }
 
@@ -3918,13 +3932,14 @@ pub(crate) fn mapdict_storage_gcarray_descr() -> DescrRef {
 /// (`erase([float])`). See [`int_gcarray_descr`].
 pub(crate) fn float_gcarray_descr() -> DescrRef {
     let token = &pyre_object::TYPED_ITEMS_BLOCK_FLOAT_TOKEN;
-    crate::descr::make_array_descr_with_type(
+    crate::descr::make_array_descr_with_full_id(
         token.base_size,
         token.item_size,
         pyre_object::gc_float_array_gc_type_id(),
         Some(token.len_offset),
         Type::Float,
         false,
+        Some(majit_translate::codewriter::jtransform::LIST_FLOAT_ITEMS_ARRAY.to_string()),
     )
 }
 
@@ -8389,6 +8404,16 @@ fn reconstruct_inline_recipe(
             nargs: 0,
             return_substitute: Some(instance),
         });
+    }
+    // An operator's tail (`crate::operator_continuation`) reconstructs no
+    // frame either, and unlike `descr_call`'s it cannot be carried out by
+    // substituting a box: its JIT-visible body is a CALL that has to run, over
+    // a value the callee has not returned yet.  The conservative blackhole
+    // resume runs it correctly, so decline the whole chain here -- named,
+    // rather than as the `NoCodeForJitcodeIndex` every check below would give
+    // it anyway.
+    if crate::operator_continuation::is_installed_level(frame.jitcode_index) {
+        decline!("OperatorTail");
     }
     let py_pc =
         crate::py_coord::resume_py_pc_for_jitcode_word(frame.jitcode_index, frame.pc) as usize;
@@ -15385,10 +15410,16 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 w_globals,
                 execution_context,
                 PY_NULL,
-                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+                pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ),
         );
         drop(arg_roots);
+        // A `new_boxed` fallback frame is freed by the `drop(frame)` below;
+        // decline rather than stamp a pointer that is about to dangle, as the
+        // recording-time frame further down does.
+        if !frame.is_gc_owned() {
+            return None;
+        }
         let concrete_frame_ptr = frame.as_mut_ptr();
         ctx.set_opref_concrete(
             frame_vable,
@@ -15458,7 +15489,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
             current_globals,
             execution_context,
             current_closure,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ),
     );
     // The `drop(concrete_frame)` below relinquishes only the host handle for a

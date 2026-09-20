@@ -354,6 +354,9 @@ pub enum VirtualInfo {
         start: Box<VirtualFieldSource>,
         length: Box<VirtualFieldSource>,
     },
+    /// resume.py `rd_virtuals = [None] * length` hole. Not a virtual;
+    /// `force_all_virtuals` skips it (`if rd_virtual is not None`).
+    Empty,
 }
 
 // `history.py:125 id(descr)` parity — descr identity via Arc::ptr_eq;
@@ -421,6 +424,7 @@ impl PartialEq for VirtualInfo {
                     items: b2,
                 },
             ) => opt_descr_arc_ptr_eq(a_descr, b_descr) && a_clear == b_clear && a2 == b2,
+            (VirtualInfo::Empty, VirtualInfo::Empty) => true,
             _ => false,
         }
     }
@@ -461,6 +465,7 @@ impl VirtualInfo {
                 length,
                 ..
             } => vec![source.as_ref(), start.as_ref(), length.as_ref()],
+            VirtualInfo::Empty => Vec::new(),
         }
     }
 
@@ -479,6 +484,7 @@ impl VirtualInfo {
             VirtualInfo::VUniPlain { .. } => ResumeVirtualKind::UniPlain,
             VirtualInfo::VUniConcat { .. } => ResumeVirtualKind::UniConcat,
             VirtualInfo::VUniSlice { .. } => ResumeVirtualKind::UniSlice,
+            VirtualInfo::Empty => ResumeVirtualKind::Hole,
         }
     }
 
@@ -593,6 +599,7 @@ impl VirtualInfo {
                 start: start.layout_summary(),
                 length: length.layout_summary(),
             },
+            VirtualInfo::Empty => ResumeVirtualLayoutSummary::Hole,
         }
     }
 }

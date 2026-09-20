@@ -81,12 +81,11 @@ pub struct CpuTotalTracker {
     /// `model.py:10` `total_compiled_bridges` — bumped by
     /// [`CompiledLoopToken::compiling_a_bridge`] before bridge assembly.
     pub total_compiled_bridges: AtomicUsize,
-    /// `model.py:11` `total_freed_loops` — bumped by the memory manager
-    /// (`memmgr.py:_kill_old_loops_now`) when an evicted token had no
-    /// attached bridges.
+    /// `model.py` `total_freed_loops` — bumped by
+    /// [`CompiledLoopToken`]'s `Drop` (`model.py` `CompiledLoopToken.__del__`).
     pub total_freed_loops: AtomicUsize,
-    /// `model.py:12` `total_freed_bridges` — bumped by the memory
-    /// manager for each bridge attached to an evicted token.
+    /// `model.py` `total_freed_bridges` — bumped by the same `Drop`
+    /// for each attached bridge (`__del__` `total_freed_bridges += bridges_count`).
     pub total_freed_bridges: AtomicUsize,
 }
 
@@ -1001,6 +1000,13 @@ pub struct CompiledLoopToken {
     /// assembly time while preserving PyPy's strict "once per CLT"
     /// semantics if a caller retries `compile_loop` with the same token.
     loop_allocation_recorded: AtomicBool,
+    /// `model.py` `self.cpu` — the backend tracker `__del__` bumps.
+    /// Set by [`record_compiled_loop_token`] at assemble time.
+    cpu_tracker: parking_lot::Mutex<Option<Arc<CpuTotalTracker>>>,
+    /// Backend CALL_ASSEMBLER map retract. `__del__` /
+    /// `free_loop_and_bridges` unregisters the token number so a
+    /// side table cannot keep this CLT alive.
+    ca_unregister: parking_lot::Mutex<Option<fn(u64)>>,
 }
 
 /// PyPy `model.py:296-307` `CompiledLoopToken.__init__` opens the
@@ -1021,10 +1027,12 @@ pub struct CompiledLoopToken {
 /// [`Backend::cpu_tracker`]) so multiple backend instances in the
 /// same process keep separate totals — matching PyPy's per-CPU
 /// `cpu.tracker`.
-pub fn record_compiled_loop_token(tracker: &CpuTotalTracker, clt: &CompiledLoopToken) {
+pub fn record_compiled_loop_token(tracker: &Arc<CpuTotalTracker>, clt: &CompiledLoopToken) {
     if clt.loop_allocation_recorded.swap(true, Ordering::AcqRel) {
         return;
     }
+    // `model.py` `self.cpu = cpu` — `__del__` bumps this same tracker.
+    *clt.cpu_tracker.lock() = Some(Arc::clone(tracker));
     tracker.total_compiled_loops.fetch_add(1, Ordering::Relaxed);
     majit_ir::debug::log_one(
         "jit-mem-looptoken-alloc",
@@ -1056,6 +1064,8 @@ impl CompiledLoopToken {
             frame_info: parking_lot::Mutex::new(JitFrameInfo::default()),
             _ll_initial_locs: parking_lot::Mutex::new(Vec::new()),
             loop_allocation_recorded: AtomicBool::new(false),
+            cpu_tracker: parking_lot::Mutex::new(None),
+            ca_unregister: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1155,6 +1165,48 @@ impl CompiledLoopToken {
         new_loop_tokens.push(oldlooptoken_weak);
         // `model.py` `self.looptokens_redirected_to = new_loop_tokens`
         *self.looptokens_redirected_to.lock() = new_loop_tokens;
+    }
+
+    /// Install the backend's CALL_ASSEMBLER retract. `Drop` calls it
+    /// so a side table cannot keep this CLT after `LoopToken.__del__`.
+    pub fn set_ca_unregister(&self, unregister: fn(u64)) {
+        *self.ca_unregister.lock() = Some(unregister);
+    }
+
+    /// `llmodel.py` `AbstractCPU.free_loop_and_bridges`.
+    ///
+    /// Retracts the CALL_ASSEMBLER side table and drops the keepalive
+    /// lists. The tracer list is the Rust-side cycle
+    /// `CLT → asmmemmgr_gcreftracers → FailDescrStore →
+    /// ResumeGuardDescr.rd_loop_token → CLT`; RPython's GC collects that
+    /// cycle, so `__del__` can run `free_loop_and_bridges`. Here the
+    /// owner (`JitCellToken::drop`) must break it first or `Drop` never
+    /// runs. Idempotent: a second call finds empty lists.
+    pub fn free_loop_and_bridges(&self) {
+        if let Some(unregister) = self.ca_unregister.lock().take() {
+            unregister(self.number);
+        }
+        self.asmmemmgr_gcreftracers.lock().clear();
+        self.asmmemmgr_blocks.lock().clear();
+    }
+}
+
+impl Drop for CompiledLoopToken {
+    fn drop(&mut self) {
+        // model.py `CompiledLoopToken.__del__`:
+        //   self.cpu.free_loop_and_bridges(self)
+        //   self.cpu.tracker.total_freed_loops += 1
+        //   self.cpu.tracker.total_freed_bridges += self.bridges_count
+        self.free_loop_and_bridges();
+        let bridges = *self.bridges_count.lock();
+        if let Some(tracker) = self.cpu_tracker.lock().take() {
+            tracker.total_freed_loops.fetch_add(1, Ordering::Relaxed);
+            if bridges > 0 {
+                tracker
+                    .total_freed_bridges
+                    .fetch_add(bridges, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -1943,6 +1995,12 @@ impl Drop for JitCellToken {
         // code they name. Our thread-safe registry projection shares only the
         // former; detach it before Rust drops compiled/asmmemmgr_blocks.
         self.invalidate_sites.lock().positions.clear();
+        // Break the CLT ↔ ResumeDescr Arc cycle so
+        // `CompiledLoopToken::__del__` can run. RPython relies on the
+        // GC; see `CompiledLoopToken::free_loop_and_bridges`.
+        if let Some(clt) = self.compiled_loop_token() {
+            clt.free_loop_and_bridges();
+        }
     }
 }
 
@@ -4925,5 +4983,46 @@ mod tests {
         let second_manager = AsmMemoryManager::new(second_stats);
         let second = second_manager.allocate(128, 128).unwrap();
         assert_eq!(second.ptr(), first_address);
+    }
+
+    /// `model.py` `CompiledLoopToken.__del__` bumps `total_freed_loops`
+    /// when the last strong CLT Arc drops.
+    #[test]
+    fn compiled_loop_token_drop_bumps_freed_counters() {
+        let tracker = Arc::new(CpuTotalTracker::default());
+        let token = JitCellToken::new(7);
+        let clt = token.compiled_loop_token_expect();
+        record_compiled_loop_token(&tracker, &clt);
+        *clt.bridges_count.lock() = 2;
+        assert_eq!(tracker.total_compiled_loops.load(Ordering::Relaxed), 1);
+        assert_eq!(tracker.total_freed_loops.load(Ordering::Relaxed), 0);
+        drop(clt);
+        drop(token);
+        assert_eq!(tracker.total_freed_loops.load(Ordering::Relaxed), 1);
+        assert_eq!(tracker.total_freed_bridges.load(Ordering::Relaxed), 2);
+    }
+
+    /// `CLT → gcreftracers → FailDescrStore → rd_loop_token → CLT` is
+    /// the cycle RPython's GC collects. `JitCellToken::drop` must call
+    /// `free_loop_and_bridges` or `__del__` never runs.
+    #[test]
+    fn jit_cell_token_drop_breaks_clt_descr_cycle() {
+        let tracker = Arc::new(CpuTotalTracker::default());
+        let token = JitCellToken::new(8);
+        let clt = token.compiled_loop_token_expect();
+        record_compiled_loop_token(&tracker, &clt);
+        let descr = make_resume_guard_descr_typed(vec![Type::Int]);
+        descr
+            .as_fail_descr()
+            .expect("resume guard")
+            .set_rd_loop_token_clt(Arc::clone(&clt) as Arc<dyn std::any::Any + Send + Sync>);
+        let mut store = majit_ir::FailDescrStore::with_capacity(1);
+        store.push(descr);
+        clt.asmmemmgr_gcreftracers
+            .lock()
+            .push(Arc::new(store) as Arc<dyn std::any::Any + Send + Sync>);
+        drop(clt);
+        drop(token);
+        assert_eq!(tracker.total_freed_loops.load(Ordering::Relaxed), 1);
     }
 }
