@@ -3292,9 +3292,9 @@ impl Optimizer {
                 // per phase; majit's flat OpRef space needs an explicit SameAs
                 // alias so nia[j] points outside the body inputarg position range.
                 //
-                // Bridges do not import this export (unroll.py:183-236): the
-                // aliases never rewrite the live JUMP args, so skip them.
-                if !building_bridge {
+                // A bridge needs the aliases too: its retrace arm exports from
+                // `ctx.preamble_end_args`, which is built from these args.
+                {
                     let mut seen: indexmap::IndexSet<OpRef> = indexmap::IndexSet::new();
                     // RPython parity: positions already holding an emitted op
                     // are phase 1 results, not body inputarg sources. Only
