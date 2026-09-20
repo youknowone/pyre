@@ -3414,17 +3414,6 @@ impl Optimizer {
                         .map(|&arg| self.force_box_for_end_of_preamble(arg, &mut ctx))
                         .collect(),
                 );
-                // unroll.py:193-205: `optimize_bridge` runs
-                // `propagate_all_forward` then flush +
-                // `force_box_for_end_of_preamble` on the jump args; it does
-                // not preview virtual state, produce short boxes, or call
-                // `export_state`. That export is only the retrace arm
-                // (unroll.py:231-233), which `optimize_bridge` still runs
-                // after `jump_to_existing_trace`. Heap writebacks from the
-                // flush + force above are already in `ctx.new_operations`.
-                if building_bridge {
-                    break 'export None;
-                }
                 // unroll.py `virtual_state = self.get_virtual_state(end_args)`.
                 // VS is captured AFTER force + flush so its `Virtual` /
                 // `VStruct` entries match the `info.is_virtual()` predicate
@@ -3768,6 +3757,13 @@ impl Optimizer {
                     short_boxes: exported_short_boxes,
                     args_state,
                 });
+                // unroll.py:193-236: `optimize_bridge` calls `export_state`
+                // only in its retrace arm, after `jump_to_existing_trace`
+                // found no match. That arm reads the preview published just
+                // above, so a bridge stops here and leaves the export to it.
+                if building_bridge {
+                    break 'export None;
+                }
                 let jump_arglist_oprefs: Vec<OpRef> =
                     jump.getarglist().iter().map(|a| a.to_opref()).collect();
                 let exported_int_bounds =
