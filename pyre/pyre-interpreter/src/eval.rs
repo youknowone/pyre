@@ -849,6 +849,46 @@ fn interp_return_log_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_INTERP_RETURN_LOG").is_some())
 }
 
+/// Debug dump for `PYRE_INTERP_RETURN_LOG`.  Reads `locals_cells_stack_w`, a
+/// virtualizable array; jtransform forbids passing that array as a call
+/// argument (`jtransform.py` `_check_no_vable_array`).  Keep the dump off
+/// the RETURN_VALUE jitcode so `is_empty` / indexing cannot escape it.
+#[cfg(not(feature = "sandbox"))]
+#[majit_macros::dont_look_inside]
+fn log_interp_return(frame: &PyFrame, value: PyObjectRef) {
+    unsafe {
+        let code_ptr = crate::pyframe::pyframe_get_pycode(frame);
+        let name = if !code_ptr.is_null() {
+            (*code_ptr).obj_name.as_str()
+        } else {
+            "?"
+        };
+        let arg0_intval = {
+            let lw = locals_w!(frame);
+            if !lw.is_empty() {
+                let v = lw[0];
+                if !v.is_null() && pyre_object::pyobject::is_int(v) {
+                    Some(pyre_object::intobject::w_int_get_value(v))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let ret_intval = if !value.is_null() && pyre_object::pyobject::is_int(value) {
+            Some(pyre_object::intobject::w_int_get_value(value))
+        } else {
+            None
+        };
+        let f_back = frame.f_backref as usize;
+        eprintln!(
+            "[interp] return name={} arg0={:?} ret={:?} frame={:p} f_back=0x{:x} ret_ref=0x{:x}",
+            name, arg0_intval, ret_intval, frame as *const _, f_back, value as usize
+        );
+    }
+}
+
 /// Whether the incminimark-parity minor-collection skip of clean prebuilt
 /// structures is enabled (`PYRE_GC_PREBUILT_REMEMBER=0` opts out, restoring
 /// the rescan-everything-every-minor behavior).
@@ -4080,37 +4120,7 @@ impl ControlFlowOpcodeHandler for PyFrame {
     fn finish_value(&mut self, value: Self::Value) -> Result<StepResult<Self::Value>, PyError> {
         #[cfg(not(feature = "sandbox"))]
         if interp_return_log_enabled() {
-            unsafe {
-                let code_ptr = crate::pyframe::pyframe_get_pycode(self);
-                let name = if !code_ptr.is_null() {
-                    (*code_ptr).obj_name.as_str()
-                } else {
-                    "?"
-                };
-                let arg0_intval = {
-                    let lw = locals_w!(self);
-                    if !lw.is_empty() {
-                        let v = lw[0];
-                        if !v.is_null() && pyre_object::pyobject::is_int(v) {
-                            Some(pyre_object::intobject::w_int_get_value(v))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-                let ret_intval = if !value.is_null() && pyre_object::pyobject::is_int(value) {
-                    Some(pyre_object::intobject::w_int_get_value(value))
-                } else {
-                    None
-                };
-                let f_back = self.f_backref as usize;
-                eprintln!(
-                    "[interp] return name={} arg0={:?} ret={:?} frame={:p} f_back=0x{:x} ret_ref=0x{:x}",
-                    name, arg0_intval, ret_intval, self as *const _, f_back, value as usize
-                );
-            }
+            log_interp_return(self, value);
         }
         self.set_frame_finished_execution(true);
         Ok(StepResult::Return(value))
