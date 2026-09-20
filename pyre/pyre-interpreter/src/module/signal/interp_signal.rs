@@ -175,8 +175,8 @@ pub fn set_handler(signum: i32, handler: PyObjectRef) {
 
 /// Drop every registered handler, at the point in teardown where running
 /// app-level code is no longer sound.  A signal recorded after this reaches
-/// `report_signal` with nothing to call, which is the case that returns
-/// without running anything.
+/// `report_signal` with a missing table entry, which reports rather than
+/// delivering.
 pub fn clear_handlers() {
     let d = handlers_dict();
     unsafe { pyre_object::w_dict_clear(d) };
@@ -516,16 +516,59 @@ impl CheckSignalAction {
         }
         Ok(())
     }
+
+    /// interp_signal.py `CheckSignalAction.set_interrupt` — simulate a
+    /// signal arriving.  `PyErr_SetInterruptEx` does not trip the signal
+    /// when the current handler is already SIG_IGN or SIG_DFL; a missing
+    /// table entry still pushes so teardown can report it.
+    pub fn set_interrupt(signum: i32) {
+        if !(1..signalstate::NSIG).contains(&signum) {
+            return;
+        }
+        let w_handler = get_handler(signum);
+        if !w_handler.is_null() && !crate::baseobjspace::callable_w(w_handler) {
+            return;
+        }
+        signalstate::signal_pushback(signum);
+    }
+}
+
+/// No callable handler remains for a tripped signal (the table was emptied,
+/// or the entry is SIG_IGN / SIG_DFL).  `PyErr_CheckSignals` reports that
+/// race as an unraisable OSError and skips delivery.
+fn report_ignored_signal(ec: &mut ExecutionContext, n: i32) {
+    let mut err = crate::PyError::os_error(format!("Signal {n} ignored due to race condition"));
+    // `_PyErr_SetObject` captures the current frame as the traceback, which
+    // is what names `__del__` in the unraisable report.  `write_unraisable`
+    // prints that chain; it does not build one.
+    let frame = ec.gettopframe_nohidden();
+    if !frame.is_null() {
+        unsafe { (*frame).mark_as_escaped() };
+        let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
+        crate::executioncontext::force_frame(frame);
+        let exc = err.to_exc_object();
+        let frame = anchor.live();
+        let last_instr = unsafe { (*frame).last_instr as i64 };
+        unsafe {
+            crate::pytraceback::record_application_traceback(exc, frame, last_instr);
+        }
+    }
+    err.write_unraisable(
+        pyre_object::w_none(),
+        rustpython_wtf8::Wtf8::new("Exception ignored while calling signal handler"),
+        pyre_object::w_none(),
+    );
+    if !frame.is_null() {
+        crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
+    }
 }
 
 /// interp_signal.py `report_signal`.
 fn report_signal(ec: &mut ExecutionContext, n: i32) -> Result<(), crate::PyError> {
     let w_handler = get_handler(n);
-    if w_handler.is_null() {
-        return Ok(()); // no handler, ignore signal
-    }
-    if !crate::baseobjspace::callable_w(w_handler) {
-        return Ok(()); // w_handler is SIG_IGN or SIG_DFL (an int)
+    if w_handler.is_null() || !crate::baseobjspace::callable_w(w_handler) {
+        report_ignored_signal(ec, n);
+        return Ok(());
     }
     // interp_signal.py:205 — re-install for OSes that clear the handler
     // (no-op on SA_RESTART platforms).

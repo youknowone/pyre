@@ -2374,7 +2374,7 @@ fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(unsafe { crate::PyError::from_exc_object(exc) });
     }
     #[cfg(not(target_arch = "wasm32"))]
-    crate::module::signal::signalstate::signal_pushback(signum);
+    crate::module::signal::interp_signal::CheckSignalAction::set_interrupt(signum);
     #[cfg(not(target_arch = "wasm32"))]
     Ok(w_none())
 }
