@@ -12,6 +12,7 @@ use rustpython_wtf8::Wtf8Buf;
 use std::sync::OnceLock;
 
 use super::ctypeobj::{self, W_CType};
+use super::misc;
 
 // ── the subclass discriminant ───────────────────────────────────────────
 
@@ -367,7 +368,7 @@ pub unsafe fn new_cdata_copy(
     size: i64,
 ) -> Result<PyObjectRef, PyError> {
     let ptr = raw_alloc(size, false)?;
-    unsafe { std::ptr::copy_nonoverlapping(source, ptr as *mut u8, size.max(0) as usize) };
+    misc::raw_memcopy(source as usize, ptr, size.max(0) as usize);
     Ok(new_cdata_full(
         ptr,
         w_ctype,

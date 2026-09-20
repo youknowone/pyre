@@ -193,6 +193,32 @@ pub fn raw_write_f64(p: usize, v: f64) {
     unsafe { (p as *mut f64).write_unaligned(v as f64) }
 }
 
+/// `misc.py _raw_memcopy`.  A trace-constant size of 1, 2, 4 or 8 is a
+/// typed load/store (`_raw_memcopy_tp`); anything else is the opaque
+/// residual (`_raw_memcopy_opaque`).
+pub fn raw_memcopy(source: usize, dest: usize, size: usize) {
+    match size {
+        1 => raw_write_u8(dest, raw_read_u8(source)),
+        2 => raw_write_u16(dest, raw_read_u16(source)),
+        4 => raw_write_u32(dest, raw_read_u32(source)),
+        8 => raw_write_u64(dest, raw_read_u64(source)),
+        _ => raw_memcopy_opaque(source, dest, size),
+    }
+}
+
+/// `misc.py _raw_memcopy_opaque`.
+///
+/// `@jit.dont_look_inside`: the body is `llmemory.raw_memcopy`, which
+/// is not a jitcode op. Leaving `copy_nonoverlapping` in a convert
+/// body residualizes as an un-lowered helper on the `_CDataBase` call
+/// descent.
+#[majit_macros::dont_look_inside]
+pub fn raw_memcopy_opaque(source: usize, dest: usize, size: usize) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(source as *const u8, dest as *mut u8, size);
+    }
+}
+
 /// `misc.py read_raw_long_data`.
 ///
 /// # Safety

@@ -12,6 +12,25 @@ use super::cdataobj::{self, W_CData};
 use super::ctypeobj::{self, W_CType};
 use super::misc;
 
+/// `W_CTypePrimitiveLongDouble._copy_longdouble`.
+///
+/// `@jit.dont_look_inside` (`ctypeprim.py`): the body is a LONGDOUBLE load
+/// and store. Rust has no that type, so the bits move as a
+/// `sizeof(long double)` raw copy — the same width the C ABI stores.
+/// Convert of a primitive walks every `kind` arm of the fused
+/// `convert_to_object`, so leaving `copy_nonoverlapping` in those arms
+/// residualizes as an un-lowered helper on the int path too.
+#[majit_macros::dont_look_inside]
+pub fn copy_longdouble(cdatasrc: usize, cdatadst: usize) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            cdatasrc as *const u8,
+            cdatadst as *mut u8,
+            misc::sizeof_long_double() as usize,
+        );
+    }
+}
+
 /// `W_CTypePrimitive.convert_to_object`.
 ///
 /// # Safety
@@ -64,11 +83,7 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRe
                 let target = W_CData::from_obj(w_cdata)
                     .expect("new_cdata_mem returns a cdata")
                     .ptr;
-                std::ptr::copy_nonoverlapping(
-                    cdata as *const u8,
-                    target as *mut u8,
-                    ct.size as usize,
-                );
+                copy_longdouble(cdata, target);
                 Ok(w_cdata)
             }
             // `W_CTypePrimitiveComplex.convert_to_object`.
@@ -201,11 +216,7 @@ pub unsafe fn convert_from_object(
                     && ctypeobj::ctype_at(source.ctype)
                         .is_some_and(|s| s.kind == ctypeobj::KIND_PRIM_LONGDOUBLE)
                 {
-                    std::ptr::copy_nonoverlapping(
-                        source.ptr as *const u8,
-                        cdata as *mut u8,
-                        ct.size as usize,
-                    );
+                    copy_longdouble(source.ptr, cdata);
                     return Ok(());
                 }
                 misc::write_raw_longdouble_data(
