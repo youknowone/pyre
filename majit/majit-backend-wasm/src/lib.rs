@@ -2102,7 +2102,13 @@ pub extern "C" fn wasm_jit_alloc_array_oldgen(
     let Ok(length) = usize::try_from(length) else {
         return oom_signal_if_zero(0);
     };
-    let payload_size = base_size as usize + item_size as usize * length;
+    // Overflowing the payload size is MemoryError, same as a negative length.
+    let Some(payload_size) = (item_size as usize)
+        .checked_mul(length)
+        .and_then(|var_size| (base_size as usize).checked_add(var_size))
+    else {
+        return oom_signal_if_zero(0);
+    };
     let obj = with_wasm_active_gc_mut(|gc| {
         let obj = gc.alloc_oldgen_typed(type_id as u32, payload_size);
         if obj.is_null() {
@@ -7237,6 +7243,17 @@ mod tests {
         let _gc_box = install_gc_box(Box::new(gc));
         assert_eq!(wasm_jit_alloc_headerless(-1), 0);
         assert_eq!(wasm_jit_alloc_headerless(0), 0);
+    }
+
+    #[test]
+    fn oldgen_array_overflow_does_not_allocate() {
+        let _compile_guard = failguard::lock_cpu();
+        let mut gc = MiniMarkGC::new();
+        let tid = gc.register_type(TypeInfo::simple(8));
+        let _gc_box = install_gc_box(Box::new(gc));
+        // 8 * 2^61 wraps to 0; without the checked size this would allocate
+        // an 8-byte object and stamp the original length into it.
+        assert_eq!(wasm_jit_alloc_array_oldgen(tid as i64, 8, 8, 1 << 61, 0), 0);
     }
 
     #[test]
