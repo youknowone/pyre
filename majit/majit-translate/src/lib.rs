@@ -246,6 +246,7 @@ fn build_semantic_program_via_active_frontend(
             let mut immutable_fields = std::collections::HashMap::new();
             let mut unsafe_fn_stubs = Vec::new();
             let mut foreign_opaque_method_externals = Vec::new();
+            let mut atomic_load_decls = Vec::new();
             for p in &paths {
                 let llbc = majit_charon_reader::Llbc::load(p)
                     .unwrap_or_else(|e| panic!("Step 4.4 cutover: load {p}: {e}"));
@@ -291,6 +292,7 @@ fn build_semantic_program_via_active_frontend(
                     .extend(front::mir::collect_marked_class_ctor_stubs_from_llbc(&llbc));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));
+                atomic_load_decls.extend(front::mir::collect_atomic_load_declined_fun_decls(&llbc));
                 let prog = front::mir::build_semantic_program_from_prelinked_llbc(
                     &llbc,
                     static_addrs,
@@ -333,6 +335,9 @@ fn build_semantic_program_via_active_frontend(
             program.immutable_fields = immutable_fields;
             program.unsafe_fn_stubs = unsafe_fn_stubs;
             program.foreign_opaque_method_externals = foreign_opaque_method_externals;
+            crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls(
+                atomic_load_decls,
+            );
             return program;
         }
     }

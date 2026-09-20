@@ -23909,6 +23909,179 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     })
 }
 
+/// Collect signature-only [`DeclinedFunDecl`] rows for every local function
+/// whose unstructured body contains a non-`Relaxed` `Atomic*::load`.
+///
+/// Re-derives the same condition `build_semantic_program_from_llbcs`
+/// records in its local `skipped` vec (`LowerError::Unsupported` whose
+/// Display contains `atomic load ordering`).  The skip list is a
+/// `(leaf, message)` pair and never leaves that function, so a sibling
+/// of [`collect_policy_opaque_fn_stubs_from_llbc`] walks the LLBC and
+/// rebuilds the full declaration (path segments, scalar lltypes, the
+/// Display string) instead of threading `skipped` out.
+pub(crate) fn collect_atomic_load_declined_fun_decls(
+    llbc: &Llbc,
+) -> Vec<crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl> {
+    use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
+    let mut out = Vec::new();
+    for fd in llbc.iter_local_fns() {
+        if fd.is_global_initializer.is_some() {
+            continue;
+        }
+        let Some(body) = fd.unstructured() else {
+            continue;
+        };
+        let Some(ordering) = first_non_relaxed_atomic_load_ordering(llbc, &body) else {
+            continue;
+        };
+        let segments: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(String::from)
+            .collect();
+        out.push(DeclinedFunDecl {
+            segments,
+            arg_lltypes: fd
+                .signature
+                .inputs
+                .iter()
+                .map(|ty| tyref_to_external_lltype(ty, llbc))
+                .collect(),
+            result_lltype: tyref_to_external_lltype(&fd.signature.output, llbc),
+            has_translatable_body: false,
+            decline_reason: format!(
+                "unsupported MIR: atomic load ordering {ordering} requires \
+                 address-preserving ordered lowering"
+            ),
+        });
+    }
+    out
+}
+
+fn first_non_relaxed_atomic_load_ordering(llbc: &Llbc, body: &Unstructured) -> Option<String> {
+    let mut ordering_locals: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                continue;
+            };
+            if let PlaceKind::Local(index) = dest.kind
+                && let Some(name) = atomic_ordering_variant_of(llbc, &rvalue)
+            {
+                ordering_locals.insert(index as usize, name);
+            }
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term() else {
+            continue;
+        };
+        if call.args.len() != 2 {
+            continue;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        if !call_is_atomic_load(reg, llbc) {
+            continue;
+        }
+        let ordering = operand_local_index(&call.args[1])
+            .and_then(|local| ordering_locals.get(&local).cloned())
+            .unwrap_or_else(|| "unknown".to_string());
+        if ordering != "Relaxed" {
+            return Some(ordering);
+        }
+    }
+    None
+}
+
+fn call_is_atomic_load(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    let Some(fd) = llbc.fn_by_id(*id) else {
+        return false;
+    };
+    if fd.item_meta.name_path().rsplit("::").next() != Some("load") {
+        return false;
+    }
+    fd.signature.inputs.first().is_some_and(|ty| {
+        adt_path_of_tyref(ty, llbc).is_some_and(|path| {
+            path.contains("::sync::atomic::")
+                && path
+                    .rsplit("::")
+                    .next()
+                    .is_some_and(|leaf| leaf.starts_with("Atomic"))
+        })
+    })
+}
+
+fn atomic_ordering_variant_of(llbc: &Llbc, rvalue: &Rvalue) -> Option<String> {
+    let Rvalue::Aggregate(kind, _) = rvalue else {
+        return None;
+    };
+    let adt = kind.as_object()?.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = match head.as_u64() {
+        Some(id) => id,
+        None => head.get("id")?.get("Adt")?.as_u64()?,
+    };
+    let td = llbc.type_by_id(type_id)?;
+    if td.item_meta.name_path() != "core::sync::atomic::Ordering" {
+        return None;
+    }
+    let TypeDeclKind::Enum(variants) = &td.kind else {
+        return None;
+    };
+    let variant_idx = adt.get(1).and_then(serde_json::Value::as_u64)? as usize;
+    Some(variants.get(variant_idx)?.name.clone())
+}
+
+fn operand_local_index(op: &Operand) -> Option<usize> {
+    let place = match op {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Const(_) => return None,
+    };
+    match &place.kind {
+        PlaceKind::Local(index) => Some(*index as usize),
+        _ => None,
+    }
+}
+
+fn tyref_to_external_lltype(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if is_unit_type(ty, llbc) {
+        return LowLevelType::Void;
+    }
+    // `tyref_to_value_type` peels `&T` and types an atomic wrapper as
+    // its inner scalar, so a pointer argument would look like a word.
+    // The residual-call ABI refuses pointer args; keep them Address.
+    if output_type_is_ref(ty, llbc) || tyref_is_raw_pointer(ty, llbc) {
+        return LowLevelType::Address;
+    }
+    match tyref_to_value_type(ty, llbc) {
+        ValueType::Int => LowLevelType::Signed,
+        ValueType::Unsigned => LowLevelType::Unsigned,
+        ValueType::Int128 => LowLevelType::SignedLongLongLong,
+        ValueType::UInt128 => LowLevelType::UnsignedLongLongLong,
+        ValueType::Bool => LowLevelType::Bool,
+        ValueType::Float => LowLevelType::Float,
+        ValueType::SingleFloat => LowLevelType::SingleFloat,
+        ValueType::Void => LowLevelType::Void,
+        _ => LowLevelType::Address,
+    }
+}
+
+fn tyref_is_raw_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|obj| obj.contains_key("RawPtr"))
+}
+
 fn collect_fn_stubs_from_llbc_if(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,

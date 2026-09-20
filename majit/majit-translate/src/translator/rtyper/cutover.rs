@@ -2258,6 +2258,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // rows in FOREIGN_STDLIB_EXTERNALS no longer match those callsites;
     // register the emitted crate path from the same table the front reads.
     register_ll_math_llexternals(registry);
+    // Acquire-load accessors harvested by
+    // `front::mir::collect_atomic_load_declined_fun_decls`.  The gate
+    // in `ll_extaccessor` keeps only verified word-only readers
+    // (`lowlevel_str_gc_type_id` and its three siblings).  Their
+    // addresses are published in `pyre-interpreter` `jit_trace_fnaddrs`
+    // (`pa0`), so the residual is a real call rather than a symbolic
+    // hash.
+    let atomic_load_decls = crate::translator::rtyper::lltypesystem::module::ll_extaccessor::harvested_atomic_load_decls();
+    register_atomic_load_llexternals(registry, &atomic_load_decls);
     // Foreign opaque-ADT method externals (`<BigInt as Add>::add`, …) the
     // LLBC collected.  `impl_method_owner` declines the Method hint for an
     // opaque owner, so these residualize as `FunctionPath` calls; declare
@@ -3212,6 +3221,34 @@ pub(crate) fn register_ll_math_llexternals(registry: &CallRegistry) {
             argnames,
             LowLevelType::Float,
         );
+    }
+}
+
+/// Register Acquire-load accessors whose body the MIR loop declined, as
+/// `register_external` / CallRegistry stubs.
+///
+/// Walks [`crate::translator::rtyper::lltypesystem::module::ll_extaccessor::collect_atomic_load_llexternals`]:
+/// only a verified word-only reader (zero-arg unsigned result,
+/// ordered-load decline, no translatable body, path whose source is
+/// exactly `AtomicU32::load(Acquire)`) is admitted.  Same
+/// non-overwriting, annotator-only carrier as
+/// [`register_ll_math_llexternals`].  The residual call is the real
+/// function; the stub annotation is a non-const scalar, never a
+/// translation-time constant.
+pub(crate) fn register_atomic_load_llexternals(
+    registry: &CallRegistry,
+    decls: &[crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl],
+) {
+    use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::collect_atomic_load_llexternals;
+    let collected = collect_atomic_load_llexternals(decls);
+    let _ = crate::translator::rtyper::extfuncregistry::register_atomic_load_accessor_externals(
+        &collected,
+    );
+    for row in &collected {
+        let argname_storage: Vec<String> = (0..row.arity()).map(|i| format!("arg{i}")).collect();
+        let argnames: Vec<&str> = argname_storage.iter().map(String::as_str).collect();
+        let segments: Vec<&str> = row.segments.iter().map(String::as_str).collect();
+        register_opaque_external(registry, &segments, &argnames, row.result.clone());
     }
 }
 
@@ -8032,5 +8069,408 @@ mod tests {
             hypot.function_desc.borrow().signature.argnames,
             ["x".to_string(), "y".to_string()]
         );
+    }
+
+    #[test]
+    fn call_registry_resolves_atomic_load_accessor_function_path() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::DeclinedFunDecl;
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let keep = DeclinedFunDecl {
+            segments: vec![
+                "pyre_object".into(),
+                "lowlevel_string".into(),
+                "lowlevel_str_gc_type_id".into(),
+            ],
+            arg_lltypes: vec![],
+            result_lltype: LowLevelType::Unsigned,
+            has_translatable_body: false,
+            decline_reason: "unsupported MIR: atomic load ordering Acquire requires \
+                 address-preserving ordered lowering"
+                .into(),
+        };
+        let drop_ptr = DeclinedFunDecl {
+            segments: vec![
+                "pyre_object".into(),
+                "typeobject".into(),
+                "w_type_get_version_tag".into(),
+            ],
+            arg_lltypes: vec![LowLevelType::Func(Box::new(
+                crate::translator::rtyper::lltypesystem::lltype::FuncType {
+                    args: vec![],
+                    result: LowLevelType::Void,
+                },
+            ))],
+            result_lltype: LowLevelType::Unsigned,
+            has_translatable_body: false,
+            decline_reason: keep.decline_reason.clone(),
+        };
+        let drop_other = DeclinedFunDecl {
+            segments: vec![
+                "pyre_object".into(),
+                "lowlevel_string".into(),
+                "set_lowlevel_str_gc_type_id".into(),
+            ],
+            arg_lltypes: vec![LowLevelType::Unsigned],
+            result_lltype: LowLevelType::Void,
+            has_translatable_body: false,
+            decline_reason: "declaration-has-no-unstructured-body".into(),
+        };
+        register_atomic_load_llexternals(&registry, &[keep, drop_ptr, drop_other]);
+        let key = FunctionPathKey::from_segments([
+            "pyre_object",
+            "lowlevel_string",
+            "lowlevel_str_gc_type_id",
+        ]);
+        let entry = registry.lookup(&key).unwrap_or_else(|| {
+            panic!(
+                "FunctionPath {{ segments: [\"pyre_object\", \"lowlevel_string\", \
+                 \"lowlevel_str_gc_type_id\"] }} is not registered in CallRegistry"
+            )
+        });
+        assert!(
+            entry.function_desc.borrow().signature.argnames.is_empty(),
+            "zero-arg accessor"
+        );
+        let stub = entry
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&crate::annotator::description::GraphCacheKey::None)
+            .cloned()
+            .expect("accessor stub is prefilled");
+        let graph = stub.graph.borrow();
+        let start = graph.startblock.borrow();
+        let link = start.exits[0].borrow();
+        let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+            panic!("accessor stub return arg must be a pre-annotated Variable");
+        };
+        let annotation = ret.annotation.borrow();
+        let annotation = annotation
+            .as_ref()
+            .expect("accessor stub return is pre-annotated");
+        match &**annotation {
+            SomeValue::Integer(si) => {
+                assert!(si.unsigned, "u32 GC type id shells as unsigned");
+                assert!(
+                    si.base.const_box.is_none(),
+                    "GC type id is published at runtime; must not const-fold"
+                );
+            }
+            other => panic!("expected unsigned SomeInteger, got {other:?}"),
+        }
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "typeobject",
+                    "w_type_get_version_tag"
+                ]))
+                .is_none(),
+            "pointer-arg Acquire reader must not become an external"
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "lowlevel_string",
+                    "set_lowlevel_str_gc_type_id"
+                ]))
+                .is_none(),
+            "a non-atomic-load decline must not become an external"
+        );
+    }
+
+    fn atomic_load_llbc(ordering: Option<&str>, zero_arg: bool) -> majit_charon_reader::Llbc {
+        use serde_json::{Value, json};
+        let span = json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str]| {
+            json!({
+                "name": path.iter().map(|s| json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span, "source_text": null, "is_local": true,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            })
+        };
+        let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+        let adt = |id| json!({"Adt": {"id": {"Adt": id}, "generics": generics}});
+        let word = json!({"Literal": {"UInt": "U64"}});
+        let receiver = json!({"Ref": ["Erased", adt(0), "Shared"]});
+        let place = |id, ty: &Value| json!({"kind": {"Local": id}, "ty": ty});
+        let variants = ["Relaxed", "Acquire", "SeqCst", "Release", "AcqRel"];
+        let statements = ordering
+            .map(|name| {
+                let index = variants.iter().position(|v| *v == name).unwrap();
+                json!([{"span": span, "kind": {"Assign": [place(2, &adt(1)),
+                {"Aggregate": [{"Adt": [1, index, null, generics]}, []]}]}}])
+            })
+            .unwrap_or_else(|| json!([]));
+        let arg_count = if zero_arg { 0 } else { 1 };
+        let inputs = if zero_arg {
+            Vec::new()
+        } else {
+            vec![receiver.clone()]
+        };
+        let reader_path: &[&str] = if zero_arg {
+            &["pyre_object", "lowlevel_string", "lowlevel_str_gc_type_id"]
+        } else {
+            &["fixture", "read_atomic"]
+        };
+        let file = json!({"charon_version": "0.1.201", "has_errors": false,
+            "translated": {"crate_name": "fixture",
+                "type_decls": [
+                    {"def_id": 0, "item_meta": meta(&["core", "sync", "atomic", "AtomicU64"]), "kind": "Opaque"},
+                    {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "Ordering"]),
+                     "kind": {"Enum": variants.iter().enumerate().map(|(i, name)| json!({
+                        "name": name, "fields": [],
+                        "discriminant": {"Scalar": {"Unsigned": ["U8", i.to_string()]}}
+                     })).collect::<Vec<_>>()}}
+                ],
+                "fun_decls": [
+                    {"def_id": 0, "item_meta": meta(reader_path),
+                     "signature": {"is_unsafe": false, "inputs": inputs, "output": word},
+                     "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": arg_count, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": word},
+                            {"index": 1, "name": "slot", "span": span, "ty": receiver},
+                            {"index": 2, "name": "ordering", "span": span, "ty": adt(1)}
+                        ]},
+                        "body": [
+                            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                                "call": {"func": {"Regular": {"kind": {"Fun": {"Regular": 1}}, "generics": generics}},
+                                    "args": [{"Copy": place(1, &receiver)}, {"Copy": place(2, &adt(1))}],
+                                    "dest": place(0, &word)}, "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                        ]
+                     }}},
+                    {"def_id": 1, "item_meta": meta(&["core", "sync", "atomic", "AtomicU64", "load"]),
+                     "signature": {"is_unsafe": false, "inputs": [receiver, adt(1)], "output": word}, "body": "Opaque"}
+                ], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("atomic fixture parses")
+    }
+
+    #[test]
+    fn collector_rederives_atomic_load_decline_from_llbc_shape() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::{
+            collect_atomic_load_llexternals, is_external_shaped_atomic_accessor,
+        };
+        let acquire = atomic_load_llbc(Some("Acquire"), true);
+        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&acquire);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(
+            decls[0].segments,
+            ["pyre_object", "lowlevel_string", "lowlevel_str_gc_type_id"]
+        );
+        assert!(decls[0].arg_lltypes.is_empty());
+        assert_eq!(decls[0].result_lltype, LowLevelType::Unsigned);
+        assert!(!decls[0].has_translatable_body);
+        assert!(
+            decls[0]
+                .decline_reason
+                .contains("atomic load ordering Acquire")
+        );
+        assert!(is_external_shaped_atomic_accessor(&decls[0]));
+        assert_eq!(collect_atomic_load_llexternals(&decls).len(), 1);
+
+        let pointer = atomic_load_llbc(Some("Acquire"), false);
+        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&pointer);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].arg_lltypes.len(), 1);
+        assert!(!is_external_shaped_atomic_accessor(&decls[0]));
+        assert!(collect_atomic_load_llexternals(&decls).is_empty());
+
+        let relaxed = atomic_load_llbc(Some("Relaxed"), true);
+        assert!(crate::front::mir::collect_atomic_load_declined_fun_decls(&relaxed).is_empty());
+    }
+
+    #[test]
+    fn harvested_zero_arg_atomic_load_accessor_registers_as_extfunc_entry() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls;
+        let acquire = atomic_load_llbc(Some("Acquire"), true);
+        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&acquire);
+        register_harvested_atomic_load_decls(decls);
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(
+            &crate::codewriter::call::GraphStore::default(),
+            &[],
+            &[],
+            &registry,
+        )
+        .unwrap();
+        let key = FunctionPathKey::from_segments([
+            "pyre_object",
+            "lowlevel_string",
+            "lowlevel_str_gc_type_id",
+        ]);
+        let entry = registry.lookup(&key).unwrap_or_else(|| {
+            panic!(
+                "harvested FunctionPath [pyre_object, lowlevel_string, \
+                 lowlevel_str_gc_type_id] is not registered in CallRegistry"
+            )
+        });
+        let stub = entry
+            .function_desc
+            .borrow()
+            .cache
+            .borrow()
+            .get(&crate::annotator::description::GraphCacheKey::None)
+            .cloned()
+            .expect("accessor stub is prefilled");
+        let graph = stub.graph.borrow();
+        let start = graph.startblock.borrow();
+        let link = start.exits[0].borrow();
+        let Some(Hlvalue::Variable(ret)) = link.args[0].as_ref() else {
+            panic!("accessor stub return arg must be a pre-annotated Variable");
+        };
+        let annotation = ret.annotation.borrow();
+        let annotation = annotation
+            .as_ref()
+            .expect("accessor stub return is pre-annotated");
+        match &**annotation {
+            SomeValue::Integer(si) => {
+                assert!(si.unsigned, "u64 GC type id shells as unsigned");
+                assert!(
+                    si.base.const_box.is_none(),
+                    "GC type id is published at runtime; must not const-fold"
+                );
+            }
+            other => panic!("expected unsigned SomeInteger, got {other:?}"),
+        }
+        register_harvested_atomic_load_decls(Vec::new());
+    }
+
+    #[test]
+    fn harvested_atomic_load_accessor_lowers_to_published_residual_call() {
+        use crate::codewriter::call::is_symbolic_fnaddr;
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::register_harvested_atomic_load_decls;
+        let acquire = atomic_load_llbc(Some("Acquire"), true);
+        let decls = crate::front::mir::collect_atomic_load_declined_fun_decls(&acquire);
+        register_harvested_atomic_load_decls(decls);
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(
+            &crate::codewriter::call::GraphStore::default(),
+            &[],
+            &[],
+            &registry,
+        )
+        .unwrap();
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "lowlevel_string",
+                    "lowlevel_str_gc_type_id",
+                ]))
+                .is_some(),
+            "annotator registry has the harvested accessor"
+        );
+
+        let mut graph = FunctionGraph::new("caller");
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "pyre_object",
+                        "lowlevel_string",
+                        "lowlevel_str_gc_type_id",
+                    ]),
+                    args: vec![],
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        // Production binds this path from `jit_trace_fnaddrs` via
+        // `register_macro_helper_trace_fnaddr`.  A non-zero, non-symbolic
+        // stand-in is the same insert; `0` is refused by that entry point.
+        const PUBLISHED: i64 = 0x00AB_CDEF;
+        let mut callcontrol = crate::call::CallControl::new();
+        callcontrol.register_macro_helper_trace_fnaddr(
+            "pyre_object::lowlevel_string::lowlevel_str_gc_type_id",
+            PUBLISHED,
+        );
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut callcontrol)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let fnaddr = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::ConstInt(addr) => Some(*addr),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("residual call materializes a funcptr constant; ops={ops:?}")
+            });
+        assert!(
+            !is_symbolic_fnaddr(fnaddr),
+            "published jit_trace_fnaddrs row must not bake a symbolic hash; fnaddr={fnaddr:#x}"
+        );
+        assert_eq!(fnaddr, PUBLISHED);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "call site must residualize; got {ops:?}"
+        );
+        register_harvested_atomic_load_decls(Vec::new());
+    }
+
+    #[test]
+    fn populate_refuses_unverified_atomic_load_harvest() {
+        use crate::translator::rtyper::lltypesystem::module::ll_extaccessor::{
+            DeclinedFunDecl, register_harvested_atomic_load_decls,
+        };
+        register_harvested_atomic_load_decls(vec![DeclinedFunDecl {
+            segments: vec!["pyre_object".into(), "gc_interp".into(), "safepoint".into()],
+            arg_lltypes: vec![],
+            result_lltype: LowLevelType::Void,
+            has_translatable_body: false,
+            decline_reason: "unsupported MIR: atomic load ordering Acquire requires \
+                 address-preserving ordered lowering"
+                .into(),
+        }]);
+        let registry = CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        populate_call_registry_from_call_graphs(
+            &crate::codewriter::call::GraphStore::default(),
+            &[],
+            &[],
+            &registry,
+        )
+        .unwrap();
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "pyre_object",
+                    "gc_interp",
+                    "safepoint"
+                ]))
+                .is_none(),
+            "safepoint contains an Acquire load but is not a word-only reader"
+        );
+        register_harvested_atomic_load_decls(Vec::new());
     }
 }

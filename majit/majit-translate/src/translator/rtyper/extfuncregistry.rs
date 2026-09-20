@@ -117,6 +117,51 @@ pub(crate) fn register_external_functions() -> Result<&'static [ExtFuncEntry], T
     }
 }
 
+/// Register collected Acquire-load accessors as `register_external`.
+///
+/// Walks [`super::lltypesystem::module::ll_extaccessor::AtomicLoadLlexternal`]
+/// the same way the `F64_METHOD_LLEXTERNALS` loop above walks the math
+/// table: dotted host path, declared arg/result annotations, no
+/// translation-time `llimpl` (the residual call is the real function).
+pub(crate) fn register_atomic_load_accessor_externals(
+    entries: &[super::lltypesystem::module::ll_extaccessor::AtomicLoadLlexternal],
+) -> Result<Vec<ExtFuncEntry>, TyperError> {
+    use super::lltypesystem::module::ll_extaccessor::{
+        host_qualname, lltype_to_external_annotation,
+    };
+    let mut out = Vec::new();
+    for row in entries {
+        let Some(result) = lltype_to_external_annotation(&row.result) else {
+            continue;
+        };
+        let mut args = Vec::with_capacity(row.arg_lltypes.len());
+        let mut declined = false;
+        for arg in &row.arg_lltypes {
+            match lltype_to_external_annotation(arg) {
+                Some(ann) => args.push(ann),
+                None => {
+                    declined = true;
+                    break;
+                }
+            }
+        }
+        if declined {
+            continue;
+        }
+        let qualname = host_qualname(&row.segments);
+        out.push(extfunc::register_external(
+            HostObject::new_builtin_callable(&qualname),
+            args,
+            Some(result),
+            Some(qualname),
+            None,
+            None,
+            true,
+        )?);
+    }
+    Ok(out)
+}
+
 fn annotation_by_name(name: &str) -> ExternalAnnotation {
     match name {
         "float" => ExternalAnnotation::Float,
@@ -214,5 +259,59 @@ mod tests {
             modf.signature_result,
             ExternalAnnotation::Tuple(_)
         ));
+    }
+
+    #[test]
+    fn registers_atomic_load_accessor_from_declaration_shape() {
+        use super::super::lltypesystem::lltype::LowLevelType;
+        use super::super::lltypesystem::module::ll_extaccessor::{
+            DeclinedFunDecl, collect_atomic_load_llexternals,
+        };
+        let keep = DeclinedFunDecl {
+            segments: vec![
+                "pyre_object".into(),
+                "lowlevel_string".into(),
+                "lowlevel_str_gc_type_id".into(),
+            ],
+            arg_lltypes: vec![],
+            result_lltype: LowLevelType::Unsigned,
+            has_translatable_body: false,
+            decline_reason: "unsupported MIR: atomic load ordering Acquire requires \
+                 address-preserving ordered lowering"
+                .into(),
+        };
+        let drop_other = DeclinedFunDecl {
+            segments: vec![
+                "pyre_object".into(),
+                "lowlevel_string".into(),
+                "set_lowlevel_str_gc_type_id".into(),
+            ],
+            arg_lltypes: vec![LowLevelType::Unsigned],
+            result_lltype: LowLevelType::Void,
+            has_translatable_body: false,
+            decline_reason: "declaration-has-no-unstructured-body".into(),
+        };
+        let collected = collect_atomic_load_llexternals([&keep, &drop_other]);
+        assert_eq!(collected.len(), 1);
+        let entries = register_atomic_load_accessor_externals(&collected)
+            .expect("register atomic-load accessor");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].name,
+            "pyre_object.lowlevel_string.lowlevel_str_gc_type_id"
+        );
+        assert!(entries[0].signature_args.is_empty());
+        assert_eq!(entries[0].signature_result, ExternalAnnotation::Unsigned);
+        let s = entries[0].compute_annotation(false);
+        match *s.s_result {
+            crate::annotator::model::SomeValue::Integer(ref si) => {
+                assert!(si.unsigned);
+                assert!(
+                    si.base.const_box.is_none(),
+                    "GC type id is published at runtime; the annotation must not be a const"
+                );
+            }
+            ref other => panic!("expected unsigned SomeInteger, got {other:?}"),
+        }
     }
 }
