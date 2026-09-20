@@ -14141,7 +14141,7 @@ mod tests {
     }
 
     #[test]
-    fn pyre_longlong2float_projects_to_convert_longlong_bytes() {
+    fn host_longlong2float_projects_to_convert_longlong_bytes() {
         let (rewritten, arg) = rewrite_direct_call(
             CallTarget::function_path(["pyre_object", "longlong2float", "longlong2float"]),
             ValueType::Int,
@@ -14174,7 +14174,7 @@ mod tests {
     }
 
     #[test]
-    fn pyre_lltype_cast_int_to_ptr_call_projects_to_llop() {
+    fn host_lltype_cast_int_to_ptr_call_projects_to_llop() {
         let (rewritten, arg) = rewrite_direct_call(
             CallTarget::function_path(["pyre_object", "lltype", "cast_int_to_ptr"]),
             ValueType::Int,

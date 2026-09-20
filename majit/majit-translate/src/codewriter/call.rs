@@ -4526,7 +4526,7 @@ impl CallControl {
                                         // no registered path at all.  Upstream has
                                         // no analogue — `funcobj.graph` is an
                                         // object reference that either exists or is
-                                        // `None` (call.py:127), never a name lookup
+                                        // `None` (`guess_call_kind`), never a name lookup
                                         // that can miss — so a miss here means the
                                         // callee was never lowered into
                                         // `function_graphs`, not that a gate judged
@@ -5243,7 +5243,7 @@ impl CallControl {
     pub fn graphs_from(&self, op: &SpaceOperation) -> Option<Vec<CallPath>> {
         match &op.kind {
             OpKind::Call { target, .. } => {
-                // call.py:97-101 direct_call branch: `funcobj.graph` if
+                // `graphs_from` direct_call branch: `funcobj.graph` if
                 // `is_candidate(graph)`.  The registered spelling is the
                 // graph identity BFS also follows; an unregistered
                 // `target_to_path` result is residual, not a different key.
@@ -5701,7 +5701,7 @@ impl CallControl {
             // it to `OpKind::New` plus `FieldWrite`s (`rewrite_op_malloc`'s
             // `new(descr)`).  A leftover constructor therefore has no
             // `CallPath` — the same answer as an `indirect_call`, which is a
-            // family of graphs rather than one (`call.py:94-114`).
+            // family of graphs rather than one (`graphs_from`).
             CallTarget::SyntheticTransparentCtor {
                 is_struct: true, ..
             } => None,

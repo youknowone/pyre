@@ -38754,7 +38754,7 @@ mod tests {
     }
 
     #[test]
-    fn pyre_longlong2float_float2longlong_projects_to_float_bytes_llop() {
+    fn host_float2longlong_projects_to_float_bytes_llop() {
         let llbc = scalar_method_call_fixture(
             "pyre_float2longlong",
             &["pyre_object", "longlong2float", "float2longlong"],
@@ -38771,7 +38771,7 @@ mod tests {
     }
 
     #[test]
-    fn pyre_longlong2float_longlong2float_projects_to_float_bytes_llop() {
+    fn host_longlong2float_projects_to_float_bytes_llop() {
         let llbc = scalar_method_call_fixture(
             "pyre_longlong2float",
             &["pyre_interpreter", "longlong2float", "longlong2float"],
@@ -38788,7 +38788,7 @@ mod tests {
     }
 
     #[test]
-    fn pyre_lltype_cast_ptr_to_int_projects_to_llop() {
+    fn host_lltype_cast_ptr_to_int_projects_to_llop() {
         let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
         let llbc = scalar_method_call_fixture(
             "pyre_cast_ptr_to_int",
@@ -38802,7 +38802,7 @@ mod tests {
     }
 
     #[test]
-    fn pyre_lltype_cast_int_to_ptr_projects_to_llop() {
+    fn host_lltype_cast_int_to_ptr_projects_to_llop() {
         let ptr_ty = serde_json::json!({"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]});
         let llbc = scalar_method_call_fixture(
             "pyre_cast_int_to_ptr",
