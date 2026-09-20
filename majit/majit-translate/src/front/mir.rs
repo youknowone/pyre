@@ -54,10 +54,13 @@
 //!     lifetimes).
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
-//!   - `Aggregate` — named structs lower to `New` + `FieldWrite` (malloc
-//!     then setfield). Transparent newtype wrappers stay a no-op alias.
-//!     Enum variants, tuples, and arrays still emit
-//!     `Call(SyntheticTransparentCtor)` for later rewrites.
+//!   - `Aggregate` — a unique, unescaped named struct lowers to `New` +
+//!     `FieldWrite` (malloc then setfield). A stack value that is copied,
+//!     returned, stored, or merged through a phi stays a constructor, so
+//!     later mutation of one copy is not visible through the others.
+//!     Transparent newtype wrappers stay a no-op alias. Enum variants,
+//!     tuples, and arrays still emit `Call(SyntheticTransparentCtor)` for
+//!     later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
 //!     / __len / __nullary_*)`.
@@ -3500,10 +3503,11 @@ fn simplify_lowered_graph(
     // `__cast_instance_intrinsic` return chain span the blocks split by the
     // `get_instantiate` / `gc_interp::enabled` calls).
     crate::model::thread_undefined_op_operands(graph);
-    // Named-struct aggregates that boxing fusion did not consume are the
-    // allocation themselves: rewrite the leftover constructor to `new(descr)`
-    // so it never reaches JitCode as an uncallable residual call.  Only the
-    // final simplify runs this — the pre-pass still has consumer rewrites
+    // Named-struct aggregates that boxing fusion did not consume become
+    // `new(descr)` only when the constructor is the unique, unescaped
+    // allocation — a stack value that is copied, returned, stored, or
+    // merged through a phi must stay a constructor. Only the final
+    // simplify runs this — the pre-pass still has consumer rewrites
     // (`range_iter`, slice-index) that match the constructor.
     if sweep_dead_vars {
         lower_struct_aggregate_ctors_to_new(graph);
@@ -3533,14 +3537,22 @@ fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
 /// `SyntheticTransparentCtor` so `fuse_boxing_alloc`,
 /// `lower_struct_ptr_writes`, and `remove_dead_aggregates` still see the
 /// construct-on-stack spelling; after those passes, a remaining struct
-/// constructor is the allocation and becomes [`OpKind::New`].
+/// constructor that is the unique, unescaped allocation becomes
+/// [`OpKind::New`].
 ///
-/// Aggregates that still participate in a boxing cluster stay constructors:
-/// the malloc argument, any phi that carries it, and nested named structs
-/// stored into those (the header object fusion reads `ob_type` off).  They
-/// are the cluster's stack value, not the heap object; rewriting them to
-/// `New` would allocate the header separately and leave fusion looking at
-/// a `New` instead of a `SyntheticTransparentCtor`.
+/// A named struct on the stack is a value: `let b = a`, passing by value,
+/// returning it, storing it into a field, or merging it through a phi
+/// copies it, and later mutation of one copy must not be visible through
+/// the other. `New` gives the result reference identity, so those
+/// constructors stay constructors.
+///
+/// Aggregates that still participate in a boxing cluster also stay
+/// constructors: the malloc argument, any phi that carries it, and nested
+/// named structs stored into those (the header object fusion reads
+/// `ob_type` off). They are the cluster's stack value, not the heap
+/// object; rewriting them to `New` would allocate the header separately
+/// and leave fusion looking at a `New` instead of a
+/// `SyntheticTransparentCtor`.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded"
@@ -3548,9 +3560,9 @@ fn call_target_is_gc_malloc(target: &CallTarget) -> bool {
 fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
     let malloc_args = boxing_cluster_ctor_results(graph);
 
-    let mut rewritten = 0usize;
-    for block in &mut graph.blocks {
-        for op in &mut block.operations {
+    let mut rewrite: Vec<(usize, usize, String)> = Vec::new();
+    for (block_idx, block) in graph.blocks.iter().enumerate() {
+        for (op_idx, op) in block.operations.iter().enumerate() {
             let Some(result) = op.result.as_ref() else {
                 continue;
             };
@@ -3577,12 +3589,68 @@ fn lower_struct_aggregate_ctors_to_new(graph: &mut FunctionGraph) -> usize {
             if owner.is_empty() {
                 continue;
             }
-            let owner = owner.clone();
-            op.kind = OpKind::New { owner };
-            rewritten += 1;
+            if struct_ctor_copied_by_value(graph, result) {
+                continue;
+            }
+            rewrite.push((block_idx, op_idx, owner.clone()));
         }
     }
-    rewritten
+    for (block_idx, op_idx, owner) in &rewrite {
+        graph.blocks[*block_idx].operations[*op_idx].kind = OpKind::New {
+            owner: owner.clone(),
+        };
+    }
+    rewrite.len()
+}
+
+/// Whether `result` is used as a by-value copy, move, or merge rather than
+/// as the unique object whose fields are initialized in place.
+///
+/// Those uses are the sites at which a stack aggregate is a value: a later
+/// `FieldWrite` on one copy must not be visible through the others, and a
+/// residual callee that takes the aggregate by value expects the stack
+/// layout, not a heap pointer.
+fn struct_ctor_copied_by_value(graph: &FunctionGraph, result: &Variable) -> bool {
+    for block in &graph.blocks {
+        if block.inputargs.iter().any(|arg| arg == result) {
+            return true;
+        }
+        for link in &block.exits {
+            if link
+                .args
+                .iter()
+                .any(|arg| arg.as_variable() == Some(result))
+            {
+                return true;
+            }
+        }
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    if args.iter().any(|arg| arg.as_variable() == Some(result))
+                        && !call_target_is_gc_malloc(target)
+                    {
+                        return true;
+                    }
+                }
+                OpKind::FieldWrite { value, .. } => {
+                    if value.as_variable() == Some(result) {
+                        return true;
+                    }
+                }
+                OpKind::FieldRead { base, .. } if base == result => {}
+                kind => {
+                    if crate::inline::op_variable_refs(kind)
+                        .iter()
+                        .any(|var| var == result)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Variables that still belong to an unfused boxing cluster: each
@@ -6370,15 +6438,16 @@ impl<'a> Lowering<'a> {
                 ))
             }
             // `Aggregate(kind, operands)` — tuple / struct / enum-variant
-            // / array construction. A named struct is `malloc(GcStruct)`
-            // plus one `setfield` per member; the constructor call is a
-            // temporary marker so boxing fusion and dead-aggregate sweep
-            // still see the construct-on-stack spelling, then
-            // [`lower_struct_aggregate_ctors_to_new`] rewrites it to
-            // `OpKind::New`. Transparent newtype wrappers stay a no-op
-            // alias of their inner operand. Enum variants, tuples, and
-            // arrays keep `CallTarget::SyntheticTransparentCtor` for the
-            // later rewrites that still match that shape.
+            // / array construction. A unique, unescaped named struct is
+            // `malloc(GcStruct)` plus one `setfield` per member; the
+            // constructor call is a temporary marker so boxing fusion and
+            // dead-aggregate sweep still see the construct-on-stack
+            // spelling, then [`lower_struct_aggregate_ctors_to_new`]
+            // rewrites it to `OpKind::New` only when that rewrite is a
+            // value-preserving allocation. Transparent newtype wrappers
+            // stay a no-op alias of their inner operand. Enum variants,
+            // tuples, and arrays keep `CallTarget::SyntheticTransparentCtor`
+            // for the later rewrites that still match that shape.
             Rvalue::Aggregate(kind, operands) => {
                 // A fieldless (C-like) enum variant carries no payload, so
                 // constructing it is just naming its discriminant integer
@@ -33497,6 +33566,22 @@ mod tests {
     }
 
     fn struct_ctor_graph(pass_to_malloc: bool) -> FunctionGraph {
+        struct_ctor_graph_escaping(pass_to_malloc, StructCtorEscape::UniqueLocal)
+    }
+
+    #[derive(Clone, Copy)]
+    enum StructCtorEscape {
+        /// Field reads only; the aggregate itself does not escape.
+        UniqueLocal,
+        /// `return s` — a by-value move to the caller.
+        Returned,
+        /// Passed to a residual call that expects the by-value layout.
+        CallArg,
+        /// Copied into a successor phi, then mutated.
+        Phi,
+    }
+
+    fn struct_ctor_graph_escaping(pass_to_malloc: bool, escape: StructCtorEscape) -> FunctionGraph {
         let mut graph = FunctionGraph::new("struct_ctor");
         let entry = graph.startblock;
         let owner = "error::DictKeyError";
@@ -33522,7 +33607,7 @@ mod tests {
             OpKind::FieldWrite {
                 base: result.clone(),
                 field: FieldDescriptor::new("kind", Some(owner.to_string())),
-                value: LinkArg::Value(payload),
+                value: LinkArg::Value(payload.clone()),
                 ty: ValueType::Int,
             },
             false,
@@ -33538,7 +33623,52 @@ mod tests {
                 true,
             );
         }
-        graph.set_return(entry, Some(result));
+        match escape {
+            StructCtorEscape::UniqueLocal => {
+                let kind = graph
+                    .push_op_var(
+                        entry,
+                        OpKind::FieldRead {
+                            base: result,
+                            field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                            ty: ValueType::Int,
+                            pure: true,
+                        },
+                        true,
+                    )
+                    .expect("field read");
+                graph.set_return(entry, Some(kind));
+            }
+            StructCtorEscape::Returned => graph.set_return(entry, Some(result)),
+            StructCtorEscape::CallArg => {
+                graph.push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["slice", "index"]),
+                        args: crate::model::call_args(vec![result]),
+                        result_ty: ValueType::Int,
+                    },
+                    true,
+                );
+                graph.set_return(entry, None);
+            }
+            StructCtorEscape::Phi => {
+                let (next, args) = graph.create_block_with_arg_vars(1);
+                let copy = args[0].clone();
+                graph.push_op_var(
+                    next,
+                    OpKind::FieldWrite {
+                        base: copy,
+                        field: FieldDescriptor::new("kind", Some(owner.to_string())),
+                        value: LinkArg::Value(payload),
+                        ty: ValueType::Int,
+                    },
+                    false,
+                );
+                graph.set_goto(entry, next, vec![result]);
+                graph.set_return(next, None);
+            }
+        }
         graph
     }
 
@@ -33563,15 +33693,42 @@ mod tests {
         (ctors, news, field_writes)
     }
 
-    /// A named struct aggregate is `malloc(GcStruct)` plus one `setfield` per
-    /// member, not a residual constructor call. Transparent newtype wrappers
-    /// are a different arm and stay a no-op alias.
+    /// A unique, unescaped named struct is `malloc(GcStruct)` plus one
+    /// `setfield` per member, not a residual constructor call. Transparent
+    /// newtype wrappers are a different arm and stay a no-op alias.
     #[test]
     fn named_struct_aggregate_lowers_to_new_plus_field_stores() {
         let mut graph = struct_ctor_graph(false);
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
         assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 1);
         assert_eq!(struct_ctor_ops(&graph), (0, 1, 1));
+    }
+
+    /// Returning the aggregate is a by-value move. `New` would give the
+    /// caller a pointer, so later copies share mutations of one object.
+    #[test]
+    fn returned_struct_ctor_keeps_value_semantics() {
+        let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::Returned);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    /// Passing the aggregate to a call is a by-value copy. Residual callees
+    /// expect the stack layout, not a heap pointer.
+    #[test]
+    fn by_value_call_arg_struct_ctor_is_not_rewritten() {
+        let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::CallArg);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
+    }
+
+    /// A phi copy plus a later field write must not share one allocation:
+    /// each copy is a distinct value.
+    #[test]
+    fn phi_mutated_struct_ctor_is_not_rewritten() {
+        let mut graph = struct_ctor_graph_escaping(false, StructCtorEscape::Phi);
+        assert_eq!(lower_struct_aggregate_ctors_to_new(&mut graph), 0);
+        assert_eq!(struct_ctor_ops(&graph), (1, 0, 2));
     }
 
     /// The rewrite is the last step of the final simplify, after boxing fusion
