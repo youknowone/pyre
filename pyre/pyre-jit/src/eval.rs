@@ -1587,12 +1587,11 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
     f(&mut frame.pycode as *mut *const () as *mut majit_ir::GcRef);
     f(&mut frame.vable_token as *mut usize as *mut majit_ir::GcRef);
 
-    // locals_cells_stack_w: visit the field slot for every GC array so major
-    // marking reaches it. A nursery array is subsequently scanned by its own
-    // type-9 walker; an old-gen array also needs this in-place scan because
-    // interpreter stores do not write-barrier its items. At a major, its own
-    // walker reaches them too, so this is harmless duplicate marking.
-    // RPython's phase-agnostic precedent is jitframe.py `jitframe_trace`.
+    // locals_cells_stack_w: visit the field slot for every GC array so both
+    // marking phases reach it. The array is then scanned by its own type-9
+    // walker, in either generation, exactly as an ordinary object field is.
+    // RPython's precedent for scanning a block in place, jitframe.py
+    // `jitframe_trace`, covers the raw counterpart below, not a GC array.
     let array = frame.locals_cells_stack_w;
     if !array.is_null() {
         let managed = pyre_object::gc_hook::try_gc_owns_object(array as *mut u8);
@@ -1602,23 +1601,25 @@ unsafe fn pyframe_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut ma
                     as *mut majit_ir::GcRef,
             );
         }
-        // The visitor forwards a promoted nursery array in place, so
-        // `frame.locals_cells_stack_w` now holds the old-gen copy. Re-read it:
-        // the local `array` read above still points at the pre-copy location,
-        // whose header is a forwarding marker (arraylen there is the
-        // forwarding address). `walk_items` and the item walk must use the
-        // live destination.
-        let array = frame.locals_cells_stack_w;
-        let walk_items = if managed {
-            !majit_gc::gc_is_nursery_object(array as usize)
-        } else {
-            true
-        };
-        // Stationary `std::alloc` blocks (never entered by
-        // `trace_and_update_object`) and old-gen GC blocks forward the
-        // locals/cells plus the live operand-stack prefix. PyPy clears every
-        // popped list slot to None; using `valuestackdepth` is the equivalent
-        // boundary for pyre's fixed-capacity array and prevents a stale
+        // A GC-managed array forwards its own items, whatever generation it is
+        // in: it is registered as a varsize array of GC refs, so
+        // `trace_and_update_object` walks its slots, and `set_ref` /
+        // `remember_frame_locals_array` put an old array holding a young value
+        // into the remembered set. That is the shape of
+        // `locals_cells_stack_w` upstream, where it is a plain list and
+        // `PyFrame` carries no trace hook at all; the drain re-arms
+        // TRACK_YOUNG_PTRS unconditionally, so the barrier stays armed for the
+        // next store.
+        //
+        // Walking a managed array's items from here as well would hand the
+        // collector slots it does not own — an extra area whose header the
+        // barrier, not this hook, is responsible for. Only a raw `std::alloc`
+        // block, which has no GC header and is never entered by
+        // `trace_and_update_object`, still needs the in-place walk.
+        let walk_items = !managed;
+        // The raw block forwards the locals/cells plus the live operand-stack
+        // prefix. `popvalue_maybe_none` clears every popped slot to None, so
+        // `valuestackdepth` is the boundary that keeps a stale
         // resume/exception slot from retaining an otherwise-dead object.
         if walk_items {
             let arr = unsafe { &mut *array };
