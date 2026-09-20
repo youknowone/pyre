@@ -4081,7 +4081,7 @@ fn _flat_pycall(
             w_globals,
             crate::call::getexecutioncontext(),
             closure,
-            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -4096,13 +4096,11 @@ fn _flat_pycall(
     for i in 0..nargs {
         new_frame.set_locals_w(i, frame.peekvalue(nargs - 1 - i));
     }
-    // The callee's locals array is old-gen (`OldGenGc`) and the arguments
-    // just written into it are young. RPython's GC transform emits the
-    // old-to-young `write_barrier` (minimark.py) after such a store;
-    // pyre has no transform pass, so the batch barrier runs here. Until the
-    // callee frame is installed on the `f_backref` chain nothing else exposes
-    // these slots, so a minor collection before then would leave every
-    // argument stale.
+    // `PyFrame.__init__` allocates `locals_cells_stack_w` as a fresh
+    // `[None] * size` nursery array.  Arguments just written into it are
+    // also young.  `remember_frame_locals_array` still runs: a full nursery
+    // can spill the array to old-gen, and until the callee sits on
+    // `f_backref` nothing else exposes these slots.
     crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
@@ -4151,6 +4149,14 @@ fn _flat_pycall_defaults(
 ) -> PyObjectRef {
     // Same RPython GC-transform live-frame root as `_flat_pycall`: positional
     // stack entries are copied only after the callee allocation returns.
+    // Normalizing a published root is a safepoint, so every call input goes
+    // out in one publish and is read back from its slot before use.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let inputs_base = _roots.publish(&[func, code, defs]);
+    _roots.normalize(inputs_base, 3);
+    let func = _roots.get(inputs_base);
+    let code = _roots.get(inputs_base + 1);
+    let defs_idx = inputs_base + 2;
     let w_globals = unsafe { function_get_globals_obj(func) };
     let closure = unsafe { function_get_closure(func) };
 
@@ -4162,7 +4168,7 @@ fn _flat_pycall_defaults(
             w_globals,
             crate::call::getexecutioncontext(),
             closure,
-            crate::pyframe::FrameLocalsArrayAllocation::OldGenGc,
+            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -4178,6 +4184,7 @@ fn _flat_pycall_defaults(
     }
 
     // function.py:224-229 — fill remaining from defs_w
+    let defs = pyre_object::gc_roots::shadow_stack_get(defs_idx);
     if !defs.is_null() {
         let ndefs = unsafe { pyre_object::w_tuple_len(defs) };
         let start = ndefs - defs_to_load;
@@ -4190,15 +4197,15 @@ fn _flat_pycall_defaults(
         }
     }
 
-    // Same old-to-young barrier as `_flat_pycall`: positional arguments and
-    // defaults were written into the callee's old-gen locals array.
+    // Same barrier as `_flat_pycall`: a full nursery can spill the callee's
+    // locals array to old-gen, and the arguments and defaults in it are young.
     crate::pyframe::remember_frame_locals_array(new_frame.locals_cells_stack_w);
     frame.dropvalues(dropvalues);
     new_frame.fix_array_ptrs();
 
     // function.py:231 — return new_frame.run(self.name, self.qualname)
     if new_frame._is_generator_or_coroutine() {
-        match crate::call::frame_into_generator_for_function(new_frame, func) {
+        match crate::call::frame_into_generator_for_function(new_frame, _roots.get(inputs_base)) {
             Ok(v) => v,
             Err(e) => {
                 crate::call::set_call_error(e);

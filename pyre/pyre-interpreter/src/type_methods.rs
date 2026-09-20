@@ -4368,11 +4368,21 @@ pub fn encode_object(
     encoding: &str,
     errors: &str,
 ) -> Result<Vec<u8>, crate::PyError> {
-    let enc_lower = encoding.to_ascii_lowercase().replace('_', "-");
-    let s = unsafe { w_str_get_wtf8(w_object) }.to_wtf8_buf();
+    // The name is matched with case folded and `_` read as `-`.  Every caller
+    // inside the runtime, and `str.encode`'s own default, already spells it
+    // that way, so the rewrite is the exception and only it pays for a buffer
+    // -- `decode_bytes_to_wtf8` reads its own name the same way.
+    let enc_lower: std::borrow::Cow<'_, str> = if encoding
+        .bytes()
+        .any(|b| b.is_ascii_uppercase() || b == b'_')
+    {
+        std::borrow::Cow::Owned(encoding.to_ascii_lowercase().replace('_', "-"))
+    } else {
+        std::borrow::Cow::Borrowed(encoding)
+    };
     if crate::importing::dev_mode_flag()
         && matches!(
-            enc_lower.as_str(),
+            enc_lower.as_ref(),
             "utf-8"
                 | "utf8"
                 | "u8"
@@ -4394,24 +4404,41 @@ pub fn encode_object(
     {
         crate::module::_codecs::validate_error_handler(errors)?;
     }
-    if matches!(enc_lower.as_str(), "utf-8" | "utf8" | "u8") {
-        return encode_utf8_with_errors(&s, w_object, errors);
+    // Name the encoder before reading the string.  `encode_text` hands
+    // `w_object` to the registry untouched, so a name the built-ins do not
+    // own must not pay for a copy of the whole input first.
+    let Some(builtin) = builtin_encoder(&enc_lower) else {
+        let encoded = crate::module::_codecs::encode_text_codec(w_object, encoding, errors)?;
+        return Ok(unsafe { pyre_object::bytesobject::bytes_like_data(encoded) }.to_vec());
+    };
+    let s = unsafe { w_str_get_wtf8(w_object) }.to_wtf8_buf();
+    match builtin {
+        BuiltinEncoder::Utf8 => encode_utf8_with_errors(&s, w_object, errors),
+        BuiltinEncoder::Ascii => crate::codec_engine::encode_ascii(&s, w_object, errors),
+        BuiltinEncoder::Latin1 => crate::codec_engine::encode_latin1(&s, w_object, errors),
+        BuiltinEncoder::RawUnicodeEscape => Ok(encode_raw_unicode_escape(&s)),
+        BuiltinEncoder::Utf16Or32(form) => encode_utf16_32(&s, form, w_object, errors),
     }
-    match enc_lower.as_str() {
-        "ascii" | "us-ascii" | "646" => crate::codec_engine::encode_ascii(&s, w_object, errors),
-        "latin-1" | "latin1" | "iso-8859-1" | "8859" => {
-            crate::codec_engine::encode_latin1(&s, w_object, errors)
-        }
-        "raw-unicode-escape" => Ok(encode_raw_unicode_escape(&s)),
-        _ => match encode_utf16_32(&s, &enc_lower, w_object, errors) {
-            Some(out) => out,
-            None => {
-                let encoded =
-                    crate::module::_codecs::encode_text_codec(w_object, encoding, errors)?;
-                Ok(unsafe { pyre_object::bytesobject::bytes_like_data(encoded) }.to_vec())
-            }
-        },
-    }
+}
+
+/// The built-in encoder a `lower`-normalized codec name selects, or `None`
+/// for a name only the codec registry can answer.
+enum BuiltinEncoder {
+    Utf8,
+    Ascii,
+    Latin1,
+    RawUnicodeEscape,
+    Utf16Or32(Utf16Or32Form),
+}
+
+fn builtin_encoder(lower: &str) -> Option<BuiltinEncoder> {
+    Some(match lower {
+        "utf-8" | "utf8" | "u8" => BuiltinEncoder::Utf8,
+        "ascii" | "us-ascii" | "646" => BuiltinEncoder::Ascii,
+        "latin-1" | "latin1" | "iso-8859-1" | "8859" => BuiltinEncoder::Latin1,
+        "raw-unicode-escape" => BuiltinEncoder::RawUnicodeEscape,
+        _ => BuiltinEncoder::Utf16Or32(utf16_32_form(lower)?),
+    })
 }
 
 /// `unicodeobject.c:_PyUnicode_EncodeRawUnicodeEscape` — code points
@@ -4456,17 +4483,19 @@ fn compact_codec_name(lower: &str) -> String {
         .collect()
 }
 
-/// utf-16 / utf-32 encode for the `lower`-normalized codec name, or
-/// `None` if `lower` names neither.  The bare `utf-16` / `utf-32` forms
-/// emit a native-endian BOM; the `-le` / `-be` forms omit it.  A lone
-/// surrogate is routed through `errors` (`surrogatepass` emits its raw
-/// code unit; `strict` raises) rather than crashing.
-pub fn encode_utf16_32(
-    s: &Wtf8,
-    lower: &str,
-    w_object: PyObjectRef,
-    errors: &str,
-) -> Option<Result<Vec<u8>, crate::PyError>> {
+/// Which of the six utf-16 / utf-32 spellings a codec name selects.  The
+/// bare `utf-16` / `utf-32` forms emit a native-endian BOM; the `-le` /
+/// `-be` forms omit it.
+pub struct Utf16Or32Form {
+    is32: bool,
+    order: rustpython_common::encodings::ByteOrder,
+    bom: bool,
+}
+
+/// The width, byte order and BOM the `lower`-normalized name selects, or
+/// `None` if it names neither codec.  Answered without reading the string so
+/// a registry name never pays for one.
+fn utf16_32_form(lower: &str) -> Option<Utf16Or32Form> {
     use rustpython_common::encodings::ByteOrder;
     let (is32, order, bom) = match compact_codec_name(lower).as_str() {
         "utf16" | "u16" => (false, ByteOrder::Native, true),
@@ -4477,11 +4506,24 @@ pub fn encode_utf16_32(
         "utf32be" => (true, ByteOrder::Big, false),
         _ => return None,
     };
-    Some(if is32 {
+    Some(Utf16Or32Form { is32, order, bom })
+}
+
+/// utf-16 / utf-32 encode in the named `form`.  A lone surrogate is routed
+/// through `errors` (`surrogatepass` emits its raw code unit; `strict`
+/// raises) rather than crashing.
+pub fn encode_utf16_32(
+    s: &Wtf8,
+    form: Utf16Or32Form,
+    w_object: PyObjectRef,
+    errors: &str,
+) -> Result<Vec<u8>, crate::PyError> {
+    let Utf16Or32Form { is32, order, bom } = form;
+    if is32 {
         crate::codec_engine::encode_utf32(s, w_object, errors, order, bom)
     } else {
         crate::codec_engine::encode_utf16(s, w_object, errors, order, bom)
-    })
+    }
 }
 
 /// utf-16 / utf-32 decode for the `lower`-normalized codec name, or

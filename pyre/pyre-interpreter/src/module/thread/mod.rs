@@ -282,6 +282,12 @@ pub fn park_if_finalizing() {
     if !is_finalizing() || FINALIZING_THREAD.load(Ordering::Acquire) == current_ident() {
         return;
     }
+    // A parked thread never runs again, so a lock it owns is never released.
+    // The import lock is one the finalizing thread itself takes; its owner
+    // keeps running and parks at the first dispatch after `release_lock`.
+    if crate::module::imp::interp_imp::lock_held_by_current_thread() {
+        return;
+    }
     let blocked = before_external_block();
     std::mem::forget(blocked);
     #[cfg(not(target_arch = "wasm32"))]

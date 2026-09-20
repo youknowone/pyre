@@ -3705,8 +3705,8 @@ impl IterOpcodeHandler for PyFrame {
         }
     }
 
-    fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError> {
-        self.set_last_instr_from_next_instr(target);
+    fn on_iter_exhausted_anchored(anchor: &Self::Anchor, target: usize) -> Result<(), PyError> {
+        unsafe { &mut *anchor.live() }.set_last_instr_from_next_instr(target);
         Ok(())
     }
 }

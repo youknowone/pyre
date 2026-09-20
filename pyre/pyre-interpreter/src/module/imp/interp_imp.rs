@@ -368,6 +368,14 @@ fn lock_held() -> bool {
     getimportlock().lock_held_by_anyone()
 }
 
+/// Whether the calling thread owns the import lock.  Finalization parks
+/// every other mutator for good, and the finalizing thread still takes this
+/// lock (importlib's module-lock weakref callback does), so its owner has to
+/// reach `release_lock` before it may be stopped.
+pub(crate) fn lock_held_by_current_thread() -> bool {
+    getimportlock().lockowner.load(Ordering::Acquire) == thread_ident()
+}
+
 /// `interp_imp.py acquire_lock`.
 fn acquire_lock() {
     getimportlock().acquire_lock();
