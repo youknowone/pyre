@@ -8,7 +8,25 @@
 use majit_backend::JitCellToken;
 use majit_ir::{DescrRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::sync::{Arc, Weak};
+
+/// `[funcbox] + argboxes` for residual-call recording. Eight OpRefs stay
+/// inline; `MAX_HOST_CALL_ARITY` is 16, and the common helper arity is 0–3.
+fn call_arg_boxes(func_ref: OpRef, args: &[OpRef]) -> SmallVec<[OpRef; 8]> {
+    let mut call_args = SmallVec::with_capacity(1 + args.len());
+    call_args.push(func_ref);
+    call_args.extend_from_slice(args);
+    call_args
+}
+
+fn call_arg_boxes_prefixed(first: OpRef, func_ref: OpRef, args: &[OpRef]) -> SmallVec<[OpRef; 8]> {
+    let mut call_args = SmallVec::with_capacity(2 + args.len());
+    call_args.push(first);
+    call_args.push(func_ref);
+    call_args.extend_from_slice(args);
+    call_args
+}
 
 /// history.py get_const_ptr_for_string(s)
 ///
@@ -3350,7 +3368,7 @@ impl TraceCtx {
         self.recorder.num_inputargs()
     }
 
-    fn infer_arg_types(&self, args: &[OpRef]) -> Vec<Type> {
+    fn infer_arg_types(&self, args: &[OpRef]) -> SmallVec<[Type; 8]> {
         args.iter()
             .map(|&arg| self.get_opref_type(arg).unwrap_or(Type::Int))
             .collect()
@@ -3763,8 +3781,7 @@ impl TraceCtx {
         descr: majit_ir::DescrRef,
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes(func_ref, args);
         if let Some(call_descr) = descr.as_call_descr() {
             let oracle: &dyn crate::heapcache::SameConstantOracle =
                 &crate::history::ConstOprefOracle;
@@ -4097,8 +4114,7 @@ impl TraceCtx {
         // itself, not a ConstInt snapshot of this iteration's value.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Void, slot);
-        let mut call_args = vec![condition, func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes_prefixed(condition, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallN, &call_args, descr);
     }
@@ -4114,8 +4130,7 @@ impl TraceCtx {
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Int, slot);
-        let mut call_args = vec![value, func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes_prefixed(value, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallValueI, &call_args, descr)
     }
@@ -4143,8 +4158,7 @@ impl TraceCtx {
         // this iteration's pointer bits.
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_from_target_slot(arg_types, Type::Ref, slot);
-        let mut call_args = vec![value, func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes_prefixed(value, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::CondCallValueR, &call_args, descr)
     }
@@ -4194,8 +4208,7 @@ impl TraceCtx {
         // `op.args[0]`'s concretetype).
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_descr_with_effect(arg_types, result_type, extra_info);
-        let mut call_args = vec![result, func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes_prefixed(result, func_ref, args);
         self.recorder
             .record_op_with_descr(OpCode::RecordKnownResult, &call_args, descr);
     }
@@ -4364,8 +4377,7 @@ impl TraceCtx {
     ) -> OpRef {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr = make_call_may_force_descr(arg_types, ret_type);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py `do_residual_call` may-force branch:
         // `direct_call_may_force` (line 2067) RECORDS first, then
         // `heapcache.invalidate_caches_varargs(opnum1, descr, allboxes)`
@@ -4430,8 +4442,7 @@ impl TraceCtx {
         let func_ref = OpRef::const_int(func_ptr as usize as i64);
         let descr =
             crate::call_descr::make_call_descr_with_effect(arg_types, ret_type, effect_info);
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py:2053-2072 (see `call_family_typed` for rationale):
         // record before invalidate.
         let result = self
@@ -4647,8 +4658,7 @@ impl TraceCtx {
             crate::call_descr::make_call_descr_with_effect(arg_types, Type::Void, effect_info);
         let descr_index = descr.index();
         let arg0_int = func_ptr as usize as i64;
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py `_record_helper_varargs` parity (see
         // `call_typed`): every CALL family record routes through the
         // canonical heap_cache.invalidate_caches_varargs BEFORE the
@@ -4897,8 +4907,7 @@ impl TraceCtx {
             // is enough for the consumers of this method.
             return cached;
         }
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py `_record_helper_varargs` parity (mirror
         // `call_typed` in trace_ctx.rs). Routes
         // heapcache.invalidate_caches_varargs BEFORE the history record
@@ -5138,8 +5147,7 @@ impl TraceCtx {
         {
             return cached;
         }
-        let mut call_args = vec![func_ref];
-        call_args.extend_from_slice(args);
+        let call_args = call_arg_boxes(func_ref, args);
         // pyjitpl.py `_record_helper_varargs` parity (mirror
         // `call_typed_with_effect` in trace_ctx.rs). Routes
         // heapcache.invalidate_caches_varargs BEFORE the history record
@@ -5304,8 +5312,7 @@ impl TraceCtx {
             Some(majit_ir::Value::Int(n)) => Some(n),
             _ => None,
         };
-        let mut allboxes = vec![func_ref];
-        allboxes.extend_from_slice(args);
+        let allboxes = call_arg_boxes(func_ref, args);
         self.heap_cache.invalidate_caches_varargs(
             OpCode::call_may_force_for_type(result_type),
             None,

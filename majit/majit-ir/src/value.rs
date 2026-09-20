@@ -1325,6 +1325,13 @@ pub fn green_uhash_step(x: u64, tp: GreenType, value: i64) -> u64 {
     (x ^ hash_whatever(tp, value)).wrapping_mul(GREEN_UHASH_MULT)
 }
 
+/// Inline slots for [`GreenKey`] values/types.
+///
+/// `merge_point_green_key` prepends the target pc onto the driver greens, so
+/// a five-green portal (`pc, stackok, is_queue, bm, program`) is six i64s.
+/// Eight covers that plus a couple of extra greens without spilling.
+pub const GREEN_INLINE: usize = 8;
+
 /// Structured green key — represents the exact values and types of all
 /// green variables at a particular program point.
 ///
@@ -1334,14 +1341,11 @@ pub fn green_uhash_step(x: u64, tp: GreenType, value: i64) -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct GreenKey {
     /// Values of all green variables, in declaration order.
-    /// Four i64s stay inline: shortcircuit's `pc, program, root` plus the
-    /// prepended target pc is exactly 32 B, which `Vec::with_capacity(4)`
-    /// minted on every `merge_point_green_key`.
-    pub values: SmallVec<[i64; 4]>,
+    pub values: SmallVec<[i64; GREEN_INLINE]>,
     /// warmstate.py — per-entry TYPE. Drives hash_whatever/equal_whatever.
     /// `GreenType` (not IR `Type`) so `Ptr to rstr.STR/UNICODE` stays distinct
     /// from generic Ref and is dispatched through ll_streq / ll_strhash.
-    pub types: SmallVec<[GreenType; 4]>,
+    pub types: SmallVec<[GreenType; GREEN_INLINE]>,
 }
 
 impl PartialEq for GreenKey {
@@ -1387,7 +1391,7 @@ impl std::hash::Hash for GreenKey {
 
 impl GreenKey {
     /// Create an all-Int green key (most common case: PC-based keys).
-    pub fn new(values: impl Into<SmallVec<[i64; 4]>>) -> Self {
+    pub fn new(values: impl Into<SmallVec<[i64; GREEN_INLINE]>>) -> Self {
         let values = values.into();
         let mut types = SmallVec::new();
         types.resize(values.len(), GreenType::Int);
@@ -1397,11 +1401,12 @@ impl GreenKey {
     /// warmstate.py:564-565 — typed green key. Accepts either IR-level
     /// [`Type`] (via `From<Type>`) or the richer [`GreenType`].
     pub fn with_types<T: Into<GreenType> + Copy>(
-        values: impl Into<SmallVec<[i64; 4]>>,
+        values: impl Into<SmallVec<[i64; GREEN_INLINE]>>,
         types: impl IntoIterator<Item = T>,
     ) -> Self {
         let values = values.into();
-        let types: SmallVec<[GreenType; 4]> = types.into_iter().map(Into::into).collect();
+        let types: SmallVec<[GreenType; GREEN_INLINE]> =
+            types.into_iter().map(Into::into).collect();
         debug_assert_eq!(values.len(), types.len());
         GreenKey { values, types }
     }

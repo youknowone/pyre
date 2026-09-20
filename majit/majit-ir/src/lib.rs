@@ -53,7 +53,8 @@ pub use resoperation::{
 };
 pub use resumecode::NumberingRef;
 pub use value::{
-    CallArgWord, CallResultWord, Const, FAILARGS_LIMIT, GREEN_UHASH_MULT, GREEN_UHASH_SEED, GcRef,
+    CallArgWord, CallResultWord, Const, FAILARGS_LIMIT, GREEN_INLINE, GREEN_UHASH_MULT,
+    GREEN_UHASH_SEED, GcRef,
     GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc, JitDriverVar, RefCurrentFn,
     RefReleaseFn, RefRetainFn, RetainedGreens, SharedConstPool, StrEqFn, StrHashFn, Type, Value,
     VarKind, equal_whatever, green_type_to_ir, green_uhash_step, make_str_slot, pypyjit_greenkey,
