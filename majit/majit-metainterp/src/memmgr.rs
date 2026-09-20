@@ -271,6 +271,14 @@ impl MemoryManager {
             }
             !evict
         });
+        // An evicted token releases the strong jump-target references
+        // `record_jump_to` stored in `keepalive_tokens`, so a mutual-jump
+        // cycle cannot keep compiled code alive. memmgr.py
+        // `_kill_old_loops_now` drops the `alive_loops` entry; here the
+        // cycle must be broken explicitly so `JitCellToken::drop` can run.
+        for token in &evicted_tokens {
+            token.keepalive_tokens.lock().clear();
+        }
         if !evicted_tokens.is_empty() {
             self.evictions = self.evictions.wrapping_add(1);
         }
@@ -293,6 +301,14 @@ impl MemoryManager {
     pub fn release_all_loops(&mut self) {
         let _scope = crate::debug::scope("jit-mem-releaseall");
         crate::debug::debug_print(&format!("Loop tokens cleared: {}", self.alive_loops.len()));
+        // An evicted token releases the strong jump-target references
+        // `record_jump_to` stored in `keepalive_tokens`, so a mutual-jump
+        // cycle cannot keep compiled code alive. memmgr.py
+        // `release_all_loops` drops every `alive_loops` entry; here the
+        // cycle must be broken explicitly so `JitCellToken::drop` can run.
+        for token in self.alive_loops.values() {
+            token.keepalive_tokens.lock().clear();
+        }
         self.alive_loops.clear();
         self.evictions = self.evictions.wrapping_add(1);
     }
@@ -318,5 +334,31 @@ impl MemoryManager {
     /// Test/debug accessor — `looptoken in self.alive_loops` upstream.
     pub fn contains(&self, looptoken: &Arc<JitCellToken>) -> bool {
         self.alive_loops.contains_key(&Arc::as_ptr(looptoken))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicted_tokens_release_keepalive_cycle() {
+        let a = Arc::new(JitCellToken::new(1));
+        let b = Arc::new(JitCellToken::new(2));
+        a.record_jump_to(Arc::clone(&b));
+        b.record_jump_to(Arc::clone(&a));
+
+        let mut mgr = MemoryManager::new(1);
+        mgr.keep_loop_alive(&a);
+        mgr.keep_loop_alive(&b);
+
+        let mut evicted = Vec::new();
+        while mgr.alive_count() > 0 {
+            evicted.extend(mgr.next_generation());
+        }
+        drop(evicted);
+
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 1);
     }
 }
