@@ -12400,3 +12400,159 @@ mod tests {
         }
     }
 }
+
+
+/// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
+/// a FieldDescr; a missing one is an invariant violation, so panic rather than
+/// emit a silently-wrong width.
+fn field_size_sign_from_descr(op: &Op) -> (usize, bool) {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        return (fd.field_size(), fd.is_field_signed());
+    }
+    missing_layout_descr("field descr (size/sign)", op)
+}
+
+
+/// Store width for a `SetfieldGc`/`SetfieldRaw`. A pointer (`Type::Ref`) field
+/// is stored at machine-word width regardless of the descr's recorded size: a
+/// pointer is 4 bytes on wasm32, so a fixed 8-byte store would clobber the
+/// adjacent field. There is no `SetfieldGcR` opcode, so the field type is the
+/// only signal — mirroring the `GetfieldGcR` read, which always loads pointers
+/// at i32 width. Non-pointer fields use the descr's true field width.
+fn setfield_store_size_from_descr(op: &Op) -> usize {
+    let descr = op.getdescr();
+    if let Some(fd) = descr.as_ref().and_then(|d| d.as_field_descr()) {
+        if fd.is_pointer_field() {
+            return std::mem::size_of::<usize>();
+        }
+        return fd.field_size();
+    }
+    missing_layout_descr("field descr (store size)", op)
+}
+
+
+fn field_is_float_from_descr(op: &Op) -> bool {
+    let descr = op.getdescr();
+    match descr.as_ref().and_then(|d| d.as_field_descr()) {
+        Some(fd) => fd.is_float_field(),
+        None => missing_layout_descr("field descr (is_float)", op),
+    }
+}
+
+
+fn emit_float_load(
+    sink: &mut PeepSink<'_, '_>,
+    offset: u64,
+    size: usize,
+) -> Result<(), BackendError> {
+    match size {
+        4 => {
+            sink.f32_load(mem32(offset));
+            sink.f64_promote_f32();
+        }
+        8 => {
+            sink.f64_load(mem64(offset));
+        }
+        other => {
+            return Err(BackendError::Unsupported(format!(
+                "wasm codegen: float load has size {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+
+fn array_item_is_float_from_descr(op: &Op) -> bool {
+    op.with_array_descr(|ad| ad.item_type() == Type::Float)
+        .unwrap_or_else(|| missing_layout_descr("array descr (item is_float)", op))
+}
+
+
+/// Argument index of the stored value for a GC ref-storing op. `SetfieldRaw` /
+/// `SetarrayitemRaw` store into non-GC memory and never need a write barrier,
+/// so only the `*Gc` variants are listed (rewrite.py only routes `SETFIELD_GC`
+/// / `SETARRAYITEM_GC` / `SETINTERIORFIELD_GC` through the barrier).
+fn ref_store_value_arg(op: &Op) -> Option<usize> {
+    match op.opcode {
+        OpCode::SetfieldGc => Some(1),
+        OpCode::SetarrayitemGc | OpCode::SetinteriorfieldGc => Some(2),
+        _ => None,
+    }
+}
+
+
+/// Extract field offset from op's descr (FieldDescr).
+fn field_offset_from_descr(op: &Op) -> u64 {
+    let __descr_arc_descr = op.getdescr();
+    if let Some(descr) = __descr_arc_descr.as_ref()
+        && let Some(fd) = descr.as_field_descr()
+    {
+        return fd.offset() as u64;
+    }
+    missing_layout_descr("field descr (offset)", op)
+}
+
+
+/// `(length-field offset, length-field size)` from an op's ArrayDescr length
+/// descriptor, mirroring `bh_arraylen_gc`, which reads the length at
+/// `len_descr().offset()` at machine-word width. The offset is taken from the
+/// registered descr (not hardcoded) so it tracks the real per-target layout,
+/// and the size lets the caller load at the field's true width — a word-sized
+/// length is 4 bytes on wasm32, so a fixed 8-byte read would pull the adjacent
+/// field into the high half. Falls back to the conventional offset / word
+/// width when no length descr is registered.
+fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
+    op.with_array_descr(|ad| {
+        ad.len_descr()
+            .map(|ld| (ld.offset() as u64, ld.field_size()))
+    })
+    .flatten()
+    .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
+}
+
+
+/// `descr.py unpack_interiorfielddescr`: `ofs = basesize + field.offset`,
+/// plus the element stride and the field's own width / signedness / kind.
+struct InteriorFieldLayout {
+    /// `basesize + field.offset`, the displacement past the scaled index.
+    offset: u64,
+    /// The array's element stride.
+    item_size: u64,
+    /// The field's own width, and how a read of it extends.
+    field_size: usize,
+    signed: bool,
+    is_float: bool,
+    is_ptr: bool,
+}
+
+impl InteriorFieldLayout {
+    /// The width an access to this field moves, and how a read of it extends.
+    fn access_size_sign(&self) -> (usize, bool) {
+        if self.is_ptr {
+            (GUEST_PTR_SIZE, false)
+        } else {
+            (self.field_size, self.signed)
+        }
+    }
+}
+
+fn unpack_interior_field(op: &Op) -> InteriorFieldLayout {
+    let descr = op
+        .getdescr()
+        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
+    let ifd = descr
+        .as_interior_field_descr()
+        .unwrap_or_else(|| missing_layout_descr("interior-field descr", op));
+    let ad = ifd.array_descr();
+    let fd = ifd.field_descr();
+    InteriorFieldLayout {
+        offset: (ad.base_size() + fd.offset()) as u64,
+        item_size: ad.item_size() as u64,
+        field_size: fd.field_size(),
+        signed: fd.is_field_signed(),
+        is_float: fd.is_float_field(),
+        is_ptr: fd.is_pointer_field(),
+    }
+}

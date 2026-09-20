@@ -1542,6 +1542,7 @@ fn nursery_alloc_params(ops: &[Op]) -> Option<codegen::NurseryAllocParams> {
             free_addr: free_addr as u32,
             top_addr: top_addr as u32,
             large_threshold: gc.max_nursery_object_size(),
+            plain_tids,
         })
     })?
 }
@@ -3556,10 +3557,16 @@ impl WasmBackend {
     #[allow(dead_code)] // constptr-only subset; production uses `rewrite_ops_for_gc`
     fn intern_ref_constants(
         inputargs: &[InputArgRc],
-        ops: &[OpRc],
-    ) -> (Vec<Op>, indexmap::IndexMap<u32, i64>) {
-        let (ops, _) = self.prepare_ops_for_compile(inputargs, ops, true);
-        (ops, self.constants.clone())
+        ops: Vec<Op>,
+    ) -> (Vec<Op>, Option<Arc<majit_gc::GcTable>>) {
+        let next_pos = codegen::next_value_pos(inputargs, &ops);
+        let input_indices: Vec<u32> = inputargs.iter().map(|ia| ia.index).collect();
+        let (ops, gcrefs) =
+            majit_gc::rewrite::remove_ref_constants_for_inputs(&ops, next_pos, &input_indices);
+        let table = (!gcrefs.is_empty()).then(|| majit_gc::GcTable::from_gcrefs(&gcrefs));
+        let gc_table_base = table.as_ref().map_or(0, |t| t.base_addr() as u32);
+        codegen::bind_failarg_const_table(&gcrefs, gc_table_base);
+        (ops, table)
     }
 
     /// `llsupport/gc.py` `get_ll_description` + `rewrite.py`
@@ -4409,6 +4416,37 @@ unsafe impl Send for WasmBackend {}
 /// terminal jump — is not judged here: it is lowered to
 /// `return_call_indirect(external_jump_slot)` and both callers resolve that
 /// slot through [`resolve_cross_loop_jump_target`].
+
+/// Stamp a position onto every non-Void-result op left unpositioned by the
+/// optimizer, so no operand resolves to `OpRef::NONE` during codegen.
+///
+/// The optimizer's force path emits materialized allocation/store ops (e.g. a
+/// virtualized list's `NewArray` backing block and its `SetfieldGc` /
+/// `SetarrayitemGc` stores) with `Op::new`, and only assigns a position to ops
+/// whose `result_type() != Void` — a Void-result store keeps `pos == NONE`.
+/// A later op that consumes such a producer's result reads its `pos` through
+/// `Operand::Op`, and an unpositioned producer yields `OpRef::NONE`
+/// (`raw() == u32::MAX`), which `emit_resolve` would use to index `value_types`
+/// out of bounds. The native backends normalize positions before codegen
+/// (dynasm `prepare_ops_for_compile`, cranelift `normalize_ops_for_codegen_simple`);
+/// the wasm backend does the same here.
+fn normalize_ops_for_codegen(inputargs: &[InputArgRc], ops: &[OpRc]) -> Vec<Op> {
+    let num_inputs = inputargs.len() as u32;
+    ops.iter()
+        .enumerate()
+        .map(|(op_idx, op)| {
+            let normalized = (**op).clone();
+            let rt = normalized.result_type();
+            if rt != majit_ir::Type::Void && normalized.pos().get().is_none() {
+                normalized
+                    .pos()
+                    .set(majit_ir::OpRef::op_typed(num_inputs + op_idx as u32, rt));
+            }
+            normalized
+        })
+        .collect()
+}
+
 fn wasm_unsupported_trace_reason(ops: &[Op], allow_ca: bool) -> Option<String> {
     for op in ops {
         if op.opcode.is_call_assembler() && !allow_ca {
