@@ -502,7 +502,11 @@ pub trait IterOpcodeHandler: SharedOpcodeHandler {
         Ok(())
     }
 
-    fn on_iter_exhausted(&mut self, target: usize) -> Result<(), PyError>;
+    /// Jump the anchored handler to `target` on FOR_ITER exhaustion.
+    /// Deliberately takes no `self`: after `iter_next` the caller's `&mut Self`
+    /// may name the abandoned copy, so the anchor is the only sound way back
+    /// to the live one.
+    fn on_iter_exhausted_anchored(anchor: &Self::Anchor, target: usize) -> Result<(), PyError>;
 }
 
 pub trait TruthOpcodeHandler: SharedOpcodeHandler {
@@ -869,6 +873,11 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
     target: usize,
 ) -> Result<(), PyError> {
     let iter = handler.peek_at(0)?;
+    // `PyFrame` can be the nursery frame materialised by an inlined
+    // CALL_ASSEMBLER.  After `iter_next` runs Python a minor collection may
+    // relocate it, so later writes go through the live frame rather than the
+    // abandoned copy.
+    let anchor = handler.anchor();
     match handler.iter_next(iter)? {
         Some(next) => {
             let fallthrough = handler.fallthrough_target();
@@ -876,11 +885,11 @@ pub fn opcode_for_iter<H: IterOpcodeHandler + ControlFlowOpcodeHandler + ?Sized>
             handler.set_next_instr(target)?;
             handler.record_for_iter_guard(next, true)?;
             handler.set_next_instr(fallthrough)?;
-            handler.push_value(next)
+            H::push_anchored(&anchor, next)
         }
         None => {
             handler.record_for_iter_guard_exhausted()?;
-            handler.on_iter_exhausted(target)
+            H::on_iter_exhausted_anchored(&anchor, target)
         }
     }
 }
