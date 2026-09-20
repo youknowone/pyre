@@ -1055,7 +1055,7 @@
     },
     "test.test_signal": {
       "dynasm": "FAIL",
-      "reason": "3 failures — test_pthread_sigmask and test_sigpending want the interpreter on the process's first thread, which darwin gives a spawned one for the stack, so a signal blocked in every thread is parked where sigpending(2) on another thread cannot report it; and test_stress_delivery_dependent, which runs out of SHORT_TIMEOUT because a compiled loop services a pending signal a full wait-bound late"
+      "reason": "3 failures — test_pthread_sigmask and test_sigpending want the interpreter on the process's first thread, which darwin gives a spawned one for the stack, so a signal blocked in every thread is parked where sigpending(2) on another thread cannot report it; and test_stress_delivery_dependent, which runs out of SHORT_TIMEOUT because a compiled loop leaves a timer-delivered signal pending for up to 1.6 s, growing with iteration count, from the first entry into machine code onwards; nothing is dropped and a plain self-directed kill stays prompt"
     },
     "test.test_site": {
       "dynasm": "FAIL",
