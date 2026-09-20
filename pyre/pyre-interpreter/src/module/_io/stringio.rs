@@ -228,7 +228,11 @@ impl W_StringIO {
             .checked_mul(4)
             .ok_or_else(|| crate::PyError::overflow_error("new position too large"))?;
         if byte_end > data.len() {
-            data.try_reserve_exact(byte_end - data.len())
+            // `UnicodeIO.resize` extends a list, so a run of writes pays the
+            // list's amortized growth.  Reserving the exact delta instead
+            // reallocates and copies the whole buffer on every write, which
+            // makes feeding a stream in chunks quadratic in its length.
+            data.try_reserve(byte_end - data.len())
                 .map_err(|_| crate::PyError::memory_error(""))?;
             data.resize(byte_end, 0);
         }

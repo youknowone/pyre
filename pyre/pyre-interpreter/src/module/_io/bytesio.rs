@@ -159,7 +159,11 @@ impl W_BytesIO {
         if self.pos == AT_END {
             let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
             let old_len = vec.len();
-            vec.try_reserve_exact(data.len())
+            // rStringIO.py:69-72 `__fast_write` appends to a StringBuilder,
+            // whose growth is amortized across the run.  An exact reservation
+            // reallocates and copies the whole buffer per write, making a
+            // chunked stream quadratic in its length.
+            vec.try_reserve(data.len())
                 .map_err(|_| crate::PyError::memory_error(""))?;
             vec.extend_from_slice(data);
             unsafe { pyre_object::bytearrayobject::w_bytearray_sync_alloc(self.buffer, old_len) };
@@ -178,7 +182,9 @@ impl W_BytesIO {
         let vec = unsafe { pyre_object::bytearrayobject::w_bytearray_vec_mut(self.buffer) };
         let old_len = vec.len();
         if end > old_len {
-            vec.try_reserve_exact(end - old_len)
+            // `__slow_write` extends `self.__bigbuffer` with `+=`, amortized
+            // for the same reason the fast path's builder is.
+            vec.try_reserve(end - old_len)
                 .map_err(|_| crate::PyError::memory_error(""))?;
             if p > vec.len() {
                 vec.resize(p, 0);
