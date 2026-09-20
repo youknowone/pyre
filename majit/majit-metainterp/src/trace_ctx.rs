@@ -5853,10 +5853,15 @@ impl TraceCtx {
             return cached_len;
         }
         // `execute_nonspec_const`'s ARRAYLEN_GC row reads the length through
-        // `ArrayDescr::len_descr` and fails loud without one; `concrete` is
-        // already `None` for such a descr because `arraylen_sanity_load`
-        // withholds it, so the funnel records rather than entering a fold it
-        // cannot complete.
+        // `ArrayDescr::len_descr` and fails loud without one.  A caller that
+        // supplies a concrete (the unit test, or a path that did not go
+        // through `arraylen_sanity_load`) still needs the same withhold, so
+        // the funnel records rather than entering a fold it cannot complete.
+        let concrete = concrete.filter(|_| {
+            arraydescr
+                .as_array_descr()
+                .is_some_and(|a| a.len_descr().is_some())
+        });
         // pyjitpl.py `opimpl_arraylen_gc` miss. The funnel owns the OPS /
         // RECORDED_OPS pairing this leg used to count by hand.
         let len = self.execute_and_record(
