@@ -38,10 +38,10 @@ pub fn copy_longdouble(cdatasrc: usize, cdatadst: usize) {
 pub unsafe fn convert_to_object(ct: &W_CType, cdata: usize) -> Result<PyObjectRef, PyError> {
     unsafe {
         match ct.kind {
-            // `W_CTypePrimitiveChar.convert_to_object`.
-            ctypeobj::KIND_PRIM_CHAR => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[(cdata
-                as *const u8)
-                .read()])),
+            // `W_CTypePrimitiveChar.convert_to_object` — `cdata[0]`.
+            ctypeobj::KIND_PRIM_CHAR => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[
+                misc::raw_read_u8(cdata) as u8,
+            ])),
             // `W_CTypePrimitiveUniChar.convert_to_object`.
             ctypeobj::KIND_PRIM_UNICHAR => {
                 let value = misc::read_raw_unsigned_data(cdata, ct.size)? as u32;
@@ -158,9 +158,9 @@ pub unsafe fn convert_from_object(
 ) -> Result<(), PyError> {
     unsafe {
         match ct.kind {
-            // `W_CTypePrimitiveChar.convert_from_object`.
+            // `W_CTypePrimitiveChar.convert_from_object` — `cdata[0] = value`.
             ctypeobj::KIND_PRIM_CHAR => {
-                (cdata as *mut u8).write(convert_to_char(ct, w_ob)?);
+                misc::raw_write_u8(cdata, u64::from(convert_to_char(ct, w_ob)?));
                 Ok(())
             }
             // `W_CTypePrimitiveUniChar.convert_from_object`.
@@ -401,8 +401,10 @@ fn cast_unicode(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> {
 pub unsafe fn cast_to_int(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
     unsafe {
         match ct.kind {
-            // `W_CTypePrimitiveChar.cast_to_int`.
-            ctypeobj::KIND_PRIM_CHAR => Ok(pyre_object::w_int_new(i64::from(cdata.read()))),
+            // `W_CTypePrimitiveChar.cast_to_int` — `ord(cdata[0])`.
+            ctypeobj::KIND_PRIM_CHAR => {
+                Ok(pyre_object::w_int_new(misc::raw_read_u8(cdata as usize) as i64))
+            }
             // `W_CTypePrimitiveUniChar.cast_to_int`.
             ctypeobj::KIND_PRIM_UNICHAR => {
                 if ct.has(ctypeobj::CTypeFlags::SIGNED_WCHAR) {
@@ -482,9 +484,9 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
         ctypeobj::KIND_PRIM_UNICHAR => unsafe { convert_to_object(ct, cdata.ptr) },
         // `W_CTypePrimitiveBool.string` bypasses the size-1 case below.
         ctypeobj::KIND_PRIM_BOOL => Err(ctypeobj::unexpected_string_argument(ct)),
-        _ if ct.size == 1 => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[unsafe {
-            (cdata.ptr as *const u8).read()
-        }])),
+        _ if ct.size == 1 => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[
+            misc::raw_read_u8(cdata.ptr) as u8,
+        ])),
         _ => {
             let _ = maxlen;
             Err(ctypeobj::unexpected_string_argument(ct))
@@ -636,7 +638,7 @@ fn vrange_max(ct: &W_CType) -> u64 {
 /// # Safety
 /// `cdata` must be readable for one byte.
 unsafe fn read_bool_0_or_1(cdata: *const u8) -> Result<u8, PyError> {
-    let value = unsafe { cdata.read() };
+    let value = misc::raw_read_u8(cdata as usize) as u8;
     if value >= 2 {
         return Err(PyError::value_error(format!(
             "got a _Bool of value {value}, expected 0 or 1"
@@ -672,7 +674,7 @@ fn convert_to_char(ct: &W_CType, w_ob: PyObjectRef) -> Result<u8, PyError> {
     if let Some(source) = W_CData::from_obj(w_ob)
         && ctypeobj::ctype_at(source.ctype).is_some_and(|s| s.kind == ctypeobj::KIND_PRIM_CHAR)
     {
-        return Ok(unsafe { (source.ptr as *const u8).read() });
+        return Ok(misc::raw_read_u8(source.ptr) as u8);
     }
     Err(ct.convert_error("string of length 1", w_ob))
 }
