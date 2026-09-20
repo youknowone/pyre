@@ -21033,6 +21033,34 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `true` when Charon's resolved layout for `ty` is a two-variant
+    /// enum stored in one pointer word with no `Branch` tag.
+    ///
+    /// That is the physical encoding of a pointer niche: `None` is the
+    /// null word and `Some(p)` is `p`.  A `Branch` discriminator is a
+    /// tagged enum and stays an aggregate `__discriminant` read.  Generic
+    /// declarations (including `core::option::Option`) emit no layout;
+    /// those return `false` here and the payload-shape walk decides.
+    fn tyref_enum_layout_is_pointer_niche(&self, ty: &TyRef) -> bool {
+        let Some(def_id) = self.tyref_adt_def_id(ty) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return false;
+        };
+        if variants.len() != 2 {
+            return false;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let Some(layout) = td.layout_for_target(&target) else {
+            return false;
+        };
+        !layout.has_branch_discriminant() && matches!(layout.size, Some(4 | 8))
+    }
+
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
     /// one variant and every variant carrying zero payload fields.  Such
     /// an enum is represented by-value as its discriminant integer, so
@@ -21134,6 +21162,13 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
         }
+        // Instantiated `Option<T>` whose Charon layout occupies one
+        // pointer word with no `Branch` tag is already a null niche.
+        // Generic `Option` declarations carry no layout; those fall
+        // through to the payload-shape walk below.
+        if self.tyref_enum_layout_is_pointer_niche(ty) {
+            return true;
+        }
         let Some(node) = tyref_node(ty, self.llbc) else {
             return false;
         };
@@ -21157,6 +21192,9 @@ impl<'a> Lowering<'a> {
             .and_then(|node| trait_assoc_projection_target(node, self.llbc));
         let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
         let payload = resolved_body.unwrap_or(payload);
+        let Some(payload) = type_node_peel_aliases(payload, self.llbc) else {
+            return false;
+        };
         if type_node_is_mut_ref(payload, self.llbc) {
             return true;
         }
@@ -30510,6 +30548,35 @@ fn strip_ty_indirections<'l>(
             continue;
         }
         return Some(node);
+    }
+    None
+}
+
+/// Follow `type T = U` declarations to the aliased type node.
+///
+/// Charon keeps a type alias as its own `TypeDecl` (`kind: Alias`) and
+/// call sites name the alias, not `U`.  A payload spelled
+/// `Option<PyObjectRef>` is therefore an `Adt` of the alias rather than
+/// the `RawPtr` `PyObjectRef` stands for; niche recognition has to peel
+/// that layer before it can see a pointer word.
+fn type_node_peel_aliases<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let stripped = strip_ty_indirections(node, llbc)?;
+        let Some(def_id) = adt_node_def_id(stripped) else {
+            return Some(stripped);
+        };
+        let Some(td) = llbc.type_by_id(def_id) else {
+            return Some(stripped);
+        };
+        match &td.kind {
+            TypeDeclKind::Alias(aliased) => {
+                node = aliased;
+            }
+            _ => return Some(stripped),
+        }
     }
     None
 }
@@ -49613,11 +49680,23 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_with_payload_ext(payload, false)
+        lower_option_source_retyped(payload, false, false)
     }
 
     fn lower_option_source_with_payload_ext(
+        payload: serde_json::Value,
+        inject_layoutless_nominal: bool,
+    ) -> FunctionGraph {
+        lower_option_source_retyped(payload, false, inject_layoutless_nominal)
+    }
+
+    fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
+        lower_option_source_retyped(payload, true, false)
+    }
+
+    fn lower_option_source_retyped(
         mut payload: serde_json::Value,
+        through_alias: bool,
         inject_layoutless_nominal: bool,
     ) -> FunctionGraph {
         fn replace_dedup(
@@ -49662,6 +49741,61 @@ mod tests {
             .get_mut("translated")
             .and_then(serde_json::Value::as_object_mut)
             .expect("corpus translated object");
+
+        if through_alias {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            // Charon `type_by_id` indexes the table by position, so the
+            // alias id is the slot this push occupies, not max(def_id)+1.
+            let alias_id = decls.len() as u64;
+            let template = decls
+                .iter()
+                .find(|decl| {
+                    decl.get("kind")
+                        .and_then(|kind| kind.get("Alias"))
+                        .is_some()
+                })
+                .cloned()
+                .expect("corpus has a type alias to copy item_meta from");
+            let mut alias_decl = template;
+            alias_decl
+                .as_object_mut()
+                .expect("type decl object")
+                .insert("def_id".to_string(), serde_json::json!(alias_id));
+            alias_decl
+                .as_object_mut()
+                .expect("type decl object")
+                .insert(
+                    "kind".to_string(),
+                    serde_json::json!({ "Alias": payload.clone() }),
+                );
+            if let Some(meta) = alias_decl
+                .get_mut("item_meta")
+                .and_then(|m| m.as_object_mut())
+            {
+                meta.insert(
+                    "name".to_string(),
+                    serde_json::json!([
+                        {"Ident": ["charon_corpus", 0]},
+                        {"Ident": ["ObjectPtr", 0]}
+                    ]),
+                );
+            }
+            decls.push(alias_decl);
+            payload = serde_json::json!({
+                "Adt": {
+                    "id": { "Adt": alias_id },
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            });
+        }
 
         let option_def_id = translated
             .get("type_decls")
@@ -49831,6 +49965,54 @@ mod tests {
         assert_eq!(
             discriminant_reads, 0,
             "a layout-less nominal raw pointer must not read __discriminant"
+        );
+    }
+
+    #[test]
+    fn niche_option_type_alias_of_raw_nominal_ptr_none_is_null() {
+        use crate::model::OpKind;
+        // `type ObjectPtr = *mut HostRegistry` is the Charon spelling of
+        // `type PyObjectRef = *mut PyObject`: the Option payload names the
+        // alias Adt, not the `RawPtr`.  Discriminant / Some / None must
+        // still see one nullable pointer word.
+        let payload = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": { "Adt": 4 },
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let graph = lower_option_source_with_aliased_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(
+            null_muts, 1,
+            "None of an alias-to-raw-nominal-ptr Option must lower to one null pointer"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "Some of an alias-to-raw-nominal-ptr Option must be the payload identity"
+        );
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "a pointer-niche Option must not read an aggregate __discriminant"
         );
     }
 
