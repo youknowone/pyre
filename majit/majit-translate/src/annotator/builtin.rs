@@ -2943,11 +2943,8 @@ mod tests {
         // shell rather than keep SomeInstance.
         let bk = bk();
         let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
-        let s_obj = SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            false,
-            Default::default(),
-        ));
+        let s_obj =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()));
         let s_root = bk
             .immutablevalue(&ConstValue::byte_str("Wtf8"))
             .expect("Wtf8 root constant");

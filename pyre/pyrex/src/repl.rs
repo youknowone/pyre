@@ -410,8 +410,7 @@ fn run_startup_file(
             exec_in_main(runtime, w_code)
         }
         Err(pyre_interpreter::syntax_warnings::SourceCompileError::Compile(error)) => {
-            let mut err =
-                pyre_interpreter::compile_err_to_syntax_error(error, &source, Mode::Exec);
+            let mut err = pyre_interpreter::compile_err_to_syntax_error(error, &source, Mode::Exec);
             err.replace_syntax_error_filename(pyre_interpreter::gateway::fsdecode_filename_bytes(
                 filename_bytes.as_deref().unwrap_or(source_path.as_bytes()),
             ));
