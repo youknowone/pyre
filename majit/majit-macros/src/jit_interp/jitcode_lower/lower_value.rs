@@ -369,6 +369,12 @@ impl<'c> Lowerer<'c> {
                 if let Some(binding) = self.lower_uint_intrinsic_call(call) {
                     return Some(binding);
                 }
+                // `<IntTy>::from_le_bytes([b0, b1, ...])` / `from_be_bytes`
+                // is the array-literal spelling of the shift/or widening
+                // already accepted as `(b0 as T) | ((b1 as T) << 8) | ...`.
+                if let Some(binding) = self.lower_from_endian_bytes_call(call) {
+                    return Some(binding);
+                }
                 self.lower_call_value(call)
             }
             Expr::MethodCall(call) => {
@@ -1035,6 +1041,81 @@ impl<'c> Lowerer<'c> {
             quote! { __builder.assert_not_none(#reg); },
         );
         Some(binding)
+    }
+
+    /// `<IntTy>::from_le_bytes([e0, e1, ...])` / `from_be_bytes`.
+    ///
+    /// The byte-load, the `as T` cast, the shift and the or already lower;
+    /// only this array-literal associated-function spelling was unrecognised.
+    /// Desugar to the equivalent shift/or chain and hand it back to
+    /// `lower_value_expr`. A mismatched element count is not a guess, so
+    /// decline rather than invent a reconstruction.
+    ///
+    /// The chain is assembled in the UNSIGNED sibling of the target and cast
+    /// once at the end. Only the casts narrow: `lower_int_cast` sign-extends
+    /// or masks, while the shift and the or are lowered in the machine-word
+    /// bank and keep every bit. Assembling `i16` directly would therefore
+    /// diverge from Rust, which evaluates `(e1 as i16) << 8` in `i16` and
+    /// wraps whatever reaches the sign bit -- `i16::from_le_bytes([0xff,
+    /// 0xff])` is `-1` there and `65535` in a chain that never narrows. No
+    /// intermediate overflows in the unsigned sibling, because a byte shifted
+    /// by at most `width - 8` still fits it, so the one trailing cast is the
+    /// only narrowing the value needs.
+    fn lower_from_endian_bytes_call(&mut self, call: &ExprCall) -> Option<Binding> {
+        if call.args.len() != 1 {
+            return None;
+        }
+        let segments = canonical_expr_segments(&call.func)?;
+        let n_seg = segments.len();
+        if n_seg < 2 {
+            return None;
+        }
+        let little_endian = match segments[n_seg - 1].as_str() {
+            "from_le_bytes" => true,
+            "from_be_bytes" => false,
+            _ => return None,
+        };
+        let ty_name = segments[n_seg - 2].as_str();
+        let (byte_width, acc_ty_name) = match ty_name {
+            "i16" | "u16" => (2usize, "u16"),
+            "i32" | "u32" => (4, "u32"),
+            "i64" | "u64" => (8, "u64"),
+            // `isize`/`usize` are deliberately absent: their width belongs to
+            // the TARGET, and this expansion runs on the host, so the host's
+            // `size_of` would be the wrong number to check the element count
+            // against on any cross build.
+            _ => return None,
+        };
+        let Expr::Array(array) = &call.args[0] else {
+            return None;
+        };
+        if array.elems.len() != byte_width {
+            return None;
+        }
+        let ty = syn::Ident::new(ty_name, proc_macro2::Span::call_site());
+        let acc_ty = syn::Ident::new(acc_ty_name, proc_macro2::Span::call_site());
+        let n = array.elems.len();
+        let mut acc: Option<Expr> = None;
+        for (i, elem) in array.elems.iter().enumerate() {
+            let amount = if little_endian {
+                8 * i
+            } else {
+                8 * (n - 1 - i)
+            };
+            let term: Expr = if amount == 0 {
+                syn::parse_quote! { (#elem as #acc_ty) }
+            } else {
+                let shift = syn::LitInt::new(&amount.to_string(), proc_macro2::Span::call_site());
+                syn::parse_quote! { ((#elem as #acc_ty) << #shift) }
+            };
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => syn::parse_quote! { #prev | #term },
+            });
+        }
+        let combined = acc?;
+        let narrowed: Expr = syn::parse_quote! { ((#combined) as #ty) };
+        self.lower_value_expr(&narrowed)
     }
 
     /// Recognizes: `promote(x)`, `hint_promote(x)`, `jit::promote(x)`.
@@ -3237,6 +3318,75 @@ mod tests {
             "majit_metainterp::intrinsics::majit_raw_load_i128(base, ea)"
         ));
         assert!(!raw_load_lowers("majit_raw_load_i128(base, ea)"));
+    }
+
+    fn emit_int_bytes_expr(src: &str, names: &[&str]) -> Option<String> {
+        let mut lowerer = Lowerer::new(None);
+        for (i, name) in names.iter().enumerate() {
+            lowerer
+                .bindings
+                .insert((*name).to_string(), binding(i as u16, BindingKind::Int));
+        }
+        let expr: Expr = syn::parse_str(src).expect("parse bytes expr");
+        lowerer.lower_value_expr(&expr)?;
+        Some(lowerer.statements.iter().map(ToString::to_string).collect())
+    }
+
+    #[test]
+    fn from_le_bytes_desugars_to_the_shift_or_chain() {
+        let names = ["b0", "b1"];
+        let via_from = emit_int_bytes_expr("u16::from_le_bytes([b0, b1])", &names)
+            .expect("from_le_bytes must lower");
+        let via_chain = emit_int_bytes_expr("((b0 as u16) | ((b1 as u16) << 8)) as u16", &names)
+            .expect("shift/or chain must lower");
+        assert_eq!(via_from, via_chain);
+    }
+
+    #[test]
+    fn from_be_bytes_reverses_the_shift_amounts() {
+        let names = ["b0", "b1"];
+        let via_from = emit_int_bytes_expr("i16::from_be_bytes([b0, b1])", &names)
+            .expect("from_be_bytes must lower");
+        let via_chain = emit_int_bytes_expr("(((b0 as u16) << 8) | (b1 as u16)) as i16", &names)
+            .expect("reversed shift/or chain must lower");
+        assert_eq!(via_from, via_chain);
+    }
+
+    /// The chain a signed target desugars to is assembled unsigned and narrowed
+    /// once. Assembling it in the signed type instead drops the narrowing,
+    /// because only the casts narrow and the shift and the or run in the
+    /// machine-word bank -- so those two streams must NOT be equal. Without
+    /// this, `from_be_bytes_reverses_the_shift_amounts` would still pass with
+    /// the sign extension removed.
+    #[test]
+    fn a_signed_target_does_not_desugar_into_its_own_type() {
+        let names = ["b0", "b1"];
+        let via_from = emit_int_bytes_expr("i16::from_le_bytes([b0, b1])", &names)
+            .expect("from_le_bytes must lower");
+        let signed_chain = emit_int_bytes_expr("(b0 as i16) | ((b1 as i16) << 8)", &names)
+            .expect("signed shift/or chain must lower");
+        assert_ne!(
+            via_from, signed_chain,
+            "`i16::from_le_bytes([0xff, 0xff])` is -1, and a chain assembled \
+             in `i16` that never narrows the combined value answers 65535"
+        );
+    }
+
+    #[test]
+    fn from_endian_bytes_refuses_a_mismatched_count_or_non_array() {
+        let names = ["b0", "b1", "b2", "b3"];
+        assert!(
+            emit_int_bytes_expr("u32::from_le_bytes([b0, b1])", &names).is_none(),
+            "a 2-byte array is not a u32"
+        );
+        assert!(
+            emit_int_bytes_expr("i8::from_le_bytes([b0])", &names).is_none(),
+            "i8 is not in the recognised integer set"
+        );
+        assert!(
+            emit_int_bytes_expr("i64::from_le_bytes(b0)", &names).is_none(),
+            "a non-array argument is not a reconstruction"
+        );
     }
 
     #[test]

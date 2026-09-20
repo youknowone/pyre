@@ -123,21 +123,45 @@ fn lookup<'a>(
     if let Some(fields) = registered.get(class_key) {
         return Some(fields);
     }
-    // `::` boundary, same as `names_same_type`. Two matching keys
-    // (`Frame` and `a::Frame` both suffix-match `x::a::Frame`) is
-    // ambiguous — fail closed instead of picking insertion order.
+    // Directional, not `names_same_type`: a QUALIFIED lookup key may resolve a
+    // shorter registered one, because the suffix is then the same type seen
+    // without its path. The reverse is not true -- a bare `Frame` host key
+    // suffix-matches a registered `a::Frame` that names a different class, and
+    // resolving it would stamp `_virtualizable_` onto an unrelated one and
+    // send it down the virtualizable lowering.
     let mut matches = registered.iter().filter(|(key, _)| {
         class_key
             .strip_suffix(key.as_str())
             .is_some_and(|prefix| prefix.ends_with("::"))
     });
-    let first = matches.next()?;
-    matches.next().is_none().then_some(first.1)
+    match (matches.next(), matches.next()) {
+        (None, _) => None,
+        (Some((_, fields)), None) => Some(fields),
+        (Some((first, _)), Some((second, _))) => {
+            panic!(
+                "ambiguous _virtualizable_ for class key {class_key}: \
+                 registered keys `{first}` and `{second}` both match"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare host key must not pick up a QUALIFIED registration: the two
+    /// share a last segment and nothing else, and resolving it would stamp
+    /// `_virtualizable_` onto a class that never declared it.
+    #[test]
+    fn a_bare_class_key_does_not_resolve_a_qualified_registration() {
+        let mut registered = HashMap::new();
+        registered.insert("a::Frame".to_string(), vec!["pc".to_string()]);
+        assert!(lookup(&registered, "Frame").is_none());
+        // The direction that IS a resolution: a qualified key naming the same
+        // type as a registered shorter one.
+        assert!(lookup(&registered, "x::a::Frame").is_some());
+    }
 
     #[test]
     fn stamp_host_virtualizable_writes_the_declared_list() {
@@ -223,7 +247,15 @@ mod tests {
     }
 
     #[test]
-    fn lookup_fails_closed_when_two_suffixes_match() {
+    #[should_panic(expected = "ambiguous _virtualizable_ for class key x::a::Frame")]
+    fn lookup_panics_when_two_suffixes_match() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
+            }
+        }
+        let _restore = Restore;
         REGISTERED.with(|registered| {
             *registered.borrow_mut() = [
                 ("Frame".to_string(), vec!["leaf".to_string()]),
@@ -234,10 +266,5 @@ mod tests {
         });
         let host = HostObject::new_class("Frame", vec![]);
         stamp_host_virtualizable(&host, "x::a::Frame");
-        assert!(
-            host.class_get("_virtualizable_").is_none(),
-            "Frame and a::Frame both suffix-match x::a::Frame"
-        );
-        register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
 }

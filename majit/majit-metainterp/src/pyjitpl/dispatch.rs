@@ -13,7 +13,7 @@ use majit_ir::{OpCode, OpRef, Type, Value};
 use super::{MIFrame, MIFrameStack};
 use crate::jitcode::insns::MAX_HOST_CALL_ARITY;
 use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt};
-use crate::trace_ctx::{VableArrayStore, VableEntryWrite};
+use crate::trace_ctx::{ClearReplaceFrames, VableArrayStore, VableEntryWrite};
 use crate::{TraceAction, TraceCtx};
 
 /// Which recorded op [`JitCodeMachine::publish_last_guard_resume_snapshot`]
@@ -3232,13 +3232,9 @@ where
 
     pub fn run_to_end(&mut self, ctx: &mut TraceCtx, sym: &mut S, runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
-        struct ClearReplaceFrames(*mut TraceCtx);
-        impl Drop for ClearReplaceFrames {
-            fn drop(&mut self) {
-                unsafe { (*self.0).clear_replace_frames() };
-            }
-        }
-        let _clear = ClearReplaceFrames(ctx);
+        // SAFETY: the guard is a local of this call and `ctx` is borrowed for
+        // longer, so it is dropped while the `TraceCtx` it names is alive.
+        let _clear = unsafe { ClearReplaceFrames::new(ctx) };
         // A previous walk may have left a committed-residual latch.
         let _ = crate::take_residual_committed();
         // Same latch class: a blackhole residual that refused a walk-local
@@ -3938,13 +3934,9 @@ where
 
     pub fn run_one_step(&mut self, ctx: &mut TraceCtx, sym: &mut S, _runtime: &R) -> TraceAction {
         self.install_replace_frames(ctx);
-        struct ClearReplaceFrames(*mut TraceCtx);
-        impl Drop for ClearReplaceFrames {
-            fn drop(&mut self) {
-                unsafe { (*self.0).clear_replace_frames() };
-            }
-        }
-        let _clear = ClearReplaceFrames(ctx);
+        // SAFETY: the guard is a local of this call and `ctx` is borrowed for
+        // longer, so it is dropped while the `TraceCtx` it names is alive.
+        let _clear = unsafe { ClearReplaceFrames::new(ctx) };
         if crate::take_walk_abort() || majit_backend::take_null_mem_access() {
             ctx.symbolic_residual_abort = true;
             if crate::is_bridge_walking() || ctx.is_bridge_trace {
@@ -14362,6 +14354,43 @@ mod tests {
         info
     }
 
+    /// Heap object matching [`make_test_vable_info`]: `pc` at offset 8, array
+    /// pointer at offset 24 to a one-item `i64` block whose item 0 is at
+    /// offset 0. The items block is owned so the pointer does not dangle.
+    #[repr(C)]
+    struct TestVableObj {
+        _header: u64,
+        pc: i64,
+        _pad16: u64,
+        stack: *mut i64,
+        _tail: [u8; 32],
+        items: Box<[i64; 1]>,
+    }
+
+    const _: () = {
+        assert!(std::mem::offset_of!(TestVableObj, pc) == 8);
+        assert!(std::mem::offset_of!(TestVableObj, stack) == 24);
+    };
+
+    impl TestVableObj {
+        fn new() -> Self {
+            let mut items = Box::new([0i64; 1]);
+            let stack = items.as_mut_ptr();
+            Self {
+                _header: 0,
+                pc: 0,
+                _pad16: 0,
+                stack,
+                _tail: [0; 32],
+                items,
+            }
+        }
+
+        fn addr(&self) -> usize {
+            self as *const Self as usize
+        }
+    }
+
     #[repr(C)]
     struct ResidualVable {
         token: u64,
@@ -14438,15 +14467,20 @@ mod tests {
         builder.vable_arraylen_with_base(3, vr, 0);
         let jitcode = builder.finish();
 
+        let mut obj = TestVableObj::new();
+        obj.pc = 111;
+        obj.items[0] = 222;
+        let addr = obj.addr();
+
         let mut ctx = TraceCtx::for_test(0);
         let info = make_test_vable_info();
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
-        let vable_ref = ctx.const_ref(999);
+        let vable_ref = ctx.const_ref(addr as i64);
         ctx.init_virtualizable_boxes(
             &info,
             vable_ref,
-            Value::Ref(majit_ir::GcRef(999)),
+            Value::Ref(majit_ir::GcRef(addr)),
             &[field_box, array_box],
             &[Value::Int(111), Value::Int(222)],
             &[1],
@@ -14459,7 +14493,7 @@ mod tests {
             &jitcode,
             0,
             |_pc| 0,
-            &[(JitArgKind::Ref, vable_ref, 999)],
+            &[(JitArgKind::Ref, vable_ref, addr as i64)],
         );
         assert!(matches!(action, TraceAction::Continue));
 
@@ -14508,14 +14542,18 @@ mod tests {
         recorder.record_input_arg(majit_ir::Type::Int); // index
         recorder.record_input_arg(majit_ir::Type::Int); // value
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
+        let mut obj = TestVableObj::new();
+        obj.pc = 111;
+        obj.items[0] = 222;
+        let addr = obj.addr();
         let info = make_test_vable_info();
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
-        let vable_ref = ctx.const_ref(999);
+        let vable_ref = ctx.const_ref(addr as i64);
         ctx.init_virtualizable_boxes(
             &info,
             vable_ref,
-            Value::Ref(majit_ir::GcRef(999)),
+            Value::Ref(majit_ir::GcRef(addr)),
             &[field_box, array_box],
             &[Value::Int(111), Value::Int(222)],
             &[1],
@@ -14535,7 +14573,7 @@ mod tests {
             0,
             |_pc| 0,
             &[
-                (JitArgKind::Ref, vable_ref, 999),
+                (JitArgKind::Ref, vable_ref, addr as i64),
                 // A non-constant index is what makes the promote emit a guard;
                 // a Const index short-circuits `implement_guard_value`.
                 (JitArgKind::Int, OpRef::input_arg_int(0), 0),
@@ -14611,14 +14649,18 @@ mod tests {
         // descr with the vinfo backref. `_nonstandard_virtualizable` only
         // emits the isstandard PTR_EQ when `vinfo is fielddescr.get_vinfo()`.
         let info = make_test_vable_info().finalize_arc(majit_ir::descr::make_size_descr(64));
+        let mut obj = TestVableObj::new();
+        obj.pc = 111;
+        obj.items[0] = 222;
+        let addr = obj.addr();
         let field_box = ctx.const_int(111);
         let array_box = ctx.const_int(222);
-        let standard_box = ctx.const_ref(999);
+        let standard_box = ctx.const_ref(addr as i64);
         ctx.install_virtualizable_info(info.clone());
         ctx.init_virtualizable_boxes(
             &info,
             standard_box,
-            Value::Ref(majit_ir::GcRef(999)),
+            Value::Ref(majit_ir::GcRef(addr)),
             &[field_box, array_box],
             &[Value::Int(111), Value::Int(222)],
             &[1],
@@ -14626,7 +14668,7 @@ mod tests {
         // Same pointer, different Box: `concrete_ptrs_eq` answers isstandard=1,
         // which is the leg that emits the PTR_EQ guard and then continues into
         // the standard path instead of falling back to the heap.
-        ctx.set_opref_concrete(vable_arg, Value::Ref(majit_ir::GcRef(999)));
+        ctx.set_opref_concrete(vable_arg, Value::Ref(majit_ir::GcRef(addr)));
 
         let mut sym = LiveSlotsSym { num_slots: 2 };
         let action = trace_jitcode_with_args(
@@ -14636,7 +14678,7 @@ mod tests {
             0,
             |_pc| 0,
             &[
-                (JitArgKind::Ref, vable_arg, 999),
+                (JitArgKind::Ref, vable_arg, addr as i64),
                 (JitArgKind::Int, OpRef::input_arg_int(0), 0),
                 (JitArgKind::Int, OpRef::input_arg_int(1), 777),
             ],

@@ -13,6 +13,8 @@
 //! Greens: [bytecode (env), pc]
 //! Reds:   [stackpos, stack]  (tracked via state_fields)
 
+use majit_metainterp::virt_array::VirtArray;
+
 // ── Bytecode opcodes ──
 
 const OP_PUSH_INT: u8 = 0; // followed by 8 bytes (i64 LE)
@@ -73,19 +75,26 @@ fn compile(words: &[&str]) -> Vec<u8> {
 /// RPython tiny2_hotpath.py Stack. `_virtualizable_ = ['stackpos', 'stack[*]']`.
 struct Tiny2State {
     stackpos: i64,
-    // Observer/replay `jit_merge_point!()` — not the `; state` close.
-    // `VirtArray` registers DirectPointer and lets `compile.py` emit the
-    // GETFIELD_GC_R + GETARRAYITEM_GC_* entry reload; that compiled loop
-    // disagrees with the interpreter on fib. `Vec` keeps RustVec storage
-    // so the entry seeds boxes via `initialize_virtualizable` instead.
-    // This portal does not resume `getarrayitem_vable_*` in the blackhole.
-    stack: Vec<i64>,
+    // Upstream `Ptr(GcArray)` shape: one pointer to a `[length][payload…]`
+    // block, which `compile.py patch_new_loop_to_load_virtualizable_fields`
+    // reloads.
+    stack: VirtArray<i64>,
 }
 
 pub type Bytecode = [u8];
 
 pub static COMPILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static LAST_OPS_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Shape of the last compiled loop body — see [`majit_metainterp::LoopBodyShape`].
+///
+/// Held as two flags rather than the struct itself so the recording stays
+/// lock-free on the compile path; the probe rebuilds the struct inside the same
+/// lock window it reads the counters in, because this is as process-global as
+/// they are.
+pub static LAST_HAS_JUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static LAST_ALWAYS_FAILS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[expect(
     dead_code,
@@ -116,15 +125,18 @@ impl BytecodeExt for [u8] {
 fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<Tiny2State> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, _opcodes| {
+    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
         COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         LAST_OPS_AFTER.store(ops_after, std::sync::atomic::Ordering::Relaxed);
+        let shape = majit_metainterp::LoopBodyShape::of(opcodes);
+        LAST_HAS_JUMP.store(shape.has_jump, std::sync::atomic::Ordering::Relaxed);
+        LAST_ALWAYS_FAILS.store(shape.has_always_fails, std::sync::atomic::Ordering::Relaxed);
     });
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
     let mut state = Tiny2State {
         stackpos: num_args as i64,
-        stack: vec![0i64; program.len()],
+        stack: VirtArray::filled(0i64, program.len()),
     };
 
     // RPython warmspot.py:281-289 canonical-liveness install hook.
@@ -138,12 +150,7 @@ fn mainloop(program: &Bytecode, num_args: usize, args_out: &mut [i64], threshold
     while pc < program.len() {
         // RPython: tinyjitdriver.jit_merge_point(...)
         //
-        // Still the bare observer/replay form. The single-executor
-        // `jit_merge_point!(driver, program, pc; state)` conversion does not
-        // hold for this interpreter yet, and `trip_count_gate` below is the
-        // permanent assertion that says so — see its second doc paragraph for
-        // the two wrong answers the conversion produces.
-        jit_merge_point!();
+        jit_merge_point!(driver, program, pc; state);
         let opcode = program[pc];
         pc += 1;
 
@@ -337,7 +344,7 @@ mod tests {
     use majit_metainterp::{RefusalKind, refusal_kind};
 
     /// Serializes every JIT entry in this module, so the `COMPILES` window in
-    /// [`jit_tier_is_inert_pending_arm_lowering`] cannot be written by another
+    /// [`jit_tier_is_alive`] cannot be written by another
     /// test running concurrently. The counters are process-wide, and libtest
     /// runs these tests in parallel by default.
     ///
@@ -368,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn jit_tier_is_inert_pending_arm_lowering() {
+    fn jit_tier_is_alive() {
         use std::sync::atomic::Ordering;
 
         const N: i64 = 1001;
@@ -380,8 +387,16 @@ mod tests {
         // would take the plain mutex twice on one thread and deadlock.
         let _guard = PROBE_LOCK.lock();
         COMPILES.store(0, Ordering::Relaxed);
+        LAST_OPS_AFTER.store(0, Ordering::Relaxed);
+        LAST_HAS_JUMP.store(false, Ordering::Relaxed);
+        LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
         let got = mainloop(&compile(&words), 0, &mut args_out, 3);
         let compiles = COMPILES.load(Ordering::Relaxed);
+        let ops_after = LAST_OPS_AFTER.load(Ordering::Relaxed);
+        let shape = majit_metainterp::LoopBodyShape {
+            has_jump: LAST_HAS_JUMP.load(Ordering::Relaxed),
+            has_always_fails: LAST_ALWAYS_FAILS.load(Ordering::Relaxed),
+        };
         assert_eq!(got, N, "the interpreter's own trip count moved");
 
         // Read after the run: nothing installs the dispatch JitCode until the
@@ -404,36 +419,33 @@ mod tests {
             .collect();
         assert_eq!(
             causes,
-            [("OP_PUSH_INT", RefusalKind::UnlowerableStmt)],
+            Vec::<(&str, RefusalKind)>::new(),
             "a degraded arm's cause moved while its name did not — a different \
              mechanism is refusing it now"
-        );
-        // The offending statement, not just the mechanism. Substring, not the
-        // whole reason: the macro renders the snippet with its own spacing.
-        assert!(
-            t2_arms[0].reason.contains("from_le_bytes"),
-            "OP_PUSH_INT's refusal no longer names the `from_le_bytes` operand \
-             read: {}",
-            t2_arms[0].reason
         );
 
         assert_eq!(
             degraded,
-            ["OP_PUSH_INT"],
-            "the degraded-arm set moved. A MISSING name means that arm lowers \
-             again; once the set is EMPTY the loop body holds no stub, the back \
-             edge can close, and this crate should get a real jit_tier_is_alive \
-             gate instead of this test"
+            Vec::<&str>::new(),
+            "the degraded-arm set moved. A NEW name means an arm silently \
+             stopped lowering and every trace reaching it now aborts"
         );
         assert_eq!(
-            compiles, 0,
-            "count_to({N}) compiled {compiles} loops, but OP_PUSH_INT is an \
-             abort stub inside the loop body, so every trace aborts and nothing \
-             closes. A non-zero count means the tier came alive: replace this \
-             test with a real liveness gate pinning a measured ops_after"
+            compiles, 1,
+            "count_to({N}) compiled {compiles} loops, not the observed 1"
+        );
+        // The body actually closes a loop — see `LoopBodyShape`. A compile
+        // count and an op count together still accept a body that bails out on
+        // its first pass; this is the term that does not. Sound HERE because
+        // this fixture loops: on a straight-line subject a `Jump`-less body is
+        // the right answer, not a defect.
+        assert!(
+            shape.closes_a_loop(),
+            "compiled {ops_after} ops but the body {} ({shape:?})",
+            shape.why_not().unwrap_or("closes a loop")
         );
         println!(
-            "[tier-inert] count_to({N}) = {got} from the interpreter alone, {compiles} loops compiled, degraded {degraded:?}"
+            "[tier-alive] count_to({N}) = {got}, compiled {compiles} loop(s) of {ops_after} ops, degraded {degraded:?}"
         );
     }
 

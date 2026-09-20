@@ -370,8 +370,9 @@ pub struct PendingAbortBlackhole {
     /// blackhole's `getarrayitem_vable_*` read the real object.  `None` when
     /// the state has no virtualizable array.
     pub virt_array_values: Option<Vec<i64>>,
-    /// The trace's virtualizable identity (`MetaInterp::set_vable_ptr`, mirrored
-    /// onto the ctx at trace entry).  `0` when the state has none.
+    /// The trace's virtualizable identity (`initialize_virtualizable` writes
+    /// it onto the ctx; `set_vable_ptr` only seeds `pending_vable_ptr`).
+    /// `0` when the state has none.
     pub virtualizable_ptr: i64,
     /// `metainterp.last_exc_value` as `blackhole.py:1811-1814` reads it —
     /// snapshotted at the abort because the accounting that follows clears the
@@ -3236,8 +3237,10 @@ impl<S: JitState> JitDriver<S> {
     /// Push the walk's loop-carried virtualizable-array element values into
     /// native `state`, the array analog of `writeback_scalar_state_fields`. The
     /// walk mutates the array on the trace-ctx shadow; native `state`'s array is
-    /// stale at the close because `synchronize_virtualizable` skips the RustVec
-    /// write-back during tracing. Without this, the compiled-loop seed
+    /// stale at the close because `synchronize_virtualizable` skips the
+    /// write-back when `VirtualizableInfo::outer_executor_owns_state` is set —
+    /// the observer/replay merge-point form, where an outer executor owns the
+    /// live struct. Without this, the compiled-loop seed
     /// (`extract_live_values` reads native `state`) reflects the trace-start
     /// array, so the loop re-executes the peeled iteration — double-firing any
     /// side-effecting residual. Consumes (`take`s) the stash. No-op when the
@@ -6221,6 +6224,11 @@ impl<S: JitState> JitDriver<S> {
                     std::hint::black_box(&mut *state);
                 }
             }
+            // No recording context to move or put back: this function
+            // refuses to run at all while `is_tracing`, so `sync_before`
+            // writes no trace pointer and the exits below have none to
+            // restore. The two `run_compiled_detailed_*` runners carry the
+            // save/restore, because a walk does reach those.
             if !self.sync_before(state, &compiled_meta, vable) {
                 return None;
             }
@@ -6464,7 +6472,7 @@ impl<S: JitState> JitDriver<S> {
                     if !result.is_finish && !result.typed_values.is_empty() {
                         state.restore_values(&compiled_meta, &result.typed_values);
                     }
-                    self.sync_after(state, &compiled_meta, vable);
+                    self.sync_after(state, &compiled_meta, vable, None);
                     std::hint::black_box(&mut *state);
                 }
             }
@@ -6513,7 +6521,7 @@ impl<S: JitState> JitDriver<S> {
                 // `descriptor_cache`), so a second consultation could only
                 // return the same object at the cost of one more refcount pair
                 // per compiled entry.
-                self.sync_after(state, run_meta, vable);
+                self.sync_after(state, run_meta, vable, None);
                 // Kept for callers that cannot consume the latch (a portal whose
                 // return type the expansion cannot build from a `Value`). Those
                 // callers see today's behaviour unchanged; a caller that drains
@@ -6531,7 +6539,7 @@ impl<S: JitState> JitDriver<S> {
                 // Carried from the entry decision above, not re-resolved; see
                 // the FINISH arm for why one resolution serves both ends of a
                 // compiled entry.
-                self.sync_after(state, run_meta, vable);
+                self.sync_after(state, run_meta, vable, None);
                 return Some(target_pc);
             }
 
@@ -7808,6 +7816,11 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref info) = info_clone {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &info.name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
+                // The entry names the frame this run executes; `sync_after`
+                // puts the caller's frame back.
+                if let Some(ctx) = self.meta.tracing.as_mut() {
+                    ctx.set_virtualizable_heap_ptr(ptr.cast_const());
+                }
             }
             // Fallback cache for layouts that cannot expose array length on
             // the heap object alone (header-less embedded arrays). Unused in
@@ -7822,9 +7835,29 @@ impl<S: JitState> JitDriver<S> {
         true
     }
 
+    /// Puts back the recording context's virtualizable frame saved before a
+    /// compiled entry. `sync_after` does this for the exits that take it; the
+    /// decline and finish exits call this directly, because a walk that resumes
+    /// recording must flush into its own frame whether or not the entry ran.
+    fn restore_trace_vable_ptr(&mut self, saved: Option<*const u8>) {
+        if let Some(ptr) = saved {
+            if let Some(ctx) = self.meta.tracing.as_mut() {
+                ctx.set_virtualizable_heap_ptr(ptr);
+            }
+        }
+    }
+
     /// Counterpart of [`Self::sync_before`]; takes the same pre-resolved
-    /// virtualizable red, and for the same reason.
-    fn sync_after(&self, state: &mut S, meta: &S::Meta, virtualizable: Option<&JitDriverVar>) {
+    /// virtualizable red, and for the same reason. Restores the recording
+    /// context's virtualizable pointer saved before that `sync_before`.
+    fn sync_after(
+        &mut self,
+        state: &mut S,
+        meta: &S::Meta,
+        virtualizable: Option<&JitDriverVar>,
+        saved_vable_ptr: Option<*const u8>,
+    ) {
+        self.restore_trace_vable_ptr(saved_vable_ptr);
         let Some(virtualizable) = virtualizable else {
             return;
         };
@@ -8076,6 +8109,11 @@ impl<S: JitState> JitDriver<S> {
         let vable = descriptor
             .as_deref()
             .and_then(JitDriverStaticData::virtualizable);
+        let saved_vable_ptr = self
+            .meta
+            .tracing
+            .as_ref()
+            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
         if !state.is_compatible(&meta) || !self.sync_before(state, &meta, vable) {
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
@@ -8099,6 +8137,7 @@ impl<S: JitState> JitDriver<S> {
             &live_values,
             state.state_field_layout().total_live_values(),
         ) {
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8107,6 +8146,7 @@ impl<S: JitState> JitDriver<S> {
         let Some(live_values) =
             self.extend_compiled_live_values(green_key, state, &meta, vable, live_values)
         else {
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8120,6 +8160,7 @@ impl<S: JitState> JitDriver<S> {
                 .meta
                 .pack_front_target_live_values(green_key, &live_values)
             else {
+                self.restore_trace_vable_ptr(saved_vable_ptr);
                 return DetailedDriverRunOutcome::Abort {
                     restored: false,
                     via_blackhole: false,
@@ -8139,6 +8180,7 @@ impl<S: JitState> JitDriver<S> {
                 .run_compiled_detailed_with_values(green_key, &live_values)
         };
         let Some(mut result) = result else {
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8151,6 +8193,7 @@ impl<S: JitState> JitDriver<S> {
             let typed_values = std::mem::take(&mut result.typed_values).into_vec();
             let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
             drop(result);
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
                 via_blackhole: false,
@@ -8177,7 +8220,7 @@ impl<S: JitState> JitDriver<S> {
             std::mem::take(&mut result.typed_values)
         };
         state.restore_values(&exit_meta, &typed_values);
-        self.sync_after(state, &exit_meta, vable);
+        self.sync_after(state, &exit_meta, vable, saved_vable_ptr);
         DetailedDriverRunOutcome::Jump {
             via_blackhole: false,
             continue_running_normally_values: None,
@@ -8237,6 +8280,11 @@ impl<S: JitState> JitDriver<S> {
                 via_blackhole: false,
             };
         }
+        let saved_vable_ptr = self
+            .meta
+            .tracing
+            .as_ref()
+            .map(|ctx| ctx.virtualizable_heap_ptr().unwrap_or(std::ptr::null()));
         if !self.sync_before(state, &meta, vable) {
             if crate::majit_log_enabled() {
                 eprintln!(
@@ -8275,6 +8323,7 @@ impl<S: JitState> JitDriver<S> {
                     ),
                 );
             }
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8289,6 +8338,7 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8305,6 +8355,7 @@ impl<S: JitState> JitDriver<S> {
                     green_key, target_pc
                 );
             }
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Abort {
                 restored: false,
                 via_blackhole: false,
@@ -8341,6 +8392,7 @@ impl<S: JitState> JitDriver<S> {
         if is_finish {
             let typed_values = std::mem::take(&mut result.typed_values).into_vec();
             drop(result);
+            self.restore_trace_vable_ptr(saved_vable_ptr);
             return DetailedDriverRunOutcome::Finished {
                 typed_values,
                 via_blackhole: false,
@@ -8353,7 +8405,7 @@ impl<S: JitState> JitDriver<S> {
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
             state.restore_values(&exit_meta, &result.typed_values);
-            self.sync_after(state, &exit_meta, vable);
+            self.sync_after(state, &exit_meta, vable, saved_vable_ptr);
             drop(result);
             return DetailedDriverRunOutcome::Jump {
                 via_blackhole: false,
@@ -10510,39 +10562,20 @@ mod tests {
         assert_eq!(after.num_reds(), 1);
     }
 
-    /// Build a driver whose virtualizable holds one array in `storage`.
-    fn driver_with_one_vable_array(
-        storage: crate::virtualizable::VableArrayStorage,
-    ) -> JitDriver<TypedRestoreState> {
+    /// Build a driver whose virtualizable holds one array.
+    fn driver_with_one_vable_array() -> JitDriver<TypedRestoreState> {
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
         driver.declare_schema_typed(vec![("pc", GreenType::Int)], vec![("state", Type::Ref)]);
         let mut info = crate::virtualizable::VirtualizableInfo::without_vable_token();
         info.name = "state".to_string();
-        match storage {
-            crate::virtualizable::VableArrayStorage::RustVec {
-                data_ptr_fn,
-                len_fn,
-            } => {
-                info.add_rust_vec_array_field(
-                    "regs",
-                    Type::Int,
-                    0,
-                    data_ptr_fn,
-                    len_fn,
-                    majit_ir::descr::make_array_descr(0, 8, Type::Int),
-                );
-            }
-            _ => {
-                info.add_array_field(
-                    "regs",
-                    Type::Int,
-                    0,
-                    0,
-                    8,
-                    majit_ir::descr::make_array_descr(8, 8, Type::Int),
-                );
-            }
-        }
+        info.add_array_field(
+            "regs",
+            Type::Int,
+            0,
+            0,
+            8,
+            majit_ir::descr::make_array_descr(8, 8, Type::Int),
+        );
         driver
             .meta
             .set_virtualizable_info(info.finalize_arc(majit_ir::descr::make_size_descr(16)));
@@ -10554,8 +10587,7 @@ mod tests {
     /// `compile.py` run.
     #[test]
     fn arming_declares_the_contract_for_a_reloadable_virtualizable() {
-        let mut driver =
-            driver_with_one_vable_array(crate::virtualizable::VableArrayStorage::DirectPointer);
+        let mut driver = driver_with_one_vable_array();
         assert!(driver.arm_flat_entry_contract(FlatEntryContract {
             len: 2,
             index_of_virtualizable: 1,
@@ -10573,34 +10605,6 @@ mod tests {
             driver.descriptor.as_ref().unwrap().virtualizable.as_deref(),
             Some("state")
         );
-    }
-
-    /// A `Vec` embedded by value has no offset a field load can reach its data
-    /// pointer at, so `patch_new_loop_to_load_virtualizable_fields` refuses that
-    /// storage. Arming must decline BEFORE the driver reaches that refusal, and
-    /// leave the descriptor exactly as it found it — no contract and no name, so
-    /// the entry keeps the shape it already had.
-    #[test]
-    fn arming_declines_a_virtualizable_the_entry_preamble_cannot_reload() {
-        fn data_ptr(_: *mut u8) -> *mut i64 {
-            std::ptr::null_mut()
-        }
-        fn len(_: *const u8) -> usize {
-            0
-        }
-        let mut driver =
-            driver_with_one_vable_array(crate::virtualizable::VableArrayStorage::RustVec {
-                data_ptr_fn: data_ptr,
-                len_fn: len,
-            });
-        assert!(!driver.arm_flat_entry_contract(FlatEntryContract {
-            len: 2,
-            index_of_virtualizable: 1,
-        }));
-        assert_eq!(driver.flat_entry_contract(), None);
-        let descriptor = driver.descriptor.as_ref().expect("descriptor survives");
-        assert_eq!(descriptor.virtualizable, None);
-        assert_eq!(descriptor.virtualizable_arg_index(), None);
     }
 
     /// With no virtualizable there is nothing for the preamble to reload from,

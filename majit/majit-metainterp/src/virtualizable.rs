@@ -125,18 +125,6 @@ pub enum VableArrayStorage {
     /// (e.g. `*mut PyObjectArray`). The data pointer is at `ptr_offset`
     /// within that container (2-level indirection).
     EmbeddedArray { ptr_offset: usize },
-    /// The frame field embeds a Rust `Vec<T>` by value. The `Vec`'s
-    /// `(ptr, cap, len)` triple has no guaranteed field order, so the data
-    /// pointer and length are read through type-aware extractor functions
-    /// monomorphized for the concrete frame type rather than via byte
-    /// offsets. `field_offset` is unused for reads (the extractors locate
-    /// the `Vec` themselves) but is retained for flat-index bookkeeping.
-    RustVec {
-        /// Returns the live data pointer of the embedded `Vec<i64>`.
-        data_ptr_fn: fn(*mut u8) -> *mut i64,
-        /// Returns the live length of the embedded `Vec<i64>`.
-        len_fn: fn(*const u8) -> usize,
-    },
 }
 
 /// Complete description of a virtualizable type.
@@ -253,6 +241,17 @@ pub struct VirtualizableInfo {
     /// `None` (PyFrame and tests) means the flat `num_green_args +
     /// index_of_virtualizable` formula already names the box.
     pub identity_live_index: Option<usize>,
+    /// Whether an outer executor (the macro-generated mainloop) owns the
+    /// live virtualizable and writes it on every opcode.
+    ///
+    /// `pyjitpl.py synchronize_virtualizable` writes the boxes back after
+    /// every vable store because upstream's metainterp IS the interpreter.
+    /// A pyre driver whose merge point is the bare observer/replay form
+    /// (`jit_merge_point!()`) leaves a second executor running the guest,
+    /// so the live struct — not the shadow — is authoritative and the
+    /// flush would clobber it. `false` is the upstream situation (the
+    /// `; state` single-executor close, or a token-bearing VTYPE).
+    pub outer_executor_owns_state: bool,
 }
 
 impl Clone for VirtualizableInfo {
@@ -277,6 +276,7 @@ impl Clone for VirtualizableInfo {
             clear_vable_descr: self.clear_vable_descr.clone(),
             identity_ref_bank_index: self.identity_ref_bank_index,
             identity_live_index: self.identity_live_index,
+            outer_executor_owns_state: self.outer_executor_owns_state,
         }
     }
 }
@@ -368,6 +368,7 @@ impl VirtualizableInfo {
             clear_vable_descr: None,
             identity_ref_bank_index: None,
             identity_live_index: None,
+            outer_executor_owns_state: false,
         }
     }
 
@@ -749,42 +750,6 @@ impl VirtualizableInfo {
             storage: VableArrayStorage::EmbeddedArray { ptr_offset },
             length_offset,
             items_offset,
-        });
-        self.array_descrs.push(array_descr);
-    }
-
-    /// Add a Rust `Vec<T>`-backed array field embedded by value in the frame.
-    ///
-    /// `field_offset` is the byte offset of the `Vec` within the frame (used
-    /// only for flat-index bookkeeping). `data_ptr_fn`/`len_fn` read the live
-    /// data pointer and length through `Vec` methods, so no assumption is
-    /// made about the in-memory order of the `Vec`'s `(ptr, cap, len)` words.
-    pub fn add_rust_vec_array_field(
-        &mut self,
-        name: impl Into<String>,
-        item_type: Type,
-        field_offset: usize,
-        data_ptr_fn: fn(*mut u8) -> *mut i64,
-        len_fn: fn(*const u8) -> usize,
-        array_descr: DescrRef,
-    ) {
-        let name = name.into();
-        let item_size = array_descr_item_size(&array_descr, item_type);
-        let item_signed = array_descr_item_signed(&array_descr);
-        let array_type_id = array_field_type_id(&name, &array_descr);
-        self.array_fields.push(VableArrayInfo {
-            name,
-            item_type,
-            item_size,
-            item_signed,
-            field_offset,
-            array_type_id,
-            storage: VableArrayStorage::RustVec {
-                data_ptr_fn,
-                len_fn,
-            },
-            length_offset: 0,
-            items_offset: 0,
         });
         self.array_descrs.push(array_descr);
     }
@@ -1356,7 +1321,6 @@ impl VirtualizableInfo {
                     let container = *(obj_ptr.add(ai.field_offset) as *const *const u8);
                     *(container.add(ai.length_offset) as *const usize)
                 }
-                VableArrayStorage::RustVec { len_fn, .. } => len_fn(obj_ptr),
             }
         }
     }
@@ -1471,7 +1435,7 @@ impl VirtualizableInfo {
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
     /// The static half of `virtualizable.py write_boxes`; the port of the whole
-    /// is [`Self::write_boxes_to_heap`].  Upstream closes with
+    /// is [`Self::write_boxes`].  Upstream closes with
     /// `assert len(boxes) == i + 1`; this one stops at the end of the static
     /// fields instead, because its callers hand it exactly that prefix.
     pub unsafe fn write_static_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
@@ -1485,7 +1449,11 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Read static boxes and array boxes from the heap object.
+    /// Port of `virtualizable.py read_boxes`. Upstream returns one flat list
+    /// of statics then array items; this splits them into
+    /// `(Vec<i64>, Vec<Vec<i64>>)`. Convergence is to flatten the pair into
+    /// one list so that `write_all_boxes` becomes a caller of `write_boxes`
+    /// rather than a second writer of the same fields.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
@@ -1509,7 +1477,11 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Write static boxes and array boxes back to the heap object.
+    /// Port of `virtualizable.py write_boxes`. Upstream takes one flat list
+    /// of statics then array items; this takes the same values as
+    /// `(&[i64], &[Vec<i64>])`. Convergence is to flatten the pair into one
+    /// list so that `write_all_boxes` becomes a caller of `write_boxes`
+    /// rather than a second writer of the same fields.
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
@@ -1540,7 +1512,7 @@ impl VirtualizableInfo {
     ///
     /// # Safety
     /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_boxes_to_heap(&self, obj_ptr: *mut u8, boxes: &[i64]) {
+    pub unsafe fn write_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         unsafe {
             let mut i = 0;
             // Static fields
@@ -1560,7 +1532,7 @@ impl VirtualizableInfo {
             assert_eq!(
                 boxes.len(),
                 i + 1,
-                "write_boxes_to_heap: boxes count mismatch (expected {}, got {})",
+                "write_boxes: boxes count mismatch (expected {}, got {})",
                 i + 1,
                 boxes.len()
             );
@@ -1575,7 +1547,7 @@ impl VirtualizableInfo {
     /// `obj_ptr` must point to a valid virtualizable object.
     pub unsafe fn force_from_boxes(&self, obj_ptr: *mut u8, boxes: &[i64]) {
         unsafe {
-            self.write_boxes_to_heap(obj_ptr, boxes);
+            self.write_boxes(obj_ptr, boxes);
             self.reset_vable_token(obj_ptr);
         }
     }
@@ -1602,23 +1574,16 @@ impl VableArrayInfo {
     /// array's data pointer followed by one `GETARRAYITEM_GC_*` per element —
     /// two loads expressible in trace IR with nothing but byte offsets. A
     /// storage whose data pointer sits at a fixed offset (from the field, or
-    /// from a container the field points at) answers that; a `Vec` embedded by
-    /// value does not, because its data pointer is one of three words in an
-    /// order the language does not specify, so no field load portably finds it.
-    /// `patch_new_loop_to_load_virtualizable_fields` panics rather than read a
-    /// capacity as a base address, which makes this the predicate a caller must
-    /// consult BEFORE putting a virtualizable on the preamble's path.
+    /// from a container the field points at) answers that.
     pub fn is_entry_reloadable(&self) -> bool {
         match self.storage {
             VableArrayStorage::DirectPointer | VableArrayStorage::EmbeddedArray { .. } => true,
-            VableArrayStorage::RustVec { .. } => false,
         }
     }
 
     pub fn can_read_length_from_heap(&self) -> bool {
         match self.storage {
             VableArrayStorage::EmbeddedArray { .. } => true,
-            VableArrayStorage::RustVec { .. } => true,
             VableArrayStorage::DirectPointer => {
                 !(self.length_offset == 0 && self.items_offset == 0)
             }
@@ -1637,53 +1602,7 @@ impl VableArrayInfo {
                     let container = *(obj_ptr.add(self.field_offset) as *const *const u8);
                     *(container.add(ptr_offset) as *const *const u8)
                 }
-                VableArrayStorage::RustVec { data_ptr_fn, .. } => {
-                    data_ptr_fn(obj_ptr as *mut u8) as *const u8
-                }
             }
-        }
-    }
-}
-
-/// Reads virtualizable fields from a heap object into a flat value array.
-///
-/// This is the "synchronize" direction: heap → JIT representation.
-///
-/// `obj_ptr` is a pointer to the virtualizable heap object.
-/// Returns a vector of values (static fields first, then array elements).
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` points to a valid object with the
-/// layout described by `info`.
-#[cfg(test)]
-unsafe fn read_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *const u8) -> Vec<i64> {
-    unsafe {
-        let mut boxes = Vec::with_capacity(info.num_static_extra_boxes);
-
-        // Read static fields
-        for index in 0..info.static_fields.len() {
-            boxes.push(info.read_field(obj_ptr, index));
-        }
-
-        boxes
-    }
-}
-
-/// Writes values back from JIT representation to a virtualizable heap object.
-///
-/// This is the "force" direction: JIT representation → heap.
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` points to a valid object with the
-/// layout described by `info`.
-#[cfg(test)]
-unsafe fn write_virtualizable_boxes(info: &VirtualizableInfo, obj_ptr: *mut u8, boxes: &[i64]) {
-    unsafe {
-        for i in 0..info.static_fields.len() {
-            if i >= boxes.len() {
-                break;
-            }
-            info.write_field(obj_ptr, i, boxes[i]);
         }
     }
 }
@@ -1875,40 +1794,6 @@ unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u
     }
 }
 
-/// Read all virtualizable state (static fields + array fields) into a flat box array.
-///
-/// Returns (static_boxes, array_boxes_per_field).
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` is valid and arrays have the specified lengths.
-#[cfg(test)]
-unsafe fn read_all_virtualizable_boxes(
-    info: &VirtualizableInfo,
-    obj_ptr: *const u8,
-    array_lengths: &[usize],
-) -> (Vec<i64>, Vec<Vec<i64>>) {
-    // SAFETY: forwarded from this function's caller via the doc-comment
-    // contract — `obj_ptr` valid + array lengths match storage.
-    unsafe { info.read_all_boxes(obj_ptr, array_lengths) }
-}
-
-/// Write all virtualizable state back to the heap.
-///
-/// # Safety
-/// The caller must ensure `obj_ptr` is valid and arrays have sufficient space.
-#[cfg(test)]
-unsafe fn write_all_virtualizable_boxes(
-    info: &VirtualizableInfo,
-    obj_ptr: *mut u8,
-    static_boxes: &[i64],
-    array_boxes: &[Vec<i64>],
-) {
-    // SAFETY: per the function-level Safety contract, callers guarantee
-    // `obj_ptr` is valid and the arrays have sufficient space; that
-    // forwards directly to `write_all_boxes`'s same precondition.
-    unsafe { info.write_all_boxes(obj_ptr, static_boxes, array_boxes) };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2066,11 +1951,11 @@ mod tests {
             *(obj_ptr.add(16) as *mut i64) = 99;
 
             // Read boxes
-            let boxes = read_virtualizable_boxes(&info, obj_ptr);
+            let boxes = info.read_static_boxes(obj_ptr);
             assert_eq!(boxes, vec![42, 99]);
 
             // Write new boxes
-            write_virtualizable_boxes(&info, obj_ptr, &[100, 200]);
+            info.write_static_boxes(obj_ptr, &[100, 200]);
             assert_eq!(*(obj_ptr.add(8) as *const i64), 100);
             assert_eq!(*(obj_ptr.add(16) as *const i64), 200);
         }
@@ -2364,12 +2249,11 @@ mod tests {
         info.add_field("y", Type::Int, 16);
         test_add_array_field(&mut info, "stack", Type::Int, 24, 0, 8);
 
-        // Use read_array_lengths + read_all_virtualizable_boxes (the auto path)
+        // Use read_array_lengths + read_all_boxes (the auto path)
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![2]);
 
-        let (static_boxes, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(static_boxes, vec![42, 99]);
         assert_eq!(array_boxes, vec![vec![10, 20]]);
     }
@@ -2398,8 +2282,7 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
 
-        let (_, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        let (_, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(array_boxes, vec![vec![100, 200, 300]]);
 
         // Verify write roundtrip with custom layout
@@ -2412,8 +2295,7 @@ mod tests {
             );
         }
         // Re-read from the actual array_data (obj_mut still points to array_data)
-        let (_, array_boxes2) =
-            unsafe { read_all_virtualizable_boxes(&info, obj_mut.as_ptr(), &lengths) };
+        let (_, array_boxes2) = unsafe { info.read_all_boxes(obj_mut.as_ptr(), &lengths) };
         assert_eq!(array_boxes2, vec![vec![111, 222, 333]]);
     }
 
@@ -2454,8 +2336,7 @@ mod tests {
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
         assert_eq!(lengths, vec![3]);
 
-        let (static_boxes, array_boxes) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        let (static_boxes, array_boxes) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(static_boxes, vec![7]);
         assert_eq!(array_boxes, vec![vec![10, 20, 30]]);
 
@@ -2463,7 +2344,7 @@ mod tests {
         let new_static = vec![42i64];
         let new_arrays = vec![vec![100i64, 200, 300]];
         unsafe {
-            write_all_virtualizable_boxes(&info, obj.as_mut_ptr(), &new_static, &new_arrays);
+            info.write_all_boxes(obj.as_mut_ptr(), &new_static, &new_arrays);
         }
 
         // Verify heap was updated
@@ -2578,8 +2459,7 @@ mod tests {
 
         // sync_before_jit: read from heap
         let lengths = unsafe { read_array_lengths(&info, obj.as_ptr()) };
-        let (mut statics, mut arrays) =
-            unsafe { read_all_virtualizable_boxes(&info, obj.as_ptr(), &lengths) };
+        let (mut statics, mut arrays) = unsafe { info.read_all_boxes(obj.as_ptr(), &lengths) };
         assert_eq!(statics, vec![11, 22]);
         assert_eq!(arrays, vec![vec![50, 60]]);
 
@@ -2591,7 +2471,7 @@ mod tests {
 
         // sync_after_jit: write back to heap
         unsafe {
-            write_all_virtualizable_boxes(&info, obj.as_mut_ptr(), &statics, &arrays);
+            info.write_all_boxes(obj.as_mut_ptr(), &statics, &arrays);
         }
 
         // Verify heap has new values
@@ -3205,7 +3085,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
                         );
                     }
                 }
-                VableArrayStorage::EmbeddedArray { .. } | VableArrayStorage::RustVec { .. } => {}
+                VableArrayStorage::EmbeddedArray { .. } => {}
             }
         }
         // virtualizable.py write_boxes: static ref fields live on the
@@ -3321,14 +3201,13 @@ pub(crate) unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableAr
                     *(arr_ptr.add(array.length_offset) as *const usize)
                 }
             }
-            VableArrayStorage::RustVec { len_fn, .. } => len_fn(vable_ptr),
         }
     }
 }
 
 /// Address of item 0 of a virtualizable array field.
 ///
-/// The three storage kinds reach the items through different indirections, and
+/// The two storage kinds reach the items through different indirections, and
 /// both the item read and the item write below resolved that separately. They
 /// now share this, so an item access and a whole-array access can never
 /// disagree about where the items start.
@@ -3359,9 +3238,6 @@ pub(crate) unsafe fn bhimpl_arraybase_vable(
                     return std::ptr::null();
                 }
                 arr_ptr.add(array.items_offset)
-            }
-            VableArrayStorage::RustVec { data_ptr_fn, .. } => {
-                data_ptr_fn(vable_ptr as *mut u8) as *const u8
             }
         }
     }
@@ -3469,7 +3345,6 @@ pub(crate) unsafe fn vable_array_write_base(
             VableArrayStorage::DirectPointer => {
                 *(vable_ptr.add(array.field_offset) as *const *mut u8)
             }
-            VableArrayStorage::RustVec { .. } => std::ptr::null_mut(),
         };
         (data_ptr, owner_ptr)
     }
@@ -3526,9 +3401,8 @@ pub(crate) unsafe fn vable_write_array_item(
 /// Write one item of a virtualizable array whose base is already resolved.
 ///
 /// Split out of [`vable_write_array_item`] so a caller walking a whole array
-/// can bind the base once, the way `virtualizable.py:134-137` binds `lst`
-/// outside its item loop.  Resolving it per item costs an indirect call for
-/// `RustVec` storage and two loads for the others.
+/// can bind the base once, the way `virtualizable.py write_from_resume_data_partial`
+/// binds `lst` outside its item loop.  Resolving it per item costs two loads.
 pub(crate) unsafe fn vable_write_array_item_at(
     vable_ptr: *mut u8,
     array: &VableArrayInfo,
@@ -3656,89 +3530,6 @@ pub(crate) unsafe fn bh_clear_vable_token(vinfo: &VirtualizableInfo, obj_ptr: *m
         unsafe { follow_forwarded_vable(obj_ptr) }
     } else {
         obj_ptr
-    }
-}
-
-#[cfg(test)]
-mod opt1_rustvec_abi_roundtrip {
-    use super::*;
-
-    // Mirrors examples/tl `TlState { stackpos: i64, stack: Vec<i64> }`: a
-    // Rust `Vec<i64>` embedded by value, the layout `RustVec` storage targets.
-    #[repr(C)]
-    struct FakeState {
-        stackpos: i64,
-        stack: Vec<i64>,
-    }
-
-    fn fake_stack_data_ptr(p: *mut u8) -> *mut i64 {
-        unsafe { (*(p as *mut FakeState)).stack.as_mut_ptr() }
-    }
-    fn fake_stack_len(p: *const u8) -> usize {
-        unsafe { (*(p as *const FakeState)).stack.len() }
-    }
-
-    fn build_info() -> VirtualizableInfo {
-        let mut info = VirtualizableInfo::new(0);
-        info.add_field(
-            "stackpos",
-            Type::Int,
-            std::mem::offset_of!(FakeState, stackpos),
-        );
-        let descr = majit_ir::descr::make_array_descr(0, std::mem::size_of::<i64>(), Type::Int);
-        info.add_rust_vec_array_field(
-            "stack",
-            Type::Int,
-            std::mem::offset_of!(FakeState, stack),
-            fake_stack_data_ptr,
-            fake_stack_len,
-            descr,
-        );
-        info
-    }
-
-    #[test]
-    fn arraylen_reads_live_vec_len() {
-        let mut s = FakeState {
-            stackpos: 0,
-            stack: vec![10, 20, 30],
-        };
-        let info = build_info();
-        let p = (&mut s as *mut FakeState) as *const u8;
-        let len = unsafe { bhimpl_arraylen_vable(p, &info.array_fields[0]) };
-        assert_eq!(len, 3);
-    }
-
-    #[test]
-    fn read_write_roundtrip_through_vec_data() {
-        let mut s = FakeState {
-            stackpos: 0,
-            stack: vec![0, 0, 0, 0],
-        };
-        let info = build_info();
-        let p = (&mut s as *mut FakeState) as *mut u8;
-        unsafe {
-            vable_write_array_item(p, &info.array_fields[0], 0, 111);
-            vable_write_array_item(p, &info.array_fields[0], 3, 444);
-        }
-        assert_eq!(s.stack, vec![111, 0, 0, 444]);
-        let v0 = unsafe { vable_read_array_item(p as *const u8, &info.array_fields[0], 0) };
-        let v3 = unsafe { vable_read_array_item(p as *const u8, &info.array_fields[0], 3) };
-        assert_eq!((v0, v3), (111, 444));
-    }
-
-    #[test]
-    fn flat_index_and_total_size_match_consume_assertion() {
-        let info = build_info();
-        // add_field sets num_static_extra_boxes = static_fields.len().
-        assert_eq!(info.num_static_extra_boxes, 1);
-        let lengths = [4usize];
-        // Flat layout [stackpos, stack[0..4]]; identity is appended separately
-        // by init_virtualizable_boxes.
-        assert_eq!(info.get_index_in_array(0, 0, &lengths), 1);
-        assert_eq!(info.get_index_in_array(0, 3, &lengths), 4);
-        // consume_vable_info asserts get_total_size(slice) == vable_size - 1.
-        assert_eq!(info.get_total_size(&lengths), 1 + 4);
     }
 }
 

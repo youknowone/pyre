@@ -730,7 +730,7 @@ pub fn expand_state(input: DeriveInput) -> TokenStream {
             /// The STATIC half of `virtualizable.py write_boxes`.  Upstream writes
             /// statics and array items and then asserts it consumed every box;
             /// `write_static_boxes` writes the statics only, and
-            /// `VirtualizableInfo::write_boxes_to_heap` answers for the whole.
+            /// `VirtualizableInfo::write_boxes` answers for the whole.
             /// Writes ALL static fields to the heap via VirtualizableInfo.
             pub fn virt_import_static_boxes(
                 &mut self,

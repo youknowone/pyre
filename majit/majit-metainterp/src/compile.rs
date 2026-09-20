@@ -2269,34 +2269,6 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
             crate::virtualizable::VableArrayStorage::DirectPointer => {
                 (item_opcode, item_descr, item_base)
             }
-            crate::virtualizable::VableArrayStorage::RustVec { .. } => {
-                // Unreached by every current consumer: state-field JIT virt
-                // arrays seed their element boxes through the macro's
-                // `initialize_virtualizable` (from `<arr>_values`), not through
-                // this heap-reload preamble, and `RustVec` storage is built
-                // only by the state-field macro.  A correct in-trace reload is
-                // also not expressible here: the data pointer is NOT the Vec's
-                // first word — `Vec<i64>` lays out as `[cap, ptr, len]` on the
-                // current toolchain and the field order is unspecified across
-                // rustc versions — and this backend IR cannot call
-                // `Vec::as_ptr`, so a fixed byte offset cannot portably locate
-                // it (resume/sync use the `data_ptr_fn`/`len_fn` extractors for
-                // exactly this reason).  Fail loud rather than emit a
-                // `GetfieldGcR` at `field_offset` that would read `cap` as the
-                // base pointer and corrupt memory.
-                //
-                // The way out is the field's declared container, not this arm: a
-                // `virt_array::VirtArray` field holds a pointer to a block whose
-                // length and payload sit at fixed offsets, which registers as
-                // `DirectPointer` above and reloads through the ordinary
-                // `compile.py:441-457` pair.
-                panic!(
-                    "patch_new_loop reload of a RustVec virtualizable array \
-                     (array {ai}) is unsupported: the in-trace IR cannot locate \
-                     the Vec data pointer portably; state-field consumers seed \
-                     elements via initialize_virtualizable instead"
-                );
-            }
             crate::virtualizable::VableArrayStorage::EmbeddedArray { ptr_offset } => {
                 // TODO (heap layout divergence):
                 // RPython's `vinfo.array_field_descrs` points at a real

@@ -94,8 +94,7 @@ fn a_block_backed_state_interprets_the_same_program_to_the_same_answer() {
 /// The registration the generated `VirtualizableInfo` builder produces is the
 /// array-pointer storage, with the block's length and payload offsets. Those
 /// two offsets are exactly what `patch_new_loop_to_load_virtualizable_fields`
-/// needs to emit the reload preamble; the `RustVec` storage a `Vec` field
-/// registers has neither and that arm refuses.
+/// needs to emit the reload preamble.
 #[test]
 fn a_block_backed_field_registers_the_storage_a_compiled_entry_can_reload() {
     let info = <Machine as majit_metainterp::JitState>::__build_virtualizable_info()
