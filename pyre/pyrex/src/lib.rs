@@ -645,12 +645,14 @@ pub fn main_entry(binary_name: &'static str) {
     // process, and a tracer attached to that process follows that thread alone
     // unless it is asked to follow clones — so an interpreter on a thread of
     // its own makes the program's whole syscall stream invisible to `strace`.
-    // Staying there needs a stack far past the ~8 MiB a process starts with,
-    // and linux is where that is available: the kernel grows that stack on
-    // demand against the soft `RLIMIT_STACK`, so raising the limit here is
-    // enough. Raising it on darwin moves the limit without moving the guard
-    // the runtime installed from the size the process started with, and the
-    // stack still faults at 8 MiB, so darwin takes a thread of its own below.
+    // Staying there needs a stack far past the ~8 MiB a process starts with.
+    // Linux grows that stack on demand against the soft `RLIMIT_STACK`, so
+    // raising the limit here is enough. Darwin cannot: `setrlimit` moves the
+    // limit without moving the guard the runtime installed from the size the
+    // process started with, and the stack still faults at 8 MiB. The linker
+    // sizes the origin thread instead (`-Wl,-stack_size` in build.rs); if
+    // that grant is large enough the interpreter stays on this thread, and a
+    // host that links or loads without it falls back to a spawned thread.
     #[cfg(all(target_os = "linux", not(feature = "sandbox")))]
     {
         // Announce the stack this thread is budgeted against, and capture the
@@ -702,38 +704,55 @@ pub fn main_entry(binary_name: &'static str) {
         }
     }
 
-    // Block async signals on this (the process's original) thread so the
-    // kernel delivers process-directed signals to the interpreter thread
-    // spawned below, where they can interrupt blocking syscalls.  The
-    // interpreter thread inherits this mask and unblocks them at the top of
-    // `real_main`.
     #[cfg(not(any(target_os = "linux", feature = "sandbox")))]
     {
+        // Capture the inherited mask before either path so `real_main`'s
+        // unblock restores signals the caller had blocked, instead of
+        // opening SIGINT/SIGALRM unconditionally.
         pyre_interpreter::module::signal::signalstate::block_async_signals_on_origin_thread();
-        std::thread::Builder::new()
-            .stack_size(INTERPRETER_THREAD_STACK_SIZE)
-            .spawn(move || {
-                // Same first statement `_thread`'s worker runs
-                // (`module/thread/mod.rs`): announce the stack this thread is
-                // budgeted against, and capture the base here at the outermost
-                // interpreter entry. Left out, `effective_stack_length` falls
-                // back to `getrlimit(RLIMIT_STACK)`, which describes the
-                // process's original thread and not this one, and the byte
-                // guard — not the recursion limit — ends up deciding how deep
-                // Python can recurse.
-                //
-                // The announced figure is the shared one, not
-                // INTERPRETER_THREAD_STACK_SIZE: the budget it sizes is stored
-                // in a process-global word every thread's inline probe reads.
-                pyre_interpreter::stack_check::configure_current_thread_stack_size(
-                    pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
-                );
-                real_main(binary_name);
-                post_run_diagnostics();
-            })
-            .expect("spawn interpreter thread")
-            .join()
-            .unwrap();
+        let run_on_origin_thread = {
+            #[cfg(target_os = "macos")]
+            {
+                // `getrlimit(RLIMIT_STACK)` does not follow `-Wl,-stack_size`.
+                let granted = unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) };
+                granted >= pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+        let run = move || {
+            // Same first statement `_thread`'s worker runs
+            // (`module/thread/mod.rs`): announce the stack this thread is
+            // budgeted against, and capture the base here at the outermost
+            // interpreter entry. Left out, `effective_stack_length` falls
+            // back to `getrlimit(RLIMIT_STACK)`. On darwin that still reports
+            // the process default (~8 MiB) even when the linker granted a
+            // larger origin-thread stack; on a spawned thread it describes
+            // the process's original thread and not this one. Either way the
+            // byte guard — not the recursion limit — would decide how deep
+            // Python can recurse.
+            //
+            // The announced figure is the shared one, not
+            // INTERPRETER_THREAD_STACK_SIZE: the budget it sizes is stored
+            // in a process-global word every thread's inline probe reads.
+            pyre_interpreter::stack_check::configure_current_thread_stack_size(
+                pyre_interpreter::stack_check::DEFAULT_RUNTIME_THREAD_STACK_SIZE,
+            );
+            real_main(binary_name);
+            post_run_diagnostics();
+        };
+        if run_on_origin_thread {
+            run();
+        } else {
+            std::thread::Builder::new()
+                .stack_size(INTERPRETER_THREAD_STACK_SIZE)
+                .spawn(run)
+                .expect("spawn interpreter thread")
+                .join()
+                .unwrap();
+        }
     }
 }
 

@@ -2,6 +2,14 @@ use std::path::Path;
 
 fn main() {
     let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // INTERPRETER_THREAD_STACK_SIZE in lib.rs is 256 MiB (0x10000000). The
+    // linker, not setrlimit, is what sizes the origin thread's stack on
+    // darwin; keep the two figures the same so the interpreter's usable
+    // stack is unchanged when it stays on that thread.
+    match target.as_str() {
+        "macos" => println!("cargo::rustc-link-arg-bins=-Wl,-stack_size,0x10000000"),
+        _ => {}
+    }
     let mut symbols = vec![
         "PyThreadState_SetAsyncExc".to_string(),
         "PyGILState_Ensure".to_string(),
