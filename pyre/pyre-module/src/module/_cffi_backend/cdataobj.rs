@@ -540,6 +540,14 @@ pub fn raw_read_ptr(data: usize) -> usize {
     unsafe { (data as *const usize).read_unaligned() }
 }
 
+/// One pointer-sized store into an exchange-buffer argument slot
+/// (`rffi.cast(rffi.CCHARPP, data)[0] = value`).
+#[majit_macros::oopspec("raw_write_ptr(data, value)")]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn raw_write_ptr(data: usize, value: usize) {
+    unsafe { (data as *mut usize).write_unaligned(value) }
+}
+
 pub fn raw_alloc(size: i64, zero: bool) -> Result<usize, PyError> {
     if size < 0 {
         return Err(PyError::value_error("negative allocation size"));

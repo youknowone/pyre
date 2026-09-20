@@ -20,8 +20,13 @@ use super::misc;
 /// # Safety
 /// `cdata` must be readable for the width of a pointer.
 pub unsafe fn pointer_convert_to_object(ct: &W_CType, cdata: *const u8) -> PyObjectRef {
-    let target = unsafe { cdata.cast::<*mut u8>().read_unaligned() };
-    cdataobj::new_cdata(target as usize, ct.as_object())
+    // `rffi.cast(rffi.CCHARPP, cdata)[0]` — `getarrayitem` of a raw
+    // pointer array, which `rewrite_op_getarrayitem` keeps as
+    // `getarrayitem_raw` / `raw_load`. The oopspec leaf is
+    // `cdataobj::raw_read_ptr`; inlining `read_unaligned` here left
+    // that rustc helper in the `_CDataBase` call descent.
+    let target = cdataobj::raw_read_ptr(cdata as usize);
+    cdataobj::new_cdata(target, ct.as_object())
 }
 
 /// `W_CTypeArray.convert_to_object` — the array itself, not a copy.  An
@@ -87,7 +92,7 @@ pub unsafe fn pointer_convert_from_object(
             return Err(ct.convert_error("compatible pointer", w_ob));
         }
     }
-    unsafe { cdata.cast::<usize>().write_unaligned(source.ptr) };
+    cdataobj::raw_write_ptr(cdata as usize, source.ptr);
     Ok(())
 }
 
@@ -553,7 +558,7 @@ pub unsafe fn pointer_convert_argument_from_object(
         {
             let value = unsafe { pyre_object::bytesobject::w_bytes_data(offset.w_bytes) };
             let ptr = unsafe { value.as_ptr().offset(offset.offset as isize) };
-            unsafe { cdata.cast::<*const u8>().cast_mut().write_unaligned(ptr) };
+            cdataobj::raw_write_ptr(cdata as usize, ptr as usize);
             set_mustfree_flag(cdata, MUSTFREE_NOTHING);
             return Ok(false);
         }
@@ -599,7 +604,7 @@ unsafe fn accept_movable_str(
         // move the bytes and there is no non-moving pin.
         misc::raw_memcopy(value.as_ptr() as usize, buf, value.len());
         (buf as *mut u8).add(value.len()).write(0);
-        cdata.cast::<usize>().write_unaligned(buf);
+        cdataobj::raw_write_ptr(cdata as usize, buf);
         set_mustfree_flag(cdata, MUSTFREE_FREE);
     }
     Ok(true)
@@ -650,7 +655,7 @@ unsafe fn prepare_pointer_call_argument(
             if file.is_null() {
                 return Ok(MUSTFREE_NOTHING);
             }
-            cdata.cast::<*mut c_void>().write_unaligned(file);
+            cdataobj::raw_write_ptr(cdata as usize, file as usize);
             return Ok(super::ctypefunc::MUSTFREE_FILE);
         } else {
             return Ok(MUSTFREE_NOTHING);
@@ -672,7 +677,7 @@ unsafe fn prepare_pointer_call_argument(
         unsafe { libc::free(buf as *mut libc::c_void) };
         return Err(e);
     }
-    unsafe { cdata.cast::<usize>().write_unaligned(buf) };
+    cdataobj::raw_write_ptr(cdata as usize, buf);
     Ok(MUSTFREE_FREE)
 }
 
