@@ -900,6 +900,30 @@ fn is_identity_cast_path(segments: &[String]) -> bool {
         || leaf == crate::runtime_names::shims::CAST_ADDRESS
 }
 
+/// `core::ptr::from_ref` / `from_mut` — rustc `ptr/mod.rs` `from_ref` is
+/// `return r`, the same bits as `r as *const T`. RPython has no
+/// reference type separate from `Ptr`; the rtyper emits `cast_pointer`
+/// (`rptr.py` / `annlowlevel.py specialize_call`) and
+/// `jtransform.py rewrite_op_cast_pointer` aliases via `same_as`.
+///
+/// Not `slice::from_ref` (one-element slice) and not `NonNull::from_ref`
+/// (wrapper struct).
+fn is_ptr_from_ref_path(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    if leaf != "from_ref" && leaf != "from_mut" {
+        return false;
+    }
+    let joined = segments.join("::");
+    if joined.contains("slice") || joined.contains("NonNull") || joined.contains("non_null") {
+        return false;
+    }
+    joined.starts_with("core::ptr::")
+        || joined.starts_with("std::ptr::")
+        || segments.get(segments.len().saturating_sub(2)).map(String::as_str) == Some("ptr")
+}
+
 /// Stored value of a GC-pointer `setfield_gc` / `setarrayitem_gc`.
 /// Raw-pointer `Ref` owners are not this (`rewrite.py
 /// handle_write_barrier_setfield` keys on `v.type == 'r'`).
@@ -931,7 +955,7 @@ fn identity_cast_operand(
                 args,
                 ..
             } = &op.kind
-                && is_identity_cast_path(segments)
+                && (is_identity_cast_path(segments) || is_ptr_from_ref_path(segments))
             {
                 return args.iter().find_map(LinkArg::as_variable).cloned();
             }
@@ -6357,6 +6381,16 @@ impl<'a> Transformer<'a> {
         // folds back to the operand alias and emits no jitcode op.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__cast_pointer"]
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
+        // `ptr::from_ref` / `from_mut` is rustc's `r as *const T` /
+        // `*mut T` (`ptr/mod.rs from_ref` returns `r`). Same
+        // `rewrite_op_cast_pointer` → `same_as` alias as the marker
+        // above: no jitcode op, not a residual helper.
+        if let CallTarget::FunctionPath { segments } = target
+            && is_ptr_from_ref_path(segments)
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -17958,6 +17992,81 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// `ptr::from_ref` is rustc `return r` / rtyper `cast_pointer` /
+    /// `rewrite_op_same_as`. The host Call must alias, not residualise.
+    #[test]
+    fn ptr_from_ref_elides_to_operand_alias() {
+        for path in [
+            vec!["core", "ptr", "from_ref"],
+            vec!["std", "ptr", "from_mut"],
+            vec!["core", "ptr::<Impl>", "from_ref"],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new("ptr_from_ref");
+            let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let target = CallTarget::function_path(path);
+            let result_ty = ValueType::Ref(None);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            match transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "ptr_from_ref",
+                &mut graph,
+            ) {
+                RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+                _ => panic!("expected Identity alias to the operand"),
+            }
+        }
+    }
+
+    /// `slice::from_ref` builds a one-element slice; `NonNull::from_ref`
+    /// wraps. Neither is `cast_pointer`.
+    #[test]
+    fn slice_and_nonnull_from_ref_are_not_pointer_identity() {
+        for path in [
+            vec!["core", "slice", "from_ref"],
+            vec!["core", "ptr", "non_null", "NonNull", "from_ref"],
+        ] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new("not_ptr_from_ref");
+            let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let target = CallTarget::function_path(path);
+            let result_ty = ValueType::Ref(None);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: crate::model::call_args(vec![arg.clone()]),
+                    result_ty: result_ty.clone(),
+                },
+            };
+            match transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                "not_ptr_from_ref",
+                &mut graph,
+            ) {
+                RewriteResult::Identity(_) => panic!("must not alias slice/NonNull from_ref"),
+                _ => {}
+            }
         }
     }
 
