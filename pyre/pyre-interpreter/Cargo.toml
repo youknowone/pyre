@@ -42,6 +42,9 @@ dynasm = ["majit-metainterp/dynasm"]
 # filesystem. Off by default; the native and wasmtime-runner targets read the
 # real filesystem instead.
 wasm_vfs = ["pyre-native/wasm_vfs", "host_env"]
+# Collect on every allocation. Forwarded so interpreter-owned rooting tests
+# can run under the same gate as `pyre-jit`.
+gc_stress = ["majit-gc/gc_stress"]
 
 [dependencies]
 pyre-object = { workspace = true }

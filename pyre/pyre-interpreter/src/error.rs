@@ -767,11 +767,22 @@ impl PyError {
         name: &str,
     ) -> Self {
         let mut err = Self::new(PyErrorKind::AttributeError, msg);
+        // `w_obj` lives only in this Rust argument. `w_str_new_managed`
+        // collects under stress, and the precise walker does not see the
+        // local, so pin it and store the slot's word — a young receiver
+        // that moved would otherwise be written into `w_obj_context` as
+        // the vacated address.
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_obj);
+        if !w_obj.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(w_obj);
+        }
         err.w_name_context = pyre_object::w_str_new_managed(name);
-        err.w_obj_context = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        err.w_obj_context = if w_obj.is_null() {
+            w_obj
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(obj_slot)
+        };
         err
     }
 
@@ -5299,5 +5310,21 @@ mod tests {
             exiting.exc_object.is_null(),
             "the read must not materialise"
         );
+    }
+
+    #[test]
+    fn attribute_error_with_context_keeps_the_receiver_through_materialisation() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let obj = pyre_object::w_list_new(vec![]);
+        let mut err = PyError::attribute_error_with_context("missing", obj, "absent");
+        assert!(!err.w_obj_context.is_null());
+        assert!(!err.w_name_context.is_null());
+        let exc = err.to_exc_object();
+        assert!(!exc.is_null());
+        let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc) };
+        assert!(!stored.is_null());
+        let name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc) };
+        assert!(!name.is_null());
     }
 }

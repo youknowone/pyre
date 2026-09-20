@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 description = "Python object model for pyre interpreter"
 
+[features]
+# Collect on every allocation. Forwarded so list/object rooting tests can run
+# under the same gate as `pyre-jit`.
+gc_stress = ["majit-gc/gc_stress"]
+
 [dependencies]
 num-traits = { workspace = true }
 majit-gc = { workspace = true }
