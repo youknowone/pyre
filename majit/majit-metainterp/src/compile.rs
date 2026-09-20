@@ -2009,19 +2009,72 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     // rewrite is fully materialized into `ops`.
     use majit_ir::{Op, OpCode, OpRef, descr::ArrayFlag};
 
-    fn set_local_forwarded(forwarding: &mut Vec<Option<Operand>>, source: OpRef, target: Operand) {
-        if source.is_none() || source.is_constant() {
-            return;
+    // compile.py `box.set_forwarded` is Box identity, not a raw number.
+    // InputArg(n) and {Int,Ref}Op(n) share `OpRef::raw()`; a single vec
+    // keyed by raw remaps an inputarg onto a live pointer op and the
+    // frame onto an int local.
+    struct LocalForwarding {
+        inputargs: Vec<Option<Operand>>,
+        ops: Vec<Option<Operand>>,
+    }
+
+    impl LocalForwarding {
+        fn with_op_capacity(max_runtime_ref: u32) -> Self {
+            Self {
+                inputargs: Vec::new(),
+                ops: vec![None; (max_runtime_ref as usize).saturating_add(1)],
+            }
         }
-        let idx = source.raw() as usize;
-        if idx >= forwarding.len() {
-            forwarding.resize(idx + 1, None);
+
+        fn slot_mut(&mut self, source: OpRef) -> Option<&mut Option<Operand>> {
+            if source.is_none() || source.is_constant() {
+                return None;
+            }
+            let idx = Self::typed_index(source)?;
+            let bank = if source.is_input_arg() {
+                &mut self.inputargs
+            } else {
+                &mut self.ops
+            };
+            if idx >= bank.len() {
+                bank.resize(idx + 1, None);
+            }
+            Some(&mut bank[idx])
         }
-        forwarding[idx] = Some(target);
+
+        fn slot(&self, source: OpRef) -> Option<&Operand> {
+            if source.is_none() || source.is_constant() {
+                return None;
+            }
+            let idx = Self::typed_index(source)?;
+            let bank = if source.is_input_arg() {
+                &self.inputargs
+            } else {
+                &self.ops
+            };
+            bank.get(idx).and_then(|s| s.as_ref())
+        }
+
+        /// Keep Ref/Int/Float of the same raw id in distinct slots.
+        fn typed_index(source: OpRef) -> Option<usize> {
+            let tag = match source.ty()? {
+                Type::Ref => 0,
+                Type::Int => 1,
+                Type::Float => 2,
+                _ => return None,
+            };
+            Some((source.raw() as usize) * 3 + tag)
+        }
+    }
+
+    fn set_local_forwarded(forwarding: &mut LocalForwarding, source: OpRef, target: Operand) {
+        if let Some(slot) = forwarding.slot_mut(source) {
+            *slot = Some(target);
+        }
     }
 
     fn get_local_box_replacement(
-        forwarding: &[Option<Operand>],
+        forwarding: &LocalForwarding,
         mut opref: OpRef,
     ) -> Option<Operand> {
         if opref.is_none() || opref.is_constant() {
@@ -2029,25 +2082,24 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         }
         let mut found = None;
         loop {
-            let idx = opref.raw() as usize;
-            match forwarding.get(idx) {
-                Some(Some(next)) => {
+            match forwarding.slot(opref) {
+                Some(next) => {
                     opref = next.to_opref();
                     found = Some(next.clone());
                 }
-                _ => return found,
+                None => return found,
             }
         }
     }
 
     /// `compile.py emit_op` / `get_box_replacement`: a residual body-LABEL
     /// `RefOp` is a reminted virtualizable slot that still forwards to the
-    /// expanded inputarg Box. Key the local table by that reminted raw so
-    /// the walk below rewrites it to the GETFIELD/GETARRAYITEM just as
-    /// RPython rewrites a LABEL arg that *is* the forwarded inputarg.
+    /// expanded inputarg Box. `OpRef::eq` is typed (`InputArgRef(n)` is
+    /// not `IntOp(n)`); match the replacement Box or the inputarg itself,
+    /// never a raw number across kinds.
     fn forward_residual_args_sharing_inputarg(
         ops: &[majit_ir::OpRc],
-        forwarding: &mut Vec<Option<Operand>>,
+        forwarding: &mut LocalForwarding,
         old_opref: OpRef,
         target: &Operand,
     ) {
@@ -2071,7 +2123,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
     fn emit_forwarded_patch_op(
         extra_ops: &mut Vec<majit_ir::OpRc>,
         op: &Op,
-        forwarding: &mut Vec<Option<Operand>>,
+        forwarding: &mut LocalForwarding,
         next_opref: &mut u32,
     ) {
         let mut emitted = op.clone();
@@ -2166,8 +2218,7 @@ pub fn patch_new_loop_to_load_virtualizable_fields(
         .map(|m| m + 1)
         .unwrap_or(0);
 
-    let mut forwarding: Vec<Option<Operand>> =
-        vec![None; (max_runtime_ref as usize).saturating_add(1)];
+    let mut forwarding = LocalForwarding::with_op_capacity(max_runtime_ref);
     let mut extra_ops: Vec<majit_ir::OpRc> = Vec::new();
     let mut i = entry_prefix_len;
 
