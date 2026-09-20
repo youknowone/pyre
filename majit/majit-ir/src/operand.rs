@@ -21,7 +21,8 @@
 //! identity at construction.
 
 use crate::forwarding::{
-    Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PtrInfoBorrow, PtrInfoBorrowMut,
+    Forwarded, ForwardingHost, IntBoundBorrow, IntBoundBorrowMut, PackedForwarded, PtrInfoBorrow,
+    PtrInfoBorrowMut, classify_packed_forwarded,
 };
 use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
@@ -615,38 +616,53 @@ impl Operand {
     /// This is the canonical walker; the former box-wrapper `get_box_replacement`
     /// delegates here.
     pub fn get_box_replacement(&self, not_const: bool) -> Operand {
-        let mut cur = self.clone();
+        if !self.is_resop() && !self.is_inputarg() {
+            return self.clone();
+        }
+        // Packed-tag walk: `self` keeps the first producer alive, and each
+        // hop is kept alive by the `_forwarded` slot that points at it.
+        // One owned Operand is built only at the end.
+        let mut cur = self.packed;
         loop {
-            // Only a bound producer has a forwarded slot to read.
-            let forwarded = if let Some(op) = cur.bound_op() {
-                op.get_forwarded()
-            } else if let Some(ia) = cur.bound_inputarg() {
-                ia.get_forwarded()
+            let packed_fwd = if cur & OP_TAG == OP_OP {
+                // SAFETY: `self` or the previous hop's `_forwarded` slot keeps this Op alive.
+                unsafe {
+                    crate::resoperation::packed_forwarded_of_op(
+                        cur as *const crate::resoperation::Op,
+                    )
+                }
             } else {
-                return cur;
+                // SAFETY: `self` or the previous hop's `_forwarded` slot keeps this InputArg alive.
+                unsafe {
+                    crate::resoperation::packed_forwarded_of_inputarg(
+                        (cur & !OP_TAG) as *const crate::value::InputArg,
+                    )
+                }
             };
-            match forwarded {
-                Forwarded::None | Forwarded::Info(_) => return cur,
-                Forwarded::Op(op_rc) => cur = Operand::Op(op_rc),
-                Forwarded::InputArg(ia_rc) => cur = Operand::InputArg(ia_rc),
-                Forwarded::Const(c) => {
+            match classify_packed_forwarded(packed_fwd) {
+                PackedForwarded::None | PackedForwarded::Info => {
+                    return Operand::clone_from_packed(cur);
+                }
+                PackedForwarded::Op(p) => cur = p as u64,
+                PackedForwarded::InputArg(p) => cur = (p as u64) | OP_INPUTARG,
+                PackedForwarded::Const(p) => {
                     if not_const {
-                        return cur;
+                        return Operand::clone_from_packed(cur);
                     }
                     // `_forwarded` contains the Const object itself in
                     // RPython. Reuse its identity; constructing a new cell
                     // here made every replacement lookup allocate.
-                    return Operand::Const(c);
+                    return Operand::clone_from_packed((p as u64) | OP_CONST);
                 }
-                Forwarded::SmallConst(enc) => {
+                PackedForwarded::SmallConst(enc) => {
                     if not_const {
-                        return cur;
+                        return Operand::clone_from_packed(cur);
                     }
                     return Operand::SmallInt(enc);
                 }
-                Forwarded::SmallWide(id) => {
+                PackedForwarded::SmallWide(id) => {
                     if not_const {
-                        return cur;
+                        return Operand::clone_from_packed(cur);
                     }
                     return Operand::SmallWide(id);
                 }
@@ -1131,6 +1147,70 @@ mod tests {
                 d.get_box_replacement(false)
             ),
         }
+    }
+
+    /// Borrowed `_forwarded` walk: one owned Operand at the end, no
+    /// intermediate producer refcount churn.
+    #[test]
+    fn get_box_replacement_borrowed_walk_keeps_intermediate_counts() {
+        use crate::op_info::OpInfo;
+        use crate::ptr_info::PtrInfo;
+
+        // Op -> Op -> Const
+        let a = op_at(0, Type::Int);
+        let b = op_at(1, Type::Int);
+        let const_cell = Rc::new(Cell::new(Value::Int(99)));
+        a.set_forwarded_op(&b);
+        b.store_forwarded(Forwarded::Const(Rc::clone(&const_cell)));
+        let start = Operand::from_bound_op(&a);
+        let before_a = OpRc::strong_count(&a);
+        let before_b = OpRc::strong_count(&b);
+        {
+            let r_false = start.get_box_replacement(false);
+            assert_eq!(r_false, Operand::Const(Rc::clone(&const_cell)));
+            assert_eq!(r_false.const_value(), Some(Value::Int(99)));
+            let r_true = start.get_box_replacement(true);
+            assert!(r_true.bound_op().is_some_and(|op| OpRc::ptr_eq(&op, &b)));
+        }
+        assert_eq!(OpRc::strong_count(&a), before_a);
+        assert_eq!(OpRc::strong_count(&b), before_b);
+
+        // Op -> InputArg
+        let c = op_at(2, Type::Int);
+        let ia = InputArgRc::new(InputArg::from_type(Type::Int, 4));
+        let start_ia = Operand::from_bound_op(&c);
+        start_ia.set_forwarded_inputarg(&ia);
+        let before_c = OpRc::strong_count(&c);
+        let before_ia = InputArgRc::strong_count(&ia);
+        {
+            let r_false = start_ia.get_box_replacement(false);
+            assert!(
+                r_false
+                    .bound_inputarg()
+                    .is_some_and(|got| InputArgRc::ptr_eq(&got, &ia))
+            );
+            let r_true = start_ia.get_box_replacement(true);
+            assert!(
+                r_true
+                    .bound_inputarg()
+                    .is_some_and(|got| InputArgRc::ptr_eq(&got, &ia))
+            );
+        }
+        assert_eq!(OpRc::strong_count(&c), before_c);
+        assert_eq!(InputArgRc::strong_count(&ia), before_ia);
+
+        // Op whose slot holds Info
+        let d = op_at(3, Type::Ref);
+        let start_info = Operand::from_bound_op(&d);
+        start_info.set_forwarded_info(OpInfo::ptr(PtrInfo::nonnull()));
+        let before_d = OpRc::strong_count(&d);
+        {
+            let r_false = start_info.get_box_replacement(false);
+            let r_true = start_info.get_box_replacement(true);
+            assert!(r_false.bound_op().is_some_and(|op| OpRc::ptr_eq(&op, &d)));
+            assert!(r_true.bound_op().is_some_and(|op| OpRc::ptr_eq(&op, &d)));
+        }
+        assert_eq!(OpRc::strong_count(&d), before_d);
     }
 
     /// `bound_op` / `bound_inputarg` expose the carried producer `Rc` for the

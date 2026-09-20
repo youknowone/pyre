@@ -3605,6 +3605,26 @@ impl Drop for ForwardedViewMut<'_> {
     }
 }
 
+/// Packed `_forwarded` word of a live `Op`, without cloning the slot.
+///
+/// SAFETY: `op` must point at an `Op` kept alive by a strong count
+/// (an `Operand` or a `_forwarded` slot that names it).
+#[inline]
+pub(crate) unsafe fn packed_forwarded_of_op(op: *const Op) -> u64 {
+    // SAFETY: the caller holds a strong ref that keeps this Op alive.
+    unsafe { (*op).descr.packed_forwarded() }
+}
+
+/// Packed `_forwarded` word of a live `InputArg`, without cloning the slot.
+///
+/// SAFETY: `ia` must point at an `InputArg` kept alive by a strong count
+/// (an `Operand` or a `_forwarded` slot that names it).
+#[inline]
+pub(crate) unsafe fn packed_forwarded_of_inputarg(ia: *const crate::value::InputArg) -> u64 {
+    // SAFETY: the caller holds a strong ref that keeps this InputArg alive.
+    unsafe { *(*ia).forwarded.0.get() }
+}
+
 impl ForwardedSlot {
     pub fn new(v: crate::forwarding::Forwarded) -> Self {
         ForwardedSlot(std::cell::UnsafeCell::new(
