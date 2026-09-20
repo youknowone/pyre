@@ -3515,19 +3515,20 @@ use pyre_object::functional::{
     RANGE_PROMOTE_STEP_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET,
-    EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET,
-    EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET,
-    EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET, EXC_W_GROUP_EXCEPTIONS_OFFSET,
-    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET, EXC_W_IMPORT_MSG_OFFSET,
-    EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET, EXC_W_NAME_OFFSET,
-    EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET, EXC_W_STRERROR_OFFSET,
-    EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET, EXC_W_SYNTAX_FILENAME_OFFSET,
-    EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
-    EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
-    EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
-    ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE, W_EXCEPTION_EXTENDED_SIZE,
-    exc_kind_to_pytype, exc_kind_uses_extended_layout, exception_extended_gc_type_id,
+    EXC_ARGS_W_OFFSET, EXC_BLOCKING_WRITTEN_ARG_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET,
+    EXC_SUPPRESS_CONTEXT_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET,
+    EXC_W_CONTEXT_OFFSET, EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET,
+    EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_OFFSET, EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET,
+    EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
+    EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
+    EXC_W_STRERROR_OFFSET, EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET,
+    EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
+    EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
+    EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET,
+    EXC_W_WINERROR_OFFSET, EXC_WRITTEN_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS,
+    W_BASE_EXCEPTION_SIZE, W_EXCEPTION_EXTENDED_SIZE, exc_kind_to_pytype,
+    exc_kind_uses_extended_layout, exception_extended_gc_type_id,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -5381,21 +5382,17 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
         extended_tid,
         exc_kind_to_pytype(kind) as *const _ as usize,
         &[
+            // Positional order is `W_BaseException` declaration order with the
+            // two `ob_header` words dropped, matching `heaptracker.py
+            // all_fielddescrs` / `get_fielddescr_index_in`.  The class word is
+            // appended last so every real field keeps the index that walk
+            // numbers; the walk never numbers a header word.
             // `kind` is a `u8` tag (1 byte, unsigned).
             (
                 "W_BaseException.kind",
                 EXC_KIND_OFFSET,
                 1,
                 Type::Int,
-                false,
-                false,
-                false,
-            ),
-            (
-                "W_BaseException.w_class",
-                W_CLASS_OFFSET,
-                WORD,
-                Type::Ref,
                 false,
                 false,
                 false,
@@ -5409,28 +5406,22 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
                 false,
             ),
-            // `w_context` (`__context__`): a GC pointer slot.  Written by
-            // the RAISE_VARARGS `__context__` chaining lowering
-            // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
-            // track it on the virtual exception; carried at field index 3.
             (
-                "W_BaseException.w_context",
-                EXC_W_CONTEXT_OFFSET,
+                "W_BaseException.w_cause",
+                EXC_W_CAUSE_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
                 false,
                 false,
             ),
-            // The runtime flattens the subclass-specific exception fields
-            // onto W_BaseException and its TypeInfo traces every one of them.
-            // Keep them in gc_fielddescrs so rewrite.py:498-504 emits the
-            // delayed NULL stores required by malloc_zero_filled=false.  They
-            // follow the four optimizer-visible fields above so the stable
-            // kind/w_class/args_w/w_context indices do not change.
+            // `w_context` (`__context__`): a GC pointer slot.  Written by
+            // the RAISE_VARARGS `__context__` chaining lowering
+            // (`exc.w_context = ec.sys_exc_value`) so the optimizer can
+            // track it on the virtual exception.
             (
-                "W_BaseException.w_cause",
-                EXC_W_CAUSE_OFFSET,
+                "W_BaseException.w_context",
+                EXC_W_CONTEXT_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -5442,6 +5433,17 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 EXC_W_TRACEBACK_OFFSET,
                 WORD,
                 Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            // This plain byte is not included in gc_fielddescrs, so a nursery
+            // allocation must initialize it explicitly.
+            (
+                "W_BaseException.suppress_context",
+                EXC_SUPPRESS_CONTEXT_OFFSET,
+                1,
+                Type::Int,
                 false,
                 false,
                 false,
@@ -5537,6 +5539,24 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
+                "W_BaseException.written",
+                EXC_WRITTEN_OFFSET,
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.blocking_written_arg",
+                EXC_BLOCKING_WRITTEN_ARG_OFFSET,
+                1,
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
                 "W_BaseException.w_code",
                 EXC_W_CODE_OFFSET,
                 WORD,
@@ -5593,24 +5613,6 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             (
                 "W_BaseException.w_import_msg",
                 EXC_W_IMPORT_MSG_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "W_BaseException.w_dict",
-                EXC_W_DICT_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
-                "W_BaseException.w_weakreflifeline",
-                EXC_W_WEAKREF_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -5725,13 +5727,29 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
                 false,
             ),
-            // This plain byte is not included in gc_fielddescrs, so a nursery
-            // allocation must initialize it explicitly.
             (
-                "W_BaseException.suppress_context",
-                EXC_SUPPRESS_CONTEXT_OFFSET,
-                1,
-                Type::Int,
+                "W_BaseException.w_dict",
+                EXC_W_DICT_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_weakreflifeline",
+                EXC_W_WEAKREF_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "W_BaseException.w_class",
+                W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
                 false,
                 false,
                 false,
@@ -5747,95 +5765,76 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
 static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
     LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
 
-/// Field descrs for the exception construction emit: `(size, kind,
-/// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
-pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+fn with_w_exception_group<R>(kind: ExcKind, f: impl FnOnce(&PyreObjectDescrGroup) -> R) -> R {
     let idx = kind as u8 as usize;
     let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
-    let group = cache[idx].as_ref().unwrap();
-    (
-        group.size_descr.clone() as DescrRef,
-        field_descr_from_group(group, 0),
-        field_descr_from_group(group, 1),
-        field_descr_from_group(group, 2),
-    )
+    f(cache[idx].as_ref().unwrap())
 }
 
-/// Field descr for `W_BaseException.w_context` (the `__context__`
-/// slot), index 3 of the per-kind exception descr group.  Used by the
-/// RAISE_VARARGS `__context__` chaining lowering; shares the same parent
-/// `SizeDescr` as the `NewWithVtable` emit so the optimizer recognises
-/// the store as a field of the virtual exception.
-pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
-    let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
-    }
-    let group = cache[idx].as_ref().unwrap();
-    field_descr_from_group(group, 3)
-}
-
-/// Field descr for `W_BaseException.w_dict` (the lazily allocated instance
-/// dictionary), the last slot of the per-kind exception descr group.  The
-/// LOAD_METHOD method-cache fold reads it to pin the receiver at "carries no
-/// instance dictionary", which is what makes the folded descriptor safe: a
-/// later `e.<name> = ...` allocates the dictionary and side-exits.
-pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
-    let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
-    }
-    let group = cache[idx].as_ref().unwrap();
-    // Located by offset rather than by a hand-counted position.  The field
-    // list is edited by hand, and naming the wrong index does not fail to
-    // compile: it silently reads a neighbouring slot that stays null for an
-    // ordinary subclass, which turns the shadowing guard below into a no-op
-    // and lets compiled code keep calling a method an instance attribute has
-    // already shadowed.
+fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef {
     let field = group
         .field_descrs
         .iter()
-        .position(|d| d.offset() == pyre_object::interp_exceptions::EXC_W_DICT_OFFSET)
-        .expect("exception descr group has no w_dict field");
+        .position(|d| d.offset() == offset)
+        .unwrap_or_else(|| panic!("exception descr group has no field at offset {offset}"));
     field_descr_from_group(group, field)
+}
+
+/// Locate a field of the per-kind exception group by offset.  See
+/// [`w_exception_dict_descr`] for why offset lookup is the right idiom.
+fn w_exception_field_descr_by_offset(kind: ExcKind, offset: usize) -> DescrRef {
+    with_w_exception_group(kind, |group| w_exception_field_at(group, offset))
+}
+
+/// Field descrs for the exception construction emit: `(size, kind,
+/// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
+pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    with_w_exception_group(kind, |group| {
+        (
+            group.size_descr.clone() as DescrRef,
+            w_exception_field_at(group, EXC_KIND_OFFSET),
+            w_exception_field_at(group, W_CLASS_OFFSET),
+            w_exception_field_at(group, EXC_ARGS_W_OFFSET),
+        )
+    })
+}
+
+/// Field descr for `W_BaseException.w_context` (the `__context__`
+/// slot).  Used by the RAISE_VARARGS `__context__` chaining lowering;
+/// shares the same parent `SizeDescr` as the `NewWithVtable` emit so the
+/// optimizer recognises the store as a field of the virtual exception.
+pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
+    w_exception_field_descr_by_offset(kind, EXC_W_CONTEXT_OFFSET)
+}
+
+/// Field descr for `W_BaseException.w_dict` (the lazily allocated instance
+/// dictionary).  The LOAD_METHOD method-cache fold reads it to pin the
+/// receiver at "carries no instance dictionary", which is what makes the
+/// folded descriptor safe: a later `e.<name> = ...` allocates the dictionary
+/// and side-exits.
+///
+/// Located by offset rather than by a hand-counted position.  The field
+/// list is edited by hand, and naming the wrong index does not fail to
+/// compile: it silently reads a neighbouring slot that stays null for an
+/// ordinary subclass, which turns the shadowing guard below into a no-op
+/// and lets compiled code keep calling a method an instance attribute has
+/// already shadowed.
+pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
+    w_exception_field_descr_by_offset(kind, EXC_W_DICT_OFFSET)
 }
 
 /// Field descr for the plain `W_BaseException.suppress_context` byte.
 pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
-    let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
-    }
-    let group = cache[idx].as_ref().unwrap();
-    let field = group
-        .field_descrs
-        .iter()
-        .position(|d| d.offset() == EXC_SUPPRESS_CONTEXT_OFFSET)
-        .expect("exception descr group has no suppress_context field");
-    field_descr_from_group(group, field)
+    w_exception_field_descr_by_offset(kind, EXC_SUPPRESS_CONTEXT_OFFSET)
 }
 
 /// Field descriptor for `W_BaseException.w_traceback`, sharing the
 /// per-kind exception allocation descriptor with the other exception slots.
 pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
-    let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
-    }
-    let group = cache[idx].as_ref().unwrap();
-    let field = group
-        .field_descrs
-        .iter()
-        .position(|d| d.offset() == EXC_W_TRACEBACK_OFFSET)
-        .expect("exception descr group has no w_traceback field");
-    field_descr_from_group(group, field)
+    w_exception_field_descr_by_offset(kind, EXC_W_TRACEBACK_OFFSET)
 }
 
 static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -5965,11 +5964,6 @@ pub fn w_exception_attr_slot_descr(
     slot: pyre_interpreter::baseobjspace::ExceptionAttrSlot,
 ) -> DescrRef {
     use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
-    let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
-    }
     let offset = match slot {
         Slot::Args => EXC_ARGS_W_OFFSET,
         Slot::Context => EXC_W_CONTEXT_OFFSET,
@@ -5988,30 +5982,20 @@ pub fn w_exception_attr_slot_descr(
         Slot::Name => EXC_W_NAME_OFFSET,
         Slot::AttrObj => EXC_W_ATTR_OBJ_OFFSET,
     };
-    let group = cache[idx].as_ref().unwrap();
-    let field_index = group
-        .field_descrs
-        .iter()
-        .position(|d| d.offset() == offset)
-        .expect("W_BaseException descr group has no field at the selected slot offset");
-    field_descr_from_group(group, field_index)
+    w_exception_field_descr_by_offset(kind, offset)
 }
 
 /// Cached field descriptor for a flattened `W_BaseException` slot selected
 /// by byte offset.  Returns `None` when the per-kind group does not carry the
 /// requested offset.
 pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
-    let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
-    if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
-    }
-    let group = cache[idx].as_ref().unwrap();
-    group
-        .field_descrs
-        .iter()
-        .position(|d| d.offset() == offset)
-        .map(|field| field_descr_from_group(group, field))
+    with_w_exception_group(kind, |group| {
+        group
+            .field_descrs
+            .iter()
+            .position(|d| d.offset() == offset)
+            .map(|field| field_descr_from_group(group, field))
+    })
 }
 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
@@ -6880,6 +6864,44 @@ mod tests {
         expected.sort_unstable();
         expected.dedup();
         assert_eq!(actual, expected);
+    }
+
+    /// `heaptracker.py all_fielddescrs` and `get_fielddescr_index_in` walk
+    /// the same `STRUCT._names` skip set, so `all_fielddescrs(S)[i].get_index()
+    /// == i`.  The runtime `W_BaseException` group must stamp that positional
+    /// census (`index_in_parent`) in declaration order, with the class word
+    /// trailing so it does not occupy a walk-numbered slot.
+    #[test]
+    fn w_base_exception_field_indices_match_all_fielddescrs_order() {
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let fields = descr
+            .as_size_descr()
+            .expect("W_BaseException SizeDescr")
+            .all_fielddescrs();
+        assert_eq!(fields.len(), 40);
+        for (i, field) in fields.iter().enumerate() {
+            assert_eq!(
+                field.index_in_parent(),
+                i,
+                "{} at offset {} has index_in_parent {}, not {i}",
+                field.field_name(),
+                field.offset(),
+                field.index_in_parent(),
+            );
+        }
+        for i in 0..38 {
+            assert!(
+                fields[i].offset() < fields[i + 1].offset(),
+                "offsets 0..=38 must be strictly increasing: {}@{} then {}@{}",
+                fields[i].field_name(),
+                fields[i].offset(),
+                fields[i + 1].field_name(),
+                fields[i + 1].offset(),
+            );
+        }
+        let class_word = fields.last().expect("group is non-empty");
+        assert_eq!(class_word.offset(), W_CLASS_OFFSET);
+        assert!(class_word.is_w_class());
     }
 
     #[test]

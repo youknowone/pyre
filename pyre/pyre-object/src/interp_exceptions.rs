@@ -463,6 +463,9 @@ pub const EXC_W_WINERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtende
 pub const EXC_W_STRERROR_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_strerror);
 pub const EXC_W_FILENAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_filename);
 pub const EXC_W_FILENAME2_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_filename2);
+pub const EXC_WRITTEN_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, written);
+pub const EXC_BLOCKING_WRITTEN_ARG_OFFSET: usize =
+    std::mem::offset_of!(W_ExceptionExtended, blocking_written_arg);
 pub const EXC_W_CODE_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_code);
 pub const EXC_W_VALUE_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_value);
 pub const EXC_W_NAME_OFFSET: usize = std::mem::offset_of!(W_ExceptionExtended, w_exc_name);
