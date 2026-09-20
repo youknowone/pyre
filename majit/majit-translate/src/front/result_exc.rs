@@ -1348,6 +1348,32 @@ pub(crate) fn rewire_result_exc_call_sites(
         fused: 0,
     };
     for (r, suffix, payload_ty) in results {
+        // Collection records every scoped Result call during body
+        // lowering.  `simplify_lowered_graph` then folds
+        // `we_are_jitted()` (`front::mir` `ConstBool(true)`) through
+        // `fold_constant_exitswitch` and `clear_unreachable_blocks`
+        // drops the interpreter arm.  `create_exception_handling`
+        // (`exceptiontransform.py`) walks `iterblocks()` and never
+        // sees those ops; a collected var with no producer and no
+        // remaining uses is that dead arm — skip it.  A var that
+        // still has uses but no producer is unproven: decline.
+        if producer_block_index(graph, r).is_none() {
+            let residence = describe_var_residence(graph, r);
+            if residence.is_absent() {
+                continue;
+            }
+            let msg = format!(
+                "{}: scoped call result var has no producer block; {}",
+                graph.name, residence
+            );
+            crate::decline::record_reason(
+                RESULT_EXC_CALLER_GATE,
+                "call-site-declined-to-residual",
+                &msg,
+                &graph.name,
+            );
+            return Err(msg);
+        }
         let site = rewire_one_call_site(
             graph,
             r,
@@ -1608,6 +1634,74 @@ fn rewire_one_option_ok_or_else_try_site(
     Ok(())
 }
 
+fn producer_block_index(graph: &FunctionGraph, r: &Variable) -> Option<usize> {
+    graph
+        .blocks
+        .iter()
+        .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(r)))
+}
+
+struct VarResidence {
+    producers: Vec<String>,
+    inputargs: Vec<usize>,
+    operands: Vec<String>,
+    exits: Vec<String>,
+}
+
+impl VarResidence {
+    fn is_absent(&self) -> bool {
+        self.producers.is_empty()
+            && self.inputargs.is_empty()
+            && self.operands.is_empty()
+            && self.exits.is_empty()
+    }
+}
+
+impl std::fmt::Display for VarResidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "producers={:?} inputargs={:?} operands={:?} exits={:?}",
+            self.producers, self.inputargs, self.operands, self.exits
+        )
+    }
+}
+
+fn describe_var_residence(graph: &FunctionGraph, r: &Variable) -> VarResidence {
+    let mut producers = Vec::new();
+    let mut inputargs = Vec::new();
+    let mut operands = Vec::new();
+    let mut exits = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        if block.inputargs.iter().any(|v| v == r) {
+            inputargs.push(bi);
+        }
+        for (oi, op) in block.operations.iter().enumerate() {
+            if op.result.as_ref() == Some(r) {
+                producers.push(format!("b{bi}.op{oi}:{}", truncated_kind(&op.kind)));
+            }
+            if op_operand_vars(&op.kind).iter().any(|v| v == r) {
+                operands.push(format!("b{bi}.op{oi}"));
+            }
+        }
+        for (ei, link) in block.exits.iter().enumerate() {
+            if link
+                .args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == r))
+            {
+                exits.push(format!("b{bi}.e{ei}->b{}", link.target.0));
+            }
+        }
+    }
+    VarResidence {
+        producers,
+        inputargs,
+        operands,
+        exits,
+    }
+}
+
 fn rewire_one_call_site(
     graph: &mut FunctionGraph,
     r: &Variable,
@@ -1620,10 +1714,7 @@ fn rewire_one_call_site(
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
     // with a single forwarding exit.
-    let a = graph
-        .blocks
-        .iter()
-        .position(|b| b.operations.iter().any(|op| op.result.as_ref() == Some(r)))
+    let a = producer_block_index(graph, r)
         .ok_or_else(|| format!("{name}: scoped call result var has no producer block"))?;
     // Tail forward: the callee's Result flows straight to returnblock.
     if forwards_to_returnblock(graph, a, r).is_ok() {
@@ -3982,6 +4073,47 @@ mod static_result_shell_tests {
         let err = lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
             .expect_err("mismatched variant tag must fail closed");
         assert!(err.contains("non-matching __discriminant write"));
+    }
+}
+
+#[cfg(test)]
+mod rewire_dead_arm_tests {
+    use super::*;
+
+    #[test]
+    fn absent_collected_var_is_skipped() {
+        let mut graph = FunctionGraph::new("dead_arm");
+        let ghost = Variable::new();
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(ghost, None, ValueType::Ref(None))],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("a collected var that simplify already deleted is a dead arm");
+        assert_eq!(outcome.diamonds, 0);
+        assert_eq!(outcome.tail_forwards, 0);
+        assert_eq!(outcome.rewrapped, 0);
+        assert_eq!(outcome.fused, 0);
+    }
+
+    #[test]
+    fn collected_var_used_without_producer_declines() {
+        let mut graph = FunctionGraph::new("used_ghost");
+        let ghost = graph.alloc_value_var();
+        graph.blocks[graph.startblock.0]
+            .inputargs
+            .push(ghost.clone());
+        let err = match rewire_result_exc_call_sites(
+            &mut graph,
+            &[(ghost, None, ValueType::Ref(None))],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        ) {
+            Ok(_) => panic!("a live use without a producer is unproven"),
+            Err(msg) => msg,
+        };
+        assert!(err.contains("scoped call result var has no producer block"));
     }
 }
 
